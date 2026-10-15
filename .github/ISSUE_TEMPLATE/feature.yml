@@ -1,0 +1,32 @@
+name: Feature request
+description: Something twr could do that it doesn't.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a larger change you'd like to make yourself, open this issue first so the shape can be agreed before you write the code ([CONTRIBUTING.md](https://github.com/ignaval/twr/blob/dev/CONTRIBUTING.md)).
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you're trying to do, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: "How twr could help: a command, a key, a config setting, a behaviour."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or other ways you considered.
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtimes involved
+      description: Which agent CLIs this concerns, if any.

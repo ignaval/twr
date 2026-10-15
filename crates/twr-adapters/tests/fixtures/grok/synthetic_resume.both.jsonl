@@ -1,0 +1,7 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"twr","version":"0.1.0"}}}
+<< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"authMethods":[{"id":"grok.com","name":"Grok","description":"Sign in with Grok"}],"_meta":{"agentVersion":"1.0.41"}}}
+>> {"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"cwd":"/work/repo","mcpServers":[],"sessionId":"s-old","_meta":{"yoloMode":false}}}
+<< {"jsonrpc":"2.0","id":2,"result":{}}
+>> {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s-old","prompt":[{"type":"text","text":"What did we do?"}]}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"We created hello.txt."}}}}
+<< {"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn"}}

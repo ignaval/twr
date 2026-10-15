@@ -1,0 +1,7 @@
+# The Rust that CI and the release builds use (.github/workflows read the channel from here).
+# Cargo.toml's rust-version is the oldest Rust twr builds with; this pins the one we ship with.
+# Bump it on purpose, in its own commit.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

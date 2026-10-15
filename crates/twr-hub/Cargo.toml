@@ -1,0 +1,35 @@
+[package]
+name = "twr-hub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr hub daemon: event store, control stream, socket API and adapter supervisors"
+
+[dependencies]
+twr-core.workspace = true
+twr-adapters.workspace = true
+twr-decisions.workspace = true
+twr-mcp.workspace = true
+twr-runner.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+rusqlite.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true

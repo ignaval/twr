@@ -1,0 +1,32 @@
+# cargo-about's settings for THIRD-PARTY-LICENSES.html, the notices of the crates built into
+# twr, which each release archive carries (.github/workflows/release.yml):
+#
+#   cargo about generate --locked --fail -o THIRD-PARTY-LICENSES.html about.hbs
+#
+# The accepted licences are deny.toml's (`[licenses] allow`); keep the two lists the same. For
+# a crate offering a choice, the first accepted one in this order is used.
+accepted = [
+    "Apache-2.0",
+    "MIT",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+# What the release binaries contain: the four release targets, without build and dev
+# dependencies.
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+ignore-build-dependencies = true
+ignore-dev-dependencies = true
+# twr's own crates are listed too, under Apache-2.0: no crate is exempt from the accepted
+# list, so a dependency outside crates.io (a path dependency, say) can't slip through.

@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.89"
+license = "Apache-2.0"
+repository = "https://github.com/ignaval/twr"
+
+[workspace.dependencies]
+twr-core = { path = "crates/twr-core" }
+twr-adapters = { path = "crates/twr-adapters" }
+twr-decisions = { path = "crates/twr-decisions" }
+twr-runner = { path = "crates/twr-runner" }
+twr-hub = { path = "crates/twr-hub" }
+twr-mcp = { path = "crates/twr-mcp" }
+twr-tui = { path = "crates/twr-tui" }
+twr-docs = { path = "crates/twr-docs" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+ulid = "3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = "0.11"
+hex = "0.4"
+toml = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
+# The TUI's markdown (replies drawn as Claude Code draws them): the parser only, no HTML.
+pulldown-cmark = { version = "0.13", default-features = false }
+tempfile = "3"
+portable-pty = "0.9"
+rmcp = { version = "3.5", default-features = false, features = ["server", "transport-io", "macros"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The hub's runner listener over TLS (wss://): the same rustls with ring.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# `twr update`'s HTTP client: rustls with ring (reqwest uses an installed default provider, else ring), no OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# macOS's mount list (`getfsstat`) for twr-runner's trims and deletions.
+libc = "0.2"
+# `twr update` checks the release's Ed25519 signatures: the ring rustls already builds.
+ring = "0.17.14"
+
+# Dev and test builds (`test` inherits `dev`) keep only line tables: panics and backtraces still
+# name file and line, and debuggers can step by line, but the variables and types of full
+# debuginfo are gone. Full debuginfo was three quarters of each test binary (~250 MB each, 48
+# of them), and a worktree's `target/` halves with this (docs/development.md#disk-usage). For a
+# debugging session: CARGO_PROFILE_DEV_DEBUG=full cargo build.
+[profile.dev]
+debug = "line-tables-only"
+
+# Release binaries (the GitHub release workflow builds these). `panic` stays `unwind`: tokio
+# turns a panicking task into a JoinError instead of taking the hub down.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

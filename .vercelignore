@@ -1,0 +1,9 @@
+# Vercel only needs what vercel.json's build copies, and .git for its ignoreCommand.
+/*
+!/.git
+!/site
+!/install.sh
+!/vercel.json
+!/docs
+/docs/*
+!/docs/img

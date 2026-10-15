@@ -1,0 +1,12 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"twr","version":"0.1.0"}}}
+<< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"authMethods":[{"id":"grok.com","name":"Grok","description":"Sign in with Grok"}],"_meta":{"agentVersion":"1.0.41"}}}
+>> {"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/work/repo","mcpServers":[],"_meta":{"yoloMode":false}}}
+<< {"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-cancel","modes":{"currentModeId":"default","availableModes":[{"id":"default","name":"Default"},{"id":"always-approve","name":"Always approve"}]}}}
+>> {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s-cancel","prompt":[{"type":"text","text":"Run the tests"}]}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-cancel","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Running the tests."}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-cancel","update":{"sessionUpdate":"tool_call","toolCallId":"call_2","title":"cargo test","kind":"execute","status":"pending","rawInput":{"command":"cargo test"}}}}
+<< {"jsonrpc":"2.0","id":"perm-a","method":"session/request_permission","params":{"sessionId":"s-cancel","toolCall":{"toolCallId":"call_2","title":"cargo test","kind":"execute"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}
+>> {"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"s-cancel"}}
+>> {"jsonrpc":"2.0","id":"perm-a","result":{"outcome":{"outcome":"cancelled"}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-cancel","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_2","status":"failed"}}}
+<< {"jsonrpc":"2.0","id":3,"result":{"stopReason":"cancelled"}}

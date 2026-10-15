@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "rm -rf site-dist && mkdir site-dist && sh -n install.sh && cp site/index.html install.sh docs/img/tui-demo.svg docs/img/tui-grid.svg site-dist/",
+  "outputDirectory": "site-dist",
+  "ignoreCommand": "[ \"$VERCEL_ENV\" != production ] || git diff --quiet HEAD^ HEAD -- site install.sh docs/img vercel.json .vercelignore || exit 1",
+  "headers": [
+    {
+      "source": "/install.sh",
+      "headers": [
+        { "key": "Content-Type", "value": "text/plain; charset=utf-8" },
+        { "key": "Cache-Control", "value": "public, max-age=300, must-revalidate" }
+      ]
+    }
+  ]
+}

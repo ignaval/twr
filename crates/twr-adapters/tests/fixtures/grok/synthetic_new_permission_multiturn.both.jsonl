@@ -1,0 +1,23 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"twr","version":"0.1.0"}}}
+<< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"authMethods":[{"id":"grok.com","name":"Grok","description":"Sign in with Grok"}],"_meta":{"agentVersion":"1.0.41"}}}
+<< {"jsonrpc":"2.0","method":"_x.ai/mcp/servers_updated","params":{"mcpServers":[]}}
+>> {"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/work/repo","mcpServers":[{"name":"twr","command":"/usr/bin/twr","args":["mcp","--socket","/run/twr.sock"],"env":[{"name":"TWR_ORCH_TOKEN","value":"tok"}]}],"_meta":{"yoloMode":false}}}
+<< {"jsonrpc":"2.0","id":"skills-reload","result":{"result":{"reloaded":0}}}
+<< {"jsonrpc":"2.0","id":2,"result":{"sessionId":"0199a000-0000-7000-8000-000000000001","modes":{"currentModeId":"always-approve","availableModes":[{"id":"default","name":"Default"},{"id":"auto","name":"Auto"},{"id":"always-approve","name":"Always approve"}]}}}
+>> {"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","modeId":"default"}}
+<< {"jsonrpc":"2.0","id":3,"result":{}}
+>> {"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","prompt":[{"type":"text","text":"Create hello.txt containing hi"}]}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"The user wants a file."}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"I'll create "}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"the file."}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Write hello.txt","kind":"edit","status":"pending","locations":[{"path":"/work/repo/hello.txt"}],"rawInput":{"path":"hello.txt","content":"hi"}}}}
+<< {"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","toolCall":{"toolCallId":"call_1","title":"Write hello.txt","kind":"edit"},"options":[{"optionId":"allow-once","name":"Allow once","kind":"allow_once"},{"optionId":"allow-always","name":"Always allow","kind":"allow_always"},{"optionId":"reject-once","name":"Reject","kind":"reject_once"}]}}
+>> {"jsonrpc":"2.0","id":0,"result":{"outcome":{"outcome":"selected","optionId":"allow-once"}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"in_progress"}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed","content":[{"type":"diff","path":"/work/repo/hello.txt","oldText":null,"newText":"hi"}]}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"plan","entries":[{"content":"Write the file","priority":"high","status":"completed"}]}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Done."}}}}
+<< {"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","_meta":{"usage":{"inputTokens":1200,"outputTokens":40}}}}
+>> {"jsonrpc":"2.0","id":5,"method":"session/prompt","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","prompt":[{"type":"text","text":"Now say bye"}]}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"0199a000-0000-7000-8000-000000000001","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Bye."}}}}
+<< {"jsonrpc":"2.0","id":5,"result":{"stopReason":"end_turn"}}

@@ -1,0 +1,23 @@
+[package]
+name = "twr-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr terminal UI: stack and grid views, attention cards, transcript pane"
+
+[dependencies]
+twr-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures.workspace = true
+pulldown-cmark.workspace = true
+ratatui.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in twr doesn't work as the docs say.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For a security vulnerability, don't use this form: see [SECURITY.md](https://github.com/ignaval/twr/blob/dev/SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: twr version
+      description: The output of `twr --version`.
+      placeholder: twr 0.2.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS and architecture
+      description: For example "Ubuntu 24.04, x86_64" or "macOS 15.1, Apple silicon".
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and its version
+      description: The agent CLI involved, if any, and its version (`claude --version`, `codex --version`, `grok --version`).
+      placeholder: Claude Code 2.1.110
+  - type: textarea
+    id: info
+    attributes:
+      label: twr info
+      description: The output of `twr info`, with the hub running.
+      render: text
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you saw, with any error message as it was printed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The commands or actions, from a fresh start if you can.
+      placeholder: |
+        1. twr thread new ~/code/api --name api
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: The relevant part of `hub.log` (in twr's data directory) or of `twr events <thread> --pretty`, if it helps.
+      render: text
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Secrets
+      description: "`hub.log`, transcripts and `config.toml` can hold tokens, API keys, webhook URLs, prompts and private paths."
+      options:
+        - label: I removed secrets and private data from everything I pasted above.
+          required: true

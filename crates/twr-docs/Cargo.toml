@@ -1,0 +1,11 @@
+[package]
+name = "twr-docs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr's own documentation, compiled in, with section search for the orchestrator's read_docs tool"
+
+[dependencies]

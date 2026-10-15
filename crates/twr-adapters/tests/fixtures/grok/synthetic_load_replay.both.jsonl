@@ -1,0 +1,9 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"twr","version":"0.1.0"}}}
+<< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true}},"authMethods":[{"id":"grok.com","name":"Grok","description":"Sign in with Grok"}],"_meta":{"agentVersion":"1.0.41"}}}
+>> {"jsonrpc":"2.0","id":2,"method":"session/load","params":{"cwd":"/work/repo","mcpServers":[],"sessionId":"s-old","_meta":{"yoloMode":false}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Create hello.txt"}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"old answer"}}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"tool_call","toolCallId":"old_1","title":"Write hello.txt","kind":"edit","status":"completed"}}}
+<< {"jsonrpc":"2.0","id":2,"result":{"modes":{"currentModeId":"always-approve","availableModes":[{"id":"ask","name":"Ask"},{"id":"always-approve","name":"Always approve"}]}}}
+>> {"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"sessionId":"s-old","modeId":"ask"}}
+<< {"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}

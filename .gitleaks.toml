@@ -1,0 +1,30 @@
+# gitleaks configuration: the default rules, minus four pieces of test data, each allowed
+# only in its own file (and, where gitleaks matches inside a file, only as an exact match).
+[extend]
+useDefault = true
+
+# A throwaway key for the TLS tests, signed by a test CA (see README.md beside it).
+[[allowlists]]
+description = "TLS test fixture key"
+paths = ['''^crates/twr-hub/tests/fixtures/tls/hub\.key$''']
+
+# The throwaway Ed25519 key the signature tests sign with (see README.md beside it).
+[[allowlists]]
+description = "signing test fixture key"
+paths = ['''^crates/twr-cli/tests/fixtures/signing/test-key\.pem$''']
+
+# RFC 6455's sample Sec-WebSocket-Key ("the sample nonce").
+[[allowlists]]
+description = "RFC 6455 sample nonce"
+condition = "AND"
+paths = ['''^crates/twr-hub/tests/runners\.rs$''']
+regexTarget = "match"
+regexes = ['''^Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==(\\r)?$''']
+
+# The fake key the project-read secret filter is tested with (its body is base64 of "openssh").
+[[allowlists]]
+description = "project-read secret filter test key"
+condition = "AND"
+paths = ['''^crates/twr-hub/src/hub/project_read\.rs$''']
+regexTarget = "match"
+regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaA==\\n";''']

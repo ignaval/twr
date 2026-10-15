@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>twr: one conversation for all your coding agents</title>
+<meta name="description" content="Talk to one orchestrator and it runs Claude Code, Codex, Grok Build and any ACP agent in parallel. Their reports, questions and permission prompts come back into the same conversation. One local binary for Linux and macOS.">
+<link rel="canonical" href="https://twr.tools/">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23141413'/%3E%3Cpath d='M8 23h16' stroke='%23e88a4f' stroke-width='4' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --bg: #fbfaf7;
+    --fg: #1d1c1a;
+    --muted: #66635c;
+    --rule: #e4e1da;
+    --code-bg: #f1eee7;
+    --accent: #b4541f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #141413;
+      --fg: #ecebe6;
+      --muted: #a09d95;
+      --rule: #2c2b28;
+      --code-bg: #1f1e1c;
+      --accent: #e88a4f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 17px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 64px 16px 48px; }
+  h1 {
+    font: 700 44px/1.1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    margin: 0 0 12px;
+    letter-spacing: -0.02em;
+  }
+  h1 span { color: var(--accent); }
+  /* The cursor breathes, like the TUI's working icon; still for reduced motion. */
+  @keyframes breathe { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: no-preference) {
+    h1 span { animation: breathe 1.5s ease-in-out infinite; }
+  }
+  .tagline { font-size: 28px; line-height: 1.25; font-weight: 600; margin: 0 0 12px; letter-spacing: -0.01em; }
+  .lede { font-size: 19px; margin: 0 0 32px; }
+  h2 {
+    font: 700 22px/1.3 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    margin: 48px 0 12px;
+  }
+  .convo {
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 16px;
+    margin: 0 0 16px;
+    font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .convo p { margin: 0; white-space: pre-wrap; }
+  .convo .you { font-weight: 700; margin-top: 12px; }
+  .convo .you:first-child { margin-top: 0; }
+  .convo .you::before { content: "> "; color: var(--accent); }
+  .convo .orch { padding-left: 2ch; }
+  .convo .hub { padding-left: 2ch; color: var(--muted); margin-top: 8px; }
+  p { margin: 0 0 16px; }
+  .muted { color: var(--muted); }
+  .install {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+    padding: 12px 12px 12px 16px;
+    margin: 0 0 12px;
+  }
+  .install code {
+    flex: 1;
+    min-width: 0;
+    overflow-x: auto;
+    white-space: nowrap;
+    font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  .install code::before { content: "$ "; color: var(--muted); }
+  button {
+    font: inherit;
+    font-size: 14px;
+    color: var(--fg);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  figure { margin: 40px 0; }
+  /* The recording is wider than the text column, so it breaks out of it on wide screens. */
+  figure.hero {
+    width: min(1104px, calc(100vw - 32px));
+    position: relative;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  figure img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 8px;
+    border: 1px solid var(--rule);
+  }
+  figcaption { font-size: 14px; color: var(--muted); margin-top: 8px; }
+  ul { padding-left: 20px; margin: 0 0 16px; }
+  li { margin-bottom: 6px; }
+  a { color: var(--accent); }
+  footer {
+    border-top: 1px solid var(--rule);
+    margin-top: 48px;
+    padding-top: 16px;
+    font-size: 14px;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>twr<span>_</span></h1>
+  <p class="tagline">One conversation for all your coding agents.</p>
+  <p class="lede">You talk to one orchestrator. It starts and messages Claude Code, Codex, Grok Build or any Agent Client Protocol agent, each in its own git worktree. When a thread finishes, asks a question or wants a permission, it comes back to that same conversation, summed up in a sentence or two.</p>
+
+  <div class="install">
+    <code id="cmd">curl -fsSL https://twr.tools/install.sh | sh</code>
+    <button type="button" id="copy">Copy</button>
+  </div>
+  <p class="muted">Linux and macOS, x86_64 and arm64.</p>
+
+  <figure class="hero">
+    <img src="tui-demo.svg" alt="An animated recording of twr: the user asks the orchestrator for two threads, the threads appear as cards, one permission is answered on its card and another by typing allow ratelimit, each report comes back into the conversation, and the user opens a thread's transcript" width="1103" height="604">
+    <figcaption>A recorded twr session. The user asks the orchestrator for two threads, allows one push on its card and a test run from the conversation, then opens a thread&#39;s transcript. The agents are scripted stand-ins; the hub, the orchestrator&#39;s tools and the TUI are the real thing.</figcaption>
+  </figure>
+
+  <h2>No sidebar of chats</h2>
+  <p>Most multi-agent tools give you a list of sessions to click through, and each agent waits in its own tab until you notice it. In twr you stay in one place. Say what you want and the orchestrator routes it.</p>
+  <div class="convo" role="img" aria-label="An example conversation: the user asks for a health check on api, allows its git push, and hears that it's done, without leaving the conversation">
+    <p class="you">on api, add a health check and push it</p>
+    <p class="orch">Started api on Claude Code, in its own worktree on branch twr/api.</p>
+    <p class="hub">· hub update</p>
+    <p class="orch">api wants to run git push origin twr/api. Allow it?</p>
+    <p class="you">allow api</p>
+    <p class="orch">Allowed. api is pushing.</p>
+    <p class="hub">· hub update</p>
+    <p class="orch">api is done. It added GET /healthz with a test and pushed twr/api.</p>
+  </div>
+  <p>Press Enter twice on a card when you want that agent's full transcript, and Esc to come back. You never have to.</p>
+
+  <h2>It relays, it never decides</h2>
+  <p>The orchestrator can pass on an answer you gave. It can't make one up. A short command such as "allow both" or "deny the webapp one" applies at once. Anything longer goes on a card that only you can confirm, and every answer names the exact version of the question you saw.</p>
+
+  <h2>Also</h2>
+  <ul>
+    <li>One Rust binary. No account, no cloud service, no telemetry.</li>
+    <li>Move the orchestrator to another agent mid-conversation. The new one starts from a handoff summary.</li>
+    <li>Park a thread to free its worktree, and resume it later on the same session.</li>
+    <li><code>twr attach</code> opens the agent's own CLI on the thread's session.</li>
+    <li>Threads can run on other machines through <code>twr runner</code>.</li>
+  </ul>
+
+  <figure>
+    <img src="tui-grid.svg" alt="The twr grid view: one tile per thread with its status, git state and last report" width="1372" height="424" loading="lazy">
+    <figcaption>The grid view (<code>g</code>). One tile per thread with its status, git state and last report.</figcaption>
+  </figure>
+
+  <footer>
+    Apache-2.0 · <a href="https://github.com/ignaval/twr">github.com/ignaval/twr</a>
+  </footer>
+</main>
+<script>
+  document.getElementById("copy").addEventListener("click", async (e) => {
+    const text = document.getElementById("cmd").textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+      e.target.textContent = "Copied";
+    } catch {
+      e.target.textContent = "Select and copy";
+    }
+    setTimeout(() => { e.target.textContent = "Copy"; }, 1500);
+  });
+</script>
+</body>
+</html>

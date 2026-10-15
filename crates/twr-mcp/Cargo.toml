@@ -1,0 +1,24 @@
+[package]
+name = "twr-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr MCP server: exposes the hub to the orchestrator thread over stdio"
+
+[dependencies]
+twr-core.workspace = true
+twr-docs.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rmcp = { workspace = true, features = ["client"] }
+tempfile.workspace = true

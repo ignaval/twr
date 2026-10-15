@@ -1,0 +1,30 @@
+[package]
+name = "twr-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "Core types for twr: events, reducers, attention stack, adapter trait, config and socket protocol"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+libc.workspace = true
+# The runner handshake's HMAC-SHA256 proofs and nonces (`runner::auth_proof`): the ring
+# that rustls already builds.
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

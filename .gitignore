@@ -1,0 +1,8 @@
+/target
+*.db
+/site-dist
+.vercel
+.env*
+.review/
+# cargo about generate (release builds)
+/THIRD-PARTY-LICENSES.html
