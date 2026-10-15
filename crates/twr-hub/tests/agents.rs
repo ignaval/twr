@@ -1479,6 +1479,10 @@ async fn a_deep_chain_without_the_marker_only_reads() {
 /// A shell between the runtime and the client whose command name is not UTF-8 (a byte
 /// that is not, and a multibyte character cut by the 15-byte limit) does not stop the
 /// walk: the client, without the marker, is the runtime's agent and only reads.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8"
+)]
 #[tokio::test]
 async fn a_command_name_that_is_not_utf8_does_not_hide_the_runtime() {
     use std::os::unix::ffi::OsStrExt;

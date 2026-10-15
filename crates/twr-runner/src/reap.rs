@@ -2878,9 +2878,9 @@ mod tests {
         let reaped = first_agent_marker(&[pid, beyond]);
         let _ = unmarked.kill();
         let _ = unmarked.wait();
-        #[cfg(not(twr_ps))]
+        #[cfg(all(target_os = "linux", not(twr_ps)))]
         assert_eq!(zombie, ChainMarker::Gone { pid });
-        #[cfg(twr_ps)]
+        #[cfg(any(not(target_os = "linux"), twr_ps))]
         assert_eq!(zombie, ChainMarker::Hidden { pid });
         assert_eq!(reaped, ChainMarker::Gone { pid });
     }
@@ -3255,6 +3255,10 @@ mod tests {
     /// A process whose command name is not UTF-8 (a byte that is not, a
     /// multibyte character cut by the 15-byte limit) is read like any other: the walk from
     /// its child goes through it to this test process (`/proc`, or `ps` with `--cfg twr_ps`).
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS refuses file names that are not UTF-8"
+    )]
     #[test]
     fn ancestry_goes_through_command_names_that_are_not_utf8() {
         use std::os::unix::ffi::OsStrExt;

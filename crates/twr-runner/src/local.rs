@@ -11237,7 +11237,8 @@ mod tests {
         }
         let external = format!("echo external >> '{}'; true", marker.display());
         run(&repo, &["config", "diff.external", &external]);
-        assert!(g.git(&repo, ["diff"]).await.unwrap().ok);
+        let diff = g.git(&repo, ["diff"]).await.unwrap();
+        assert!(diff.ok, "{diff:?}");
         assert!(
             !marker.exists(),
             "{}",

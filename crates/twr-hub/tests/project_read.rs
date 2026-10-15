@@ -1147,6 +1147,10 @@ fn byte_named_repo(repo: &Path, files: &[(&[u8], String)]) {
     git(repo, &["commit", "-qm", "bytes"]);
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8"
+)]
 #[tokio::test]
 async fn names_that_are_not_utf8_never_hide_a_secret() {
     let mut th = start(|c, home| {
@@ -1215,6 +1219,10 @@ async fn names_that_are_not_utf8_never_hide_a_secret() {
 /// Lines of files whose names are not UTF-8 are never shown: when they fill most of the lines
 /// git returns, `more` still says only whether a line twr would show matched, never whether a
 /// file a read refuses (found past those lines, unchecked) did.
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8"
+)]
 #[tokio::test]
 async fn unshown_lines_never_leave_more_to_an_unchecked_file() {
     let repo = |dir: &Path, last: String| {
@@ -1439,6 +1447,10 @@ async fn alternates_added_while_a_read_runs_fail_it() {
     th.stop().await;
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS refuses file names that are not UTF-8"
+)]
 #[tokio::test]
 async fn a_binary_file_whose_name_is_not_utf8_refuses_a_search() {
     let mut th = start(|c, home| {
