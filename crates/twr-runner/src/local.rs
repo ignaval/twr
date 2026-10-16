@@ -266,14 +266,6 @@ fn subcommand(args: &[OsString]) -> Option<&str> {
     None
 }
 
-/// Overrides, `(key, value)`, that keep the drivers config `names` (`git config --list
-/// --name-only -z`) defines from running anything: a filter's `clean`, `smudge` and `process`
-/// empty (git then applies no filter) and not `required`; a merge driver [`FAILS`] (the merge
-/// of such a file is a conflict, never a program the repository picked); a diff driver's
-/// `textconv` [`FAILS`] and `command` [`SUCCEEDS`], and so `diff.external` (no driver name:
-/// the program a diff runs for every file), which git runs even when empty (it fails then). Where
-/// a name makes Git LFS run a program ([`lfs_runs`]), Git LFS's filter (`filter.lfs`, yours)
-/// is turned off too: its files stay pointers.
 /// The command an override that must succeed runs, whatever git appends to it: git runs a
 /// command with a space through its shell as `<command> "$@"`, so it is `:`, the shell's own
 /// no-op, which every shell has and which takes any arguments (`exit 0` doesn't: bash, which
@@ -285,6 +277,16 @@ const SUCCEEDS: &str = ": off";
 /// The command an override that must fail runs ([`SUCCEEDS`], negated).
 const FAILS: &str = "! : off";
 
+/// Overrides, `(key, value)`, that keep the drivers config `names` (`git config --list
+/// --name-only -z`) defines from running anything: a filter's `clean`, `smudge` and `process`
+/// empty (git then applies no filter) and not `required`; a merge driver [`FAILS`] (the merge
+/// of such a file is a conflict, never a program the repository picked); a diff driver's
+/// `textconv` [`FAILS`], never read from its cache (`cachetextconv`: notes the repository could
+/// plant, keyed by the textconv string), and `command` [`SUCCEEDS`], and so `diff.external` (no
+/// driver name: the program a diff runs for every file), which git runs even when empty (it
+/// fails then). Where
+/// a name makes Git LFS run a program ([`lfs_runs`]), Git LFS's filter (`filter.lfs`, yours)
+/// is turned off too: its files stay pointers.
 fn neutralize(names: &[u8]) -> anyhow::Result<Vec<(OsString, OsString)>> {
     use std::os::unix::ffi::OsStrExt;
     let mut out: std::collections::BTreeSet<(Vec<u8>, &'static str)> = Default::default();
@@ -344,7 +346,11 @@ fn neutralize(names: &[u8]) -> anyhow::Result<Vec<(OsString, OsString)>> {
             (b"hook", b"command" | b"event" | b"enabled") => {
                 &[(b"enabled", "false"), (b"command", SUCCEEDS)]
             }
-            (b"diff", b"textconv" | b"command") => &[(b"textconv", FAILS), (b"command", SUCCEEDS)],
+            (b"diff", b"textconv" | b"cachetextconv" | b"command") => &[
+                (b"textconv", FAILS),
+                (b"cachetextconv", "false"),
+                (b"command", SUCCEEDS),
+            ],
             _ => continue,
         };
         for (k, v) in set {
@@ -5927,6 +5933,7 @@ mod tests {
             ("filter.a.b.clean", ""),
             ("merge.m.driver", FAILS),
             ("diff.d.textconv", FAILS),
+            ("diff.d.cachetextconv", "false"),
             ("diff.d.command", SUCCEEDS),
             ("diff.external", SUCCEEDS),
         ] {
@@ -11222,7 +11229,6 @@ mod tests {
         );
     }
 
-    /// A diff, or a commit shown or logged with its patch, runs neither the program
     /// The commands overrides run do what they must as git runs them, `<command> "$@"` with
     /// arguments, in every shell this machine has: bash refuses `exit 0` with arguments.
     #[test]
@@ -11245,7 +11251,17 @@ mod tests {
                 );
                 let status = std::process::Command::new(sh)
                     .args(["-c", &format!("{command} \"$@\""), command])
-                    .args(["/tmp/a b", "abc123", "100644"])
+                    .args([
+                        "/tmp/a b",
+                        "--",
+                        "-",
+                        "",
+                        "-n",
+                        "*",
+                        "[",
+                        "$(touch /tmp/no)",
+                        "100644",
+                    ])
                     .status()
                     .unwrap();
                 assert_eq!(status.success(), ok, "{sh} -c '{command} \"$@\"'");
@@ -11253,6 +11269,7 @@ mod tests {
         }
     }
 
+    /// A diff, or a commit shown or logged with its patch, runs neither the program
     /// `diff.external` names nor a diff driver's `textconv`, should twr ever run one.
     #[tokio::test]
     async fn diffs_run_no_program_the_repository_names() {
