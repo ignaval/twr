@@ -4,6 +4,7 @@
 //! - [`hub`]: the single-writer core, turn dispatch, supervisors, subscriptions
 //! - [`host`]: where runtimes run ([`host::ThreadHost`])
 //! - [`remote`]: remote boxes (a runner's box as a [`host::ThreadHost`])
+//! - [`ssh_box`]: the hub's ssh supervisor of each SSH box
 //! - [`listener`]: the runner WebSocket listener (`hub.listen`, optional TLS)
 //! - [`report`]: report summaries (the hub fallback report, trimming written reports)
 //! - [`server`]: the Unix socket NDJSON API
@@ -16,6 +17,7 @@ pub mod listener;
 pub mod remote;
 pub mod report;
 pub mod server;
+pub mod ssh_box;
 pub mod store;
 
 use std::path::PathBuf;

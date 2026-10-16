@@ -1228,6 +1228,10 @@ impl Transcript {
                         "the runtime stopped for a trim of its build output; the next prompt \
                          resumes the session"
                     }
+                    Some(twr_core::event::BOX_UPGRADE_REASON) => {
+                        "restarting on the box's new twr build; the next prompt resumes the \
+                         session"
+                    }
                     _ => "thread stopped",
                 };
                 self.notice(NoticeLevel::Info, text.into());
@@ -10835,6 +10839,10 @@ pub(crate) mod tests {
             (
                 Some(twr_core::event::TRIM_RESTART_REASON),
                 "the runtime stopped for a trim of its build output; the next prompt resumes the session",
+            ),
+            (
+                Some(twr_core::event::BOX_UPGRADE_REASON),
+                "restarting on the box's new twr build; the next prompt resumes the session",
             ),
             (Some("hub_shutdown"), "thread stopped"),
             (None, "thread stopped"),

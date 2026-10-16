@@ -1,5 +1,9 @@
 //! The runner process: connects outbound to the hub over WebSocket (`ws://` or `wss://` via
-//! rustls with the webpki root certificates) and serves the hub from a [`LocalBox`].
+//! rustls with the webpki root certificates) and serves the hub from a [`LocalBox`]. Or, as an
+//! SSH box's daemon ([`RunnerOptions::daemon`], `twr runner --daemon`), takes its connections
+//! from the hub on a Unix socket instead of dialing ([`crate::daemon`]): the same session runs
+//! over either transport (the code below is generic over the WebSocket's byte stream), and
+//! only how a connection is made and how the hub is authenticated differ.
 //!
 //! Connection loop: connect; authenticate ([`twr_core::runner`]: `hello` with a fresh nonce,
 //! check the hub's proof in its `challenge` before sending anything else, send this runner's
@@ -31,6 +35,12 @@
 //! token (a wrong URL, a different token, or another process listening on the port, such as
 //! another user's on a loopback port an SSH tunnel did not get) gets nothing but the hello,
 //! and the runner tries again later.
+//!
+//! A daemon has no token: its connections are sealed channels the hub's key opened
+//! ([`twr_core::sealed`]), so the hub is proven before the WebSocket starts, and the
+//! handshake inside skips the proofs (sealed connections, [`twr_core::runner`]: the runner
+//! does not check the challenge's proof and answers
+//! [`twr_core::runner::SEALED_AUTH_PROOF`]). A daemon never backs off: it accepts.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -39,12 +49,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, watch};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use twr_core::runner::{
     auth_proof, check_auth_proof, hub_errors, new_nonce, valid_nonce, Hello, HubMsg, Inventory,
-    Prover, RunnerMsg, Secret, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    Prover, RunnerMsg, Secret, MAX_FRAME_BYTES, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
 use crate::lbox::{LocalBox, LocalBoxOptions};
@@ -166,12 +178,32 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
 /// Spooled frames sent per batch between checks for other work.
 const BATCH: usize = 128;
 
+/// What makes a runner an SSH box's daemon (`twr runner --daemon`): where it takes the hub's
+/// connections and whose key opens them. Every path comes from the relay that started it
+/// ([`crate::relay::DaemonPaths`]), as an argument: a daemon started by `systemd-run` has
+/// another environment, so it derives no path from its own.
+#[derive(Debug, Clone)]
+pub struct DaemonOptions {
+    /// The Unix socket it listens on (its directory private, [`crate::daemon`]).
+    pub socket: PathBuf,
+    /// The hub's public key ([`twr_core::sealed::HubKey::public`]): only a connection this
+    /// key opened ([`twr_core::sealed::daemon_side`]) reaches the runner protocol.
+    pub hub_key: [u8; 32],
+    /// The box's machine lock ([`LocalBoxOptions::machine_lock`]): one daemon per hub key and
+    /// box on the machine.
+    pub lock: PathBuf,
+    /// The build the daemon says it runs (its status line, the channel's hello, the
+    /// inventory): its own, [`twr_core::build_id`]. Tests make a daemon "of another build".
+    pub build: Option<String>,
+}
+
 /// Everything `twr runner` needs.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
-    /// `ws://host:port[/path]` or `wss://...`.
+    /// `ws://host:port[/path]` or `wss://...`. A daemon's ([`RunnerOptions::for_daemon`]) is
+    /// `ssh://<hub id>`, which only names the hub in its logs.
     pub hub_url: String,
-    /// The box's token (`[boxes.<name>] token` on the hub).
+    /// The box's token (`[boxes.<name>] token` on the hub). Empty for a daemon.
     pub token: Secret,
     /// Box name.
     pub box_name: String,
@@ -204,6 +236,9 @@ pub struct RunnerOptions {
     /// every event cross the network in clear text. Off: such a URL is refused
     /// ([`RunnerOptions::validate`]).
     pub allow_insecure: bool,
+    /// Run as an SSH box's daemon: accept the hub's sealed connections on a Unix socket
+    /// instead of dialing `hub_url` with the token.
+    pub daemon: Option<DaemonOptions>,
 }
 
 impl RunnerOptions {
@@ -230,14 +265,32 @@ impl RunnerOptions {
             shutdown_grace: Duration::from_secs(10),
             ca_file: None,
             allow_insecure: false,
+            daemon: None,
         }
     }
 
+    /// The options of an SSH box's daemon (`twr runner --daemon`) with the defaults: no token,
+    /// `hub_url` `ssh://<hub id>` ([`twr_core::sealed::hub_id`]), for its logs only.
+    pub fn for_daemon(
+        box_name: impl Into<String>,
+        data_dir: impl Into<PathBuf>,
+        daemon: DaemonOptions,
+    ) -> Self {
+        let url = format!("ssh://{}", twr_core::sealed::hub_id(&daemon.hub_key));
+        let mut o = RunnerOptions::new(url, Secret::default(), box_name, data_dir);
+        o.daemon = Some(daemon);
+        o
+    }
+
     /// The box options these runner options imply (built-in adapters, and the box's machine
-    /// lock, [`machine_lock_path`]).
+    /// lock: [`machine_lock_path`], or a daemon's [`DaemonOptions::lock`], which its relay
+    /// resolved).
     pub fn box_options(&self) -> LocalBoxOptions {
         let mut o = LocalBoxOptions::new(&self.data_dir, &self.box_name);
-        o.machine_lock = machine_lock_path(&self.hub_url, &self.box_name);
+        o.machine_lock = match &self.daemon {
+            Some(d) => Some(d.lock.clone()),
+            None => machine_lock_path(&self.hub_url, &self.box_name),
+        };
         o.spool_max_bytes = self.spool_max_bytes;
         if let Some(w) = &self.worktrees_dir {
             o.worktrees = w.clone();
@@ -248,9 +301,13 @@ impl RunnerOptions {
     /// Checks the options: the box name, a token of at least
     /// [`twr_core::runner::TOKEN_MIN_LEN`] characters, and a `wss://` hub URL or a `ws://` one
     /// to a loopback host ([`is_loopback_host`]; any host with
-    /// [`RunnerOptions::allow_insecure`]).
+    /// [`RunnerOptions::allow_insecure`]). A daemon has neither token nor URL: only its box
+    /// name is checked.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_box_name(&self.box_name)?;
+        if self.daemon.is_some() {
+            return Ok(());
+        }
         if self.token.is_empty() {
             bail!("the runner token is empty");
         }
@@ -290,7 +347,7 @@ pub fn machine_lock_path(hub_url: &str, box_name: &str) -> Option<PathBuf> {
 }
 
 /// [`machine_lock_path`] with the environment read through `env`.
-fn machine_lock_path_in(
+pub(crate) fn machine_lock_path_in(
     hub_url: &str,
     box_name: &str,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -344,23 +401,9 @@ pub fn is_loopback_host(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Box names become file names (`runner-<box>.db`): `[A-Za-z0-9._-]`, not starting with `.`,
-/// at most 64 bytes.
-pub fn validate_box_name(name: &str) -> anyhow::Result<()> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "invalid box name {name:?}: use letters, digits, '.', '_' or '-' (not starting with '.')"
-        ))
-    }
-}
+/// Box names become file names (`runner-<box>.db`): [`twr_core::runner::validate_box_name`],
+/// which the hub's config checks share.
+pub use twr_core::runner::validate_box_name;
 
 /// The TLS configuration for a hub whose certificate chains to the CA(s) in `ca_file` (and
 /// nothing else).
@@ -419,7 +462,9 @@ pub async fn shutdown_signal() {
     tracing::info!("shutting down");
 }
 
-/// Runs the runner on `lbox` until `shutdown` resolves, then shuts down gracefully.
+/// Runs the runner on `lbox` until `shutdown` resolves, then shuts down gracefully. A daemon
+/// binds its socket first (an error if it cannot: [`crate::daemon`]), and also shuts down so
+/// when a `stop` request comes on it.
 pub async fn run_with(
     opts: RunnerOptions,
     lbox: LocalBox,
@@ -428,12 +473,24 @@ pub async fn run_with(
     opts.validate()?;
     // wss: rustls with ring (no system OpenSSL). Fails only when already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let socket = match &opts.daemon {
+        Some(d) => Some(crate::daemon::DaemonSocket::bind(&d.socket).await?),
+        None => None,
+    };
     let (stop_tx, stop_rx) = watch::channel(false);
-    let conn = connect_loop(&opts, &lbox, stop_rx);
+    // A daemon's `stop` request (it stores its wakeup: none is lost).
+    let asked = Notify::new();
+    let conn = connect_loop(&opts, &lbox, socket, stop_rx, &asked);
     tokio::pin!(conn);
+    let requested = async {
+        tokio::select! {
+            _ = shutdown => {}
+            () = asked.notified() => tracing::info!("asked to stop: shutting down"),
+        }
+    };
     let mut shutdown_at = None;
     tokio::select! {
-        _ = shutdown => {
+        () = requested => {
             shutdown_at = Some(Instant::now());
             let _ = stop_tx.send(true);
             conn.as_mut().await;
@@ -445,14 +502,19 @@ pub async fn run_with(
         opts.shutdown_grace.saturating_sub(t.elapsed())
     });
     lbox.shutdown(left.max(Duration::from_millis(100))).await;
-    // A repository change still running (its connection is gone) runs on to its end first,
-    // at most for as long as a git change may run before it is killed.
-    if !lbox.git_changes_done(Duration::ZERO).await {
+    // A repository change still running (its connection is gone; the connection's reader has
+    // ended, so none begins any more) runs on to its end first, received but not started yet
+    // included, at most for as long as a git change may run before it is killed.
+    if lbox.changes_running() > 0 || !lbox.git_changes_done(Duration::ZERO).await {
         tracing::info!("waiting for the repository changes in progress before stopping");
-        if !lbox
-            .git_changes_done(twr_core::git::GIT_CHANGE_TIMEOUT)
-            .await
-        {
+        let limit = twr_core::git::GIT_CHANGE_TIMEOUT;
+        let done = tokio::time::timeout(limit, async {
+            lbox.changes_done().await;
+            lbox.git_changes_done(limit).await
+        })
+        .await
+        .unwrap_or(false);
+        if !done {
             tracing::warn!("stopping with a repository change still running; what it was changing is left part way");
         }
     }
@@ -546,7 +608,7 @@ impl Backoff {
 }
 
 /// Resolves once `stop` is set (never, if its sender is gone without setting it).
-async fn stopped(stop: &mut watch::Receiver<bool>) {
+pub(crate) async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
         if *stop.borrow_and_update() {
             return;
@@ -557,7 +619,37 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Receiver<bool>) {
+/// The WebSocket limits of a connection to the hub, either transport. What this side buffers
+/// to send is bounded too: a peer that pings without reading (one that is not the hub, before
+/// the handshake failed) cannot grow it.
+pub(crate) fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+        .max_write_buffer_size(MAX_FRAME_BYTES + (1 << 20))
+}
+
+/// Serves the hub until `stop` is set or the box fails: a daemon's connections come from its
+/// `socket` ([`crate::daemon::accept_loop`], which tells `asked` of a `stop` request), a
+/// runner's from dialing the hub ([`dial_loop`]).
+async fn connect_loop(
+    opts: &RunnerOptions,
+    lbox: &LocalBox,
+    socket: Option<crate::daemon::DaemonSocket>,
+    stop: watch::Receiver<bool>,
+    asked: &Notify,
+) {
+    match (socket, &opts.daemon) {
+        (Some(socket), Some(daemon)) => {
+            crate::daemon::accept_loop(opts, daemon, socket, lbox, stop, asked).await
+        }
+        _ => dial_loop(opts, lbox, stop).await,
+    }
+}
+
+/// The runner's connection loop: dials the hub, serves it, and dials again with backoff (see
+/// the module docs).
+async fn dial_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Receiver<bool>) {
     let mut backoff = Backoff::new(opts.backoff_min, opts.backoff_max);
     let connector = match opts.ca_file.as_deref().map(tls_connector).transpose() {
         Ok(c) => c,
@@ -566,7 +658,7 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
             return;
         }
     };
-    let mut epoch_hint = None;
+    let epoch_hint = std::sync::Mutex::new(None);
     let mut fatal = lbox.fatal_watch();
     loop {
         if *stop.borrow() || lbox.fatal_error().is_some() {
@@ -584,18 +676,12 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
                 () = stopped(&mut stop) => return,
             }
         }
-        // What this side buffers to send is bounded too: a peer that pings without reading
-        // (one that is not the hub, before the handshake failed) cannot grow it.
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_FRAME_BYTES))
-            .max_frame_size(Some(MAX_FRAME_BYTES))
-            .max_write_buffer_size(MAX_FRAME_BYTES + (1 << 20));
         let attempt = tokio::select! {
             r = tokio::time::timeout(
                 opts.welcome_timeout,
                 tokio_tungstenite::connect_async_tls_with_config(
                     opts.hub_url.as_str(),
-                    Some(config),
+                    Some(ws_config()),
                     true,
                     connector.clone(),
                 ),
@@ -605,7 +691,15 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
         let mut refused = false;
         match attempt {
             Ok(Ok((ws, _resp))) => {
-                let out = serve(ws, lbox, opts, &mut epoch_hint, stop.clone()).await;
+                let out = serve(
+                    ws,
+                    lbox,
+                    opts,
+                    &epoch_hint,
+                    stop.clone(),
+                    std::future::pending(),
+                )
+                .await;
                 if out.welcomed {
                     backoff.reset();
                 }
@@ -640,21 +734,55 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
     }
 }
 
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+/// What a connection's WebSocket runs over: TCP (and TLS) when the runner dials, a sealed
+/// stream over the daemon's socket ([`twr_core::sealed::SealedStream`]).
+pub(crate) trait HubStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
-struct Served {
-    welcomed: bool,
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HubStream for S {}
+
+/// The outcome of one connection ([`serve`]).
+pub(crate) struct Served {
+    /// The hub welcomed it.
+    pub(crate) welcomed: bool,
     /// `Ok(true)`: shut down; `Ok(false)`: the hub closed the connection.
-    result: anyhow::Result<bool>,
+    pub(crate) result: anyhow::Result<bool>,
 }
 
-/// Aborts the reader task when the connection ends.
-struct AbortOnDrop(tokio::task::JoinHandle<anyhow::Result<()>>);
+/// A connection's reader task ([`read_loop`]). [`serve`] joins it before it returns
+/// ([`Reader::join`]): aborting a task only asks it to stop at its next await, and a reader in
+/// the middle of taking a command (on another worker thread) would otherwise count or start
+/// it after the connection is over, where the next connection's wait for repository changes
+/// in progress cannot see it.
+struct Reader {
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Its outcome was taken ([`Reader::outcome`]): the task is over.
+    done: bool,
+}
 
-impl Drop for AbortOnDrop {
+impl Reader {
+    /// Waits for the reader to end by itself: the connection's outcome. Cancel safe.
+    async fn outcome(&mut self) -> anyhow::Result<bool> {
+        let r = (&mut self.task).await;
+        self.done = true;
+        reader_result(r)
+    }
+
+    /// Stops the reader and waits until it no longer runs.
+    async fn join(mut self) {
+        if !self.done {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for Reader {
+    /// A connection dropped part way (the runner going away) at least asks its reader to stop.
     fn drop(&mut self) {
-        self.0.abort();
+        if !self.done {
+            self.task.abort();
+        }
     }
 }
 
@@ -662,39 +790,56 @@ fn text(msg: &RunnerMsg) -> anyhow::Result<Message> {
     Ok(Message::Text(serde_json::to_string(msg)?.into()))
 }
 
-async fn serve(
-    ws: Ws,
+/// Serves one connection to the hub: the handshake, the replay of the spool, then live
+/// frames and commands, until it ends, `stop` has drained it, the box failed, or `replaced`
+/// completes (a daemon's newer connection replaces this one: an error). Whichever way it
+/// ends, its reader task has ended when this returns ([`Reader::join`]), so no command of
+/// this connection begins afterwards. `epoch_hint` is the epoch of the last welcome, which
+/// the inventory reports (shared, not borrowed mutably: a daemon ends a session it replaces
+/// part way).
+pub(crate) async fn serve<S: HubStream>(
+    ws: WebSocketStream<S>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
-    epoch_hint: &mut Option<u64>,
+    epoch_hint: &std::sync::Mutex<Option<u64>>,
     stop: watch::Receiver<bool>,
+    replaced: impl std::future::Future<Output = ()> + Send,
 ) -> Served {
     let mut welcomed = false;
-    let result = serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed).await;
+    let mut reader = None;
+    let result = tokio::select! {
+        r = serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed, &mut reader) => r,
+        () = replaced => Err(anyhow!("a newer connection from the hub replaced this one")),
+    };
+    if let Some(r) = reader {
+        r.join().await;
+    }
     Served { welcomed, result }
 }
 
-async fn serve_inner(
-    ws: Ws,
+async fn serve_inner<S: HubStream>(
+    ws: WebSocketStream<S>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
-    epoch_hint: &mut Option<u64>,
+    epoch_hint: &std::sync::Mutex<Option<u64>>,
     mut stop: watch::Receiver<bool>,
     welcomed: &mut bool,
+    reader_slot: &mut Option<Reader>,
 ) -> anyhow::Result<bool> {
     let (mut sink, mut stream) = ws.split();
     let spool = lbox.spool().clone();
     let io_timeout = opts.idle_timeout;
 
+    let hint = *epoch_hint.lock().unwrap_or_else(|e| e.into_inner());
     let (epoch, watermarks) = tokio::time::timeout(
         opts.welcome_timeout,
-        handshake(&mut sink, &mut stream, lbox, opts, *epoch_hint),
+        handshake(&mut sink, &mut stream, lbox, opts, hint),
     )
     .await
     .map_err(|_| anyhow!("no welcome from the hub within {:?}", opts.welcome_timeout))??;
     spool.apply_watermarks(&watermarks)?;
     *welcomed = true;
-    *epoch_hint = Some(epoch);
+    *epoch_hint.lock().unwrap_or_else(|e| e.into_inner()) = Some(epoch);
     tracing::info!(
         epoch,
         box_name = %opts.box_name,
@@ -704,12 +849,15 @@ async fn serve_inner(
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RunnerMsg>();
     let last_rx = Arc::new(Mutex::new(Instant::now()));
-    let mut reader = AbortOnDrop(tokio::spawn(read_loop(
-        stream,
-        lbox.clone(),
-        out_tx.clone(),
-        last_rx.clone(),
-    )));
+    let reader = reader_slot.insert(Reader {
+        task: tokio::spawn(read_loop(
+            stream,
+            lbox.clone(),
+            out_tx.clone(),
+            last_rx.clone(),
+        )),
+        done: false,
+    });
 
     let mut cursor = 0i64;
     let mut synced = false;
@@ -748,8 +896,8 @@ async fn serve_inner(
             while let Ok(m) = out_rx.try_recv() {
                 send!(text(&m)?);
             }
-            if reader.0.is_finished() {
-                return reader_end(&mut reader).await;
+            if reader.task.is_finished() {
+                return reader.outcome().await;
             }
             continue;
         }
@@ -781,7 +929,7 @@ async fn serve_inner(
                     draining = Some(tokio::time::Instant::now() + opts.shutdown_grace);
                 }
             }
-            r = &mut reader.0 => return reader_result(r),
+            r = reader.outcome() => return r,
             _ = tick.tick() => {
                 let silent = last_rx.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
                 if silent > opts.idle_timeout {
@@ -796,7 +944,9 @@ async fn serve_inner(
 }
 
 /// The next text message from the hub before the welcome (other frames skipped).
-async fn next_hub_msg(stream: &mut futures::stream::SplitStream<Ws>) -> anyhow::Result<HubMsg> {
+async fn next_hub_msg<S: HubStream>(
+    stream: &mut futures::stream::SplitStream<WebSocketStream<S>>,
+) -> anyhow::Result<HubMsg> {
     loop {
         let msg = match stream.next().await {
             Some(m) => m.context("reading from the hub")?,
@@ -815,7 +965,13 @@ async fn next_hub_msg(stream: &mut futures::stream::SplitStream<Ws>) -> anyhow::
 /// The error for a refusal `code` / `message` from the hub during the handshake (logged too
 /// when it is about the box or token, the one thing the user has to fix here).
 fn refused(opts: &RunnerOptions, code: &str, message: &str) -> anyhow::Error {
-    if code == hub_errors::UNAUTHORIZED {
+    if code == hub_errors::UNAUTHORIZED && opts.daemon.is_some() {
+        tracing::error!(
+            box_name = %opts.box_name,
+            "the hub rejected this box daemon's box name: is the box an SSH box of that hub \
+             (`transport = \"ssh\"`)?"
+        );
+    } else if code == hub_errors::UNAUTHORIZED {
         tracing::error!(
             box_name = %opts.box_name,
             "the hub rejected this runner's box name or token (a hub older than this runner \
@@ -835,10 +991,12 @@ fn refused(opts: &RunnerOptions, code: &str, message: &str) -> anyhow::Error {
 }
 
 /// The handshake (see the module docs) up to the welcome: `(epoch, watermarks)`. Nothing but
-/// the hello goes out before the hub has proved that it knows the box's token.
-async fn handshake(
-    sink: &mut futures::stream::SplitSink<Ws, Message>,
-    stream: &mut futures::stream::SplitStream<Ws>,
+/// the hello goes out before the hub has proved that it knows the box's token. On a daemon's
+/// sealed connection the channel already proved the hub: the challenge's proof is not
+/// checked, and the runner's is [`SEALED_AUTH_PROOF`].
+async fn handshake<S: HubStream>(
+    sink: &mut futures::stream::SplitSink<WebSocketStream<S>, Message>,
+    stream: &mut futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
     epoch_hint: Option<u64>,
@@ -858,16 +1016,18 @@ async fn handshake(
             hub_msg_type(&other)
         ),
     };
-    let proven = valid_nonce(&hub_nonce)
-        && hub_nonce != nonce
-        && check_auth_proof(
-            &opts.token,
-            Prover::Hub,
-            &opts.box_name,
-            &nonce,
-            &hub_nonce,
-            &proof,
-        );
+    let sealed = opts.daemon.is_some();
+    let proven = sealed
+        || (valid_nonce(&hub_nonce)
+            && hub_nonce != nonce
+            && check_auth_proof(
+                &opts.token,
+                Prover::Hub,
+                &opts.box_name,
+                &nonce,
+                &hub_nonce,
+                &proof,
+            ));
     if !proven {
         tracing::error!(
             box_name = %opts.box_name,
@@ -882,13 +1042,17 @@ async fn handshake(
             "the hub did not prove that it knows the box's token".into(),
         )));
     }
-    let mine = auth_proof(
-        &opts.token,
-        Prover::Runner,
-        &opts.box_name,
-        &nonce,
-        &hub_nonce,
-    );
+    let mine = if sealed {
+        SEALED_AUTH_PROOF.to_string()
+    } else {
+        auth_proof(
+            &opts.token,
+            Prover::Runner,
+            &opts.box_name,
+            &nonce,
+            &hub_nonce,
+        )
+    };
     sink.send(text(&RunnerMsg::Auth { proof: mine })?)
         .await
         .context("sending the proof")?;
@@ -908,6 +1072,10 @@ async fn handshake(
         acks_needed: lbox.spool().pending()?,
         runtimes: lbox.runtimes().to_vec(),
         worktrees: lbox.worktrees().to_path_buf(),
+        build: match &opts.daemon {
+            Some(d) => d.build.clone(),
+            None => twr_core::build_id().map(str::to_string),
+        },
     });
     sink.send(text(&inventory)?)
         .await
@@ -930,11 +1098,6 @@ fn hub_msg_type(m: &HubMsg) -> String {
         .unwrap_or_else(|| "a message".to_string())
 }
 
-/// The outcome of a connection whose reader has finished.
-async fn reader_end(reader: &mut AbortOnDrop) -> anyhow::Result<bool> {
-    reader_result((&mut reader.0).await)
-}
-
 fn reader_result(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<bool> {
     match r {
         Ok(Ok(())) => Ok(false),
@@ -945,8 +1108,8 @@ fn reader_result(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyho
 
 /// Reads hub messages: applies acks, answers pings and runs commands (session commands in
 /// arrival order, the others concurrently).
-async fn read_loop(
-    mut stream: futures::stream::SplitStream<Ws>,
+async fn read_loop<S: HubStream>(
+    mut stream: futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: LocalBox,
     out: mpsc::UnboundedSender<RunnerMsg>,
     last_rx: Arc<Mutex<Instant>>,
@@ -978,7 +1141,11 @@ async fn read_loop(
                     let r = lbox.handle_cmd(&cmd_id, op).await;
                     let _ = out.send(RunnerMsg::CmdResult(r));
                 } else {
-                    // Counted from its arrival: the next hello waits for it.
+                    // Counted from its arrival: the next hello waits for it (the next
+                    // connection's, once this reader has ended: `Reader::join`).
+                    if op.changes_repository() {
+                        lbox.change_received();
+                    }
                     let change = op.changes_repository().then(|| lbox.begin_change());
                     let lbox = lbox.clone();
                     let out = out.clone();

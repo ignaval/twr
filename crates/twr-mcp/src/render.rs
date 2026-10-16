@@ -9,7 +9,9 @@
 //! `… [cut; read_transcript seq=<seq> shows it in full]`.
 
 use serde_json::Value;
-use twr_core::event::{MODEL_RESTART_REASON, MODE_RESTART_REASON, RUNTIME_RESTART_REASON};
+use twr_core::event::{
+    BOX_UPGRADE_REASON, MODEL_RESTART_REASON, MODE_RESTART_REASON, RUNTIME_RESTART_REASON,
+};
 
 /// Output cap for one tool result, in bytes.
 pub const OUTPUT_CAP: usize = 20 * 1024;
@@ -420,6 +422,10 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
         "thread.stopped" if restart_reason(&d) == Some(RUNTIME_RESTART_REASON) => {
             "previous runtime stopped for the move to another runtime; the new one starts with \
              the next turn"
+                .to_string()
+        }
+        "thread.stopped" if restart_reason(&d) == Some(BOX_UPGRADE_REASON) => {
+            "runtime restarting on the box's new twr build; the next prompt resumes its session"
                 .to_string()
         }
         "thread.model_changed" => model_changed(&d),
@@ -1170,7 +1176,7 @@ mod tests {
         assert_eq!(s, "@7 [t1] model kept at sonnet, effort at low by user\n");
     }
 
-    /// Both settings-restart reasons read as a restart on the session, not a stop.
+    /// The settings-restart reasons read as a restart on the session, not a stop.
     #[test]
     fn settings_restarts_render_as_restarts() {
         let stop = |reason: Option<&str>| {
@@ -1187,6 +1193,11 @@ mod tests {
         assert_eq!(
             stop(Some(twr_core::event::MODEL_RESTART_REASON)),
             "@7 [t1] runtime restarting on its session with the new model / effort\n"
+        );
+        assert_eq!(
+            stop(Some(twr_core::event::BOX_UPGRADE_REASON)),
+            "@7 [t1] runtime restarting on the box's new twr build; the next prompt resumes its \
+             session\n"
         );
         assert_eq!(stop(None), "@7 [t1] thread.stopped\n");
         assert_eq!(stop(Some("user")), "@7 [t1] thread.stopped\n");
@@ -1517,6 +1528,7 @@ mod tests {
         assert!(stop(RUNTIME_RESTART_REASON).contains("move to another runtime"));
         assert!(stop(MODEL_RESTART_REASON).contains("new model / effort"));
         assert!(stop(MODE_RESTART_REASON).contains("new permission mode"));
+        assert!(stop(BOX_UPGRADE_REASON).contains("box's new twr build"));
         assert_eq!(
             line(&ev(
                 "thread.deleted",

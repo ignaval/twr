@@ -10,6 +10,8 @@
 //! whether it is set. Every struct is destructured without `..`, so a field added to the
 //! configuration fails to compile here until someone decides whether it may be shown.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 use twr_core::config::{
     BoxConfig, BoxProjectConfig, Config, HubConfig, NotifyConfig, OrchestratorConfig,
@@ -26,13 +28,14 @@ fn runtime_shown(runtime: &str) -> String {
     }
 }
 
-/// What `config.show` returns for `config`.
-pub fn config_view(config: &Config) -> Value {
+/// What `config.show` returns for `config`, its boxes those of `boxes` (the hub's, which
+/// includes those added since it started; `None`: `config`'s own).
+pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>) -> Value {
     let Config {
         default_runtime,
         orchestrator,
         hub,
-        boxes,
+        boxes: configured,
         projects,
         threads,
         trash,
@@ -124,13 +127,17 @@ pub fn config_view(config: &Config) -> Value {
         })
         .collect();
     let boxes: Map<String, Value> = boxes
+        .unwrap_or(configured)
         .iter()
         .map(|(name, b)| {
             let BoxConfig {
                 token,
                 ssh: _,
+                transport,
+                build: _,
                 projects,
             } = b;
+            let transport = super::boxes::transport_name(transport.unwrap_or_default());
             let projects: Map<String, Value> = projects
                 .iter()
                 .map(|(name, p)| {
@@ -141,7 +148,11 @@ pub fn config_view(config: &Config) -> Value {
                 .collect();
             (
                 name.clone(),
-                json!({ "has_token": token.is_some(), "projects": projects }),
+                json!({
+                    "transport": transport,
+                    "has_token": token.is_some(),
+                    "projects": projects,
+                }),
             )
         })
         .collect();
@@ -258,7 +269,7 @@ runtime = "acp:remote --key s3cret-box"
 "#,
         )
         .unwrap();
-        let v = config_view(&config);
+        let v = config_view(&config, None);
         let text = v.to_string();
         assert!(!text.contains("s3cret"), "{text}");
         assert_eq!(v["default_runtime"], "acp:<command>");
@@ -278,11 +289,28 @@ runtime = "acp:remote --key s3cret-box"
         assert_eq!(v["projects"]["api"]["repo"], "/home/me/code/api");
         assert_eq!(v["runtimes"], json!(["gem"]));
         assert_eq!(v["boxes"]["gpu"]["has_token"], true);
+        assert_eq!(v["boxes"]["gpu"]["transport"], "token");
+        // The hub's own list of boxes, when given: an SSH box shows its transport, never its
+        // destination.
+        let ssh: BTreeMap<String, BoxConfig> = BTreeMap::from([(
+            "far".to_string(),
+            BoxConfig {
+                transport: Some(twr_core::config::BoxTransport::Ssh),
+                ssh: Some("-i /home/me/.ssh/s3cret_id me@far".into()),
+                build: Some("0123456789abcdef".into()),
+                ..Default::default()
+            },
+        )]);
+        let w = config_view(&config, Some(&ssh));
+        assert!(!w.to_string().contains("s3cret"), "{w}");
+        assert_eq!(w["boxes"]["far"]["transport"], "ssh");
+        assert_eq!(w["boxes"]["far"]["has_token"], false);
+        assert!(w["boxes"].get("gpu").is_none(), "{w}");
         assert_eq!(v["boxes"]["gpu"]["projects"]["api"]["repo"], "/srv/api");
         assert_eq!(v["hub"]["tls"], true);
         assert_eq!(v["notify"]["command_set"], true);
         assert_eq!(v["project_roots_default"], false);
-        let defaults = config_view(&Config::default());
+        let defaults = config_view(&Config::default(), None);
         assert_eq!(defaults["project_roots_default"], true);
         assert_eq!(defaults["project_roots"], json!(DEFAULT_PROJECT_ROOTS));
         // What idle trims delete: the threads' list, and a project's own.

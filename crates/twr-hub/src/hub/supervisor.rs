@@ -467,8 +467,8 @@ pub(super) async fn supervise(
                     body,
                     EventBody::ThreadStarted(_) | EventBody::ThreadResumed(_)
                 ) {
-                    let host = (hub.core().registry.get(&thread))
-                        .and_then(|v| hub.hosts.get(&v.box_name).cloned());
+                    let host =
+                        (hub.core().registry.get(&thread)).and_then(|v| hub.host(&v.box_name));
                     crate::host::stamp_start_time(host, &thread, &mut body).await;
                 }
                 let ev = (body, raw, turn);
@@ -727,7 +727,7 @@ pub(super) async fn reap_runtime(hub: &Arc<Inner>, thread: &str, generation: u64
             .registry
             .get(thread)
             .map_or_else(|| LOCAL_BOX.to_string(), |v| v.box_name.clone());
-        let Some(host) = hub.hosts.get(&box_name).filter(|h| !h.is_remote()) else {
+        let Some(host) = hub.host(&box_name).filter(|h| !h.is_remote()) else {
             return Some(true);
         };
         // Recorded for the live runtime, i.e. this generation's process (and signalled only
@@ -742,7 +742,7 @@ pub(super) async fn reap_runtime(hub: &Arc<Inner>, thread: &str, generation: u64
         });
         // Checked with the generation, under the same lock: nothing can start in between.
         rt.reaping += 1;
-        (Arc::clone(host), proc)
+        (host, proc)
     };
     let (t, min_start) = (thread.to_string(), hub.start_ticks);
     let gone = tokio::task::spawn_blocking(move || {

@@ -2,6 +2,7 @@
 
 #[macro_use]
 mod term;
+mod boxes;
 mod pretty;
 
 use std::collections::HashMap;
@@ -410,6 +411,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<WsCmd>,
     },
+    /// Add, list, inspect, install twr on and remove remote boxes. `twr box add <name>
+    /// <ssh destination>` sets up a box the hub reaches over SSH (no token, listener or
+    /// tunnel): the hub installs twr there, keeps it connected, and runs the box's threads in
+    /// a daemon on the box that outlives the connection.
+    #[command(name = "box")]
+    Boxes {
+        #[command(subcommand)]
+        cmd: boxes::BoxCmd,
+    },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
     /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner token` prints a new
     /// token for `[boxes.<name>] token`.
@@ -421,7 +431,11 @@ enum Cmd {
         /// in 127.0.0.0/8, `[::1]` or an IPv4-mapped one such as `[::ffff:127.0.0.1]`: an SSH
         /// tunnel's end). Plain `ws://` to any other host is refused unless --allow-insecure is
         /// given.
-        #[arg(long, value_name = "URL", required = true)]
+        #[arg(
+            long,
+            value_name = "URL",
+            required_unless_present_any = ["stdio", "daemon"]
+        )]
         hub: Option<String>,
         /// File holding the box's token (`[boxes.<name>] token` on the hub, at least 16
         /// characters); it must not be accessible by other users (`chmod 600`). Default:
@@ -442,6 +456,48 @@ enum Cmd {
         /// the network in clear text (the token never does). Only on a network you trust.
         #[arg(long)]
         allow_insecure: bool,
+        /// An SSH box's relay, which the hub's ssh runs: starts the box daemon of --hub-key
+        /// and --box when none runs, then relays stdin/stdout to it.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["daemon", "hub", "token_file", "ca", "allow_insecure"],
+            requires_all = ["box_name", "hub_key"]
+        )]
+        stdio: bool,
+        /// An SSH box's daemon, which the relay starts: serves the hub's sealed connections on
+        /// --daemon-socket, logging to --log.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["hub", "token_file", "ca", "allow_insecure", "replace", "stop"],
+            requires_all = ["box_name", "hub_key", "daemon_socket", "data_dir", "lock", "log"]
+        )]
+        daemon: bool,
+        /// The hub's box key (64 hex digits: its Ed25519 public key).
+        #[arg(long, hide = true, value_name = "HEX")]
+        hub_key: Option<String>,
+        /// With --stdio: replace a box daemon of another build with this one.
+        #[arg(long, hide = true, requires = "stdio")]
+        replace: bool,
+        /// With --stdio: stop the box daemon of --hub-key and --box instead of relaying to it,
+        /// and wait until it has stopped (at most 60 s). Its data and worktrees stay. Nothing
+        /// to do when none runs.
+        #[arg(long, hide = true, requires = "stdio", conflicts_with = "replace")]
+        stop: bool,
+        /// With --stdio: the build id the hub launched (this executable's, as the hub knows
+        /// it), taken as this relay's own when it cannot read its executable.
+        #[arg(long, hide = true, value_name = "ID", requires = "stdio")]
+        build: Option<String>,
+        /// With --daemon: the socket to listen on (`--socket` is the hub socket's).
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        daemon_socket: Option<PathBuf>,
+        /// With --daemon: its machine lock.
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        lock: Option<PathBuf>,
+        /// With --daemon: the file it logs to.
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        log: Option<PathBuf>,
     },
 }
 
@@ -729,6 +785,9 @@ fn main() -> ExitCode {
             cmd: Some(HubCmd::Stop { .. })
         })
     );
+    // The relay's read of stdin is a blocking task, which a runtime's graceful shutdown would
+    // wait on after the daemon's side ended: it leaves without it.
+    let relaying = matches!(cli.cmd, Some(Cmd::Runner { stdio: true, .. }));
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
     if matches!(cli.cmd, Some(Cmd::ClaudeMemoryGuard)) {
@@ -780,14 +839,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    shutdown_cli_runtime(runtime, stopping_hub);
+    shutdown_cli_runtime(runtime, stopping_hub || relaying);
     code
 }
 
 /// A timed-out process-table read is a blocking task, which Tokio cannot cancel. Short
-/// stop commands must exit without waiting on it; the foreground hub keeps graceful drop.
-fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, stopping_hub: bool) {
-    if stopping_hub {
+/// stop commands must exit without waiting on it, as must an SSH box's relay (its read of
+/// stdin); the foreground hub keeps graceful drop.
+fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, background: bool) {
+    if background {
         runtime.shutdown_background();
     }
 }
@@ -930,6 +990,61 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // An SSH box's relay and daemon need no twr home: every path comes from the box's
+    // environment (the relay) or the relay (the daemon).
+    let cli = match cli.cmd {
+        Some(Cmd::Runner {
+            cmd: None,
+            stdio: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            replace,
+            stop,
+            build,
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let mut opts = twr_runner::relay::RelayOptions::new(&box_name, hub_key, replace)?;
+            if let Some(b) = build {
+                if !twr_core::valid_build_id(&b) {
+                    bail!("--build {b:?} is not a build id");
+                }
+                opts.build = Some(b);
+            }
+            if stop {
+                twr_runner::relay::stop(&opts, &mut |line: &str| note(line)).await?;
+            } else {
+                twr_runner::relay::relay(opts).await?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            daemon: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            daemon_socket: Some(socket),
+            data_dir: Some(data_dir),
+            lock: Some(lock),
+            log: Some(log),
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let opts = twr_runner::RunnerOptions::for_daemon(
+                box_name,
+                data_dir,
+                twr_runner::DaemonOptions {
+                    socket,
+                    hub_key,
+                    lock,
+                    build: twr_core::build_id().map(str::to_string),
+                },
+            );
+            run_box_daemon(opts, &log).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        cmd => Cli { cmd, ..cli },
+    };
     // A bulk stop selects a home, not one workspace; even a stale workspace selection
     // must not keep it from reaching the others. Refuse locally before discovering them,
     // including when no hub is there to enforce the RPC's agent guard.
@@ -972,6 +1087,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             data_dir,
             ca,
             allow_insecure,
+            ..
         }) => {
             // clap requires both without a subcommand.
             let (Some(hub), Some(box_name)) = (hub, box_name) else {
@@ -998,6 +1114,21 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         // Workspaces are the root's: these work from any workspace, existing or not.
         Some(Cmd::Ws { cmd }) => {
             ws(cmd, &paths).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        // Before the config is loaded: it repairs config files that do not load (a box in
+        // both, or one whose settings twr refuses, comes out of boxes.toml). The hub's socket
+        // as config.toml alone says, else the default.
+        Some(Cmd::Boxes {
+            cmd: boxes::BoxCmd::Remove { name },
+        }) => {
+            let socket = cli.socket.clone().unwrap_or_else(|| {
+                Config::load(&paths.config_file)
+                    .unwrap_or_default()
+                    .in_workspace(&paths)
+                    .socket_path(&paths)
+            });
+            boxes::remove(&paths, &socket, &name).await?;
             return Ok(ExitCode::SUCCESS);
         }
         cmd => Cli { cmd, ..cli },
@@ -1129,6 +1260,7 @@ async fn run_simple(
             orchestrator_use(&socket, &runtime, model, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
+        Cmd::Boxes { cmd } => boxes::run(cmd, config, &paths, &socket).await,
         Cmd::Usage {
             json,
             threads: true,
@@ -2547,6 +2679,24 @@ const RELEASE_LINE: &str = "# twr release ";
 /// refused.
 fn release_of(source: &UpdateSource, script: &[u8], sums: &[u8]) -> anyhow::Result<String> {
     let url = format!("{}/sha256sums.txt", source.base);
+    let tag = sums_release(source, sums)?;
+    let listed = listed_sha256(sums, "install.sh");
+    let actual = sha256_hex(script);
+    match listed {
+        None => bail!("{url} lists no install.sh; nothing was run"),
+        Some(hash) if !hash.eq_ignore_ascii_case(&actual) => bail!(
+            "the installer from {} is not the install.sh of {tag} (its SHA-256 is not the one \
+             in sha256sums.txt); nothing was run",
+            source.script
+        ),
+        Some(_) => Ok(tag),
+    }
+}
+
+/// The release `sums` (a sha256sums.txt whose signature verified, from `source`) names on its
+/// [`RELEASE_LINE`], which must be the one `source` asked for, if it named one.
+fn sums_release(source: &UpdateSource, sums: &[u8]) -> anyhow::Result<String> {
+    let url = format!("{}/sha256sums.txt", source.base);
     let text =
         std::str::from_utf8(sums).map_err(|_| anyhow!("{url} is not text; nothing was run"))?;
     let mut tags = text
@@ -2563,21 +2713,61 @@ fn release_of(source: &UpdateSource, script: &[u8], sums: &[u8]) -> anyhow::Resu
     if let Some(asked) = source.tag.as_deref().filter(|asked| *asked != tag) {
         bail!("{url} is the checksums of {tag}, not of {asked}; nothing was run");
     }
-    let listed = text.lines().find_map(|l| {
-        let (hash, name) = l.split_once("  ")?;
-        (name.trim_end() == "install.sh").then_some(hash)
-    });
-    let digest = ring::digest::digest(&ring::digest::SHA256, script);
-    let actual: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-    match listed {
-        None => bail!("{url} lists no install.sh; nothing was run"),
-        Some(hash) if !hash.eq_ignore_ascii_case(&actual) => bail!(
-            "the installer from {} is not the install.sh of {tag} (its SHA-256 is not the one \
-             in sha256sums.txt); nothing was run",
-            source.script
-        ),
-        Some(_) => Ok(tag),
+    Ok(tag)
+}
+
+/// The SHA-256 `sums` (sha256sums.txt) lists for file `name`, as written there.
+fn listed_sha256<'a>(sums: &'a [u8], name: &str) -> Option<&'a str> {
+    std::str::from_utf8(sums).ok()?.lines().find_map(|l| {
+        let (hash, file) = l.split_once("  ")?;
+        (file.trim_end() == name).then_some(hash)
+    })
+}
+
+/// The SHA-256 of `bytes`, lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Largest release archive `twr box install` downloads ([`fetch_release_archive`]).
+const RELEASE_ARCHIVE_MAX: usize = 256 << 20;
+
+/// How long `twr box install` waits for a release archive.
+const RELEASE_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Downloads release `tag`'s archive for `target` (`twr-<target>.tar.gz`), checked the way
+/// `twr update` checks a release: sha256sums.txt and its signature are downloaded from the
+/// release (or the mirror of [`INSTALL_SCRIPT_URL_ENV`]), the signature must verify with the
+/// release key, the checksums must name release `tag` and list the archive, and the archive
+/// must have the SHA-256 they list. Returns the archive and its SHA-256 (lowercase hex).
+async fn fetch_release_archive(tag: &str, target: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    let key = release_key(test_token_trusted(), std::env::var_os(TEST_RELEASE_KEY_ENV))?;
+    let mirror = std::env::var(INSTALL_SCRIPT_URL_ENV)
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+    let source = update_source(Some(tag), mirror).await?;
+    let sums_url = format!("{}/sha256sums.txt", source.base);
+    let sig_url = format!("{sums_url}.sig");
+    let sums = fetch_release_file(&sums_url).await?;
+    let signature = fetch_signature(&sig_url).await?;
+    check_signature(&key, &sums, &signature, &sums_url, &sig_url)?;
+    sums_release(&source, &sums)?;
+    let asset = format!("twr-{target}.tar.gz");
+    let Some(want) = listed_sha256(&sums, &asset).map(str::to_ascii_lowercase) else {
+        bail!("{sums_url} lists no {asset}: release {tag} has no build for {target}");
+    };
+    let base = source.archives.as_deref().unwrap_or(&source.base);
+    let url = format!("{base}/{asset}");
+    let archive = fetch_limited(&url, RELEASE_ARCHIVE_MAX, RELEASE_ARCHIVE_TIMEOUT).await?;
+    let actual = sha256_hex(&archive);
+    if actual != want {
+        bail!(
+            "{url} is not the {asset} of {tag} (its SHA-256 is not the one in sha256sums.txt); \
+             nothing was installed"
+        );
     }
+    Ok((archive, actual))
 }
 
 /// A release file a server answered with a status other than 2xx.
@@ -2723,28 +2913,34 @@ fn cargo_bin_dirs(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathB
 /// 2xx is an error), or `file:///<path>` read from disk ([`read_release_file`]). At most
 /// [`RELEASE_FILE_MAX`] bytes, within [`RELEASE_FILE_TIMEOUT`].
 async fn fetch_release_file(url: &str) -> anyhow::Result<Vec<u8>> {
-    let too_large = || anyhow!("{url} is over {RELEASE_FILE_MAX} bytes; nothing was run");
+    fetch_limited(url, RELEASE_FILE_MAX, RELEASE_FILE_TIMEOUT).await
+}
+
+/// [`fetch_release_file`] with another size limit `max` and time limit `timeout` (a release
+/// archive, [`fetch_release_archive`]).
+async fn fetch_limited(url: &str, max: usize, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let too_large = || anyhow!("{url} is over {max} bytes; nothing was run");
     if let Some(rest) = url.strip_prefix("file://") {
         let path = rest.strip_prefix("localhost").unwrap_or(rest);
         if !path.starts_with('/') {
             bail!("{url} is not a local file:// URL (use file:///absolute/path)");
         }
         let owned = PathBuf::from(path);
-        let bytes = read_detached(RELEASE_FILE_TIMEOUT, move || read_release_file(&owned))
+        let bytes = read_detached(timeout, move || read_release_file(&owned, max))
             .await
             .map_err(|_| anyhow!("reading {path} timed out; nothing was run"))?
             .with_context(|| format!("reading {path}"))?;
-        if bytes.len() > RELEASE_FILE_MAX {
+        if bytes.len() > max {
             return Err(too_large());
         }
         return Ok(bytes);
     }
     if !url.starts_with("https://") {
-        bail!("{url}: twr update only downloads over https:// (or reads file:///)");
+        bail!("{url}: twr only downloads over https:// (or reads file:///)");
     }
     let client = reqwest::Client::builder()
         .https_only(true)
-        .timeout(RELEASE_FILE_TIMEOUT)
+        .timeout(timeout)
         .build()
         .context("setting up the HTTP client")?;
     let what = || format!("downloading {url}");
@@ -2757,15 +2953,12 @@ async fn fetch_release_file(url: &str) -> anyhow::Result<Vec<u8>> {
         }
         .into());
     }
-    if resp
-        .content_length()
-        .is_some_and(|n| n > RELEASE_FILE_MAX as u64)
-    {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
         return Err(too_large());
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.with_context(what)? {
-        if body.len() + chunk.len() > RELEASE_FILE_MAX {
+        if body.len() + chunk.len() > max {
             return Err(too_large());
         }
         body.extend_from_slice(&chunk);
@@ -2802,9 +2995,9 @@ where
 
 /// The release file at local `path`, read only when it is a regular file, as its opened
 /// descriptor says (a symbolic link to one will do): opened without blocking, so a FIFO there
-/// cannot hang the update, and read up to one byte past [`RELEASE_FILE_MAX`], so a device
-/// such as `/dev/zero` or a huge file cannot fill memory (the caller refuses what is longer).
-fn read_release_file(path: &Path) -> std::io::Result<Vec<u8>> {
+/// cannot hang the update, and read up to one byte past `max`, so a device such as
+/// `/dev/zero` or a huge file cannot fill memory (the caller refuses what is longer).
+fn read_release_file(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -2815,8 +3008,7 @@ fn read_release_file(path: &Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("not a regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(RELEASE_FILE_MAX as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -2919,6 +3111,37 @@ async fn run_runner(
     }
     opts.token = token;
     twr_runner::run(opts).await
+}
+
+/// `twr runner --daemon`: an SSH box's daemon ([`twr_runner::daemon`]), started by its relay
+/// with every path as an argument, its stdout and stderr `/dev/null`: it logs to `log`
+/// (appended, 0600, in its private data directory), its failure included, and runs until a
+/// `stop` request, SIGINT or SIGTERM.
+async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::Result<()> {
+    if let Some(dir) = log.parent() {
+        twr_core::paths::ensure_private_dir(dir)?;
+    }
+    let file = twr_core::paths::open_private_append(log)
+        .with_context(|| format!("opening the box daemon's log {}", log.display()))?;
+    tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    tracing::info!(
+        version = twr_core::version(),
+        build = twr_core::build_id().unwrap_or("-"),
+        box_name = %opts.box_name,
+        "the box daemon starts"
+    );
+    let r = twr_runner::run(opts).await;
+    if let Err(e) = &r {
+        tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
+    }
+    r
 }
 
 /// `twr mcp`: the MCP server on stdio. Tracing goes to stderr only: stdout carries MCP.
@@ -6432,6 +6655,119 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// The SSH box's relay (`--stdio`) and daemon (`--daemon`) take a box and a hub key, none
+    /// of the token runner's flags, and not each other; the daemon every path. Hidden from
+    /// help.
+    #[test]
+    fn the_box_relay_and_daemon_flags_parse() {
+        let key = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let args: Vec<&str> = ["twr", "runner"].iter().chain(extra).copied().collect();
+            Cli::try_parse_from(args)
+        };
+        let relay = ["--stdio", "--box", "b", "--hub-key", key.as_str()];
+        let c = parse(&[&relay[..], &["--build=0123456789abcdef"]].concat()).unwrap();
+        assert!(
+            matches!(&c.cmd, Some(Cmd::Runner { build: Some(b), .. }) if b == "0123456789abcdef")
+        );
+        let c = parse(&relay).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stdio: true,
+                daemon: false,
+                replace: false,
+                hub: None,
+                ..
+            })
+        ));
+        let c = parse(&[&relay[..], &["--replace"]].concat()).unwrap();
+        assert!(matches!(c.cmd, Some(Cmd::Runner { replace: true, .. })));
+        let c = parse(&[&relay[..], &["--stop"]].concat()).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stop: true,
+                replace: false,
+                ..
+            })
+        ));
+        let daemon = [
+            "--daemon",
+            "--box",
+            "b",
+            "--hub-key",
+            key.as_str(),
+            "--daemon-socket",
+            "/s/x.sock",
+            "--data-dir",
+            "/d",
+            "--lock",
+            "/l",
+            "--log",
+            "/d/daemon.log",
+        ];
+        let c = parse(&daemon).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                daemon: true,
+                daemon_socket: Some(_),
+                lock: Some(_),
+                log: Some(_),
+                ..
+            })
+        ));
+        // The names the hub passes joined to their flag (`--box=<name>`), as the relay and the
+        // daemon get them.
+        for args in [
+            vec!["--stdio", "--box=b", "--hub-key", key.as_str()],
+            [&["--daemon", "--box=b"][..], &daemon[3..]].concat(),
+        ] {
+            let c = parse(&args).unwrap();
+            assert!(
+                matches!(&c.cmd, Some(Cmd::Runner { box_name: Some(b), .. }) if b == "b"),
+                "{args:?}"
+            );
+        }
+        // What each refuses.
+        for bad in [
+            vec!["--stdio", "--box", "b"],
+            vec!["--stdio", "--hub-key", key.as_str()],
+            [&relay[..], &["--daemon"]].concat(),
+            [&relay[..], &["--hub", "ws://h:1"]].concat(),
+            [&relay[..], &["--token-file", "/t"]].concat(),
+            [&relay[..], &["--ca", "/c"]].concat(),
+            [&relay[..], &["--allow-insecure"]].concat(),
+            [&relay[..], &["--lock", "/l"]].concat(),
+            [&daemon[..], &["--replace"]].concat(),
+            [&daemon[..], &["--stop"]].concat(),
+            [&relay[..], &["--stop", "--replace"]].concat(),
+            vec!["--hub", "ws://h:1", "--box", "b", "--stop"],
+            [&daemon[..], &["--hub", "ws://h:1"]].concat(),
+            daemon[..daemon.len() - 2].to_vec(),
+            daemon[..daemon.len() - 4].to_vec(),
+            vec!["--hub", "ws://h:1", "--box", "b", "--replace"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--daemon-socket", "/s"],
+            vec!["--box", "b", "--hub-key", key.as_str()],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        // Hidden: the help shows none of them.
+        let help = cli_help_page().1;
+        for flag in [
+            "--stdio",
+            "--daemon",
+            "--hub-key",
+            "--replace",
+            "--stop",
+            "--lock",
+            "--log",
+        ] {
+            assert!(!help.contains(flag), "{flag}");
+        }
     }
 
     #[test]

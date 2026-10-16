@@ -59,7 +59,10 @@ twr mode api plan                      # change a thread's permission mode (thre
 twr model api opus --effort high       # change a thread's model and reasoning effort
 twr model api --runtime codex          # move a thread to another runtime, with a handoff
 twr orchestrator use codex --model gpt-5   # move the orchestrator to another runtime
-twr runner --hub ws://127.0.0.1:7878 --box gpu --token-file ~/.config/twr/gpu.token
+twr box add gpu me@gpu-box             # a box the hub reaches over SSH: it installs twr there
+twr thread new api --box gpu           # a thread on that box
+twr box list                           # the boxes, their state and twr version
+twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file ~/.config/twr/gpu.token
 twr info                               # what the running hub uses
 twr usage                              # how much of each subscription's 5h / weekly windows is used
 twr usage --threads --since 7d         # what each thread's turns spent: tokens, and cost where reported
@@ -119,7 +122,7 @@ On a phone (below 60 columns, or `/compact on`) it shows one screen at a time: t
 
 ## How it works
 
-Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. Threads on other machines run under `twr runner`, which connects out to the hub over WebSocket.
+Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. Threads on other machines run under a box daemon the hub reaches over SSH (`twr box add`), or under `twr runner`, which connects out to the hub over WebSocket.
 
 ```mermaid
 flowchart LR

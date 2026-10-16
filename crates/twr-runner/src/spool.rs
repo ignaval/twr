@@ -31,6 +31,13 @@
 //!   so a runner killed while a runtime initializes still leaves a trace: the next runner kills
 //!   every process marked for the thread that started after `min_start` ([`crate::reap`]) and
 //!   records the session's exit.
+//! - `meta(key PRIMARY KEY, value)`: `protocol`, the runner protocol
+//!   ([`twr_core::runner::PROTOCOL_VERSION`]) the outbox's frames were written under. A spool
+//!   of another protocol (or of a runner from before the stamp) is used only when every
+//!   frame it still holds decodes as this build's [`RunnerMsg`] (then it is stamped anew);
+//!   otherwise [`Spool::open`] refuses it, naming how many frames and which protocol, so the
+//!   runner fails where the user sees it instead of replaying frames the hub cannot read on
+//!   every connection.
 //!
 //! Size bound: the frames in the outbox may take at most `max_bytes` (default
 //! [`DEFAULT_MAX_BYTES`]). An append that would exceed it is refused ([`Appended::Full`])
@@ -47,7 +54,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use rusqlite::{params, Connection, OptionalExtension};
-use twr_core::runner::{cmd_errors, CmdError, CmdResult, DURABLE_CMD_PREFIXES, RESULT_RETENTION};
+use twr_core::runner::{
+    cmd_errors, CmdError, CmdResult, RunnerMsg, DURABLE_CMD_PREFIXES, PROTOCOL_VERSION,
+    RESULT_RETENTION,
+};
 
 /// Default bound of the outbox (256 MiB of frames).
 pub const DEFAULT_MAX_BYTES: u64 = 256 << 20;
@@ -207,6 +217,68 @@ fn lock_spool(path: &Path) -> anyhow::Result<std::fs::File> {
     }
 }
 
+/// The `meta` key of the spool's protocol stamp.
+const PROTOCOL_KEY: &str = "protocol";
+
+/// Checks the protocol stamp of the spool `conn` (at `path`, for errors) against this build's
+/// [`PROTOCOL_VERSION`]: the same, nothing to do; another one (or none: a spool from before
+/// the stamp, or a new one), every frame in the outbox must decode as this build's
+/// [`RunnerMsg`], and then the spool is stamped with this build's protocol. A frame that does
+/// not decode refuses the spool: the hub could not read it either, and the runner would send
+/// it again on every connection. The error names the count and the protocol, and what to do.
+fn check_protocol(conn: &Connection, path: &Path) -> anyhow::Result<()> {
+    let stamp: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            [PROTOCOL_KEY],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let current = PROTOCOL_VERSION.to_string();
+    if stamp.as_deref() == Some(current.as_str()) {
+        return Ok(());
+    }
+    let (mut frames, mut unreadable) = (0u64, 0u64);
+    {
+        let mut st = conn.prepare("SELECT frame FROM outbox ORDER BY id")?;
+        let mut rows = st.query([])?;
+        while let Some(row) = rows.next()? {
+            frames += 1;
+            let frame: String = row.get(0)?;
+            if serde_json::from_str::<RunnerMsg>(&frame).is_err() {
+                unreadable += 1;
+            }
+        }
+    }
+    let was = match &stamp {
+        Some(p) => format!("runner protocol {p}"),
+        None => "a runner protocol from before spools recorded theirs".to_string(),
+    };
+    if unreadable > 0 {
+        anyhow::bail!(
+            "the runner spool {} holds {unreadable} unsent frame(s) (of {frames}) written under \
+             {was}, which this twr (runner protocol {PROTOCOL_VERSION}) cannot read: run the twr \
+             that wrote them until the hub has received them, or move the spool away (losing \
+             those events)",
+            path.display()
+        );
+    }
+    if frames > 0 {
+        tracing::info!(
+            frames,
+            from = %was,
+            protocol = PROTOCOL_VERSION,
+            "the spool's frames were written under another protocol and read fine: keeping them"
+        );
+    }
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![PROTOCOL_KEY, current],
+    )?;
+    Ok(())
+}
+
 /// Creates `path` with mode 0600 if missing and restricts it if others can read it.
 fn create_private(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -264,8 +336,13 @@ impl Spool {
                  runtime TEXT NOT NULL,
                  min_start INTEGER,
                  ts INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS meta (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
              );",
         )?;
+        check_protocol(&conn, path)?;
         // A spool from before `runtimes.min_start` gets the column (its rows have none).
         let has_min_start = conn
             .prepare("SELECT 1 FROM pragma_table_info('runtimes') WHERE name = 'min_start'")?
@@ -1024,6 +1101,90 @@ mod tests {
         assert!(started.elapsed() >= LOCK_WAIT);
         drop(s);
         open(dir.path(), DEFAULT_MAX_BYTES);
+    }
+
+    /// The spool records its protocol: a spool of another protocol (or of none, from before
+    /// the stamp) is used and stamped anew when its frames decode, and refused, naming the
+    /// count and the protocol, when one does not. An empty one is always stamped anew.
+    #[test]
+    fn a_spool_of_another_protocol_is_used_only_if_its_frames_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runner-b.db");
+        let stamp = |s: &Spool| -> Option<String> {
+            s.lock()
+                .conn
+                .query_row("SELECT value FROM meta WHERE key = 'protocol'", [], |r| {
+                    r.get(0)
+                })
+                .optional()
+                .unwrap()
+        };
+        let restamp = |s: &Spool, v: Option<&str>| {
+            let g = s.lock();
+            match v {
+                Some(v) => g
+                    .conn
+                    .execute("UPDATE meta SET value = ?1 WHERE key = 'protocol'", [v])
+                    .unwrap(),
+                None => g.conn.execute("DELETE FROM meta", []).unwrap(),
+            };
+        };
+        // A new spool is stamped with this protocol, and reopens as is.
+        let s = open(dir.path(), DEFAULT_MAX_BYTES);
+        assert_eq!(stamp(&s), Some(PROTOCOL_VERSION.to_string()));
+        s.append("a", false, frame("a")).unwrap();
+        drop(s);
+        let mut s = open(dir.path(), DEFAULT_MAX_BYTES);
+        assert_eq!(s.len().unwrap(), 1);
+        // An older protocol, or none, whose frames decode: kept and stamped anew.
+        for old in [Some("5"), None] {
+            restamp(&s, old);
+            drop(s);
+            s = open(dir.path(), DEFAULT_MAX_BYTES);
+            assert_eq!(stamp(&s), Some(PROTOCOL_VERSION.to_string()));
+            assert_eq!(s.len().unwrap(), 1);
+        }
+        // A frame this build cannot decode, under another protocol: refused, nothing changed.
+        s.append("b", false, |rseq| {
+            format!(r#"{{"type":"exited-v9","thread":"b","rseq":{rseq}}}"#)
+        })
+        .unwrap();
+        restamp(&s, Some("5"));
+        drop(s);
+        let e = Spool::open(&path, DEFAULT_MAX_BYTES)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("holds 1 unsent frame(s) (of 2) written under runner protocol 5")
+                && e.contains(&format!("(runner protocol {PROTOCOL_VERSION})"))
+                && e.contains(&path.display().to_string()),
+            "{e}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM meta", []).unwrap();
+        drop(conn);
+        let e = Spool::open(&path, DEFAULT_MAX_BYTES)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("from before spools recorded theirs"), "{e}");
+        // Under this protocol the spool is this build's own, and opens as is.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('protocol', ?1)",
+            [PROTOCOL_VERSION.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+        let s = open(dir.path(), DEFAULT_MAX_BYTES);
+        assert_eq!(s.len().unwrap(), 2);
+        // Once the unreadable frame is gone (acked by the twr that wrote it), another
+        // protocol's empty spool is stamped anew.
+        s.ack("b", 1).unwrap();
+        s.ack("a", 1).unwrap();
+        restamp(&s, Some("5"));
+        drop(s);
+        let s = open(dir.path(), DEFAULT_MAX_BYTES);
+        assert_eq!(stamp(&s), Some(PROTOCOL_VERSION.to_string()));
     }
 
     #[test]

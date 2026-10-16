@@ -1,7 +1,16 @@
 //! Remote boxes: [`RemoteBox`] is the [`ThreadHost`] of a box whose runner
-//! connects to the hub (`[boxes.<name>]`). Every host call becomes a command
+//! connects to the hub (`[boxes.<name>]`, transport `token`), or that the hub reaches over ssh
+//! itself (transport `ssh`, [`crate::ssh_box`]). Every host call becomes a command
 //! ([`HubMsg::Cmd`] with an [`Op`]) on the box's current connection; the runner answers
 //! [`RunnerMsg::CmdResult`](twr_core::runner::RunnerMsg::CmdResult) once per command id.
+//!
+//! **Transports.** A token box's runner proves its token on the hub's listener
+//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). An SSH box has no token:
+//! its only connections are the sealed ones the hub's own ssh supervisor opens
+//! (`Hub::serve_sealed_runner`), so on the listener it is a box the hub does not know (a
+//! random proof, then `unauthorized`). Its threads' branches take the namespace of the hub's
+//! own box ([`RemoteBox::with_branch_namespace`]): the box's daemon belongs to this hub
+//! instance alone, as the hub's own worktrees do; a token box keeps `twr/<name>`.
 //!
 //! **Commands.** Each command gets a fresh id (a ULID) that it keeps for its whole life: a
 //! command in flight when its connection drops is sent again, with the same id, once the box is
@@ -92,16 +101,16 @@
 //! interactive command the hub's own adapter for the runtime builds for another box
 //! (`Adapter::remote_attach_command`: never fitted to what the hub knows of its own binaries,
 //! which may be other versions than the box's; never a program, argument or environment the
-//! runner names), wrapped as `ssh -t <boxes.NAME.ssh> -- <shell command>`
-//! ([`ssh_command`]). The runner is asked first (`attach_info`): it must offer an interactive
-//! CLI for the runtime, and only the working directory of its answer is used, when it is the
-//! thread's directory or lies under the box's worktrees or the thread's repository
-//! ([`attach_dir`]).
+//! runner names), wrapped as `ssh -t <boxes.NAME.ssh> -- <shell command>` with every kind
+//! of forwarding off ([`ssh_command`]). The runner is asked first (`attach_info`): it must
+//! offer an interactive CLI for the runtime, and only the working directory of its answer is
+//! used, when it is the thread's directory or lies under the box's worktrees or the thread's
+//! repository ([`attach_dir`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -109,6 +118,7 @@ use futures::future::{BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use twr_core::adapter::{AdapterCmd, AdapterEvent, AdapterHandle, SpawnConfig};
+use twr_core::config::BoxTransport;
 use twr_core::event::GitSnapshot;
 use twr_core::git::{
     DeleteRefs, GitOps, OnlyCommits, PurgeOutcome, RemoveOutcome, RestoreOutcome, RestoreRequest,
@@ -244,8 +254,15 @@ impl std::fmt::Debug for RemoteBox {
 
 struct Inner {
     name: String,
+    /// How the box connects: a token box's runner dials the listener, an SSH box's daemon is
+    /// dialed by the hub (see the module docs).
+    transport: BoxTransport,
+    /// The token box's token (empty for an SSH box, and for a token box configured without
+    /// one: neither is accepted on the listener).
     token: Secret,
     ssh: Option<String>,
+    /// Namespace of its threads' branches (`twr/<namespace>/<name>`; `None`: `twr/<name>`).
+    branch_namespace: Option<String>,
     state: Mutex<State>,
     /// Session generations (this box's own counter).
     gens: AtomicU64,
@@ -266,6 +283,19 @@ struct Inner {
     /// The latest refused connection that named this box, until one authenticates
     /// ([`RemoteBox::note_refusal`]).
     refusal: Mutex<Option<Refusal>>,
+    /// Hub operations on the box under way that passed its switching gate
+    /// ([`RemoteBox::begin_op`]).
+    ops: Arc<AtomicUsize>,
+}
+
+/// A hub operation on a box under way ([`RemoteBox::begin_op`]): counted until dropped.
+#[derive(Debug)]
+pub struct BoxOp(Arc<AtomicUsize>);
+
+impl Drop for BoxOp {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A connection naming a box that the hub refused before it authenticated: when, and why in
@@ -444,13 +474,31 @@ impl State {
 }
 
 impl RemoteBox {
-    /// Box `name`, whose runner authenticates with `token`; `ssh` is its `ssh` destination.
+    /// Token box `name`, whose runner authenticates with `token`; `ssh` is its `ssh`
+    /// destination (for attach).
     pub fn new(name: impl Into<String>, token: Secret, ssh: Option<String>) -> Self {
+        Self::with_transport(name.into(), BoxTransport::Token, token, ssh)
+    }
+
+    /// SSH box `name`, which the hub reaches with `ssh` (its destination, also used for
+    /// attach). It has no token: the listener refuses every connection naming it.
+    pub fn new_ssh(name: impl Into<String>, ssh: String) -> Self {
+        Self::with_transport(name.into(), BoxTransport::Ssh, Secret::default(), Some(ssh))
+    }
+
+    fn with_transport(
+        name: String,
+        transport: BoxTransport,
+        token: Secret,
+        ssh: Option<String>,
+    ) -> Self {
         RemoteBox {
             inner: Arc::new(Inner {
-                name: name.into(),
+                name,
+                transport,
                 token,
                 ssh,
+                branch_namespace: None,
                 state: Mutex::new(State::default()),
                 gens: AtomicU64::new(1),
                 rejected: AtomicU64::new(0),
@@ -459,6 +507,7 @@ impl RemoteBox {
                 change_timeout: twr_core::git::CHANGE_REQUEST_TIMEOUT,
                 settled: Notify::new(),
                 refusal: Mutex::new(None),
+                ops: Arc::default(),
             }),
         }
     }
@@ -472,9 +521,59 @@ impl RemoteBox {
         self
     }
 
+    /// Namespace of the branches of new worktrees on this box (`twr/<namespace>/<name>`;
+    /// `None`, the default: `twr/<name>`), for creation and restore alike. An SSH box gets the
+    /// hub's own box's (see the module docs). Set before the box is shared.
+    pub fn with_branch_namespace(mut self, namespace: Option<String>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the box is configured before it is shared")
+            .branch_namespace = namespace;
+        self
+    }
+
+    /// How the box connects (see the module docs).
+    pub fn transport(&self) -> BoxTransport {
+        self.inner.transport
+    }
+
     /// Repository changes on the box whose outcome is unknown (see the module docs).
     pub fn unsettled(&self) -> usize {
         self.state().unsettled.len()
+    }
+
+    /// A hub operation on the box begins that checked its switching gate and then awaits the
+    /// box (a new thread's workspace, a deletion, a trash restore, an attach's question):
+    /// counted until the returned guard is dropped, on every way out. The hub takes it under
+    /// its core lock in the same step as the gate check (`Core::reserve_box`), and a box with
+    /// any is not quiet (`Core::box_quiet`), so no switch begins while one runs, and none
+    /// starts once one began.
+    pub fn begin_op(&self) -> BoxOp {
+        self.inner.ops.fetch_add(1, Ordering::SeqCst);
+        BoxOp(Arc::clone(&self.inner.ops))
+    }
+
+    /// Hub operations on the box under way ([`RemoteBox::begin_op`]).
+    pub fn ops_in_progress(&self) -> usize {
+        self.inner.ops.load(Ordering::SeqCst)
+    }
+
+    /// Repository changes on the box waiting for their answer or unsettled: what may still
+    /// change the box's repositories ([`Op::changes_repository`], see the module docs).
+    pub fn repository_changes(&self) -> usize {
+        let st = self.state();
+        st.pending
+            .values()
+            .filter(|p| !p.session && p.op.changes_repository())
+            .count()
+            + st.unsettled.len()
+    }
+
+    /// Closes the box's current connection, if it has one, saying `why`: it ends as a lost
+    /// connection does (the box goes offline, and its runner keeps everything for the next).
+    pub fn close_connection(&self, why: &str) {
+        if let Some(c) = &self.state().conn {
+            c.tx.close(why);
+        }
     }
 
     /// Waits until no repository change of the hub may still run on the box (see the module
@@ -536,9 +635,10 @@ impl RemoteBox {
 
     /// The hub's handshake proof for this box over the runner's and the hub's nonces
     /// ([`twr_core::runner::auth_proof`] by [`Prover::Hub`]); `None` for a box without a token
-    /// (it accepts no runner).
+    /// (it accepts no runner on the listener), an SSH box among them.
     pub fn hub_proof(&self, runner_nonce: &str, hub_nonce: &str) -> Option<String> {
-        (!self.inner.token.is_empty()).then(|| {
+        let token_box = self.inner.transport == BoxTransport::Token;
+        (token_box && !self.inner.token.is_empty()).then(|| {
             auth_proof(
                 &self.inner.token,
                 Prover::Hub,
@@ -550,16 +650,17 @@ impl RemoteBox {
     }
 
     /// Whether `proof` is the runner's handshake proof for this box over these nonces
-    /// (constant time; a box without a token accepts none).
+    /// (constant time; a box without a token accepts none, an SSH box none either).
     pub fn checks_runner_proof(&self, runner_nonce: &str, hub_nonce: &str, proof: &str) -> bool {
-        check_auth_proof(
-            &self.inner.token,
-            Prover::Runner,
-            &self.inner.name,
-            runner_nonce,
-            hub_nonce,
-            proof,
-        )
+        self.inner.transport == BoxTransport::Token
+            && check_auth_proof(
+                &self.inner.token,
+                Prover::Runner,
+                &self.inner.name,
+                runner_nonce,
+                hub_nonce,
+                proof,
+            )
     }
 
     /// What the latest inventory said (kept while the box is offline).
@@ -1266,7 +1367,13 @@ impl RemoteBox {
         let dir = attach_dir(answer.cwd.as_deref(), &cfg.cwd, worktrees.as_deref(), repo);
         let mut info = AttachInfo::from_command(local);
         info.cwd = dir.clone();
-        Ok(Some((ssh_command(&ssh, &info, None), dir)))
+        let cmd = ssh_command(&ssh, &info, None).map_err(|why| {
+            CmdError::new(
+                codes::BAD_REQUEST,
+                format!("[boxes.{}] ssh = {ssh:?}: {why}", self.inner.name),
+            )
+        })?;
+        Ok(Some((cmd, dir)))
     }
 }
 
@@ -1322,6 +1429,13 @@ impl ThreadHost for RemoteBox {
             run: Some(twr_core::event::new_id()),
         };
         Ok(self.start_session(&thread, Some(op)))
+    }
+
+    fn worktree_branch(&self, name: &str) -> String {
+        match &self.inner.branch_namespace {
+            Some(ns) => format!("twr/{ns}/{name}"),
+            None => twr_core::git::thread_branch(name),
+        }
     }
 
     fn attach_command(
@@ -1645,13 +1759,53 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The `ssh` arguments a box's `ssh` setting stands for: its whitespace-separated words (a
+/// destination, possibly preceded by `ssh` options), as attach and the hub's own ssh
+/// ([`crate::ssh_box`]) pass them, once [`twr_core::config::check_ssh_words`] accepts them
+/// (else why not: they forward something, or change what ssh runs or how). Every caller
+/// passes [`SSH_NO_FORWARDING`] after them.
+pub fn ssh_words(ssh: &str) -> Result<Vec<&str>, String> {
+    twr_core::config::check_ssh_words(ssh)?;
+    Ok(ssh.split_whitespace().collect())
+}
+
+/// What every ssh twr runs passes after a box's `ssh` words ([`ssh_words`]) and before `--`:
+/// no agent forwarding (`-a`), no X11 forwarding (`-x`), no GSSAPI credential forwarding
+/// (`-k`). ssh takes options after the destination too, and the last of `-a`/`-A` (and so
+/// on) wins over an earlier one and over any `ForwardAgent` (`ForwardX11`,
+/// `GSSAPIDelegateCredentials`) of the command line or a config file, so these hold whatever
+/// precedes them.
+pub const SSH_NO_FORWARDING: &[&str] = &["-a", "-x", "-k"];
+
+/// The options `twr attach`'s ssh passes before a box's `ssh` words: a terminal (`-t`), and
+/// what the hub's own ssh clears too (`crate::ssh_box::SSH_OPTIONS`; ssh takes the first
+/// value of a `-o` option, so these hold over your ssh config files): no forwarded port,
+/// agent, X11 display or tunnel, no local command.
+pub const ATTACH_SSH_OPTIONS: &[&str] = &[
+    "-t",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "Tunnel=no",
+];
+
 /// The local command that runs `info` on a remote box over ssh:
-/// `ssh -t <ssh...> -- 'cd <cwd> && exec env -u K -- 'K2=V' <program> <args>'`, every part
-/// shell-quoted (the remote side runs it with the user's login shell; `--` ends `env`'s
-/// options, so a variable whose name starts with `-` is set, not taken for one). `cwd` is used when the
-/// command has no directory of its own. `ssh` is split on whitespace (a destination, possibly
-/// preceded by `ssh` options).
-pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Command {
+/// `ssh -t -o <no forwarding...> <ssh...> -a -x -k -- 'cd <cwd> && exec env -u K -- 'K2=V'
+/// <program> <args>'` ([`ATTACH_SSH_OPTIONS`], [`SSH_NO_FORWARDING`]),
+/// every part shell-quoted (the remote side runs it with the user's login shell; `--` ends
+/// `env`'s options, so a variable whose name starts with `-` is set, not taken for one).
+/// `cwd` is used when the command has no directory of its own. `ssh` is split on whitespace
+/// (a destination, possibly preceded by `ssh` options: [`ssh_words`], an error when it
+/// refuses them). An attached CLI on the box gets no forwarding either: it is an agent's
+/// CLI, and must not reach your ssh agent, X11 display, Kerberos credentials or forwarded
+/// ports any more than the box daemon's runtimes can.
+pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Result<Command, String> {
     let mut remote = String::new();
     let dir = info
         .cwd
@@ -1682,11 +1836,12 @@ pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Command 
         remote.push_str(&sh_quote(a));
     }
     let mut c = Command::new("ssh");
-    c.arg("-t")
-        .args(ssh.split_whitespace())
+    c.args(ATTACH_SSH_OPTIONS)
+        .args(ssh_words(ssh)?)
+        .args(SSH_NO_FORWARDING)
         .arg("--")
         .arg(remote);
-    c
+    Ok(c)
 }
 
 #[cfg(test)]
@@ -1831,7 +1986,7 @@ mod tests {
             cwd: Some("/w/it's".into()),
             env: vec![("A".into(), Some("x y".into())), ("B".into(), None)],
         };
-        let c = ssh_command("-p 2222 me@gpu", &info, None);
+        let c = ssh_command("-p 2222 me@gpu", &info, None).unwrap();
         let argv: Vec<String> = std::iter::once(c.get_program())
             .chain(c.get_args())
             .map(|a| a.to_string_lossy().into_owned())
@@ -1841,13 +1996,32 @@ mod tests {
             vec![
                 "ssh",
                 "-t",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "Tunnel=no",
                 "-p",
                 "2222",
                 "me@gpu",
+                "-a",
+                "-x",
+                "-k",
                 "--",
                 r"cd '/w/it'\''s' && exec env -u 'B' -- 'A=x y' 'claude' '--resume' 's 1'"
             ]
         );
+        // Words that forward something, or decide the terminal, are refused: attach's own
+        // `-t` is the only one.
+        for (bad, says) in [("-A me@gpu", "ssh agent"), ("-T me@gpu", "terminal")] {
+            let e = ssh_command(bad, &info, None).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
         // The remote string runs as meant in a shell (echo instead of the program).
         let info = AttachInfo {
             program: "sh".into(),
@@ -1859,7 +2033,7 @@ mod tests {
             env: vec![("A".into(), Some("x y".into())), ("B".into(), None)],
         };
         let dir = tempfile::tempdir().unwrap();
-        let c = ssh_command("host", &info, Some(dir.path()));
+        let c = ssh_command("host", &info, Some(dir.path())).unwrap();
         let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
             .args(["-c", &remote])
@@ -1875,7 +2049,7 @@ mod tests {
             cwd: None,
             env: vec![("-ODD".into(), Some("y".into())), ("B".into(), None)],
         };
-        let c = ssh_command("host", &info, Some(dir.path()));
+        let c = ssh_command("host", &info, Some(dir.path())).unwrap();
         let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
             .args(["-c", &remote])

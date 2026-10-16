@@ -18,6 +18,7 @@ use super::{
     MAX_ALIASES,
 };
 use crate::host::ThreadHost;
+use crate::remote::BoxOp;
 
 impl Core {
     /// `thread.stop` of thread `id` for `caller` (see [`Hub::stop_thread_by`]).
@@ -71,8 +72,7 @@ impl Core {
             .get(&id)
             .map_or((false, false), |r| (r.live.is_some(), r.exiting));
         let view = self.view(&id)?.clone();
-        let box_offline =
-            hub.remotes.contains_key(&view.box_name) && !self.box_online(&view.box_name);
+        let box_offline = hub.has_remote(&view.box_name) && !self.box_online(&view.box_name);
         // After a hub restart a remote runtime is taken over only when its box connects
         // (`hub::runners`): until then the log is all the hub knows, and a runtime it shows
         // running may well still run there. Once the box is online, a runtime the hub does
@@ -142,7 +142,7 @@ impl Core {
         // a runtime not taken over yet: no forwarder would consume the id, and a later
         // session of the thread must not inherit it.)
         if let (Some(c), true) = (&remote_stop, live) {
-            if let Some(rbox) = hub.remotes.get(&c.box_name) {
+            if let Some(rbox) = hub.remote(&c.box_name) {
                 rbox.expect_stop(&id, &c.cmd_id);
             }
         }
@@ -187,7 +187,8 @@ impl Hub {
     /// (`project_found`).
     pub async fn new_thread_by(&self, req: NewThread, caller: &Caller) -> Result<Value, RpcError> {
         let cfg = &self.inner.config;
-        let (box_name, host, remote) = self.thread_box(&req)?;
+        // Held until the thread is recorded (or refused): its box is not switched meanwhile.
+        let (box_name, host, remote, mut op) = self.thread_box(&req)?;
         let found = self.find_project(&req, remote).await?;
         let target = self.thread_project(&req, &box_name, remote, found.as_deref())?;
         // A twr-managed worktree unless asked otherwise: `no_worktree`, or the project's
@@ -230,7 +231,7 @@ impl Hub {
         let workspace = workspace?;
         if core.shutting_down {
             drop(core);
-            workspace.discard(&self.inner, &box_name, &host);
+            workspace.discard(&self.inner, &box_name, &host, op.take());
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
         }
         // Again with the repository git found (the top level, symlinks resolved), under the
@@ -246,7 +247,7 @@ impl Hub {
             });
         if let Err(e) = refused {
             drop(core);
-            workspace.discard(&self.inner, &box_name, &host);
+            workspace.discard(&self.inner, &box_name, &host, op.take());
             return Err(e);
         }
         let mut twr = workspace.twr.clone();
@@ -308,7 +309,7 @@ impl Hub {
         let created = core.append_batch(&self.inner, batch);
         if let Err(e) = created {
             drop(core);
-            workspace.discard(&self.inner, &box_name, &host);
+            workspace.discard(&self.inner, &box_name, &host, op.take());
             return Err(append_err(e));
         }
         if let Some(project) = context_root {
@@ -477,9 +478,15 @@ impl Hub {
     }
 
     /// The box of a new thread (`box`, else the project's `box`, else `local`) with its host,
-    /// and whether it is a remote one: `box_offline` when it is not configured or its runner
-    /// is not connected.
-    fn thread_box(&self, req: &NewThread) -> Result<(String, Arc<dyn ThreadHost>, bool), RpcError> {
+    /// whether it is a remote one, and for one the operation on it begun with its gate check
+    /// ([`Core::reserve_box`]: the box is not switched while the thread's workspace is being
+    /// made): `box_offline` when it is not configured, its runner is not connected, or it is
+    /// being switched.
+    #[allow(clippy::type_complexity)]
+    fn thread_box(
+        &self,
+        req: &NewThread,
+    ) -> Result<(String, Arc<dyn ThreadHost>, bool, Option<BoxOp>), RpcError> {
         let cfg = &self.inner.config;
         let box_name = req
             .box_name
@@ -490,20 +497,24 @@ impl Hub {
                     .and_then(|p| p.box_name.clone())
             })
             .unwrap_or_else(|| LOCAL_BOX.into());
-        let Some(host) = self.inner.hosts.get(&box_name).cloned() else {
+        let Some(host) = self.inner.host(&box_name) else {
             return Err(rpc(
                 codes::BOX_OFFLINE,
-                format!("no box {box_name:?} is configured ([boxes.{box_name}] with a token)"),
+                format!("no box {box_name:?} is configured ([boxes.{box_name}])"),
             ));
         };
-        let remote = self.inner.remotes.get(&box_name);
+        let remote = self.inner.remote(&box_name);
         if remote.as_ref().is_some_and(|r| !r.is_ready()) {
             return Err(rpc(
                 codes::BOX_OFFLINE,
                 format!("box {box_name:?} is offline (its runner is not connected)"),
             ));
         }
-        Ok((box_name, host, remote.is_some()))
+        let op = match remote {
+            Some(_) => self.inner.core().reserve_box(&self.inner, &box_name)?,
+            None => None,
+        };
+        Ok((box_name, host, remote.is_some(), op))
     }
 
     /// The project of a new thread on box `box_name` (`remote`: a remote box): its name, its
@@ -522,11 +533,9 @@ impl Hub {
         if req.project.trim().is_empty() {
             return Err(rpc(codes::BAD_REQUEST, "project is required"));
         }
-        let box_project = cfg
-            .boxes
-            .get(box_name)
-            .filter(|_| remote)
-            .and_then(|b| b.projects.get(&req.project));
+        // The box's configuration as it was added (a box added live is not in `cfg`).
+        let box_cfg = remote.then(|| self.inner.box_config(box_name)).flatten();
+        let box_project = box_cfg.as_ref().and_then(|b| b.projects.get(&req.project));
         // A configured project on the hub's own box: the root its workspace resolves to is where
         // its standing context lives (`hub::context`).
         let configured_local =

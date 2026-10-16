@@ -1,0 +1,884 @@
+//! SSH boxes, the hub side: a box daemon of the twr-runner library runs in this process and
+//! stands in for the box; the hub reaches it as its ssh supervisor would (the daemon's socket,
+//! the sealed channel with a hub key, a WebSocket inside it) and serves the connection with
+//! `Hub::serve_sealed_runner`. Covered: a sealed box goes online and runs a fake runtime's
+//! turn, and a restarted hub takes its session over through the same daemon; the sealed
+//! handshake's refusals; the listener treating an SSH box as unknown; boxes added while the
+//! hub runs (`box.add`, `box.install`), with their refusals; `hub.info`'s box fields.
+//!
+//! Every hub here dials its SSH boxes with `TWR_SSH=false` (set once, first thing): its
+//! supervisor's probe fails at once, so the supervisor stays out of the way (and shows it).
+//! Its ssh part is covered end to end by the CLI's tests, with a fake ssh.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use futures::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use tokio::sync::oneshot;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
+use twr_adapters::FakeAdapter;
+use twr_core::adapter::Adapter;
+use twr_core::config::{BoxConfig, BoxTransport, Config};
+use twr_core::event::*;
+use twr_core::proto::codes;
+use twr_core::runner::{
+    auth_proof, hub_errors, new_nonce, Hello, HubMsg, Inventory, Prover, RunnerMsg, Secret,
+    PROTOCOL_VERSION, SEALED_AUTH_PROOF,
+};
+use twr_core::sealed::{hub_side, HubKey};
+use twr_hub::hub::SealedEnd;
+use twr_hub::listener::{pre_auth_ws_config, RunnerListener};
+use twr_hub::{Caller, Hub, HubOptions, NewThread};
+use twr_runner::daemon::{request, Request};
+use twr_runner::relay::DaemonPaths;
+use twr_runner::{DaemonOptions, LocalBox, RunnerOptions};
+
+const BOX: &str = "gpu";
+const WAIT: Duration = Duration::from_secs(20);
+
+// ------------------------------------------------------------------------------------------
+// Harness
+// ------------------------------------------------------------------------------------------
+
+/// Logs, and `TWR_SSH=false` before any hub runs (see the module docs). Std's environment is
+/// locked against its own process spawns, which are the only readers here.
+fn init() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("TWR_SSH", "false");
+        let _ = tracing_subscriber::fmt()
+            .with_test_writer()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .try_init();
+    });
+}
+
+/// The built-in adapters plus the fake runtime.
+fn with_fake() -> twr_hub::host::AdapterLookup {
+    Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
+        match name {
+            "fake" => Some(Arc::new(FakeAdapter::new())),
+            other => twr_adapters::find(other),
+        }
+    })
+}
+
+fn ssh_box() -> BoxConfig {
+    BoxConfig {
+        transport: Some(BoxTransport::Ssh),
+        ssh: Some("me@gpu.invalid".into()),
+        ..Default::default()
+    }
+}
+
+fn config() -> Config {
+    let mut c = Config {
+        default_runtime: "fake".into(),
+        ..Default::default()
+    };
+    c.boxes.insert(BOX.into(), ssh_box());
+    c
+}
+
+fn hub_opts(dir: &Path, cfg: Config) -> HubOptions {
+    init();
+    let mut o = HubOptions::new(dir.join("hub").join("twr.db"), cfg);
+    o.adapters = with_fake();
+    o.stop_timeout = Duration::from_secs(5);
+    o.git_tick = Some(Duration::ZERO);
+    o.stall_after = Some(Duration::ZERO);
+    o
+}
+
+async fn wait_for(what: &str, cond: impl Fn() -> bool) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !cond() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("timed out waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Box `name`'s entry of `hub.info`.
+fn box_info(hub: &Hub, name: &str) -> Value {
+    hub.info()["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == name)
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn online(hub: &Hub, name: &str) -> bool {
+    hub.boxes().iter().any(|(n, on, _)| n == name && *on)
+}
+
+/// A box daemon running in this process, as `twr runner --daemon` runs on a box.
+struct Daemon {
+    socket: PathBuf,
+    lbox: LocalBox,
+    stop: Option<oneshot::Sender<()>>,
+}
+
+impl Daemon {
+    async fn start(dir: &Path, key: &HubKey, name: &str) -> Daemon {
+        init();
+        let paths = DaemonPaths {
+            // In a directory of its own (the daemon makes it 0700, and refuses one others can
+            // write).
+            socket: dir.join("st/box-daemons/d.sock"),
+            data_dir: dir.join("data"),
+            lock: dir.join("st/locks/box.lock"),
+            log: dir.join("data/daemon.log"),
+        };
+        let mut opts = RunnerOptions::for_daemon(
+            name,
+            &paths.data_dir,
+            DaemonOptions {
+                socket: paths.socket.clone(),
+                hub_key: key.public(),
+                lock: paths.lock.clone(),
+                build: twr_core::build_id().map(str::to_string),
+            },
+        );
+        opts.ping_interval = Duration::from_millis(500);
+        opts.idle_timeout = Duration::from_secs(10);
+        opts.welcome_timeout = Duration::from_secs(10);
+        opts.shutdown_grace = Duration::from_secs(3);
+        let mut o = opts.box_options();
+        o.adapters = with_fake();
+        if !o.runtimes.iter().any(|r| r == "fake") {
+            o.runtimes.push("fake".into());
+        }
+        twr_core::paths::ensure_private_dir(&paths.data_dir).unwrap();
+        let lbox = LocalBox::open(o).unwrap();
+        let (tx, rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(twr_runner::run_with(opts, lbox.clone(), async move {
+            let _ = rx.await;
+        }));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while request(&paths.socket, Request::Status).await.is_err() {
+            assert!(!task.is_finished(), "the daemon ended: {:?}", task.await);
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon's socket"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        Daemon {
+            socket: paths.socket,
+            lbox,
+            stop: Some(tx),
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+/// Connects `hub` to the daemon on `socket` as its ssh supervisor does (the `connect`
+/// request, the sealed channel opened with `key`, a WebSocket accepted inside it with the
+/// small pre-authentication limits), and serves it in the background.
+async fn connect(
+    hub: &Hub,
+    socket: &Path,
+    key: &HubKey,
+    name: &str,
+) -> tokio::task::JoinHandle<SealedEnd> {
+    let (stream, _) = request(socket, Request::Connect).await.unwrap();
+    let (sealed, hello) = tokio::time::timeout(WAIT, hub_side(stream, key, name))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(hello.box_name, name);
+    let ws = tokio_tungstenite::accept_async_with_config(sealed, Some(pre_auth_ws_config()))
+        .await
+        .unwrap();
+    let (hub, name) = (hub.clone(), name.to_string());
+    tokio::spawn(async move { hub.serve_sealed_runner(ws, &name).await })
+}
+
+/// Waits for `thread`'s event of `kind` in turn `turn`.
+async fn until_turn_event(hub: &Hub, thread: &str, kind: &str, turn: u64) {
+    let mut sub = hub.subscribe_thread(thread, 0).unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let ev = sub.next().await.unwrap().expect("hub stopped");
+            if ev.kind() == kind && ev.turn == Some(turn) {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no {kind} of turn {turn}"));
+}
+
+fn count(hub: &Hub, thread: &str, kind: &str) -> usize {
+    hub.thread_events(thread, 0, 100_000)
+        .unwrap()
+        .1
+        .iter()
+        .filter(|e| e.kind() == kind)
+        .count()
+}
+
+/// A raw runner's end of a sealed connection served by `hub` for `name` (no channel: the
+/// WebSocket over an in-memory pipe), and the hub's serving task.
+async fn raw_sealed(
+    hub: &Hub,
+    name: &str,
+) -> (
+    WebSocketStream<tokio::io::DuplexStream>,
+    impl std::future::Future<Output = SealedEnd>,
+) {
+    let (hub_end, runner_end) = tokio::io::duplex(1 << 20);
+    let (hub, name) = (hub.clone(), name.to_string());
+    let served = tokio::spawn(async move {
+        let ws =
+            WebSocketStream::from_raw_socket(hub_end, Role::Server, Some(pre_auth_ws_config()))
+                .await;
+        hub.serve_sealed_runner(ws, &name).await
+    });
+    let runner = WebSocketStream::from_raw_socket(runner_end, Role::Client, None).await;
+    (runner, async move { served.await.unwrap() })
+}
+
+async fn send<S>(ws: &mut WebSocketStream<S>, m: &RunnerMsg)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    ws.send(Message::Text(serde_json::to_string(m).unwrap().into()))
+        .await
+        .unwrap();
+}
+
+/// The hub's next message, `None` once it closed.
+async fn next<S>(ws: &mut WebSocketStream<S>) -> Option<HubMsg>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        match tokio::time::timeout(WAIT, ws.next())
+            .await
+            .expect("no message")
+        {
+            Some(Ok(Message::Text(t))) => match serde_json::from_str(t.as_str()).unwrap() {
+                HubMsg::Ping | HubMsg::Pong => continue,
+                m => return Some(m),
+            },
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+            Some(Ok(_)) => continue,
+        }
+    }
+}
+
+fn hello(name: &str, protocol: u32) -> RunnerMsg {
+    RunnerMsg::Hello(Hello {
+        box_name: name.into(),
+        protocol,
+        nonce: new_nonce().unwrap(),
+    })
+}
+
+fn assert_error(m: Option<HubMsg>, code: &str) -> String {
+    match m {
+        Some(HubMsg::Error { code: c, message }) => {
+            assert_eq!(c, code, "{message}");
+            message
+        }
+        other => panic!("expected error {code}, got {other:?}"),
+    }
+}
+
+fn user() -> Caller {
+    Caller::user("test")
+}
+
+// ------------------------------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------------------------------
+
+/// A sealed box goes online and a fake runtime's turn runs on it; `hub.info` says so. The hub
+/// restarts: the runtime keeps running on the box, and the new hub, connecting to the same
+/// daemon, takes its session over (no new runtime, no crash) and runs the next turn on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_box_runs_turns_and_a_restarted_hub_takes_its_session_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = HubKey::generate().unwrap();
+    let daemon = Daemon::start(&dir.path().join("box"), &key, BOX).await;
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+    // The supervisor's ssh fails here (`TWR_SSH=false`): the box is offline, and says why.
+    let h = hub.clone();
+    wait_for("the supervisor's failed probe", move || {
+        let b = box_info(&h, BOX);
+        b["state"] == "offline"
+            && b["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("probing on box gpu failed (exit 1)"))
+    })
+    .await;
+    let b = box_info(&hub, BOX);
+    assert_eq!(b["transport"], "ssh");
+    assert_eq!(b["online"], false);
+    assert_eq!(b["switch_pending"], false);
+    assert_eq!(b["notes"], json!([]));
+
+    let served = connect(&hub, &daemon.socket, &key, BOX).await;
+    let h = hub.clone();
+    wait_for("the box online", move || online(&h, BOX)).await;
+    let b = box_info(&hub, BOX);
+    assert_eq!(
+        (&b["state"], &b["online"], &b["transport"]),
+        (&json!("online"), &json!(true), &json!("ssh")),
+        "{b}"
+    );
+    assert_eq!(b["version"], twr_runner::client::version());
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let req = NewThread {
+        project: project.to_string_lossy().into_owned(),
+        runtime: Some("fake".into()),
+        name: Some("remote1".into()),
+        box_name: Some(BOX.into()),
+        ..Default::default()
+    };
+    let t = hub.new_thread(req, "test").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.send(
+        &t,
+        "alpha beta",
+        TurnFrom::User,
+        Source::User("test".into()),
+    )
+    .unwrap();
+    until_turn_event(&hub, &t, "turn.ended", 1).await;
+    assert_eq!(daemon.lbox.live_count(), 1);
+
+    // The hub restarts; the runtime runs on.
+    hub.shutdown().await;
+    let end = tokio::time::timeout(WAIT, served).await.unwrap().unwrap();
+    assert!(end.welcomed && end.protocol_refused.is_none(), "{end:?}");
+    assert_eq!(end.build.as_deref(), twr_core::build_id());
+    drop(hub);
+    assert_eq!(daemon.lbox.live_count(), 1);
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+    let _served = connect(&hub, &daemon.socket, &key, BOX).await;
+    let h = hub.clone();
+    wait_for("the box online again", move || online(&h, BOX)).await;
+    assert_eq!(hub.get_thread(&t).unwrap()["live"], true);
+    hub.send(&t, "gamma", TurnFrom::User, Source::User("test".into()))
+        .unwrap();
+    until_turn_event(&hub, &t, "turn.ended", 2).await;
+    assert_eq!(count(&hub, &t, "thread.started"), 1);
+    assert_eq!(count(&hub, &t, "thread.resumed"), 0);
+    assert_eq!(count(&hub, &t, "thread.crashed"), 0);
+    assert_eq!(daemon.lbox.live_count(), 1);
+    hub.shutdown().await;
+}
+
+/// A sealed connection is bound to its box: a hello for another box and an `auth` with a
+/// proof are `unauthorized`; a runner of another protocol is refused and the supervisor told;
+/// the empty proof is authenticated, and the session ends welcomed with its inventory's
+/// build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sealed_handshake_is_bound_to_its_box() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+
+    let (mut ws, served) = raw_sealed(&hub, BOX).await;
+    send(&mut ws, &hello("other", PROTOCOL_VERSION)).await;
+    let m = assert_error(next(&mut ws).await, hub_errors::UNAUTHORIZED);
+    assert!(m.contains("box gpu's"), "{m}");
+    assert_eq!(served.await, SealedEnd::default());
+
+    let (mut ws, served) = raw_sealed(&hub, BOX).await;
+    send(&mut ws, &hello(BOX, PROTOCOL_VERSION)).await;
+    assert!(matches!(
+        next(&mut ws).await,
+        Some(HubMsg::Challenge { .. })
+    ));
+    let token = Secret::new("a-token-0123456789abcdef");
+    let proof = auth_proof(&token, Prover::Runner, BOX, &new_nonce().unwrap(), "x");
+    send(&mut ws, &RunnerMsg::Auth { proof }).await;
+    assert_error(next(&mut ws).await, hub_errors::UNAUTHORIZED);
+    assert_eq!(served.await, SealedEnd::default());
+    let r = hub.box_refusal(BOX).unwrap();
+    assert!(
+        r.reason.contains("sent a proof on a sealed connection"),
+        "{}",
+        r.reason
+    );
+
+    let (mut ws, served) = raw_sealed(&hub, BOX).await;
+    send(&mut ws, &hello(BOX, PROTOCOL_VERSION + 1)).await;
+    assert_error(next(&mut ws).await, hub_errors::PROTOCOL);
+    assert_eq!(served.await.protocol_refused, Some(PROTOCOL_VERSION + 1));
+
+    let (mut ws, served) = raw_sealed(&hub, BOX).await;
+    send(&mut ws, &hello(BOX, PROTOCOL_VERSION)).await;
+    assert!(matches!(
+        next(&mut ws).await,
+        Some(HubMsg::Challenge { .. })
+    ));
+    send(
+        &mut ws,
+        &RunnerMsg::Auth {
+            proof: SEALED_AUTH_PROOF.into(),
+        },
+    )
+    .await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Authenticated)));
+    let inv = Inventory {
+        version: "9.9.9-raw".into(),
+        runtimes: vec!["fake".into()],
+        worktrees: "/nonexistent".into(),
+        build: Some("0123456789abcdef".into()),
+        ..Default::default()
+    };
+    // Large once authenticated: past the pre-authentication limit.
+    let mut big = inv.clone();
+    big.runtimes
+        .extend((0..2000).map(|i| format!("runtime-{i:04}")));
+    send(&mut ws, &RunnerMsg::Inventory(big)).await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Welcome { .. })));
+    assert!(
+        hub.box_refusal(BOX).is_none(),
+        "an authenticated connection clears it"
+    );
+    drop(ws);
+    let end = served.await;
+    assert_eq!(
+        end,
+        SealedEnd {
+            welcomed: true,
+            protocol_refused: None,
+            build: Some("0123456789abcdef".into()),
+        }
+    );
+    hub.shutdown().await;
+}
+
+/// On the listener an SSH box is a box the hub does not know: a random proof, then
+/// `unauthorized`, and no refusal recorded for the box.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_listener_refuses_an_ssh_box() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = config();
+    cfg.hub.listen = Some("127.0.0.1:0".into());
+    let l = RunnerListener::bind(&cfg.hub).await.unwrap().unwrap();
+    let url = l.url();
+    let hub = Hub::open(hub_opts(dir.path(), cfg)).await.unwrap();
+    let _server = l.serve(hub.clone());
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    let nonce = new_nonce().unwrap();
+    send(
+        &mut ws,
+        &RunnerMsg::Hello(Hello {
+            box_name: BOX.into(),
+            protocol: PROTOCOL_VERSION,
+            nonce: nonce.clone(),
+        }),
+    )
+    .await;
+    let Some(HubMsg::Challenge {
+        nonce: hub_nonce,
+        proof,
+    }) = next(&mut ws).await
+    else {
+        panic!("no challenge")
+    };
+    assert_eq!(proof.len(), 64);
+    // Not a proof over an empty token either.
+    let empty = Secret::new("");
+    assert_ne!(
+        proof,
+        auth_proof(&empty, Prover::Hub, BOX, &nonce, &hub_nonce)
+    );
+    let mine = auth_proof(&empty, Prover::Runner, BOX, &nonce, &hub_nonce);
+    send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+    let m = assert_error(next(&mut ws).await, hub_errors::UNAUTHORIZED);
+    assert_eq!(m, "unknown box or bad token");
+    assert!(hub.box_refusal(BOX).is_none());
+    assert!(!online(&hub, BOX));
+    hub.shutdown().await;
+}
+
+/// `box.add` reads config.toml and boxes.toml again and adds a token box (its short token a
+/// warning; its runner can authenticate on the listener at once) and an SSH box (its
+/// configured project used by `thread.new` once its daemon is connected); `config.show`
+/// lists both with their transports. Refused: a box the hub has (nothing replaced), one in
+/// neither file, files that do not parse, a short token, the orchestrator (agents cannot call
+/// it at all), a named workspace. `box.install` wakes an SSH box only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn boxes_are_added_while_the_hub_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let config_file = cfg_dir.join("config.toml");
+    let boxes_file = cfg_dir.join("boxes.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    let mut cfg = Config::load_with_boxes(&config_file).unwrap();
+    cfg.hub.listen = Some("127.0.0.1:0".into());
+    let l = RunnerListener::bind(&cfg.hub).await.unwrap().unwrap();
+    let url = l.url();
+    let mut opts = hub_opts(dir.path(), cfg);
+    opts.config_file = Some(config_file.clone());
+    let hub = Hub::open(opts).await.unwrap();
+    let _server = l.serve(hub.clone());
+    let lab_token = "lab-token-0123456789";
+    let project = dir.path().join("api");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        &boxes_file,
+        format!(
+            "[boxes.lab]\ntoken = \"{lab_token}\"\n\n[boxes.far]\ntransport = \"ssh\"\nssh = \
+             \"me@far.invalid\"\n\n[boxes.far.projects.api]\nrepo = \"{}\"\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+
+    let v = hub.box_add("lab", &user()).await.unwrap();
+    assert_eq!(
+        v,
+        json!({"box": "lab", "transport": "token", "listening": true, "already": false})
+    );
+    let warnings = hub.info()["warnings"].to_string();
+    assert!(warnings.contains("boxes.lab.token is short"), "{warnings}");
+    assert!(!warnings.contains(lab_token), "{warnings}");
+    // Its runner authenticates on the listener now.
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    let nonce = new_nonce().unwrap();
+    send(
+        &mut ws,
+        &RunnerMsg::Hello(Hello {
+            box_name: "lab".into(),
+            protocol: PROTOCOL_VERSION,
+            nonce: nonce.clone(),
+        }),
+    )
+    .await;
+    let Some(HubMsg::Challenge { nonce: hn, .. }) = next(&mut ws).await else {
+        panic!("no challenge")
+    };
+    let proof = auth_proof(&Secret::new(lab_token), Prover::Runner, "lab", &nonce, &hn);
+    send(&mut ws, &RunnerMsg::Auth { proof }).await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Authenticated)));
+    drop(ws);
+
+    let v = hub.box_add("far", &user()).await.unwrap();
+    assert_eq!(v["transport"], "ssh");
+    let b = box_info(&hub, "far");
+    assert_eq!(
+        (&b["transport"], &b["online"]),
+        (&json!("ssh"), &json!(false))
+    );
+    assert_eq!(box_info(&hub, "lab")["transport"], "token");
+    assert_eq!(box_info(&hub, "lab")["switch_pending"], Value::Null);
+    let shown = hub.config_show();
+    assert_eq!(shown["boxes"]["lab"]["transport"], "token");
+    assert_eq!(shown["boxes"]["far"]["transport"], "ssh");
+    assert!(!shown.to_string().contains("far.invalid"), "{shown}");
+
+    // Its daemon connected, `thread.new` finds the project boxes.toml gives it.
+    let key = HubKey::generate().unwrap();
+    let daemon = Daemon::start(&dir.path().join("far"), &key, "far").await;
+    let _served = connect(&hub, &daemon.socket, &key, "far").await;
+    let h = hub.clone();
+    wait_for("far online", move || online(&h, "far")).await;
+    let req = NewThread {
+        project: "api".into(),
+        runtime: Some("fake".into()),
+        name: Some("on-far".into()),
+        box_name: Some("far".into()),
+        ..Default::default()
+    };
+    let t = hub.new_thread(req, "test").await.unwrap();
+    assert_eq!(t["box_name"], "far");
+    assert_eq!(t["repo"], project.to_string_lossy().as_ref(), "{t}");
+
+    // A box the hub has: conflict, and nothing replaced.
+    std::fs::write(
+        &boxes_file,
+        "[boxes.lab]\ntransport = \"ssh\"\nssh = \"me@lab.invalid\"\n",
+    )
+    .unwrap();
+    let e = hub.box_add("lab", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{}", e.message);
+    assert_eq!(box_info(&hub, "lab")["transport"], "token");
+    // As the files say it (its build aside): nothing to do, and it says so.
+    std::fs::write(
+        &boxes_file,
+        format!(
+            "[boxes.far]\ntransport = \"ssh\"\nssh = \"me@far.invalid\"\nbuild = \
+             \"0123456789abcdef\"\n\n[boxes.far.projects.api]\nrepo = \"{}\"\n",
+            project.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(hub.box_add("far", &user()).await.unwrap()["already"], true);
+    // In neither file; files that do not parse; a short token.
+    let e = hub.box_add("nope", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
+    std::fs::write(&boxes_file, "[boxes.x\n").unwrap();
+    let e = hub.box_add("x", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(e.message.contains("boxes.toml"), "{}", e.message);
+    std::fs::write(&boxes_file, "[boxes.tiny]\ntoken = \"0123456789\"\n").unwrap();
+    let e = hub.box_add("tiny", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(
+        e.message.contains("boxes.tiny.token is too short"),
+        "{}",
+        e.message
+    );
+    assert!(!e.message.contains("0123456789"), "{}", e.message);
+    assert_eq!(box_info(&hub, "tiny"), Value::Null);
+    // `ssh` words that would forward something: an SSH box's, and a token box's (`twr
+    // attach` runs them).
+    for (name, file, says) in [
+        (
+            "fwd",
+            "[boxes.fwd]\ntransport = \"ssh\"\nssh = \"-qoForwardAgent=yes me@fwd\"\n".to_string(),
+            "`-o ForwardAgent=yes`: it forwards your ssh agent",
+        ),
+        (
+            "x11",
+            format!("[boxes.x11]\ntoken = \"{lab_token}\"\nssh = \"-X me@x11\"\n"),
+            "boxes.x11.ssh = \"-X me@x11\": `-X`",
+        ),
+    ] {
+        std::fs::write(&boxes_file, file).unwrap();
+        let e = hub.box_add(name, &user()).await.unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+        assert!(e.message.contains(says), "{}", e.message);
+        assert_eq!(box_info(&hub, name), Value::Null);
+    }
+    // Users only.
+    let e = hub
+        .box_add("tiny", &Caller::Orchestrator)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
+    let e = hub
+        .box_install("far", &Caller::Orchestrator)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
+    for m in ["box.add", "box.install"] {
+        assert!(twr_hub::server::METHODS.contains(&m));
+        assert!(!twr_hub::server::AGENT_METHODS.contains(&m));
+        assert!(!twr_hub::server::ORCHESTRATOR_METHODS.contains(&m));
+    }
+    // `box.install`: SSH boxes only.
+    assert_eq!(
+        hub.box_install("far", &user()).await.unwrap(),
+        json!({"box": "far"})
+    );
+    // It takes the box's new build, and nothing else: a box whose settings changed since
+    // the hub added it (the CLI installed at another destination than the one the hub dials)
+    // is a conflict until the hub restarts.
+    let far = |ssh: &str| {
+        format!(
+            "[boxes.far]\ntransport = \"ssh\"\nssh = \"{ssh}\"\nbuild = \"0123456789abcdef\"\n\n\
+             [boxes.far.projects.api]\nrepo = \"{}\"\n",
+            project.display()
+        )
+    };
+    std::fs::write(&boxes_file, far("me@elsewhere.invalid")).unwrap();
+    let e = hub.box_install("far", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{}", e.message);
+    assert!(
+        e.message.contains("`twr hub stop`, then `twr`"),
+        "{}",
+        e.message
+    );
+    std::fs::write(&boxes_file, far("me@far.invalid")).unwrap();
+    assert_eq!(
+        hub.box_install("far", &user()).await.unwrap(),
+        json!({"box": "far"})
+    );
+    let e = hub.box_install("lab", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST);
+    let e = hub.box_install("nope", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND);
+    hub.shutdown().await;
+
+    // A named workspace's hub adds none.
+    std::fs::write(
+        &boxes_file,
+        "[boxes.w]\ntransport = \"ssh\"\nssh = \"me@w\"\n",
+    )
+    .unwrap();
+    let mut opts = hub_opts(&dir.path().join("ws"), Config::default());
+    opts.config_file = Some(config_file);
+    opts.workspace = Some("client-x".into());
+    let hub = Hub::open(opts).await.unwrap();
+    let e = hub.box_add("w", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    hub.shutdown().await;
+
+    // A hub does not start with a box whose `ssh` would forward something.
+    let mut cfg = Config::default();
+    cfg.boxes.insert(
+        "lab".into(),
+        BoxConfig {
+            token: Some(lab_token.into()),
+            ssh: Some("-A me@lab".into()),
+            ..BoxConfig::default()
+        },
+    );
+    let e = Hub::open(hub_opts(&dir.path().join("fwd"), cfg))
+        .await
+        .err()
+        .expect("refused");
+    assert!(format!("{e:#}").contains("boxes.lab.ssh"), "{e:#}");
+}
+
+/// Concurrent adds of one box: one adds it, the others find it there as the files say
+/// (`already`), and the hub has one such box (with one supervisor).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_adds_of_one_box_add_it_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_file = dir.path().join("config.toml");
+    std::fs::write(&config_file, "").unwrap();
+    std::fs::write(
+        dir.path().join("boxes.toml"),
+        "[boxes.c2]\ntransport = \"ssh\"\nssh = \"me@c2.invalid\"\n",
+    )
+    .unwrap();
+    let mut opts = hub_opts(dir.path(), Config::default());
+    opts.config_file = Some(config_file);
+    let hub = Hub::open(opts).await.unwrap();
+    let adds: Vec<_> = (0..8)
+        .map(|_| {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.box_add("c2", &user()).await })
+        })
+        .collect();
+    let mut added = 0;
+    for a in adds {
+        let v = a.await.unwrap().unwrap();
+        if v["already"] == false {
+            added += 1;
+        }
+    }
+    assert_eq!(added, 1);
+    let boxes = hub.info()["boxes"].clone();
+    assert_eq!(boxes.as_array().unwrap().len(), 1, "{boxes}");
+    // Its one supervisor runs (and fails to probe here).
+    let h = hub.clone();
+    wait_for("the supervisor's failed probe", move || {
+        box_info(&h, "c2")["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("probing on box c2"))
+    })
+    .await;
+    hub.shutdown().await;
+}
+
+/// A delete card confirmed after one of its threads was deleted and restored is replaced by a
+/// card for the others; when the box of every other one is offline by then, the user's
+/// confirmed intent is not dropped silently: an error item on each says the deletion did not
+/// happen and why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_card_whose_box_went_offline_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = HubKey::generate().unwrap();
+    let daemon = Daemon::start(&dir.path().join("box"), &key, BOX).await;
+    let hub = Hub::open(hub_opts(dir.path(), config())).await.unwrap();
+    let _served = connect(&hub, &daemon.socket, &key, BOX).await;
+    let h = hub.clone();
+    wait_for("the box online", move || online(&h, BOX)).await;
+    let repo = twr_core::testkit::git::init_repo(&dir.path().join("repo"));
+    let mut ids = Vec::new();
+    for name in ["a", "b"] {
+        let req = NewThread {
+            project: repo.to_string_lossy().into_owned(),
+            runtime: Some("fake".into()),
+            name: Some(name.into()),
+            box_name: Some(BOX.into()),
+            ..Default::default()
+        };
+        ids.push(
+            hub.new_thread(req, "test").await.unwrap()["id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    let (a, b) = (ids[0].clone(), ids[1].clone());
+    let ask = |threads: &[&str]| {
+        let threads: Vec<String> = threads.iter().map(|t| t.to_string()).collect();
+        let hub = hub.clone();
+        async move { hub.delete_threads(&threads, &user()).await.unwrap() }
+    };
+    let answer = |card: &Value| {
+        hub.respond_at(
+            card["attn_id"].as_str().unwrap(),
+            twr_core::adapter::Answer::new("Delete"),
+            card["revision"].as_u64(),
+            &user(),
+        )
+    };
+    let ab = ask(&["a", "b"]).await;
+    let only_a = ask(&["a"]).await;
+    answer(&only_a).unwrap();
+    let h = hub.clone();
+    let id = a.clone();
+    wait_for("a deleted", move || h.thread_view(&id).is_err()).await;
+    let item = hub
+        .control_read(0, 100_000)
+        .unwrap()
+        .0
+        .into_iter()
+        .find_map(|(_, e)| match e.body {
+            EventBody::ThreadDeleted(d) if e.thread == a => d.trash,
+            _ => None,
+        })
+        .expect("a's trash item");
+    hub.trash_restore(&item, None, &user()).await.unwrap();
+    assert!(hub.thread_view(&a).is_ok());
+
+    // The box goes offline; then the card from before is confirmed.
+    drop(daemon);
+    let h = hub.clone();
+    wait_for("the box offline", move || !online(&h, BOX)).await;
+    answer(&ab).unwrap();
+    let h = hub.clone();
+    let id = b.clone();
+    wait_for("an item on b saying why", move || {
+        h.attention_list(true).iter().any(|i| {
+            i["thread"] == json!(id)
+                && i["summary"].as_str().is_some_and(|s| {
+                    s.contains(&format!(
+                        "card {} was confirmed, but",
+                        ab["attn_id"].as_str().unwrap()
+                    )) && s.contains("offline")
+                })
+        })
+    })
+    .await;
+    assert!(hub.thread_view(&b).is_ok(), "b is still there");
+    hub.shutdown().await;
+}

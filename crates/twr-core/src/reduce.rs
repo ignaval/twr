@@ -2152,6 +2152,38 @@ mod tests {
         assert_eq!(replayed.get("t1"), Some(&v));
     }
 
+    /// The `thread.stopped` of a box switch (`box_upgrade`) folds like a mode restart's: the
+    /// thread keeps its session and is not stopped, live and on replay; a plain stop after it
+    /// still stops.
+    #[test]
+    fn a_box_upgrade_is_no_stop() {
+        let mut s = ThreadScript::new("t1");
+        let upgrade = SessionPayload {
+            session_id: Some("sess-1".into()),
+            ext: serde_json::json!({"twr": {"reason": BOX_UPGRADE_REASON}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        let mut evs = vec![
+            s.created("api"),
+            s.started("sess-1"),
+            s.turn_started("go"),
+            s.turn_ended(TurnResult::Completed),
+            s.event(EventBody::ThreadStopped(upgrade)),
+        ];
+        let v = view(&evs);
+        assert!(!v.stopped, "a box upgrade is no stop");
+        assert_eq!(v.status(), S::Idle);
+        assert_eq!(v.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        evs.push(s.started("sess-1"));
+        evs.push(s.stopped());
+        let v = view(&evs);
+        assert!(v.stopped, "a plain stop still stops");
+        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+    }
+
     /// The model and effort start as `thread.created`'s `ext.twr.model` / `ext.twr.effort`
     /// (none in a log from before efforts), then follow `thread.model_changed` (a cleared value
     /// is the runtime's default again); the `thread.stopped` of a model restart closes the

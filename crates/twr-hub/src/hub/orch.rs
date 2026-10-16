@@ -1085,9 +1085,7 @@ impl Inner {
             Ok(None) => runtime.to_string(),
             Err(_) => return false,
         };
-        self.hosts
-            .get(LOCAL_BOX)
-            .is_some_and(|h| h.has_runtime(&name))
+        self.host(LOCAL_BOX).is_some_and(|h| h.has_runtime(&name))
     }
 
     /// The local runtimes that can be the orchestrator ([`ThreadHost::hosts_orchestrator`]),
@@ -1095,7 +1093,7 @@ impl Inner {
     ///
     /// [`ThreadHost::hosts_orchestrator`]: crate::host::ThreadHost::hosts_orchestrator
     pub(super) fn orchestrator_runtimes(&self) -> Vec<String> {
-        let Some(host) = self.hosts.get(LOCAL_BOX) else {
+        let Some(host) = self.host(LOCAL_BOX) else {
             return Vec::new();
         };
         let mut out: Vec<String> = twr_adapters::registry_with(true)
@@ -1129,7 +1127,7 @@ impl Inner {
                 let fix = "install the agent, or fix the runtime's command";
                 Some((PathBuf::from(a.command.first()?), fix.to_string()))
             }),
-            None => self.hosts.get(LOCAL_BOX).and_then(|h| h.program(runtime)),
+            None => self.host(LOCAL_BOX).and_then(|h| h.program(runtime)),
         };
         Ok(self.check_program(program))
     }
@@ -1290,8 +1288,7 @@ impl Core {
         };
         command
             && hub
-                .hosts
-                .get(LOCAL_BOX)
+                .host(LOCAL_BOX)
                 .is_some_and(|h| h.has_runtime(&view.runtime))
     }
 
@@ -3282,8 +3279,8 @@ impl Hub {
             }
             None => runtime.to_string(),
         };
-        let local = self.inner.hosts.get(LOCAL_BOX);
-        if !local.is_some_and(|h| h.has_runtime(&adapter)) {
+        let local = self.inner.host(LOCAL_BOX);
+        if !local.as_ref().is_some_and(|h| h.has_runtime(&adapter)) {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!(

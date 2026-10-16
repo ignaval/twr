@@ -1,4 +1,5 @@
-//! `config.toml`. Every field has a default; a missing file means all defaults.
+//! `config.toml`, and `boxes.toml` next to it ([`BoxesFile`]: the boxes `twr box add` wrote,
+//! merged into `[boxes]`). Every field has a default; a missing file means all defaults.
 //!
 //! ```toml
 //! default_runtime = "claude-code"
@@ -21,13 +22,23 @@
 //! tls = { cert = "/etc/twr/hub.pem", key = "/etc/twr/hub.key" }   # serve wss:// (PEM files)
 //! allow_insecure_remote = false            # plain ws:// on the network (events in clear text)
 //!
+//! # A box the hub reaches over ssh: it runs twr there itself (`twr box add gpu me@gpu.lan`
+//! # writes this table to boxes.toml).
 //! [boxes.gpu]
-//! token = "..."                 # the runner's token (`--token-file` / TWR_RUNNER_TOKEN); never logged
-//!                               # or sent (16 characters at least; `twr runner token` prints one)
-//! ssh = "me@gpu.lan"            # `twr attach` runs `ssh -t <ssh> -- <command>` for its threads
+//! transport = "ssh"             # unset = "token"
+//! ssh = "me@gpu.lan"            # the hub's `ssh` destination; `twr attach` runs `ssh -t <ssh> --
+//!                               # <command>` for its threads
+//! build = "0123456789abcdef"    # the twr build to run there, when the box's OS or CPU is not the
+//!                               # hub's (`twr box install` writes it); unset = the hub's own
 //!
 //! [boxes.gpu.projects.api]      # where project `api` lives on that box
 //! repo = "/srv/src/api"
+//!
+//! # A box whose runner connects to the hub's listener (`[hub] listen`) with a token.
+//! [boxes.lab]
+//! token = "..."                 # the runner's token (`--token-file` / TWR_RUNNER_TOKEN); never logged
+//!                               # or sent (16 characters at least; `twr runner token` prints one)
+//! ssh = "me@lab.lan"            # optional: `twr attach` runs `ssh -t <ssh> -- <command>`
 //!
 //! [projects.api]
 //! repo = "/home/me/src/api"
@@ -377,29 +388,265 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-/// `[boxes.<name>]`: a remote box whose runner connects to the hub.
+/// `[boxes.<name>]`: a remote box, which the hub reaches over ssh or whose runner connects to
+/// the hub ([`BoxConfig::transport`]).
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BoxConfig {
+    /// How the hub and the box's runner find each other; `None` is [`BoxTransport::Token`],
+    /// what every box was before SSH boxes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transport: Option<BoxTransport>,
     /// Token the box's runner authenticates with (compared in constant time; never logged).
-    /// A box without one cannot connect.
+    /// A token box without one cannot connect; an SSH box has none ([`Config::validate`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// `ssh` destination of the box (`user@host`, or a `~/.ssh/config` host; whitespace
-    /// separates extra `ssh` arguments placed before it, e.g. `-p 2222 me@host`): `twr attach`
-    /// on its threads runs `ssh -t <ssh> -- <command>`.
+    /// separates extra `ssh` arguments placed before it, e.g. `-p 2222 me@host`, none that
+    /// forwards anything or changes how ssh runs: [`check_ssh_words`]): `twr attach` on its
+    /// threads runs `ssh -t <ssh> -- <command>`, and the hub connects to an SSH box with it
+    /// (required there).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
+    /// The build id ([`crate::build_id`], 16 lowercase hex digits) of the twr installed on an
+    /// SSH box whose OS or CPU is not the hub's, which the hub cannot upload its own
+    /// executable to: `twr box install` uploads a build for that target and writes its id
+    /// here, and the hub runs that build. `None`: the hub's own build. SSH boxes only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
     /// Projects on this box: where each repository lives there.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub projects: BTreeMap<String, BoxProjectConfig>,
+}
+
+impl BoxConfig {
+    /// How the hub and the box's runner find each other: `transport`, else
+    /// [`BoxTransport::Token`].
+    pub fn transport(&self) -> BoxTransport {
+        self.transport.unwrap_or_default()
+    }
+
+    /// [`Config::validate`]'s checks of box `name`: an SSH box has an `ssh` destination that
+    /// [`check_ssh_words`] accepts and no token; `build`, on SSH boxes only, is a build id. (A
+    /// token box's `ssh`, which only `twr attach` uses, is the hub's to check: every twr
+    /// command loads the config, and one written before the check must not keep `twr hub
+    /// stop` from working.)
+    fn check(&self, name: &str) -> anyhow::Result<()> {
+        match self.transport() {
+            BoxTransport::Ssh => {
+                if self.ssh.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                    anyhow::bail!(
+                        "boxes.{name}: an SSH box (transport = \"ssh\") needs `ssh`, the \
+                         destination the hub connects to (`me@host`)"
+                    );
+                }
+                self.check_ssh(name)?;
+                if self.token.is_some() {
+                    anyhow::bail!(
+                        "boxes.{name}.token: an SSH box has no token, the hub connects to it \
+                         over ssh (remove the token, or the transport for a box whose runner \
+                         connects to the hub)"
+                    );
+                }
+            }
+            BoxTransport::Token => {
+                if self.build.is_some() {
+                    anyhow::bail!(
+                        "boxes.{name}.build: only an SSH box (transport = \"ssh\") has a build"
+                    );
+                }
+            }
+        }
+        if let Some(id) = &self.build {
+            if !crate::valid_build_id(id) {
+                anyhow::bail!(
+                    "boxes.{name}.build: {id:?} is not a build id ({} lowercase hex digits; \
+                     `twr box install` writes it)",
+                    crate::BUILD_ID_LEN
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// [`check_ssh_words`] of the box's `ssh` (none, or only spaces: nothing to check), as an
+    /// error naming `boxes.<name>.ssh`.
+    pub fn check_ssh(&self, name: &str) -> anyhow::Result<()> {
+        match self.ssh.as_deref().filter(|s| !s.trim().is_empty()) {
+            Some(ssh) => check_ssh_words(ssh)
+                .map_err(|why| anyhow::anyhow!("boxes.{name}.ssh = {ssh:?}: {why}")),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The `ssh` options that take a value (OpenSSH's `ssh` option letters: a value follows the
+/// letter in the same word, or is the next word).
+const SSH_VALUE_OPTIONS: &str = "BDEFIJLOPQRSWbceilmopw";
+
+/// The `ssh` options without a value that a box's `ssh` may hold (the rest are refused,
+/// [`ssh_flag_refusal`]).
+const SSH_PLAIN_OPTIONS_OK: &str = "1246Cagkqvx";
+
+/// Why `ssh` option `-<flag>` (a value one when [`SSH_VALUE_OPTIONS`] has it) has no place in
+/// a box's `ssh`; `None` when it may be there.
+fn ssh_flag_refusal(flag: char) -> Option<&'static str> {
+    Some(match flag {
+        'A' => "it forwards your ssh agent to the box",
+        'K' => "it forwards your GSSAPI (Kerberos) credentials to the box",
+        'X' | 'Y' => "it forwards your X11 display to the box",
+        'L' | 'R' | 'D' => "it forwards ports",
+        'w' => "it forwards a tunnel device",
+        'W' => "it forwards ssh's stdin and stdout to a port instead of running twr",
+        'M' | 'S' | 'O' => "it controls a shared (multiplexed) ssh connection",
+        'N' | 's' => "ssh would run no command, or a subsystem, instead of twr",
+        'f' => "ssh would go to the background",
+        't' | 'T' => "twr decides whether ssh gets a terminal (`twr attach` asks for one)",
+        'n' => "ssh would not read stdin, which carries the hub's connection",
+        'G' | 'Q' | 'V' => "ssh would only print something and exit",
+        'E' | 'y' => "ssh's own errors would go to a log instead of the hub",
+        _ if SSH_VALUE_OPTIONS.contains(flag) || SSH_PLAIN_OPTIONS_OK.contains(flag) => {
+            return None
+        }
+        _ => "twr does not know that ssh option",
+    })
+}
+
+/// Why `ssh -o <key>=...` has no place in a box's `ssh` (`key` compared without regard to
+/// case); `None` when it may be there.
+fn ssh_option_refusal(key: &str) -> Option<&'static str> {
+    let key = key.to_ascii_lowercase();
+    Some(match key.as_str() {
+        "forwardagent" => "it forwards your ssh agent to the box",
+        "gssapidelegatecredentials" => "it forwards your GSSAPI (Kerberos) credentials",
+        "forwardx11" | "forwardx11trusted" => "it forwards your X11 display to the box",
+        "localforward" | "remoteforward" | "dynamicforward" | "clearallforwardings" => {
+            "it is about forwarding ports, which twr turns off"
+        }
+        "tunnel" | "tunneldevice" => "it forwards a tunnel device",
+        "permitlocalcommand" | "localcommand" => "it runs a local command",
+        "batchmode" => "the hub runs ssh without prompting, and `twr box add` with prompts",
+        "stdinnull"
+        | "requesttty"
+        | "remotecommand"
+        | "sessiontype"
+        | "forkafterauthentication" => "it changes what ssh runs, or how, which twr decides",
+        "controlmaster" | "controlpath" | "controlpersist" => {
+            "it controls a shared (multiplexed) ssh connection"
+        }
+        "include" | "match" | "host" => "it brings in other configuration",
+        _ => return None,
+    })
+}
+
+/// The key of `ssh -o <value>` as OpenSSH reads it: `"`s dropped, then leading `=`s and
+/// whitespace skipped, and the key ends at the next `=` or whitespace (`=ControlMaster=yes`
+/// sets `ControlMaster`).
+fn ssh_option_key(value: &str) -> String {
+    let unquoted: String = value.chars().filter(|c| *c != '"').collect();
+    unquoted
+        .trim_start_matches(|c: char| c == '=' || c.is_whitespace())
+        .split(|c: char| c == '=' || c.is_whitespace())
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Checks the words of a box's `ssh` setting (whitespace-separated: `ssh` options, then the
+/// destination): exactly one destination, no `--`, and no option that forwards anything (your
+/// agent, X11, GSSAPI credentials, ports, a tunnel), runs a local command, shares a connection
+/// (`ControlMaster`, `-S`, `-O`), or changes what ssh runs or how (`-N`, `-T`, `-t`, `-n`,
+/// `-f`, `RemoteCommand`, `BatchMode`, ...), which the hub's and `twr attach`'s ssh decide.
+/// (Both also pass `-a -x -k` after these words, which turns agent, X11 and GSSAPI forwarding
+/// off whatever comes before; a forwarding option is refused rather than silently
+/// overridden.) Options are parsed as ssh
+/// parses them: several letters in one word (`-qA`), a value in the same word (`-p2222`,
+/// `-oForwardAgent=yes`) or the next, and `-o` keys (before `=` or alone, `"`s dropped)
+/// without regard to case. A word after the destination that is not an option would be run
+/// on the box: refused. Why not, else `Ok`.
+pub fn check_ssh_words(ssh: &str) -> Result<(), String> {
+    let mut words = ssh.split_whitespace();
+    let mut destination: Option<&str> = None;
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return Err(
+                "`--` would make the rest a command on the box: give options, then the \
+                 destination"
+                    .to_string(),
+            );
+        }
+        let Some(letters) = word.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            if let Some(d) = destination {
+                return Err(format!(
+                    "`{word}` after the destination `{d}` would run on the box as a command: \
+                     give options, then one destination"
+                ));
+            }
+            destination = Some(word);
+            continue;
+        };
+        for (i, flag) in letters.char_indices() {
+            if let Some(why) = ssh_flag_refusal(flag) {
+                return Err(format!("`-{flag}` (in `{word}`): {why}"));
+            }
+            if !SSH_VALUE_OPTIONS.contains(flag) {
+                continue;
+            }
+            let rest = &letters[i + flag.len_utf8()..];
+            let value = if rest.is_empty() {
+                words
+                    .next()
+                    .ok_or_else(|| format!("`-{flag}` needs a value"))?
+            } else {
+                rest
+            };
+            if flag == 'o' {
+                let key = ssh_option_key(value);
+                let named = key.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && key.chars().all(|c| c.is_ascii_alphanumeric());
+                if !named {
+                    return Err(format!(
+                        "`-o {value}`: twr cannot tell which ssh option it sets"
+                    ));
+                }
+                if let Some(why) = ssh_option_refusal(&key) {
+                    return Err(format!("`-o {value}`: {why}"));
+                }
+            }
+            break;
+        }
+    }
+    match destination {
+        Some(_) => Ok(()),
+        None => Err("no destination (`me@host`, after any ssh options)".to_string()),
+    }
 }
 
 impl fmt::Debug for BoxConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoxConfig")
+            .field("transport", &self.transport)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("ssh", &self.ssh)
+            .field("build", &self.build)
             .field("projects", &self.projects)
             .finish()
     }
+}
+
+/// `[boxes.<name>] transport`: how the hub and a box's runner find each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoxTransport {
+    /// The box's runner (`twr runner --hub <url>`) connects to the hub's listener (`[hub]
+    /// listen`) and both prove they know the box's `token`. For a box the hub cannot reach by
+    /// ssh.
+    #[default]
+    Token,
+    /// The hub runs twr on the box over `ssh` itself (`ssh <ssh> -- twr runner --stdio ...`)
+    /// and speaks the runner protocol over that connection, inside a channel only the hub's
+    /// key can open ([`crate::sealed`]): no token, listener or tunnel.
+    Ssh,
 }
 
 /// `[boxes.<name>.projects.<project>]`
@@ -742,13 +989,19 @@ impl Config {
     }
 
     /// Checks values the types allow but twr does not: runtime presets
-    /// ([`RuntimePreset::validate`]), `project_roots` that are neither absolute nor under `~`.
+    /// ([`RuntimePreset::validate`]), `project_roots` that are neither absolute nor under `~`,
+    /// an SSH box without `ssh` or with a `token` (which it would never use: refused, so a
+    /// token is never silently ignored), and a box `build` that is not a build id or not on an
+    /// SSH box.
     /// Box tokens that are too short are the hub's to refuse ([`Config::check_box_tokens`]):
     /// every twr command loads the config, and one that is too short must not keep `twr hub
     /// stop` from stopping a hub started before the minimum.
     pub fn validate(&self) -> anyhow::Result<()> {
         for (name, preset) in &self.runtimes {
             preset.validate(name)?;
+        }
+        for (name, b) in &self.boxes {
+            b.check(name)?;
         }
         for (name, p) in &self.projects {
             if let Some(b) = &p.base {
@@ -874,9 +1127,39 @@ impl Config {
         }
     }
 
-    /// Loads the config file from `paths`, as its workspace sees it ([`Config::in_workspace`]).
+    /// Loads `config_file` ([`Config::load`]) with the boxes of the `boxes.toml` next to it
+    /// ([`BoxesFile::path_for`]; missing = none) merged into `boxes`, and checks the result
+    /// ([`Config::validate`]). A box named in both files is an error that names both.
+    pub fn load_with_boxes(config_file: &Path) -> anyhow::Result<Config> {
+        let mut config = Self::load(config_file)?;
+        let boxes_file = BoxesFile::path_for(config_file);
+        let added = BoxesFile::load(&boxes_file)?;
+        if added.boxes.is_empty() {
+            return Ok(config);
+        }
+        for (name, b) in added.boxes {
+            if config.boxes.contains_key(&name) {
+                anyhow::bail!(
+                    "box {name} is in both {} and {}: keep one of them (`twr box remove {name}` \
+                     removes it from {}; it works with the files as they are)",
+                    config_file.display(),
+                    boxes_file.display(),
+                    boxes_file.display()
+                );
+            }
+            config.boxes.insert(name, b);
+        }
+        // `config_file` alone passed: what fails now came from `boxes.toml`.
+        config
+            .validate()
+            .with_context(|| format!("in {}", boxes_file.display()))?;
+        Ok(config)
+    }
+
+    /// Loads the config file from `paths` with its `boxes.toml` ([`Config::load_with_boxes`]),
+    /// as its workspace sees it ([`Config::in_workspace`]).
     pub fn load_from(paths: &Paths) -> anyhow::Result<Config> {
-        Ok(Self::load(&paths.config_file)?.in_workspace(paths))
+        Ok(Self::load_with_boxes(&paths.config_file)?.in_workspace(paths))
     }
 
     /// The config as the workspace of `paths` sees it. Every workspace shares the config file;
@@ -947,6 +1230,204 @@ impl Config {
             .as_deref()
             .or(self.threads.model.as_deref())
             .filter(|m| !m.trim().is_empty())
+    }
+}
+
+/// `boxes.toml`, next to `config.toml`: the boxes twr added itself (`twr box add`, `twr box
+/// remove`, `twr box install`), kept apart so that twr never rewrites the user's own file.
+/// It holds `[boxes.<name>]` tables and nothing else; [`Config::load_with_boxes`] merges them
+/// into the config's `boxes`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BoxesFile {
+    /// The boxes, by name.
+    pub boxes: BTreeMap<String, BoxConfig>,
+}
+
+/// What [`BoxesFile::save`] writes at the top of `boxes.toml` (comments in the file are not
+/// kept: twr rewrites it whole).
+const BOXES_FILE_HEADER: &str = "\
+# Written by twr: `twr box add`, `twr box remove` and `twr box install` change this file, and
+# rewrite it whole (comments are not kept). Configure anything else in config.toml, next to
+# it; a box named in both files is an error.
+";
+
+impl BoxesFile {
+    /// The `boxes.toml` of `config_file`: in the same directory.
+    pub fn path_for(config_file: &Path) -> PathBuf {
+        config_file.with_file_name("boxes.toml")
+    }
+
+    /// Reads `path` (missing = no boxes). Only parsed: [`Config::load_with_boxes`] checks the
+    /// boxes together with the config they join.
+    pub fn load(path: &Path) -> anyhow::Result<BoxesFile> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(BoxesFile::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    /// Replaces `path` with these boxes, atomically: a reader sees the old file or the new
+    /// one, never a part. The new file is written to a temporary file in the same directory
+    /// (created exclusively, mode 0600), synced, renamed over `path`, and the directory
+    /// synced so the rename survives a crash. The directory is created when missing. Callers
+    /// that read, change and save hold [`BoxesFile::lock`] across all three.
+    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
+        let body = toml::to_string(self).context("writing boxes.toml")?;
+        Self::save_body(path, &body)
+    }
+
+    /// Removes box `name` from `path` without reading the rest as boxes ([`BoxesFile::save`]'s
+    /// way, under the caller's [`BoxesFile::lock`]): the file is read as any TOML table, so a
+    /// box with settings twr refuses (or that another twr version wrote) can be taken out, and
+    /// every other table stays as it was (comments aside). Its table, as found, when it was
+    /// there; `None` when not (nothing written). An error when the file is no TOML at all.
+    pub fn remove_box(path: &Path, name: &str) -> anyhow::Result<Option<toml::Value>> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        let mut table: toml::Table = toml::from_str(&text).with_context(|| {
+            format!(
+                "parsing {}: it is no TOML file; remove [boxes.{name}] from it by hand",
+                path.display()
+            )
+        })?;
+        let removed = table
+            .get_mut("boxes")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|boxes| boxes.remove(name));
+        if removed.is_some() {
+            let body = toml::to_string(&table).context("writing boxes.toml")?;
+            Self::save_body(path, &body)?;
+        }
+        Ok(removed)
+    }
+
+    /// Whether the TOML file `path` (`config.toml` or `boxes.toml`) has a `[boxes.<name>]`,
+    /// read as any TOML table: also when twr cannot load it as its config. `false` when it
+    /// cannot be read or is no TOML.
+    pub fn names_box(path: &Path, name: &str) -> bool {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
+            .is_some_and(|t| {
+                t.get("boxes")
+                    .and_then(toml::Value::as_table)
+                    .is_some_and(|b| b.contains_key(name))
+            })
+    }
+
+    /// Replaces `path` with the header and `body`, atomically ([`BoxesFile::save`]).
+    fn save_body(path: &Path, body: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "boxes.toml".into());
+        let nonce = crate::runner::new_nonce()?;
+        let tmp = dir.join(format!(".{name}.{}.tmp", &nonce[..16]));
+        // Removes the temporary file unless it was renamed into place.
+        struct Tmp<'a>(&'a Path, bool);
+        impl Drop for Tmp<'_> {
+            fn drop(&mut self) {
+                if !self.1 {
+                    let _ = std::fs::remove_file(self.0);
+                }
+            }
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .with_context(|| format!("creating {}", tmp.display()))?;
+        let mut guard = Tmp(&tmp, false);
+        f.write_all(BOXES_FILE_HEADER.as_bytes())
+            .and_then(|()| f.write_all(b"\n"))
+            .and_then(|()| f.write_all(body.as_bytes()))
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+        guard.1 = true;
+        std::fs::File::open(dir)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("syncing {}", dir.display()))?;
+        Ok(())
+    }
+
+    /// Takes the lock of `path` (`<path>.lock`, an exclusive `flock`; the file is created
+    /// with mode 0600, and its directory when missing), waiting for whoever holds it: twr
+    /// commands that change `boxes.toml` hold it from reading the file to saving it, so two
+    /// at once cannot lose one's change. Advisory: only those commands take it. Released when
+    /// the [`BoxesLock`] drops.
+    pub fn lock(path: &Path) -> anyhow::Result<BoxesLock> {
+        BoxesLock::take(path, true)?
+            .ok_or_else(|| anyhow::anyhow!("the lock of {} was not taken", path.display()))
+    }
+
+    /// [`BoxesFile::lock`] without waiting: `None` when someone else holds it.
+    pub fn try_lock(path: &Path) -> anyhow::Result<Option<BoxesLock>> {
+        BoxesLock::take(path, false)
+    }
+}
+
+/// The exclusive lock of a `boxes.toml` ([`BoxesFile::lock`]), held until it drops (closing
+/// the file releases the `flock`).
+#[derive(Debug)]
+pub struct BoxesLock {
+    _file: std::fs::File,
+}
+
+impl BoxesLock {
+    /// Opens (creating, 0600) `<path>.lock` and `flock`s it exclusively, waiting when `wait`;
+    /// `None` when not waiting and someone else holds it.
+    fn take(path: &Path, wait: bool) -> anyhow::Result<Option<BoxesLock>> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let lock = path.with_file_name(name);
+        if let Some(dir) = lock.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&lock)
+            .with_context(|| format!("opening {}", lock.display()))?;
+        let op = if wait {
+            libc::LOCK_EX
+        } else {
+            libc::LOCK_EX | libc::LOCK_NB
+        };
+        loop {
+            // SAFETY: flock on a descriptor this function owns (`file` stays open across the
+            // call); no memory is passed.
+            if unsafe { libc::flock(file.as_raw_fd(), op) } == 0 {
+                return Ok(Some(BoxesLock { _file: file }));
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::EWOULDBLOCK) if !wait => return Ok(None),
+                _ => return Err(e).with_context(|| format!("locking {}", lock.display())),
+            }
+        }
     }
 }
 
@@ -1437,6 +1918,358 @@ mod tests {
         );
         let c = Config::from_toml_str(&toml(&"k".repeat(32))).unwrap();
         assert!(c.warnings(None).is_empty());
+    }
+
+    #[test]
+    fn box_transports_and_builds_are_checked() {
+        let c = Config::from_toml_str(
+            "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"me@gpu\"\nbuild = \"0123456789abcdef\"\n\
+             [boxes.lab]\ntoken = \"0123456789abcdef0123\"\n\
+             [boxes.cpu]\ntransport = \"token\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.boxes["gpu"].transport(), BoxTransport::Ssh);
+        assert_eq!(c.boxes["gpu"].build.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(c.boxes["lab"].transport, None);
+        assert_eq!(
+            c.boxes["lab"].transport(),
+            BoxTransport::Token,
+            "the default"
+        );
+        assert_eq!(c.boxes["cpu"].transport(), BoxTransport::Token);
+        let dbg = format!("{:?}", c.boxes["gpu"]);
+        assert!(
+            dbg.contains("Ssh") && dbg.contains("0123456789abcdef"),
+            "{dbg}"
+        );
+
+        let ssh = "[boxes.gpu]\ntransport = \"ssh\"\n";
+        for (bad, says) in [
+            ("[boxes.gpu]\ntransport = \"tcp\"\n", "unknown variant"),
+            (
+                "[boxes.gpu]\ntransport = \"SSH\"\nssh = \"me@gpu\"\n",
+                "unknown variant",
+            ),
+            (
+                ssh,
+                "boxes.gpu: an SSH box (transport = \"ssh\") needs `ssh`",
+            ),
+            (&format!("{ssh}ssh = \" \"\n"), "needs `ssh`"),
+            (
+                &format!("{ssh}ssh = \"me@gpu\"\ntoken = \"0123456789abcdef0123\"\n"),
+                "boxes.gpu.token: an SSH box has no token, the hub connects to it over ssh",
+            ),
+            (
+                "[boxes.gpu]\ntoken = \"0123456789abcdef0123\"\nbuild = \"0123456789abcdef\"\n",
+                "boxes.gpu.build: only an SSH box",
+            ),
+            (
+                &format!("{ssh}ssh = \"me@gpu\"\nbuild = \"0123456789ABCDEF\"\n"),
+                "boxes.gpu.build: \"0123456789ABCDEF\" is not a build id",
+            ),
+            (
+                &format!("{ssh}ssh = \"me@gpu\"\nbuild = \"0123\"\n"),
+                "is not a build id",
+            ),
+        ] {
+            let e = format!("{:#}", Config::from_toml_str(bad).unwrap_err());
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
+
+    /// A box's `ssh` words: options ssh parses as ssh does (letters together, values in the
+    /// same word or the next, `-o` keys in any case or quoted), one destination; forwarding,
+    /// local commands, shared connections and what decides how ssh runs are refused, in an
+    /// SSH box's config and by [`BoxConfig::check_ssh`].
+    #[test]
+    fn box_ssh_words_cannot_forward_or_change_what_ssh_runs() {
+        for ok in [
+            "me@gpu",
+            "-p 2222 me@gpu",
+            "-p2222 -i ~/.ssh/id_gpu -l me gpu",
+            "-4 -C -q -v -g -e none -J jump -F ~/.ssh/other me@gpu",
+            "-o Port=2222 -oIdentitiesOnly=yes -o ProxyCommand=nc me@gpu",
+            "me@gpu -p 2222",
+            "-a -x -k me@gpu",
+            "-qp 2222 me@gpu",
+            "ssh://me@gpu:2222",
+        ] {
+            assert_eq!(check_ssh_words(ok), Ok(()), "{ok}");
+        }
+        for (bad, says) in [
+            ("-A me@gpu", "`-A` (in `-A`): it forwards your ssh agent"),
+            ("-X me@gpu", "X11"),
+            ("-Y me@gpu", "X11"),
+            ("-qA me@gpu", "`-A` (in `-qA`)"),
+            ("-K me@gpu", "GSSAPI"),
+            ("-L 80:x:80 me@gpu", "forwards ports"),
+            ("-R80:x:80 me@gpu", "forwards ports"),
+            ("-D 1080 me@gpu", "forwards ports"),
+            ("-W x:22 me@gpu", "instead of running twr"),
+            ("-w 0 me@gpu", "tunnel"),
+            ("-M me@gpu", "shared"),
+            ("-S /tmp/s me@gpu", "shared"),
+            ("-O exit me@gpu", "shared"),
+            ("-N me@gpu", "no command"),
+            ("-s me@gpu", "subsystem"),
+            ("-f me@gpu", "background"),
+            ("-t me@gpu", "terminal"),
+            ("-T me@gpu", "terminal"),
+            ("-n me@gpu", "stdin"),
+            ("-G me@gpu", "exit"),
+            ("-V me@gpu", "exit"),
+            ("-E /tmp/log me@gpu", "log"),
+            ("-Z me@gpu", "does not know"),
+            (
+                "-o ForwardAgent=yes me@gpu",
+                "`-o ForwardAgent=yes`: it forwards",
+            ),
+            ("-oforwardagent=yes me@gpu", "ssh agent"),
+            ("-q -oFORWARDAGENT=/tmp/sock me@gpu", "ssh agent"),
+            ("-o \"ForwardAgent\"=yes me@gpu", "ssh agent"),
+            ("-o ForwardAgent yes me@gpu", "ssh agent"),
+            ("-o=ControlMaster=yes me@gpu", "shared"),
+            ("-o =RemoteCommand=id me@gpu", "what ssh runs"),
+            ("-o =SessionType=none me@gpu", "what ssh runs"),
+            ("-o==SessionType=none me@gpu", "what ssh runs"),
+            ("-o = me@gpu", "cannot tell which ssh option"),
+            ("-o 1Port=22 me@gpu", "cannot tell which ssh option"),
+            ("-o Port-x=22 me@gpu", "cannot tell which ssh option"),
+            ("-o ForwardX11=yes me@gpu", "X11"),
+            ("-o ForwardX11Trusted=yes me@gpu", "X11"),
+            ("-o GSSAPIDelegateCredentials=yes me@gpu", "GSSAPI"),
+            ("-o LocalForward=80:x:80 me@gpu", "forwarding"),
+            ("-o RemoteForward=80:x:80 me@gpu", "forwarding"),
+            ("-o DynamicForward=1080 me@gpu", "forwarding"),
+            ("-o ClearAllForwardings=no me@gpu", "forwarding"),
+            ("-o PermitLocalCommand=yes me@gpu", "local command"),
+            ("-o LocalCommand=x me@gpu", "local command"),
+            ("-o BatchMode=no me@gpu", "prompting"),
+            ("-o StdinNull=yes me@gpu", "what ssh runs"),
+            ("-o RequestTTY=force me@gpu", "what ssh runs"),
+            ("-o RemoteCommand=x me@gpu", "what ssh runs"),
+            ("-o SessionType=none me@gpu", "what ssh runs"),
+            ("-o ForkAfterAuthentication=yes me@gpu", "what ssh runs"),
+            ("-o ControlMaster=auto me@gpu", "shared"),
+            ("-o ControlPath=/tmp/c me@gpu", "shared"),
+            ("-o ControlPersist=1h me@gpu", "shared"),
+            ("-o Tunnel=yes me@gpu", "tunnel"),
+            ("-o TunnelDevice=0:0 me@gpu", "tunnel"),
+            ("-o Include=/tmp/x me@gpu", "other configuration"),
+            ("me@gpu -A", "ssh agent"),
+            ("me@gpu rm -rf", "`rm` after the destination `me@gpu`"),
+            ("-- me@gpu", "`--`"),
+            ("me@gpu --", "`--`"),
+            ("-p 2222", "no destination"),
+            ("-p", "`-p` needs a value"),
+        ] {
+            let e = check_ssh_words(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+        // In an SSH box's config (and `BoxConfig::check_ssh`), named.
+        let e = Config::from_toml_str("[boxes.gpu]\ntransport = \"ssh\"\nssh = \"-A me@gpu\"\n")
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("boxes.gpu.ssh = \"-A me@gpu\": `-A`"),
+            "{e:#}"
+        );
+        // A token box's `ssh` (attach only) is the hub's to refuse.
+        let c = Config::from_toml_str("[boxes.lab]\nssh = \"-A me@lab\"\n").unwrap();
+        let e = c.boxes["lab"].check_ssh("lab").unwrap_err();
+        assert!(format!("{e:#}").contains("boxes.lab.ssh"), "{e:#}");
+        assert!(BoxConfig::default().check_ssh("x").is_ok());
+    }
+
+    /// A box comes out of boxes.toml whatever its settings, the other tables as they were;
+    /// a missing file or box is `None`, a file that is no TOML an error.
+    #[test]
+    fn a_box_is_removed_from_boxes_toml_loosely() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("boxes.toml");
+        assert_eq!(BoxesFile::remove_box(&file, "gpu").unwrap(), None);
+        std::fs::write(
+            &file,
+            "[boxes.bad]\ntransport = \"tcp\"\nnot_a_key = 1\n\n[boxes.gpu]\ntransport = \
+             \"ssh\"\nssh = \"me@gpu\"\n",
+        )
+        .unwrap();
+        assert!(BoxesFile::load(&file).is_err());
+        assert!(BoxesFile::names_box(&file, "bad"));
+        let bad = BoxesFile::remove_box(&file, "bad").unwrap().unwrap();
+        assert_eq!(
+            bad.get("not_a_key").and_then(toml::Value::as_integer),
+            Some(1)
+        );
+        assert!(!BoxesFile::names_box(&file, "bad"));
+        let left = BoxesFile::load(&file).unwrap();
+        assert_eq!(left.boxes["gpu"].ssh.as_deref(), Some("me@gpu"));
+        assert_eq!(BoxesFile::remove_box(&file, "nope").unwrap(), None);
+        std::fs::write(&file, "[boxes.gpu\n").unwrap();
+        assert!(BoxesFile::remove_box(&file, "gpu").is_err());
+        assert!(!BoxesFile::names_box(&file, "gpu"));
+    }
+
+    /// `boxes.toml` next to `config.toml`: merged into `[boxes]`, a box in both is an error
+    /// naming both files, and the merged config is checked.
+    #[test]
+    fn boxes_toml_is_merged_into_the_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::with_home(dir.path());
+        assert_eq!(paths.boxes_file(), dir.path().join("boxes.toml"));
+        assert_eq!(paths.boxes_file(), BoxesFile::path_for(&paths.config_file));
+        let w = paths.workspace("client-x").unwrap();
+        assert_eq!(
+            w.boxes_file(),
+            paths.boxes_file(),
+            "shared like the config file"
+        );
+
+        // boxes.toml alone (no config.toml).
+        let gpu = "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"me@gpu\"\n";
+        std::fs::write(paths.boxes_file(), gpu).unwrap();
+        let c = Config::load_from(&paths).unwrap();
+        assert_eq!(c.boxes["gpu"].transport(), BoxTransport::Ssh);
+        // Both files.
+        std::fs::write(
+            &paths.config_file,
+            "default_runtime = \"codex\"\n[boxes.lab]\ntoken = \"0123456789abcdef0123\"\n",
+        )
+        .unwrap();
+        let c = Config::load_from(&paths).unwrap();
+        assert_eq!(c.default_runtime, "codex");
+        assert_eq!(c.boxes.keys().collect::<Vec<_>>(), ["gpu", "lab"]);
+        // A named workspace sees them too.
+        assert_eq!(Config::load_from(&w).unwrap().boxes.len(), 2);
+
+        // In both files.
+        std::fs::write(
+            &paths.config_file,
+            "[boxes.gpu]\ntoken = \"0123456789abcdef0123\"\n",
+        )
+        .unwrap();
+        let e = format!("{:#}", Config::load_from(&paths).unwrap_err());
+        assert!(
+            e.contains("box gpu is in both")
+                && e.contains(&paths.config_file.display().to_string())
+                && e.contains(&paths.boxes_file().display().to_string()),
+            "{e}"
+        );
+        std::fs::remove_file(&paths.config_file).unwrap();
+
+        // A box boxes.toml holds is checked, and the error names the file.
+        std::fs::write(paths.boxes_file(), "[boxes.gpu]\ntransport = \"ssh\"\n").unwrap();
+        let e = format!("{:#}", Config::load_from(&paths).unwrap_err());
+        assert!(e.contains("boxes.toml") && e.contains("needs `ssh`"), "{e}");
+        // Anything but boxes, or what does not parse, is refused naming the file.
+        for bad in [
+            "default_runtime = \"codex\"\n",
+            "[boxes.gpu]\nsh = \"me@gpu\"\n",
+            "[boxes.gpu\n",
+        ] {
+            std::fs::write(paths.boxes_file(), bad).unwrap();
+            let e = format!("{:#}", Config::load_from(&paths).unwrap_err());
+            assert!(e.contains("boxes.toml"), "{bad}: {e}");
+        }
+        std::fs::remove_file(paths.boxes_file()).unwrap();
+        assert_eq!(Config::load_from(&paths).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn boxes_toml_is_saved_whole_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // The directory is made when missing.
+        let path = dir.path().join("cfg").join("boxes.toml");
+        let mut file = BoxesFile::default();
+        file.boxes.insert(
+            "gpu".into(),
+            BoxConfig {
+                transport: Some(BoxTransport::Ssh),
+                ssh: Some("-p 2222 me@gpu".into()),
+                build: Some("0123456789abcdef".into()),
+                ..Default::default()
+            },
+        );
+        let mut far = BoxConfig {
+            transport: Some(BoxTransport::Ssh),
+            ssh: Some("far".into()),
+            ..Default::default()
+        };
+        far.projects.insert(
+            "api".into(),
+            BoxProjectConfig {
+                repo: "/srv/api".into(),
+                runtime: None,
+            },
+        );
+        file.boxes.insert("far".into(), far);
+        file.save(&path).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(BoxesFile::load(&path).unwrap(), file);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# Written by twr"), "{text}");
+        assert!(text.contains("config.toml"), "{text}");
+        assert!(
+            !text.contains("token") && !text.contains("projects]\n\n"),
+            "{text}"
+        );
+        // It loads as part of the config next to it.
+        let c = Config::load_with_boxes(&path.with_file_name("config.toml")).unwrap();
+        assert_eq!(c.boxes, file.boxes);
+
+        // A save replaces the file (whatever its mode was) and leaves no temporary file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        file.boxes.remove("far");
+        file.save(&path).unwrap();
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(BoxesFile::load(&path).unwrap(), file);
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, ["boxes.toml"]);
+        // Empty.
+        BoxesFile::default().save(&path).unwrap();
+        assert_eq!(BoxesFile::load(&path).unwrap(), BoxesFile::default());
+        assert_eq!(
+            BoxesFile::load(&dir.path().join("missing.toml")).unwrap(),
+            BoxesFile::default()
+        );
+    }
+
+    #[test]
+    fn the_boxes_toml_lock_is_exclusive() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boxes.toml");
+        let held = BoxesFile::lock(&path).unwrap();
+        let lock_file = dir.path().join("boxes.toml.lock");
+        let mode = std::fs::metadata(&lock_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        // Another descriptor, even in this process, does not get it.
+        assert!(BoxesFile::try_lock(&path).unwrap().is_none());
+        // A waiter gets it once the holder lets go.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let lock = BoxesFile::lock(&path).unwrap();
+                tx.send(()).unwrap();
+                lock
+            }
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the waiter waits"
+        );
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let theirs = waiter.join().unwrap();
+        assert!(BoxesFile::try_lock(&path).unwrap().is_none());
+        drop(theirs);
+        assert!(BoxesFile::try_lock(&path).unwrap().is_some());
     }
 
     #[test]

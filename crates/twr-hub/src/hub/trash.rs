@@ -282,13 +282,11 @@ impl Core {
 impl Hub {
     /// The hosts of every box that is online (the local box always), by name.
     fn online_hosts(&self) -> Vec<(String, Arc<dyn ThreadHost>)> {
+        let hosts = self.inner.hosts_list();
         let core = self.inner.core();
-        let mut out: Vec<(String, Arc<dyn ThreadHost>)> = self
-            .inner
-            .hosts
-            .iter()
-            .filter(|(name, _)| name.as_str() == LOCAL_BOX || core.online_boxes.contains(*name))
-            .map(|(n, h)| (n.clone(), Arc::clone(h)))
+        let mut out: Vec<(String, Arc<dyn ThreadHost>)> = hosts
+            .into_iter()
+            .filter(|(name, _)| name.as_str() == LOCAL_BOX || core.online_boxes.contains(name))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -593,7 +591,7 @@ impl Hub {
             if ids.is_empty() {
                 continue;
             }
-            let Some(host) = self.inner.hosts.get(&box_name).cloned() else {
+            let Some(host) = self.inner.host(&box_name) else {
                 for id in ids {
                     failed.push((id, box_name.clone(), "no such box".to_string()));
                 }
@@ -891,11 +889,14 @@ impl Hub {
         }
         let hub = &self.inner;
         let thread = entry.seen.thread.clone();
-        let (view, name, branch, host, rt, former) = {
+        // `_op`: the box's operation, begun with its gate check and held until the restore is
+        // over, so the box is not switched meanwhile (`Core::reserve_box`).
+        let (view, name, branch, host, rt, former, _op) = {
             let mut core = hub.core();
             if core.shutting_down {
                 return Err(rpc(codes::CONFLICT, "hub is shutting down"));
             }
+            let op = core.reserve_box(hub, &entry.seen.box_name)?;
             let Some(view) = core.registry.deleted_view(&thread).cloned() else {
                 return Err(rpc(
                     codes::NOT_FOUND,
@@ -948,7 +949,7 @@ impl Hub {
                 ));
             }
             let rt = core.deleted_rt.get(&thread).cloned().unwrap_or_default();
-            let host = hub.hosts.get(&view.box_name).cloned();
+            let host = hub.host(&view.box_name);
             let new_branch = || {
                 host.as_ref()
                     .map_or_else(|| thread_branch(&name), |h| h.worktree_branch(&name))
@@ -970,7 +971,7 @@ impl Hub {
                 .collect();
             core.reserved_names.insert(name.clone());
             core.reserved_names.extend(former.iter().cloned());
-            (view, name, branch, host, rt, former)
+            (view, name, branch, host, rt, former, op)
         };
         let release = |core: &mut Core| {
             core.trash_busy.remove(&item);

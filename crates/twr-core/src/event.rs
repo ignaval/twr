@@ -643,6 +643,12 @@ pub const RUNTIME_RESTART_REASON: &str = "runtime_change";
 /// The thread does not count as stopped; its next prompt resumes the session.
 pub const TRIM_RESTART_REASON: &str = "trim";
 
+/// `ext.twr.reason` of the `thread.stopped` that closes an idle runtime on an SSH box the hub
+/// switches to the build it launched there (the box's daemon ran another build of the same
+/// runner protocol): every runtime of the box is stopped, the daemon replaced, and the thread
+/// does not count as stopped; its next prompt resumes the session on the new daemon.
+pub const BOX_UPGRADE_REASON: &str = "box_upgrade";
+
 /// `task.updated` `task_id` prefix of a job (`twr job run`, the hub's `job.start`): a command
 /// the hub runs for a thread, recorded as one of its background tasks by the hub
 /// (`Source::Hub`). Unlike a runtime's own tasks, it outlives the runtime that was up when it
@@ -725,8 +731,8 @@ pub fn set_twr_ext(ext: &mut Option<JsonMap>, key: &str, value: Value) {
 }
 
 /// Whether `thread.stopped` `p` closed a runtime the hub restarts in new settings
-/// ([`MODE_RESTART_REASON`], [`MODEL_RESTART_REASON`], [`RUNTIME_RESTART_REASON`] or
-/// [`TRIM_RESTART_REASON`]).
+/// ([`MODE_RESTART_REASON`], [`MODEL_RESTART_REASON`], [`RUNTIME_RESTART_REASON`],
+/// [`TRIM_RESTART_REASON`] or [`BOX_UPGRADE_REASON`]).
 pub fn is_settings_restart(p: &SessionPayload) -> bool {
     matches!(
         p.ext
@@ -739,6 +745,7 @@ pub fn is_settings_restart(p: &SessionPayload) -> bool {
                 | MODEL_RESTART_REASON
                 | RUNTIME_RESTART_REASON
                 | TRIM_RESTART_REASON
+                | BOX_UPGRADE_REASON
         )
     )
 }
@@ -2091,6 +2098,7 @@ mod tests {
             MODEL_RESTART_REASON,
             TRIM_RESTART_REASON,
             RUNTIME_RESTART_REASON,
+            BOX_UPGRADE_REASON,
         ] {
             let mut ext = JsonMap::new();
             ext.insert("twr".into(), json!({ "reason": reason }));

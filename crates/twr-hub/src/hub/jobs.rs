@@ -509,7 +509,7 @@ impl Core {
             ));
         }
         // Held from now until it ends: a removal or trim of its directory waits or is refused.
-        let workdir = match hub.hosts.get(&view.box_name) {
+        let workdir = match hub.host(&view.box_name) {
             Some(host) => host
                 .use_workdir(&cfg.cwd, id)
                 .map_err(|e| rpc(codes::CONFLICT, format!("{e:#}")))?,
@@ -763,7 +763,7 @@ impl Core {
             }
             let hold = self.registry.get(&thread).cloned().and_then(|view| {
                 let cwd = super::spawn_config(hub, &view).cwd;
-                let host = hub.hosts.get(&view.box_name)?;
+                let host = hub.host(&view.box_name)?;
                 host.use_workdir(&cwd, &thread).ok().flatten()
             });
             tracing::error!(
@@ -1315,8 +1315,8 @@ async fn gated_spawn(
     if let Some(hook) = hub.job_gate_hook.clone() {
         let _ = tokio::task::spawn_blocking(move || hook(pid)).await;
     }
-    let start_time = match hub.hosts.get(super::LOCAL_BOX) {
-        Some(host) => crate::host::read_start_time(Arc::clone(host), pid).await,
+    let start_time = match hub.host(super::LOCAL_BOX) {
+        Some(host) => crate::host::read_start_time(host, pid).await,
         None => None,
     };
     let opened = match start_time {
