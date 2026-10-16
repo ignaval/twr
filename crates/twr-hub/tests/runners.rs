@@ -192,6 +192,7 @@ fn runner_opts(url: &str, dir: &Path) -> RunnerOptions {
     let mut o = RunnerOptions::new(url, Secret::new(TOKEN), BOX, dir);
     o.backoff_min = Duration::from_millis(20);
     o.backoff_max = Duration::from_millis(200);
+    o.refused_retry = Duration::from_millis(200);
     o.ping_interval = Duration::from_millis(500);
     o.idle_timeout = Duration::from_secs(10);
     o.welcome_timeout = Duration::from_secs(5);
@@ -637,7 +638,7 @@ async fn spawn_send_permission_and_respond_through_a_runner() {
         panic!()
     };
     assert_eq!(p.box_name, BOX);
-    assert_eq!(p.version.as_deref(), Some(twr_runner::client::VERSION));
+    assert_eq!(p.version.as_deref(), Some(twr_runner::client::version()));
     let info = h.hub().info();
     assert_eq!(info["boxes"][0]["online"], json!(true));
 
@@ -1041,6 +1042,7 @@ async fn a_second_connection_of_a_box_fences_the_first() {
     let mut o = runner_opts(&h.url, &rdir);
     o.backoff_min = Duration::from_millis(500);
     o.backoff_max = Duration::from_millis(500);
+    o.refused_retry = Duration::from_millis(500);
     let runner = Runner::start(o, open_box(&rdir));
     h.online().await;
     let first = {
@@ -1125,6 +1127,21 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
         expect_error(raw_expect(&mut ws).await, hub_errors::UNAUTHORIZED);
         assert!(raw_expect(&mut ws).await.is_none());
     }
+    // The configured box's refusal is recorded for `twr info` (the unknown box's is not).
+    let r = h.hub().box_refusal(BOX).expect("a refusal of the box");
+    assert!(r.reason.contains("does not match"), "{}", r.reason);
+    assert!(h.hub().box_refusal("nope").is_none());
+    // A runner that leaves after the challenge (it did not accept the hub's proof).
+    let mut ws = raw(&h.url).await;
+    let (_, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
+    assert!(matches!(m, Some(HubMsg::Challenge { .. })), "{m:?}");
+    drop(ws);
+    wait_for("the refusal of a runner that left", || {
+        h.hub()
+            .box_refusal(BOX)
+            .is_some_and(|r| r.reason.contains("did not accept the hub's proof"))
+    })
+    .await;
     // The hub's own proof sent back (a replay), or garbage.
     for replay in [true, false] {
         let mut ws = raw(&h.url).await;
@@ -1146,6 +1163,12 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
         let message = expect_error(m, hub_errors::PROTOCOL);
         assert!(message.contains(update), "{message}");
         assert!(raw_expect(&mut ws).await.is_none());
+        let r = h.hub().box_refusal(BOX).expect("a refusal of the box");
+        assert!(
+            r.reason.contains(&format!("protocol {protocol}")) && r.reason.contains(update),
+            "{}",
+            r.reason
+        );
     }
     // An older runner's hello, token and all: refused as another protocol.
     let mut ws = raw(&h.url).await;
@@ -1180,6 +1203,15 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
     assert!(logs.contains("runner refused"), "{logs}");
     assert!(!logs.contains(TOKEN) && !logs.contains("wrong-token-8d1e"));
+    // `hub.info` shows the latest refusal while the box is offline.
+    let info = h.hub().info();
+    let refused = &info["boxes"][0]["refused"];
+    assert!(refused["at"].is_string(), "{info}");
+    assert!(refused["reason"].is_string(), "{info}");
+    // A connection that authenticates clears it.
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, self::hello(TOKEN)).await;
+    wait_for("the refusal cleared", || h.hub().box_refusal(BOX).is_none()).await;
     h.shutdown().await;
 }
 

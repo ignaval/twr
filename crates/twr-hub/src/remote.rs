@@ -263,6 +263,18 @@ struct Inner {
     /// Wakes [`RemoteBox::wait_settled`] when [`State::unsettled`] shrinks or the box's
     /// readiness changes.
     settled: Notify,
+    /// The latest refused connection that named this box, until one authenticates
+    /// ([`RemoteBox::note_refusal`]).
+    refusal: Mutex<Option<Refusal>>,
+}
+
+/// A connection naming a box that the hub refused before it authenticated: when, and why in
+/// words for `twr info`. Nothing in it is proven: any peer that reaches the
+/// listener can name the box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
 }
 
 /// The box's current connection.
@@ -446,6 +458,7 @@ impl RemoteBox {
                 disposable: None,
                 change_timeout: twr_core::git::CHANGE_REQUEST_TIMEOUT,
                 settled: Notify::new(),
+                refusal: Mutex::new(None),
             }),
         }
     }
@@ -574,6 +587,26 @@ impl RemoteBox {
         self.inner.rejected.load(Ordering::Relaxed)
     }
 
+    /// Records that a connection naming this box was refused before it authenticated, and
+    /// why (shown while the box is offline, so a runner that keeps being refused is visible
+    /// on the hub's side too). The next authenticated connection clears it.
+    pub fn note_refusal(&self, reason: impl Into<String>) {
+        *self.refusal_slot() = Some(Refusal {
+            at: chrono::Utc::now(),
+            reason: reason.into(),
+        });
+    }
+
+    /// The latest refusal [`RemoteBox::note_refusal`] recorded since a connection of this box
+    /// last authenticated.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.refusal_slot().clone()
+    }
+
+    fn refusal_slot(&self) -> MutexGuard<'_, Option<Refusal>> {
+        self.inner.refusal.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The operation `cmd` of thread `thread`'s session is on the box (a `respond` already
     /// carries the runtime's own attention id, see the module docs).
     pub fn session_op(&self, thread: &str, cmd: AdapterCmd) -> Option<Op> {
@@ -642,6 +675,7 @@ impl RemoteBox {
     /// changed; the connection is to be refused) once the hub has numbered `u64::MAX`
     /// connections of this box.
     pub fn connect(&self, inv: &Inventory, tx: ConnTx) -> Option<u64> {
+        *self.refusal_slot() = None;
         let mut st = self.state();
         // The hub's own counter, never the runner's `epoch_hint` (see the module docs).
         let epoch = st.last_epoch.checked_add(1)?;

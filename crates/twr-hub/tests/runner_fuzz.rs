@@ -1287,6 +1287,7 @@ impl RunnerProc {
         let mut o = RunnerOptions::new(url, Secret::new(token(box_name)), box_name, dir);
         o.backoff_min = Duration::from_millis(20);
         o.backoff_max = Duration::from_millis(200);
+        o.refused_retry = Duration::from_millis(200);
         o.ping_interval = Duration::from_millis(500);
         o.idle_timeout = Duration::from_secs(10);
         o.welcome_timeout = Duration::from_secs(5);

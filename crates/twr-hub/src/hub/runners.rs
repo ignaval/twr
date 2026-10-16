@@ -348,6 +348,12 @@ impl Hub {
             .map_or(0, RemoteBox::rejected_frames)
     }
 
+    /// The latest refused connection naming box `name` since one of its connections last
+    /// authenticated ([`RemoteBox::note_refusal`]).
+    pub fn box_refusal(&self, name: &str) -> Option<crate::remote::Refusal> {
+        self.inner.remotes.get(name).and_then(RemoteBox::refusal)
+    }
+
     /// The remote boxes: `(name, online, runner version)`.
     pub fn boxes(&self) -> Vec<(String, bool, Option<String>)> {
         let core = self.inner.core();
@@ -501,6 +507,13 @@ where
         } else {
             "update twr on the hub".to_string()
         };
+        if let Some(b) = hub.remotes.get(&hello.box_name) {
+            b.note_refusal(format!(
+                "a runner speaking protocol {} was refused (the hub's is {PROTOCOL_VERSION}): \
+                 {update}",
+                hello.protocol
+            ));
+        }
         let m = refuse(
             hub_errors::PROTOCOL,
             format!(
@@ -564,6 +577,12 @@ where
         Next::Closed => {
             // A runner that did not accept the hub's proof leaves without a word.
             tracing::warn!(peer, box_name = %hello.box_name, "runner left before it authenticated (did it refuse the hub's proof? its token may differ from the hub's)");
+            if let Some(b) = &rbox {
+                b.note_refusal(
+                    "a runner left after the hub's challenge: it did not accept the hub's \
+                     proof, so its token likely differs from this box's token",
+                );
+            }
             return None;
         }
         Next::TimedOut => {
@@ -572,7 +591,13 @@ where
             return None;
         }
     };
-    let rbox = rbox.filter(|b| b.checks_runner_proof(&hello.nonce, &hub_nonce, &proof));
+    let rbox = rbox.filter(|b| {
+        let ok = b.checks_runner_proof(&hello.nonce, &hub_nonce, &proof);
+        if !ok {
+            b.note_refusal("a runner was refused: its proof does not match this box's token");
+        }
+        ok
+    });
     let Some(rbox) = rbox else {
         tracing::warn!(peer, box_name = %hello.box_name, "runner refused: unknown box or bad token");
         let m = refuse(hub_errors::UNAUTHORIZED, "unknown box or bad token".into());

@@ -141,6 +141,7 @@ async fn remote_threads_get_the_logged_context_and_no_hub_file_is_touched() {
     let mut ro = RunnerOptions::new(&url, Secret::new(TOKEN), BOX, &rdir);
     ro.backoff_min = Duration::from_millis(20);
     ro.backoff_max = Duration::from_millis(200);
+    ro.refused_retry = Duration::from_millis(200);
     // The fake runtime on the box, whatever the environment enables.
     let mut box_opts = LocalBoxOptions::new(&rdir, BOX);
     box_opts.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {

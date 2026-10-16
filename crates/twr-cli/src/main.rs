@@ -1166,7 +1166,7 @@ async fn run_simple(
                     base,
                 },
         } => {
-            let project = project_param(config, &project)?;
+            let project = project_param(config, &project, box_name.as_deref())?;
             let mut c = connect(&socket).await?;
             let mut params = json!({ "project": project, "aliases": aliases });
             if no_worktree {
@@ -1643,8 +1643,16 @@ fn str_of(v: &Value) -> &str {
 
 /// A configured project name is sent as is; an existing directory becomes an absolute path
 /// (the hub resolves paths in its own working directory).
-fn project_param(config: &Config, project: &str) -> anyhow::Result<String> {
+/// The `project` of a `thread.new` for what was typed: a configured project's name as is, a
+/// directory of this machine as its absolute path, anything else as is (the hub looks it up).
+/// For a remote box (`box_name` other than `local`), only the hub resolves it: a project
+/// configured for that box (`[boxes.<box>.projects.<name>]`) is a name, and a path means a
+/// path on the box, never a directory here.
+fn project_param(config: &Config, project: &str, box_name: Option<&str>) -> anyhow::Result<String> {
     if config.projects.contains_key(project) {
+        return Ok(project.to_string());
+    }
+    if box_name.is_some_and(|b| b != "local") {
         return Ok(project.to_string());
     }
     let p = Path::new(project);
@@ -3326,12 +3334,7 @@ async fn info(socket: &Path, raw: bool) -> anyhow::Result<()> {
         }
     );
     for b in i["boxes"].as_array().into_iter().flatten() {
-        let state = if b["online"].as_bool() == Some(true) {
-            "online"
-        } else {
-            "offline"
-        };
-        outln!("box:          {} {state}", str_of(&b["name"]));
+        outln!("box:          {}", box_info_line(b));
     }
     for w in i["warnings"].as_array().into_iter().flatten() {
         outln!("warning:      {}", str_of(w));
@@ -4173,6 +4176,28 @@ async fn trash_list(socket: &Path, raw: bool) -> anyhow::Result<()> {
 }
 
 /// An RFC 3339 time as `trash.list` gives it, shorter: `2026-10-04 12:30 UTC`.
+/// A box of `hub.info` for `twr info`: its name, whether it's online, the twr version its
+/// runner last reported, and while it's offline the latest refused connection that named it.
+fn box_info_line(b: &Value) -> String {
+    let state = if b["online"].as_bool() == Some(true) {
+        "online"
+    } else {
+        "offline"
+    };
+    let mut line = format!("{} {state}", str_of(&b["name"]));
+    if let Some(v) = b["version"].as_str() {
+        line.push_str(&format!(" (twr {v})"));
+    }
+    if let Some(r) = b["refused"].as_object() {
+        line.push_str(&format!(
+            "; last refused {}: {}",
+            trash_time(&r["at"]),
+            str_of(&r["reason"])
+        ));
+    }
+    line
+}
+
 fn trash_time(t: &Value) -> String {
     let t = str_of(t);
     match t.get(..16) {
@@ -5863,6 +5888,64 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// `twr info`'s box line: online with the runner's version, offline with the latest
+    /// refusal, and a box that never connected.
+    #[test]
+    fn box_info_lines() {
+        let line = |b: serde_json::Value| super::box_info_line(&b);
+        assert_eq!(
+            line(serde_json::json!({"name": "gpu", "online": true,
+                "version": "0.2.0+dev.abc1234", "refused": null})),
+            "gpu online (twr 0.2.0+dev.abc1234)"
+        );
+        assert_eq!(
+            line(
+                serde_json::json!({"name": "gpu", "online": false, "version": "0.2.0",
+                "refused": {"at": "2026-10-16T09:30:12.345Z", "reason": "a bad proof"}})
+            ),
+            "gpu offline (twr 0.2.0); last refused 2026-10-16 09:30 UTC: a bad proof"
+        );
+        assert_eq!(
+            line(
+                serde_json::json!({"name": "mac", "online": false, "version": null,
+                "refused": null})
+            ),
+            "mac offline"
+        );
+    }
+
+    /// `thread new`'s project: a directory here becomes its path for the local box only; for a
+    /// remote box what was typed goes to the hub as is.
+    #[test]
+    fn project_params_for_remote_boxes_stay_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("api");
+        std::fs::create_dir(&sub).unwrap();
+        let typed = sub.to_string_lossy().into_owned();
+        let config = super::Config::from_toml_str(
+            "[boxes.gpu]\ntoken = \"0123456789abcdef0123456789abcdef\"\n\
+             [boxes.gpu.projects.api]\nrepo = \"/srv/api\"\n",
+        )
+        .unwrap();
+        let abs = std::fs::canonicalize(&sub).unwrap();
+        assert_eq!(
+            super::project_param(&config, &typed, None).unwrap(),
+            abs.to_string_lossy()
+        );
+        assert_eq!(
+            super::project_param(&config, &typed, Some("local")).unwrap(),
+            abs.to_string_lossy()
+        );
+        assert_eq!(
+            super::project_param(&config, &typed, Some("gpu")).unwrap(),
+            typed
+        );
+        assert_eq!(
+            super::project_param(&config, "api", Some("gpu")).unwrap(),
+            "api"
+        );
+    }
+
     /// `twr usage`: per runtime its label, plan and age, then each window's remaining share and
     /// reset; a note when nothing is known.
     #[test]
