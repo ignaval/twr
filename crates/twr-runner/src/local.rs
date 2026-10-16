@@ -268,12 +268,23 @@ fn subcommand(args: &[OsString]) -> Option<&str> {
 
 /// Overrides, `(key, value)`, that keep the drivers config `names` (`git config --list
 /// --name-only -z`) defines from running anything: a filter's `clean`, `smudge` and `process`
-/// empty (git then applies no filter) and not `required`; a merge driver `exit 1` (the merge
+/// empty (git then applies no filter) and not `required`; a merge driver [`FAILS`] (the merge
 /// of such a file is a conflict, never a program the repository picked); a diff driver's
-/// `textconv` `exit 1` and `command` `exit 0`, and so `diff.external` (no driver name: the
-/// program a diff runs for every file), which git runs even when empty (it fails then). Where
+/// `textconv` [`FAILS`] and `command` [`SUCCEEDS`], and so `diff.external` (no driver name:
+/// the program a diff runs for every file), which git runs even when empty (it fails then). Where
 /// a name makes Git LFS run a program ([`lfs_runs`]), Git LFS's filter (`filter.lfs`, yours)
 /// is turned off too: its files stay pointers.
+/// The command an override that must succeed runs, whatever git appends to it: git runs a
+/// command with a space through its shell as `<command> "$@"`, so it is `:`, the shell's own
+/// no-op, which every shell has and which takes any arguments (`exit 0` doesn't: bash, which
+/// is `/bin/sh` on macOS, Fedora or Arch, refuses `exit 0 a b`, and the diff fails). A command
+/// with no space git runs itself, found through `PATH`, which may name the repository's own
+/// directory.
+const SUCCEEDS: &str = ": off";
+
+/// The command an override that must fail runs ([`SUCCEEDS`], negated).
+const FAILS: &str = "! : off";
+
 fn neutralize(names: &[u8]) -> anyhow::Result<Vec<(OsString, OsString)>> {
     use std::os::unix::ffi::OsStrExt;
     let mut out: std::collections::BTreeSet<(Vec<u8>, &'static str)> = Default::default();
@@ -300,10 +311,10 @@ fn neutralize(names: &[u8]) -> anyhow::Result<Vec<(OsString, OsString)>> {
             // `hook.command` and the like, no name: a hook all the same (git 2.54 and later).
             if matches!(name, b"hook.command" | b"hook.event" | b"hook.enabled") {
                 out.insert((b"hook.enabled".to_vec(), "false"));
-                out.insert((b"hook.command".to_vec(), "exit 0"));
+                out.insert((b"hook.command".to_vec(), SUCCEEDS));
             }
             if name == b"diff.external" {
-                out.insert((b"diff.external".to_vec(), "exit 0"));
+                out.insert((b"diff.external".to_vec(), SUCCEEDS));
             }
             continue;
         }
@@ -326,16 +337,14 @@ fn neutralize(names: &[u8]) -> anyhow::Result<Vec<(OsString, OsString)>> {
             ],
             // Shell builtins, run by git's own shell (a space in it): never a program found
             // through `PATH`, which may name the repository's own directory.
-            (b"merge", b"driver") => &[(b"driver", "exit 1")],
+            (b"merge", b"driver") => &[(b"driver", FAILS)],
             // A hook defined in config (git 2.54 and later: `hook.<name>.command` for the
             // events `hook.<name>.event` names), which `core.hooksPath` does not turn off: off,
             // and should it run, it does nothing (allows).
             (b"hook", b"command" | b"event" | b"enabled") => {
-                &[(b"enabled", "false"), (b"command", "exit 0")]
+                &[(b"enabled", "false"), (b"command", SUCCEEDS)]
             }
-            (b"diff", b"textconv" | b"command") => {
-                &[(b"textconv", "exit 1"), (b"command", "exit 0")]
-            }
+            (b"diff", b"textconv" | b"command") => &[(b"textconv", FAILS), (b"command", SUCCEEDS)],
             _ => continue,
         };
         for (k, v) in set {
@@ -5916,10 +5925,10 @@ mod tests {
             ("filter.lfs.process", ""),
             ("filter.lfs.required", "false"),
             ("filter.a.b.clean", ""),
-            ("merge.m.driver", "exit 1"),
-            ("diff.d.textconv", "exit 1"),
-            ("diff.d.command", "exit 0"),
-            ("diff.external", "exit 0"),
+            ("merge.m.driver", FAILS),
+            ("diff.d.textconv", FAILS),
+            ("diff.d.command", SUCCEEDS),
+            ("diff.external", SUCCEEDS),
         ] {
             assert!(
                 got.contains(&(want.0.to_string(), want.1.to_string())),
@@ -5940,7 +5949,7 @@ mod tests {
         assert_eq!(
             flat,
             [
-                ("hook.command".to_string(), "exit 0".to_string()),
+                ("hook.command".to_string(), SUCCEEDS.to_string()),
                 ("hook.enabled".to_string(), "false".to_string())
             ]
         );
@@ -5953,7 +5962,7 @@ mod tests {
         assert_eq!(
             hooks,
             [
-                ("hook.evil.command".to_string(), "exit 0".to_string()),
+                ("hook.evil.command".to_string(), SUCCEEDS.to_string()),
                 ("hook.evil.enabled".to_string(), "false".to_string())
             ]
         );
@@ -11214,6 +11223,36 @@ mod tests {
     }
 
     /// A diff, or a commit shown or logged with its patch, runs neither the program
+    /// The commands overrides run do what they must as git runs them, `<command> "$@"` with
+    /// arguments, in every shell this machine has: bash refuses `exit 0` with arguments.
+    #[test]
+    fn override_commands_take_any_arguments_in_any_shell() {
+        let shells: Vec<&str> = ["sh", "dash", "bash", "zsh"]
+            .into_iter()
+            .filter(|sh| {
+                std::process::Command::new(sh)
+                    .args(["-c", ":"])
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
+            .collect();
+        assert!(shells.contains(&"sh"), "{shells:?}");
+        for sh in shells {
+            for (command, ok) in [(SUCCEEDS, true), (FAILS, false)] {
+                assert!(
+                    command.contains(' '),
+                    "{command}: git would run it through PATH"
+                );
+                let status = std::process::Command::new(sh)
+                    .args(["-c", &format!("{command} \"$@\""), command])
+                    .args(["/tmp/a b", "abc123", "100644"])
+                    .status()
+                    .unwrap();
+                assert_eq!(status.success(), ok, "{sh} -c '{command} \"$@\"'");
+            }
+        }
+    }
+
     /// `diff.external` names nor a diff driver's `textconv`, should twr ever run one.
     #[tokio::test]
     async fn diffs_run_no_program_the_repository_names() {
