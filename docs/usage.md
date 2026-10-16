@@ -325,6 +325,8 @@ twr events api --follow --hydrate # NDJSON, with payloads moved to the blob stor
 twr control --follow --pretty     # the global control stream; a hub shutdown's stops fold into one dimmed line
 ```
 
+`twr box list` lists the remote boxes, their state and the twr version they run, and `twr box status <box>` shows one in full; `twr box add <box> <ssh destination>` adds a box the hub reaches over SSH ([runners.md](runners.md#ssh-boxes)).
+
 `twr info` shows what the running hub uses: its boxes and the orchestrator runtime, and how loaded its machine is (`load: busy: CPU pressure 52%, memory pressure 0%, disk pressure 0%, load 5.1 on 4 cores`; see [tui.md](tui.md#machine-load)).
 
 ## Security

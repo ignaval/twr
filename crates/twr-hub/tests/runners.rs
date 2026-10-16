@@ -40,6 +40,18 @@ const WAIT: Duration = Duration::from_secs(15);
 // Harness
 // ------------------------------------------------------------------------------------------
 
+/// The `ssh` arguments of a remote attach to `dest`, up to its remote command: a terminal, no
+/// forwarding of any kind (before and after the box's words), `--`.
+fn attach_ssh(dest: &str) -> Vec<String> {
+    std::iter::once("ssh")
+        .chain(twr_hub::remote::ATTACH_SSH_OPTIONS.iter().copied())
+        .chain([dest])
+        .chain(twr_hub::remote::SSH_NO_FORWARDING.iter().copied())
+        .chain(["--"])
+        .map(String::from)
+        .collect()
+}
+
 fn config(ssh: Option<&str>) -> Config {
     let mut c = Config {
         default_runtime: "fake".into(),
@@ -611,6 +623,7 @@ async fn raw_hello(ws: &mut RawWs, h: Hello) {
         acks_needed: h.acks_needed,
         runtimes: h.runtimes,
         worktrees: h.worktrees,
+        build: None,
     };
     raw_send(ws, &RunnerMsg::Inventory(inv)).await;
 }
@@ -1966,8 +1979,8 @@ async fn remote_attach_quiesces_through_the_runner_and_returns_an_ssh_command() 
         "{:?}",
         grant.env
     );
-    assert_eq!(&grant.argv[..4], ["ssh", "-t", "me@gpu.lan", "--"]);
-    let remote = &grant.argv[4];
+    assert_eq!(grant.argv[..grant.argv.len() - 1], attach_ssh("me@gpu.lan"));
+    let remote = &grant.argv[grant.argv.len() - 1];
     assert!(
         remote.starts_with(&format!("cd '{}' && exec ", proj.display())),
         "{remote}"
@@ -2069,8 +2082,8 @@ async fn a_remote_acp_preset_attaches_with_its_template() {
         .await
         .unwrap();
     assert_eq!(grant.runtime, "acp");
-    assert_eq!(&grant.argv[..4], ["ssh", "-t", "me@gpu.lan", "--"]);
-    let remote = &grant.argv[4];
+    assert_eq!(grant.argv[..grant.argv.len() - 1], attach_ssh("me@gpu.lan"));
+    let remote = &grant.argv[grant.argv.len() - 1];
     assert!(
         remote.starts_with(&format!("cd '{}' && exec ", proj.display())),
         "{remote}"
@@ -2150,7 +2163,7 @@ async fn a_remote_attach_keeps_its_directory_from_a_park_of_the_worktrees_thread
     };
     let grant = attach().await.unwrap();
     assert!(
-        grant.argv[4].contains(&wt.to_string_lossy().into_owned()),
+        grant.argv[grant.argv.len() - 1].contains(&wt.to_string_lossy().into_owned()),
         "{grant:?}"
     );
     until(&mut sub, |e| e.kind() == "thread.attached").await;
@@ -3307,8 +3320,8 @@ async fn a_remote_attach_runs_the_hubs_command_whatever_the_runner_answers() {
     raw_ok(&mut ws, id).await;
     raw_frame(&mut ws, exited(&t, 3, Some(0), Some("r1"))).await;
     let grant = attach.await.unwrap().unwrap();
-    assert_eq!(&grant.argv[..4], ["ssh", "-t", "me@gpu.lan", "--"]);
-    let remote = &grant.argv[4];
+    assert_eq!(grant.argv[..grant.argv.len() - 1], attach_ssh("me@gpu.lan"));
+    let remote = &grant.argv[grant.argv.len() - 1];
     let dir_on_box = dir.path().join("rawproj");
     assert!(
         remote.starts_with(&format!("cd '{}' && exec ", dir_on_box.display())),
@@ -3423,8 +3436,8 @@ async fn remote_threads_run_and_attach_with_the_configured_environment() {
     raw_ok(&mut ws, id).await;
     raw_frame(&mut ws, exited(&configured, 3, Some(0), Some("r1"))).await;
     let grant = attach.await.unwrap().unwrap();
-    assert_eq!(&grant.argv[..4], ["ssh", "-t", "me@gpu.lan", "--"]);
-    let remote = &grant.argv[4];
+    assert_eq!(grant.argv[..grant.argv.len() - 1], attach_ssh("me@gpu.lan"));
+    let remote = &grant.argv[grant.argv.len() - 1];
     for set in ["'CARGO_INCREMENTAL=0'", "'CARGO_TARGET_DIR=/cache/rawproj'"] {
         assert!(remote.contains(set), "{set} not in {remote}");
     }
@@ -3513,7 +3526,7 @@ async fn a_remote_attach_is_never_fitted_to_the_hubs_own_binaries() {
     raw_ok(&mut ws, id).await;
     raw_frame(&mut ws, exited(&t, 3, Some(0), Some("r1"))).await;
     let grant = attach.await.unwrap().unwrap();
-    let remote = &grant.argv[4];
+    let remote = &grant.argv[grant.argv.len() - 1];
     assert!(remote.contains("'twr-fake-attach' 's-fit'"), "{remote}");
     assert!(!remote.contains("--fitted-to-this-box"), "{remote}");
     h.shutdown().await;

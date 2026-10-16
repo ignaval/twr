@@ -112,6 +112,8 @@ mod append;
 mod attach;
 mod attention;
 mod background;
+mod box_switch;
+mod boxes;
 mod closing;
 mod commands;
 mod config_view;
@@ -158,6 +160,7 @@ pub use agents::{
 pub use append::{rejection, InvalidEvent};
 pub use attach::AttachGrant;
 pub use attention::Relay;
+pub(crate) use boxes::WeakHub;
 pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
@@ -171,6 +174,7 @@ pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
+pub use runners::SealedEnd;
 pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
@@ -199,7 +203,6 @@ use twr_decisions::Ladder;
 use crate::host::{
     builtin_adapters, AdapterLookup, ThreadHost, AGENT_ENV, RUNTIME_GEN_ENV, THREAD_ENV,
 };
-use crate::remote::RemoteBox;
 use crate::store::{self, StagedBlobs, Store};
 use supervisor::{split_runtime_attn_id, supervise};
 
@@ -327,6 +330,9 @@ pub struct HubOptions {
     /// How long a remote box's answer to a repository change is waited for
     /// ([`twr_core::git::CHANGE_REQUEST_TIMEOUT`] by default; tests shorten it).
     pub change_request_timeout: Duration,
+    /// When an SSH box whose daemon runs another build than the one launched is switched to
+    /// it ([`crate::ssh_box::SwitchTiming`]; its defaults, tests shorten them).
+    pub box_switch: crate::ssh_box::SwitchTiming,
     /// The `systemd-run` and `systemctl` that limit the local workers under `[threads]
     /// cpu_weight` or `memory_high` (`hub::limits`; `None`: the ones on `PATH`).
     pub systemd_tools: Option<(PathBuf, PathBuf)>,
@@ -362,6 +368,10 @@ pub struct HubOptions {
     /// its members are read (`hub::jobs`, every 5 s while it runs). Never set outside tests.
     #[doc(hidden)]
     pub job_members_hook: Option<MarkerReadHook>,
+    /// Test hook: an SSH box's supervisor dials the box through it instead of ssh (no probe,
+    /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
+    #[doc(hidden)]
+    pub box_dialer: Option<crate::ssh_box::BoxDialer>,
 }
 
 /// [`HubOptions::marker_read_hook`].
@@ -403,6 +413,7 @@ impl HubOptions {
             git_bin: None,
             handoff_reply_timeout: handoff::HANDOFF_REPLY_TIMEOUT,
             change_request_timeout: twr_core::git::CHANGE_REQUEST_TIMEOUT,
+            box_switch: crate::ssh_box::SwitchTiming::default(),
             systemd_tools: None,
             start_time_faults: 0,
             orchestrator_token_unverified: false,
@@ -411,6 +422,7 @@ impl HubOptions {
             job_gate_hook: None,
             reap_job_group_hook: None,
             job_members_hook: None,
+            box_dialer: None,
         }
     }
 }
@@ -584,10 +596,33 @@ struct Inner {
     events_tx: broadcast::Sender<Arc<Event>>,
     live_count: watch::Sender<usize>,
     state: watch::Sender<HubState>,
-    hosts: HashMap<String, Arc<dyn ThreadHost>>,
-    /// The remote boxes (`[boxes.<name>]`), also in `hosts`.
-    remotes: HashMap<String, RemoteBox>,
+    /// The boxes: the hub's own and the remote ones (`[boxes.<name>]`), reached only through
+    /// the accessors of `hub::boxes` (`Inner::host`, `Inner::remote`, ...), which never hold
+    /// it across an `.await` or while taking the core lock.
+    boxes: std::sync::RwLock<boxes::Boxes>,
+    /// The configuration the hub started with. Its `boxes` are those of the start: a box added
+    /// since is only in [`Inner::boxes`] (`Inner::box_config`).
     config: Config,
+    /// [`HubOptions::config_file`]: where `box.add` reads boxes from.
+    config_file: Option<PathBuf>,
+    /// [`HubOptions::change_request_timeout`], for the remote boxes added later.
+    change_request_timeout: Duration,
+    /// Serializes `box.install`s: each reads the files, compares and applies, so a slower
+    /// one's older read can't be applied after a newer one's (`hub::boxes`).
+    box_install_lock: tokio::sync::Mutex<()>,
+    /// [`HubOptions::box_switch`].
+    box_switch: crate::ssh_box::SwitchTiming,
+    /// [`HubOptions::box_dialer`].
+    box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// [`HubOptions::worktree_namespace`]: the branch namespace of the hub's own box, also the
+    /// SSH boxes' ([`crate::remote`]).
+    worktree_namespace: Option<String>,
+    /// The runner listener serves this hub ([`crate::listener::RunnerListener::serve`]): a
+    /// token box can connect.
+    listening: std::sync::atomic::AtomicBool,
+    /// The hub's box key (`<data dir>/box-key`, [`crate::ssh_box`]), once an SSH box needed
+    /// it.
+    box_key: tokio::sync::OnceCell<Arc<twr_core::sealed::HubKey>>,
     db_path: PathBuf,
     instance_name: String,
     /// [`HubOptions::workspace`].
@@ -603,8 +638,9 @@ struct Inner {
     ack_batch_delay: Duration,
     started_at: DateTime<Utc>,
     /// What is wrong with the configuration but does not stop the hub (`hub.info`'s
-    /// `warnings`; logged at start): [`Config::warnings`].
-    warnings: Vec<String>,
+    /// `warnings`; logged): [`Config::warnings`] at start, and the warnings of the boxes added
+    /// since (`Inner::warn`).
+    warnings: Mutex<Vec<String>>,
     /// Why the hub failed ([`fail_hub`]), once it has.
     ///
     /// [`fail_hub`]: supervisor::fail_hub
@@ -773,9 +809,11 @@ struct ThreadRt {
     session_settings: Option<restart::RunSettings>,
     /// The runtime is being stopped to restart in the thread's new settings (`hub::restart`):
     /// its exit is recorded as a `thread.stopped` with this `ext.twr.reason` (`mode_change` or
-    /// `model_change`) and the runtime is started again on its session. A `thread.stop`
-    /// meanwhile clears it (the stop wins). Memory only: a hub restart starts every local
-    /// runtime afresh in the thread's settings anyway.
+    /// `model_change`) and the runtime is started again on its session. Also a stop for a
+    /// trim (`trim`, `hub::disk`) or for the switch of its box to another build
+    /// (`box_upgrade`, `hub::box_switch`), after which the thread is not free until that is
+    /// over. A `thread.stop` meanwhile clears it (the stop wins). Memory only: a hub restart
+    /// starts every local runtime afresh in the thread's settings anyway.
     restart_reason: Option<&'static str>,
     /// The runtime's own turns whose start the hub dropped (`hub::supervisor`): runtime turn
     /// id → the open turn that took them in. Each one's end adds its usage to that turn once.
@@ -1177,6 +1215,10 @@ struct Core {
     /// Remote boxes whose runner is connected, synced and reconciled (`hub::runners`):
     /// only their threads get new turns and box commands.
     online_boxes: HashSet<String>,
+    /// SSH boxes being switched to the build the hub launched there (`hub::box_switch`): their
+    /// threads take no turn and start no runtime until the box's next connection is
+    /// reconciled. Memory only.
+    switching_boxes: HashSet<String>,
     /// Runner frames are being committed without a sync each: their connection syncs the
     /// batch before acking it (`hub::runners`, [`store::AppendBatch::defer_sync`]).
     defer_ack_sync: bool,
@@ -1465,10 +1507,11 @@ impl Core {
         name == LOCAL_BOX || self.online_boxes.contains(name)
     }
 
-    /// `box_offline` unless the thread's box is online ([`Core::box_online`]).
+    /// `box_offline` unless the thread's box is online ([`Core::box_online`]) and not being
+    /// switched to another build ([`Core::refuse_switching_box`]).
     fn require_box(&self, view: &ThreadView) -> Result<(), RpcError> {
         if self.box_online(&view.box_name) {
-            Ok(())
+            self.refuse_switching_box(&view.box_name)
         } else {
             Err(rpc(
                 codes::BOX_OFFLINE,
@@ -1477,6 +1520,36 @@ impl Core {
                     view.box_name, view.name
                 ),
             ))
+        }
+    }
+
+    /// [`Core::refuse_switching_box`] of box `name` and, when it is a remote box, an
+    /// operation on it begun in the same step ([`crate::remote::RemoteBox::begin_op`]): hold it
+    /// across the awaits that follow, so that the box is not quiet (`Core::box_quiet`) and no
+    /// switch begins until it is dropped.
+    pub(super) fn reserve_box(
+        &self,
+        hub: &Inner,
+        name: &str,
+    ) -> Result<Option<crate::remote::BoxOp>, RpcError> {
+        self.refuse_switching_box(name)?;
+        Ok(hub.remote(name).map(|r| r.begin_op()))
+    }
+
+    /// `box_offline` while SSH box `name` is being switched to the hub's build (its
+    /// `switching` gate, `hub::box_switch`): a repository request started now (a new thread,
+    /// a park, resume, deletion or restore) would fail when the box's session closes. An
+    /// operation that awaits the box after this check holds [`Core::reserve_box`]'s guard
+    /// instead (one that records its own state in the same step, such as a park, resume,
+    /// deletion or attach lease, is counted by that).
+    fn refuse_switching_box(&self, name: &str) -> Result<(), RpcError> {
+        if self.switching_boxes.contains(name) {
+            Err(rpc(
+                codes::BOX_OFFLINE,
+                format!("box {name:?} is switching to the hub's twr build: try again in a minute"),
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -1494,9 +1567,9 @@ impl Core {
     }
 
     /// Whether `thread` can take a new turn now: the hub is not shutting down, no turn is
-    /// open, it is not attached (or being attached), parked or resumed, its box is online, its
-    /// runtime is not exiting or being stopped, and no answer to its remote runtime awaits the
-    /// box's acknowledgement.
+    /// open, it is not attached (or being attached), parked or resumed, its box is online and
+    /// not being switched to another build, its runtime is not exiting or being stopped, and
+    /// no answer to its remote runtime awaits the box's acknowledgement.
     fn thread_free(&self, thread: &str) -> bool {
         if self.shutting_down {
             return false;
@@ -1515,9 +1588,10 @@ impl Core {
         {
             return false;
         }
-        // A remote box's threads wait (prompts stay queued) while it is offline; its
-        // reconnection dispatches them (`hub::runners`).
-        if !self.box_online(&view.box_name) {
+        // A remote box's threads wait (prompts stay queued) while it is offline, or while it
+        // is being switched to another build (`hub::box_switch`); its reconnection dispatches
+        // them (`hub::runners`).
+        if !self.box_online(&view.box_name) || self.switching_boxes.contains(&view.box_name) {
             return false;
         }
         let rt = self.rt.get(thread);
@@ -1842,10 +1916,7 @@ impl Core {
         // A worker on the hub's machine runs under the limits configured (`hub::limits`).
         if !self.orch.is_thread(thread)
             && !view.is_orchestrator()
-            && hub
-                .hosts
-                .get(&view.box_name)
-                .is_some_and(|h| !h.is_remote())
+            && hub.host(&view.box_name).is_some_and(|h| !h.is_remote())
         {
             cfg.wrap = hub.limits.wrap_for(&cfg.env);
         }
@@ -1856,21 +1927,21 @@ impl Core {
         // Its working directory is held from before it starts until it is gone; refused while
         // the directory's worktree is being removed (a park whose caller went away, whose git
         // runs on) or created.
-        let workdir = match hub.hosts.get(&view.box_name) {
+        let workdir = match hub.host(&view.box_name) {
             Some(host) => host.use_workdir(&cfg.cwd, thread)?,
             None => None,
         };
         // A local runtime is recorded before it exists: a hub that dies before the runtime
         // reports its process finds it at startup by its marker (`crate::store`
         // `spawn_intents`). The closing sequence of the thread retires the record.
-        let intent = match (hub.hosts.get(&view.box_name), hub.start_ticks) {
+        let intent = match (hub.host(&view.box_name), hub.start_ticks) {
             (Some(host), Some(min_start)) if !host.is_remote() => {
                 self.store.add_spawn_intent(thread, min_start)?;
                 true
             }
             _ => false,
         };
-        let started = match hub.hosts.get(&view.box_name) {
+        let started = match hub.host(&view.box_name) {
             None => Err(anyhow::anyhow!("box {:?} is not available", view.box_name)),
             Some(host) => match &view.session_id {
                 Some(session) => host
@@ -1907,8 +1978,7 @@ impl Core {
         // A remote session's run is the hub's to name (`spawn` / `resume`): known before any
         // frame of it, so no frame or exit of another run of the thread is ever taken for it.
         let run = hub
-            .remotes
-            .get(&view.box_name)
+            .remote(&view.box_name)
             .and_then(|r| r.session_run(thread));
         // From here the process its adapter reported starting (`AdapterHandle::pid`) is the
         // thread's for the hub's socket, before the runtime reports it (`hub::agents`). The
@@ -2001,9 +2071,16 @@ impl Hub {
             .append_ex(&self.inner, thread, turn, source, body, raw, None)
     }
 
-    /// The configuration the hub runs with.
+    /// The configuration the hub started with (its `boxes` those of the start: a box added
+    /// since is in [`Hub::config_show`]'s).
     pub fn config(&self) -> &Config {
         &self.inner.config
+    }
+
+    /// `config.show`: the configuration the hub runs with ([`config_view`]), its boxes the
+    /// hub's own list (those added since it started included).
+    pub fn config_show(&self) -> Value {
+        config_view(&self.inner.config, Some(&self.inner.box_configs()))
     }
 
     /// The workspace this hub serves ([`HubOptions::workspace`]; `default` for none).
@@ -2018,22 +2095,14 @@ impl Hub {
     pub fn info(&self) -> Value {
         // Read before taking the core: the hub's machine, where its local threads run.
         let load = twr_core::load::Load::sample_cached().map(|l| l.to_json());
-        let boxes: Vec<Value> = self
-            .boxes()
-            .into_iter()
-            .map(|(name, online, version)| {
-                // Refusals only matter while no runner of the box is connected.
-                let refused = (!online)
-                    .then(|| self.box_refusal(&name))
-                    .flatten()
-                    .map(|r| json!({"at": r.at, "reason": r.reason}));
-                json!({"name": name, "online": online, "version": version, "refused": refused})
-            })
-            .collect();
+        let boxes = self.boxes_json();
+        // (Read once, on the first call: not under the core lock.)
+        let build = twr_core::build_id();
         let core = self.inner.core();
         json!({
             "boxes": boxes,
             "version": twr_core::version(),
+            "build": build,
             "pid": std::process::id(),
             "db": self.inner.db_path,
             "instance": self.inner.instance_name,
@@ -2050,7 +2119,7 @@ impl Hub {
             "disk": core.disk_json(&self.inner),
             "notify_hook": !self.inner.config.notify.command.is_empty(),
             "worker_limits": self.inner.limits.by(),
-            "warnings": self.inner.warnings,
+            "warnings": self.inner.warnings(),
         })
     }
 

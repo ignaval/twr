@@ -361,6 +361,13 @@ impl Paths {
         (self.data_dir == home.join("data")).then_some(home)
     }
 
+    /// The boxes twr added itself (`twr box add`): `boxes.toml` next to the config file,
+    /// shared by every workspace of the root as the config file is
+    /// ([`crate::config::BoxesFile`]).
+    pub fn boxes_file(&self) -> PathBuf {
+        crate::config::BoxesFile::path_for(&self.config_file)
+    }
+
     /// SQLite database file.
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("twr.db")

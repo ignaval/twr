@@ -344,10 +344,7 @@ impl Core {
         // Only a new effort (or one for a new runtime) is checked against the binary: one the
         // thread has runs already.
         if new_effort.is_some() && (new_effort != view.effort || switch.is_some()) {
-            let local = hub
-                .hosts
-                .get(&view.box_name)
-                .is_some_and(|h| !h.is_remote());
+            let local = hub.host(&view.box_name).is_some_and(|h| !h.is_remote());
             if let Some(why) = runtime_spec::effort_refusal(&target, local) {
                 return Err(rpc(codes::BAD_REQUEST, why));
             }

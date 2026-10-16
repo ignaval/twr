@@ -5,7 +5,9 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, online, version}], client, identity, warnings}` |
+//! | `hub.info`          | -                                                   | `{version, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, switch_pending}], client, identity, warnings}` |
+//! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
+//! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
@@ -174,7 +176,9 @@
 //! listing. `trash.list` lists the trash of every box (the orchestrator may call it);
 //! `trash.empty` purges items now and `trash.restore` puts a thread back (`hub::trash`): users
 //! only, not in `ORCHESTRATOR_METHODS`, and the hub refuses the orchestrator identity as
-//! well. Items are purged `[trash] keep_days` after their deletion.
+//! well. Items are purged `[trash] keep_days` after their deletion. `box.add` and
+//! `box.install` change the hub's boxes (`hub::boxes`): users only too, refused to the
+//! orchestrator and to agents alike.
 //! `thread.send` succeeds once the prompt is queued (`queued` is its queue row id, and `ref`
 //! too: the message's ref); if dispatching it then failed, `dispatch_error` says why and the
 //! prompt stays queued. `say` returns the same `ref` when it queued the message (`send`,
@@ -621,6 +625,8 @@ pub const METHODS: &[&str] = &[
     "hub.info",
     "hub.shutdown",
     "config.show",
+    "box.add",
+    "box.install",
     "notify.looking",
     "usage.get",
     "usage.threads",
@@ -1010,7 +1016,7 @@ async fn connection(
             "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "project.files" | "project.read" | "project.search" => {
+            | "project.files" | "project.read" | "project.search" | "box.add" | "box.install" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1487,6 +1493,13 @@ struct TrashEmptyParams {
     dry_run: bool,
 }
 
+/// `box.add`, `box.install`: the box.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxParams {
+    name: String,
+}
+
 /// `trash.restore`: the item, and the name to restore it under.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1780,6 +1793,16 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             let p: TrashRestoreParams = params(p)?;
             hub.trash_restore(&p.item, p.as_name.as_deref(), caller)
                 .await
+        }
+        // Reads config.toml and boxes.toml again (`hub::boxes`).
+        "box.add" => {
+            let p: BoxParams = params(p)?;
+            hub.box_add(&p.name, caller).await
+        }
+        // Reads the box's `build` from them again.
+        "box.install" => {
+            let p: BoxParams = params(p)?;
+            hub.box_install(&p.name, caller).await
         }
         "context.read" => {
             let p: ProjectParams = params(p)?;
@@ -2135,7 +2158,7 @@ fn call(
             Ok(info)
         }
         "hub.shutdown" => Ok(json!({ "ok": true })),
-        "config.show" => Ok(crate::hub::config_view(hub.config())),
+        "config.show" => Ok(hub.config_show()),
         "thread.spawn" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]

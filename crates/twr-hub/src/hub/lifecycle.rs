@@ -12,17 +12,17 @@ use rusqlite::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
 use twr_core::config::Config;
 use twr_core::event::*;
+use twr_core::proto::RpcError;
 use twr_core::reduce::{AttentionStack, Registry};
 use twr_decisions::Ladder;
 
 use super::append::hydrated_from_store;
 use super::closing::release_live;
 use super::{
-    after, context, git, hook, orch, runners, runtime_spec, stall, trash, Core, Exit, Hub,
+    after, boxes, context, git, hook, orch, runtime_spec, stall, trash, Core, Exit, Hub,
     HubOptions, HubState, Inner, GIT_TICK, LOCAL_BOX, LOCK_FILE,
 };
 use crate::host::{LocalHost, StaleProcess, ThreadHost};
-use crate::remote::RemoteBox;
 use crate::store::{self, Store};
 
 /// How long [`Hub::open`] retries a busy data-directory lock. A lock released moments ago can
@@ -72,7 +72,7 @@ impl Hub {
         for w in &warnings {
             tracing::warn!("{w}");
         }
-        let (hosts, remotes) = box_hosts(&opts);
+        let local = local_host(&opts);
         let job_slots_dir = opts
             .job_slots_dir
             .clone()
@@ -84,9 +84,16 @@ impl Hub {
             events_tx,
             live_count: watch::Sender::new(0),
             state: watch::Sender::new(HubState::Running),
-            hosts,
-            remotes,
+            boxes: std::sync::RwLock::new(boxes::Boxes::with_local(local)),
             config: opts.config,
+            config_file: opts.config_file,
+            change_request_timeout: opts.change_request_timeout,
+            box_switch: opts.box_switch,
+            box_install_lock: tokio::sync::Mutex::new(()),
+            box_dialer: opts.box_dialer,
+            worktree_namespace: opts.worktree_namespace,
+            listening: Default::default(),
+            box_key: Default::default(),
             db_path: opts.db_path,
             instance_name: opts.instance_name,
             workspace: opts.workspace,
@@ -103,7 +110,7 @@ impl Hub {
             reap_job_group_hook: opts.reap_job_group_hook,
             job_members_hook: opts.job_members_hook,
             started_at: Utc::now(),
-            warnings,
+            warnings: Mutex::new(warnings),
             fatal: Mutex::new(None),
             ladder: Ladder::standard(),
             socket: opts.socket,
@@ -134,6 +141,16 @@ impl Hub {
                 .flatten(),
             _lock: lock,
         });
+        // Every remote box, before the log's runtimes are looked at: a remote box's are its
+        // runner's to report (`stale_runtimes`). All of them were admitted already
+        // (`checked_config`); their tasks start below, once the hub is open.
+        let mut registered = Vec::new();
+        for (name, b) in inner.config.boxes.clone() {
+            match boxes::register_box(&inner, &name, b) {
+                Ok(r) => registered.push(r),
+                Err(e) => anyhow::bail!("box {name}: {}", RpcError::from(e).message),
+            }
+        }
         // What is left of the jobs a stopped hub ran and did not see end goes before anything
         // can start a runtime or a job in their directories or take their slots (it holds
         // none any more), and before they are recorded lost below: each job's process group as
@@ -176,6 +193,10 @@ impl Hub {
         hub.inner.core().close_lost_jobs(&hub.inner);
         // Prompts waiting for other threads: each checked now, then as those threads move.
         after::start(&hub.inner);
+        // The remote boxes' own tasks (an SSH box's supervisor dials it from now on).
+        for (rbox, ssh) in registered {
+            boxes::start_box(&hub.inner, rbox, ssh);
+        }
         Ok(hub)
     }
 
@@ -204,8 +225,9 @@ impl Hub {
         let deadline = tokio::time::Instant::now() + within;
         let waits: Vec<_> = self
             .inner
-            .hosts
-            .values()
+            .hosts_list()
+            .into_iter()
+            .map(|(_, h)| h)
             .filter(|h| !h.is_remote())
             .map(|h| h.changes_done(within))
             .collect();
@@ -252,7 +274,7 @@ impl Hub {
                 .registry
                 .list()
                 .into_iter()
-                .filter(|v| self.inner.remotes.contains_key(&v.box_name))
+                .filter(|v| self.inner.has_remote(&v.box_name))
                 .map(|v| v.id.clone())
                 .collect();
             for thread in remote {
@@ -310,12 +332,12 @@ impl Hub {
             // the log shows it running), so the next hub start reaps it before anything else.
             let mut gone = HashSet::new();
             for (thread, generation, proc, box_name) in &stuck {
-                let Some(host) = self.inner.hosts.get(box_name).filter(|h| !h.is_remote()) else {
+                let Some(host) = self.inner.host(box_name).filter(|h| !h.is_remote()) else {
                     // (Remote runtimes were let go above.)
                     continue;
                 };
                 tracing::warn!(%thread, "runtime did not stop in time; killing it");
-                let (host, t, proc) = (Arc::clone(host), thread.clone(), proc.clone());
+                let (t, proc) = (thread.clone(), proc.clone());
                 let (min_start, gen) = (self.inner.start_ticks, Some(*generation));
                 let reaped = tokio::task::spawn_blocking(move || {
                     if let Some(p) = &proc {
@@ -374,6 +396,9 @@ impl Hub {
             }
         }
         self.inner.state.send_replace(HubState::Stopped);
+        // The SSH boxes' supervisors end with it, killing their ssh (their boxes' runtimes
+        // keep running there, as a token runner's do).
+        self.ssh_boxes_ended(Duration::from_secs(2)).await;
     }
 
     /// Why the hub failed, if it did: the store could not record events the hub had to record
@@ -388,12 +413,15 @@ impl Hub {
     }
 }
 
-/// The configuration [`Hub::open`] runs with: valid, no box token too short to use
-/// ([`Config::check_box_tokens`]), `threads.default_mode` in its canonical spelling (or
-/// refused).
+/// The configuration [`Hub::open`] runs with: valid, every box admitted
+/// ([`boxes::admit_box`]: a valid name, no box token too short to use), `threads.default_mode`
+/// in its canonical spelling (or refused).
 fn checked_config(config: &mut Config) -> anyhow::Result<()> {
     config.validate()?;
-    config.check_box_tokens()?;
+    for (name, b) in &config.boxes {
+        // (Its warning is among `Config::warnings` already.)
+        boxes::admit_box(name, b)?;
+    }
     // `threads.default_mode` in its canonical spelling, or the config is refused.
     config.threads.default_mode = runtime_spec::canonical_mode(&config.threads.default_mode, None)
         .map_err(|e| anyhow::anyhow!("threads.default_mode: {e}"))?;
@@ -459,6 +487,7 @@ impl Core {
             items_deleted: HashSet::new(),
             items_restored: HashMap::new(),
             online_boxes: HashSet::new(),
+            switching_boxes: HashSet::new(),
             defer_ack_sync: false,
         };
         // Reducers fold hydrated payloads: control kinds, agent text whose end the thread's
@@ -493,52 +522,25 @@ impl Core {
     }
 }
 
-/// The boxes threads can run on (`Inner::hosts`): the local one, with the adapters of `opts`,
-/// and every valid `[boxes.<name>]`, which are also the remote boxes (`Inner::remotes`).
-fn box_hosts(
-    opts: &HubOptions,
-) -> (
-    HashMap<String, Arc<dyn ThreadHost>>,
-    HashMap<String, RemoteBox>,
-) {
-    let mut hosts: HashMap<String, Arc<dyn ThreadHost>> = HashMap::new();
+/// The hub's own box (`local`), with the adapters, git and branch namespace of `opts`.
+fn local_host(opts: &HubOptions) -> Arc<dyn ThreadHost> {
     let worktrees = data_dir_of(&opts.db_path).join("worktrees");
     let trash = data_dir_of(&opts.db_path).join("trash");
-    hosts.insert(
-        LOCAL_BOX.into(),
-        Arc::new({
-            let host = LocalHost::new(opts.adapters.clone(), worktrees)
-                .with_branch_namespace(opts.worktree_namespace.clone())
-                .with_trash(trash);
-            match opts.git_bin.clone() {
-                Some(bin) => host.with_git_bin(bin),
-                None => host,
-            }
-            .with_park_disposable(opts.config.threads.park_disposable.clone())
-            .with_start_time_faults(opts.start_time_faults)
-        }),
-    );
-    let mut remotes = HashMap::new();
-    for (name, b) in &opts.config.boxes {
-        if name == LOCAL_BOX || twr_runner::client::validate_box_name(name).is_err() {
-            tracing::warn!(box_name = %name, "ignoring [boxes] entry: invalid box name");
-            continue;
+    let host = LocalHost::new(opts.adapters.clone(), worktrees)
+        .with_branch_namespace(opts.worktree_namespace.clone())
+        .with_trash(trash);
+    Arc::new(
+        match opts.git_bin.clone() {
+            Some(bin) => host.with_git_bin(bin),
+            None => host,
         }
-        let token = twr_core::runner::Secret::new(b.token.clone().unwrap_or_default());
-        if token.is_empty() {
-            tracing::warn!(box_name = %name, "box has no token: its runner cannot connect");
-        }
-        let rbox = RemoteBox::new(name.clone(), token, b.ssh.clone())
-            .with_park_disposable(opts.config.threads.park_disposable.clone())
-            .with_change_timeout(opts.change_request_timeout);
-        hosts.insert(name.clone(), Arc::new(rbox.clone()));
-        remotes.insert(name.clone(), rbox);
-    }
-    (hosts, remotes)
+        .with_park_disposable(opts.config.threads.park_disposable.clone())
+        .with_start_time_faults(opts.start_time_faults),
+    )
 }
 
-/// Starts the hub's background tasks: the notifier, the stall and git tickers,
-/// and each remote box's settling of orphaned runtimes.
+/// Starts the hub's background tasks: the notifier, the stall and git tickers. (Each remote
+/// box's own tasks start with it, `boxes::start_box`.)
 fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(orch::notifier(Arc::downgrade(inner), notify_rx));
     tokio::spawn(super::background::ticker(Arc::downgrade(inner)));
@@ -560,13 +562,6 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
             inner.disk_tick,
         ));
     }
-    for rbox in inner.remotes.values() {
-        tokio::spawn(runners::settle_orphans(
-            Arc::downgrade(inner),
-            rbox.clone(),
-            inner.state.subscribe(),
-        ));
-    }
 }
 
 /// A thread whose runtime may have outlived the previous hub: (thread, the recorded process,
@@ -582,7 +577,7 @@ fn stale_runtimes(inner: &Inner) -> Vec<Stale> {
     core.registry
         .list()
         .into_iter()
-        .filter(|v| !inner.remotes.contains_key(&v.box_name))
+        .filter(|v| !inner.has_remote(&v.box_name))
         // A job alone (the hub's, `hub::jobs`) is no runtime left behind.
         .filter(|v| {
             v.current_turn.is_some()
@@ -611,8 +606,8 @@ fn stale_runtimes(inner: &Inner) -> Vec<Stale> {
 /// Kills the recorded processes of `stale` and waits for them to exit.
 async fn reap_stale_runtimes(inner: &Inner, stale: &[Stale]) -> anyhow::Result<()> {
     for (_, proc, box_name) in stale {
-        if let (Some(p), Some(host)) = (proc, inner.hosts.get(box_name)) {
-            let (host, p) = (Arc::clone(host), p.clone());
+        if let (Some(p), Some(host)) = (proc, inner.host(box_name)) {
+            let p = p.clone();
             tokio::task::spawn_blocking(move || host.reap_stale(&p)).await?;
         }
     }
@@ -628,8 +623,8 @@ async fn reap_unreported_runtimes(inner: &Inner, intents: &[(String, u64)]) -> a
             .registry
             .get(thread)
             .map_or_else(|| LOCAL_BOX.to_string(), |v| v.box_name.clone());
-        if let Some(host) = inner.hosts.get(&box_name).filter(|h| !h.is_remote()) {
-            let (host, t, min_start) = (Arc::clone(host), thread.clone(), *min_start);
+        if let Some(host) = inner.host(&box_name).filter(|h| !h.is_remote()) {
+            let (t, min_start) = (thread.clone(), *min_start);
             // Any generation: the previous hub's runtimes (this one has started none yet).
             let killed =
                 tokio::task::spawn_blocking(move || host.reap_marked(&t, min_start, None)).await?;
@@ -722,7 +717,7 @@ impl Core {
             .list()
             .into_iter()
             .filter(|v| v.current_turn.is_none())
-            .filter(|v| !inner.remotes.contains_key(&v.box_name))
+            .filter(|v| !inner.has_remote(&v.box_name))
             .filter_map(|v| Some((v.id.clone(), v.last_turn.as_ref()?.turn)))
             .collect();
         for (thread, turn) in idle {
@@ -1066,6 +1061,28 @@ mod tests {
             assert!(e.contains("boxes.gpu.token is too short"), "{e}");
             assert!(e.contains("`twr runner token` prints a new one"), "{e}");
             assert!(!e.contains("0123456789"), "{e}");
+        }
+        // A box the hub could never use refuses it too (it was skipped before): an invalid
+        // name, `local`.
+        for (name, bad, says) in [
+            ("bad-name", "a b", "invalid box name \"a b\""),
+            ("bad-dash", "-gpu", "invalid box name \"-gpu\""),
+            ("bad-local", "local", "the hub's own box"),
+        ] {
+            let mut c = Config::default();
+            c.boxes.insert(
+                bad.into(),
+                twr_core::config::BoxConfig {
+                    token: Some("k".repeat(32)),
+                    ..Default::default()
+                },
+            );
+            let e = Hub::open(HubOptions::new(db(name), c))
+                .await
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains(says), "{e}");
         }
     }
 }

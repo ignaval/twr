@@ -350,7 +350,7 @@ impl Core {
         };
         self.append_batch(hub, batch)?;
         if let Some(c) = &remote_stop {
-            if let Some(rbox) = hub.remotes.get(&c.box_name) {
+            if let Some(rbox) = hub.remote(&c.box_name) {
                 rbox.expect_stop(thread, &c.cmd_id);
             }
         }

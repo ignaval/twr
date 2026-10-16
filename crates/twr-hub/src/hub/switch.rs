@@ -116,8 +116,7 @@ impl Core {
             return Ok(None);
         }
         if !hub
-            .hosts
-            .get(&view.box_name)
+            .host(&view.box_name)
             .is_some_and(|h| h.has_runtime(&new.runtime))
         {
             return Err(rpc(

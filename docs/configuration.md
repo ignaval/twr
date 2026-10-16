@@ -136,13 +136,18 @@ attach = "gemini --resume {session}"  # optional: what `twr attach` runs; also t
 # tls = { cert = "hub.pem", key = "hub.key" }   # serve wss:// (PEM files)
 allow_insecure_remote = false     # true: plain ws:// on the network (events in clear text)
 
-[boxes.gpu]                       # example: a remote box; see runners.md
-token = "..."                     # the runner presents this; never logged; `twr runner token` makes one
-ssh = "me@gpu-box"                # used by `twr attach` for threads on that box
+[boxes.gpu]                       # example: a box the hub reaches over SSH; see runners.md
+transport = "ssh"                 # the hub connects to it; unset = "token" (its runner connects to the hub)
+ssh = "me@gpu-box"                # where; also used by `twr attach` for threads on that box
+# build = "0123456789abcdef"      # the twr build `twr box install` put on a box of another OS or CPU
 
 [boxes.gpu.projects.api]
 repo = "/srv/code/api"            # where that project lives on the box
 # runtime = "codex"               # runtime for this project's threads on that box
+
+[boxes.lab]                       # example: a box whose runner connects to the hub
+token = "..."                     # the runner presents this; never logged; `twr runner token` makes one
+ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 ```
 
 ## Notes on some keys
@@ -191,7 +196,13 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 
 `[boxes.<name>] token` must be at least 16 characters long. The hub refuses to start with a shorter one, and warns about one shorter than 32 in its log and in `twr info`. Other commands still load such a config, so after an upgrade `twr hub stop` still stops the old hub. To fix it, put a new token from `twr runner token` (64 characters) in the config and in the runner's token file, restart the hub (`twr hub stop`, then `twr`) and the runner. A config that holds a box token or a `[notify]` command holds a secret: keep it private with `chmod 600`. The hub warns at start, in its log and in `twr info`, when other users can access it (any group or other permission bit). See [runners.md](runners.md#set-it-up).
 
-`[boxes.<name>] ssh` is a destination `ssh` understands: `user@host` or a host from `~/.ssh/config`. Extra `ssh` arguments may come before it, separated by spaces, as in `-p 2222 me@host`.
+`[boxes.<name>] ssh` is a destination `ssh` understands: `user@host` or a host from `~/.ssh/config`. Extra `ssh` options may come before it (or after it), separated by spaces, as in `-p 2222 me@host`. They may set how ssh reaches the box: `-p`, `-i`, `-J`, `-F`, `-l`, `-4`, `-6`, `-C`, `-q`, `-v`, `-e`, `-b`, `-c`, `-m`, `-B`, `-I`, `-P`, and `-o` options such as `Port`, `IdentityFile`, `ProxyCommand` or `ProxyJump`. They may not forward anything, run a local command, share a connection or change what ssh runs or how, which twr decides (every ssh twr runs for a box, `twr attach`'s included, turns forwarding off; [security-model.md](security-model.md#ssh-boxes)): `-A`, `-X`, `-Y`, `-K`, `-L`, `-R`, `-D`, `-W`, `-w`, `-M`, `-S`, `-O`, `-N`, `-s`, `-f`, `-t`, `-T`, `-n`, `-G`, `-Q`, `-V`, `-E`, `-y`, and `-o` with `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted`, `GSSAPIDelegateCredentials`, `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`, `Tunnel`, `TunnelDevice`, `PermitLocalCommand`, `LocalCommand`, `BatchMode`, `StdinNull`, `RequestTTY`, `RemoteCommand`, `SessionType`, `ForkAfterAuthentication`, `ControlMaster`, `ControlPath`, `ControlPersist`, `Include`, `Match` or `Host` (in any case). Neither may `--` or a second word that isn't an option, which ssh would run on the box. twr reads the options as ssh does (`-qA` is `-q -A`, `-oForwardAgent=yes` is `-o ForwardAgent=yes`, `-o =ControlMaster=yes` sets `ControlMaster`), and refuses an `-o` whose option name it can't read. An SSH box with such a value is refused wherever the config is read, `twr box add` included; a token box's (only `twr attach` uses it) is refused when the hub starts or adds the box.
+
+`[boxes.<name>] transport` says how the hub and the box find each other. `"ssh"`: the hub connects to the box over ssh, installs twr there and runs a box daemon ([SSH boxes](runners.md#ssh-boxes)); such a box needs `ssh` and has no `token`. `"token"`, or no `transport`: the box's runner connects to the hub's listener with the box's `token` ([Boxes the hub can't reach over SSH](runners.md#boxes-the-hub-cant-reach-over-ssh)). `[boxes.<name>] build`, on SSH boxes only, is the build id (16 lowercase hex digits) of the twr that `twr box install` put on a box of another OS or CPU, which the hub runs there; a box of the hub's own OS and CPU runs the hub's build whatever it says.
+
+### boxes.toml
+
+`twr box add`, `twr box install` and `twr box remove` write `boxes.toml`, next to `config.toml`, never `config.toml` itself. It holds `[boxes.<name>]` tables only, and every command and hub reads it together with `config.toml`, as if its boxes were there. A box named in both files is an error. twr rewrites the file whole, keeping every table and key but not comments, and takes a lock (`boxes.toml.lock`) while it reads and writes it, so two commands at once don't lose a change. You may edit it, for example to give a box `[boxes.<name>.projects.<project>]` entries; a box you configure by hand can just as well live in `config.toml`. A hub reads both files when it starts; `twr box add` adds a box to a running hub, and any other change to a box needs a hub restart.
 
 ## Environment variables
 
@@ -201,6 +212,8 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
 | `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` |
+| `TWR_SSH` | the ssh program the hub and `twr box` run for SSH boxes, instead of `ssh` on `PATH` (it gets the same arguments) |
+| `TWR_BOX_LAUNCHER` | on an SSH box, in the environment ssh commands get there: `setsid` makes the relay start the box daemon in a new session, never as a systemd user service. For tests and troubleshooting |
 | `VISUAL`, `EDITOR` | the editor for `twr context edit` |
 | `RUST_LOG` | the log filter of `twr hub` and `twr runner` (default `info`) and `twr mcp` (default `warn`), e.g. `debug` or `twr_hub=debug`. They log to stderr; a hub that `twr` starts in the background logs to `hub.log` in the data directory |
 

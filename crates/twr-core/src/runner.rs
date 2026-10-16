@@ -19,6 +19,13 @@
 //!    connection, and a proof is bound to both nonces and to its direction, so neither side
 //!    can replay one. An unknown box gets a challenge with a random proof (the runner cannot
 //!    tell it from a wrong token), and a bad proof `error{unauthorized}`.
+//!
+//!    Sealed connections (an SSH box's daemon, [`crate::sealed`]) have no token: the sealed
+//!    channel the protocol runs inside already proved the hub (its key signed the channel's
+//!    opening) and binds the connection to the box. The same messages go through, but the
+//!    runner does not check the challenge's proof and answers [`SEALED_AUTH_PROOF`], and the
+//!    hub ignores the runner's proof (the hub's ssh dialed the box: there is nothing more to
+//!    check on its side).
 //! 3. The runner sends [`RunnerMsg::Inventory`] (version, running sessions, in-flight command
 //!    ids, highest spooled `rseq` per thread), which may be large: only an authenticated
 //!    connection may send large messages. The hub answers [`HubMsg::Welcome`] with a fresh
@@ -93,7 +100,15 @@ pub fn valid_run_id(run: &str) -> bool {
 /// 6: the mutual challenge-response handshake (a small [`Hello`], [`HubMsg::Challenge`],
 /// [`RunnerMsg::Auth`], [`HubMsg::Authenticated`], then [`RunnerMsg::Inventory`]): the token
 /// no longer crosses the connection, and the runner checks the hub before it trusts it.
+///
+/// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
+/// the protocol they were written under): a bump that changes how spooled frames encode must
+/// migrate the spool, or the next runner refuses to open one that holds such frames.
 pub const PROTOCOL_VERSION: u32 = 6;
+
+/// The proof a runner sends in [`RunnerMsg::Auth`] on a sealed connection (see the module
+/// docs): none. The hub does not check it there.
+pub const SEALED_AUTH_PROOF: &str = "";
 
 /// Largest WebSocket message either side accepts (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
@@ -207,6 +222,26 @@ pub fn check_token_len(token: &str, what: &str) -> Result<Option<String>, String
         )))
     } else {
         Ok(None)
+    }
+}
+
+/// Checks a box name (`[boxes.<name>]`, `twr runner --box`): box names become file names
+/// (`runner-<box>.db`) and parts of paths on the box, so `[A-Za-z0-9._-]`, not starting with
+/// `.`, at most 64 bytes.
+pub fn validate_box_name(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "invalid box name {name:?}: use letters, digits, '.', '_' or '-' (not starting with \
+             '.' or '-')"
+        ))
     }
 }
 
@@ -364,6 +399,13 @@ pub struct Inventory {
     /// Directory under which the box keeps thread worktrees
     /// (`<worktrees>/<project>/<thread-name>`).
     pub worktrees: PathBuf,
+    /// The runner's build id ([`crate::build_id`]: the first 16 hex digits of the SHA-256 of
+    /// its executable), when it could read its own executable. It tells two builds of one
+    /// version apart (two dirty development builds share their version string), so the hub
+    /// knows whether an SSH box runs the build it launched. Absent from an older runner's
+    /// inventory, and ignored by an older hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
 }
 
 /// Runner to hub.
@@ -1214,6 +1256,7 @@ mod tests {
             acks_needed: acks,
             runtimes: vec!["fake".into()],
             worktrees: "/data/worktrees".into(),
+            build: Some("0123456789abcdef".into()),
         }));
         round_trip_runner(RunnerMsg::Event {
             thread: "t1".into(),
@@ -1461,6 +1504,25 @@ mod tests {
         assert!(h.nonce.is_empty());
         let auth = serde_json::to_value(RunnerMsg::Auth { proof: "p".into() }).unwrap();
         assert_eq!(auth, json!({"type": "auth", "proof": "p"}));
+
+        // An older runner's inventory has no build, and one without a build sends none (an
+        // older hub ignores it either way: the inventory takes unknown fields).
+        let inv: RunnerMsg =
+            serde_json::from_value(json!({"type": "inventory", "version": "1"})).unwrap();
+        let RunnerMsg::Inventory(inv) = inv else {
+            panic!("not an inventory")
+        };
+        assert_eq!(inv.build, None);
+        let v = serde_json::to_value(RunnerMsg::Inventory(inv)).unwrap();
+        assert!(v.get("build").is_none(), "{v}");
+        let inv: RunnerMsg = serde_json::from_value(
+            json!({"type": "inventory", "version": "1", "build": "0123456789abcdef", "new": 1}),
+        )
+        .unwrap();
+        let RunnerMsg::Inventory(inv) = inv else {
+            panic!("not an inventory")
+        };
+        assert_eq!(inv.build.as_deref(), Some("0123456789abcdef"));
         let ok = serde_json::to_value(HubMsg::Authenticated).unwrap();
         assert_eq!(ok, json!({"type": "authenticated"}));
 
@@ -1563,6 +1625,27 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(!valid_nonce(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn box_names_are_checked() {
+        for ok in ["gpu", "gpu-2", "a.b_c", &"x".repeat(64)] {
+            validate_box_name(ok).unwrap();
+        }
+        for bad in [
+            "",
+            ".hidden",
+            "-gpu",
+            "--help",
+            "a/b",
+            "a b",
+            "ü",
+            &"x".repeat(65),
+            "a\0b",
+        ] {
+            let e = validate_box_name(bad).unwrap_err().to_string();
+            assert!(e.starts_with("invalid box name"), "{bad:?}: {e}");
         }
     }
 

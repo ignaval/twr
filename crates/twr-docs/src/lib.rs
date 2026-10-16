@@ -657,6 +657,7 @@ mod tests {
                 "connect a runner on another machine with a token",
                 "docs/runners.md",
             ),
+            ("ssh box daemon", "docs/runners.md"),
             ("socket api methods", "SKILL.md"),
         ] {
             let top = top_ids(&lib, q, 3);

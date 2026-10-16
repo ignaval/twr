@@ -339,8 +339,7 @@ impl Core {
             .map(|s| s.runtime.as_str());
         let interruptible = view.box_name == LOCAL_BOX
             && live_runtime.is_some_and(|runtime| {
-                hub.hosts
-                    .get(&view.box_name)
+                hub.host(&view.box_name)
                     .is_some_and(|h| h.interrupts_turns(runtime))
             });
         if !interruptible {

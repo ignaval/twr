@@ -304,6 +304,18 @@ struct Inner {
     op_permits: tokio::sync::Semaphore,
     /// Repository changes received from the hub and not finished ([`LocalBox::begin_change`]).
     changes: watch::Sender<usize>,
+    /// [`LocalBox::hold_change_receipts`] (tests).
+    receipt_hold: Mutex<Option<std::sync::mpsc::Sender<ChangeReceiptPause>>>,
+}
+
+/// A repository change paused by [`LocalBox::hold_change_receipts`] (tests) as the
+/// connection's reader takes it, before it is counted: the reader's thread is blocked until
+/// `go` is sent (or dropped).
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ChangeReceiptPause {
+    /// Lets the reader go on.
+    pub go: std::sync::mpsc::Sender<()>,
 }
 
 impl Drop for Inner {
@@ -392,6 +404,7 @@ impl LocalBox {
                 inflight: Mutex::new(HashMap::new()),
                 op_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPS),
                 changes: watch::Sender::new(0),
+                receipt_hold: Mutex::new(None),
             }),
         })
     }
@@ -403,6 +416,37 @@ impl LocalBox {
         self.inner.changes.send_modify(|n| *n += 1);
         ChangeInProgress {
             changes: self.inner.changes.clone(),
+        }
+    }
+
+    /// Test hook: from now on the connection's reader, as it takes a repository change from
+    /// the hub and before it counts it ([`LocalBox::begin_change`]), sends a
+    /// [`ChangeReceiptPause`] on the returned channel and blocks its thread until the pause's
+    /// `go`: a reader in the middle of being polled, which aborting its task does not stop.
+    #[doc(hidden)]
+    pub fn hold_change_receipts(&self) -> std::sync::mpsc::Receiver<ChangeReceiptPause> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self
+            .inner
+            .receipt_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        rx
+    }
+
+    /// The connection's reader takes a repository change ([`LocalBox::hold_change_receipts`]).
+    pub(crate) fn change_received(&self) {
+        let hold = self
+            .inner
+            .receipt_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hold) = hold {
+            let (go, wait) = std::sync::mpsc::channel();
+            if hold.send(ChangeReceiptPause { go }).is_ok() {
+                let _ = wait.recv();
+            }
         }
     }
 

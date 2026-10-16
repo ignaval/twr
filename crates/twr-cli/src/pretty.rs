@@ -82,6 +82,12 @@ pub fn summary(ev: &Event) -> String {
                     "session={session} (stopped for a trim; the next prompt resumes the session)"
                 );
             }
+            if reason == Some(twr_core::event::BOX_UPGRADE_REASON) {
+                return format!(
+                    "session={session} (restarting on the box's new twr build; the next prompt \
+                     resumes the session)"
+                );
+            }
             let what = if reason == Some(twr_core::event::MODEL_RESTART_REASON) {
                 "model"
             } else {
@@ -476,6 +482,53 @@ mod tests {
             }),
         );
         assert_eq!(summary(&ev), "Claude: 5h 78% · wk 56% left (read)");
+    }
+
+    /// A stop the hub makes to restart a runtime says why, not that the thread stopped.
+    #[test]
+    fn settings_restarts_say_why() {
+        use twr_core::event::*;
+        let stop = |reason: Option<&str>| {
+            let ext = reason.and_then(|r| {
+                serde_json::json!({"twr": {"reason": r}})
+                    .as_object()
+                    .cloned()
+            });
+            summary(&Event::new(
+                "t1",
+                4,
+                None,
+                Source::Hub,
+                EventBody::ThreadStopped(SessionPayload {
+                    session_id: Some("s1".into()),
+                    ext,
+                    ..Default::default()
+                }),
+            ))
+        };
+        assert_eq!(
+            stop(Some(MODE_RESTART_REASON)),
+            "session=s1 (restarting in its new mode)"
+        );
+        assert_eq!(
+            stop(Some(MODEL_RESTART_REASON)),
+            "session=s1 (restarting in its new model)"
+        );
+        assert_eq!(
+            stop(Some(RUNTIME_RESTART_REASON)),
+            "session=s1 (replaced by its new runtime)"
+        );
+        assert_eq!(
+            stop(Some(TRIM_RESTART_REASON)),
+            "session=s1 (stopped for a trim; the next prompt resumes the session)"
+        );
+        assert_eq!(
+            stop(Some(BOX_UPGRADE_REASON)),
+            "session=s1 (restarting on the box's new twr build; the next prompt resumes the \
+             session)"
+        );
+        assert_eq!(stop(Some("hub_shutdown")), "session=s1");
+        assert_eq!(stop(None), "session=s1");
     }
 
     #[test]

@@ -286,8 +286,7 @@ impl Core {
             ));
         }
         let git = hub
-            .hosts
-            .get(&box_name)
+            .host(&box_name)
             .map(|h| h.git())
             .ok_or_else(|| rpc(codes::CONFLICT, format!("box {box_name} is not configured")))?;
         let stopping = self.rt.get(id).is_some_and(|r| r.live.is_some());
@@ -301,7 +300,7 @@ impl Core {
             };
             self.append_batch(hub, batch).map_err(super::append_err)?;
             if let Some(c) = &remote_stop {
-                if let Some(rbox) = hub.remotes.get(&c.box_name) {
+                if let Some(rbox) = hub.remote(&c.box_name) {
                     rbox.expect_stop(id, &c.cmd_id);
                 }
             }
@@ -672,7 +671,7 @@ impl Core {
             })
             .filter_map(|v| {
                 let (b, wt) = self.managed_worktree(&v.id)?;
-                let git = hub.hosts.get(b)?.git();
+                let git = hub.host(b)?.git();
                 Some((
                     self.disk.measured.get(&v.id).map(|m| m.at),
                     Due {
@@ -913,11 +912,12 @@ async fn trim(
 /// a time, then the cards.
 pub(super) async fn disk_round(hub: &Arc<Inner>) {
     let boxes: Vec<(String, Arc<dyn GitOps>)> = {
+        let hosts = hub.hosts_list();
         let core = hub.core();
-        hub.hosts
-            .iter()
+        hosts
+            .into_iter()
             .filter(|(b, _)| core.box_online(b))
-            .map(|(b, h)| (b.clone(), h.git()))
+            .map(|(b, h)| (b, h.git()))
             .collect()
     };
     // The free space first, each box bounded: a box that recovered closes its card whatever

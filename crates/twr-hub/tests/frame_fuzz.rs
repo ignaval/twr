@@ -365,6 +365,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
             acks_needed: BTreeMap::from([(string(rng), number(rng))]),
             runtimes: vec![string(rng)],
             worktrees: string(rng).into(),
+            build: None,
         }),
         3 | 4 => RunnerMsg::Event {
             thread: string(rng),
