@@ -222,6 +222,7 @@ async fn a_thread_on_a_remote_box_does_not_search_the_hub() {
     let mut ro = RunnerOptions::new(&url, Secret::new(TOKEN), BOX, &rdir);
     ro.backoff_min = Duration::from_millis(20);
     ro.backoff_max = Duration::from_millis(200);
+    ro.refused_retry = Duration::from_millis(200);
     let mut box_opts = LocalBoxOptions::new(&rdir, BOX);
     box_opts.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
         match name {

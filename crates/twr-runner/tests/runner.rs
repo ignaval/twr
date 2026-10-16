@@ -35,6 +35,8 @@ struct HubState {
     /// Connections whose runner did not answer the hub's challenge (it did not accept the
     /// hub's proof).
     unanswered: u64,
+    /// When each of those connections ended (the runner left after the challenge).
+    unanswered_at: Vec<std::time::Instant>,
     /// Every event/exited frame received, duplicates included.
     received: Vec<(String, u64)>,
     committed: Vec<Committed>,
@@ -119,7 +121,9 @@ impl FakeHub {
             _ => None,
         };
         let Some(RunnerMsg::Auth { proof }) = next(stream.next().await) else {
-            self.state().unanswered += 1;
+            let mut st = self.state();
+            st.unanswered += 1;
+            st.unanswered_at.push(std::time::Instant::now());
             return;
         };
         assert!(
@@ -270,6 +274,7 @@ fn opts(hub: &FakeHub, dir: &Path) -> RunnerOptions {
     let mut o = RunnerOptions::new(hub.url.clone(), Secret::new(TOKEN), BOX, dir);
     o.backoff_min = Duration::from_millis(20);
     o.backoff_max = Duration::from_millis(100);
+    o.refused_retry = Duration::from_millis(20);
     o.ping_interval = Duration::from_millis(200);
     o.idle_timeout = Duration::from_secs(5);
     o.welcome_timeout = Duration::from_secs(5);
@@ -380,7 +385,7 @@ async fn hello_welcome_then_live_events_in_rseq_order() {
         assert_eq!(s.hellos[0].box_name, BOX);
         assert_eq!(s.hellos[0].protocol, PROTOCOL_VERSION);
         let h = &s.inventories[0];
-        assert_eq!(h.version, twr_runner::client::VERSION);
+        assert_eq!(h.version, twr_runner::client::version());
         assert!(h.runtimes.contains(&"fake".to_string()));
         assert!(h.running.is_empty());
         assert_eq!(h.worktrees, dir.path().join("worktrees"));
@@ -479,6 +484,7 @@ async fn a_peer_that_cannot_prove_the_token_gets_nothing_but_the_hello() {
     let mut o = RunnerOptions::new(url, Secret::new(TOKEN), BOX, dir.path());
     o.backoff_min = Duration::from_millis(20);
     o.backoff_max = Duration::from_millis(50);
+    o.refused_retry = Duration::from_millis(50);
     o.welcome_timeout = Duration::from_secs(5);
     let run = start(o, lbox.clone());
     wait_for("four connections", || seen.lock().unwrap().len() >= 4).await;
@@ -797,13 +803,24 @@ async fn the_spool_is_private_and_the_token_never_logged() {
     run.shutdown().await;
 
     // With a wrong token the runner does not accept the hub's proof: it sends nothing after
-    // its hello (and tries again later), and logs neither token.
+    // its hello, tries again no sooner than `refused_retry` (however short its backoff), and
+    // logs neither token.
     let mut bad = o.clone();
     bad.token = Secret::new("wrong-token-7c9d");
+    bad.refused_retry = Duration::from_millis(400);
     let connections = hub.state().connections;
+    let before = hub.state().unanswered_at.len();
     let run = start(bad, lbox.clone());
-    hub.wait("refused hellos", |s| s.unanswered >= 3).await;
+    hub.wait("refused hellos", |s| s.unanswered_at.len() >= before + 3)
+        .await;
     run.shutdown().await;
+    // Each retry starts after the previous connection ended and the wait passed, so the ends
+    // of successive refused connections are at least `refused_retry` apart.
+    let ends = hub.state().unanswered_at[before..].to_vec();
+    for w in ends.windows(2) {
+        let gap = w[1] - w[0];
+        assert!(gap >= Duration::from_millis(400), "{gap:?}");
+    }
     assert_eq!(hub.state().connections, connections);
 
     // Every test in this file logs into the same capture (at TRACE).

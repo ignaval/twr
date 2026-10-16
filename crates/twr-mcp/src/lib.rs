@@ -1465,7 +1465,7 @@ impl TwrMcp {
 
     #[tool(
         description = "What the running hub reports about itself: {version, pid, started_at, \
-                       threads, open_attention, orchestrator, boxes: [{name, online, version}], \
+                       threads, open_attention, orchestrator, boxes: [{name, online, version, refused}], \
                        identity (its workspace and home), load}. load is how loaded the \
                        hub's machine is, where its local threads run: {level: calm | busy | \
                        saturated, summary, cpu_pressure, memory_pressure, io_pressure (the \

@@ -2,6 +2,17 @@
 
 All notable changes to twr are recorded here. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and twr follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html): before 1.0, a new minor version may change commands, config keys and the socket API.
 
+## [Unreleased]
+
+### Changed
+
+- A runner reports twr's whole version, with the commit of a development build (`0.2.0+dev.<commit>`), and `twr info` shows each box's version. While a box is offline, `twr info` (and `hub.info`'s `refused`) also shows the latest connection naming it that the hub refused, and why: a runner of another protocol, one that didn't accept the hub's proof (its token differs), or a bad proof.
+- A runner the hub refuses, or whose hub can't prove it knows the token, waits at least a minute before it tries again, and a protocol refusal is logged as an error saying to run the same twr on both sides.
+
+### Fixed
+
+- `twr thread new <name> --box <box>` sends `<name>` to the hub as typed for a remote box. It used to turn a name that is also a folder in the current directory into that folder's path on this machine, so a project configured only for the box (`[boxes.<box>.projects.<name>]`) wasn't found.
+
 ## [0.2.0] - 2026-10-15
 
 The first public release. twr is one conversation for all your coding agents: you talk to one orchestrator, and a local hub runs the threads it starts, Claude Code, Codex, Grok Build or any Agent Client Protocol agent, each in its own git worktree. Permissions, questions and reports come back to that conversation or to the thread's card, and only you answer them. It's a single binary for Linux and macOS, with no account, cloud service or telemetry. Earlier versions were never published.

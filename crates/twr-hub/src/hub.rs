@@ -2021,7 +2021,14 @@ impl Hub {
         let boxes: Vec<Value> = self
             .boxes()
             .into_iter()
-            .map(|(name, online, version)| json!({"name": name, "online": online, "version": version}))
+            .map(|(name, online, version)| {
+                // Refusals only matter while no runner of the box is connected.
+                let refused = (!online)
+                    .then(|| self.box_refusal(&name))
+                    .flatten()
+                    .map(|r| json!({"at": r.at, "reason": r.reason}));
+                json!({"name": name, "online": online, "version": version, "refused": refused})
+            })
             .collect();
         let core = self.inner.core();
         json!({

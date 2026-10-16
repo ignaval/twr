@@ -50,8 +50,24 @@ use twr_core::runner::{
 use crate::lbox::{LocalBox, LocalBoxOptions};
 use crate::spool::DEFAULT_MAX_BYTES;
 
-/// Runner version reported in the inventory.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Runner version reported in the inventory: twr's whole version, with the build of a
+/// development install (`0.2.0+dev.<commit>`, [`twr_core::version`]).
+pub fn version() -> &'static str {
+    twr_core::version()
+}
+
+/// A connection the hub refused (`error{unauthorized}` or `error{protocol}`), or whose hub
+/// could not prove that it knows the box's token.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Environment variable the CLI reads the token from (removed from the process environment
 /// once read, see [`take_token_env`]).
@@ -169,6 +185,10 @@ pub struct RunnerOptions {
     pub backoff_min: Duration,
     /// Largest reconnect delay.
     pub backoff_max: Duration,
+    /// The shortest wait before connecting again after the hub refused the runner, or could
+    /// not prove that it knows the token (default a minute): retrying sooner can't help, since
+    /// one side's twr or token has to change first.
+    pub refused_retry: Duration,
     /// How often to ping the hub.
     pub ping_interval: Duration,
     /// Reconnect when the hub has been silent this long.
@@ -203,6 +223,7 @@ impl RunnerOptions {
             spool_max_bytes: DEFAULT_MAX_BYTES,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
+            refused_retry: Duration::from_secs(60),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
             welcome_timeout: Duration::from_secs(30),
@@ -581,6 +602,7 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
             ) => r,
             () = stopped(&mut stop) => return,
         };
+        let mut refused = false;
         match attempt {
             Ok(Ok((ws, _resp))) => {
                 let out = serve(ws, lbox, opts, &mut epoch_hint, stop.clone()).await;
@@ -593,7 +615,10 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
                 match out.result {
                     Ok(true) => return,
                     Ok(false) => tracing::warn!("hub connection closed"),
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "hub connection lost"),
+                    Err(e) => {
+                        refused = e.downcast_ref::<Refused>().is_some();
+                        tracing::warn!(error = %format!("{e:#}"), "hub connection lost")
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -601,7 +626,11 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
             }
             Err(_) => tracing::warn!(hub = %opts.hub_url, "connecting to the hub timed out"),
         }
-        let delay = backoff.next();
+        let delay = if refused {
+            backoff.next().max(opts.refused_retry)
+        } else {
+            backoff.next()
+        };
         tracing::info!(retry_in_ms = delay.as_millis() as u64, "reconnecting");
         tokio::select! {
             () = tokio::time::sleep(delay) => {}
@@ -792,8 +821,17 @@ fn refused(opts: &RunnerOptions, code: &str, message: &str) -> anyhow::Error {
             "the hub rejected this runner's box name or token (a hub older than this runner \
              answers so too: both must run the same twr version)"
         );
+    } else if code == hub_errors::PROTOCOL {
+        tracing::error!(
+            box_name = %opts.box_name,
+            version = version(),
+            "the hub refused this runner's protocol ({message}): run the same twr version on \
+             the hub and here, then restart this runner"
+        );
     }
-    anyhow!("the hub refused the runner: {code}: {message}")
+    anyhow::Error::new(Refused(format!(
+        "the hub refused the runner: {code}: {message}"
+    )))
 }
 
 /// The handshake (see the module docs) up to the welcome: `(epoch, watermarks)`. Nothing but
@@ -840,7 +878,9 @@ async fn handshake(
              leaves it to anyone: use -o ExitOnForwardFailure=yes). Nothing was sent to it",
             opts.box_name
         );
-        bail!("the hub did not prove that it knows the box's token");
+        return Err(anyhow::Error::new(Refused(
+            "the hub did not prove that it knows the box's token".into(),
+        )));
     }
     let mine = auth_proof(
         &opts.token,
@@ -861,7 +901,7 @@ async fn handshake(
         ),
     }
     let inventory = RunnerMsg::Inventory(Inventory {
-        version: VERSION.to_string(),
+        version: version().to_string(),
         epoch_hint,
         running: lbox.running(),
         in_flight: lbox.in_flight(),

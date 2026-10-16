@@ -40,6 +40,59 @@ The runner refuses a token file other users can access (any group or other permi
 
 One runner per box runs on a machine. A runner locks its spool, its worktrees directory and a lock file for its hub and box in `$XDG_STATE_HOME/twr/runner-locks/` (by default `~/.local/state/twr/runner-locks/`), which stays put whether the runner was started from a login session, a systemd service or cron. A second runner of the same box for the same hub on that machine refuses to start, whatever its `--data-dir`. Two of them would kill each other's runtimes as leftovers and run repository changes over each other. The lock goes by the `--hub` URL as written, so give every runner of a box the same one.
 
+### Keep it running
+
+The tunnel and the runner above end when you log out. To keep a box connected, run both as systemd user services. On the hub machine, the tunnel (it needs a key ssh can use without asking, from `ssh-agent` or without a passphrase):
+
+```ini
+# ~/.config/systemd/user/twr-tunnel-gpu.service
+[Unit]
+Description=twr runner tunnel to gpu
+
+[Service]
+ExecStart=/usr/bin/ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 7878:127.0.0.1:7878 me@gpu-box
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+On the box, the runner:
+
+```ini
+# ~/.config/systemd/user/twr-runner-gpu.service
+[Unit]
+Description=twr runner for box gpu
+
+[Service]
+ExecStart=%h/.local/bin/twr runner --hub ws://127.0.0.1:7878 --box gpu --token-file %h/.config/twr/gpu.token
+# A service reads no shell startup file: put every agent CLI's folder on PATH, or set
+# TWR_CLAUDE_BIN, TWR_CODEX_BIN or TWR_GROK_BIN to its full path.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Stop the runner first and let it stop its runtimes and finish a repository change (up to
+# 5 minutes) before systemd kills what is left.
+KillMode=mixed
+TimeoutStopSec=330
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+```
+
+Enable each with `systemctl --user daemon-reload` and `systemctl --user enable --now <name>`, and run `loginctl enable-linger` on both machines so user services run without a login session. `systemctl --user stop` stops the runner the way Ctrl-C does: it stops its runtimes and lets a repository change in progress finish. `KillMode=mixed` makes systemd signal only the runner at first; the default would signal the runtimes and git at the same moment. Check that the agents start with `systemctl --user status twr-runner-gpu` and `journalctl --user -u twr-runner-gpu`: an agent the service can't find fails its thread's start with "not found on PATH".
+
+### Over Tailscale
+
+With [Tailscale](https://tailscale.com) on both machines, the hub's listener can stay on loopback while Tailscale serves it to your tailnet with a TLS certificate. On the hub machine, with HTTPS certificates turned on for the tailnet:
+
+```sh
+tailscale serve --bg --tls-terminated-tcp=7878 tcp://127.0.0.1:7878
+```
+
+The runner then connects with `--hub wss://<hub machine>.<tailnet>.ts.net:7878` and needs no tunnel. It checks the certificate against the public web roots, which Tailscale's certificates chain to. Every device on the tailnet can reach that port, so the token is what keeps others out; narrow it with the tailnet's access rules. The hub sees these connections as coming from loopback, so only the overall limit on unauthenticated connections (16) applies to them, not the per-address one. `tailscale serve --tls-terminated-tcp=7878 off` stops it.
+
 A project whose threads should always run on the box can say so with `[projects.<name>] box = "gpu"`. Without a `[boxes.<box>.projects.<name>]` entry, the project's `repo` is taken as a path on the box.
 
 ## Transport and TLS
@@ -70,7 +123,9 @@ A second runner for the same box, on another machine, replaces the first one, wh
 
 When a runner starts, it kills the runtimes its predecessor left behind (one killed with SIGKILL, or that lost power) and records their ends. It records nothing for one it can't show gone, and stops with an error that names the thread and process: one that still runs after the kill, one whose process it can't identify, a process of yours that started since, hides its environment and is tied to the runtime (in its process group, or below the runtime or a process marked for its thread: a non-dumpable process there could be one of the runtime's), or a process table it can't read. A hidden process that isn't tied to the runtime, such as an `ssh-agent` or a `sudo` you started in the same terminal, doesn't count. The hub then sees the box offline instead of starting another runtime next to the survivor. Stop the process, then start the runner again.
 
-`twr info` lists each box and whether it's online.
+`twr info` lists each box, whether it's online and the twr version its runner last reported. While a box is offline, it also shows the latest connection naming the box that the hub refused, and why: a runner of another protocol version, a runner that did not accept the hub's proof (its token differs from the hub's), or a bad proof. Anyone who can reach the listener can name a box, so this is a hint, not proof of who connected.
+
+A runner the hub refuses, or whose hub can't prove it knows the token, waits at least a minute before trying again, since one side's twr or token has to change first.
 
 ## Attach on a remote box
 
