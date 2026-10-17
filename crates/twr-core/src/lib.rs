@@ -6,6 +6,8 @@
 //! - [`reduce`]: pure reducers (thread views, registry, attention stack, stack order)
 //! - [`adapter`]: the runtime adapter trait and its channel-based handle
 //! - [`git`]: the box git trait (worktrees, snapshots) and the porcelain v2 parser
+//! - [`gitremote`]: git remote URLs: which twr clones, how they are shown and compared
+//! - [`project_lookup`]: a git repository by its folder name under the project roots
 //! - [`load`]: how loaded the machine is (pressure stall information, the load average)
 //! - [`paths`], [`config`]: filesystem layout and `config.toml`
 //! - [`notify`]: which control events deserve a user notification
@@ -23,9 +25,11 @@ pub mod client;
 pub mod config;
 pub mod event;
 pub mod git;
+pub mod gitremote;
 pub mod load;
 pub mod notify;
 pub mod paths;
+pub mod project_lookup;
 pub mod proto;
 pub mod reduce;
 pub mod runner;

@@ -142,7 +142,7 @@ ssh = "me@gpu-box"                # where; also used by `twr attach` for threads
 # build = "0123456789abcdef"      # the twr build `twr box install` put on a box of another OS or CPU
 
 [boxes.gpu.projects.api]
-repo = "/srv/code/api"            # where that project lives on the box
+repo = "/srv/code/api"            # where that project lives on the box (`twr box project gpu api` finds and writes it)
 # runtime = "codex"               # runtime for this project's threads on that box
 
 [boxes.lab]                       # example: a box whose runner connects to the hub
@@ -202,7 +202,7 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 
 ### boxes.toml
 
-`twr box add`, `twr box install` and `twr box remove` write `boxes.toml`, next to `config.toml`, never `config.toml` itself. It holds `[boxes.<name>]` tables only, and every command and hub reads it together with `config.toml`, as if its boxes were there. A box named in both files is an error. twr rewrites the file whole, keeping every table and key but not comments, and takes a lock (`boxes.toml.lock`) while it reads and writes it, so two commands at once don't lose a change. You may edit it, for example to give a box `[boxes.<name>.projects.<project>]` entries; a box you configure by hand can just as well live in `config.toml`. A hub reads both files when it starts; `twr box add` adds a box to a running hub, and any other change to a box needs a hub restart.
+`twr box add`, `twr box install`, `twr box remove` and `twr box project` write `boxes.toml`, next to `config.toml`, never `config.toml` itself. It holds `[boxes.<name>]` tables only, and every command and hub reads it together with `config.toml`, as if its boxes were there. A box named in both files is an error. twr rewrites the file whole, keeping every table and key but not comments, and takes a lock (`boxes.toml.lock`) while it reads and writes it, so two commands at once don't lose a change. `twr box project <box> <project>` writes a box's `[boxes.<box>.projects.<project>] repo` once it found the repository on the box, or cloned it there ([runners.md](runners.md#projects-on-a-box)), and `--remove` takes the entry out; you may also edit the file yourself, for example to add such entries. A box you configure by hand can just as well live in `config.toml` (`twr box project` then prints the lines to add there). A hub reads both files when it starts; `twr box add` adds a box to a running hub, `twr box project` has it read the box's projects again, and any other change to a box needs a hub restart.
 
 ## Environment variables
 

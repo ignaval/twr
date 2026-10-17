@@ -628,6 +628,7 @@ pub const METHODS: &[&str] = &[
     "config.show",
     "box.add",
     "box.install",
+    "box.projects",
     "box.agents",
     "notify.looking",
     "usage.get",
@@ -1020,7 +1021,8 @@ async fn connection(
             "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "project.files" | "project.read" | "project.search" | "box.add" | "box.install" => {
+            | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
+            | "box.projects" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1818,6 +1820,17 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "box.install" => {
             let p: BoxParams = params(p)?;
             hub.box_install(&p.name, caller).await
+        }
+        // Reads the box's projects from them again.
+        "box.projects" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BoxProjectsParams {
+                #[serde(rename = "box")]
+                box_name: String,
+            }
+            let p: BoxProjectsParams = params(p)?;
+            hub.box_projects(&p.box_name, caller).await
         }
         "context.read" => {
             let p: ProjectParams = params(p)?;

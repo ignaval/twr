@@ -426,6 +426,17 @@ impl BoxConfig {
         self.transport.unwrap_or_default()
     }
 
+    /// How the hub reaches this box: all of it but its `build` and its `projects`, which `twr
+    /// box install` and `twr box project` change while the hub runs. Two configs of one box
+    /// that differ in this are two different boxes to those commands and to the hub.
+    pub fn connection(&self) -> BoxConfig {
+        BoxConfig {
+            build: None,
+            projects: BTreeMap::new(),
+            ..self.clone()
+        }
+    }
+
     /// [`Config::validate`]'s checks of box `name`: an SSH box has an `ssh` destination that
     /// [`check_ssh_words`] accepts and no token; `build`, on SSH boxes only, is a build id. (A
     /// token box's `ssh`, which only `twr attach` uses, is the hub's to check: every twr
@@ -1234,7 +1245,7 @@ impl Config {
 }
 
 /// `boxes.toml`, next to `config.toml`: the boxes twr added itself (`twr box add`, `twr box
-/// remove`, `twr box install`), kept apart so that twr never rewrites the user's own file.
+/// remove`, `twr box install`, `twr box project`), kept apart so that twr never rewrites the user's own file.
 /// It holds `[boxes.<name>]` tables and nothing else; [`Config::load_with_boxes`] merges them
 /// into the config's `boxes`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1247,9 +1258,9 @@ pub struct BoxesFile {
 /// What [`BoxesFile::save`] writes at the top of `boxes.toml` (comments in the file are not
 /// kept: twr rewrites it whole).
 const BOXES_FILE_HEADER: &str = "\
-# Written by twr: `twr box add`, `twr box remove` and `twr box install` change this file, and
-# rewrite it whole (comments are not kept). Configure anything else in config.toml, next to
-# it; a box named in both files is an error.
+# Written by twr: `twr box add`, `twr box remove`, `twr box install` and `twr box project`
+# change this file, and rewrite it whole (comments are not kept). Configure anything else in
+# config.toml, next to it; a box named in both files is an error.
 ";
 
 impl BoxesFile {

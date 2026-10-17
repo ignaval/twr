@@ -17,6 +17,8 @@
 //!   made on it, and the hub's sealed connections it takes from it.
 //! - [`relay`]: what the hub's `ssh` runs on an SSH box (`twr runner --stdio`): starts the
 //!   daemon when needed, then relays bytes between ssh and the daemon's socket.
+//! - [`repos`]: a box's side of `twr box project`: finding a project's repository on the box
+//!   (`twr runner --find-repo`) and cloning one there in the user's terminal (`--clone-repo`).
 //!
 //! The wire protocol is [`twr_core::runner`].
 
@@ -27,6 +29,7 @@ pub mod lbox;
 pub mod local;
 pub mod reap;
 pub mod relay;
+pub mod repos;
 pub mod spool;
 pub mod workdirs;
 

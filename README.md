@@ -60,6 +60,7 @@ twr model api opus --effort high       # change a thread's model and reasoning e
 twr model api --runtime codex          # move a thread to another runtime, with a handoff
 twr orchestrator use codex --model gpt-5   # move the orchestrator to another runtime
 twr box add gpu me@gpu-box             # a box the hub reaches over SSH: it installs twr there
+twr box project gpu api                # find (or clone) the project's repository on the box
 twr thread new api --box gpu           # a thread on that box
 twr box list                           # the boxes, their state and twr version
 twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file ~/.config/twr/gpu.token

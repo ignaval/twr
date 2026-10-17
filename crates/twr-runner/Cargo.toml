@@ -21,9 +21,9 @@ sha2.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing.workspace = true
-
-# The mount points (`getfsstat(2)`), which trimming and deleting build output need.
-[target.'cfg(target_os = "macos")'.dependencies]
+# `twr runner --clone-repo`'s git: its process group, the terminal's foreground group, and
+# `waitid`; on macOS also the mount points (`getfsstat(2)`), which trimming and deleting
+# build output need.
 libc.workspace = true
 
 [dev-dependencies]
