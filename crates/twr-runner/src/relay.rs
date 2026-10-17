@@ -472,6 +472,12 @@ pub fn decide(
 
 /// Runs the relay on stdin/stdout, its notes on stderr (`twr runner --stdio`).
 pub async fn relay(opts: RelayOptions) -> anyhow::Result<()> {
+    // No handler for SIGTERM or SIGINT, unlike the runner (`crate::client::Shutdown`): their
+    // default action, at any moment, is the right stop. The relay has nothing to finish: its
+    // start lock is an flock the kernel releases, the daemon it starts runs on its own (a
+    // session, systemd or launchd) and must outlive it, a plist it leaves is removed by the
+    // next relay under that lock, and the hub's side dials again. A handler would only keep
+    // the signal from ending the startup waits and the copying.
     let io = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
     relay_with(opts, io, &mut |line: &str| {
         use std::io::Write;
@@ -1397,6 +1403,10 @@ async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::R
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // No terminal (a relay run by hand from one has it): `systemd-run` asks for none
+    // (`--user` talks to the user's manager, no polkit prompt), and a wrapper on `PATH` may
+    // touch it. Not the daemon's session: the service manager starts that.
+    twr_adapters::process::new_session(&mut cmd);
     let out = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
         .await
         .map_err(|_| anyhow!("it did not finish within {PROBE_TIMEOUT:?}"))??;

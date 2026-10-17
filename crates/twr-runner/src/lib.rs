@@ -31,8 +31,10 @@ pub mod reap;
 pub mod relay;
 pub mod repos;
 pub mod spool;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod workdirs;
 
 pub use agents::{BoxEnv, BOX_PROBE_ENV};
-pub use client::{run, run_with, DaemonOptions, RunnerOptions};
+pub use client::{run, run_with, DaemonOptions, RunnerOptions, Shutdown};
 pub use lbox::{LocalBox, LocalBoxOptions};

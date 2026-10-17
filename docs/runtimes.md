@@ -15,7 +15,7 @@ Pick one per thread with `twr thread new --runtime`, per project with `[projects
 | `pty:<command>` | degraded | any interactive CLI in a pseudo-terminal, with guessed turns and prompts |
 | `fake` | test | scripted; only with `TWR_ENABLE_FAKE=1`, for tests and the [screenshots](development.md#screenshots) |
 
-The binaries are `claude`, `codex` and `grok` on `PATH`. `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` and `TWR_GROK_BIN` point twr at other ones. On a remote box, the runner puts its login shell's `PATH` first ([runners.md](runners.md#agents-on-a-box)). Sign in with each agent's own CLI first: twr never runs a login by itself and never sees your keys. `twr box login <box> <agent>` starts the agent's own login on a remote box, in your terminal. Every runtime runs in its own process group with twr's secrets, such as the runner and orchestrator tokens, removed from its environment.
+The binaries are `claude`, `codex` and `grok` on `PATH`. `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` and `TWR_GROK_BIN` point twr at other ones. On a remote box, the runner puts its login shell's `PATH` first ([runners.md](runners.md#agents-on-a-box)). Sign in with each agent's own CLI first: twr never runs a login by itself and never sees your keys. `twr box login <box> <agent>` starts the agent's own login on a remote box, in your terminal. Every runtime runs in a session and process group of its own, with twr's secrets, such as the runner and orchestrator tokens, removed from its environment. A headless runtime has no controlling terminal; a `pty:` runtime has its pseudo-terminal as its own private one. Neither can use the terminal of whoever started the hub.
 
 ## What has been checked against the real CLIs
 

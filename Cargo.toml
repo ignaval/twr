@@ -50,6 +50,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # macOS's mount list (`getfsstat`) for twr-runner's trims and deletions.
 libc = "0.2"
+# twr-runner's shutdown latch (`client::Shutdown`): an action in the SIGTERM / SIGINT handler
+# itself, next to Tokio's (which goes through the same registry).
+signal-hook-registry = "1.4"
 # `twr update` checks the release's Ed25519 signatures: the ring rustls already builds.
 ring = "0.17.14"
 

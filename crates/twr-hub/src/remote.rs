@@ -2093,6 +2093,7 @@ pub fn ssh_exec_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     fn conn() -> (ConnTx, watch::Receiver<Option<String>>) {
         let (tx, _rx) = mpsc::channel(4);
@@ -2271,22 +2272,6 @@ mod tests {
         assert_eq!(b.agents(), new);
     }
 
-    /// Creates the executable `path` with `content` without this process holding it open for
-    /// writing (a fork holding it would make exec'ing it fail with ETXTBSY): `cp` writes it.
-    fn install(path: &Path, content: &str) {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let src = path.with_extension("src");
-        std::fs::write(&src, content).unwrap();
-        let st = std::process::Command::new("cp")
-            .arg(&src)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(st.success());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
     const BUILD: &str = "0123456789abcdef";
 
     /// A fake build of twr in `data`'s builds tree that writes where it ran, its environment
@@ -2294,7 +2279,7 @@ mod tests {
     fn fake_build(data: &Path, out: &Path) {
         install(
             &data.join(format!("twr/runner/builds/{BUILD}/twr")),
-            &format!(
+            format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"${{FOO-unset}}\" \"${{TWR_RUNNER_TOKEN-unset}}\" \
                  \"$HOME\" \"$SHELL\" \"$@\" > '{}'\n",
                 out.display()

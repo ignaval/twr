@@ -1229,8 +1229,9 @@ async fn gate_line(sock: &std::os::unix::net::UnixStream) -> Option<String> {
 }
 
 /// Starts job `id`'s command `command` (its words, the program first) in `cwd` with
-/// environment `vars` (all of it) and output to `out` / `err`, as the leader of a process
-/// group of its own, held at its start gate ([`crate::job_gate`], run from
+/// environment `vars` (all of it) and output to `out` / `err`, as the leader of a session and
+/// process group of its own (no controlling terminal: a command that reads the terminal of
+/// whoever started the hub gets an error instead of being stopped), held at its start gate ([`crate::job_gate`], run from
 /// [`HubOptions::job_gate_exe`]) until its process group is recorded ([`release`]): so a later
 /// hub knows the group of every job whose command ran, and kills what is left of it when this
 /// hub stops without seeing the job end, also a process of it that cleared the `TWR_AGENT`
@@ -1283,8 +1284,8 @@ async fn gated_spawn(
         .stdin(std::os::fd::OwnedFd::from(gate_end))
         .stdout(out)
         .stderr(err)
-        .process_group(0)
         .kill_on_drop(false);
+    twr_adapters::process::new_session(&mut cmd);
     let spawned = cmd.spawn();
     // The parent's copy of the gate's end goes with the command.
     drop(cmd);

@@ -334,21 +334,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
-
-    /// Creates the executable `path` with `content` without this process holding it open for
-    /// writing (`cp` writes it: a fork holding it would make exec'ing it fail with ETXTBSY).
-    fn install(path: &Path, content: &str) {
-        let src = path.with_extension("src");
-        std::fs::write(&src, content).unwrap();
-        let st = std::process::Command::new("cp")
-            .arg(&src)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(st.success());
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    use crate::test_support::install;
 
     #[test]
     fn shells_by_name() {
@@ -426,7 +412,7 @@ mod tests {
     /// A shell `shell.sh` named `name` in `dir` (the name picks how it is asked).
     fn shell(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
-        install(&p, &format!("#!/bin/sh\n{body}\n"));
+        install(&p, format!("#!/bin/sh\n{body}\n"));
         p
     }
 

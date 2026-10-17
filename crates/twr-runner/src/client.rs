@@ -44,6 +44,8 @@
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -456,38 +458,186 @@ pub fn open_box(opts: &RunnerOptions) -> anyhow::Result<LocalBox> {
     LocalBox::open(opts.box_options())
 }
 
-/// Runs the runner until SIGINT or SIGTERM.
-pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
-    let lbox = open_box(&opts)?;
-    run_with(opts, lbox, shutdown_signal()).await
+/// Runs the runner until SIGINT or SIGTERM, which `shutdown` has listened for since it was
+/// made, first thing in the process ([`Shutdown::install`]): one that came before the box
+/// opens, or while it opens (which can take seconds: it waits for the box's lock and ends what
+/// a predecessor left running), stops the runner before it binds, probes or connects anything,
+/// exit 0 ([`run_with`]), even when the opening failed meanwhile (its error is not reported:
+/// the runner was asked to stop).
+pub async fn run(opts: RunnerOptions, mut shutdown: Shutdown) -> anyhow::Result<()> {
+    if shutdown.fired() {
+        stopped_before_start();
+        return Ok(());
+    }
+    test_start_hold(&mut shutdown);
+    let opened = open_box(&opts);
+    if shutdown.fired() {
+        stopped_before_start();
+        return Ok(());
+    }
+    run_with(opts, opened?, shutdown.wait()).await
 }
 
-/// Resolves on SIGINT or SIGTERM.
-pub async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot listen for SIGTERM");
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
+/// Test only (debug builds only, ignored by a release build): a file path. [`run`] writes it
+/// as the box starts opening, then holds the opening (blocking the thread, as a slow opening
+/// does) until a signal came (at most [`TEST_START_HOLD`]), so a test can send SIGTERM while
+/// the runner starts and nothing in the runtime delivers it meanwhile.
+pub const TEST_START_HOLD_ENV: &str = "TWR_TEST_RUNNER_START_HOLD";
+
+/// The longest [`TEST_START_HOLD_ENV`] holds the box's opening.
+const TEST_START_HOLD: Duration = Duration::from_secs(10);
+
+/// [`TEST_START_HOLD_ENV`]'s hold, in a debug build where it is set: blocks the thread.
+fn test_start_hold(shutdown: &mut Shutdown) {
+    let Some(marker) = std::env::var_os(TEST_START_HOLD_ENV).filter(|_| cfg!(debug_assertions))
+    else {
+        return;
     };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+    if let Err(e) = std::fs::write(&marker, b"") {
+        tracing::warn!(error = %e, "cannot write the start hold's marker");
+        return;
     }
-    tracing::info!("shutting down");
+    let until = Instant::now() + TEST_START_HOLD;
+    while !shutdown.fired() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Says the runner stopped on a signal that came while it started.
+fn stopped_before_start() {
+    tracing::info!("stopped before it started: asked to stop while starting");
+}
+
+/// SIGTERM and SIGINT, listened for from the moment it is made ([`Shutdown::install`]): one
+/// that comes before anything waits for it is kept, not lost, and does not kill the process
+/// (the default action) either. Make it first thing, before anything slow.
+///
+/// Each signal is listened for twice: by a Tokio stream (what [`Shutdown::wait`] awaits), and
+/// by a latch set in the signal handler itself (`signal_hook_registry`, which Tokio's own
+/// handler goes through too). The stream only yields once the runtime has delivered the
+/// signal, which it does not while this thread is busy with something synchronous (opening
+/// the box) on a current-thread runtime, or before its driver next runs on another; the latch
+/// is set when the signal arrives, whatever the runtime does, so [`Shutdown::fired`] sees it
+/// then.
+pub struct Shutdown {
+    term: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+    /// Set by the signal handler (SIGTERM or SIGINT came), or by [`Shutdown::fired`] when a
+    /// stream already yielded.
+    latch: Arc<AtomicBool>,
+    /// The latch's handler actions, removed when this is dropped.
+    actions: Vec<signal_hook_registry::SigId>,
+}
+
+impl Shutdown {
+    /// Listens for SIGTERM and SIGINT from now on (both at once). In a Tokio runtime. A
+    /// signal it cannot listen for is logged and keeps its default action.
+    pub fn install() -> Shutdown {
+        use tokio::signal::unix::{signal, SignalKind};
+        let latch = Arc::new(AtomicBool::new(false));
+        let mut actions = Vec::new();
+        let mut listen = |kind: SignalKind, signo: libc::c_int, name: &str| {
+            let stream = match signal(kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot listen for {name}");
+                    return None;
+                }
+            };
+            // Only alongside a stream: Tokio's handler already replaced the default action,
+            // and `wait` can await the signal. Should the latch fail, `fired` asks the stream.
+            let set = Arc::clone(&latch);
+            // SAFETY: the action runs in the signal handler, where only async-signal-safe
+            // operations are allowed: it only stores `true` to an `AtomicBool` (lock-free on
+            // every target twr builds for), allocating, locking and dropping nothing (the
+            // `Arc` it holds is dropped when the action is unregistered, outside the handler).
+            // SIGTERM and SIGINT are not among the signals the registry refuses.
+            match unsafe { signal_hook_registry::register(signo, move || set.store(true, SeqCst)) }
+            {
+                Ok(id) => actions.push(id),
+                Err(e) => tracing::warn!(error = %e, "cannot latch {name} in its handler"),
+            }
+            Some(stream)
+        };
+        let term = listen(SignalKind::terminate(), libc::SIGTERM, "SIGTERM");
+        let int = listen(SignalKind::interrupt(), libc::SIGINT, "SIGINT");
+        Shutdown {
+            term,
+            int,
+            latch,
+            actions,
+        }
+    }
+
+    /// Whether SIGTERM or SIGINT came since [`Shutdown::install`], without waiting: the
+    /// latch, which the signal handler set (or, should the latch not be registered, a stream
+    /// that already yielded).
+    pub fn fired(&mut self) -> bool {
+        use futures::FutureExt;
+        if !self.latch.load(SeqCst)
+            && [&mut self.term, &mut self.int]
+                .into_iter()
+                .flatten()
+                .any(|s| s.recv().now_or_never().is_some())
+        {
+            self.latch.store(true, SeqCst);
+        }
+        self.latch.load(SeqCst)
+    }
+
+    /// Resolves once SIGTERM or SIGINT came since [`Shutdown::install`]: at once when the
+    /// latch is set ([`Shutdown::fired`]), else when a stream yields (a signal after the
+    /// check: Tokio's handler saw it too).
+    pub async fn wait(mut self) {
+        async fn recv(s: &mut Option<tokio::signal::unix::Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        if !self.fired() {
+            tokio::select! {
+                () = recv(&mut self.term) => {}
+                () = recv(&mut self.int) => {}
+            }
+        }
+        tracing::info!("shutting down");
+    }
+}
+
+impl Drop for Shutdown {
+    fn drop(&mut self) {
+        for id in self.actions.drain(..) {
+            signal_hook_registry::unregister(id);
+        }
+    }
+}
+
+/// Resolves on SIGINT or SIGTERM: [`Shutdown::install`], then [`Shutdown::wait`], when first
+/// polled (a signal before that has its default action: make a [`Shutdown`] first thing
+/// instead where that matters).
+pub async fn shutdown_signal() {
+    Shutdown::install().wait().await
 }
 
 /// Runs the runner on `lbox` until `shutdown` resolves, then shuts down gracefully. A daemon
 /// binds its socket first (an error if it cannot: [`crate::daemon`]), and also shuts down so
-/// when a `stop` request comes on it.
+/// when a `stop` request comes on it. When `shutdown` has already resolved (a signal while the
+/// runner started: [`Shutdown::wait`]), it stops at once, exit 0, having bound, probed and
+/// connected nothing.
 pub async fn run_with(
     opts: RunnerOptions,
     lbox: LocalBox,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
+    use futures::FutureExt;
+    let mut shutdown = std::pin::pin!(shutdown);
+    if shutdown.as_mut().now_or_never().is_some() {
+        stopped_before_start();
+        return Ok(());
+    }
     opts.validate()?;
     // wss: rustls with ring (no system OpenSSL). Fails only when already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();

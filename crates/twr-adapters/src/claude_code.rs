@@ -36,7 +36,7 @@
 //! removed ([`crate::process::SCRUBBED_ENV`], inherited or configured; `attach` too), and, with
 //! `--settings` (the orchestrator's file guard), the variables that would keep Claude Code from
 //! running its hook ([`guard::HOOK_ENV`], inherited or configured; `attach` too), in its
-//! own process group, with stdin/stdout piped and the last 4 KB of stderr kept for `Exited`.
+//! own session and process group (no controlling terminal), with stdin/stdout piped and the last 4 KB of stderr kept for `Exited`.
 //! Stdout lines (at most [`crate::process::MAX_LINE`] bytes each: a longer one is skipped, and
 //! a skipped `result` still ends its turn as an error with `ext.twr.error`) go through the
 //! pure [`translate::Translator`]; see there for the mapping:
@@ -562,8 +562,8 @@ impl Start {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        process::new_session(&mut cmd);
         process::scrub(&mut cmd);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
@@ -693,10 +693,13 @@ fn queue_line(stdin: &mut Stdin, line: String) {
 
 /// Sends `SIGKILL` to process group `pgid` with the `kill` command (no libc in this crate).
 fn kill_group(pgid: u32) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, ?status, "claude-code: killed process group");
 }
 

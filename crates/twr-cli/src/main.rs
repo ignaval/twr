@@ -4,10 +4,11 @@
 mod term;
 mod boxes;
 mod pretty;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
@@ -3367,12 +3368,13 @@ fn check_script(url: &str, script: &[u8]) -> anyhow::Result<()> {
 
 /// The version `exe --version` prints (`twr <version>`), if it runs.
 fn installed_version(exe: &Path) -> Option<String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    // No terminal: `twr --version` needs none.
+    twr_adapters::process::new_session_std(&mut cmd);
+    let out = cmd.output().ok()?;
     let text = String::from_utf8(out.stdout).ok()?;
     let v = text.trim().strip_prefix("twr ")?.trim();
     (out.status.success() && !v.is_empty()).then(|| v.to_string())
@@ -3420,11 +3422,13 @@ async fn hub_version_note(new_exe: &Path, socket: Option<PathBuf>, paths: &Paths
 /// token, which comes from `--token-file` (mode 0600) or `$TWR_RUNNER_TOKEN` and is never
 /// logged; the variable is removed from the environment first thing, so nothing the runner
 /// starts inherits it. A token shorter than [`twr_core::runner::TOKEN_GOOD_LEN`] is warned
-/// about (one too short to use is refused).
+/// about (one too short to use is refused). A SIGINT or SIGTERM is listened for from the
+/// start: one that comes while it starts stops it before it connects ([`twr_runner::run`]).
 async fn run_runner(
     mut opts: twr_runner::RunnerOptions,
     token_file: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let shutdown = twr_runner::Shutdown::install();
     let env_token = twr_runner::client::take_token_env();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -3449,14 +3453,17 @@ async fn run_runner(
         tracing::warn!("{warning}");
     }
     opts.token = token;
-    twr_runner::run(opts).await
+    twr_runner::run(opts, shutdown).await
 }
 
 /// `twr runner --daemon`: an SSH box's daemon ([`twr_runner::daemon`]), started by its relay
 /// with every path as an argument, its stdout and stderr `/dev/null`: it logs to `log`
 /// (appended, 0600, in its private data directory), its failure included, and runs until a
-/// `stop` request, SIGINT or SIGTERM.
+/// `stop` request, SIGINT or SIGTERM. Those signals are listened for from the start: one that
+/// comes while it starts (its relay stopped meanwhile, say) stops it before it binds its socket
+/// ([`twr_runner::run`]).
 async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::Result<()> {
+    let shutdown = twr_runner::Shutdown::install();
     if let Some(dir) = log.parent() {
         twr_core::paths::ensure_private_dir(dir)?;
     }
@@ -3476,7 +3483,7 @@ async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::
         box_name = %opts.box_name,
         "the box daemon starts"
     );
-    let r = twr_runner::run(opts).await;
+    let r = twr_runner::run(opts, shutdown).await;
     if let Err(e) = &r {
         tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
     }
@@ -6459,7 +6466,9 @@ async fn probe_hub(socket: &Path) -> anyhow::Result<Probe> {
     )
 }
 
-/// Starts `twr hub` detached (own process group, output to the hub log).
+/// Starts `twr hub` detached (a session of its own, without a controlling terminal: neither
+/// it nor what it starts, a runtime or a job, can be stopped or hung up by the terminal `twr`
+/// ran in; output to the hub log).
 fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     twr_core::paths::ensure_private_dir(&paths.data_dir)?;
     let log_path = paths.hub_log();
@@ -6475,12 +6484,12 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
-        .process_group(0)
         // Started from an agent's shell, this process carries its marker; the hub never does.
         .env_remove(twr_hub::host::AGENT_ENV)
         // Nor a test's user token: a hub started for whoever runs the TUI trusts no token
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
+    twr_adapters::process::new_session_std(&mut cmd);
     spawn_reaped(&mut cmd).context("starting the hub")?;
     Ok(())
 }

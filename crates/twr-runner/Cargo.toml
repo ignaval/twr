@@ -25,6 +25,8 @@ tracing.workspace = true
 # `waitid`; on macOS also the mount points (`getfsstat(2)`), which trimming and deleting
 # build output need.
 libc.workspace = true
+# `client::Shutdown`'s latch, set in the signal handler (Tokio's own registry).
+signal-hook-registry.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

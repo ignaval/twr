@@ -31,6 +31,8 @@ All notable changes to twr are recorded here. The format is based on [Keep a Cha
 
 - `twr thread new <name> --box <box>` sends `<name>` to the hub as typed for a remote box. It used to turn a name that is also a folder in the current directory into that folder's path on this machine, so a project configured only for the box (`[boxes.<box>.projects.<name>]`) wasn't found.
 - Box daemons on macOS: a `twr box project --clone` reserves and cleans up its folder through held directory descriptors, as on Linux, instead of `/proc` paths a Mac doesn't have, so a folder swapped for a link meanwhile can't redirect the cleanup. Where a process group is ended after its leader exits (probes, ssh, `git clone`), what `waitid` reports of the leader is no longer trusted on macOS, which doesn't fill it in reliably: the exit status is the reap's, and a clone's group is killed even after a success (fail closed). A process that something else reaped first is never signalled again.
+- Jobs, headless runtimes, notification commands, the hub's ssh, the git twr runs and the tools twr runs in the background start in a session of their own, without a controlling terminal (a `pty:` runtime's is its own pseudo-terminal), and the hub `twr` starts has none either. A job or runtime that read the terminal of the shell that started the hub (a prompt, `stty`) was stopped by it for good; it now gets an error. `twr job cancel` still ends a job's whole process group.
+- `twr runner` and an SSH box's daemon stop cleanly on a SIGTERM or SIGINT that comes while they start (opening the box can take seconds): they exit 0 before they connect or bind their socket, instead of being killed by the signal.
 
 ## [0.2.0] - 2026-10-15
 

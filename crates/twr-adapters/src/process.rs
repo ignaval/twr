@@ -196,19 +196,36 @@ pub fn start_error(
 }
 
 /// Starts `cmd` in a session of its own (`setsid`): without a controlling terminal, so a
-/// probe that tries to use one (an interactive login shell, a CLI asking a question) gets
-/// nothing instead of stopping the runner's process group, and in a process group of its own
-/// (its process id), which [`kill_group`] ends with whatever it started.
+/// process that tries to use one (an interactive login shell, a CLI asking a question, a
+/// command reading `/dev/tty`) gets an error instead of being stopped by the terminal of
+/// whoever started twr (SIGTTIN, SIGTTOU), and in a process group of its own (its process id,
+/// as `process_group(0)` makes it), which [`kill_group`] ends with whatever it started. Not
+/// together with `process_group(0)`: a group leader cannot start a session (`EPERM`). A
+/// process it starts that makes a session of its own (`setsid`, a daemon) leaves that group.
 pub fn new_session(cmd: &mut tokio::process::Command) {
     // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        cmd.pre_exec(setsid);
     }
+}
+
+/// [`new_session`] for a `std` command.
+pub fn new_session_std(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(setsid);
+    }
+}
+
+/// `setsid(2)`, between fork and exec ([`new_session`]): it allocates nothing (an `io::Error`
+/// of an OS error does not).
+fn setsid() -> io::Result<()> {
+    // SAFETY: setsid(2) takes nothing and touches no memory of this process.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Sends `SIGKILL` to process group `pgid`. Only while the group's leader is not reaped (it

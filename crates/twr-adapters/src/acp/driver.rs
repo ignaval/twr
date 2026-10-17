@@ -4,10 +4,11 @@
 //! carries out hub commands, and reports the exit with the last [`STDERR_TAIL`] bytes of
 //! stderr.
 //!
-//! The process runs in its own process group, kill-on-drop, with twr's secrets removed from
-//! its environment ([`crate::process::scrub`]); the rest of its group is killed whenever it
-//! exits. `stop` cancels what runs, answers pending requests `cancelled`, closes stdin and,
-//! after the grace period, kills the process group.
+//! The process runs in a session and process group of its own (no controlling terminal),
+//! kill-on-drop, with twr's secrets removed from its environment
+//! ([`crate::process::scrub`]); the rest of its group is killed whenever it exits. `stop`
+//! cancels what runs, answers pending requests `cancelled`, closes stdin and, after the grace
+//! period, kills the process group.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -43,7 +44,8 @@ pub fn absolute_cwd(cwd: &Path) -> anyhow::Result<PathBuf> {
 }
 
 /// Starts `program args` (under `wrap`, [`process::wrapped`]) in `cwd` with `env` added
-/// (twr's secrets removed), stdio piped, in its own process group, killed on drop. `fix`: what
+/// (twr's secrets removed), stdio piped, in a session of its own ([`process::new_session`]:
+/// no controlling terminal, its own process group), killed on drop. `fix`: what
 /// to do when the program is not there ([`process::start_error`]).
 pub fn launch(
     wrap: &[String],
@@ -60,8 +62,8 @@ pub fn launch(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
+        .kill_on_drop(true);
+    process::new_session(&mut cmd);
     process::scrub(&mut cmd);
     process::check_wrapped(wrap, program, env, cwd, fix)?;
     cmd.spawn()
@@ -137,10 +139,13 @@ fn queue_line(stdin: &mut Stdin, line: String, log: &'static str) {
 
 /// Sends `SIGKILL` to process group `pgid` with the `kill` command (no libc in this crate).
 fn kill_group(pgid: u32, log: &'static str) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, ?status, "{log}: killed process group");
 }
 

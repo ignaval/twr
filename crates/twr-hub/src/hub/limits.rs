@@ -276,12 +276,15 @@ fn run_quiet(argv: &[String]) -> bool {
     let Some((program, args)) = argv.split_first() else {
         return false;
     };
-    let child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    // No terminal (the hub's, when it runs in the foreground of one): a `systemd-run` or
+    // `systemctl` found on `PATH` may be a wrapper that touches it.
+    twr_adapters::process::new_session_std(&mut cmd);
+    let child = cmd.spawn();
     let Ok(mut child) = child else {
         return false;
     };
@@ -307,25 +310,24 @@ pub(super) fn default_tools() -> (PathBuf, PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     /// A weight systemctl cannot set becomes a niceness: alone without a memory limit, inside
     /// the scope with one.
     #[test]
     fn a_weight_systemctl_cannot_set_is_a_niceness() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().join("systemd-run");
         let ctl = dir.path().join("systemctl");
         for (p, code) in [(&run, 0), (&ctl, 1)] {
-            std::fs::write(p, format!("#!/bin/sh\nexit {code}\n")).unwrap();
-            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install(p, format!("#!/bin/sh\nexit {code}\n"));
         }
         let cpu = ThreadsConfig {
             cpu_weight: Some(20),
             ..Default::default()
         };
         let l = Limits::prepare(&cpu, &run, &ctl);
-        assert_eq!(l.by(), Some("nice"));
+        assert_eq!(l.by(), Some("nice"), "no nice found: {l:?}");
         assert!(
             l.wrap_for(&[])[0].ends_with("/nice"),
             "{:?}",
@@ -337,7 +339,11 @@ mod tests {
             ..Default::default()
         };
         let l = Limits::prepare(&both, &run, &ctl);
-        assert_eq!(l.by(), Some("systemd and nice"));
+        assert_eq!(
+            l.by(),
+            Some("systemd and nice"),
+            "the probe of the fake systemd-run failed, or no nice: {l:?}"
+        );
         let wrap = l.wrap_for(&[]);
         assert_eq!(wrap[0], run.to_string_lossy());
         assert_eq!(
@@ -352,16 +358,19 @@ mod tests {
     /// the hub's.
     #[test]
     fn a_workers_manager_variables_skip_systemd_run() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().join("systemd-run");
-        std::fs::write(&run, "#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install(&run, "#!/bin/sh\nexit 0\n");
         let threads = ThreadsConfig {
             memory_high: Some("2G".into()),
             ..Default::default()
         };
         let l = Limits::prepare(&threads, &run, Path::new("/nonexistent/systemctl"));
+        assert_eq!(
+            l.by(),
+            Some("systemd"),
+            "the probe of the fake systemd-run failed: {l:?}"
+        );
         let plain = l.wrap_for(&[("CARGO_INCREMENTAL".into(), "0".into())]);
         assert_eq!(plain[0], run.to_string_lossy());
         let env = [
@@ -386,21 +395,22 @@ mod tests {
     /// A systemd without `--expand-environment` (before 254) runs the workers without it.
     #[test]
     fn an_older_systemd_runs_without_expand_environment() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let run = dir.path().join("systemd-run");
-        std::fs::write(
+        install(
             &run,
             "#!/bin/sh\ncase \"$*\" in *--expand-environment*) exit 1;; esac\nexit 0\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let threads = ThreadsConfig {
             memory_high: Some("2G".into()),
             ..Default::default()
         };
         let l = Limits::prepare(&threads, &run, Path::new("/nonexistent/systemctl"));
-        assert_eq!(l.by(), Some("systemd"));
+        assert_eq!(
+            l.by(),
+            Some("systemd"),
+            "the probe of the fake systemd-run failed: {l:?}"
+        );
         let wrap = l.wrap_for(&[]);
         assert!(!wrap.iter().any(|a| a.contains("expand")), "{wrap:?}");
         assert_eq!(wrap[wrap.len() - 3..], ["-p", "MemoryHigh=2G", "--"]);

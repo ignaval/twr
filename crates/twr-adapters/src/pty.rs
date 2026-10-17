@@ -498,10 +498,13 @@ struct Io {
 
 /// Sends `signal` to process group `pgid` with the `kill` command.
 fn signal_group(pgid: u32, signal: &str) {
-    let status = std::process::Command::new("kill")
-        .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    crate::process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, signal, ?status, "pty: signalled process group");
 }
 

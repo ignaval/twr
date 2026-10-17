@@ -19,6 +19,8 @@ pub mod report;
 pub mod server;
 pub mod ssh_box;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use std::path::PathBuf;
 

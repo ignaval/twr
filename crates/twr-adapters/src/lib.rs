@@ -18,6 +18,8 @@ pub mod grok_build;
 pub mod process;
 pub mod pty;
 pub mod resolve;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod usage;
 
 pub use acp::AcpAdapter;

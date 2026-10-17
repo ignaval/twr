@@ -1736,6 +1736,28 @@ fn sha256_hex(data: &[u8]) -> String {
         .collect()
 }
 
+/// Copies `from` to `to` with `cp`, so this process never holds `to` open for writing: a child
+/// another test thread forks while this process writes the file would inherit the descriptor,
+/// and exec'ing the file would fail with ETXTBSY until that child execs or exits.
+fn cp(from: &Path, to: &Path) {
+    let st = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(st.success(), "cp failed");
+}
+
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path` ([`cp`]: why), and the side file is removed.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    cp(Path::new(&src), path);
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A release of a fake twr 9.9.9 for this machine, as install.sh expects it, in `dir`: the
 /// archive and its sha256sums.txt, which names the release v9.9.9 as the release workflow
 /// writes it. Returns the archive's name.
@@ -1796,7 +1818,7 @@ fn update_reinstalls_the_running_executable() {
     // one over it leaves the build's binary alone).
     let link = |to: &Path| {
         if std::fs::hard_link(TWR, to).is_err() {
-            std::fs::copy(TWR, to).unwrap();
+            cp(Path::new(TWR), to);
         }
     };
     link(&bin.join("twr"));
@@ -2122,12 +2144,7 @@ fn install_sh_checks_the_signature_of_the_checksums() {
     // An openssl that can't do Ed25519 (as macOS's LibreSSL), first on PATH when asked.
     let no_openssl = tmp.path().join("no-openssl");
     std::fs::create_dir(&no_openssl).unwrap();
-    std::fs::write(no_openssl.join("openssl"), "#!/bin/sh\nexit 1\n").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let exe = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(no_openssl.join("openssl"), exe).unwrap();
-    }
+    install(&no_openssl.join("openssl"), "#!/bin/sh\nexit 1\n");
 
     let mut n = 0;
     let mut run = |env: &[(&str, &str)], verifier: bool| {
@@ -2338,7 +2355,6 @@ fn wait_after_a_start_failure_waits_for_a_held_prompt() {
 /// left behind.
 #[test]
 fn install_sh_keeps_the_old_twr_when_the_new_one_fails_to_run() {
-    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let release = tmp.path().join("release");
     fake_release_of(
@@ -2349,8 +2365,7 @@ fn install_sh_keeps_the_old_twr_when_the_new_one_fails_to_run() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let old = "#!/bin/sh\necho 'twr 0.1.0'\n";
-    std::fs::write(bin.join("twr"), old).unwrap();
-    std::fs::set_permissions(bin.join("twr"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    install(&bin.join("twr"), old);
     let out = Command::new("sh")
         .arg(install_sh())
         .env("HOME", tmp.path())
@@ -2547,16 +2562,14 @@ fn make_signing_key_makes_a_key_only_where_nothing_is() {
     )
     .unwrap();
     let started = tmp.path().join("started");
-    std::fs::write(
-        slow.join("openssl"),
+    install(
+        &slow.join("openssl"),
         format!(
             "#!/bin/sh\nif [ \"$1\" = genpkey ]; then touch '{}'; sleep 2; fi\nexec {} \"$@\"\n",
             started.display(),
             real.trim()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(slow.join("openssl"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut child = run(Some(&slow))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
