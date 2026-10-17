@@ -3,12 +3,13 @@
 //!
 //! Every command runs as `git -c <SAFE_CONFIG>... -C <dir> ...` with the caller's `GIT_DIR` /
 //! `GIT_WORK_TREE` / `GIT_INDEX_FILE` removed (a hub started from a git hook must not act on
-//! that repository), no terminal prompts, stdin closed, in a process group of its own, with
-//! its output capped ([`MAX_STDOUT`]). [`SAFE_CONFIG`] overrides what an agent could plant in
-//! the repository's config to make twr run code (fsmonitor, hooks, network transports) or
-//! hide files from it (`status.showUntrackedFiles=no`). Every command sees the literal object
-//! graph: replacement objects (`git replace`) and legacy grafts (`info/grafts`) are ignored,
-//! so nothing is judged reachable through a graft that can be removed.
+//! that repository), no terminal prompts, stdin closed, in a session and process group of its
+//! own (no controlling terminal), with its output capped ([`MAX_STDOUT`]). [`SAFE_CONFIG`]
+//! overrides what an agent could plant in the repository's config to make twr run code
+//! (fsmonitor, hooks, network transports) or hide files from it
+//! (`status.showUntrackedFiles=no`). Every command sees the literal object graph: replacement
+//! objects (`git replace`) and legacy grafts (`info/grafts`) are ignored, so nothing is judged
+//! reachable through a graft that can be removed.
 //!
 //! No command uses a git transport (`ext::` included, whatever `protocol.<name>.allow` the
 //! repository sets) or lazily fetches a partial clone's missing objects, so git itself runs no ssh,
@@ -1073,6 +1074,8 @@ impl LocalGit {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // No terminal: `bin` may be a wrapper (or a PATH lookup) that touches one.
+        twr_adapters::process::new_session(&mut c);
         let mut child = c.spawn()?;
         match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
             Ok(Ok(s)) if s.success() => Ok(()),
@@ -1195,10 +1198,12 @@ impl LocalGit {
             .env("LC_ALL", "C")
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Its own group: killed as a whole on timeout, and out of reach of a terminal's
-            // Ctrl-C meant for twr (a `worktree add` must not stop half-way).
-            .process_group(0);
+            .stderr(Stdio::piped());
+        // Its own session and group: killed as a whole on timeout, out of reach of a
+        // terminal's Ctrl-C meant for twr (a `worktree add` must not stop half-way), and
+        // without a controlling terminal (a hook or filter that reads one gets an error
+        // instead of being stopped).
+        twr_adapters::process::new_session(&mut c);
         c
     }
 
@@ -4332,14 +4337,18 @@ const DF_TIMEOUT: Duration = Duration::from_secs(10);
 /// ordinary user may still write, its "Available"); `None` when `df` fails or takes longer
 /// than [`DF_TIMEOUT`] (it is killed).
 async fn disk_free(dir: &Path) -> Option<(Option<u64>, Option<u64>)> {
-    let child = tokio::process::Command::new("df")
-        .arg("-Pk")
+    let mut cmd = tokio::process::Command::new("df");
+    cmd.arg("-Pk")
         .arg(dir)
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let out = tokio::time::timeout(DF_TIMEOUT, child).await.ok()?.ok()?;
+        .kill_on_drop(true);
+    // No terminal: whatever `df` on `PATH` is.
+    twr_adapters::process::new_session(&mut cmd);
+    let out = tokio::time::timeout(DF_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
     out.status
         .success()
         .then(|| parse_df(&String::from_utf8_lossy(&out.stdout)))
@@ -5416,6 +5425,7 @@ impl LocalGit {
 mod tests {
     use super::trash::Step;
     use super::*;
+    use crate::test_support::install;
     use twr_core::git::LinkedWorktree;
     use twr_core::testkit::git::{branch_exists, commit_all, init_repo, run, worktrees};
 
@@ -5651,29 +5661,19 @@ mod tests {
         let bin = repo.join(".bin");
         std::fs::create_dir_all(&bin).unwrap();
         for name in ["false", "true", "cat", "exit"] {
-            let p = bin.join(name);
-            std::fs::write(
-                &p,
+            install(
+                &bin.join(name),
                 format!("#!/bin/sh\necho {name} >> '{}'\nexit 0\n", marker.display()),
-            )
-            .unwrap();
-            std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
+            );
         }
         let wrapper = dir.path().join("git-with-path");
-        std::fs::write(
+        install(
             &wrapper,
             format!(
                 "#!/bin/sh\nPATH='{}':\"$PATH\" exec git \"$@\"\n",
                 bin.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &wrapper,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+        );
         let s = LocalGit::with_bin(&wrapper)
             .snapshot(wt.clone(), Some(on.clone()))
             .await
@@ -11155,21 +11155,16 @@ mod tests {
     /// code through twr's own git commands.
     #[tokio::test]
     async fn repository_config_cannot_run_code_through_twr() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let g = LocalGit::default();
         let repo = init_repo(&dir.path().join("repo"));
         let marker = dir.path().join("pwned");
         let script = dir.path().join("evil.sh");
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
-                marker.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let evil = format!(
+            "#!/bin/sh\necho \"$0 $*\" >> '{}'\nexit 1\n",
+            marker.display()
+        );
+        install(&script, &evil);
         let hooks = dir.path().join("evil-hooks");
         std::fs::create_dir(&hooks).unwrap();
         for h in [
@@ -11177,7 +11172,7 @@ mod tests {
             "reference-transaction",
             "post-index-change",
         ] {
-            std::fs::copy(&script, hooks.join(h)).unwrap();
+            install(&hooks.join(h), &evil);
         }
         run(
             &repo,
@@ -11687,7 +11682,6 @@ mod tests {
     /// tests: the `LocalGit` that runs git with that global config, and a plain git with it.
     /// `None` (said) without Git LFS.
     fn with_lfs(dir: &Path) -> Option<(LocalGit, PlainGit)> {
-        use std::os::unix::fs::PermissionsExt;
         let found = std::env::var_os("PATH").and_then(|path| {
             std::env::split_paths(&path)
                 .map(|d| d.join("git-lfs"))
@@ -11708,15 +11702,13 @@ mod tests {
         )
         .unwrap();
         let wrapper = dir.join("git-with-global");
-        std::fs::write(
+        install(
             &wrapper,
             format!(
                 "#!/bin/sh\nGIT_CONFIG_GLOBAL='{}' exec git \"$@\"\n",
                 global.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let plain = move |at: &Path, args: &[&str]| {
             let out = std::process::Command::new("git")
                 .arg("-C")
@@ -11744,7 +11736,6 @@ mod tests {
     /// gone (a checkout of it fetches it), and a canary script at `canary.sh` that writes
     /// `ran` when run.
     fn lfs_repo(dir: &Path, plain: &PlainGit) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let repo = init_repo(&dir.join("repo"));
         std::fs::write(
             repo.join(".gitattributes"),
@@ -11763,15 +11754,13 @@ mod tests {
             &["remote", "add", "origin", "https://example.invalid/x.git"],
         );
         let script = dir.join("canary.sh");
-        std::fs::write(
+        install(
             &script,
             format!(
                 "#!/bin/sh\necho ran >> '{}'\nexit 1\n",
                 dir.join("ran").display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         repo
     }
 
@@ -11971,29 +11960,16 @@ mod tests {
         assert!(marker.exists());
     }
 
-    /// A fake git that runs `body` (a shell snippet).
-    /// A `git` that runs `body`. Installed without this process ever holding it open for
-    /// writing: tests fork in parallel threads, and a child forked while the file
-    /// was open for writing keeps that descriptor until it execs, making an exec of the file
-    /// fail with ETXTBSY. So the bytes go to a side file and `cp` writes the executable.
+    /// A fake git that runs `body` (a shell snippet), written by [`install`] (ETXTBSY).
     fn fake_git(dir: &Path, body: &str) -> LocalGit {
-        use std::os::unix::fs::PermissionsExt;
         let p = dir.join("fake-git");
-        let src = dir.join("fake-git.src");
         // Before every command twr lists the drivers the config defines (`config --list
         // --name-only`), and before some the submodules (`ls-files --stage`): answered at
         // once, with none. Where git finds its repository (`rev-parse --absolute-git-dir`),
         // read before and after each such command too, is git's own answer.
         let lists = "for a in \"$@\"; do case \"$a\" in --name-only|--stage) exit 0;; \
                      --absolute-git-dir) exec git \"$@\";; esac; done";
-        std::fs::write(&src, format!("#!/bin/sh\n{lists}\n{body}\n")).unwrap();
-        let st = std::process::Command::new("cp")
-            .arg(&src)
-            .arg(&p)
-            .status()
-            .unwrap();
-        assert!(st.success(), "cp failed");
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install(&p, format!("#!/bin/sh\n{lists}\n{body}\n"));
         LocalGit::with_bin(p).with_timeouts(
             Duration::from_millis(300),
             Duration::from_millis(300),

@@ -832,8 +832,9 @@ async fn top_level(dir: &std::fs::File) -> anyhow::Result<PathBuf> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .process_group(0)
         .kill_on_drop(true);
+    // Not the terminal's: git and what it runs (a hook) stay out of the clone's terminal.
+    twr_adapters::process::new_session(&mut c);
     let fd = dir.as_raw_fd();
     // SAFETY: fchdir(2) is async-signal-safe and the closure allocates nothing; `dir` is open
     // until the command has run (it is awaited here).
@@ -1189,6 +1190,7 @@ impl Drop for TerminalBack {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
     use std::os::unix::fs::DirBuilderExt;
     use std::process::Stdio;
     use twr_core::testkit::git::{init_repo, run};
@@ -1974,7 +1976,7 @@ mod tests {
             let bin = dir.join("bin");
             std::fs::create_dir(&bin).unwrap();
             let git = bin.join("git");
-            std::fs::write(
+            install(
                 &git,
                 "#!/bin/sh\nfor a; do t=$a; done\n\
                  mkdir -p \"$t/.git/objects\" \"$t/src\" && echo x > \"$t/src/a.rs\"\n\
@@ -1982,9 +1984,7 @@ mod tests {
                  echo \"$$ $!\" > \"$TWR_TEST_CLONE_CHILD/git.tmp\" && \
                  mv \"$TWR_TEST_CLONE_CHILD/git.tmp\" \"$TWR_TEST_CLONE_CHILD/git.pids\"\n\
                  wait\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             let path = format!(
                 "{}:{}",
                 bin.display(),
@@ -2638,13 +2638,11 @@ mod tests {
         let home = d.path().canonicalize().unwrap();
         repo_with_origin(&home.join("code/api"), None);
         let slow = home.join("slow-git");
-        std::fs::write(
+        install(
             &slow,
             "#!/bin/sh\ncase $1 in --version) echo 'git version 2.40.0'; exit 0 ;; esac\n\
              exec sleep 60\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let started = tokio::time::Instant::now();
         let r = find_repo(
             &LocalGit::with_bin(&slow),

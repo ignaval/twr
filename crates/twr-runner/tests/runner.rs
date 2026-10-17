@@ -2770,15 +2770,35 @@ async fn oversized_events_become_marked_placeholders() {
     assert!(dropped(&e.ext) > twr_core::runner::MAX_FRAME_BYTES as u64);
 }
 
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path`, and the side file is removed. A child another test thread forks while this process
+/// writes the file would inherit the descriptor, and exec'ing the file would fail with
+/// ETXTBSY until that child execs or exits.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// At most `MAX_CONCURRENT_OPS` non-session ops (here: git snapshots) run at once.
 #[tokio::test]
 async fn non_session_ops_are_bounded() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join("probe");
     std::fs::create_dir(&probe).unwrap();
     let git = dir.path().join("fake-git");
-    std::fs::write(
+    install(
         &git,
         format!(
             // (The listing of the config's drivers before each command, and where git finds its
@@ -2786,9 +2806,7 @@ async fn non_session_ops_are_bounded() {
             "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --name-only|--absolute-git-dir) exit 0;; esac; done\nd='{}'\ntouch \"$d/run.$$\"\nls \"$d\" | grep -c '^run\\.' >> \"$d/../counts\"\nsleep 0.2\nrm -f \"$d/run.$$\"\n",
             probe.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     init_logs();
     let mut o = LocalBoxOptions::new(&dir.path().join("data"), BOX);
     o.git = twr_runner::local::LocalGit::with_bin(&git);

@@ -54,6 +54,27 @@ fn test_token() -> &'static Path {
     })
 }
 
+/// Copies `from` to `to` with `cp`, so this process never holds `to` open for writing: a child
+/// another test thread forks while this process writes the file would inherit the descriptor,
+/// and exec'ing the file would fail with ETXTBSY until that child execs or exits.
+fn cp(from: &Path, to: &Path) {
+    let st = Command::new("cp").arg(from).arg(to).status().unwrap();
+    assert!(st.success(), "cp failed");
+}
+
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path` ([`cp`]: why), and the side file is removed.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    cp(Path::new(&src), path);
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// The test's twr home, its fake box and its fake ssh.
 struct Setup {
     _dir: tempfile::TempDir,
@@ -102,7 +123,7 @@ impl Setup {
             assert!(!p.to_str().unwrap().contains('\''));
         }
         assert!(!path.contains('\''));
-        std::fs::write(
+        install(
             &ssh,
             format!(
                 r#"#!/bin/sh
@@ -139,8 +160,7 @@ exec "$@" sh -c "$cmd"
                 log = log.display(),
                 box_home = box_home.display(),
             ),
-        )
-        .unwrap();
+        );
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
         Setup {
             _dir: dir,
@@ -158,10 +178,8 @@ exec "$@" sh -c "$cmd"
 
     /// Puts a fake agent CLI `name` on the box's PATH: a sh script with `body`.
     fn box_agent(&self, name: &str, body: &str) {
-        let bin = self.box_home.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let file = bin.join(name);
-        std::fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+        let file = self.box_home.join("bin").join(name);
+        install(&file, format!("#!/bin/sh\n{body}"));
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
 
@@ -1055,7 +1073,7 @@ fn a_mac_box_from_add_to_restart() {
     // A twr built on the box (here: this one, copied), installed from there.
     let built = t.box_home.join(".local/bin/twr");
     std::fs::create_dir_all(built.parent().unwrap()).unwrap();
-    std::fs::copy(TWR, &built).unwrap();
+    cp(Path::new(TWR), &built);
     std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o755)).unwrap();
     let id = twr_core::build_id_of(&built).unwrap();
     let out = t.ok(&[
@@ -1234,7 +1252,7 @@ fn box_build() -> &'static Path {
     BUILD.get_or_init(|| {
         let dir = tempfile::tempdir().unwrap().keep();
         let exe = dir.join("twr");
-        std::fs::copy(TWR, &exe).unwrap();
+        cp(Path::new(TWR), &exe);
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         exe
     })
@@ -1265,7 +1283,7 @@ impl Setup {
         }
         let exe = dir.join("twr");
         if std::fs::hard_link(box_build(), &exe).is_err() {
-            std::fs::copy(box_build(), &exe).unwrap();
+            cp(box_build(), &exe);
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
@@ -1785,16 +1803,10 @@ fn box_project_clones_in_the_terminal() {
     // a line of its own.
     let hooks = t.box_home.join("hooks");
     std::fs::create_dir(&hooks).unwrap();
-    std::fs::write(
-        hooks.join("post-checkout"),
+    install(
+        &hooks.join("post-checkout"),
         "#!/bin/sh\nprintf 'hook ready'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(
-        hooks.join("post-checkout"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    );
     std::fs::write(
         t.box_home.join(".gitconfig"),
         format!(

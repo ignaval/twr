@@ -93,8 +93,9 @@
 //! opening); `respond` → the JSON-RPC response to the pending request; `stop` →
 //! `session/cancel` for a running prompt, a `cancelled` answer to pending requests, then stdin
 //! is closed (grok 1.0.44 exits on EOF), and after [`STOP_GRACE`] the process group is killed.
-//! The process runs in `cwd` with `cfg.env`, in its own process group, kill-on-drop, with the
-//! last 4 KB of stderr kept for `Exited`; the rest of its group is killed whenever it exits.
+//! The process runs in `cwd` with `cfg.env`, in its own session and process group,
+//! kill-on-drop, with the last 4 KB of stderr kept for `Exited`; the rest of its group is
+//! killed whenever it exits.
 //! Stdin is written by a dedicated task, so a runtime that stops reading cannot block `stop`.
 //! The binary is `grok` on `PATH` unless [`BIN_ENV`] (or [`GrokBuildAdapter::with_bin`])
 //! names another one.

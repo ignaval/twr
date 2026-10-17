@@ -705,15 +705,14 @@ async fn the_relay_starts_the_daemon_and_relays_to_it() {
     let key = HubKey::generate().unwrap();
     // The "twr" the relay starts: this test binary, running only `daemon_child_process`.
     let program = dir.path().join("twr");
-    std::fs::write(
+    install(
         &program,
-        format!(
+        &format!(
             "#!/bin/sh\n{CHILD_ARGS_ENV}=\"$*\" exec '{}' --exact daemon_child_process \
              --nocapture --test-threads=1\n",
             std::env::current_exe().unwrap().display()
         ),
-    )
-    .unwrap();
+    );
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();

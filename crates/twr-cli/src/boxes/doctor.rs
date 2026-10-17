@@ -320,7 +320,9 @@ const BOX_COMMAND_SECS: u32 = 10;
 /// seconds: with `timeout` where the box has one that takes `timeout <secs> <command>` (GNU,
 /// BusyBox), else (a Mac) in the background, killed by a watcher once `secs` pass. The watcher
 /// is a subshell whose `sleep` is its own child: stopped (`TERM`), it ends that `sleep` and
-/// reaps it before it exits, so stopping it leaves nothing running. `twr_b` stops it and waits
+/// reaps it before it exits, so stopping it leaves nothing running. It ends it with `kill -9`:
+/// a `TERM` that reaches the `sleep` before it has exec'd (still a fork of the shell, with the
+/// shell's handler) can be lost, and the watcher would then wait out the whole `sleep`. `twr_b` stops it and waits
 /// for it as soon as the command has ended, before it returns; so the watcher's `kill -9`
 /// comes only after its whole `sleep`, while the command has not ended (bar one ending at that
 /// very moment). Its output goes to `/dev/null`, so a `$(...)` around `twr_b` does not wait
@@ -334,7 +336,7 @@ fn bounded_prelude(secs: u32) -> String {
          \x20   \"$@\" &\n\
          \x20   twr_p=$!\n\
          \x20   (\n\
-         \x20     trap 'case $! in \"$twr_p\") ;; *) kill \"$!\"; wait \"$!\" ;; esac; exit 0' TERM\n\
+         \x20     trap 'case $! in \"$twr_p\") ;; *) kill -9 \"$!\"; wait \"$!\" ;; esac; exit 0' TERM\n\
          \x20     sleep {secs} &\n\
          \x20     wait \"$!\" && kill -9 \"$twr_p\"\n\
          \x20   ) >/dev/null 2>&1 &\n\
@@ -2253,6 +2255,7 @@ fn agents_of(v: &Value) -> Vec<AgentInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     fn set(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
@@ -2643,23 +2646,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
-        let install = |bin: &std::path::Path, name: &str, body: &str| {
-            std::fs::create_dir_all(bin).unwrap();
-            let src = dir.path().join(format!("{name}.src"));
-            std::fs::write(&src, format!("#!/bin/sh\n{body}\n")).unwrap();
-            let st = std::process::Command::new("install")
-                .args(["-m", "755"])
-                .arg(&src)
-                .arg(bin.join(name))
-                .status()
-                .unwrap();
-            assert!(st.success());
-        };
         let slow = dir.path().join("slow");
-        install(&slow, "df", "exec sleep 30");
+        install(&slow.join("df"), "#!/bin/sh\nexec sleep 30\n");
         // A box without a `timeout` that works.
         let no_timeout = dir.path().join("no-timeout");
-        install(&no_timeout, "timeout", "exit 1");
+        install(&no_timeout.join("timeout"), "#!/bin/sh\nexit 1\n");
         let path = std::env::var("PATH").unwrap_or_default();
         for extra in [vec![&slow], vec![&no_timeout, &slow]] {
             let mut dirs: Vec<String> = extra.iter().map(|d| d.display().to_string()).collect();
@@ -2694,7 +2685,6 @@ mod tests {
     /// status is the command's. Under `sh` and, where there is one, `bash` (a Mac's `/bin/sh`).
     #[test]
     fn a_bounded_command_that_ends_early_leaves_no_watcher_behind() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = std::env::var("PATH").unwrap_or_default();
         let real_sleep = std::env::split_paths(&path)
@@ -2703,11 +2693,8 @@ mod tests {
             .expect("a sleep on PATH");
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let write = |name: &str, body: String| {
-            let p = bin.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
+        let write =
+            |name: &str, body: String| install(&bin.join(name), format!("#!/bin/sh\n{body}\n"));
         write("timeout", "exit 1".into());
         write(
             "sleep",
@@ -2769,14 +2756,11 @@ mod tests {
         let data = dir.path().join("data");
         let id = "00000000000000aa";
         let exe = std::path::PathBuf::from(ssh_box::build_path(data.to_str().unwrap(), id));
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        install(&exe, "#!/bin/sh\nexec sleep 30\n");
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         let no_timeout = dir.path().join("no-timeout");
         std::fs::create_dir(&no_timeout).unwrap();
-        let fake = no_timeout.join("timeout");
-        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        install(&no_timeout.join("timeout"), "#!/bin/sh\nexit 1\n");
         let path = std::env::var("PATH").unwrap_or_default();
         let script =
             box_side_script_bounded(data.to_str().unwrap(), id, Some(("gpu", "ab")), true, 1, 1);
@@ -2840,15 +2824,13 @@ mod tests {
         let data = dir.path().join("it's data");
         let id = "00000000000000aa";
         let exe = std::path::PathBuf::from(ssh_box::build_path(data.to_str().unwrap(), id));
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(
+        install(
             &exe,
             "#!/bin/sh\ncase \"$*\" in\n\
              *--status) echo 'twr-box 1 00000000000000aa 7 0123456789abcdef' ;;\n\
              *--agents) echo '{\"login_path\":{\"error\":\"SHELL is not set\"},\"agents\":[{\"runtime\":\"codex\",\"found\":true,\"login\":\"logged_out\"}]}'; echo oops >&2 ;;\n\
              esac\n",
-        )
-        .unwrap();
+        );
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
         let script = box_side_script(data.to_str().unwrap(), id, Some(("gpu", "ab")), true);
@@ -2916,7 +2898,7 @@ mod tests {
                 ),
             ),
         ] {
-            std::fs::write(&file, body).unwrap();
+            install(&file, body);
             std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         let key = "cd".repeat(32);
@@ -3146,14 +3128,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
-            bin.join("uname"),
+        install(
+            &bin.join("uname"),
             "#!/bin/sh\ncase $1 in -s) echo Darwin ;; *) echo arm64 ;; esac\n",
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(bin.join("uname"), std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        );
         let run = |path: &str| {
             let out = std::process::Command::new("sh")
                 .arg("-c")

@@ -305,18 +305,29 @@ pub fn parse_cpu_list(text: &str) -> Option<usize> {
 }
 
 /// `program args`'s standard output, when it exits successfully within [`SYSCTL_DEADLINE`];
-/// killed and reaped past it.
+/// killed and reaped past it. It runs in a session of its own (`setsid`), without the hub's
+/// controlling terminal: a `sysctl` (or a wrapper on `PATH`) that touches one gets an error
+/// instead of stopping the hub's process group.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 fn run_with_deadline(program: &str, args: &[&str]) -> Option<String> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
-        .args(args)
+    let mut cmd = Command::new(program);
+    cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().ok()?;
     let deadline = std::time::Instant::now() + SYSCTL_DEADLINE;
     let status = loop {
         match child.try_wait() {

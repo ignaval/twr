@@ -76,7 +76,7 @@
 //!   that attach). See [`attach_argv`].
 //!
 //! The process runs the command in `cwd` with `cfg.env` (minus [`COMMAND_ENV`] /
-//! [`ATTACH_ENV`]), in its own process group, kill-on-drop, twr's secrets removed; see
+//! [`ATTACH_ENV`]), in its own session and process group, kill-on-drop, twr's secrets removed; see
 //! [`driver`].
 
 pub mod driver;

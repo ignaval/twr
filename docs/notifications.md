@@ -42,7 +42,7 @@ By default the title and body name only the thread and the kind of thing: `api n
 
 The title and body never hold control characters, so a placeholder can't start a new line or a new header.
 
-The command runs on the hub's machine, in its own process group, with the hub's environment minus twr's tokens. After `timeout_secs` (30 by default, at most 600) its whole group is ended. A command that fails or times out is logged in the hub's log and not retried. It counts as an [agent](usage.md#security): it descends from the hub and carries a `TWR_AGENT` marker of its own, so a `twr` it runs, even from a process it left behind, can read the hub but not answer or send anything. When the command exits, times out or the hub stops, whatever is left of its process group is ended too. The command needn't read its stdin: once it exits, the hub stops writing to it, even while a process it left running holds stdin open.
+The command runs on the hub's machine, in a session and process group of its own (without a controlling terminal), with the hub's environment minus twr's tokens. After `timeout_secs` (30 by default, at most 600) its whole group is ended. A command that fails or times out is logged in the hub's log and not retried. It counts as an [agent](usage.md#security): it descends from the hub and carries a `TWR_AGENT` marker of its own, so a `twr` it runs, even from a process it left behind, can read the hub but not answer or send anything. When the command exits, times out or the hub stops, whatever is left of its process group is ended too. The command needn't read its stdin: once it exits, the hub stops writing to it, even while a process it left running holds stdin open.
 
 ## Recipes
 

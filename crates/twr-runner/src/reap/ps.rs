@@ -85,8 +85,8 @@ fn classify(code: Option<i32>, out: &[u8], err: &[u8]) -> Ps {
 /// Runs `ps` with `args` (bounded by [`TIMEOUT`]).
 pub(super) fn run(args: &[&str]) -> Ps {
     let (bin, timeout) = fake::get().unwrap_or_else(|| (PS.into(), TIMEOUT));
-    let child = Command::new(&bin)
-        .args(args)
+    let mut cmd = Command::new(&bin);
+    cmd.args(args)
         .env("TZ", "UTC0")
         .env("LC_ALL", "C")
         .env_remove(THREAD_ENV)
@@ -95,9 +95,10 @@ pub(super) fn run(args: &[&str]) -> Ps {
         .env_remove(AGENT_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
+        .stderr(Stdio::piped());
+    // No terminal: whatever `ps` this is.
+    twr_adapters::process::new_session_std(&mut cmd);
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "cannot run ps; the process table is unknown");
@@ -609,20 +610,9 @@ pub(super) mod tests {
         name: &str,
         script: &str,
     ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+        // (Through `cp`: a `ps` that fails to run with ETXTBSY would read as one that failed.)
         let path = dir.join(name);
-        // Written by `cp`, not by this process: a child another test forks while this one
-        // holds the file open for writing keeps that descriptor until it execs, and running
-        // the file meanwhile fails (ETXTBSY), which reads as a `ps` that failed.
-        let src = dir.join(format!("{name}.src"));
-        std::fs::write(&src, format!("#!/bin/sh\n{script}\n")).unwrap();
-        let st = std::process::Command::new("cp")
-            .arg(&src)
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(st.success(), "cp failed");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::install(&path, format!("#!/bin/sh\n{script}\n"));
         path
     }
 

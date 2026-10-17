@@ -676,6 +676,7 @@ async fn run_for_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     /// `bin` resolved as a spawn in `/` resolves it.
     fn at(bin: &Path) -> Resolved {
@@ -1055,9 +1056,8 @@ Commands:
     }
 
     /// A `claude` stub in `dir` answering `--help` and `--version` with the arms of a
-    /// `case "$1" in`; every `--help` run is counted in `<dir>/probes`. Written by `cp` (see
-    /// `install_executable` in `tests/claude_code.rs`: no fork of this process may hold it
-    /// open for writing when it is run).
+    /// `case "$1" in`; every `--help` run is counted in `<dir>/probes`. Written by `cp`
+    /// ([`install`]: no fork of this process may hold it open for writing when it is run).
     fn stub(dir: &Path, help: &str, version: &str) -> PathBuf {
         let path = dir.join("claude");
         stub_at(&path, dir, help, version);
@@ -1069,25 +1069,11 @@ Commands:
         let d = dir.display();
         install(
             path,
-            &format!(
+            format!(
                 "#!/bin/sh\ncase \"$1\" in\n--help) echo probed >> {d}/probes; {help};;\n\
                  --version) {version};;\nesac\nexit 9\n"
             ),
         );
-    }
-
-    /// The executable `path` with `content`, written by `cp` (see [`stub`]).
-    fn install(path: &Path, content: &str) {
-        let src = path.with_extension("src");
-        std::fs::write(&src, content).unwrap();
-        let st = std::process::Command::new("cp")
-            .arg(&src)
-            .arg(path)
-            .status()
-            .unwrap();
-        assert!(st.success(), "cp failed");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn probes(dir: &Path) -> usize {

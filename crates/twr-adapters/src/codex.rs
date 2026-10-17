@@ -120,7 +120,7 @@
 //! ([`translate::check_policy`]). The sandbox's `networkAccess` and `writableRoots` are
 //! also reported as `ext.codex.sandbox_network` and `ext.codex.sandbox_writable_roots`.
 //!
-//! Process handling matches the Claude Code adapter: own process group, `SpawnConfig::env`
+//! Process handling matches the Claude Code adapter: own session and process group, `SpawnConfig::env`
 //! added and twr's secrets removed, stdout lines capped at [`crate::process::MAX_LINE`] (a
 //! skipped `turn/completed` still ends the turn as an error), stdin written by a dedicated task, the last 4 KB of stderr kept for `Exited`, the
 //! group killed on every exit path. `stop` interrupts a running turn (`turn/interrupt`), closes
@@ -907,8 +907,8 @@ impl Adapter for CodexAdapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        process::new_session(&mut cmd);
         process::scrub(&mut cmd);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
@@ -1057,10 +1057,13 @@ fn queue_line(stdin: &mut Stdin, line: String) {
 
 /// Sends `SIGKILL` to process group `pgid` with the `kill` command (no libc in this crate).
 fn kill_group(pgid: u32) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, ?status, "codex: killed process group");
 }
 

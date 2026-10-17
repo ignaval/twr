@@ -1293,11 +1293,13 @@ pub fn signal(pid: u32, group: bool, sig: &str) -> bool {
     } else {
         pid.to_string()
     };
-    std::process::Command::new("kill")
-        .args([format!("-{sig}"), "--".into(), target])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args([format!("-{sig}"), "--".into(), target])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    twr_adapters::process::new_session_std(&mut cmd);
+    cmd.status().is_ok_and(|s| s.success())
 }
 
 /// Whether process group `pgid` has a member that has not exited (a zombie has: it only waits

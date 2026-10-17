@@ -118,8 +118,9 @@
 //! command whose every variable part is shell-quoted. What it prints is read with limits
 //! ([`SSH_OUTPUT_MAX`] per stream of a script's ssh, lines of [`NOTE_MAX_BYTES`] at most
 //! from the relay, [`SESSION_NOTES_MAX`] of them per session). Each
-//! child runs in a process group of its own (a terminal's signals to the hub do not reach it)
-//! and is killed with that group when it is dropped. ssh's own failures (exit 255: a refused
+//! child runs in a session and process group of its own (no controlling terminal: a
+//! terminal's signals to the hub do not reach it, and a `ProxyCommand` that reads the terminal
+//! gets an error instead of being stopped) and is killed with that group when it is dropped. ssh's own failures (exit 255: a refused
 //! key, an unknown host key, a name that does not resolve) become a plain `last_error`
 //! ([`ssh_failure`]).
 //!
@@ -391,7 +392,8 @@ fn ssh_args_with(options: &[&str], ssh: &str, remote: &str) -> Result<Vec<String
 }
 
 /// A background ssh ([`ssh_args`]; an error when the box's words are refused) of
-/// [`ssh_program`]: no stdin, stdout and stderr piped, its own process group, the child killed
+/// [`ssh_program`]: no stdin, stdout and stderr piped, its own session and process group
+/// ([`twr_adapters::process::new_session`]: no controlling terminal), the child killed
 /// when dropped (run through [`Ssh`], which kills the whole group instead, and nothing once
 /// something else reaped the child).
 pub fn ssh_command(ssh: &str, remote: &str) -> Result<Command, String> {
@@ -400,8 +402,8 @@ pub fn ssh_command(ssh: &str, remote: &str) -> Result<Command, String> {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .kill_on_drop(true);
+    twr_adapters::process::new_session(&mut c);
     Ok(c)
 }
 
@@ -424,7 +426,8 @@ pub struct Ssh {
 }
 
 impl Ssh {
-    /// Spawns `c`, which makes its child a process group's leader (`process_group(0)`).
+    /// Spawns `c`, which makes its child a process group's leader ([`ssh_command`]'s
+    /// session).
     pub fn spawn(mut c: Command) -> std::io::Result<Ssh> {
         c.kill_on_drop(false);
         Ok(Ssh {
@@ -2297,6 +2300,7 @@ async fn prune(sbox: &SshBox, data: &str, reference: &str, id: &str, running: Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     /// Takes group and other write off `root` and everything under it (not following links):
     /// what a test made under a umask that leaves group write on, made as twr makes it.
@@ -2843,8 +2847,7 @@ mod tests {
         // refused, never taken for one that does not exist.
         let failing = dir.path().join("failing-ls");
         std::fs::create_dir_all(&failing).unwrap();
-        std::fs::write(failing.join("ls"), "#!/bin/sh\nexit 2\n").unwrap();
-        mode(&failing.join("ls"), 0o755);
+        install(&failing.join("ls"), "#!/bin/sh\nexit 2\n");
         let path = format!(
             "{}:{}",
             failing.display(),
@@ -2970,7 +2973,6 @@ mod tests {
     /// `shasum` falls back to size and version (the hub's upload) or refuses (a release).
     #[test]
     fn a_failing_sha256_tool_refuses_the_upload() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path().join("data");
         let data_s = data.to_str().unwrap();
@@ -2980,10 +2982,7 @@ mod tests {
         let id = twr_core::build_id_of(&exe).unwrap();
         let size = std::fs::metadata(&exe).unwrap().len();
         let tool = |dir: &std::path::Path, name: &str, body: &str| {
-            std::fs::create_dir_all(dir).unwrap();
-            let f = dir.join(name);
-            std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install(&dir.join(name), format!("#!/bin/sh\n{body}\n"));
         };
         // Only what the scripts need, no SHA-256 tool, then fakes of one in front.
         let base = dir.path().join("base");
@@ -3699,19 +3698,16 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ssh_leaves_nothing_of_its_group_behind() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("fake-ssh");
-        std::fs::write(
+        install(
             &fake,
             "#!/bin/sh\nsh -c 'echo $$ > \"$0\"; exec sleep 600' \"$HELPER_PID\" \
              > /dev/null 2>&1 < /dev/null &\n\
              while [ ! -s \"$HELPER_PID\" ]; do sleep 0.05; done\n\
              [ -n \"$STAY\" ] && sleep 600\n\
              echo said\nexit 3\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let alive = |pid: i32| {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
@@ -3743,8 +3739,8 @@ mod tests {
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .process_group(0)
                 .kill_on_drop(true);
+            twr_adapters::process::new_session(&mut c);
             c
         };
         // A script's ssh: its exit status kept, the helper gone.
