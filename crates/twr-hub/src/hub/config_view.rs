@@ -130,9 +130,12 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         .unwrap_or(configured)
         .iter()
         .map(|(name, b)| {
+            // Never its `ssh` or its `command` (one may hold a secret).
             let BoxConfig {
                 token,
                 ssh: _,
+                command: _,
+                terminal_command: _,
                 transport,
                 build: _,
                 projects,
@@ -166,7 +169,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
     json!({
         "note": "the configuration this hub loaded when it started (a change to the file \
                  applies after a hub restart); tokens, env values, preset command lines, \
-                 the notify command, ssh destinations and TLS files are never shown",
+                 the notify command, ssh destinations, box commands and TLS files are never \
+                 shown",
         "default_runtime": runtime_shown(default_runtime),
         "project_roots": roots,
         "project_roots_default": roots_default,
@@ -290,21 +294,45 @@ runtime = "acp:remote --key s3cret-box"
         assert_eq!(v["runtimes"], json!(["gem"]));
         assert_eq!(v["boxes"]["gpu"]["has_token"], true);
         assert_eq!(v["boxes"]["gpu"]["transport"], "token");
-        // The hub's own list of boxes, when given: an SSH box shows its transport, never its
-        // destination.
-        let ssh: BTreeMap<String, BoxConfig> = BTreeMap::from([(
-            "far".to_string(),
-            BoxConfig {
-                transport: Some(twr_core::config::BoxTransport::Ssh),
-                ssh: Some("-i /home/me/.ssh/s3cret_id me@far".into()),
-                build: Some("0123456789abcdef".into()),
-                ..Default::default()
-            },
-        )]);
+        // The hub's own list of boxes, when given: an SSH or a command box shows its
+        // transport, never its destination or its command.
+        let ssh: BTreeMap<String, BoxConfig> = BTreeMap::from([
+            (
+                "far".to_string(),
+                BoxConfig {
+                    transport: Some(twr_core::config::BoxTransport::Ssh),
+                    ssh: Some("-i /home/me/.ssh/s3cret_id me@far".into()),
+                    build: Some("0123456789abcdef".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "sb".to_string(),
+                BoxConfig {
+                    transport: Some(twr_core::config::BoxTransport::Command),
+                    command: Some(
+                        ["docker", "exec", "-i", "-e", "KEY=s3cret", "ctr"]
+                            .map(String::from)
+                            .to_vec(),
+                    ),
+                    terminal_command: Some(
+                        ["docker", "exec", "-i", "-t", "ctr"]
+                            .map(String::from)
+                            .to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]);
         let w = config_view(&config, Some(&ssh));
-        assert!(!w.to_string().contains("s3cret"), "{w}");
+        assert!(
+            !w.to_string().contains("s3cret") && !w.to_string().contains("docker"),
+            "{w}"
+        );
         assert_eq!(w["boxes"]["far"]["transport"], "ssh");
         assert_eq!(w["boxes"]["far"]["has_token"], false);
+        assert_eq!(w["boxes"]["sb"]["transport"], "command");
+        assert_eq!(w["boxes"]["sb"]["has_token"], false);
         assert!(w["boxes"].get("gpu").is_none(), "{w}");
         assert_eq!(v["boxes"]["gpu"]["projects"]["api"]["repo"], "/srv/api");
         assert_eq!(v["hub"]["tls"], true);

@@ -3,8 +3,9 @@
 //! the sealed channel with a hub key, a WebSocket inside it) and serves the connection with
 //! `Hub::serve_sealed_runner`. Covered: a sealed box goes online and runs a fake runtime's
 //! turn, and a restarted hub takes its session over through the same daemon; the sealed
-//! handshake's refusals; the listener treating an SSH box as unknown; boxes added while the
-//! hub runs (`box.add`, `box.install`), with their refusals; `hub.info`'s box fields.
+//! handshake's refusals; the listener treating an SSH or a command box as unknown; boxes added
+//! while the hub runs (`box.add`, `box.install`), with their refusals; `hub.info`'s box fields;
+//! a command box added, dialed (through the test dialer), used and restarted.
 //!
 //! Every hub here dials its SSH boxes with `TWR_SSH=false` (set once, first thing): its
 //! supervisor's probe fails at once, so the supervisor stays out of the way (and shows it).
@@ -74,6 +75,20 @@ fn ssh_box() -> BoxConfig {
     BoxConfig {
         transport: Some(BoxTransport::Ssh),
         ssh: Some("me@gpu.invalid".into()),
+        ..Default::default()
+    }
+}
+
+/// A command box whose program does not exist (its supervisor's probe fails at once), a
+/// secret among its words.
+fn command_box() -> BoxConfig {
+    BoxConfig {
+        transport: Some(BoxTransport::Command),
+        command: Some(
+            ["/nonexistent/twr-test-exec", "-i", "-e", "K=s3cret", "box"]
+                .map(String::from)
+                .to_vec(),
+        ),
         ..Default::default()
     }
 }
@@ -479,12 +494,19 @@ async fn a_sealed_handshake_is_bound_to_its_box() {
     hub.shutdown().await;
 }
 
-/// On the listener an SSH box is a box the hub does not know: a random proof, then
-/// `unauthorized`, and no refusal recorded for the box.
+/// On the listener an SSH box, and a command box, is a box the hub does not know: a random
+/// proof, then `unauthorized`, and no refusal recorded for the box.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_listener_refuses_an_ssh_box() {
+    for dialed in [ssh_box(), command_box()] {
+        listener_refuses(dialed).await;
+    }
+}
+
+async fn listener_refuses(dialed: BoxConfig) {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config();
+    cfg.boxes.insert(BOX.into(), dialed);
     cfg.hub.listen = Some("127.0.0.1:0".into());
     let l = RunnerListener::bind(&cfg.hub).await.unwrap().unwrap();
     let url = l.url();
@@ -1489,5 +1511,161 @@ async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert_eq!(box_info(&hub, BOX)["state"], "needs_install");
+    hub.shutdown().await;
+}
+
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// A command box, added with `box.add` from boxes.toml, is dialed by its supervisor (the test
+/// dialer standing in for its command, the daemon in this process): it goes online with the
+/// fields of a box the hub dials in `hub.info` and transport `command`, its threads' branches
+/// take the hub's namespace, and a fake runtime's turn runs on it. Neither `hub.info` nor
+/// `config.show` shows its command. `box.install` and `box.restart` take it: the restart
+/// dials again with `--restart` and the box comes back on a larger epoch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_command_box_is_added_dialed_and_restarted() {
+    use futures::FutureExt;
+    use twr_hub::ssh_box::{BoxDialer, BoxIo, Dial};
+    let dir = tempfile::tempdir().unwrap();
+    // The hub's box key, made now: the daemon checks its holder.
+    let data = dir.path().join("hub");
+    std::fs::create_dir_all(&data).unwrap();
+    let key = HubKey::load_or_create(&data.join(twr_hub::ssh_box::BOX_KEY_FILE)).unwrap();
+    let daemon = Daemon::start(&dir.path().join("sb"), &key, "sb").await;
+    let dials: Arc<std::sync::Mutex<Vec<Dial>>> = Arc::default();
+    let dialer: BoxDialer = {
+        let (socket, dials) = (daemon.socket.clone(), Arc::clone(&dials));
+        Arc::new(move |name: String, dial: Dial| {
+            let (socket, dials) = (socket.clone(), Arc::clone(&dials));
+            async move {
+                assert_eq!(name, "sb");
+                dials.lock().unwrap().push(dial);
+                let (stream, _) = request(&socket, Request::Connect)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+                let io: Box<dyn BoxIo> = Box::new(stream);
+                let build = twr_core::build_id().unwrap_or("0123456789abcdef");
+                Ok((io, build.to_string()))
+            }
+            .boxed()
+        })
+    };
+    let config_file = dir.path().join("config.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    let mut opts = hub_opts(dir.path(), Config::load_with_boxes(&config_file).unwrap());
+    opts.config_file = Some(config_file);
+    opts.box_dialer = Some(dialer);
+    opts.worktree_namespace = Some("hubns".into());
+    let hub = Hub::open(opts).await.unwrap();
+    std::fs::write(
+        dir.path().join("boxes.toml"),
+        "[boxes.sb]\ntransport = \"command\"\ncommand = [\"docker\", \"exec\", \"-i\", \"-e\", \
+         \"K=s3cret\", \"twr-s3cret-ctr\"]\nterminal_command = [\"docker\", \"exec\", \"-i\", \
+         \"-t\", \"twr-s3cret-ctr\"]\n",
+    )
+    .unwrap();
+    let v = hub.box_add("sb", &user()).await.unwrap();
+    assert_eq!(
+        (&v["transport"], &v["already"]),
+        (&json!("command"), &json!(false))
+    );
+    let h = hub.clone();
+    wait_for("sb online", move || online(&h, "sb")).await;
+    let b = box_info(&hub, "sb");
+    assert_eq!(
+        (&b["transport"], &b["state"], &b["online"]),
+        (&json!("command"), &json!("online"), &json!(true)),
+        "{b}"
+    );
+    // The fields of a box the hub dials.
+    assert!(b["notes"].is_array(), "{b}");
+    assert!(b["switch_pending"].is_boolean(), "{b}");
+    assert_eq!(b["restart_pending"], false, "{b}");
+    assert_eq!(b["launch"], "detached", "{b}");
+    let epoch = b["epoch"].as_u64().unwrap();
+    for shown in [hub.info().to_string(), hub.config_show().to_string()] {
+        assert!(
+            !shown.contains("s3cret") && !shown.contains("docker"),
+            "{shown}"
+        );
+    }
+    assert_eq!(hub.config_show()["boxes"]["sb"]["transport"], "command");
+    assert_eq!(hub.config_show()["boxes"]["sb"]["has_token"], false);
+    assert_eq!(dials.lock().unwrap().as_slice(), [Dial::default()]);
+
+    // A thread on it: its branch in the hub's namespace, and a turn.
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let t = hub
+        .new_thread(
+            NewThread {
+                project: repo.to_string_lossy().into_owned(),
+                runtime: Some("fake".into()),
+                name: Some("on-sb".into()),
+                box_name: Some("sb".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    git(
+        &repo,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/twr/hubns/on-sb",
+        ],
+    );
+    hub.send(&t, "alpha", TurnFrom::User, Source::User("test".into()))
+        .unwrap();
+    until_turn_event(&hub, &t, "turn.ended", 1).await;
+    assert_eq!(daemon.lbox.live_count(), 1);
+
+    // `box.install` and `box.restart` take a command box.
+    assert_eq!(
+        hub.box_install("sb", &user()).await.unwrap(),
+        json!({"box": "sb"})
+    );
+    assert_eq!(
+        hub.box_restart("sb", &user()).unwrap(),
+        json!({"box": "sb", "epoch": epoch})
+    );
+    let h = hub.clone();
+    wait_for("sb online again, restarted", move || {
+        let b = box_info(&h, "sb");
+        b["online"] == true
+            && b["epoch"].as_u64().is_some_and(|e| e > epoch)
+            && b["restart_pending"] == false
+    })
+    .await;
+    assert!(
+        dials.lock().unwrap().last().is_some_and(|d| d.restart),
+        "{:?}",
+        dials.lock().unwrap()
+    );
+    // The orchestrator may not.
+    let e = hub.box_restart("sb", &Caller::Orchestrator).unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
     hub.shutdown().await;
 }

@@ -1,12 +1,13 @@
 //! Remote boxes: [`RemoteBox`] is the [`ThreadHost`] of a box whose runner
-//! connects to the hub (`[boxes.<name>]`, transport `token`), or that the hub reaches over ssh
-//! itself (transport `ssh`, [`crate::ssh_box`]). Every host call becomes a command
-//! ([`HubMsg::Cmd`] with an [`Op`]) on the box's current connection; the runner answers
+//! connects to the hub (`[boxes.<name>]`, transport `token`), or that the hub reaches itself,
+//! over ssh (transport `ssh`) or through a command (transport `command`, [`crate::ssh_box`]).
+//! Every host call becomes a command ([`HubMsg::Cmd`] with an [`Op`]) on the box's current
+//! connection; the runner answers
 //! [`RunnerMsg::CmdResult`](twr_core::runner::RunnerMsg::CmdResult) once per command id.
 //!
 //! **Transports.** A token box's runner proves its token on the hub's listener
-//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). An SSH box has no token:
-//! its only connections are the sealed ones the hub's own ssh supervisor opens
+//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). An SSH or a command box
+//! has no token: its only connections are the sealed ones the hub's own supervisor opens
 //! (`Hub::serve_sealed_runner`), so on the listener it is a box the hub does not know (a
 //! random proof, then `unauthorized`). Its threads' branches take the namespace of the hub's
 //! own box ([`RemoteBox::with_branch_namespace`]): the box's daemon belongs to this hub
@@ -110,7 +111,9 @@
 //! thread's environment passed as arguments and set on the agent's command only. The runner is asked first
 //! (`attach_info`): it must offer an interactive CLI for the runtime, and only the working
 //! directory of its answer is used, when it is the thread's directory or lies under the box's
-//! worktrees or the thread's repository ([`attach_dir`]).
+//! worktrees or the thread's repository ([`attach_dir`]). A command box refuses attach
+//! (`unsupported`): `docker exec -t` can be detached or lost while the agent's CLI keeps
+//! running in the container, so the end of an attach cannot be told.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -138,6 +141,7 @@ use twr_core::runner::{
 };
 
 use crate::host::{path_component, StaleProcess, ThreadHost};
+use crate::ssh_box::BoxLink;
 
 /// How long a session's `spawn` / `resume` may take to be answered (across reconnections).
 pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -282,10 +286,11 @@ struct Inner {
     /// How the box connects: a token box's runner dials the listener, an SSH box's daemon is
     /// dialed by the hub (see the module docs).
     transport: BoxTransport,
-    /// The token box's token (empty for an SSH box, and for a token box configured without
-    /// one: neither is accepted on the listener).
+    /// The token box's token (empty for an SSH or a command box, and for a token box
+    /// configured without one: none of them is accepted on the listener).
     token: Secret,
-    ssh: Option<String>,
+    /// How `twr attach` reaches it: its `ssh` (a token box's may have none), or its command.
+    link: Option<BoxLink>,
     /// Namespace of its threads' branches (`twr/<namespace>/<name>`; `None`: `twr/<name>`).
     branch_namespace: Option<String>,
     state: Mutex<State>,
@@ -510,27 +515,40 @@ impl RemoteBox {
     /// Token box `name`, whose runner authenticates with `token`; `ssh` is its `ssh`
     /// destination (for attach).
     pub fn new(name: impl Into<String>, token: Secret, ssh: Option<String>) -> Self {
-        Self::with_transport(name.into(), BoxTransport::Token, token, ssh)
+        let link = ssh.map(BoxLink::Ssh);
+        Self::with_transport(name.into(), BoxTransport::Token, token, link)
     }
 
     /// SSH box `name`, which the hub reaches with `ssh` (its destination, also used for
     /// attach). It has no token: the listener refuses every connection naming it.
     pub fn new_ssh(name: impl Into<String>, ssh: String) -> Self {
-        Self::with_transport(name.into(), BoxTransport::Ssh, Secret::default(), Some(ssh))
+        let link = Some(BoxLink::Ssh(ssh));
+        Self::with_transport(name.into(), BoxTransport::Ssh, Secret::default(), link)
+    }
+
+    /// Command box `name`, which the hub reaches through `link` (its command). Like an SSH
+    /// box it has no token, and attach is refused on it (see the module docs).
+    pub fn new_command(name: impl Into<String>, link: BoxLink) -> Self {
+        Self::with_transport(
+            name.into(),
+            BoxTransport::Command,
+            Secret::default(),
+            Some(link),
+        )
     }
 
     fn with_transport(
         name: String,
         transport: BoxTransport,
         token: Secret,
-        ssh: Option<String>,
+        link: Option<BoxLink>,
     ) -> Self {
         RemoteBox {
             inner: Arc::new(Inner {
                 name,
                 transport,
                 token,
-                ssh,
+                link,
                 branch_namespace: None,
                 state: Mutex::new(State::default()),
                 gens: AtomicU64::new(1),
@@ -1434,7 +1452,8 @@ impl RemoteBox {
     /// the directory [`attach_dir`] settles on, wrapped as `ssh -t <ssh> -- <command>`
     /// ([`ssh_command`]). `repo` is the thread's repository on the box (`thread.created`).
     /// Returns the command and that directory on the box. `None` when the runner has no
-    /// interactive CLI for the runtime. `unsupported` without `[boxes.NAME] ssh`.
+    /// interactive CLI for the runtime. `unsupported` without `[boxes.NAME] ssh`, and on a
+    /// command box (before the runner is asked: see the module docs).
     pub async fn attach_command(
         &self,
         runtime: &str,
@@ -1443,7 +1462,23 @@ impl RemoteBox {
         local: &Command,
         repo: Option<&Path>,
     ) -> Result<Option<(Command, Option<PathBuf>)>, CmdError> {
-        let Some(ssh) = self.inner.ssh.clone().filter(|s| !s.trim().is_empty()) else {
+        if self.inner.transport == BoxTransport::Command {
+            return Err(CmdError::new(
+                codes::UNSUPPORTED,
+                format!(
+                    "twr can't attach to threads on box {} yet: a command box's terminal \
+                     (`docker exec -t`) can be detached or lost while the agent's CLI keeps \
+                     running in the container, so twr can't tell when the attach ends. Continue \
+                     the thread from the TUI or with `twr send`.",
+                    self.inner.name
+                ),
+            ));
+        }
+        let ssh = match &self.inner.link {
+            Some(BoxLink::Ssh(ssh)) if !ssh.trim().is_empty() => Some(ssh.clone()),
+            _ => None,
+        };
+        let Some(ssh) = ssh else {
             return Err(CmdError::new(
                 codes::UNSUPPORTED,
                 format!(
@@ -1485,16 +1520,18 @@ impl RemoteBox {
         // knows: the hub's command runs as it is. So does an SSH box whose inventory names no
         // build (a runner of another twr): its PATH and `TWR_*_BIN` are not applied then, said
         // once in the hub's log.
-        let build = match self.inner.transport {
-            BoxTransport::Ssh => self.info().and_then(|i| i.build),
-            BoxTransport::Token => None,
+        let dialed = self.inner.transport.dialed();
+        let build = if dialed {
+            self.info().and_then(|i| i.build)
+        } else {
+            None
         };
         let builtin = twr_adapters::resolve::BUILTIN_AGENTS
             .iter()
             .any(|(r, ..)| *r == runtime);
         if builtin
             && build.is_none()
-            && self.inner.transport == BoxTransport::Ssh
+            && dialed
             && !self
                 .inner
                 .attach_fallback_logged
@@ -2489,6 +2526,53 @@ mod tests {
                 assert!(!remote.contains("runner --exec"), "{remote}");
                 assert!(remote.contains("'claude' '--resume' 's1'"), "{remote}");
             }
+        }
+    }
+
+    /// A command box refuses `twr attach` (its terminal can be detached or lost while the
+    /// agent's CLI runs on in the container), with or without `terminal_command`, before its
+    /// runner is asked; it has no token proof either way.
+    #[tokio::test]
+    async fn a_command_box_refuses_attach() {
+        let cfg = SpawnConfig {
+            thread: "t1".into(),
+            cwd: "/w".into(),
+            ..Default::default()
+        };
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for terminal in [None, Some(words(&["docker", "exec", "-i", "-t", "c"]))] {
+            let b = RemoteBox::new_command(
+                "sb",
+                BoxLink::Command {
+                    command: words(&["docker", "exec", "-i", "c"]),
+                    terminal,
+                },
+            );
+            assert_eq!(b.transport(), BoxTransport::Command);
+            assert_eq!(b.hub_proof("a", "b"), None);
+            assert!(!b.checks_runner_proof("a", "b", ""));
+            let (tx, mut rx) = mpsc::channel(4);
+            let (close, _closed) = watch::channel(None);
+            let inv = Inventory {
+                build: Some(BUILD.into()),
+                worktrees: "/w".into(),
+                ..Default::default()
+            };
+            let epoch = b.connect(&inv, ConnTx::new(tx, close)).unwrap();
+            assert!(b.set_ready(epoch, &[], Vec::new()));
+            let e = b
+                .attach_command("claude-code", &cfg, "s1", &Command::new("claude"), None)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, codes::UNSUPPORTED);
+            assert_eq!(
+                e.message,
+                "twr can't attach to threads on box sb yet: a command box's terminal (`docker \
+                 exec -t`) can be detached or lost while the agent's CLI keeps running in the \
+                 container, so twr can't tell when the attach ends. Continue the thread from \
+                 the TUI or with `twr send`."
+            );
+            assert!(rx.try_recv().is_err(), "the runner was asked");
         }
     }
 

@@ -416,8 +416,9 @@ enum Cmd {
     },
     /// Add, list, inspect, install twr on and remove remote boxes. `twr box add <name>
     /// <ssh destination>` sets up a box the hub reaches over SSH (no token, listener or
-    /// tunnel): the hub installs twr there, keeps it connected, and runs the box's threads in
-    /// a daemon on the box that outlives the connection. `twr box doctor <name>` checks a box,
+    /// tunnel), and `twr box add <name> --command docker exec -i <container>` one it reaches
+    /// through that command (a container): the hub installs twr there, keeps it connected,
+    /// and runs the box's threads in a daemon on the box that outlives the connection. `twr box doctor <name>` checks a box,
     /// and `twr box login <name> <agent>` logs an agent CLI in there, in this terminal.
     #[command(name = "box")]
     Boxes {
@@ -3825,7 +3826,8 @@ async fn attach(socket: &Path, thread: &str, force: bool) -> anyhow::Result<Exit
 /// What `twr attach` says before it pauses the runtime of `thread` (its `thread.get`), with the
 /// hub's boxes in `info` (`hub.info`): a Claude Code thread on a Mac box (`os` `Darwin`, from
 /// the hub's probe of an SSH box; a token box's is not known) then runs over ssh, where Claude
-/// Code may not read its keychain login.
+/// Code may not read its keychain login. Nothing for a command box: the hub refuses attach
+/// there (`attach.begin`), and nothing runs over ssh.
 fn attach_mac_warning(thread: &Value, info: &Value) -> Option<String> {
     if thread["runtime"] != twr_adapters::claude_code::NAME {
         return None;
@@ -3837,7 +3839,7 @@ fn attach_mac_warning(thread: &Value, info: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .find(|b| b["name"].as_str() == Some(name))?;
-    (b["os"] == "Darwin").then(|| {
+    (b["os"] == "Darwin" && b["transport"] != "command").then(|| {
         format!(
             "twr: box {name} is a Mac: attached, Claude Code runs there over ssh, where it may \
              not read its keychain login. If it asks you to log in, end the attach (exit it) \
@@ -6255,6 +6257,24 @@ fn refuse_agent() -> anyhow::Result<()> {
 }
 
 fn refuse_agent_action(action: &str) -> anyhow::Result<()> {
+    match calling_agent() {
+        Some(agent) => bail!(
+            "this request comes from {agent}: agents cannot {action}; only you \
+             can, from your own terminal"
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Whether this process runs for a thread's agent ([`calling_agent`]): what it prints is then
+/// read by that agent (`twr box doctor` never shows it a command box's words).
+fn caller_is_agent() -> bool {
+    calling_agent().is_some()
+}
+
+/// The thread's agent this process runs for, as said ([`twr_hub::local_agent`]); none for a
+/// test's own processes ([`test_user_waived`]).
+fn calling_agent() -> Option<String> {
     // A test's own processes, on its throwaway home only (`TWR_HOME`), with the token its
     // hubs share (`TWR_TEST_USER_TOKEN_FILE`): run from inside a thread, they would count as
     // that thread's agent.
@@ -6263,16 +6283,9 @@ fn refuse_agent_action(action: &str) -> anyhow::Result<()> {
         std::env::var_os(twr_core::client::TEST_USER_TOKEN_ENV).as_deref(),
         twr_core::paths::effective_uid(),
     ) {
-        return Ok(());
+        return None;
     }
-    match twr_hub::local_agent(std::process::id()) {
-        Some(agent) => bail!(
-            "this request comes from {}: agents cannot {action}; only you \
-             can, from your own terminal",
-            agent.detail()
-        ),
-        None => Ok(()),
-    }
+    twr_hub::local_agent(std::process::id()).map(|agent| agent.detail())
 }
 
 /// Whether [`refuse_agent_action`] lets this process act as the user: it honours the test
@@ -7006,13 +7019,15 @@ mod tests {
     }
 
     /// Attaching a Claude Code thread on a Mac box warns about the keychain over ssh; another
-    /// runtime, another OS, a token box (no OS known) or the hub's own box does not.
+    /// runtime, another OS, a token box (no OS known), a command box (attach refused there, no
+    /// ssh) or the hub's own box does not.
     #[test]
     fn attaching_claude_on_a_mac_warns_about_the_keychain() {
         let info = json!({"boxes": [
             {"name": "mac", "transport": "ssh", "os": "Darwin"},
             {"name": "gpu", "transport": "ssh", "os": "Linux"},
             {"name": "lab", "transport": "token", "os": null},
+            {"name": "sb", "transport": "command", "os": "Darwin"},
         ]});
         let thread = |runtime: &str, b: &str| json!({"runtime": runtime, "box_name": b});
         let w = attach_mac_warning(&thread("claude-code", "mac"), &info).unwrap();
@@ -7026,6 +7041,7 @@ mod tests {
             ("codex", "mac"),
             ("claude-code", "gpu"),
             ("claude-code", "lab"),
+            ("claude-code", "sb"),
             ("claude-code", "local"),
             ("claude-code", "gone"),
         ] {

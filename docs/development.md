@@ -115,6 +115,16 @@ cargo test -p twr-hub --test runner_fuzz -- --ignored --nocapture
 
 A failure prints the seed, the invariant, the details and the end of the step log, and keeps the data directory. A seed fixes the actions but not the thread scheduling, so run a failing seed a few times.
 
+## The container box test
+
+The regular suite tests container boxes through a fake `docker exec`. The tests that use a real docker are ignored; run them where `docker` works for your user:
+
+```sh
+cargo test -p twr-cli --test ssh_box container_box -- --ignored
+```
+
+They build `docs/tools/container-box/Dockerfile` once as `twr-test-box:<the Dockerfile's hash>` (its base pulled the first time, which needs the network), and run each case in a container of its own, removed at the end: a box from `twr box add --command` to the container's removal (a thread's turns, doctor, `docker restart`, `docker stop` and `start`, the hub's client killed during a daemon restart, `twr hub stop`), the terminal paths (a clone whose client is killed, Ctrl-C during a clone, the detach keys during `twr box login`), and a container that runs as root. The image stays for the next run; `docker image rm twr-test-box:<hash>` removes it. `TWR_TEST_BOX_IMAGE` names another base image (default `ubuntu:24.04`): the debug build the tests upload needs this machine's glibc or newer there.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push to `dev` and `main` and on every pull request. It uses `pull_request`, never `pull_request_target`, so code from a fork runs without the repository's secrets and with a read-only token, and GitHub asks a maintainer to approve the workflows of a first-time contributor before they run. A new push to a pull request cancels the run still going for its previous one. On `dev` and `main` a new run waits for the one in progress instead, and GitHub keeps one waiting run per branch: a newer push replaces the run still waiting, so of quick pushes only the first and the last get a CI result. The jobs:

@@ -12,6 +12,12 @@
 //! reaches the box when set. The box is this machine, so the hub uploads this build of twr
 //! into the fake home, and the box daemon runs from there.
 //!
+//! A command box (`transport = "command"`, a container) goes through a fake `docker exec -i`
+//! instead ([`Setup::exec`]): its first argument is the container (only `box` exists; another
+//! fails as docker says), and it runs the rest as it is, with no shell around it, in the same
+//! fake box environment; it logs each run as the fake ssh does. Its variants give the box no
+//! input (`docker exec` without `-i`) or a terminal (`-t`, through `script`).
+//!
 //! Linux only: the test finds the box's processes in `/proc`.
 #![cfg(target_os = "linux")]
 
@@ -90,6 +96,15 @@ struct Setup {
     /// One line per run of the fake ssh: its pid, the destination and the remote command
     /// (newlines and tabs as spaces).
     log: PathBuf,
+    /// The fake `docker exec -i`: `<exec> box <argv...>` runs the argv in the fake box.
+    exec: PathBuf,
+    /// The same without passing its input on (`docker exec` without `-i`).
+    exec_noinput: PathBuf,
+    /// The same giving the box a terminal (`docker exec -i -t`, through `script`).
+    exec_tty: PathBuf,
+    /// One line per run of any of them: its pid, the container and the rest of its argv
+    /// (newlines and tabs as spaces).
+    exec_log: PathBuf,
 }
 
 impl Setup {
@@ -162,6 +177,39 @@ exec "$@" sh -c "$cmd"
             ),
         );
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let exec_log = dir.path().join("exec.log");
+        let env = format!(
+            "env -i HOME='{}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_FAKE=1",
+            box_home.display()
+        );
+        let fake_exec = |file: &str, run: String| {
+            let file = dir.path().join(file);
+            install(
+                &file,
+                format!(
+                    r#"#!/bin/sh
+# A fake `docker exec -i` for twr's tests: `$1` is the container (only `box` exists), the rest
+# the command to run there, as it is (no shell around it), in the fake box's environment.
+printf '%s\t%s\t%s\n' "$$" "$1" "$(shift; printf '%s ' "$@" | tr '\n\t' '  ')" >> '{log}'
+[ "$1" = box ] || {{ echo "Error response from daemon: No such container: $1" >&2; exit 1; }}
+shift
+cd '{box_home}' || exit 1
+{run}
+"#,
+                    log = exec_log.display(),
+                    box_home = box_home.display(),
+                ),
+            );
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+            file
+        };
+        let exec = fake_exec("fake-exec", format!("exec {env} \"$@\""));
+        let exec_noinput = fake_exec("fake-exec-noinput", format!("exec {env} \"$@\" </dev/null"));
+        // (`sh -c <line>`: the line, run with a terminal of its own, as `-t` gives one.)
+        let exec_tty = fake_exec(
+            "fake-exec-tty",
+            format!("exec {env} script -qec \"$3\" /dev/null"),
+        );
         Setup {
             _dir: dir,
             home,
@@ -169,6 +217,10 @@ exec "$@" sh -c "$cmd"
             hub_home,
             ssh,
             log,
+            exec,
+            exec_noinput,
+            exec_tty,
+            exec_log,
         }
     }
 
@@ -243,18 +295,12 @@ exec "$@" sh -c "$cmd"
 
     /// The fake ssh's runs so far: (pid, destination, remote command).
     fn ssh_runs(&self) -> Vec<(u32, String, String)> {
-        std::fs::read_to_string(&self.log)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| {
-                let mut f = l.splitn(3, '\t');
-                Some((
-                    f.next()?.parse().ok()?,
-                    f.next()?.to_string(),
-                    f.next()?.to_string(),
-                ))
-            })
-            .collect()
+        runs(&self.log)
+    }
+
+    /// The fake exec's runs so far: (pid, container, the rest of its argv).
+    fn exec_runs(&self) -> Vec<(u32, String, String)> {
+        runs(&self.exec_log)
     }
 
     /// The runs of the relay the hub connects through (not `--stop`).
@@ -292,6 +338,23 @@ exec "$@" sh -c "$cmd"
             (self.count(thread, "report.ready") >= n).then_some(())
         });
     }
+}
+
+/// The runs logged in `log` (the fake ssh's, the fake exec's): (pid, destination or container,
+/// the rest).
+fn runs(log: &Path) -> Vec<(u32, String, String)> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            Some((
+                f.next()?.parse().ok()?,
+                f.next()?.to_string(),
+                f.next()?.to_string(),
+            ))
+        })
+        .collect()
 }
 
 struct HubProc(Child);
@@ -333,19 +396,25 @@ fn processes_mentioning(needle: &str) -> Vec<(u32, Vec<String>)> {
         let Some(pid) = e.file_name().to_str().and_then(|p| p.parse::<u32>().ok()) else {
             continue;
         };
-        let Ok(raw) = std::fs::read(e.path().join("cmdline")) else {
+        let Some(args) = cmdline(pid) else {
             continue;
         };
-        let args: Vec<String> = raw
-            .split(|b| *b == 0)
-            .filter(|a| !a.is_empty())
-            .map(|a| String::from_utf8_lossy(a).into_owned())
-            .collect();
         if args.iter().any(|a| a.contains(needle)) {
             out.push((pid, args));
         }
     }
     out
+}
+
+/// The arguments of process `pid` (`/proc/<pid>/cmdline`), when it runs and they can be read.
+fn cmdline(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(
+        raw.split(|b| *b == 0)
+            .filter(|a| !a.is_empty())
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect(),
+    )
 }
 
 /// The box daemons running from the fake box (`twr runner --daemon` of a build under it).
@@ -1240,6 +1309,1092 @@ fn box_restart_and_from_box_guards() {
     ]);
     assert!(e.contains("cannot be used with"), "{e}");
     assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+}
+
+// -------------------------------------------------------------------------------------------
+// Command boxes
+// -------------------------------------------------------------------------------------------
+
+impl Setup {
+    /// `twr <args>` with a terminal on its stdin and stdout (`script`): whether it succeeded,
+    /// and what it printed.
+    fn in_terminal(&self, args: &[&str]) -> (bool, String) {
+        let line: Vec<String> = std::iter::once(TWR)
+            .chain(args.iter().copied())
+            .map(twr_core::paths::sh_word)
+            .collect();
+        let out = Command::new("script")
+            .args(["-qec", &line.join(" "), "/dev/null"])
+            .env("TWR_HOME", &self.home)
+            .env("TWR_TEST_USER_TOKEN_FILE", test_token())
+            .env_remove("TWR_WORKSPACE")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null())
+            .output()
+            .expect("running script");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text.replace('\r', ""))
+    }
+}
+
+/// The processes of the box's relays (`twr runner --stdio` of a build under the fake box).
+fn box_relays(box_home: &Path) -> Vec<u32> {
+    processes_mentioning(box_home.to_str().unwrap())
+        .into_iter()
+        .filter(|(_, args)| args.iter().any(|a| a == "--stdio"))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// A command box (a fake `docker exec -i box`) from `twr box add --command` to `twr box
+/// remove`: the CLI probes it through the command, its pipe check with it, and the hub
+/// installs its own build through it and comes online; boxes.toml has the command as given
+/// and no terminal_command (the fake is no docker). No ssh runs. `twr box list` and `status`
+/// say `command`, and a thread on the box runs a turn. `twr attach` is refused (the hub's
+/// message) before anything is stopped. Doctor checks `command` and `pipe` instead of ssh,
+/// then the build, the daemon and logind, whose fix shows an agent no stop command (it holds
+/// the command's words). `twr box login` and `--clone` are refused without a
+/// terminal_command, naming the box and the key, before anything runs. `twr box restart`
+/// brings it back on a new daemon through `--restart`. With the hub stopped, no relay of the
+/// box is left and its daemon runs on; `twr box remove` prints the stop command as the box's
+/// command runs it, which stops the daemon.
+#[test]
+fn a_command_box_from_add_to_remove() {
+    let t = Setup::new();
+    let _cleanup = BoxProcesses(t.box_home.clone());
+    let paths = t.paths();
+    let mut hub = Some(t.start_hub(1));
+    let exec = t.exec.to_str().unwrap();
+    let label = format!("{} box", twr_core::paths::sh_word(exec));
+
+    let out = t.ok(&["box", "add", "sb", "--command", exec, "box", "--yes"]);
+    for line in [
+        format!("probing box sb through `{label}`..."),
+        "box sb: linux/".to_string(),
+        format!("Adding box sb (command: {label}):"),
+        "- The hub installs its own build".to_string(),
+        format!("- The hub runs `{label} sh -c ...` itself, from its own environment"),
+        "- `twr box login` and `twr box project --clone` need a terminal_command in [boxes.sb]"
+            .to_string(),
+        "box sb is online: twr ".to_string(),
+    ] {
+        assert!(out.contains(&line), "{line:?} in:\n{out}");
+    }
+    let file = twr_core::config::BoxesFile::load(&paths.boxes_file()).unwrap();
+    let sb = &file.boxes["sb"];
+    assert_eq!(sb.transport, Some(twr_core::config::BoxTransport::Command));
+    assert_eq!(sb.command, Some(vec![exec.to_string(), "box".to_string()]));
+    assert_eq!(sb.terminal_command, None);
+    assert_eq!(sb.ssh, None);
+    // Through the command only: the CLI's probe and the hub's, its upload, its relay.
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+    let runs = t.exec_runs();
+    assert!(runs.iter().all(|(_, c, _)| c == "box"), "{runs:?}");
+    let probes = runs
+        .iter()
+        .filter(|(_, _, c)| {
+            c.starts_with("sh -c ") && c.contains("twr-probe 1") && c.contains("pipe=")
+        })
+        .count();
+    assert!(probes >= 2, "{runs:?}");
+    assert!(
+        runs.iter().any(|(_, _, c)| c.contains(".twr.upload.")),
+        "{runs:?}"
+    );
+    let id = twr_core::build_id_of(Path::new(TWR)).unwrap();
+    let exe = t
+        .box_home
+        .join(".local/share/twr/runner/builds")
+        .join(&id)
+        .join("twr");
+    assert_eq!(twr_core::build_id_of(&exe).unwrap(), id);
+
+    let list = t.ok(&["box", "list"]);
+    let row = list.lines().find(|l| l.starts_with("sb ")).unwrap();
+    let cells: Vec<&str> = row.split_whitespace().collect();
+    assert_eq!(cells[1..3], ["command", "online"], "{list}");
+    let status = t.box_status("sb");
+    assert_eq!(status["transport"], "command", "{status}");
+    assert_eq!(status["build"], id.as_str(), "{status}");
+    let text = t.ok(&["box", "status", "sb"]);
+    assert!(text.contains("transport:      command ("), "{text}");
+    assert!(!text.contains(exec), "the command is not shown: {text}");
+
+    // A thread on the box.
+    let repo = init_repo(&t.box_home.join("repo"));
+    t.ok(&[
+        "thread",
+        "new",
+        repo.to_str().unwrap(),
+        "--box",
+        "sb",
+        "--runtime",
+        "fake",
+        "--name",
+        "contained",
+    ]);
+    t.turn("contained", "hello from the container", 1);
+
+    // Attach: refused by the hub before the runtime is stopped.
+    let e = t.fails(&["attach", "contained"]);
+    assert!(
+        e.contains("twr can't attach to threads on box sb yet")
+            && e.contains("Continue the thread from the TUI or with `twr send`"),
+        "{e}"
+    );
+    assert_eq!(t.count("contained", "thread.attached"), 0);
+    assert_eq!(t.count("contained", "thread.stopped"), 0);
+    t.turn("contained", "still running", 2);
+    assert_eq!(t.count("contained", "thread.started"), 1);
+
+    // Doctor: the command and its pipe instead of ssh.
+    let out = t.twr(&["box", "doctor", "sb"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.starts_with(&format!("box sb: command (the hub runs `{label}`)\n")),
+        "{text}"
+    );
+    let out = t.twr(&["box", "doctor", "sb", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let checks = v["checks"].as_array().unwrap();
+    let result = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["check"] == name)
+            .map(|c| c["result"].as_str().unwrap().to_string())
+    };
+    for ok in ["command", "pipe", "build", "daemon"] {
+        assert_eq!(result(ok).as_deref(), Some("ok"), "{ok}: {v}");
+    }
+    assert!(result("logind").is_some(), "{v}");
+    for none in ["ssh", "ssh_batch"] {
+        assert_eq!(result(none), None, "{none}: {v}");
+    }
+    assert_eq!(v["build"], json!({"id": id, "source": "hub"}), "{v}");
+
+    // logind's fix when the daemon runs outside a systemd user service (fakes of loginctl,
+    // busctl and systemctl on the box): the user gets the stop command, an agent `twr box
+    // restart` and never the command's words, in text and in JSON. For these runs only, the
+    // command (doctor reads it from boxes.toml; the hub keeps its own) holds a secret.
+    let file = paths.boxes_file();
+    let kept = std::fs::read_to_string(&file).unwrap();
+    let secret: String = kept
+        .lines()
+        .map(|l| match l.strip_prefix("command = [") {
+            Some(rest) => format!("command = [\"env\", \"KEY=s3cret\", {rest}\n"),
+            None => format!("{l}\n"),
+        })
+        .collect();
+    assert!(secret.contains("KEY=s3cret"), "{kept}");
+    std::fs::write(&file, &secret).unwrap();
+    t.box_agent("loginctl", "echo Linger=yes\n");
+    t.box_agent("busctl", "echo 'b true'\n");
+    t.box_agent(
+        "systemctl",
+        "[ \"$1 $2\" = '--user list-units' ] || exit 1\nexit 0\n",
+    );
+    let doctor = |json: bool, agent: bool| {
+        let mut args = vec!["box", "doctor", "sb"];
+        if json {
+            args.push("--json");
+        }
+        let mut c = t.command(&args);
+        if agent {
+            c.env("TWR_AGENT", "worker:1")
+                .env_remove("TWR_TEST_USER_TOKEN_FILE");
+        }
+        let out = c.output().unwrap();
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let logind_fix = |json: &str| {
+        let v: Value = serde_json::from_str(json.trim()).unwrap();
+        let c = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == "logind")
+            .unwrap_or_else(|| panic!("no logind check: {v}"))
+            .clone();
+        assert_eq!(c["result"], "warn", "{v}");
+        c["fix"].as_str().unwrap().to_string()
+    };
+    let (out, err) = doctor(false, true);
+    let text = format!("{out}{err}");
+    assert!(
+        text.contains(
+            "! logind: you linger, but the box daemon runs outside a systemd user service"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("then restart the box daemon (`twr box restart sb`)"),
+        "{text}"
+    );
+    for word in ["s3cret", "--stop", "sh -c"] {
+        assert!(!text.contains(word), "{word} in:\n{text}");
+    }
+    let (json, err) = doctor(true, true);
+    assert!(
+        !json.contains("s3cret") && !err.contains("s3cret"),
+        "{json}{err}"
+    );
+    let fix = logind_fix(&json);
+    assert!(
+        fix.contains("`twr box restart sb`") && !fix.contains("--stop"),
+        "{fix}"
+    );
+    // The user gets the stop command.
+    let (text, _) = doctor(false, false);
+    assert!(
+        text.contains("then stop the box daemon with `env KEY=s3cret "),
+        "{text}"
+    );
+    let (json, _) = doctor(true, false);
+    let fix = logind_fix(&json);
+    assert!(
+        fix.contains("KEY=s3cret") && fix.contains("--stop"),
+        "{fix}"
+    );
+    std::fs::write(&file, &kept).unwrap();
+    for fake in ["loginctl", "busctl", "systemctl"] {
+        std::fs::remove_file(t.box_home.join("bin").join(fake)).unwrap();
+    }
+
+    // What needs a terminal on the box: refused without a terminal_command, before anything
+    // runs on it.
+    let before = t.exec_runs().len();
+    if Command::new("script")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        let (ok, said) = t.in_terminal(&["box", "login", "sb", "claude"]);
+        assert!(!ok, "{said}");
+        assert!(
+            said.contains(
+                "box sb has no terminal_command: set one in [boxes.sb] (its command with `-t`: \
+                 `docker exec -i -t <container>`), or log in inside the container with `claude \
+                 auth login`"
+            ),
+            "{said}"
+        );
+        let (ok, said) = t.in_terminal(&["box", "project", "sb", "api", "--clone", "--yes"]);
+        assert!(!ok, "{said}");
+        assert!(
+            said.contains("box sb has no terminal_command")
+                && said.contains("`twr box project sb api --path <path>`"),
+            "{said}"
+        );
+        assert_eq!(t.exec_runs().len(), before, "{:?}", t.exec_runs());
+    } else {
+        eprintln!("no `script` here: the terminal refusals are skipped");
+    }
+
+    // Restart: a new daemon, on a newer connection, through `--restart`.
+    let before = daemons(&t.box_home);
+    assert_eq!(before.len(), 1, "{before:?}");
+    let epoch = t.box_status("sb")["epoch"].as_u64().unwrap();
+    let out = t.ok(&["box", "restart", "sb", "--yes"]);
+    assert!(
+        out.contains("box sb is back online with a new daemon: twr "),
+        "{out}"
+    );
+    let after = daemons(&t.box_home);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_ne!(after, before, "a new daemon");
+    assert!(t.box_status("sb")["epoch"].as_u64().unwrap() > epoch);
+    let restarts = t
+        .exec_runs()
+        .iter()
+        .filter(|(_, _, c)| c.contains(" runner --stdio ") && c.contains(" --restart"))
+        .count();
+    assert_eq!(restarts, 1, "{:?}", t.exec_runs());
+
+    // The hub stopped: it ends its command, so no relay of the box is left; the daemon runs on.
+    t.ok(&["hub", "stop"]);
+    hub.take().unwrap().exited();
+    poll("no relay of the box left", || {
+        box_relays(&t.box_home).is_empty().then_some(())
+    });
+    assert_eq!(daemons(&t.box_home), after, "the daemon outlives the hub");
+
+    // Removed: the stop command is the box's command with `sh -c`, and it stops the daemon.
+    let out = t.ok(&["box", "remove", "sb"]);
+    assert!(out.contains("removed box sb from"), "{out}");
+    assert!(
+        out.contains("twr never stops or removes box sb's container: it stays as it is."),
+        "{out}"
+    );
+    let stop = out
+        .lines()
+        .find(|l| l.contains("--stop"))
+        .unwrap_or_else(|| panic!("no stop command: {out}"))
+        .trim()
+        .to_string();
+    assert!(stop.starts_with(&format!("{label} sh -c ")), "{stop}");
+    assert!(
+        stop.contains(&format!("/twr/runner/builds/{id}/twr")),
+        "{stop}"
+    );
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(&stop)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{said}");
+    assert!(said.contains("twr-box: stopped the box daemon"), "{said}");
+    poll("no box daemon left", || {
+        daemons(&t.box_home).is_empty().then_some(())
+    });
+}
+
+/// `twr box add --command` refuses a command that cannot carry the hub's connection, saying
+/// how to fix it, and writes nothing: one that does not pass its input on (`docker exec`
+/// without `-i`), one that gives the box a terminal (`-t`), a container that does not exist
+/// (as docker says it), and an ssh-like program (before anything runs). No hub is started.
+#[test]
+fn a_command_box_that_cannot_carry_the_connection_is_not_added() {
+    let t = Setup::new();
+    let paths = t.paths();
+    let add = |argv: &[&str]| {
+        let mut args = vec!["box", "add", "sb", "--command"];
+        args.extend_from_slice(argv);
+        args.push("--yes");
+        t.fails(&args)
+    };
+    let e = add(&[t.exec_noinput.to_str().unwrap(), "box"]);
+    assert!(
+        e.contains(
+            "box sb's command does not pass the hub's input to the box: `docker exec` and \
+             `kubectl exec` need `-i`"
+        ),
+        "{e}"
+    );
+    if Command::new("script")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        let e = add(&[t.exec_tty.to_str().unwrap(), "box"]);
+        assert!(
+            e.contains(
+                "box sb's command gives the box a terminal (a `-t` in it?): the hub's \
+                 connection is binary. Remove `-t` from [boxes.sb] command"
+            ),
+            "{e}"
+        );
+    } else {
+        eprintln!("no `script` here: the terminal case is skipped");
+    }
+    let e = add(&[t.exec.to_str().unwrap(), "nosuch"]);
+    assert!(
+        e.contains(
+            "box sb's container does not exist (Error response from daemon: No such container: \
+             nosuch): create and start it"
+        ),
+        "{e}"
+    );
+    let ran = t.exec_runs().len();
+    let e = add(&["tailscale", "ssh", "me@box"]);
+    assert!(
+        e.contains("`tailscale ssh` passes its arguments to a shell on the box"),
+        "{e}"
+    );
+    assert_eq!(t.exec_runs().len(), ran);
+    assert!(!paths.boxes_file().exists());
+    assert!(!paths.socket.exists(), "a hub was started");
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+}
+
+/// `twr box doctor`, which agents may run, never shows an agent a command box's words (one may
+/// hold a secret): its header, its progress and the failed command check's fix name the
+/// program and how many words it has, in text and in JSON. The user sees the command.
+#[test]
+fn box_doctor_never_shows_an_agent_a_command_s_words() {
+    let t = Setup::new();
+    let exec = t.exec.to_str().unwrap();
+    std::fs::write(
+        t.paths().boxes_file(),
+        format!(
+            "[boxes.sb]\ntransport = \"command\"\ncommand = [{exec:?}, \"nosuch\", \"-e\", \
+             \"KEY=s3cret\"]\n"
+        ),
+    )
+    .unwrap();
+    let doctor = |json: bool, agent: bool| {
+        let mut args = vec!["box", "doctor", "sb"];
+        if json {
+            args.push("--json");
+        }
+        let mut c = t.command(&args);
+        if agent {
+            c.env("TWR_AGENT", "worker:1")
+                .env_remove("TWR_TEST_USER_TOKEN_FILE");
+        }
+        let out = c.output().unwrap();
+        assert!(!out.status.success());
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let shown = format!("{exec} (4 words)");
+    let (out, err) = doctor(false, true);
+    let text = format!("{out}{err}");
+    assert!(
+        !text.contains("s3cret") && !text.contains("nosuch -e"),
+        "{text}"
+    );
+    assert!(
+        text.starts_with(&format!("box sb: command (the hub runs `{shown}`)\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("probing box sb through `{shown}`...")),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "box sb's container does not exist (Error response from daemon: No such \
+             container: nosuch)"
+        ),
+        "{text}"
+    );
+    let (json, err) = doctor(true, true);
+    assert!(
+        !json.contains("s3cret") && !err.contains("s3cret"),
+        "{json}{err}"
+    );
+    let v: Value = serde_json::from_str(json.trim()).unwrap();
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "command")
+        .unwrap_or_else(|| panic!("no command check: {v}"))
+        .clone();
+    assert_eq!(check["result"], "fail", "{v}");
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("[boxes.sb] command ({shown}) runs here")),
+        "{v}"
+    );
+    // The user sees the command, in its fix too.
+    let (text, _) = doctor(false, false);
+    assert!(text.contains("nosuch -e KEY=s3cret"), "{text}");
+    let (json, _) = doctor(true, false);
+    assert!(json.contains("nosuch -e KEY=s3cret true"), "{json}");
+}
+
+// -------------------------------------------------------------------------------------------
+// Container boxes with a real docker (ignored: `cargo test -p twr-cli --test ssh_box
+// container_box -- --ignored`)
+// -------------------------------------------------------------------------------------------
+
+/// `docker <args>`, its stdin null.
+fn docker(args: &[&str]) -> Output {
+    Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("running docker")
+}
+
+/// `docker <args>`, which must succeed: its stdout.
+fn docker_ok(args: &[&str]) -> String {
+    let out = docker(args);
+    assert!(
+        out.status.success(),
+        "docker {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// The image of docs/tools/container-box/Dockerfile (the docs' recipe), built once as
+/// `twr-test-box:<the Dockerfile's hash>[-<base>]` from base `TWR_TEST_BOX_IMAGE` (default
+/// `ubuntu:24.04`, whose glibc runs this debug build). Panics, saying so, when docker can't be
+/// used here.
+fn box_image() -> &'static str {
+    static IMAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    IMAGE.get_or_init(|| {
+        let v = Command::new("docker")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .stdin(Stdio::null())
+            .output();
+        match v {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => panic!(
+                "these tests need docker, and `docker version` failed here: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => panic!("these tests need docker, and `docker` can't be run here: {e}"),
+        }
+        let context = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/tools/container-box");
+        let hash = twr_core::build_id_of(&context.join("Dockerfile")).unwrap();
+        let base = std::env::var("TWR_TEST_BOX_IMAGE").unwrap_or_default();
+        let tag = if base.is_empty() {
+            format!("twr-test-box:{hash}")
+        } else {
+            let clean: String = base
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect();
+            format!("twr-test-box:{hash}-{clean}")
+        };
+        if !docker(&["image", "inspect", &tag]).status.success() {
+            let mut args = vec!["build", "-q", "-t", &tag];
+            let arg = format!("BASE={base}");
+            if !base.is_empty() {
+                args.extend(["--build-arg", &arg]);
+            }
+            let dir = context.to_str().unwrap();
+            args.push(dir);
+            docker_ok(&args);
+        }
+        tag
+    })
+}
+
+/// A container of [`box_image`] (`docker run -d --init -e TWR_ENABLE_FAKE=1 <extra>`), removed
+/// with `docker rm -f` when dropped.
+struct Container(String);
+
+impl Container {
+    fn run(extra: &[&str]) -> Container {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("twr-test-{}-{nanos}", std::process::id());
+        let mut args = vec![
+            "run",
+            "-d",
+            "--name",
+            &name,
+            "--init",
+            "-e",
+            "TWR_ENABLE_FAKE=1",
+        ];
+        args.extend_from_slice(extra);
+        args.push(box_image());
+        let c = Container(name.clone());
+        docker_ok(&args);
+        c
+    }
+
+    /// `docker exec <container> sh -c <script>` as the container's user: its stdout, when it
+    /// succeeded.
+    fn sh(&self, script: &str) -> Option<String> {
+        let out = docker(&["exec", &self.0, "sh", "-c", script]);
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// The pids of the processes in the container whose command line matches `pattern`
+    /// (`pgrep -f`).
+    fn pgrep(&self, pattern: &str) -> Vec<u32> {
+        // (No shell around it, whose command line would match too.)
+        String::from_utf8_lossy(&docker(&["exec", &self.0, "pgrep", "-f", "--", pattern]).stdout)
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect()
+    }
+}
+
+impl Container {
+    /// Kills the processes in the container whose command line matches `pattern` (`pkill -f`,
+    /// as root).
+    fn pkill(&self, pattern: &str) {
+        let _ = docker(&[
+            "exec", "-u", "root", &self.0, "pkill", "-9", "-f", "--", pattern,
+        ]);
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        let _ = docker(&["rm", "-f", &self.0]);
+    }
+}
+
+/// Waits up to `within` for `f` to return Some.
+fn poll_for<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+impl Setup {
+    /// A hub, and box sb added through `docker exec -i <ctr>` with `extra` exec options before
+    /// the container (`twr box add sb --command docker exec -i <extra> <ctr> --yes`): what
+    /// `add` printed, once the box is online.
+    fn add_container(&self, ctr: &Container, extra: &[&str]) -> (HubProc, String) {
+        let hub = self.start_hub(1);
+        let mut args = vec!["box", "add", "sb", "--command", "docker", "exec", "-i"];
+        args.extend_from_slice(extra);
+        args.extend([ctr.0.as_str(), "--yes"]);
+        let out = self.ok(&args);
+        (hub, out)
+    }
+
+    /// `twr <args>` with a terminal (`script`) whose input this test writes: the process, its
+    /// output going to `out`.
+    fn spawn_in_terminal(&self, args: &[&str], out: &Path) -> Child {
+        let line: Vec<String> = std::iter::once(TWR)
+            .chain(args.iter().copied())
+            .map(twr_core::paths::sh_word)
+            .collect();
+        Command::new("script")
+            .args(["-qec", &line.join(" "), "/dev/null"])
+            .env("TWR_HOME", &self.home)
+            .env("TWR_TEST_USER_TOKEN_FILE", test_token())
+            .env("HOME", &self.hub_home)
+            .env_remove("TWR_WORKSPACE")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::piped())
+            .stdout(std::fs::File::create(out).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("running script")
+    }
+}
+
+/// Waits up to `within` for `child` to exit: whether it succeeded.
+fn exited_within(child: &mut Child, within: Duration) -> bool {
+    poll_for("the command to end", within, || {
+        child.try_wait().unwrap().map(|s| s.success())
+    })
+}
+
+/// Whether `args` are those of a `docker exec` client into container `ctr` (a word of them,
+/// the test's own unique name) that mention `needle`.
+fn docker_client_of(args: &[String], ctr: &Container, needle: &str) -> bool {
+    args.first()
+        .is_some_and(|a| a == "docker" || a.ends_with("/docker"))
+        && args.get(1).is_some_and(|a| a == "exec")
+        && args.contains(&ctr.0)
+        && args.iter().any(|a| a.contains(needle))
+}
+
+/// The host processes of `docker exec` clients into `ctr` whose arguments mention `needle`
+/// ([`docker_client_of`]): never another test's, or another box's.
+fn docker_clients(ctr: &Container, needle: &str) -> Vec<u32> {
+    processes_mentioning(&ctr.0)
+        .into_iter()
+        .filter(|(_, args)| docker_client_of(args, ctr, needle))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// SIGKILLs `pid`, one of [`docker_clients`]`(ctr, needle)`, once its arguments read again
+/// right before still say it is (a client that ended and whose pid was taken again fails the
+/// test instead).
+fn kill_docker_client(ctr: &Container, needle: &str, pid: u32) {
+    let args = cmdline(pid).unwrap_or_default();
+    assert!(
+        docker_client_of(&args, ctr, needle),
+        "docker exec client {pid} ended before it was killed (now: {args:?})"
+    );
+    // SAFETY: kill(2) of a pid; no memory is passed.
+    unsafe {
+        libc_kill(pid as i32, 9);
+    }
+}
+
+/// A container box from start to end, in the docs' recipe container (`--init`, the image's
+/// plain user): `twr box add --command docker exec -i <ctr>` uploads the hub's build through
+/// the pipe and the box comes online, with the `terminal_command` it derived; a thread there
+/// runs a turn, and attach to it is refused; doctor's command and pipe checks pass, and the
+/// daemon runs in a session of its own (no loginctl). `docker restart` brings the box back on
+/// a new connection (the thread's next prompt runs); `docker stop` shows as a stopped
+/// container, and `docker start` brings it back. The hub's `docker exec` client killed while
+/// the relay of a restart waits for the old daemon to end: that relay ends at once, and the
+/// next attempt starts the only daemon. `twr hub stop` leaves no relay in the container, and
+/// the daemon runs on. Once the container is gone, a new hub says it doesn't exist.
+#[test]
+#[ignore = "needs docker: cargo test -p twr-cli --test ssh_box container_box -- --ignored"]
+fn container_box_from_add_to_removal() {
+    let t = Setup::new();
+    let ctr = Container::run(&[]);
+    let start = Instant::now();
+    let (hub, out) = t.add_container(&ctr, &[]);
+    let mut hub = Some(hub);
+    assert!(out.contains("box sb is online: twr "), "{out}");
+    eprintln!("container box online after {:?}", start.elapsed());
+    let file = twr_core::config::BoxesFile::load(&t.paths().boxes_file()).unwrap();
+    let sb = &file.boxes["sb"];
+    let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(sb.command, Some(words(&["docker", "exec", "-i", &ctr.0])));
+    assert_eq!(
+        sb.terminal_command,
+        Some(words(&["docker", "exec", "-i", "-t", &ctr.0]))
+    );
+    let status = t.box_status("sb");
+    assert_eq!(status["transport"], "command", "{status}");
+    assert_eq!(status["launch"], "detached", "{status}");
+    assert_eq!(ctr.pgrep("runner --daemon").len(), 1);
+
+    // A thread in a repository of the container's.
+    ctr.sh(
+        "git init -q ~/p && git -C ~/p -c user.email=t@t -c user.name=t commit -q --allow-empty \
+         -m i",
+    )
+    .unwrap();
+    t.ok(&[
+        "thread",
+        "new",
+        "/home/box/p",
+        "--box",
+        "sb",
+        "--runtime",
+        "fake",
+        "--name",
+        "inbox",
+    ]);
+    t.turn("inbox", "hello from the container", 1);
+    let e = t.fails(&["attach", "inbox"]);
+    assert!(
+        e.contains("twr can't attach to threads on box sb yet"),
+        "{e}"
+    );
+
+    // Doctor through the command.
+    let out = t.twr(&["box", "doctor", "sb", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let result = |name: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["check"] == name)
+            .map(|c| {
+                (
+                    c["result"].as_str().unwrap().to_string(),
+                    c["message"].to_string(),
+                )
+            })
+    };
+    for ok in ["command", "pipe", "build", "daemon"] {
+        assert_eq!(result(ok).map(|r| r.0).as_deref(), Some("ok"), "{ok}: {v}");
+    }
+    let logind = result("logind").unwrap_or_else(|| panic!("no logind check: {v}"));
+    assert!(logind.1.contains("no loginctl"), "{v}");
+
+    // `docker restart`: the box comes back on a new connection, and the thread goes on.
+    let epoch = t.box_status("sb")["epoch"].as_u64().unwrap();
+    docker_ok(&["restart", &ctr.0]);
+    poll("box sb back online after docker restart", || {
+        let s = t.box_status("sb");
+        (s["state"] == "online" && s["epoch"].as_u64().unwrap() > epoch).then_some(())
+    });
+    assert_eq!(ctr.pgrep("runner --daemon").len(), 1);
+    // Its runtime was lost with the container's processes: a crash card.
+    poll("the thread's crash card", || {
+        (t.count("inbox", "thread.crashed") == 1).then_some(())
+    });
+    t.turn("inbox", "after the restart", 2);
+
+    // `docker stop`: a stopped container, said as such; `docker start`: back.
+    docker_ok(&["stop", "-t", "1", &ctr.0]);
+    poll_for(
+        "the stopped container in last_error",
+        Duration::from_secs(60),
+        || {
+            let s = t.box_status("sb");
+            s["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("box sb's container is stopped"))
+                .then_some(())
+        },
+    );
+    docker_ok(&["start", &ctr.0]);
+    poll_for(
+        "box sb online after docker start",
+        Duration::from_secs(120),
+        || (t.box_status("sb")["state"] == "online").then_some(()),
+    );
+    assert_eq!(ctr.pgrep("runner --daemon").len(), 1);
+
+    // A restart whose relay waits for the old daemon to end (its machine lock, taken over by
+    // `flock` as the daemon lets go of it): the hub's client killed, that relay ends, starting
+    // nothing; once the lock is free, the hub's next attempt starts the only daemon.
+    let locks = ctr
+        .sh("ls ~/.local/state/twr/runner-locks/")
+        .unwrap_or_default();
+    let lock = locks
+        .split_whitespace()
+        .find(|l| l.ends_with(".lock"))
+        .unwrap_or_else(|| panic!("no machine lock in {locks:?}"))
+        .to_string();
+    docker_ok(&[
+        "exec",
+        "-d",
+        &ctr.0,
+        "sh",
+        "-c",
+        &format!("exec flock ~/.local/state/twr/runner-locks/{lock} sleep 120"),
+    ]);
+    let old = ctr.pgrep("runner --daemon");
+    let mut restart = t
+        .command(&["box", "restart", "sb", "--yes"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    poll_for(
+        "the restart's relay to wait",
+        Duration::from_secs(60),
+        || {
+            (ctr.pgrep("runner --daemon").is_empty()
+                && !ctr.pgrep("runner --stdio.*--restart").is_empty())
+            .then_some(())
+        },
+    );
+    let clients = docker_clients(&ctr, "--restart");
+    assert_eq!(clients.len(), 1, "{clients:?}");
+    kill_docker_client(&ctr, "--restart", clients[0]);
+    poll_for("the restart's relay to end", Duration::from_secs(5), || {
+        ctr.pgrep("runner --stdio.*--restart")
+            .is_empty()
+            .then_some(())
+    });
+    assert!(ctr.pgrep("runner --daemon").is_empty(), "a daemon started");
+    ctr.pkill("flock .*sleep 120");
+    ctr.pkill("^sleep 120");
+    poll_for(
+        "box sb online on a new daemon",
+        Duration::from_secs(120),
+        || (t.box_status("sb")["state"] == "online").then_some(()),
+    );
+    let daemons = ctr.pgrep("runner --daemon");
+    assert_eq!(daemons.len(), 1, "{daemons:?}");
+    assert_ne!(daemons, old);
+    let _ = restart.kill();
+    let _ = restart.wait();
+
+    // The hub stopped: no relay left in the container; the daemon runs on.
+    t.ok(&["hub", "stop"]);
+    hub.take().unwrap().exited();
+    poll_for("no relay in the container", Duration::from_secs(5), || {
+        ctr.pgrep("runner --stdio").is_empty().then_some(())
+    });
+    assert_eq!(ctr.pgrep("runner --daemon"), daemons);
+
+    // The container gone: a new hub says so.
+    docker_ok(&["rm", "-f", &ctr.0]);
+    let _hub = t.start_hub(2);
+    poll_for(
+        "the missing container in last_error",
+        Duration::from_secs(60),
+        || {
+            t.box_status("sb")["last_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("box sb's container does not exist"))
+                .then_some(())
+        },
+    );
+}
+
+/// What needs a terminal on a container box, through `docker exec -i -t` in a real terminal
+/// (`script`): a clone whose `docker exec` client is killed runs to its end in the container
+/// (no git and no clone left after it, the folder absent or a whole clone, nothing recorded),
+/// and the box daemon still answers; Ctrl-C during a clone reaches git in the container, and
+/// the folder is removed; the detach keys (Ctrl-P Ctrl-Q) during `twr box login` end the CLI
+/// and leave the agent's login running in the container, as documented.
+#[test]
+#[ignore = "needs docker: cargo test -p twr-cli --test ssh_box container_box -- --ignored"]
+fn container_box_terminal_paths() {
+    let t = Setup::new();
+    let ctr = Container::run(&["-e", "TWR_TEST_CLONE_ALLOW_FILE=1"]);
+    let (_hub, _) = t.add_container(&ctr, &[]);
+
+    // The hub machine's repository, whose origin the container's git maps to a bare
+    // repository there; a post-checkout hook that says it started, then takes its time.
+    let url = "https://example.invalid/o/api.git";
+    let hub_repo = init_repo(&t.hub_home.join("code/api"));
+    twr_core::testkit::git::run(&hub_repo, &["remote", "add", "origin", url]);
+    ctr.sh(&format!(
+        "set -e; git init -q --bare ~/bare.git; git init -q ~/seed; cd ~/seed; echo hi > \
+         README.md; git add README.md; git -c user.email=t@t -c user.name=t commit -qm i; git \
+         push -q ~/bare.git HEAD:refs/heads/main; git -C ~/bare.git symbolic-ref HEAD \
+         refs/heads/main; mkdir ~/code ~/hooks; printf '#!/bin/sh\\ntouch ~/hook.started\\nsleep \
+         15\\n' > ~/hooks/post-checkout; chmod +x ~/hooks/post-checkout; git config --global \
+         url.file:///home/box/bare.git.insteadOf {url}; git config --global core.hooksPath \
+         ~/hooks"
+    ))
+    .expect("the container's repositories");
+    let boxes_before = std::fs::read_to_string(t.paths().boxes_file()).unwrap();
+    let clone_args = ["box", "project", "sb", "api", "--clone", "--yes"];
+    let out = t.home.join("clone.out");
+
+    // The client killed once git runs: the clone runs to its end in the container.
+    let mut cli = t.spawn_in_terminal(&clone_args, &out);
+    poll_for("the clone's hook", Duration::from_secs(60), || {
+        ctr.sh("test -e ~/hook.started").map(|_| ())
+    });
+    let clients = docker_clients(&ctr, "--clone-repo");
+    assert_eq!(clients.len(), 1, "{clients:?}");
+    kill_docker_client(&ctr, "--clone-repo", clients[0]);
+    assert!(!exited_within(&mut cli, Duration::from_secs(30)));
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        said.contains("the connection to box sb ended before the clone said how it went"),
+        "{said}"
+    );
+    poll_for(
+        "no clone left in the container",
+        Duration::from_secs(60),
+        || {
+            (ctr.pgrep("--clone-repo").is_empty() && ctr.pgrep("(^|/)git( |$)").is_empty())
+                .then_some(())
+        },
+    );
+    let whole =
+        ctr.sh("git -C ~/code/api rev-parse -q --verify HEAD && test -f ~/code/api/README.md");
+    let absent = ctr.sh("test ! -e ~/code/api");
+    assert!(whole.is_some() || absent.is_some(), "a partial clone");
+    assert_eq!(
+        std::fs::read_to_string(t.paths().boxes_file()).unwrap(),
+        boxes_before
+    );
+    assert_eq!(t.box_status("sb")["state"], "online");
+    let doctor = t.twr(&["box", "doctor", "sb", "--json"]);
+    let v: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let daemon = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == "daemon")
+        .unwrap_or_else(|| panic!("no daemon check: {v}"));
+    assert_eq!(daemon["result"], "ok", "{v}");
+
+    // Ctrl-C during the clone: git in the container stops, and the folder is removed.
+    ctr.sh("rm -rf ~/code/api ~/hook.started").unwrap();
+    let mut cli = t.spawn_in_terminal(&clone_args, &out);
+    poll_for("the clone's hook", Duration::from_secs(60), || {
+        ctr.sh("test -e ~/hook.started").map(|_| ())
+    });
+    {
+        use std::io::Write;
+        let stdin = cli.stdin.as_mut().unwrap();
+        stdin.write_all(b"\x03").unwrap();
+        stdin.flush().unwrap();
+    }
+    assert!(!exited_within(&mut cli, Duration::from_secs(30)));
+    poll_for("the folder removed", Duration::from_secs(30), || {
+        ctr.sh("test ! -e ~/code/api").map(|_| ())
+    });
+    assert!(ctr.pgrep("--clone-repo").is_empty());
+    assert_eq!(
+        std::fs::read_to_string(t.paths().boxes_file()).unwrap(),
+        boxes_before
+    );
+
+    // The detach keys during a login: the CLI returns, the login runs on in the container.
+    docker_ok(&[
+        "exec",
+        "-u",
+        "root",
+        &ctr.0,
+        "sh",
+        "-c",
+        "printf '#!/bin/sh\\ncase \"$*\" in *login*) touch /tmp/login.started; exec sleep 300 ;; \
+         esac\\necho 2.0.0\\n' > /usr/local/bin/claude; chmod 755 /usr/local/bin/claude",
+    ]);
+    let out = t.home.join("login.out");
+    let mut cli = t.spawn_in_terminal(&["box", "login", "sb", "claude"], &out);
+    poll_for("the fake login", Duration::from_secs(60), || {
+        ctr.sh("test -e /tmp/login.started").map(|_| ())
+    });
+    {
+        use std::io::Write;
+        let stdin = cli.stdin.as_mut().unwrap();
+        stdin.write_all(b"\x10\x11").unwrap();
+        stdin.flush().unwrap();
+    }
+    exited_within(&mut cli, Duration::from_secs(30));
+    let said = std::fs::read_to_string(&out).unwrap();
+    assert!(said.contains("claude's login on box sb ended"), "{said}");
+    let left = ctr.pgrep("^sleep 300");
+    assert_eq!(
+        left.len(),
+        1,
+        "the login is still running in the container: {said}"
+    );
+    ctr.pkill("^sleep 300");
+}
+
+/// A container that runs as root, with `HOME=/root` in its environment (`-e HOME`, or an
+/// image's `ENV HOME`): `docker exec -u box` keeps that HOME (docker sets the exec user's own
+/// only when the container's environment has none), so the command needs `-e HOME=/home/box
+/// -w /home/box` too. With them the box comes online, doctor finds its data directory under
+/// box's home, the daemon runs as box, and `terminal_command` keeps every word; without them,
+/// `add` fails with the hint.
+#[test]
+#[ignore = "needs docker: cargo test -p twr-cli --test ssh_box container_box -- --ignored"]
+fn container_box_in_a_root_container() {
+    let t = Setup::new();
+    let as_root = ["--user", "root", "-e", "HOME=/root"];
+    let ctr = Container::run(&as_root);
+    let as_box = ["-u", "box", "-e", "HOME=/home/box", "-w", "/home/box"];
+    let (mut hub, out) = t.add_container(&ctr, &as_box);
+    assert!(out.contains("box sb is online: twr "), "{out}");
+    let file = twr_core::config::BoxesFile::load(&t.paths().boxes_file()).unwrap();
+    let mut want: Vec<String> = ["docker", "exec", "-i", "-t"]
+        .iter()
+        .chain(&as_box)
+        .map(|s| s.to_string())
+        .collect();
+    want.push(ctr.0.clone());
+    assert_eq!(file.boxes["sb"].terminal_command, Some(want));
+    let doctor = t.twr(&["box", "doctor", "sb"]);
+    let text = said(&doctor);
+    assert!(text.contains("/home/box/.local/share"), "{text}");
+    assert!(!text.contains("/root/"), "{text}");
+    let daemons = ctr.sh("ps -o user= -C twr").unwrap_or_default();
+    assert!(daemons.split_whitespace().all(|u| u == "box"), "{daemons}");
+
+    // Without HOME: the upload is refused, with the fix.
+    t.ok(&["hub", "stop"]);
+    hub.exited();
+    std::fs::remove_file(t.paths().boxes_file()).unwrap();
+    let ctr2 = Container::run(&as_root);
+    hub = t.start_hub(2);
+    let out = t.twr(&[
+        "box",
+        "add",
+        "sb",
+        "--command",
+        "docker",
+        "exec",
+        "-i",
+        "-u",
+        "box",
+        &ctr2.0,
+        "--yes",
+    ]);
+    let text = said(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(
+        text.contains("box sb's HOME is /root, which its user can't write to"),
+        "{text}"
+    );
+    drop(hub);
 }
 
 // -------------------------------------------------------------------------------------------

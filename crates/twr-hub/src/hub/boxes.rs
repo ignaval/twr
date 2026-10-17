@@ -15,18 +15,19 @@
 //! transport rules of [`Config::validate`], a token of at least
 //! [`twr_core::runner::TOKEN_MIN_LEN`] characters for a token box, a warning below
 //! [`twr_core::runner::TOKEN_GOOD_LEN`]), then [`register_box`] (the [`RemoteBox`] built and
-//! inserted), then [`start_box`] (the settling of its orphaned commands, and for an SSH box in
-//! the default workspace its ssh supervisor, [`crate::ssh_box`]). At startup every box is
-//! admitted before the hub opens anything (a box that is refused refuses the hub: a box the
-//! hub would skip could never connect anyway), registered before the log's runtimes are
+//! inserted), then [`start_box`] (the settling of its orphaned commands, and for an SSH or a
+//! command box in the default workspace its supervisor, [`crate::ssh_box`]). At startup every
+//! box is admitted before the hub opens anything (a box that is refused refuses the hub: a box
+//! the hub would skip could never connect anyway), registered before the log's runtimes are
 //! looked at (a remote box's are left to its runner), and started once the hub is open.
 //!
 //! `box.add {name}` (users only) re-reads the hub's config file and the `boxes.toml` next to
 //! it ([`Config::load_with_boxes`]) and adds box `name` from them; `box.install {name}` wakes
-//! an SSH box's supervisor at once (a build was just installed on it); `box.projects {box}`
-//! takes a box's `[boxes.<name>.projects]` from them again (`twr box project` just recorded
-//! one), the only change to a box the hub takes without a restart besides its build;
-//! `box.restart {box}` has an SSH box's supervisor restart its daemon ([`crate::ssh_box`],
+//! the supervisor of a box the hub connects to (ssh or command) at once (a build was just
+//! installed on it); `box.projects {box}` takes a box's `[boxes.<name>.projects]` from them
+//! again (`twr box project` just recorded one), the only change to a box the hub takes
+//! without a restart besides its build;
+//! `box.restart {box}` has such a box's supervisor restart its daemon ([`crate::ssh_box`],
 //! "Restarting the daemon").
 
 use std::collections::{BTreeMap, HashMap};
@@ -42,7 +43,7 @@ use super::lifecycle::data_dir_of;
 use super::{rpc, runners, Caller, Hub, Inner, LOCAL_BOX};
 use crate::host::ThreadHost;
 use crate::remote::RemoteBox;
-use crate::ssh_box::{self, SshBox};
+use crate::ssh_box::{self, BoxLink, SshBox};
 
 /// Every box the hub knows: its own (`local`) and the remote ones (see the module docs).
 pub(super) struct Boxes {
@@ -52,8 +53,8 @@ pub(super) struct Boxes {
     remotes: HashMap<String, RemoteBox>,
     /// Each remote box's configuration as it was added (its projects, for `thread.new`).
     configs: BTreeMap<String, BoxConfig>,
-    /// The SSH boxes the hub dials (in the default workspace only), with their supervisor's
-    /// state.
+    /// The boxes the hub dials (SSH and command boxes, in the default workspace only), with
+    /// their supervisor's state.
     ssh: HashMap<String, Arc<SshBox>>,
 }
 
@@ -149,10 +150,10 @@ impl Inner {
 
 /// The one check a box passes before anything of it is published or started, at startup and
 /// on a live add (see the module docs): a valid box name that is not `local`, the transport
-/// rules of [`Config::validate`] (an SSH box has an `ssh` destination and no token; `build`
-/// only on an SSH box, and a build id), `ssh` words that forward nothing and leave how ssh
-/// runs to twr ([`twr_core::config::check_ssh_words`], a token box's too: `twr attach` runs
-/// them), and for a token box a token of at least
+/// rules of [`Config::validate`] (an SSH box has an `ssh` destination and no token, a command
+/// box a `command` and neither; `build` only on those, and a build id), `ssh` words that
+/// forward nothing and leave how ssh runs to twr ([`twr_core::config::check_ssh_words`], a
+/// token box's too: `twr attach` runs them), and for a token box a token of at least
 /// [`twr_core::runner::TOKEN_MIN_LEN`] characters. Returns the warning for a token shorter
 /// than [`twr_core::runner::TOKEN_GOOD_LEN`]. A token box without a token is admitted (it can
 /// never connect; logged).
@@ -200,9 +201,10 @@ impl From<AddBoxError> for RpcError {
 }
 
 /// Admits box `name` ([`admit_box`]; its short-token warning goes to the hub's warnings),
-/// builds its [`RemoteBox`] (the hub's park-disposable paths and change timeout; an SSH box
-/// also the branch namespace of the hub's own box, see [`crate::remote`]) and, for an SSH box
-/// in the default workspace, its supervisor's state ([`SshBox`]), then checks the name and
+/// builds its [`RemoteBox`] (the hub's park-disposable paths and change timeout; an SSH or a
+/// command box also the branch namespace of the hub's own box, see [`crate::remote`]: its
+/// daemon belongs to this hub instance) and, for one of those in the default workspace, its
+/// supervisor's state ([`SshBox`]), then checks the name and
 /// inserts all of it under one write lock. Starts nothing ([`start_box`]).
 pub(super) fn register_box(
     inner: &Inner,
@@ -223,11 +225,21 @@ pub(super) fn register_box(
             RemoteBox::new_ssh(name, cfg.ssh.clone().unwrap_or_default())
                 .with_branch_namespace(inner.worktree_namespace.clone())
         }
+        BoxTransport::Command => {
+            // (`admit_box` checked that it has one.)
+            let Some(link) = BoxLink::of(&cfg) else {
+                return Err(AddBoxError::Refused(anyhow::anyhow!(
+                    "boxes.{name}: a command box needs `command`"
+                )));
+            };
+            RemoteBox::new_command(name, link)
+                .with_branch_namespace(inner.worktree_namespace.clone())
+        }
     }
     .with_park_disposable(inner.config.threads.park_disposable.clone())
     .with_change_timeout(inner.change_request_timeout);
     // A named workspace's hub never dials boxes, as it never listens.
-    let ssh = (cfg.transport() == BoxTransport::Ssh && inner.workspace.is_none())
+    let ssh = (cfg.transport().dialed() && inner.workspace.is_none())
         .then(|| Arc::new(SshBox::new(name, &cfg)));
     {
         let mut boxes = inner.boxes_mut();
@@ -248,7 +260,7 @@ pub(super) fn register_box(
 }
 
 /// Starts what a registered box runs: the settling of its orphaned commands
-/// ([`runners::settle_orphans`]) and, for an SSH box the hub dials, its supervisor.
+/// ([`runners::settle_orphans`]) and, for a box the hub dials, its supervisor.
 pub(super) fn start_box(inner: &Arc<Inner>, rbox: RemoteBox, ssh: Option<Arc<SshBox>>) {
     tokio::spawn(runners::settle_orphans(
         Arc::downgrade(inner),
@@ -340,15 +352,16 @@ impl Hub {
         }))
     }
 
-    /// `box.install {name}` (users only): wakes SSH box `name`'s supervisor at once (the CLI
+    /// `box.install {name}` (users only): wakes box `name`'s supervisor at once (an SSH or a
+    /// command box; the CLI
     /// just installed a build on it), and returns `{box}`. The box's `build` is read again
     /// from the hub's config file and the `boxes.toml` next to it first (`twr box install`
     /// records there the build it installed for another OS or CPU); when they cannot be read,
     /// or no longer have the box, the build the hub knew stays. Only the build is taken: a box
-    /// whose other settings changed there since the hub added it (its ssh destination, say,
-    /// where the CLI just installed, while the hub dials the old one; its projects aside,
-    /// which `box.projects` takes) is `conflict`, nothing changed: the hub takes a box's new
-    /// settings when it restarts. `unauthorized` for the
+    /// whose other settings changed there since the hub added it (its ssh destination or
+    /// command, say, where the CLI just installed, while the hub dials the old one; its
+    /// projects aside, which `box.projects` takes) is `conflict`, nothing changed: the hub
+    /// takes a box's new settings when it restarts. `unauthorized` for the
     /// orchestrator, `not_found` for a box the hub does not have, `bad_request` for a token
     /// box (or one the hub does not dial: a named workspace's).
     pub async fn box_install(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
@@ -364,10 +377,13 @@ impl Hub {
                 format!("the hub has no box {name:?}"),
             ));
         };
-        if rbox.transport() != BoxTransport::Ssh {
+        if !rbox.transport().dialed() {
             return Err(rpc(
                 codes::BAD_REQUEST,
-                format!("box {name} is not an SSH box: its runner connects to the hub itself"),
+                format!(
+                    "box {name} is not a box the hub connects to (ssh or command): its runner \
+                     connects to the hub itself"
+                ),
             ));
         }
         let Some(sbox) = self.inner.ssh_box(name) else {
@@ -384,16 +400,16 @@ impl Hub {
             let read = tokio::task::spawn_blocking(move || Config::load_with_boxes(&file)).await;
             match read {
                 Ok(Ok(config)) => match config.boxes.get(name) {
-                    Some(cfg) if cfg.transport() == BoxTransport::Ssh => {
+                    Some(cfg) if cfg.transport().dialed() => {
                         let registered = self.inner.box_config(name);
                         if registered.as_ref().map(connection) != Some(connection(cfg)) {
                             return Err(rpc(
                                 codes::CONFLICT,
                                 format!(
                                     "box {name}'s settings changed in the config files since the \
-                                     hub added it (its ssh destination, say): the hub does not \
-                                     take a new build for it until it reads them again. \
-                                     Restart the hub (`twr hub stop`, then `twr`)"
+                                     hub added it (its ssh destination or command, say): the \
+                                     hub does not take a new build for it until it reads them \
+                                     again. Restart the hub (`twr hub stop`, then `twr`)"
                                 ),
                             ));
                         }
@@ -403,7 +419,7 @@ impl Hub {
                         sbox.set_build(cfg.build.clone());
                     }
                     _ => {
-                        tracing::warn!(box_name = %name, "box.install: the files no longer have the SSH box; keeping its build")
+                        tracing::warn!(box_name = %name, "box.install: the files no longer have the box (ssh or command); keeping its build")
                     }
                 },
                 Ok(Err(e)) => {
@@ -418,7 +434,8 @@ impl Hub {
         Ok(json!({ "box": name }))
     }
 
-    /// `box.restart {box}` (users only): SSH box `name`'s daemon is restarted by its
+    /// `box.restart {box}` (users only): box `name`'s daemon (an SSH or a command box's) is
+    /// restarted by its
     /// supervisor (see [`crate::ssh_box`], "Restarting the daemon"): the session that is up
     /// ends (the box is offline until the next one; its runtimes end with the daemon), and the
     /// next attempt, at once, has the relay stop whatever daemon answers for this hub's key
@@ -449,12 +466,12 @@ impl Hub {
                 format!("the hub has no box {name:?}"),
             ));
         };
-        if rbox.transport() != BoxTransport::Ssh {
+        if !rbox.transport().dialed() {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!(
-                    "box {name} is not an SSH box: its runner connects to the hub itself; \
-                     restart that `twr runner` on the box"
+                    "box {name} is not a box the hub connects to (ssh or command): its runner \
+                     connects to the hub itself; restart that `twr runner` on the box"
                 ),
             ));
         }
@@ -666,7 +683,8 @@ impl Hub {
                     (None, false) => "offline",
                 };
                 let st = st.unwrap_or_default();
-                let ssh_box = b.transport() == BoxTransport::Ssh;
+                // The fields of a box the hub dials (ssh or command).
+                let ssh_box = b.transport().dialed();
                 let v = json!({
                     "name": name,
                     "transport": transport_name(b.transport()),
@@ -693,8 +711,8 @@ impl Hub {
         out.into_iter().map(|(_, v)| v).collect()
     }
 
-    /// Waits (at most `within` each) for the SSH boxes' supervisors to end, once the hub
-    /// stopped: each kills its ssh as it ends.
+    /// Waits (at most `within` each) for the supervisors of the boxes the hub dials to end,
+    /// once the hub stopped: each kills its ssh or command as it ends.
     pub(super) async fn ssh_boxes_ended(&self, within: std::time::Duration) {
         for s in self.inner.ssh_boxes() {
             s.ended(within).await;
@@ -720,5 +738,6 @@ pub(super) fn transport_name(t: BoxTransport) -> &'static str {
     match t {
         BoxTransport::Token => "token",
         BoxTransport::Ssh => "ssh",
+        BoxTransport::Command => "command",
     }
 }
