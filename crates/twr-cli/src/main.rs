@@ -479,7 +479,9 @@ enum Cmd {
         #[arg(
             long,
             hide = true,
-            conflicts_with_all = ["hub", "token_file", "ca", "allow_insecure", "replace", "stop"],
+            conflicts_with_all = [
+                "hub", "token_file", "ca", "allow_insecure", "replace", "stop", "restart"
+            ],
             requires_all = ["box_name", "hub_key", "daemon_socket", "data_dir", "lock", "log"]
         )]
         daemon: bool,
@@ -494,6 +496,11 @@ enum Cmd {
         /// to do when none runs.
         #[arg(long, hide = true, requires = "stdio", conflicts_with = "replace")]
         stop: bool,
+        /// With --stdio: stop the box daemon of --hub-key and --box, whatever its build, start a
+        /// new one, and relay to it (`twr box restart`; a Mac's daemon then starts in the GUI
+        /// session when there is one). One relay at a time starts a daemon.
+        #[arg(long, hide = true, requires = "stdio", conflicts_with = "stop")]
+        restart: bool,
         /// With --stdio: the build id the hub launched (this executable's, as the hub knows
         /// it), taken as this relay's own when it cannot read its executable.
         #[arg(long, hide = true, value_name = "ID", requires = "stdio")]
@@ -504,7 +511,7 @@ enum Cmd {
             long,
             hide = true,
             requires = "stdio",
-            conflicts_with_all = ["replace", "stop", "build"]
+            conflicts_with_all = ["replace", "stop", "build", "restart"]
         )]
         status: bool,
         /// Print this box's agent CLIs as its runner finds them, as JSON: the login shell's
@@ -1288,11 +1295,13 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             hub_key: Some(hub_key),
             replace,
             stop,
+            restart,
             build,
             ..
         }) => {
             let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
             let mut opts = twr_runner::relay::RelayOptions::new(&box_name, hub_key, replace)?;
+            opts.restart = restart;
             if let Some(b) = build {
                 if !twr_core::valid_build_id(&b) {
                     bail!("--build {b:?} is not a build id");
@@ -1326,6 +1335,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     hub_key,
                     lock,
                     build: twr_core::build_id().map(str::to_string),
+                    launch: Some(twr_runner::daemon::own_launch()),
                 },
             );
             run_box_daemon(opts, &log).await?;
@@ -3744,6 +3754,15 @@ async fn connect(socket: &Path) -> anyhow::Result<Client> {
 /// the thread's queued prompts run. Exits with the CLI's exit code.
 async fn attach(socket: &Path, thread: &str, force: bool) -> anyhow::Result<ExitCode> {
     let mut lease = connect(socket).await?;
+    // Said before `attach.begin` pauses the runtime. (A thread this cannot read is
+    // `attach.begin`'s to refuse.)
+    if let Ok(t) = lease.call("thread.get", json!({ "thread": thread })).await {
+        if let Ok(info) = lease.call("hub.info", Value::Null).await {
+            if let Some(w) = attach_mac_warning(&t, &info) {
+                note(&w);
+            }
+        }
+    }
     let grant = match lease
         .call("attach.begin", json!({ "thread": thread, "force": force }))
         .await
@@ -3794,6 +3813,30 @@ async fn attach(socket: &Path, thread: &str, force: bool) -> anyhow::Result<Exit
         note(&format!("twr: detached from {thread}"));
     }
     Ok(code)
+}
+
+/// What `twr attach` says before it pauses the runtime of `thread` (its `thread.get`), with the
+/// hub's boxes in `info` (`hub.info`): a Claude Code thread on a Mac box (`os` `Darwin`, from
+/// the hub's probe of an SSH box; a token box's is not known) then runs over ssh, where Claude
+/// Code may not read its keychain login.
+fn attach_mac_warning(thread: &Value, info: &Value) -> Option<String> {
+    if thread["runtime"] != twr_adapters::claude_code::NAME {
+        return None;
+    }
+    let name = thread["box_name"]
+        .as_str()
+        .filter(|b| *b != twr_hub::hub::LOCAL_BOX)?;
+    let b = info["boxes"]
+        .as_array()?
+        .iter()
+        .find(|b| b["name"].as_str() == Some(name))?;
+    (b["os"] == "Darwin").then(|| {
+        format!(
+            "twr: box {name} is a Mac: attached, Claude Code runs there over ssh, where it may \
+             not read its keychain login. If it asks you to log in, end the attach (exit it) \
+             and continue the thread from the TUI: the box daemon's Claude Code keeps its login"
+        )
+    })
 }
 
 /// What `twr attach` says before running the command, if anything: on the first attach to a
@@ -6953,6 +6996,38 @@ mod tests {
         assert_eq!(attach_hint(&json!({"runtime": "claude-code"})), None);
     }
 
+    /// Attaching a Claude Code thread on a Mac box warns about the keychain over ssh; another
+    /// runtime, another OS, a token box (no OS known) or the hub's own box does not.
+    #[test]
+    fn attaching_claude_on_a_mac_warns_about_the_keychain() {
+        let info = json!({"boxes": [
+            {"name": "mac", "transport": "ssh", "os": "Darwin"},
+            {"name": "gpu", "transport": "ssh", "os": "Linux"},
+            {"name": "lab", "transport": "token", "os": null},
+        ]});
+        let thread = |runtime: &str, b: &str| json!({"runtime": runtime, "box_name": b});
+        let w = attach_mac_warning(&thread("claude-code", "mac"), &info).unwrap();
+        assert!(
+            w.contains("box mac is a Mac")
+                && w.contains("keychain login")
+                && w.contains("continue the thread from the TUI"),
+            "{w}"
+        );
+        for (runtime, b) in [
+            ("codex", "mac"),
+            ("claude-code", "gpu"),
+            ("claude-code", "lab"),
+            ("claude-code", "local"),
+            ("claude-code", "gone"),
+        ] {
+            assert_eq!(
+                attach_mac_warning(&thread(runtime, b), &info),
+                None,
+                "{runtime} on {b}"
+            );
+        }
+    }
+
     #[test]
     fn say_and_mcp_parse_and_say_outcomes_read_well() {
         let c = Cli::try_parse_from(["twr", "say", "on", "api,", "-v", "fix"]).unwrap();
@@ -7131,9 +7206,21 @@ mod tests {
             Some(Cmd::Runner {
                 stop: true,
                 replace: false,
+                restart: false,
                 ..
             })
         ));
+        for extra in [&["--restart"][..], &["--restart", "--replace"]] {
+            let c = parse(&[&relay[..], extra].concat()).unwrap();
+            assert!(matches!(
+                c.cmd,
+                Some(Cmd::Runner {
+                    restart: true,
+                    stop: false,
+                    ..
+                })
+            ));
+        }
         let daemon = [
             "--daemon",
             "--box",
@@ -7184,7 +7271,10 @@ mod tests {
             [&relay[..], &["--lock", "/l"]].concat(),
             [&daemon[..], &["--replace"]].concat(),
             [&daemon[..], &["--stop"]].concat(),
+            [&daemon[..], &["--restart"]].concat(),
             [&relay[..], &["--stop", "--replace"]].concat(),
+            [&relay[..], &["--stop", "--restart"]].concat(),
+            vec!["--hub", "ws://h:1", "--box", "b", "--restart"],
             vec!["--hub", "ws://h:1", "--box", "b", "--stop"],
             [&daemon[..], &["--hub", "ws://h:1"]].concat(),
             daemon[..daemon.len() - 2].to_vec(),
@@ -7203,6 +7293,7 @@ mod tests {
             "--hub-key",
             "--replace",
             "--stop",
+            "--restart",
             "--lock",
             "--log",
         ] {
@@ -7284,6 +7375,7 @@ mod tests {
             vec!["--hub", "ws://h:1", "--box", "b", "--status"],
             [&relay[..], &["--status", "--stop"]].concat(),
             [&relay[..], &["--status", "--replace"]].concat(),
+            [&relay[..], &["--status", "--restart"]].concat(),
             [&relay[..], &["--status", "--build=0123456789abcdef"]].concat(),
             vec!["--agents", "token"],
         ] {

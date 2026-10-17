@@ -1019,6 +1019,211 @@ fn box_login_is_refused_to_agents_and_without_a_terminal() {
     assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
 }
 
+/// A fake `uname` for the box: a Mac on Apple silicon (the hub's probe, doctor's and the
+/// relay's scripts read it; the box's twr is still this Linux build).
+const UNAME_MAC: &str = "case $1 in -s) echo Darwin ;; -m) echo arm64 ;; *) echo Darwin ;; esac\n";
+
+/// A Mac box (a fake `uname` on the box): `twr box add` says what a Mac needs and that it needs
+/// a build; `twr box install --from-box` copies a twr already on the box into its builds,
+/// checked, records it, and the hub connects with it; `twr box doctor` has a macOS group
+/// (whether anyone is logged in at the screen can't be told here: `/bin/launchctl` is not
+/// there, which is no "no one"; the daemon runs from ssh) and takes
+/// Claude Code's login from the box daemon; `twr box restart` replaces the daemon with a new
+/// one on a newer connection (`--restart`) and says it still runs from ssh.
+#[test]
+fn a_mac_box_from_add_to_restart() {
+    let t = Setup::new();
+    let _cleanup = BoxProcesses(t.box_home.clone());
+    t.box_agent("uname", UNAME_MAC);
+    t.box_agent("claude", CLAUDE_LOGGED_IN);
+    let paths = t.paths();
+    let _hub = t.start_hub(1);
+
+    let out = t.ok(&["box", "add", "mac", "fake@box", "--yes"]);
+    for line in [
+        "box mac: macos/aarch64 (Darwin arm64)",
+        "- The box is a Mac. It needs:",
+        "  - someone logged in at the Mac's screen",
+        "automatic login",
+        "  - its agents logged in at the Mac itself",
+        "box mac needs a twr build for macos/aarch64: run `twr box install mac`",
+    ] {
+        assert!(out.contains(line), "{line:?} in:\n{out}");
+    }
+    assert_eq!(t.box_status("mac")["state"], "needs_install");
+
+    // A twr built on the box (here: this one, copied), installed from there.
+    let built = t.box_home.join(".local/bin/twr");
+    std::fs::create_dir_all(built.parent().unwrap()).unwrap();
+    std::fs::copy(TWR, &built).unwrap();
+    std::fs::set_permissions(&built, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let id = twr_core::build_id_of(&built).unwrap();
+    let out = t.ok(&[
+        "box",
+        "install",
+        "mac",
+        "--from-box",
+        built.to_str().unwrap(),
+        "--yes",
+    ]);
+    let exe = t
+        .box_home
+        .join(".local/share/twr/runner/builds")
+        .join(&id)
+        .join("twr");
+    for line in [
+        format!("installed build {id} on box mac, at {}", exe.display()),
+        "box mac runs it as twr ".to_string(),
+        format!("recorded build = \"{id}\" for box mac in"),
+        "box mac is online: twr ".to_string(),
+    ] {
+        assert!(out.contains(&line), "{line:?} in:\n{out}");
+    }
+    assert_eq!(
+        std::fs::metadata(&exe).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(twr_core::build_id_of(&exe).unwrap(), id);
+    let boxes = std::fs::read_to_string(paths.boxes_file()).unwrap();
+    assert!(boxes.contains(&format!("build = \"{id}\"")), "{boxes}");
+    let status = t.box_status("mac");
+    assert_eq!(
+        (&status["os"], &status["running_build"], &status["launch"]),
+        (&json!("Darwin"), &json!(id), &json!("detached")),
+        "{status}"
+    );
+    // A file that is not there.
+    let e = t.fails(&[
+        "box",
+        "install",
+        "mac",
+        "--from-box",
+        t.box_home.join("nope").to_str().unwrap(),
+        "--yes",
+    ]);
+    assert!(
+        e.contains("is not a regular file on the box") && e.contains("nothing was installed"),
+        "{e}"
+    );
+
+    // Doctor: the macOS group, and Claude Code's login as the daemon sees it.
+    box_agents_refresh(&paths.socket, "mac");
+    let out = t.twr(&["box", "doctor", "mac"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    for line in [
+        "! macOS GUI session: couldn't tell whether someone is logged in at the Mac's screen \
+         (`launchctl print gui/<uid>`: exit 127)",
+        "! macOS daemon launch: the daemon runs from ssh, so Claude Code can't read its \
+         keychain login\n    fix: log in at the Mac's screen (or turn on automatic login), \
+         then `twr box restart mac`",
+        "(as the box daemon reported it)",
+    ] {
+        assert!(text.contains(line), "{line:?} in:\n{text}");
+    }
+    assert!(text.contains("✓ claude: logged in (claude.ai)"), "{text}");
+    assert!(!text.contains("logind"), "{text}");
+
+    // Restart: a new daemon, on a newer connection, through `--restart`.
+    let before = daemons(&t.box_home);
+    assert_eq!(before.len(), 1, "{before:?}");
+    let epoch = t.box_status("mac")["epoch"].as_u64().unwrap();
+    let out = t.ok(&["box", "restart", "mac", "--yes"]);
+    for line in [
+        "This stops box mac's daemon and the agents it runs",
+        "restarting box mac's daemon: the hub connects again, and the relay on the box stops \
+         the daemon (a repository change it runs is finished first: up to 330 s)",
+        // The relay's notes as it goes.
+        "\n  twr-box: stopping the box daemon ",
+        "\n  twr-box: restarted the box daemon ",
+        "box mac is back online with a new daemon: twr ",
+        "the daemon runs from ssh, so Claude Code can't read its keychain login: log in at \
+         the Mac's screen (or turn on automatic login), then `twr box restart mac`",
+    ] {
+        assert!(out.contains(line), "{line:?} in:\n{out}");
+    }
+    let after = daemons(&t.box_home);
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert_ne!(after, before, "a new daemon");
+    let status = t.box_status("mac");
+    assert!(status["epoch"].as_u64().unwrap() > epoch, "{status}");
+    assert_eq!(status["restart_pending"], false, "{status}");
+    let runs = t.ssh_runs();
+    let restarts = runs
+        .iter()
+        .filter(|(_, _, c)| c.contains(" runner --stdio ") && c.ends_with(" --restart"))
+        .count();
+    assert_eq!(restarts, 1, "{runs:?}");
+    let notes = status["notes"].to_string();
+    assert!(
+        notes.contains("restarting the box daemon (`twr box restart`)")
+            && notes.contains("twr-box: restarted the box daemon"),
+        "{notes}"
+    );
+}
+
+/// `twr box restart` and `twr box install --from-box` refuse before any ssh: an agent, no
+/// terminal without --yes, a token box, a path that is not absolute (a quoted `~` included:
+/// the help and the error say how to get the absolute one), --binary with it.
+#[test]
+fn box_restart_and_from_box_guards() {
+    let t = Setup::new();
+    std::fs::write(
+        t.paths().boxes_file(),
+        "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"fake@box\"\n\n[boxes.lab]\ntoken = \
+         \"lab-token-0123456789abcdef0123456789\"\n",
+    )
+    .unwrap();
+    let out = t
+        .command(&["box", "restart", "gpu", "--yes"])
+        .env("TWR_AGENT", "worker:1")
+        .env_remove("TWR_TEST_USER_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(e.contains("agents cannot restart box daemons"), "{e}");
+    let e = t.fails(&["box", "restart", "gpu"]);
+    assert!(
+        e.contains("without confirmation") && e.contains("--yes"),
+        "{e}"
+    );
+    let e = t.fails(&["box", "restart", "lab", "--yes"]);
+    assert!(e.contains("box lab is a token box"), "{e}");
+    let e = t.fails(&["box", "install", "gpu", "--from-box", "bin/twr", "--yes"]);
+    assert!(
+        e.contains("absolute path on box gpu") && e.contains("on the box, `command -v twr`"),
+        "{e}"
+    );
+    // A quoted `~` stays a `~`: not an absolute path either.
+    let e = t.fails(&[
+        "box",
+        "install",
+        "gpu",
+        "--from-box",
+        "~/.local/bin/twr",
+        "--yes",
+    ]);
+    assert!(e.contains("absolute path on box gpu"), "{e}");
+    let help = t.ok(&["box", "install", "--help"]);
+    assert!(
+        help.contains("`command -v twr` or `echo ~/.local/bin/twr` prints it")
+            && !help.contains("quote"),
+        "{help}"
+    );
+    let e = t.fails(&[
+        "box",
+        "install",
+        "gpu",
+        "--from-box",
+        "/x/twr",
+        "--binary",
+        "/y/twr",
+    ]);
+    assert!(e.contains("cannot be used with"), "{e}");
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+}
+
 // -------------------------------------------------------------------------------------------
 // twr box project
 // -------------------------------------------------------------------------------------------

@@ -375,6 +375,7 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
                 method: opt(rng, string),
                 note: opt(rng, string),
             }],
+            launch: opt(rng, string),
         }),
         3 | 4 => RunnerMsg::Event {
             thread: string(rng),

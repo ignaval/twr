@@ -25,7 +25,9 @@
 //! it ([`Config::load_with_boxes`]) and adds box `name` from them; `box.install {name}` wakes
 //! an SSH box's supervisor at once (a build was just installed on it); `box.projects {box}`
 //! takes a box's `[boxes.<name>.projects]` from them again (`twr box project` just recorded
-//! one), the only change to a box the hub takes without a restart besides its build.
+//! one), the only change to a box the hub takes without a restart besides its build;
+//! `box.restart {box}` has an SSH box's supervisor restart its daemon ([`crate::ssh_box`],
+//! "Restarting the daemon").
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard, Weak};
@@ -416,6 +418,60 @@ impl Hub {
         Ok(json!({ "box": name }))
     }
 
+    /// `box.restart {box}` (users only): SSH box `name`'s daemon is restarted by its
+    /// supervisor (see [`crate::ssh_box`], "Restarting the daemon"): the session that is up
+    /// ends (the box is offline until the next one; its runtimes end with the daemon), and the
+    /// next attempt, at once, has the relay stop whatever daemon answers for this hub's key
+    /// and start a new one. Returns at once `{box, epoch}`: the epoch of the connection being
+    /// replaced (null when none is up); `hub.info` shows the box online again on a larger
+    /// epoch, with `restart_pending` false, once a new daemon serves it. `unauthorized` for
+    /// the orchestrator, `not_found` for a box the hub does not have, `unsupported` in a named
+    /// workspace (its hub does not connect to boxes), `bad_request` for a token box.
+    pub fn box_restart(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
+        if caller.is_orchestrator() {
+            return Err(rpc(
+                codes::UNAUTHORIZED,
+                "only the user restarts box daemons (`twr box restart`)",
+            ));
+        }
+        if let Some(w) = &self.inner.workspace {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                format!(
+                    "boxes belong to the default workspace's hub, not workspace {w}'s: restart \
+                     it without -w"
+                ),
+            ));
+        }
+        let Some(rbox) = self.inner.remote(name) else {
+            return Err(rpc(
+                codes::NOT_FOUND,
+                format!("the hub has no box {name:?}"),
+            ));
+        };
+        if rbox.transport() != BoxTransport::Ssh {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                format!(
+                    "box {name} is not an SSH box: its runner connects to the hub itself; \
+                     restart that `twr runner` on the box"
+                ),
+            ));
+        }
+        let Some(sbox) = self.inner.ssh_box(name) else {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                format!(
+                    "this hub does not connect to box {name} (only the default workspace's does)"
+                ),
+            ));
+        };
+        let epoch = rbox.epoch();
+        tracing::info!(box_name = %name, ?epoch, "restarting the box's daemon");
+        sbox.request_restart();
+        Ok(json!({ "box": name, "epoch": epoch }))
+    }
+
     /// `box.projects {box}` (users only): box `name`'s projects (`[boxes.<name>.projects]`,
     /// where each repository is on the box) read again from the hub's config file and the
     /// `boxes.toml` next to it (`twr box project` just recorded one there), replacing the ones
@@ -625,6 +681,9 @@ impl Hub {
                     "build": st.build,
                     "running_build": st.running,
                     "switch_pending": ssh_box.then_some(st.switch_pending),
+                    "restart_pending": ssh_box.then_some(st.restart_pending),
+                    "epoch": b.epoch(),
+                    "launch": b.info().and_then(|i| i.launch),
                     "agents": b.agents(),
                 });
                 (name, v)

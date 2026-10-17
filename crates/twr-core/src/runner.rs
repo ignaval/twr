@@ -422,6 +422,30 @@ pub struct Inventory {
     /// sent right after it started), probes none (a box set up without), or is older.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<AgentInfo>,
+    /// How an SSH box's daemon was started, as it tells from its own environment
+    /// ([`valid_launch`]): `launchd <label>` (a launchd job in the user's GUI session, macOS),
+    /// `systemd <unit>` (a transient user service, Linux) or `detached` (a session of its own,
+    /// started from ssh). Absent from a runner that is no box daemon, or an older one; ignored
+    /// by an older hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+}
+
+/// Whether `launch` is what a box daemon reports of how it was started
+/// ([`Inventory::launch`]): `detached`, or `launchd ` or `systemd ` and a name of 1 to 128
+/// letters, digits, `.`, `-`, `_` and `@`. Nothing else is kept or shown.
+pub fn valid_launch(launch: &str) -> bool {
+    if launch == "detached" {
+        return true;
+    }
+    let name = launch
+        .strip_prefix("launchd ")
+        .or_else(|| launch.strip_prefix("systemd "));
+    name.is_some_and(|n| {
+        (1..=128).contains(&n.len())
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@'))
+    })
 }
 
 /// Whether an agent CLI on a box is signed in ([`AgentInfo::login`]).
@@ -1296,6 +1320,34 @@ pub fn decode_result<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, CmdE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box daemon's launch is one of three shapes, its name short and plain.
+    #[test]
+    fn launches() {
+        for ok in [
+            "detached",
+            "launchd tools.twr.box.0123456789abcdef.0a1b2c3d",
+            "systemd twr-box-0123456789abcdef-0a1b2c3d.service",
+            "systemd a@b",
+        ] {
+            assert!(valid_launch(ok), "{ok}");
+        }
+        let long = format!("launchd {}", "a".repeat(129));
+        for bad in [
+            "",
+            "setsid",
+            "launchd",
+            "launchd ",
+            "systemd  x",
+            "launchd a b",
+            "launchd a/b",
+            "launchd \u{1b}[0m",
+            "Detached",
+            long.as_str(),
+        ] {
+            assert!(!valid_launch(bad), "{bad:?}");
+        }
+    }
     use crate::event::{AgentText, GitSnapshot, SessionPayload};
     use serde_json::json;
 
@@ -1364,6 +1416,7 @@ mod tests {
                 method: Some("claude.ai".into()),
                 note: None,
             }],
+            launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
         }));
         round_trip_runner(RunnerMsg::Event {
             thread: "t1".into(),

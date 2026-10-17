@@ -14,7 +14,8 @@
 //! the session), a prompt sent during the drain is queued and runs once after the switch, a
 //! `thread.stop` during the drain leaves its thread stopped, and a new thread, a park or a
 //! deletion on the box during the drain is refused (`box_offline`, the box is switching); a
-//! busy box (a running turn, an open permission) is not switched until it is quiet.
+//! busy box (a running turn, an open permission) is not switched until it is quiet. A restart
+//! (`box.restart`) reconnects at once with a dial that restarts the daemon.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +34,7 @@ use twr_core::proto::{codes, RpcError};
 use twr_core::sealed::{hub_side, HubKey};
 use twr_hub::hub::SealedEnd;
 use twr_hub::listener::pre_auth_ws_config;
-use twr_hub::ssh_box::{BoxDialer, BoxIo, SwitchTiming};
+use twr_hub::ssh_box::{BoxDialer, BoxIo, Dial, SwitchTiming};
 use twr_hub::{Caller, Hub, HubOptions, NewThread};
 use twr_runner::daemon::{request, Request};
 use twr_runner::relay::DaemonPaths;
@@ -165,6 +166,7 @@ impl Daemon {
                 hub_key,
                 lock: paths.lock.clone(),
                 build: Some(build.to_string()),
+                launch: None,
             },
         );
         opts.ping_interval = Duration::from_millis(500);
@@ -289,9 +291,10 @@ struct BoxSide {
 /// itself to have launched ([`LAUNCHED`]); a dial that replaces it stops it and starts the
 /// launched build's (this binary's) on the same data directory.
 fn dialer(side: Arc<tokio::sync::Mutex<BoxSide>>, hold: watch::Receiver<bool>) -> BoxDialer {
-    Arc::new(move |name: String, replace: bool| {
+    Arc::new(move |name: String, dial: Dial| {
         let side = Arc::clone(&side);
         let hold = hold.clone();
+        let replace = dial.replace;
         async move {
             assert_eq!(name, BOX);
             let mut side = side.lock().await;
@@ -703,8 +706,9 @@ async fn an_installed_build_replaces_the_running_one() {
             box_dir.clone(),
             key.public(),
         );
-        Arc::new(move |name: String, replace: bool| {
+        Arc::new(move |name: String, dial: Dial| {
             let (dials, side, box_dir) = (Arc::clone(&dials), Arc::clone(&side), box_dir.clone());
+            let replace = dial.replace;
             async move {
                 assert_eq!(name, BOX);
                 dials.lock().unwrap().push(replace);
@@ -763,7 +767,10 @@ async fn an_installed_build_replaces_the_running_one() {
     let h = hub.clone();
     wait_for("the box online on the installed build", move || {
         let b = box_info(&h);
-        online(&h) && b["running_build"] == SECOND
+        // (The note comes with the reconciliation that puts the box online: wait for both.)
+        online(&h)
+            && b["running_build"] == SECOND
+            && has_note(&h, &format!("now on build {SECOND}"))
     })
     .await;
     let b = box_info(&hub);
@@ -875,8 +882,9 @@ async fn a_switch_that_does_not_take_is_not_tried_again() {
     let dials = Arc::new(std::sync::Mutex::new(Vec::new()));
     let dialer: BoxDialer = {
         let dials = Arc::clone(&dials);
-        Arc::new(move |_name: String, replace: bool| {
+        Arc::new(move |_name: String, dial: Dial| {
             let (dials, socket) = (Arc::clone(&dials), socket.clone());
+            let replace = dial.replace;
             async move {
                 dials.lock().unwrap().push(replace);
                 let (stream, _) = request(&socket, Request::Connect)
@@ -918,4 +926,140 @@ async fn a_switch_that_does_not_take_is_not_tried_again() {
     assert_eq!(b["switch_pending"], true, "{b}");
     hub.shutdown().await;
     drop(daemon);
+}
+
+/// `box.restart` (`twr box restart`): it returns at once with the epoch of the connection it
+/// replaces; the supervisor ends that session and dials again at once with a restart, which
+/// stops the daemon (its runtime ends with it) and starts a new one; the box comes back online
+/// on a newer connection with no restart pending; the idle thread's runtime ended as with any
+/// runner restart (`thread.crashed`), and its next prompt resumes its session on the new daemon. Refused: the orchestrator, a box the hub does not have, a token
+/// box, a named workspace's hub; agents cannot call it at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_reconnects_to_a_new_daemon() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start(&box_dir, key.public()).await;
+    let dials = Arc::new(std::sync::Mutex::new(Vec::<Dial>::new()));
+    let side = Arc::new(tokio::sync::Mutex::new(Some(daemon)));
+    // A restart stops the daemon and starts a new one on the same data directory, as the
+    // relay's `--restart` does.
+    let dialer: BoxDialer = {
+        let (dials, side, box_dir, hub_key) = (
+            Arc::clone(&dials),
+            Arc::clone(&side),
+            box_dir.clone(),
+            key.public(),
+        );
+        Arc::new(move |name: String, dial: Dial| {
+            let (dials, side, box_dir) = (Arc::clone(&dials), Arc::clone(&side), box_dir.clone());
+            async move {
+                assert_eq!(name, BOX);
+                dials.lock().unwrap().push(dial);
+                let mut side = side.lock().await;
+                if dial.restart {
+                    if let Some(old) = side.take() {
+                        old.stop().await;
+                    }
+                    *side = Some(Daemon::start(&box_dir, hub_key).await);
+                }
+                let socket = side.as_ref().expect("a daemon").socket.clone();
+                let (stream, _) = request(&socket, Request::Connect)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+                let io: Box<dyn BoxIo> = Box::new(stream);
+                Ok((io, own_build().to_string()))
+            }
+            .boxed()
+        })
+    };
+    let mut opts = hub_opts(dir.path());
+    opts.config.boxes.insert(
+        "lab".into(),
+        BoxConfig {
+            token: Some("lab-token-0123456789".into()),
+            ..Default::default()
+        },
+    );
+    opts.box_dialer = Some(dialer);
+    let hub = Hub::open(opts).await.unwrap();
+    let h = hub.clone();
+    wait_for("the box online", move || online(&h)).await;
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let req = NewThread {
+        project: project.to_string_lossy().into_owned(),
+        runtime: Some("fake".into()),
+        name: Some("idle".into()),
+        box_name: Some(BOX.into()),
+        ..Default::default()
+    };
+    let t = hub.new_thread(req, "test").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.send(&t, "alpha beta", TurnFrom::User, user()).unwrap();
+    until_turn_event(&hub, &t, "turn.ended", 1).await;
+    let session = hub.get_thread(&t).unwrap()["session_id"].clone();
+    assert!(session.is_string(), "{session}");
+
+    let b = box_info(&hub);
+    assert_eq!(b["restart_pending"], false, "{b}");
+    let before = b["epoch"].as_u64().expect("an epoch while online");
+    let caller = Caller::user("test");
+    let r = hub.box_restart(BOX, &caller).unwrap();
+    assert_eq!(r, serde_json::json!({"box": BOX, "epoch": before}));
+    let h = hub.clone();
+    wait_for("the box online on a new connection", move || {
+        let b = box_info(&h);
+        online(&h)
+            && b["state"] == "online"
+            && b["epoch"].as_u64().is_some_and(|e| e > before)
+            && b["restart_pending"] == false
+    })
+    .await;
+    assert_eq!(
+        *dials.lock().unwrap(),
+        [
+            Dial::default(),
+            Dial {
+                replace: false,
+                restart: true
+            }
+        ]
+    );
+    assert!(has_note(
+        &hub,
+        "restarting the box daemon (`twr box restart`)"
+    ));
+    // The runtime ended with the old daemon; the next prompt resumes the session.
+    hub.send(&t, "after the restart", TurnFrom::User, user())
+        .unwrap();
+    until_turn_event(&hub, &t, "turn.ended", 2).await;
+    assert_eq!(hub.get_thread(&t).unwrap()["session_id"], session);
+    // As with any runner restart, the runtime's end was a crash (the runner lost it).
+    assert_eq!(count(&hub, &t, "thread.crashed"), 1);
+    // Nothing more: one restart, one dial for it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(dials.lock().unwrap().len(), 2);
+
+    // Refused.
+    let e = hub.box_restart(BOX, &Caller::Orchestrator).unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{}", e.message);
+    let e = hub.box_restart("nope", &caller).unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
+    let e = hub.box_restart("lab", &caller).unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(
+        twr_hub::server::METHODS.contains(&"box.restart")
+            && !twr_hub::server::AGENT_METHODS.contains(&"box.restart")
+            && !twr_hub::server::ORCHESTRATOR_METHODS.contains(&"box.restart")
+    );
+    hub.shutdown().await;
+    let mut opts = hub_opts(&dir.path().join("ws"));
+    opts.workspace = Some("client-x".into());
+    let hub = Hub::open(opts).await.unwrap();
+    let e = hub.box_restart(BOX, &caller).unwrap_err();
+    assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    hub.shutdown().await;
 }

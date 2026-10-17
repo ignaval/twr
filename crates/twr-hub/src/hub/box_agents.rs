@@ -345,7 +345,7 @@ mod tests {
     }
 
     /// The orchestrator and agents see a box's state and which agents it has, signed in or
-    /// not; a user sees all of it.
+    /// not (not how its daemon was started, say); a user sees all of it.
     #[test]
     fn the_limited_view_keeps_state_and_agents_only() {
         let b = json!({
@@ -354,6 +354,7 @@ mod tests {
             "last_error": "/home/me/err", "notes": ["/home/me/.local/share/twr"],
             "os": "Linux", "arch": "x86_64", "build": "0123456789abcdef",
             "running_build": "0123456789abcdef", "switch_pending": false,
+            "launch": "launchd tools.twr.box.0123456789abcdef.0a1b2c3d",
             "agents": [agent()],
             "something_new": 1,
         });

@@ -222,23 +222,75 @@ pub fn kill_group(pgid: u32) {
 /// Waits for `child`, spawned as the leader of a process group of its own (`process_group(0)`
 /// or [`new_session`]), to exit, kills what is left of that group (what it started in the
 /// background, which would otherwise outlive it), then reaps it: its exit status. The group
-/// is killed while the child is not reaped yet (it waits with `WNOWAIT`): until then its pid,
-/// which is the group's id, cannot name another process or group. Without that wait (it
-/// fails), the child is reaped without the kill. Cancel safe as far as the group goes: a
-/// caller dropped while waiting leaves the child to its own kill (`kill_on_drop`).
+/// is killed while the child is not reaped yet (it waits with `waitid(WEXITED | WNOWAIT)`,
+/// [`exited_unreaped`]): until then its pid, which is the group's id, cannot name another
+/// process or group. That wait only says the child has exited: what `waitid` reports of it is
+/// not read (macOS does not fill it in reliably); the status is the reap's. Should the wait
+/// fail:
+///
+/// - with `ECHILD`, the child is no longer this process's to wait for (something else reaped
+///   it): its id may name another process by now, so nothing is killed, and that error is
+///   returned at once (no reap is waited for), so the caller lets go of the id before anything
+///   of its own (a timeout that drops this, a guard) could signal it;
+/// - otherwise, the child is still this process's and not reaped (only the reap below reaps
+///   it), so its id still names its group: the group is killed, the child with it (whether it
+///   had exited or not), so that the reap that follows cannot wait forever.
+///
+/// An error for which [`ownership_lost`] holds says the child was reaped by something else:
+/// whoever holds its id (a group guard, a `Drop` that kills the group, the `Child`'s own
+/// `kill_on_drop`) must not signal it again.
+///
+/// Cancel safe as far as the group goes: a caller dropped while waiting leaves the child to
+/// its own kill (`kill_on_drop`, or the caller's group guard).
 pub async fn finish_group(
     child: &mut tokio::process::Child,
 ) -> io::Result<std::process::ExitStatus> {
+    finish_group_with(child, exited_unreaped).await
+}
+
+/// [`finish_group`], `wait` standing for [`exited_unreaped`] (tests make it fail).
+async fn finish_group_with(
+    child: &mut tokio::process::Child,
+    wait: fn(u32) -> io::Result<()>,
+) -> io::Result<std::process::ExitStatus> {
     if let Some(pid) = child.id() {
-        let exited = tokio::task::spawn_blocking(move || exited_unreaped(pid)).await;
-        if matches!(exited, Ok(Ok(()))) {
-            kill_group(pid);
+        match tokio::task::spawn_blocking(move || wait(pid)).await {
+            Ok(Ok(())) => kill_group(pid),
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::ECHILD) => {
+                tracing::warn!(
+                    pid,
+                    "waitid: the process is not this one's child any more; its group is not killed"
+                );
+                // At once, not after a reap: the caller clears what holds the id (its group
+                // guard) before any timeout of its own can drop this and leave the id armed.
+                return Err(e);
+            }
+            // Not reaped (only the reap below reaps it): its id still names its group.
+            Ok(Err(e)) => {
+                tracing::warn!(pid, error = %e, "waitid failed: killing the process group before reaping its leader");
+                kill_group(pid);
+            }
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "waiting with waitid failed: killing the process group before reaping its leader");
+                kill_group(pid);
+            }
         }
     }
     child.wait().await
 }
 
-/// Blocks until process `pid` (a child of this process) has exited, without reaping it.
+/// Whether `e`, from waiting for a child ([`finish_group`], `Child::wait`), says it is not
+/// this process's child any more (`ECHILD`: something else reaped it). Its id may name another
+/// process, or group, by then: nothing may signal it again, the `Child`'s `kill_on_drop`
+/// included (a holder of such a child spawns it without `kill_on_drop` and kills its group
+/// itself while it still owns it, as [`run_bounded`] and the hub's `Ssh` do).
+pub fn ownership_lost(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD)
+}
+
+/// Blocks until process `pid` (a child of this process) has exited, without reaping it
+/// (`waitid` with `WNOWAIT`; interrupted calls are made again). Only that it has exited: the
+/// `siginfo_t` it fills is not read.
 fn exited_unreaped(pid: u32) -> io::Result<()> {
     loop {
         // SAFETY: an all-zero `siginfo_t` is a valid value; waitid(2) writes into it.
@@ -263,8 +315,9 @@ fn exited_unreaped(pid: u32) -> io::Result<()> {
     }
 }
 
-/// Kills process group `.0` when dropped, unless cleared first (its leader was reaped: the
-/// id may be another process's by then).
+/// Kills process group `.0` when dropped, unless cleared first (its leader was reaped, by
+/// this process or, [`ownership_lost`], by something else: the id may be another process's by
+/// then).
 struct GroupGuard(Option<u32>);
 
 impl Drop for GroupGuard {
@@ -300,19 +353,33 @@ pub enum Bounded {
 /// first; once it exited, [`finish_group`] kills what it left in the background before it is
 /// reaped). When it is stopped early (enough, too large, timed out, a failed read), its group
 /// is killed and its leader reaped (waiting at most [`REAP_LIMIT`]) before this returns, so a
-/// caller that `exec`s next leaves no zombie child to what it runs. What it printed is never
-/// logged.
+/// caller that `exec`s next leaves no zombie child to what it runs. Should something else
+/// reap it ([`ownership_lost`]), nothing of it is signalled again ([`Bounded::Failed`]). The
+/// group, not the `Child`'s `kill_on_drop` (turned off: it would signal the leader's id
+/// whoever reaped it), is what is killed, the leader with it. What it printed is never logged.
 pub async fn run_bounded(
+    cmd: tokio::process::Command,
+    limit: std::time::Duration,
+    max: usize,
+    enough: impl Fn(&[u8]) -> bool,
+) -> Bounded {
+    run_bounded_with(cmd, limit, max, enough, exited_unreaped).await
+}
+
+/// [`run_bounded`], `wait` standing for [`exited_unreaped`] (tests reap the child elsewhere
+/// first).
+async fn run_bounded_with(
     mut cmd: tokio::process::Command,
     limit: std::time::Duration,
     max: usize,
     enough: impl Fn(&[u8]) -> bool,
+    wait: fn(u32) -> io::Result<()>,
 ) -> Bounded {
     use tokio::io::AsyncReadExt;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+        .kill_on_drop(false);
     scrub(&mut cmd);
     new_session(&mut cmd);
     let Ok(mut child) = cmd.spawn() else {
@@ -342,19 +409,26 @@ pub async fn run_bounded(
                 return Bounded::Enough(out);
             }
         }
-        match finish_group(&mut child).await {
+        match finish_group_with(&mut child, wait).await {
             Ok(status) => {
                 group.0 = None;
                 Bounded::Exited(status.code(), out)
             }
-            Err(_) => Bounded::Failed,
+            Err(e) => {
+                if ownership_lost(&e) {
+                    // Reaped by something else: its id is not this process's to signal.
+                    group.0 = None;
+                }
+                Bounded::Failed
+            }
         }
     };
     let outcome = tokio::time::timeout(limit, run)
         .await
         .unwrap_or(Bounded::TimedOut);
     // Not reaped yet (stopped early): kill the group while its leader is unreaped, then reap
-    // the leader, bounded (one stuck in the kernel is left to `kill_on_drop`).
+    // the leader, bounded (one stuck in the kernel is left to tokio's reaping of dropped
+    // children; it was sent SIGKILL with its group).
     if let Some(pgid) = group.0.take() {
         kill_group(pgid);
         let _ = tokio::time::timeout(REAP_LIMIT, child.wait()).await;
@@ -851,6 +925,142 @@ mod tests {
             let pid = pid.trim();
             assert!(!present(pid), "probe {pid} ({body}) was left unreaped");
         }
+    }
+
+    /// A process group leader (`sh`) that starts a sleeper in the background, writes its pid
+    /// into `pidfile`, then runs `then`.
+    fn leader_with_helper(pidfile: &Path, then: &str) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}.tmp' && mv '{0}.tmp' '{0}'; \
+                 {then}",
+                pidfile.display()
+            ),
+        ])
+        .stdin(std::process::Stdio::null())
+        .process_group(0);
+        cmd.spawn().unwrap()
+    }
+
+    /// [`exited_unreaped`] after something else (here) reaped child `pid` first: `waitid`
+    /// then fails with `ECHILD`, as when another waiter of this process got to it.
+    fn reaped_elsewhere(pid: u32) -> io::Result<()> {
+        let mut status = 0;
+        // SAFETY: waitpid(2) of this test's child, with a valid pointer to `status`.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(r, pid as libc::pid_t, "{}", io::Error::last_os_error());
+        exited_unreaped(pid)
+    }
+
+    /// A child reaped by something else before [`finish_group`] waits for it: its group (a
+    /// helper it left running) is not killed, and the error says the ownership was lost; the
+    /// same through [`run_bounded`], whose group guard then signals nothing either.
+    #[tokio::test]
+    async fn a_child_reaped_elsewhere_is_not_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("finish");
+        let mut child = leader_with_helper(&pidfile, "exit 0");
+        let helper = written(&pidfile);
+        let e = finish_group_with(&mut child, reaped_elsewhere)
+            .await
+            .unwrap_err();
+        assert!(ownership_lost(&e), "{e}");
+        drop(child);
+        assert!(
+            alive(&helper),
+            "the group of a child reaped elsewhere was killed"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+
+        let pidfile = dir.path().join("bounded");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}.tmp' && mv '{0}.tmp' '{0}'; \
+                 exit 0",
+                pidfile.display()
+            ),
+        ]);
+        let out = run_bounded_with(
+            cmd,
+            std::time::Duration::from_secs(20),
+            1 << 16,
+            |_| false,
+            reaped_elsewhere,
+        )
+        .await;
+        assert!(matches!(out, Bounded::Failed), "{out:?}");
+        let helper = written(&pidfile);
+        assert!(
+            alive(&helper),
+            "run_bounded signalled a group it no longer owned"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+    }
+
+    /// The pid written into `pidfile`, once it is.
+    fn written(pidfile: &Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(p) = std::fs::read_to_string(pidfile) {
+                return p.trim().to_string();
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid written");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// `waitid` failing with anything but `ECHILD` (injected): the leader is still this
+    /// process's, so its group is killed, a leader still running included, and the reap
+    /// returns at once with the status it reaped (killed). With `ECHILD` (the child is not
+    /// this process's any more) nothing is killed: what the leader left runs on, and the
+    /// error comes back at once, without waiting for a reap (the leader here still runs).
+    #[tokio::test]
+    async fn a_failed_waitid_kills_the_group_unless_the_child_is_gone() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let einval = |_| Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let pidfile = dir.path().join("running");
+        let mut child = leader_with_helper(&pidfile, "exec sleep 30");
+        let helper = written(&pidfile);
+        let start = std::time::Instant::now();
+        let status = finish_group_with(&mut child, einval).await.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive(&helper) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper outlived its group"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let echild = |_| Err(io::Error::from_raw_os_error(libc::ECHILD));
+        let pidfile = dir.path().join("gone");
+        let mut child = leader_with_helper(&pidfile, "exec sleep 30");
+        let helper = written(&pidfile);
+        let start = std::time::Instant::now();
+        let e = finish_group_with(&mut child, echild).await.unwrap_err();
+        assert!(ownership_lost(&e), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the leader was waited for after ECHILD"
+        );
+        assert!(
+            alive(&helper),
+            "a group no longer known to be this process's was killed"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+        // (Still this test's child, in truth: ended and reaped here.)
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
     }
 
     /// A relative `PATH` directory is taken from the program's working directory, an empty one

@@ -175,6 +175,19 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
     Ok(Secret::new(token))
 }
 
+/// How long a runner's shutdown waits for its runtimes by default
+/// ([`RunnerOptions::shutdown_grace`]).
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The longest a runner (an SSH box's daemon) takes to shut down once asked, with the default
+/// grace: its runtimes' grace ([`DEFAULT_SHUTDOWN_GRACE`]), then a repository change still
+/// running (at most [`twr_core::git::GIT_CHANGE_TIMEOUT`]), and a margin: 330 s. A launchd
+/// job's `ExitTimeOut`, the systemd unit's `TimeoutStopSec` in `docs/runners.md`, and how long
+/// a relay waits for a daemon it asked to stop ([`crate::relay::STOP_TIMEOUT`]).
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(
+    DEFAULT_SHUTDOWN_GRACE.as_secs() + twr_core::git::GIT_CHANGE_TIMEOUT.as_secs() + 20,
+);
+
 /// Spooled frames sent per batch between checks for other work.
 const BATCH: usize = 128;
 
@@ -195,6 +208,9 @@ pub struct DaemonOptions {
     /// The build the daemon says it runs (its status line, the channel's hello, the
     /// inventory): its own, [`twr_core::build_id`]. Tests make a daemon "of another build".
     pub build: Option<String>,
+    /// How it was started, as it tells from its own environment
+    /// ([`crate::daemon::own_launch`]): its inventory's [`Inventory::launch`].
+    pub launch: Option<String>,
 }
 
 /// Everything `twr runner` needs.
@@ -262,7 +278,7 @@ impl RunnerOptions {
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
             welcome_timeout: Duration::from_secs(30),
-            shutdown_grace: Duration::from_secs(10),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             ca_file: None,
             allow_insecure: false,
             daemon: None,
@@ -1095,6 +1111,7 @@ async fn handshake<S: HubStream>(
         },
         // What is known: none before the first probe ended (`Op::Agents` asks later).
         agents: lbox.agents(),
+        launch: opts.daemon.as_ref().and_then(|d| d.launch.clone()),
     });
     sink.send(text(&inventory)?)
         .await

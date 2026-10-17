@@ -249,6 +249,10 @@ pub struct BoxInfo {
     /// build in the box's builds tree that a remote attach runs (`twr runner --exec`,
     /// [`ssh_exec_command`]).
     pub build: Option<String>,
+    /// How an SSH box's daemon says it was started (its inventory's, when it is a
+    /// [`twr_core::runner::valid_launch`]): `launchd <label>`, `systemd <unit>` or `detached`.
+    /// `hub.info` shows it to users only.
+    pub launch: Option<String>,
 }
 
 /// A box's report of its agent CLIs as the hub keeps it: the probe's own filters applied
@@ -709,6 +713,12 @@ impl RemoteBox {
         self.state().conn.as_ref().is_some_and(|c| c.epoch == epoch)
     }
 
+    /// The current connection's epoch, while the box has one (each new connection's is
+    /// larger: see the module docs).
+    pub fn epoch(&self) -> Option<u64> {
+        self.state().conn.as_ref().map(|c| c.epoch)
+    }
+
     /// The box's agent CLIs as it last reported them ([`BoxInfo::agents`]; none before its
     /// first connection, or while it reported none).
     pub fn agents(&self) -> Vec<AgentInfo> {
@@ -900,6 +910,10 @@ impl RemoteBox {
             worktrees: inv.worktrees.clone(),
             agents: kept_agents(inv.agents.clone()),
             build: inv.build.clone().filter(|b| twr_core::valid_build_id(b)),
+            launch: inv
+                .launch
+                .clone()
+                .filter(|l| twr_core::runner::valid_launch(l)),
         });
         drop(st);
         self.inner.settled.notify_waiters();
