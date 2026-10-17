@@ -172,6 +172,8 @@ impl Daemon {
         opts.welcome_timeout = Duration::from_secs(10);
         opts.shutdown_grace = Duration::from_secs(3);
         let mut o = opts.box_options();
+        // No real login shell or agent CLI under a test.
+        o.env = twr_runner::BoxEnv::none();
         o.adapters = with_fake();
         if !o.runtimes.iter().any(|r| r == "fake") {
             o.runtimes.push("fake".into());

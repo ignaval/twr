@@ -10,6 +10,8 @@
 //!   (shared with the hub).
 //! - [`workdirs`]: working-directory reservations that keep worktree changes and runtime
 //!   starts in the same directory apart (shared with the hub's own box).
+//! - [`agents`]: what a box learns of its environment for its agents: the login shell's
+//!   `PATH` its runtimes get, and its agent CLIs (`Op::Agents`, the inventory).
 //! - [`client`]: the WebSocket connection loop behind `twr runner` ([`run`]).
 //! - [`daemon`]: an SSH box's daemon (`twr runner --daemon`): its Unix socket, the requests
 //!   made on it, and the hub's sealed connections it takes from it.
@@ -18,6 +20,7 @@
 //!
 //! The wire protocol is [`twr_core::runner`].
 
+pub mod agents;
 pub mod client;
 pub mod daemon;
 pub mod lbox;
@@ -27,5 +30,6 @@ pub mod relay;
 pub mod spool;
 pub mod workdirs;
 
+pub use agents::{BoxEnv, BOX_PROBE_ENV};
 pub use client::{run, run_with, DaemonOptions, RunnerOptions};
 pub use lbox::{LocalBox, LocalBoxOptions};

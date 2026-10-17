@@ -3,8 +3,9 @@
 //! Claude Code's options change between versions: `--permission-prompts` first appeared in
 //! 2.1.259 (and defaults to `host` there), and before 2.1.200 the `manual` permission mode was
 //! called `default`. The adapter reads both outputs before the first spawn of a binary and
-//! caches what it found per binary (its resolved path, size and modification time, so a
-//! `claude update` is noticed), then:
+//! caches what it found per binary and `PATH` (its resolved path, size and modification time,
+//! so a `claude update` is noticed, and the `PATH` it was probed with: a wrapper such as
+//! `exec claude-real "$@"` runs another `claude` on another `PATH`), then:
 //!
 //! - passes `--permission-prompts host` only when `--help` lists it (`--permission-prompt-tool
 //!   stdio` is always passed: it routes prompts to twr in every version);
@@ -19,7 +20,14 @@
 //!
 //! What is found describes this box's binary only: the interactive attach fits its command to
 //! the cache (never probing), and the hub's attach to a thread on another box uses none of it
-//! (`ClaudeCodeAdapter::remote_attach_command`); a runner probes its own box's binary.
+//! (`ClaudeCodeAdapter::remote_attach_command`); a runner probes its own box's binary. The
+//! binary probed is the one the spawn runs: resolved as the spawn resolves it
+//! ([`crate::resolve::resolve`]: on the runtime's `PATH`, its thread's or the one a runner
+//! gave it, else the hub's), and `--help` / `--version` run with that `PATH` too (a Node
+//! script finds its `node` there), in the runtime's working directory. A `PATH` with a
+//! relative or empty entry (`bin:/usr/bin`) finds programs from that directory, so its results
+//! are kept per directory as well; with an absolute `PATH` threads in every directory share
+//! one result per binary.
 //!
 //! When `--help` cannot be read (it cannot be run, exits non-zero without listing options, or
 //! takes longer than [`PROBE_TIMEOUT`]) nothing is guessed: the adapter passes every option,
@@ -27,20 +35,19 @@
 //! `--help` was not read and the update hint ([`refused_options_hint`]). Only a definite answer
 //! is cached (`--help` and `--version` both exited within the limit, and `--help` listed its
 //! options or exited 0); anything else is probed again by the next spawn. One probe of a
-//! binary runs at a time: spawns arriving while it runs wait for its result, and it is killed
-//! when no spawn waits for it any more.
+//! binary with a `PATH` (and directory, as above) runs at a time: spawns arriving while it
+//! runs wait for its result, and it is killed when no spawn waits for it any more.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
-use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use crate::process;
+use crate::resolve::Resolved;
 
 /// The oldest Claude Code twr works with: the oldest version checked against everything the
 /// adapter uses (its options, the permission modes, permission prompts over stdio, allow with
@@ -331,13 +338,43 @@ pub fn refused_options_hint(stderr: &str, program: &Path, unread: Option<&str>) 
 // Probe and cache
 // ---------------------------------------------------------------------------------------------
 
-/// Which binary a probe result belongs to: a different path, size or modification time is a
-/// different binary (`claude update` replaces it, or moves the `claude` symlink).
+/// Which binary a probe result belongs to, run with which `PATH`: a different path, size or
+/// modification time is a different binary (`claude update` replaces it, or moves the `claude`
+/// symlink), and a different `PATH` may run a different program through the same one (a
+/// `TWR_CLAUDE_BIN` wrapper running `exec claude-real "$@"` finds `claude-real` there). A
+/// `PATH` with a relative or empty entry finds it from the working directory too, so there
+/// the directory is part of it as well.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BinaryId {
     path: PathBuf,
+    /// The `PATH` the probe runs with, the one the spawn gets: the runtime's
+    /// ([`Resolved::path`]), else this process's; `None` when there is none.
+    search: Option<std::ffi::OsString>,
+    /// The runtime's working directory when `search` has a relative or empty entry
+    /// ([`relative_entry`]); `None` otherwise (threads in other directories share the result).
+    dir: Option<PathBuf>,
     len: u64,
     modified: Option<SystemTime>,
+}
+
+/// What results and probes are kept by: a binary's resolved path, the `PATH` it runs with and,
+/// when that `PATH` depends on it, the working directory ([`BinaryId`]; its size and
+/// modification time tell a result that is out of date).
+type Key = (PathBuf, Option<std::ffi::OsString>, Option<PathBuf>);
+
+impl BinaryId {
+    fn key(&self) -> Key {
+        (self.path.clone(), self.search.clone(), self.dir.clone())
+    }
+}
+
+/// Whether `PATH` `search` has an entry found from the working directory: a relative one
+/// (`bin`) or an empty one (the directory itself).
+fn relative_entry(search: Option<&std::ffi::OsStr>) -> bool {
+    search.is_some_and(|s| {
+        s.is_empty()
+            || std::env::split_paths(s).any(|d| d.as_os_str().is_empty() || d.is_relative())
+    })
 }
 
 /// What the adapter knows of a binary's `--help`.
@@ -372,16 +409,20 @@ impl Help {
 #[derive(Debug)]
 struct Flight {
     id: BinaryId,
+    /// The working directory the probe runs in: the first waiting spawn's (an empty one: this
+    /// process's).
+    cwd: PathBuf,
     /// Its result, once there is one. Each waiting spawn holds a receiver; the probe is killed
     /// when there are none.
     done: watch::Sender<Option<Help>>,
 }
 
-/// Definite probe results (see the module docs) and the probes in flight, by resolved path.
+/// Definite probe results (see the module docs) and the probes in flight, by resolved path,
+/// `PATH` and, for a `PATH` with a relative entry, working directory ([`Key`]).
 #[derive(Debug, Default)]
 struct Cache {
-    known: HashMap<PathBuf, (BinaryId, Support)>,
-    flying: HashMap<PathBuf, Arc<Flight>>,
+    known: HashMap<Key, (BinaryId, Support)>,
+    flying: HashMap<Key, Arc<Flight>>,
 }
 
 static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Default::default);
@@ -417,53 +458,67 @@ impl Probe {
     }
 }
 
-/// What is known about `program` as a spawn in `cwd` would run it (a bare name is looked up
-/// on `PATH`, a relative path from `cwd`). Unless its answer is cached, waits for the probe in
-/// flight or starts one (each run bounded by `limit`); call it in a tokio runtime.
-pub fn lookup(program: &Path, cwd: &Path, limit: Duration) -> Lookup {
-    let Some(id) = identify(program, cwd) else {
+/// What is known about the binary `bin` resolves to ([`crate::resolve::resolve`], as the
+/// spawn in working directory `cwd` resolves it), run with the `PATH` the spawn gets. Unless
+/// its answer for that binary and `PATH` (and `cwd`, when that `PATH` has a relative entry) is
+/// cached, waits for the probe in flight or starts one (each run bounded by `limit`, with that
+/// `PATH`, in `cwd`); call it in a tokio runtime.
+pub fn lookup(bin: &Resolved, cwd: &Path, limit: Duration) -> Lookup {
+    let Some(id) = identify(bin, cwd) else {
         return Lookup::Known(Help::Unread("it could not be located".into()));
     };
+    let key = id.key();
     let mut cache = cache();
-    match cache.known.get(&id.path) {
+    match cache.known.get(&key) {
         Some((known, support)) if *known == id => {
             return Lookup::Known(Help::Read(support.clone()))
         }
         _ => {}
     }
-    if let Some(f) = cache.flying.get(&id.path).filter(|f| f.id == id) {
+    if let Some(f) = cache.flying.get(&key).filter(|f| f.id == id) {
         return Lookup::Probe(Probe(f.done.subscribe()));
     }
     let (done, waiting) = watch::channel(None);
-    let flight = Arc::new(Flight { id, done });
-    cache
-        .flying
-        .insert(flight.id.path.clone(), Arc::clone(&flight));
+    let flight = Arc::new(Flight {
+        id,
+        cwd: cwd.to_path_buf(),
+        done,
+    });
+    cache.flying.insert(key, Arc::clone(&flight));
     tokio::spawn(fly(flight, limit));
     Lookup::Probe(Probe(waiting))
 }
 
-/// The cached support of `program`, if it was probed as it is now (never probes).
-pub fn cached(program: &Path, cwd: &Path) -> Option<Support> {
-    let id = identify(program, cwd)?;
-    match cache().known.get(&id.path) {
+/// The cached support of the binary `bin` resolves to, run with the `PATH` `bin` gives in
+/// working directory `cwd`, if it was probed as it is now with that `PATH` (and in `cwd`, when
+/// that `PATH` has a relative entry; never probes).
+pub fn cached(bin: &Resolved, cwd: &Path) -> Option<Support> {
+    let id = identify(bin, cwd)?;
+    match cache().known.get(&id.key()) {
         Some((known, support)) if *known == id => Some(support.clone()),
         _ => None,
     }
 }
 
-fn identify(program: &Path, cwd: &Path) -> Option<BinaryId> {
-    let base = if cwd.as_os_str().is_empty() {
-        std::env::current_dir().ok()?
-    } else {
-        cwd.to_path_buf()
-    };
-    let path = std::env::var_os("PATH");
-    let found = process::find_program(program, path.as_deref(), &base)?;
-    let path = std::fs::canonicalize(found).ok()?;
+/// The binary `bin` resolved to, as it is now, with the `PATH` it runs with (`bin`'s, else
+/// this process's, as the spawn inherits it) and, when that `PATH` has a relative entry, the
+/// working directory `cwd` (an empty one: this process's, as the spawn inherits it): `None`
+/// when none was found.
+fn identify(bin: &Resolved, cwd: &Path) -> Option<BinaryId> {
+    let path = std::fs::canonicalize(bin.found.as_ref()?).ok()?;
     let meta = std::fs::metadata(&path).ok()?;
+    let search = bin.path.clone().or_else(|| std::env::var_os("PATH"));
+    let dir = relative_entry(search.as_deref()).then(|| {
+        if cwd.as_os_str().is_empty() {
+            std::env::current_dir().unwrap_or_default()
+        } else {
+            cwd.to_path_buf()
+        }
+    });
     Some(BinaryId {
         path,
+        search,
+        dir,
         len: meta.len(),
         modified: meta.modified().ok(),
     })
@@ -473,7 +528,7 @@ fn identify(program: &Path, cwd: &Path) -> Option<BinaryId> {
 /// waiting for it; kills the probe if they all stop waiting first.
 async fn fly(flight: Arc<Flight>, limit: Duration) {
     let _landed = Landed(Arc::clone(&flight));
-    let run = probe(&flight.id, limit);
+    let run = probe(&flight.id, &flight.cwd, limit);
     tokio::pin!(run);
     let (help, definite) = loop {
         tokio::select! {
@@ -497,19 +552,20 @@ async fn fly(flight: Arc<Flight>, limit: Duration) {
     if let (true, Help::Read(s)) = (definite, &help) {
         cache
             .known
-            .insert(flight.id.path.clone(), (flight.id.clone(), s.clone()));
+            .insert(flight.id.key(), (flight.id.clone(), s.clone()));
     }
     flight.done.send_replace(Some(help));
 }
 
 /// Takes `flight` out of the probes in flight (if a newer probe did not replace it).
 fn land(cache: &mut Cache, flight: &Arc<Flight>) {
+    let key = flight.id.key();
     if cache
         .flying
-        .get(&flight.id.path)
+        .get(&key)
         .is_some_and(|f| Arc::ptr_eq(f, flight))
     {
-        cache.flying.remove(&flight.id.path);
+        cache.flying.remove(&key);
     }
 }
 
@@ -522,13 +578,15 @@ impl Drop for Landed {
     }
 }
 
-/// Runs `--help` and `--version` of binary `id` (each bounded by `limit`): what it supports,
-/// and whether that is definite (worth caching): `--help` was read and `--version` exited
-/// within the limit, whatever its code.
-async fn probe(id: &BinaryId, limit: Duration) -> (Help, bool) {
+/// Runs `--help` and `--version` of binary `id` in the runtime's working directory `cwd`
+/// (each bounded by `limit`, with its `PATH`, [`BinaryId::search`]): what it supports, and
+/// whether that is definite (worth caching): `--help` was read and `--version` exited within
+/// the limit, whatever its code.
+async fn probe(id: &BinaryId, cwd: &Path, limit: Duration) -> (Help, bool) {
+    let path = id.search.as_deref();
     let (help, version) = tokio::join!(
-        run_for_output(&id.path, "--help", limit),
-        run_for_output(&id.path, "--version", limit)
+        run_for_output(&id.path, "--help", path, cwd, limit),
+        run_for_output(&id.path, "--version", path, cwd, limit)
     );
     let (version, version_known) = match &version {
         Ran::Exited(0, out) => (Some(out.as_str()), true),
@@ -574,64 +632,55 @@ enum Ran {
     Failed(String),
 }
 
-/// Kills process group `.0` when dropped (if still set).
-struct KillGroup(Option<u32>);
+/// Most bytes of `--help` / `--version` output read (1 MiB, well above what Claude Code
+/// prints): a binary that floods its stdout is stopped there and its probe fails.
+const MAX_PROBE_OUTPUT: usize = 1 << 20;
 
-impl Drop for KillGroup {
-    fn drop(&mut self) {
-        if let Some(p) = self.0 {
-            super::kill_group(p);
-        }
-    }
-}
-
-/// Runs `program arg` for at most `limit`. Its process group is killed unless it exits by
-/// itself in time, also when this is dropped first (no spawn waits for the probe any more).
-async fn run_for_output(program: &Path, arg: &str, limit: Duration) -> Ran {
+/// Runs `program arg` (with `PATH` `path` when given, in `cwd` unless it is empty) for at
+/// most `limit`, reading at most [`MAX_PROBE_OUTPUT`] of its stdout ([`process::run_bounded`]:
+/// its process group is killed once it exits, before it is reaped, else when it is stopped
+/// early or this is dropped first; no spawn waits for the probe any more).
+async fn run_for_output(
+    program: &Path,
+    arg: &str,
+    path: Option<&std::ffi::OsStr>,
+    cwd: &Path,
+    limit: Duration,
+) -> Ran {
     let mut cmd = tokio::process::Command::new(program);
-    cmd.arg(arg)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .process_group(0);
-    process::scrub(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return Ran::Failed(format!("it could not be started: {e}")),
-    };
-    let mut group = KillGroup(child.id());
-    let Some(mut stdout) = child.stdout.take() else {
-        return Ran::Failed("its stdout was not piped".into());
-    };
-    let run = async {
-        let mut out = Vec::new();
-        stdout
-            .read_to_end(&mut out)
-            .await
-            .map_err(|e| format!("reading its output failed: {e}"))?;
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("waiting for it failed: {e}"))?;
-        match status.code() {
-            Some(code) => Ok((code, String::from_utf8_lossy(&out).into_owned())),
-            None => Err("it was killed by a signal".to_string()),
+    if let Some(p) = path {
+        cmd.env("PATH", p);
+    }
+    if !cwd.as_os_str().is_empty() {
+        cmd.current_dir(cwd);
+    }
+    cmd.arg(arg);
+    match process::run_bounded(cmd, limit, MAX_PROBE_OUTPUT, |_| false).await {
+        process::Bounded::Exited(Some(code), out) => {
+            Ran::Exited(code, String::from_utf8_lossy(&out).into_owned())
         }
-    };
-    match tokio::time::timeout(limit, run).await {
-        Ok(Ok((code, out))) => {
-            group.0 = None;
-            Ran::Exited(code, out)
+        process::Bounded::Exited(None, _) => Ran::Failed("it was killed by a signal".into()),
+        process::Bounded::NotStarted => Ran::Failed("it could not be started".into()),
+        process::Bounded::TooLarge => Ran::Failed(format!(
+            "it printed more than {} KiB",
+            MAX_PROBE_OUTPUT >> 10
+        )),
+        process::Bounded::TimedOut => Ran::Failed(format!("it took longer than {limit:?}")),
+        // `Enough` is never asked for.
+        process::Bounded::Failed | process::Bounded::Enough(_) => {
+            Ran::Failed("reading its output failed".into())
         }
-        Ok(Err(why)) => Ran::Failed(why),
-        Err(_) => Ran::Failed(format!("it took longer than {limit:?}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `bin` resolved as a spawn in `/` resolves it.
+    fn at(bin: &Path) -> Resolved {
+        crate::resolve::resolve(bin, &[], None, Path::new("/"))
+    }
 
     /// Claude Code 2.1.287 (wrapped at 80 columns), cut down.
     const HELP_287: &str = r#"Usage: claude [options] [command] [prompt]
@@ -1010,26 +1059,35 @@ Commands:
     /// `install_executable` in `tests/claude_code.rs`: no fork of this process may hold it
     /// open for writing when it is run).
     fn stub(dir: &Path, help: &str, version: &str) -> PathBuf {
-        let src = dir.join("claude.src");
+        let path = dir.join("claude");
+        stub_at(&path, dir, help, version);
+        path
+    }
+
+    /// [`stub`] at `path`, counting its `--help` runs in `<dir>/probes`.
+    fn stub_at(path: &Path, dir: &Path, help: &str, version: &str) {
         let d = dir.display();
-        std::fs::write(
-            &src,
-            format!(
+        install(
+            path,
+            &format!(
                 "#!/bin/sh\ncase \"$1\" in\n--help) echo probed >> {d}/probes; {help};;\n\
                  --version) {version};;\nesac\nexit 9\n"
             ),
-        )
-        .unwrap();
-        let path = dir.join("claude");
+        );
+    }
+
+    /// The executable `path` with `content`, written by `cp` (see [`stub`]).
+    fn install(path: &Path, content: &str) {
+        let src = path.with_extension("src");
+        std::fs::write(&src, content).unwrap();
         let st = std::process::Command::new("cp")
             .arg(&src)
-            .arg(&path)
+            .arg(path)
             .status()
             .unwrap();
         assert!(st.success(), "cp failed");
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     fn probes(dir: &Path) -> usize {
@@ -1044,7 +1102,7 @@ Commands:
     /// The result of a spawn's lookup, waiting for the probe if there is one; whether it was
     /// cached.
     async fn look(bin: &Path, limit: Duration) -> (Help, bool) {
-        match lookup(bin, Path::new("/"), limit) {
+        match lookup(&at(bin), Path::new("/"), limit) {
             Lookup::Known(h) => (h, true),
             Lookup::Probe(p) => (p.wait().await, false),
         }
@@ -1074,7 +1132,7 @@ Commands:
     }
 
     fn cached_support(bin: &Path) -> Option<Support> {
-        cached(bin, Path::new("/"))
+        cached(&at(bin), Path::new("/"))
     }
 
     /// A `--help` listing its options counts even when it exits non-zero; one that says
@@ -1137,13 +1195,202 @@ Commands:
         assert_eq!(probes(dir.path()), 2);
     }
 
+    /// A `--help` that floods its stdout is stopped at the cap: not read, not cached.
+    #[tokio::test]
+    async fn a_flooding_help_is_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = stub(dir.path(), "exec yes flood", "exit 0");
+        let (h, cached) = look(&bin, LIMIT).await;
+        assert!(!cached);
+        assert_eq!(h, Help::Unread("it printed more than 1024 KiB".into()));
+        assert_eq!(cached_support(&bin), None);
+    }
+
+    /// One wrapper (a `TWR_CLAUDE_BIN` running `exec claude-real "$@"`) on two `PATH`s runs
+    /// two different `claude`s: each `PATH` is probed on its own, and what is cached for one
+    /// never answers for the other, neither for a spawn's lookup nor for the cache reads of an
+    /// attach command and of the effort check.
+    #[tokio::test]
+    async fn one_wrapper_on_two_paths_is_two_binaries() {
+        use twr_core::adapter::{Adapter, SpawnConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let (new, old) = (dir.path().join("new"), dir.path().join("old"));
+        for (d, help, version) in [
+            (&new, help_288(), "2.1.288"),
+            (&old, HELP_287.into(), "2.1.287"),
+        ] {
+            std::fs::create_dir(d).unwrap();
+            let file = d.join("help.txt");
+            std::fs::write(&file, help).unwrap();
+            stub_at(
+                &d.join("claude-real"),
+                d,
+                &format!("cat {}; exit 0", file.display()),
+                &format!("echo '{version} (Claude Code)'; exit 0"),
+            );
+        }
+        let wrapper = dir.path().join("wrapper");
+        install(&wrapper, "#!/bin/sh\nexec claude-real \"$@\"\n");
+        let env = |d: &Path| vec![("PATH".to_string(), format!("{}:/usr/bin:/bin", d.display()))];
+        let on = |d: &Path| crate::resolve::resolve(&wrapper, &env(d), None, Path::new("/"));
+        let look_on = |d: &Path| {
+            let r = on(d);
+            async move {
+                match lookup(&r, Path::new("/"), LIMIT) {
+                    Lookup::Known(h) => (h, true),
+                    Lookup::Probe(p) => (p.wait().await, false),
+                }
+            }
+        };
+        // Probed apart, though the wrapper is one file.
+        let (h_new, cached_new) = look_on(&new).await;
+        let (h_old, cached_old) = look_on(&old).await;
+        assert!(!cached_new && !cached_old);
+        assert!(h_new.support().unwrap().lists(EFFORT), "{h_new:?}");
+        assert!(!h_old.support().unwrap().lists(EFFORT), "{h_old:?}");
+        assert_eq!((probes(&new), probes(&old)), (1, 1));
+        // Each answered from the cache since, with its own result.
+        let (again, was_cached) = look_on(&old).await;
+        assert!(was_cached);
+        assert_eq!(again, h_old);
+        assert_eq!(cached(&on(&new), Path::new("/")).as_ref(), h_new.support());
+        assert_eq!(cached(&on(&old), Path::new("/")).as_ref(), h_old.support());
+        assert_eq!((probes(&new), probes(&old)), (1, 1));
+        // The effort check and the attach command read the result of their own `PATH`.
+        assert_eq!(
+            effort_refusal(&wrapper, &cached(&on(&new), Path::new("/")).unwrap()),
+            None
+        );
+        assert!(effort_refusal(&wrapper, &cached(&on(&old), Path::new("/")).unwrap()).is_some());
+        let adapter = crate::claude_code::ClaudeCodeAdapter::with_bin(&wrapper);
+        let attach = |d: &Path| {
+            let cfg = SpawnConfig {
+                effort: Some("high".into()),
+                env: env(d),
+                cwd: dir.path().to_path_buf(),
+                ..Default::default()
+            };
+            let c = adapter.attach_command(&cfg, "s-1").unwrap();
+            c.get_args().any(|a| a == EFFORT)
+        };
+        assert!(attach(&new), "the newer claude takes --effort");
+        assert!(!attach(&old), "the older one would refuse it");
+    }
+
+    /// One absolute wrapper (`exec claude-real "$@"`) with the relative `PATH` `bin:/usr/bin`
+    /// runs the `bin/claude-real` of each thread's directory: the probe runs there, and each
+    /// directory is probed (at the same time, too) and cached on its own, for a spawn's lookup
+    /// and for the cache reads of an attach command and of the effort check. With an absolute
+    /// `PATH`, threads in other directories share the one probe.
+    #[tokio::test]
+    async fn a_relative_path_is_probed_per_directory() {
+        use twr_core::adapter::{Adapter, SpawnConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let (new, old) = (dir.path().join("new"), dir.path().join("old"));
+        for (d, help, version) in [
+            (&new, help_288(), "2.1.288"),
+            (&old, HELP_287.into(), "2.1.287"),
+        ] {
+            std::fs::create_dir_all(d.join("bin")).unwrap();
+            let file = d.join("help.txt");
+            std::fs::write(&file, help).unwrap();
+            stub_at(
+                &d.join("bin/claude-real"),
+                d,
+                &format!("cat {}; exit 0", file.display()),
+                &format!("echo '{version} (Claude Code)'; exit 0"),
+            );
+        }
+        let wrapper = dir.path().join("wrapper");
+        install(&wrapper, "#!/bin/sh\nexec claude-real \"$@\"\n");
+        let env = vec![("PATH".to_string(), "bin:/usr/bin:/bin".to_string())];
+        let on = |d: &Path| crate::resolve::resolve(&wrapper, &env, None, d);
+        // Both probed at once: neither waits for the other's probe.
+        let (p_new, p_old) = match (
+            lookup(&on(&new), &new, LIMIT),
+            lookup(&on(&old), &old, LIMIT),
+        ) {
+            (Lookup::Probe(a), Lookup::Probe(b)) => (a, b),
+            other => panic!("not two probes: {other:?}"),
+        };
+        let (h_new, h_old) = (p_new.wait().await, p_old.wait().await);
+        assert!(h_new.support().unwrap().lists(EFFORT), "{h_new:?}");
+        assert!(!h_old.support().unwrap().lists(EFFORT), "{h_old:?}");
+        assert_eq!((probes(&new), probes(&old)), (1, 1));
+        // Each answered from the cache since, with its own result.
+        for (d, h) in [(&new, &h_new), (&old, &h_old)] {
+            match lookup(&on(d), d, LIMIT) {
+                Lookup::Known(known) => assert_eq!(&known, h),
+                Lookup::Probe(_) => panic!("probed again in {}", d.display()),
+            }
+            assert_eq!(cached(&on(d), d).as_ref(), h.support());
+        }
+        assert_eq!((probes(&new), probes(&old)), (1, 1));
+        // Nothing probed in a third directory: nothing known there.
+        assert_eq!(cached(&on(dir.path()), dir.path()), None);
+        // The effort check and the attach command read the result of their own directory.
+        assert_eq!(
+            effort_refusal(&wrapper, &cached(&on(&new), &new).unwrap()),
+            None
+        );
+        assert!(effort_refusal(&wrapper, &cached(&on(&old), &old).unwrap()).is_some());
+        let adapter = crate::claude_code::ClaudeCodeAdapter::with_bin(&wrapper);
+        let attach = |d: &Path| {
+            let cfg = SpawnConfig {
+                effort: Some("high".into()),
+                env: env.clone(),
+                cwd: d.to_path_buf(),
+                ..Default::default()
+            };
+            let c = adapter.attach_command(&cfg, "s-1").unwrap();
+            c.get_args().any(|a| a == EFFORT)
+        };
+        assert!(attach(&new), "the newer claude takes --effort");
+        assert!(!attach(&old), "the older one would refuse it");
+
+        // An absolute `PATH` (to `new/bin`): one probe, shared by every directory.
+        let env = vec![(
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", new.join("bin").display()),
+        )];
+        let on = |d: &Path| crate::resolve::resolve(&wrapper, &env, None, d);
+        let (h, was_cached) = match lookup(&on(&old), &old, LIMIT) {
+            Lookup::Known(h) => (h, true),
+            Lookup::Probe(p) => (p.wait().await, false),
+        };
+        assert!(!was_cached);
+        assert!(h.support().unwrap().lists(EFFORT), "{h:?}");
+        assert_eq!((probes(&new), probes(&old)), (2, 1));
+        for d in [&new, &old, &dir.path().to_path_buf()] {
+            match lookup(&on(d), d, LIMIT) {
+                Lookup::Known(known) => assert_eq!(known, h),
+                Lookup::Probe(_) => panic!("probed again in {}", d.display()),
+            }
+            assert_eq!(cached(&on(d), d).as_ref(), h.support());
+        }
+        assert_eq!((probes(&new), probes(&old)), (2, 1));
+    }
+
+    #[test]
+    fn relative_path_entries() {
+        let rel = |s: &str| relative_entry(Some(std::ffi::OsStr::new(s)));
+        assert!(rel("bin:/usr/bin"));
+        assert!(rel("/usr/bin:./bin"));
+        assert!(rel("/usr/bin:"));
+        assert!(rel(":/usr/bin"));
+        assert!(rel("/usr/bin::/bin"));
+        assert!(rel(""));
+        assert!(!rel("/usr/bin:/bin"));
+        assert!(!relative_entry(None));
+    }
+
     /// Spawns arriving while a probe runs wait for it: one probe, one result for all.
     #[tokio::test]
     async fn spawns_share_one_probe() {
         let dir = tempfile::tempdir().unwrap();
         let bin = stub(dir.path(), "sleep 0.5; exit 3", "exit 0");
         let probes_now: Vec<Probe> = (0..3)
-            .map(|_| match lookup(&bin, Path::new("/"), LIMIT) {
+            .map(|_| match lookup(&at(&bin), Path::new("/"), LIMIT) {
                 Lookup::Probe(p) => p,
                 Lookup::Known(h) => panic!("known: {h:?}"),
             })
@@ -1169,7 +1416,7 @@ Commands:
             &format!("sleep 1; echo done >> {d}/done; exit 0"),
             "exit 0",
         );
-        let Lookup::Probe(p) = lookup(&bin, Path::new("/"), LIMIT) else {
+        let Lookup::Probe(p) = lookup(&at(&bin), Path::new("/"), LIMIT) else {
             panic!("not probed");
         };
         tokio::time::sleep(Duration::from_millis(200)).await;

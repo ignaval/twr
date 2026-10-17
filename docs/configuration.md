@@ -188,7 +188,7 @@ The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the
 
 `cpu_weight` and `memory_high` limit the workers on the hub's machine. Both are off by default. See [usage.md](usage.md#resource-limits).
 
-`disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts. 0 turns both off. See [worktrees.md](worktrees.md#disk-use).
+`disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts, and `twr box doctor` warns under it. 0 turns them off. See [worktrees.md](worktrees.md#disk-use).
 
 `[trash] keep_days` is how long a deleted thread's worktree, record and branch stay in the trash of its box before the hub purges them. The hub checks when it starts and every hour, on every box that is online; a box that is offline is purged at the first check after it reconnects. `twr trash empty` purges sooner, and `twr trash restore` brings a thread back until then. See [usage.md](usage.md#trash).
 
@@ -211,7 +211,9 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 | `TWR_HOME` | put the config, the data directory and the socket under this directory |
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
-| `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` |
+| `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` (on a remote box, the login shell's `PATH` and then the runner's: [runners.md](runners.md#the-login-shells-path)) |
+| `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Any other value, or none, leaves the check on. For tests and troubleshooting |
+| `TWR_BOX_PROBE` | in a runner's environment (`twr runner`, an SSH box's daemon): `off` keeps it from asking your login shell for its `PATH` (the runtimes keep the runner's own) and from checking its agent CLIs (it reports none to the hub); a remote attach (`twr runner --exec`), `twr box login` and `twr box doctor`'s look at the box's agents then skip the login shell too, so they find the agent the runner does. Any other value, or none, leaves both on. For tests and troubleshooting |
 | `TWR_SSH` | the ssh program the hub and `twr box` run for SSH boxes, instead of `ssh` on `PATH` (it gets the same arguments) |
 | `TWR_BOX_LAUNCHER` | on an SSH box, in the environment ssh commands get there: `setsid` makes the relay start the box daemon in a new session, never as a systemd user service. For tests and troubleshooting |
 | `VISUAL`, `EDITOR` | the editor for `twr context edit` |

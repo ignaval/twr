@@ -487,7 +487,8 @@ impl Hub {
             .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// `hub.info`'s `boxes`: each remote box with its transport and state (see SKILL.md).
+    /// `hub.info`'s `boxes`: each remote box with its transport, state and agents (see
+    /// SKILL.md), as a user sees it (`box_agents::project_box` makes the orchestrator's view).
     pub(super) fn boxes_json(&self) -> Vec<Value> {
         let remotes = self.inner.remotes_list();
         let ssh: HashMap<String, Arc<SshBox>> = self
@@ -542,6 +543,7 @@ impl Hub {
                     "build": st.build,
                     "running_build": st.running,
                     "switch_pending": ssh_box.then_some(st.switch_pending),
+                    "agents": b.agents(),
                 });
                 (name, v)
             })

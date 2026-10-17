@@ -101,10 +101,15 @@ pub fn valid_run_id(run: &str) -> bool {
 /// [`RunnerMsg::Auth`], [`HubMsg::Authenticated`], then [`RunnerMsg::Inventory`]): the token
 /// no longer crosses the connection, and the runner checks the hub before it trusts it.
 ///
+/// 7: the agents op ([`Op::Agents`]: the box's agent CLIs, found or not, their versions and
+/// whether they are signed in), which a runner before it would leave unanswered; the
+/// inventory's [`Inventory::agents`] came with it (additive: an older runner's inventory has
+/// none). No spooled frame changed: a protocol 6 spool's frames decode as they are.
+///
 /// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
 /// the protocol they were written under): a bump that changes how spooled frames encode must
 /// migrate the spool, or the next runner refuses to open one that holds such frames.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// The proof a runner sends in [`RunnerMsg::Auth`] on a sealed connection (see the module
 /// docs): none. The hub does not check it there.
@@ -406,6 +411,83 @@ pub struct Inventory {
     /// inventory, and ignored by an older hub.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    /// The box's agent CLIs as its runner last probed them (protocol 7: [`Op::Agents`] asks
+    /// for them, fresh or not). Empty when the runner has not probed them yet (an inventory
+    /// sent right after it started), probes none (a box set up without), or is older.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentInfo>,
+}
+
+/// Whether an agent CLI on a box is signed in ([`AgentInfo::login`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLogin {
+    /// Its status command said it is signed in.
+    LoggedIn,
+    /// Its status command said it is not.
+    LoggedOut,
+    /// Not known: the CLI has no status command (Grok Build), it is not installed, or its
+    /// status could not be read ([`AgentInfo::note`] says why). Also any value a newer box
+    /// sends that this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// One built-in agent runtime's CLI on a box, as the box's agent probe found it
+/// (`twr_adapters::agents`): resolved as the box would start the runtime (its `TWR_*_BIN`,
+/// else on the `PATH` its runtimes get), its version, and whether it is signed in. Never more
+/// than this: no account detail (email, organization, plan) is kept, and every string is
+/// short and printable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentInfo {
+    /// The runtime (`claude-code`, `codex`, `grok-build`).
+    pub runtime: String,
+    /// Whether its program was found: an executable file on the box.
+    pub found: bool,
+    /// The executable file found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The first line its `--version` printed, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Whether it is signed in.
+    pub login: AgentLogin,
+    /// How it is signed in, when it says and twr knows the word (Claude Code's `authMethod`:
+    /// `claude.ai`, `console`, `api-key`, `bedrock`, `vertex`; anything else is `other`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Why something is not known (a fixed phrase: "not found on PATH", "`claude auth
+    /// status` took longer than 10s").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What `twr runner --agents` prints (one JSON object): the box's agents as its runner would
+/// probe them, and how the login shell's `PATH` they are resolved with went.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsReport {
+    /// The login shell's `PATH` ([`LoginPathReport`]).
+    pub login_path: LoginPathReport,
+    /// The agents, one per built-in agent runtime.
+    pub agents: Vec<AgentInfo>,
+}
+
+/// How asking the box's login shell for its `PATH` went ([`AgentsReport::login_path`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoginPathReport {
+    /// The shell asked (`$SHELL`), when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// How many entries its `PATH` gave (put before the runner's own), when it gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<usize>,
+    /// Why it gave none (the runtimes then get the runner's own `PATH`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Runner to hub.
@@ -569,6 +651,7 @@ pub mod hub_errors {
 /// | `trash_restore` | [`crate::git::RestoreOutcome`] |
 /// | `trash_restore_undo` | bool |
 /// | `disk_usage` | [`crate::git::DiskReading`] |
+/// | `agents` | `[`[`AgentInfo`]`]` |
 ///
 /// `git_common_dir`, `worktree_trash`, `branch_only_commits`, `worktree_inventory` and the
 /// `trash_*` ops came with protocol 3 ([`PROTOCOL_VERSION`]): a runner from before them is refused at its hello, so it is never
@@ -768,6 +851,14 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposable: Option<Vec<String>>,
     },
+    /// The box's agent CLIs ([`AgentInfo`], protocol 7): as the runner last probed them, or
+    /// probed again first when `refresh` (a probe started after the request, at most 10 s a
+    /// command). A box that probes none answers an empty list.
+    Agents {
+        /// Probe again before answering (a just installed or signed in CLI).
+        #[serde(default)]
+        refresh: bool,
+    },
 }
 
 impl Op {
@@ -839,6 +930,7 @@ impl Op {
             Op::TrashRestore { .. } => "trash_restore",
             Op::TrashRestoreUndo { .. } => "trash_restore_undo",
             Op::DiskUsage { .. } => "disk_usage",
+            Op::Agents { .. } => "agents",
         }
     }
 
@@ -1257,6 +1349,15 @@ mod tests {
             runtimes: vec!["fake".into()],
             worktrees: "/data/worktrees".into(),
             build: Some("0123456789abcdef".into()),
+            agents: vec![AgentInfo {
+                runtime: "claude-code".into(),
+                found: true,
+                path: Some("/home/u/.local/bin/claude".into()),
+                version: Some("2.1.302 (Claude Code)".into()),
+                login: AgentLogin::LoggedIn,
+                method: Some("claude.ai".into()),
+                note: None,
+            }],
         }));
         round_trip_runner(RunnerMsg::Event {
             thread: "t1".into(),
@@ -1451,6 +1552,8 @@ mod tests {
                 worktree: Some("/w".into()),
                 disposable: Some(vec!["target/".into()]),
             },
+            Op::Agents { refresh: true },
+            Op::Agents { refresh: false },
         ];
         for op in ops {
             let name = op.name();
@@ -1523,6 +1626,11 @@ mod tests {
             panic!("not an inventory")
         };
         assert_eq!(inv.build.as_deref(), Some("0123456789abcdef"));
+        // An inventory without agents (an older runner, or one that has not probed yet) has
+        // none, and sends none.
+        assert!(inv.agents.is_empty());
+        let v = serde_json::to_value(RunnerMsg::Inventory(inv)).unwrap();
+        assert!(v.get("agents").is_none(), "{v}");
         let ok = serde_json::to_value(HubMsg::Authenticated).unwrap();
         assert_eq!(ok, json!({"type": "authenticated"}));
 
@@ -1540,6 +1648,40 @@ mod tests {
             r,
             json!({"type": "cmd_result", "cmd_id": "c", "ok": true, "result": null})
         );
+    }
+
+    /// The agents op and what it answers, on the wire: `refresh` defaults to false, a login
+    /// state this build does not know reads as unknown, and what is not known is not sent.
+    #[test]
+    fn agents_on_the_wire() {
+        let op: Op = serde_json::from_value(json!({"type": "agents"})).unwrap();
+        assert_eq!(op, Op::Agents { refresh: false });
+        assert_eq!(op.name(), "agents");
+        assert!(!op.is_session_op() && !op.changes_repository() && op.thread().is_none());
+        let info = AgentInfo {
+            runtime: "codex".into(),
+            found: true,
+            path: Some("/usr/bin/codex".into()),
+            login: AgentLogin::LoggedOut,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            json!({"runtime": "codex", "found": true, "path": "/usr/bin/codex", "login": "logged_out"})
+        );
+        let newer: AgentInfo = serde_json::from_value(
+            json!({"runtime": "grok-build", "found": false, "login": "expired", "new": 1}),
+        )
+        .unwrap();
+        assert_eq!(newer.login, AgentLogin::Unknown);
+        assert!(!newer.found);
+        let report: AgentsReport = serde_json::from_value(json!({
+            "login_path": {"shell": "/bin/csh", "error": "csh is not asked"},
+            "agents": [{"runtime": "claude-code", "login": "logged_in"}]
+        }))
+        .unwrap();
+        assert_eq!(report.login_path.entries, None);
+        assert_eq!(report.agents[0].login, AgentLogin::LoggedIn);
     }
 
     #[test]

@@ -65,7 +65,7 @@ pub fn launch(
     process::scrub(&mut cmd);
     process::check_wrapped(wrap, program, env, cwd, fix)?;
     cmd.spawn()
-        .map_err(|e| process::start_error(e, program, cwd, fix))
+        .map_err(|e| process::start_error(e, program, env, cwd, fix))
 }
 
 /// Last [`STDERR_TAIL`] bytes of a stream.

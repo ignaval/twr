@@ -102,6 +102,26 @@ fn is_dry_run(result: &Value) -> bool {
 /// `trash.empty`, `trash.restore` or `orchestrator.use` did (`None` for other methods, and for a `thread.send` that started a
 /// turn: the transcript shows it).
 pub fn result_status(method: &str, result: &Value) -> Option<String> {
+    // The hub's advisory on a call that makes, changes, restarts or starts a thread's runtime
+    // (its box reports the runtime's CLI missing): said after what was done, alone when
+    // nothing else is said (a `thread.send` that started a turn).
+    let warning = matches!(
+        method,
+        "thread.new" | "thread.set_model" | "thread.set_mode" | "thread.send"
+    )
+    .then(|| result["warning"].as_str())
+    .flatten()
+    .filter(|w| !w.trim().is_empty());
+    match (method_status(method, result), warning) {
+        (Some(status), Some(w)) => Some(format!("{status}; warning: {w}")),
+        (Some(status), None) => Some(status),
+        (None, Some(w)) => Some(format!("warning: {w}")),
+        (None, None) => None,
+    }
+}
+
+/// [`result_status`] before the hub's advisory.
+fn method_status(method: &str, result: &Value) -> Option<String> {
     match method {
         "say" => {}
         "thread.send" => return queued_note(result),
@@ -1283,8 +1303,9 @@ const TABS_EVERY: Duration = Duration::from_secs(5);
 /// How often the TUI reads this machine's load for its status bar ([`twr_core::load`]).
 pub const LOAD_EVERY: Duration = Duration::from_secs(5);
 
-/// How often the TUI asks its hub (`hub.info`'s `disk`) whether a box is low on disk.
-const DISK_EVERY: Duration = Duration::from_secs(60);
+/// How often the TUI asks its hub (`hub.info`) whether a box is low on disk (`disk`) and how
+/// its remote boxes are (`boxes`: a thread's box token).
+pub const INFO_EVERY: Duration = Duration::from_secs(10);
 
 /// How long the tab strip waits for one hub's answer.
 const TAB_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1933,6 +1954,8 @@ async fn drive(
     let current_name = current.clone();
     let mut state = AppState::new();
     state.instance_name = instance;
+    // The boxes as the hub said them on connecting: the first frame's box tokens.
+    state.apply_boxes(&info);
     state.attach_via = selection;
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
@@ -1987,9 +2010,10 @@ async fn drive(
             let _ = looking_tx.send(Some(looking));
         }
     }
-    // Whether a box is low on disk: asked now, then every [`DISK_EVERY`].
-    let mut disk_poll = tokio::time::interval(DISK_EVERY);
-    disk_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Whether a box is low on disk, and how the remote boxes are: asked now, then every
+    // [`INFO_EVERY`].
+    let mut info_poll = tokio::time::interval(INFO_EVERY);
+    info_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (load_tx, mut load_rx) = mpsc::unbounded_channel::<Option<twr_core::load::Load>>();
     let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<Vec<workspace::Tab>>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
@@ -2288,9 +2312,9 @@ async fn drive(
                     load_pending = false;
                     state.load = load;
                 }
-                _ = disk_poll.tick() => {
-                    if !state.disk_pending {
-                        state.disk_pending = true;
+                _ = info_poll.tick() => {
+                    // (Recorded as sent now: its answer is older than a runner event after.)
+                    if state.send_info() {
                         let _ = call_tx.send(("hub.info", Value::Null));
                     }
                 }
@@ -3695,6 +3719,61 @@ mod tests {
         assert_eq!(
             result_status("thread.new", &json!({"name": "api2", "runtime": "codex"})).as_deref(),
             Some("created api2 (runtime codex)")
+        );
+        // The hub's advisory (the box reports the CLI missing) follows what was done.
+        let w = "box gpu reports no `codex` on its PATH; the thread may fail to start: run `twr \
+                 box doctor gpu`";
+        assert_eq!(
+            result_status(
+                "thread.new",
+                &json!({"name": "api2", "runtime": "codex", "warning": w})
+            ),
+            Some(format!("created api2 (runtime codex); warning: {w}"))
+        );
+        assert_eq!(
+            result_status(
+                "thread.set_model",
+                &json!({"thread_name": "api2", "model": "o3", "applies": "next_start",
+                        "warning": w})
+            ),
+            Some(format!(
+                "api2 now has model o3, effort default; from its next start; warning: {w}"
+            ))
+        );
+        // A mode change that restarts the runtime, and a send that starts it: also when the
+        // send itself says nothing (it started a turn).
+        assert_eq!(
+            result_status(
+                "thread.set_mode",
+                &json!({"thread_name": "api2", "mode": "auto", "previous": "manual",
+                        "changed": true, "applies": "now", "warning": w})
+            )
+            .unwrap(),
+            format!(
+                "{}; warning: {w}",
+                result_status(
+                    "thread.set_mode",
+                    &json!({"thread_name": "api2", "mode": "auto", "previous": "manual",
+                            "changed": true, "applies": "now"})
+                )
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            result_status(
+                "thread.send",
+                &json!({"thread": "t1", "turn": 1, "warning": w})
+            ),
+            Some(format!("warning: {w}"))
+        );
+        assert_eq!(
+            result_status("thread.send", &json!({"thread": "t1", "turn": 1})),
+            None
+        );
+        // Only on those results.
+        assert_eq!(
+            result_status("thread.stop", &json!({"warning": w})).as_deref(),
+            Some("stopped")
         );
         let (m, p) = action_request(&Action::Stop {
             thread: "t1".into(),

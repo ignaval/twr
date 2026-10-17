@@ -56,7 +56,9 @@ use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 
 use super::runtime_spec::RuntimeSpec;
-use super::{append_err, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub, Inner};
+use super::{
+    append_err, box_agents, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub, Inner,
+};
 
 /// A checked `thread.set_model` ([`Core::model_change`]).
 pub(super) struct ModelChange {
@@ -143,12 +145,28 @@ impl Core {
         let Some(event) = event else {
             return Ok(out);
         };
+        // Advisory: the thread's box reports the CLI the change starts missing
+        // (`hub::box_agents`): the new runtime's on a move, else the thread's own (a new
+        // model or effort restarts it). The change goes ahead either way.
+        let warning = self.registry.get(&id).and_then(|view| {
+            let target = switch
+                .as_ref()
+                .map_or(view.runtime.as_str(), |new| new.runtime.as_str());
+            box_agents::agent_warning(hub, &view.box_name, target)
+        });
         if let Some(new) = switch.as_ref().filter(|_| caller.is_orchestrator()) {
             if self.move_needs_card(&id, &new.runtime) {
                 self.move_check(&id)?;
                 let spec = runtime.map(str::trim).unwrap_or_default();
-                return Ok(self.propose_move(&id, spec, model, effort));
+                let mut out = self.propose_move(&id, spec, model, effort);
+                if let Some(w) = warning {
+                    out["warning"] = json!(w);
+                }
+                return Ok(out);
             }
+        }
+        if let Some(w) = warning {
+            out["warning"] = json!(w);
         }
         self.append(hub, &id, None, caller.source(), event)
             .map_err(append_err)?;
@@ -345,7 +363,10 @@ impl Core {
         // thread has runs already.
         if new_effort.is_some() && (new_effort != view.effort || switch.is_some()) {
             let local = hub.host(&view.box_name).is_some_and(|h| !h.is_remote());
-            if let Some(why) = runtime_spec::effort_refusal(&target, local) {
+            // Resolved as the thread's next spawn resolves it (its environment and directory).
+            let spawn = super::spawn_config(hub, &view);
+            if let Some(why) = runtime_spec::effort_refusal(&target, local, &spawn.env, &spawn.cwd)
+            {
                 return Err(rpc(codes::BAD_REQUEST, why));
             }
         }

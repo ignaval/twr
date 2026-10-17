@@ -8,6 +8,7 @@ use std::sync::Arc;
 use twr_core::adapter::Adapter;
 
 pub mod acp;
+pub mod agents;
 pub mod attn;
 mod background;
 pub mod claude_code;
@@ -16,6 +17,7 @@ pub mod fake;
 pub mod grok_build;
 pub mod process;
 pub mod pty;
+pub mod resolve;
 pub mod usage;
 
 pub use acp::AcpAdapter;

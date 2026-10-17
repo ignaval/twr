@@ -889,6 +889,12 @@ where
         "runner connected"
     );
     tx.send(HubMsg::Welcome { epoch, watermarks });
+    // The box's agent CLIs, asked on this connection while it lasts (`hub::box_agents`).
+    let _agents = super::box_agents::AbortOnDrop(tokio::spawn(super::box_agents::poll(
+        rbox.clone(),
+        epoch,
+        hub.agents_poll,
+    )));
     let end = SealedEnd {
         welcomed: true,
         protocol_refused: None,

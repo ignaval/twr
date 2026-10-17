@@ -414,7 +414,8 @@ enum Cmd {
     /// Add, list, inspect, install twr on and remove remote boxes. `twr box add <name>
     /// <ssh destination>` sets up a box the hub reaches over SSH (no token, listener or
     /// tunnel): the hub installs twr there, keeps it connected, and runs the box's threads in
-    /// a daemon on the box that outlives the connection.
+    /// a daemon on the box that outlives the connection. `twr box doctor <name>` checks a box,
+    /// and `twr box login <name> <agent>` logs an agent CLI in there, in this terminal.
     #[command(name = "box")]
     Boxes {
         #[command(subcommand)]
@@ -434,7 +435,7 @@ enum Cmd {
         #[arg(
             long,
             value_name = "URL",
-            required_unless_present_any = ["stdio", "daemon"]
+            required_unless_present_any = ["stdio", "daemon", "agents", "login", "exec"]
         )]
         hub: Option<String>,
         /// File holding the box's token (`[boxes.<name>] token` on the hub, at least 16
@@ -443,7 +444,11 @@ enum Cmd {
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
         /// Box name (as configured on the hub).
-        #[arg(long = "box", value_name = "NAME", required = true)]
+        #[arg(
+            long = "box",
+            value_name = "NAME",
+            required_unless_present_any = ["agents", "login", "exec"]
+        )]
         box_name: Option<String>,
         /// Data directory for the spool and worktrees (default: the twr data directory).
         #[arg(long, value_name = "DIR")]
@@ -489,6 +494,107 @@ enum Cmd {
         /// it), taken as this relay's own when it cannot read its executable.
         #[arg(long, hide = true, value_name = "ID", requires = "stdio")]
         build: Option<String>,
+        /// With --stdio: print the status line of the box daemon of --hub-key and --box, or
+        /// `no daemon`, and nothing else (`twr box doctor`).
+        #[arg(
+            long,
+            hide = true,
+            requires = "stdio",
+            conflicts_with_all = ["replace", "stop", "build"]
+        )]
+        status: bool,
+        /// Print this box's agent CLIs as its runner finds them, as JSON: the login shell's
+        /// PATH, then each agent's path, version and login state (`twr box doctor`).
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login"
+            ]
+        )]
+        agents: bool,
+        /// Start AGENT's login in this terminal, on the program this box's runner would run
+        /// (its TWR_*_BIN, else on the login shell's PATH): `claude auth login`, `codex login
+        /// --device-auth`, `grok login --device-auth` (`twr box login`). Needs a terminal.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "AGENT",
+            value_parser = ["claude", "claude-code", "codex", "grok", "grok-build"],
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key"
+            ]
+        )]
+        login: Option<String>,
+        /// Run RUNTIME's CLI with the arguments after `--`, its program resolved as a spawn
+        /// of a thread on this box resolves it (its TWR_*_BIN, else on --path, else on the
+        /// login shell's PATH before this one): what `twr attach` runs on an SSH box, with
+        /// the arguments the hub built.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "RUNTIME",
+            value_parser = ["claude-code", "codex", "grok-build"],
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec: Option<String>,
+        /// With --exec: the thread's PATH, when it configures one (it wins over the login
+        /// shell's, as for a spawn). (The conflicts repeat --exec's: clap does not check
+        /// `requires` against an argument that conflicts with one given.)
+        #[arg(
+            long = "path",
+            hide = true,
+            value_name = "PATH",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_path: Option<String>,
+        /// With --exec: a variable of the thread's environment (NAME=VALUE, repeated), set on
+        /// the runtime's command only: the program is resolved, and the login shell asked,
+        /// with this process's environment, as a spawn's are.
+        #[arg(
+            long = "env",
+            hide = true,
+            value_name = "NAME=VALUE",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_env: Vec<String>,
+        /// With --exec: a variable the runtime's command does not get (repeated).
+        #[arg(
+            long = "unset",
+            hide = true,
+            value_name = "NAME",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_unset: Vec<String>,
+        /// With --exec: the runtime's arguments.
+        #[arg(
+            last = true,
+            hide = true,
+            value_name = "ARGS",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_args: Vec<String>,
         /// With --daemon: the socket to listen on (`--socket` is the hub socket's).
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         daemon_socket: Option<PathBuf>,
@@ -995,6 +1101,54 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let cli = match cli.cmd {
         Some(Cmd::Runner {
             cmd: None,
+            agents: true,
+            ..
+        }) => {
+            let report = twr_runner::agents::agents_report(&twr_runner::BoxEnv::user()).await;
+            outln!("{}", serde_json::to_string(&report)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            login: Some(agent),
+            ..
+        }) => return runner_login(&agent).await,
+        Some(Cmd::Runner {
+            cmd: None,
+            exec: Some(runtime),
+            exec_path,
+            exec_env,
+            exec_unset,
+            exec_args,
+            ..
+        }) => {
+            return runner_exec(
+                &runtime,
+                exec_path.as_deref(),
+                &exec_env,
+                &exec_unset,
+                &exec_args,
+            )
+            .await
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            stdio: true,
+            status: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let opts = twr_runner::relay::RelayOptions::new(&box_name, hub_key, false)?;
+            match twr_runner::relay::status(&opts).await? {
+                Some(status) => outln!("{}", status.line().trim_end()),
+                None => outln!("no daemon"),
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
             stdio: true,
             box_name: Some(box_name),
             hub_key: Some(hub_key),
@@ -1180,6 +1334,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             run_mcp(socket).await?;
             Ok(ExitCode::SUCCESS)
         }
+        Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
         cmd => run_simple(cmd, &config, paths, socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -1199,6 +1354,7 @@ async fn run_simple(
         | Cmd::ClaudeMemoryGuard
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
+        | Cmd::Boxes { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -1260,7 +1416,6 @@ async fn run_simple(
             orchestrator_use(&socket, &runtime, model, !no_summary, wait, ask).await
         }
         Cmd::Info { json } => info(&socket, json).await,
-        Cmd::Boxes { cmd } => boxes::run(cmd, config, &paths, &socket).await,
         Cmd::Usage {
             json,
             threads: true,
@@ -1342,6 +1497,9 @@ async fn run_simple(
             if let Some(repo) = t["project_found"]["repo"].as_str() {
                 outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
             }
+            if let Some(w) = result_warning(&t) {
+                errln!("{w}");
+            }
             Ok(())
         }
         Cmd::Send {
@@ -1402,6 +1560,9 @@ async fn run_simple(
                     w = workspace_hint()
                 ),
                 None => outln!("queued on {thread} ({} pending)", r["pending"]),
+            }
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
             }
             if let Some(e) = r["dispatch_error"].as_str() {
                 errln!("twr: the prompt is queued, but dispatching it failed: {e}");
@@ -1488,6 +1649,9 @@ async fn run_simple(
                 .call("thread.set_mode", json!({ "thread": thread, "mode": mode }))
                 .await?;
             outln!("{}", mode_outcome(&thread, &r));
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
+            }
             if let Some(e) = r["dispatch_error"].as_str() {
                 errln!("twr: the mode is set, but restarting the runtime failed: {e}");
             }
@@ -1513,6 +1677,9 @@ async fn run_simple(
             }
             let r = c.call("thread.set_model", params).await?;
             outln!("{}", model_outcome(&thread, &r));
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
+            }
             if let Some(e) = r["dispatch_error"].as_str() {
                 if r["runtime_changed"].as_bool() == Some(true) {
                     errln!("twr: the runtime is set, but stopping the previous one failed: {e}");
@@ -1881,6 +2048,16 @@ fn model_show(t: &Value) -> String {
 }
 
 /// What `twr model` prints for a `thread.set_model` result.
+/// The advisory of a `thread.new` / `thread.set_model` / `thread.set_mode` / `thread.send`
+/// result `r` (its `warning`: the box reports the CLI of the runtime the call starts or
+/// restarts missing; the thread was made, changed or sent to all the same), as the
+/// line printed to stderr: `warning: <it>`, its commands run in this workspace ([`localize`]).
+/// `errln!` cleans it for the terminal.
+fn result_warning(r: &Value) -> Option<String> {
+    let w = r["warning"].as_str().filter(|w| !w.trim().is_empty())?;
+    Some(format!("warning: {}", localize(w)))
+}
+
 fn model_outcome(thread: &str, r: &Value) -> String {
     let name = r["thread_name"].as_str().unwrap_or(thread);
     let now = model_effort(&r["model"], &r["effort"]);
@@ -1979,11 +2156,29 @@ async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Resul
     // A test's throwaway hub (under `TWR_HOME` only) trusts the test's clients: in a debug
     // build only, which the tests run and no installed twr is ([`test_token_trusted`]), and
     // only from a private file of the hub's user ([`hub_test_token`]).
-    if test_token_trusted() {
+    let trusted = test_token_trusted();
+    if trusted {
         opts.test_user_token = hub_test_token();
+    }
+    // The hub's own agent CLIs (`hub.info` `agents`), probed in the background; never under
+    // a test's throwaway hub, nor with `TWR_AGENT_PROBE=off`, so tests run none of the user's
+    // real agent CLIs.
+    if probes_own_agents(trusted, std::env::var_os(AGENT_PROBE_ENV).as_deref()) {
+        opts.agent_probe = Some(twr_hub::hub::own_agent_probe());
     }
     opts.worktree_namespace = paths.worktree_namespace();
     twr_hub::run(opts, socket).await
+}
+
+/// `TWR_AGENT_PROBE`: `off` keeps the hub from probing its own box's agent CLIs (no
+/// `claude`, `codex` or `grok` runs; `hub.info` reports no local agents). Any other value, or
+/// none: it probes them. For tests and troubleshooting.
+const AGENT_PROBE_ENV: &str = "TWR_AGENT_PROBE";
+
+/// Whether the hub probes its own agent CLIs: not for a test's throwaway hub (`test`,
+/// [`test_token_trusted`]), nor when [`AGENT_PROBE_ENV`] is `off` (`value`).
+fn probes_own_agents(test: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    !test && value.is_none_or(|v| v != "off")
 }
 
 /// The test user token a test's throwaway hub trusts ([`twr_core::client::TEST_USER_TOKEN_ENV`]),
@@ -3142,6 +3337,93 @@ async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::
         tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
     }
     r
+}
+
+/// `twr runner --login <agent>` (`twr box login` runs it over ssh with a terminal): resolves
+/// the agent as this box's runner would (its `TWR_*_BIN`, else on the box's baseline login
+/// `PATH` merged before this one, none with `TWR_BOX_PROBE=off`:
+/// [`twr_runner::agents::login_command`] with [`twr_runner::BoxEnv::user`], the daemon's) and
+/// replaces this process with its login command, so the login talks to the user's terminal
+/// directly. Refused without a terminal on stdin and stdout.
+async fn runner_login(agent: &str) -> anyhow::Result<ExitCode> {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    let Some(runtime) = twr_adapters::agents::agent_runtime(agent) else {
+        bail!("{agent:?} is not an agent twr logs in (claude, codex or grok)");
+    };
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "`twr runner --login` needs a terminal on stdin and stdout: the login asks you \
+             things (`twr box login <box> {agent}` runs it with one)"
+        );
+    }
+    let mut cmd = twr_runner::agents::login_command(
+        &twr_runner::BoxEnv::user(),
+        runtime,
+        |k| std::env::var_os(k),
+        |why| {
+            note(&format!(
+                "twr: the login shell gave no PATH ({why}): looking for {agent} on this one"
+            ))
+        },
+    )
+    .await?;
+    let shown = format!(
+        "{} {}",
+        cmd.get_program().to_string_lossy(),
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // Only returns when it could not run it.
+    let e = cmd.exec();
+    bail!("running `{shown}`: {e}")
+}
+
+/// `twr runner --exec <runtime> [--path <PATH>] [--env NAME=VALUE]... [--unset NAME]... --
+/// <args>` (a remote attach to a thread on an SSH box runs it over ssh): resolves the runtime's
+/// program as a spawn of the thread on this box resolves it
+/// ([`twr_runner::agents::exec_command`] with [`twr_runner::BoxEnv::user`], the daemon's: its
+/// `TWR_*_BIN`, else on the thread's `PATH` when given, else on the box's baseline login `PATH`
+/// merged before this one, the shell asked with this process's environment, the box's as ssh
+/// gives it, as the daemon asks it with its own, and not asked with `TWR_BOX_PROBE=off`) and
+/// replaces this process with it, with `args` (the hub's) as they are and the thread's other
+/// variables (`set`, `unset`) on it alone.
+async fn runner_exec(
+    runtime: &str,
+    path: Option<&str>,
+    set: &[String],
+    unset: &[String],
+    args: &[String],
+) -> anyhow::Result<ExitCode> {
+    use std::os::unix::process::CommandExt;
+    let mut env = Vec::new();
+    for e in set {
+        let Some((k, v)) = e.split_once('=') else {
+            bail!("--env {e:?}: expected NAME=VALUE");
+        };
+        env.push((k.to_string(), Some(v.to_string())));
+    }
+    env.extend(unset.iter().map(|k| (k.clone(), None)));
+    let mut cmd = twr_runner::agents::exec_command(
+        &twr_runner::BoxEnv::user(),
+        runtime,
+        args,
+        path,
+        &env,
+        |k| std::env::var_os(k),
+        |why| {
+            note(&format!(
+                "twr: the login shell gave no PATH ({why}): looking for {runtime}'s program \
+                 on this one"
+            ))
+        },
+    )
+    .await?;
+    // Only returns when it could not run it.
+    let e = cmd.exec();
+    bail!("running {}: {e}", cmd.get_program().to_string_lossy())
 }
 
 /// `twr mcp`: the MCP server on stdio. Tracing goes to stderr only: stdout carries MCP.
@@ -6770,6 +7052,148 @@ mod tests {
         }
     }
 
+    /// The hub probes its own agent CLIs unless it is a test's, or `TWR_AGENT_PROBE=off`;
+    /// any other value leaves it on.
+    #[test]
+    fn the_hubs_own_agent_probe_can_be_turned_off() {
+        use std::ffi::OsStr;
+        assert!(probes_own_agents(false, None));
+        assert!(probes_own_agents(false, Some(OsStr::new("on"))));
+        assert!(probes_own_agents(false, Some(OsStr::new("OFF"))));
+        assert!(probes_own_agents(false, Some(OsStr::new(""))));
+        assert!(!probes_own_agents(false, Some(OsStr::new("off"))));
+        assert!(!probes_own_agents(true, None));
+    }
+
+    /// The box-side probes of `twr box doctor` / `twr box login`: `--agents` and `--login
+    /// <agent>` take no other runner flag and not each other; `--status` goes with the
+    /// relay's box and hub key only. Hidden from help.
+    #[test]
+    fn the_box_probe_flags_parse() {
+        let key = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let args: Vec<&str> = ["twr", "runner"].iter().chain(extra).copied().collect();
+            Cli::try_parse_from(args)
+        };
+        let c = parse(&["--agents"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                agents: true,
+                hub: None,
+                box_name: None,
+                login: None,
+                ..
+            })
+        ));
+        for agent in ["claude", "claude-code", "codex", "grok", "grok-build"] {
+            let c = parse(&["--login", agent]).unwrap();
+            assert!(
+                matches!(&c.cmd, Some(Cmd::Runner { login: Some(a), agents: false, .. }) if a == agent),
+                "{agent}"
+            );
+        }
+        let relay = ["--stdio", "--box=b", "--hub-key", key.as_str()];
+        let c = parse(&[&relay[..], &["--status"]].concat()).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stdio: true,
+                status: true,
+                stop: false,
+                ..
+            })
+        ));
+        for bad in [
+            vec!["--login", "acp"],
+            vec!["--login"],
+            vec!["--agents", "--login", "codex"],
+            vec!["--agents", "--box", "b"],
+            vec!["--agents", "--hub", "ws://h:1"],
+            vec!["--agents", "--hub", "ws://h:1", "--box", "b"],
+            vec!["--agents", "--data-dir", "/d"],
+            vec!["--agents", "--token-file", "/t"],
+            vec!["--agents", "--hub-key", key.as_str()],
+            [&relay[..], &["--agents"]].concat(),
+            vec!["--login", "claude", "--box", "b"],
+            vec!["--login", "claude", "--hub", "ws://h:1", "--box", "b"],
+            vec!["--login", "claude", "--allow-insecure"],
+            [&relay[..], &["--login", "codex"]].concat(),
+            vec!["--login", "claude", "--daemon"],
+            vec!["--status"],
+            vec!["--status", "--box", "b", "--hub-key", key.as_str()],
+            vec!["--hub", "ws://h:1", "--box", "b", "--status"],
+            [&relay[..], &["--status", "--stop"]].concat(),
+            [&relay[..], &["--status", "--replace"]].concat(),
+            [&relay[..], &["--status", "--build=0123456789abcdef"]].concat(),
+            vec!["--agents", "token"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        // `--exec` takes a built-in runtime, `--path` and the arguments after `--`, and no
+        // other runner flag.
+        let c = parse(&[
+            "--exec",
+            "claude-code",
+            "--path=bin:/usr/bin",
+            "--",
+            "--resume",
+            "s",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec: Some(r), exec_path: Some(p), exec_args, box_name: None, .. })
+                if r == "claude-code" && p == "bin:/usr/bin" && exec_args == &["--resume", "s"]
+        ));
+        let c = parse(&["--exec=codex", "--", "resume", "--model", "x"]).unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec: Some(r), exec_path: None, exec_args, exec_env, .. })
+                if r == "codex" && exec_args == &["resume", "--model", "x"] && exec_env.is_empty()
+        ));
+        // The thread's other variables, each in an argument of its own.
+        let c = parse(&[
+            "--exec=codex",
+            "--env=HOME=/x y",
+            "--env=A=b=c",
+            "--unset=CLAUDE_CODE_SIMPLE",
+            "--",
+            "resume",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec_env, exec_unset, exec_args, .. })
+                if exec_env == &["HOME=/x y", "A=b=c"]
+                    && exec_unset == &["CLAUDE_CODE_SIMPLE"]
+                    && exec_args == &["resume"]
+        ));
+        for bad in [
+            vec!["--exec", "acp", "--", "x"],
+            vec!["--exec", "codex", "--box", "b"],
+            vec!["--exec", "codex", "--agents"],
+            vec!["--exec", "codex", "--login", "codex"],
+            vec!["--exec", "codex", "--hub", "ws://h:1"],
+            [&relay[..], &["--exec", "codex"]].concat(),
+            vec!["--path", "/x"],
+            vec!["--env=A=b"],
+            vec!["--unset=A"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--env=A=b"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--", "x"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--path", "/x"],
+            vec!["--agents", "--", "x"],
+            vec!["--login", "codex", "--path", "/x"],
+            [&relay[..], &["--", "x"]].concat(),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        let help = cli_help_page().1;
+        for flag in ["--agents", "--login", "--status", "--exec"] {
+            assert!(!help.contains(flag), "{flag}");
+        }
+    }
+
     #[test]
     fn new_subcommands_parse() {
         let c = Cli::try_parse_from(["twr", "attach", "api", "--force"]).unwrap();
@@ -7147,6 +7571,21 @@ mod tests {
 
     /// `twr model` says what changed and when the runtime takes it, and shows the model and
     /// effort (and what a live runtime still runs with) with only the thread.
+    /// `twr thread new` and `twr model` print the hub's advisory (`warning`) to stderr; a
+    /// result without one prints nothing more.
+    #[test]
+    fn results_with_a_warning_say_it() {
+        let w = "box gpu reports no `codex` on its PATH; the thread may fail to start: run `twr \
+                 box doctor gpu`";
+        let made = json!({"id": "t1", "name": "api", "runtime": "codex", "warning": w});
+        assert_eq!(result_warning(&made), Some(format!("warning: {w}")));
+        let set = json!({"thread_name": "api", "changed": true, "model": "o3", "warning": w});
+        assert_eq!(result_warning(&set), Some(format!("warning: {w}")));
+        assert_eq!(result_warning(&json!({"id": "t1", "name": "api"})), None);
+        assert_eq!(result_warning(&json!({"warning": " "})), None);
+        assert_eq!(result_warning(&json!({"warning": 3})), None);
+    }
+
     #[test]
     fn model_outcomes_and_show() {
         let r = |applies: &str| {

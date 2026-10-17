@@ -2,7 +2,8 @@
 //! SSH (`[boxes.<name>] transport = "ssh"`, in `boxes.toml`) and adds it to the running hub
 //! (`box.add`); `list` and `status` show `hub.info`'s boxes; `install` puts a twr build on an
 //! SSH box (the hub's own, a release's for another OS or CPU, or a file) and has the hub
-//! connect again (`box.install`); `remove` takes a box out of `boxes.toml`.
+//! connect again (`box.install`); `remove` takes a box out of `boxes.toml`; `doctor` checks a
+//! box and `login` starts an agent CLI's login on it ([`doctor`]).
 //!
 //! The probes run ssh in the user's terminal, with the hub's ssh options but without
 //! `BatchMode` ([`twr_hub::ssh_box::interactive_ssh_args`]), so ssh can ask about an unknown
@@ -12,7 +13,7 @@
 //! `config.toml` and saved in one hold.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
@@ -29,6 +30,8 @@ use super::{
     ask_on_stderr, connect, consent, fetch_release_archive, is_release_tag, refuse_agent_action,
     str_of, table, wait_for_hub, workspace_hint, Consent, PrivateDir,
 };
+
+mod doctor;
 
 /// How long `twr box add` and `twr box install` wait for the box to come online.
 const ONLINE_WAIT: Duration = Duration::from_secs(90);
@@ -78,8 +81,9 @@ pub(super) enum BoxCmd {
         yes: bool,
     },
     /// List the hub's remote boxes: name, transport (`ssh`: the hub connects to it; `token`:
-    /// its runner connects to the hub), state, the twr version its runner reported, and its OS
-    /// and CPU (SSH boxes).
+    /// its runner connects to the hub), state, the twr version its runner reported, its OS
+    /// and CPU (SSH boxes), and its agent CLIs as it last reported them (`claude ✓`: logged
+    /// in, `✗`: logged out, `?`: not known, `-`: not installed).
     #[command(alias = "ls")]
     List {
         /// Print the boxes of `hub.info` as JSON.
@@ -87,7 +91,8 @@ pub(super) enum BoxCmd {
         json: bool,
     },
     /// Show what the hub knows of a box: its state, the twr version and build it runs, its
-    /// OS and CPU, the last error, its latest notes, and a connection the hub refused.
+    /// OS and CPU, the last error, its latest notes, a connection the hub refused, and its
+    /// agent CLIs (path, version, login).
     Status {
         /// The box's name.
         name: String,
@@ -120,6 +125,33 @@ pub(super) enum BoxCmd {
         /// The box's name.
         name: String,
     },
+    /// Check a box and say how to fix what is wrong: the hub's view of it (when a hub runs),
+    /// ssh without prompting (as the hub runs it) and in this terminal, the box's OS, CPU,
+    /// data directory and twr builds, its box daemon, logind (Linux), its agent CLIs (path,
+    /// version, login), git, free disk, and the projects configured for it. Works without a
+    /// hub and with the box offline. The checks on the box run the hub's twr build when it is
+    /// there, else the box's configured build, else the newest one there, and say which.
+    /// Never shows account details. Exits 1 when a check failed (✗).
+    Doctor {
+        /// The box's name.
+        name: String,
+        /// Print the checks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Start an agent CLI's own login on a box, in this terminal: `claude auth login`, `codex
+    /// login --device-auth` or `grok login --device-auth`, over ssh with a terminal, run by the
+    /// box's twr build (as `twr box doctor` picks it) on the program the box's runner would
+    /// start. twr never sees what you type. Then says whether the agent is logged in (the
+    /// box daemon's view through the hub when one runs, else the box's over ssh). Needs a
+    /// terminal.
+    Login {
+        /// The box's name.
+        name: String,
+        /// The agent: claude, codex or grok.
+        #[arg(value_parser = ["claude", "claude-code", "codex", "grok", "grok-build"])]
+        agent: String,
+    },
 }
 
 /// Runs `twr box ...` for the hub on `socket` of `paths`'s workspace, whose config (with
@@ -129,19 +161,26 @@ pub(super) async fn run(
     config: &Config,
     paths: &Paths,
     socket: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ExitCode> {
     match cmd {
         BoxCmd::Add { name, ssh, yes } => {
             let (ssh, yes) = destination(&ssh, yes);
-            add(config, paths, socket, &name, &ssh, yes).await
+            add(config, paths, socket, &name, &ssh, yes).await?
         }
-        BoxCmd::List { json } => list(socket, json).await,
-        BoxCmd::Status { name, json } => status(socket, &name, json).await,
+        BoxCmd::List { json } => list(socket, json).await?,
+        BoxCmd::Status { name, json } => status(socket, &name, json).await?,
         BoxCmd::Install { name, binary, yes } => {
-            install(config, paths, socket, &name, binary.as_deref(), yes).await
+            install(config, paths, socket, &name, binary.as_deref(), yes).await?
         }
-        BoxCmd::Remove { name } => remove(paths, socket, &name).await,
+        BoxCmd::Remove { name } => remove(paths, socket, &name).await?,
+        BoxCmd::Doctor { name, json } => {
+            return doctor::doctor(config, paths, socket, &name, json).await
+        }
+        BoxCmd::Login { name, agent } => {
+            return doctor::login(config, paths, socket, &name, &agent).await
+        }
     }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// The ssh destination of `twr box add`'s words, joined with spaces, and whether `--yes` was
@@ -169,10 +208,18 @@ fn default_workspace_only(paths: &Paths, cmd: &str) -> anyhow::Result<()> {
 }
 
 /// The hub's version and build: the running hub's (`hub.info`), else this twr's (the one a
-/// hub started now runs).
+/// hub started now runs). When whether a hub runs, or what it runs, is unknown (`unknown`),
+/// so is its build (`None`, never this twr's: a hub that runs may run another).
 struct HubBuild {
+    /// The running hub's version, else this twr's (also when unknown: only `label` shows it,
+    /// and says it is not known).
     version: String,
     build: Option<String>,
+    /// The runner protocol the hub's boxes must speak: the running hub's (`hub.info`
+    /// `runner_protocol`; `None` from a hub older than that field: not known), else this twr's
+    /// (no hub runs: a hub started now speaks it); `None` too when whether a hub runs is
+    /// unknown.
+    protocol: Option<u32>,
     /// `hub.info` of the running hub, when one answered.
     info: Option<Value>,
     /// Why whether a hub runs, or what it says, is unknown: something answers on the socket
@@ -207,11 +254,19 @@ impl HubBuild {
         }
     }
 
-    /// This twr's version and build (what a hub started now runs), `unknown` as given.
+    /// This twr's version and build (what a hub started now runs), `unknown` as given: then
+    /// the build is not known (`None`), nor the protocol.
     fn own(unknown: Option<String>) -> HubBuild {
         HubBuild {
             version: twr_core::version().to_string(),
-            build: twr_core::build_id().map(str::to_string),
+            build: unknown
+                .is_none()
+                .then(twr_core::build_id)
+                .flatten()
+                .map(str::to_string),
+            protocol: unknown
+                .is_none()
+                .then_some(twr_core::runner::PROTOCOL_VERSION),
             info: None,
             unknown,
         }
@@ -222,13 +277,19 @@ impl HubBuild {
         HubBuild {
             version: str_of(&info["version"]).to_string(),
             build: info["build"].as_str().map(str::to_string),
+            protocol: info["runner_protocol"]
+                .as_u64()
+                .and_then(|p| u32::try_from(p).ok()),
             info: Some(info),
             unknown: None,
         }
     }
 
-    /// `twr <version>, build <id>`.
+    /// `twr <version>, build <id>`; what is said of a hub whose build is unknown.
     fn label(&self) -> String {
+        if self.unknown.is_some() {
+            return "the running hub's, which it did not say".to_string();
+        }
         match &self.build {
             Some(b) => format!("twr {}, build {b}", self.version),
             None => format!("twr {}", self.version),
@@ -811,7 +872,7 @@ async fn list(socket: &Path, json: bool) -> anyhow::Result<()> {
 
 /// `twr box list`'s table of `hub.info` boxes `boxes`.
 fn list_text(boxes: &[Value]) -> String {
-    let rows: Vec<[String; 5]> = boxes
+    let rows: Vec<[String; 6]> = boxes
         .iter()
         .map(|b| {
             [
@@ -820,10 +881,77 @@ fn list_text(boxes: &[Value]) -> String {
                 str_of(&b["state"]).to_string(),
                 b["version"].as_str().unwrap_or("-").to_string(),
                 os_arch(b).unwrap_or_else(|| "-".into()),
+                agents_cell(&box_agents(b)),
             ]
         })
         .collect();
-    table(&["NAME", "TRANSPORT", "STATE", "VERSION", "OS/ARCH"], &rows)
+    table(
+        &["NAME", "TRANSPORT", "STATE", "VERSION", "OS/ARCH", "AGENTS"],
+        &rows,
+    )
+}
+
+/// The agents of a `hub.info` box entry (or of `box.agents`) `b`, as the box last reported
+/// them: none when it has not.
+fn box_agents(b: &Value) -> Vec<twr_core::runner::AgentInfo> {
+    serde_json::from_value(b["agents"].clone()).unwrap_or_default()
+}
+
+/// The command an agent runtime is known by (`claude-code`: `claude`), else the runtime.
+fn agent_name(runtime: &str) -> &str {
+    twr_adapters::resolve::BUILTIN_AGENTS
+        .iter()
+        .find(|(r, ..)| *r == runtime)
+        .map_or(runtime, |(_, command, _)| command)
+}
+
+/// `twr box list`'s AGENTS cell: each agent's command and a mark (`claude ✓ codex ✗ grok ?`:
+/// logged in, logged out, not known; `-`: not installed), or `-` when the box reported none.
+fn agents_cell(agents: &[twr_core::runner::AgentInfo]) -> String {
+    if agents.is_empty() {
+        return "-".into();
+    }
+    agents
+        .iter()
+        .map(|a| format!("{} {}", agent_name(&a.runtime), login_mark(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// [`agents_cell`]'s mark of agent `a`.
+fn login_mark(a: &twr_core::runner::AgentInfo) -> &'static str {
+    use twr_core::runner::AgentLogin;
+    match (a.found, a.login) {
+        (false, _) => "-",
+        (true, AgentLogin::LoggedIn) => "✓",
+        (true, AgentLogin::LoggedOut) => "✗",
+        (true, AgentLogin::Unknown) => "?",
+    }
+}
+
+/// Agent `a` in a sentence (`logged in (claude.ai), 2.1.3 (Claude Code), at /usr/bin/claude`;
+/// `not installed (not found on PATH)`), without its name. Only what the probe keeps: no
+/// account detail.
+fn agent_said(a: &twr_core::runner::AgentInfo) -> String {
+    use twr_core::runner::AgentLogin;
+    if !a.found {
+        return match &a.note {
+            Some(n) => format!("not installed ({n})"),
+            None => "not installed".to_string(),
+        };
+    }
+    let mut parts = vec![match (a.login, &a.method) {
+        (AgentLogin::LoggedIn, Some(m)) => format!("logged in ({m})"),
+        (AgentLogin::LoggedIn, None) => "logged in".to_string(),
+        (AgentLogin::LoggedOut, _) => "logged out".to_string(),
+        (AgentLogin::Unknown, _) => match &a.note {
+            Some(n) => format!("login not known ({n})"),
+            None => "login not known".to_string(),
+        },
+    }];
+    parts.extend(a.version.clone());
+    parts.extend(a.path.as_ref().map(|p| format!("at {p}")));
+    parts.join(", ")
 }
 
 /// A box entry's OS and CPU as Rust names them where twr knows them (`linux/x86_64`).
@@ -902,6 +1030,19 @@ fn status_text(b: &Value) -> String {
             "refused:",
             &format!("{}: {}", super::trash_time(&r["at"]), str_of(&r["reason"])),
         );
+    }
+    let agents = box_agents(b);
+    if agents.is_empty() {
+        line("agents:", "- (not reported yet)");
+    } else {
+        out.push_str("agents:         (as the box last reported them)\n");
+        for a in &agents {
+            out.push_str(&format!(
+                "  {}: {}\n",
+                agent_name(&a.runtime),
+                agent_said(a)
+            ));
+        }
     }
     let notes = b["notes"].as_array().cloned().unwrap_or_default();
     if !notes.is_empty() {
@@ -1382,6 +1523,10 @@ mod tests {
         let hub = HubBuild::of_running(&socket).await;
         assert!(hub.info.is_none());
         assert!(hub.unknown.is_some(), "a mute hub is no absent one");
+        // Nor is its build this twr's: it may run another.
+        assert_eq!(hub.build, None);
+        assert_eq!(hub.protocol, None);
+        assert!(hub.label().contains("did not say"), "{}", hub.label());
         mute.abort();
     }
 
@@ -1475,18 +1620,34 @@ mod tests {
     #[test]
     fn list_and_status_show_the_boxes() {
         let ssh = json!({"name": "gpu", "transport": "ssh", "state": "online", "online": true,
-            "version": "0.2.0", "build": "0123456789abcdef", "os": "Linux", "arch": "x86_64",
-            "last_error": null, "notes": ["twr-box: started the box daemon 0123456789abcdef"],
-            "switch_pending": false, "refused": null});
+        "version": "0.2.0", "build": "0123456789abcdef", "os": "Linux", "arch": "x86_64",
+        "last_error": null, "notes": ["twr-box: started the box daemon 0123456789abcdef"],
+        "switch_pending": false, "refused": null,
+        "agents": [
+            {"runtime": "claude-code", "found": true, "path": "/home/me/.local/bin/claude",
+             "version": "2.1.0 (Claude Code)", "login": "logged_in", "method": "claude.ai"},
+            {"runtime": "codex", "found": true, "path": "/usr/bin/codex",
+             "login": "logged_out"},
+            {"runtime": "grok-build", "found": false, "login": "unknown",
+             "note": "not found on PATH"}
+        ]});
         let token = json!({"name": "mac", "transport": "token", "state": "offline",
             "online": false, "version": null, "os": null, "arch": null, "last_error": null,
             "notes": null, "switch_pending": null,
-            "refused": {"at": "2026-10-16T09:30:12.345Z", "reason": "a bad proof"}});
+            "refused": {"at": "2026-10-16T09:30:12.345Z", "reason": "a bad proof"},
+            "agents": []});
         assert_eq!(
             list_text(&[ssh.clone(), token.clone()]),
-            "NAME  TRANSPORT  STATE    VERSION  OS/ARCH\n\
-             gpu   ssh        online   0.2.0    linux/x86_64\n\
-             mac   token      offline  -        -\n"
+            "NAME  TRANSPORT  STATE    VERSION  OS/ARCH       AGENTS\n\
+             gpu   ssh        online   0.2.0    linux/x86_64  claude ✓ codex ✗ grok -\n\
+             mac   token      offline  -        -             -\n"
+        );
+        // A login twr does not know is `?`.
+        let unknown = json!([{"runtime": "grok-build", "found": true, "login": "unknown"},
+            {"runtime": "other", "found": true, "login": "something-new"}]);
+        assert_eq!(
+            agents_cell(&box_agents(&json!({ "agents": unknown }))),
+            "grok ? other ?"
         );
         let s = status_text(&ssh);
         assert!(s.contains("state:          online\n"), "{s}");
@@ -1495,6 +1656,16 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("os/arch:        linux/x86_64\n"), "{s}");
+        assert!(
+            s.contains(
+                "agents:         (as the box last reported them)\n  \
+                 claude: logged in (claude.ai), 2.1.0 (Claude Code), at \
+                 /home/me/.local/bin/claude\n  \
+                 codex: logged out, at /usr/bin/codex\n  \
+                 grok: not installed (not found on PATH)\n"
+            ),
+            "{s}"
+        );
         assert!(
             s.ends_with("notes:          (newest last)\n  twr-box: started the box daemon 0123456789abcdef\n"),
             "{s}"
@@ -1509,6 +1680,7 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("version:        - (never connected)\n"), "{t}");
+        assert!(t.contains("agents:         - (not reported yet)\n"), "{t}");
     }
 
     #[test]

@@ -1814,6 +1814,132 @@ impl DecisionLog {
     }
 }
 
+/// A remote box as the hub last said it (`hub.info`'s `boxes`, polled every
+/// [`crate::INFO_EVERY`]), with what `runner.connected` / `runner.disconnected` changed since:
+/// what a thread's box token says ([`BoxStatus::word`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoxStatus {
+    /// `online`, `switching`, `connecting`, `offline`, `needs_install` or `error`.
+    pub state: String,
+    /// A runner of the box is connected.
+    pub online: bool,
+    /// The connected runner's twr version.
+    pub version: Option<String>,
+    /// The build the box's daemon runs (an SSH box's).
+    pub running_build: Option<String>,
+    /// The box runs another build of the hub's protocol, switched once it is quiet.
+    pub switch_pending: bool,
+    /// Why the box's last runner was refused, while none is connected.
+    pub refused: Option<String>,
+    /// The box's runner, or the build the hub would launch there, speaks another runner
+    /// protocol than the hub: its refusal or last error says so ([`names_protocol`]). Another
+    /// build or version alone is not a mismatch.
+    pub protocol_mismatch: bool,
+}
+
+/// What a thread's box token adds after `@box` when the box is not simply online
+/// ([`BoxStatus::word`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxWord {
+    /// The hub is switching the box to another build: its threads wait.
+    Switching,
+    /// The box runs another build of the same protocol, switched once quiet.
+    UpdatePending,
+    /// Its runner speaks another runner protocol than the hub.
+    Mismatch,
+    /// It needs `twr box install`.
+    NeedsInstall,
+    /// The hub cannot dial it (its box key).
+    Error,
+    /// The hub has no such box (removed since its threads were made): its threads cannot
+    /// run.
+    NotConfigured,
+    /// The hub is connecting to it.
+    Reconnecting,
+    /// No runner of it is connected.
+    Offline,
+}
+
+impl BoxWord {
+    /// The word as the token says it.
+    pub fn text(self) -> &'static str {
+        match self {
+            BoxWord::Switching => "switching",
+            BoxWord::UpdatePending => "update pending",
+            BoxWord::Mismatch => "twr mismatch",
+            BoxWord::NeedsInstall => "needs install",
+            BoxWord::Error => "error",
+            BoxWord::NotConfigured => "not configured",
+            BoxWord::Reconnecting => "reconnecting",
+            BoxWord::Offline => "offline",
+        }
+    }
+}
+
+impl BoxStatus {
+    /// The box as one entry of `hub.info`'s `boxes`.
+    fn from_info(b: &Value) -> BoxStatus {
+        let text = |v: &Value| v.as_str().map(str::to_string);
+        let refused = text(&b["refused"]["reason"]);
+        let last_error = text(&b["last_error"]);
+        let protocol_mismatch = refused
+            .iter()
+            .chain(last_error.iter())
+            .any(|s| names_protocol(s));
+        BoxStatus {
+            state: text(&b["state"]).unwrap_or_default(),
+            online: b["online"].as_bool() == Some(true),
+            version: text(&b["version"]),
+            running_build: text(&b["running_build"]),
+            switch_pending: b["switch_pending"].as_bool() == Some(true),
+            refused,
+            protocol_mismatch,
+        }
+    }
+
+    /// What its token says after `@box`: nothing when it is online with nothing pending;
+    /// else, first of these, `switching`, `update pending`, then why it is not online
+    /// (`twr mismatch`, `needs install`, `error`, `reconnecting`, `offline`).
+    pub fn word(&self) -> Option<BoxWord> {
+        if self.state == "switching" {
+            return Some(BoxWord::Switching);
+        }
+        if self.switch_pending {
+            return Some(BoxWord::UpdatePending);
+        }
+        // A state this TUI does not know goes by whether the box is online.
+        let known = ["needs_install", "error", "connecting", "offline"];
+        if self.state == "online" || (self.online && !known.contains(&self.state.as_str())) {
+            return None;
+        }
+        // `needs install` says what to do, so it wins over the mismatch that caused it (a
+        // build of another target that speaks an older protocol).
+        if self.state == "needs_install" {
+            return Some(BoxWord::NeedsInstall);
+        }
+        if self.protocol_mismatch {
+            return Some(BoxWord::Mismatch);
+        }
+        Some(match self.state.as_str() {
+            "error" => BoxWord::Error,
+            "connecting" => BoxWord::Reconnecting,
+            _ => BoxWord::Offline,
+        })
+    }
+}
+
+/// Whether `t` runs on a remote box (not the hub's own, `local`): its box token shows.
+pub fn on_remote_box(t: &ThreadView) -> bool {
+    !t.box_name.is_empty() && t.box_name != "local"
+}
+
+/// Whether `s` names a runner protocol (`speaks protocol 6`, `speaking protocol 6`): the hub's
+/// words for a runner refused for its protocol, or a build that would be.
+fn names_protocol(s: &str) -> bool {
+    s.match_indices("protocol ")
+        .any(|(i, m)| s[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Everything the renderer needs.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -1849,8 +1975,21 @@ pub struct AppState {
     /// The boxes low on disk, with their free bytes (`hub.info`'s `disk`, polled): the status
     /// bar says so.
     pub disk_low: Vec<(String, u64)>,
+    /// The hub's remote boxes, by name ([`BoxStatus`]): what a thread's box token says.
+    pub boxes: BTreeMap<String, BoxStatus>,
+    /// A `hub.info` answer listed the hub's boxes ([`AppState::apply_boxes`]): a remote box
+    /// missing from [`AppState::boxes`] since is not configured, not merely undescribed.
+    pub boxes_known: bool,
     /// A `hub.info` poll is on its way: the next one waits for it.
-    pub disk_pending: bool,
+    pub info_pending: bool,
+    /// How many live `runner.connected` / `runner.disconnected` events were applied: the
+    /// order of those against the `hub.info` polls ([`AppState::send_info`]).
+    pub live_seq: u64,
+    /// Each box's last live runner event, by [`AppState::live_seq`].
+    pub box_live: BTreeMap<String, u64>,
+    /// [`AppState::live_seq`] when the `hub.info` poll on its way was sent: its answer says
+    /// nothing newer of a box than a live event after that.
+    pub info_sent: u64,
     /// Attention revisions known only by their capped preview, by attention id
     /// ([`Incomplete`]).
     pub incomplete: BTreeMap<String, Incomplete>,
@@ -2162,6 +2301,8 @@ impl AppState {
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
             EventBody::ThreadDeleted(p) => self.forget_thread(&ev.thread, p),
+            EventBody::RunnerConnected(p) => self.apply_runner(true, p),
+            EventBody::RunnerDisconnected(p) => self.apply_runner(false, p),
             EventBody::ThreadRenamed(p) if self.catch_up.is_none() => {
                 self.view.status = Some(format!("{} is now {}", p.previous, p.name));
             }
@@ -2188,6 +2329,92 @@ impl AppState {
             && self.registry.list().iter().any(|t| t.is_orchestrator())
         {
             self.view.picker = None;
+        }
+    }
+
+    /// What `t`'s box token says after `@box` ([`BoxStatus::word`]): nothing for a box online
+    /// with nothing pending or a local thread; `not configured` for a box the hub's boxes
+    /// ([`AppState::boxes_known`]) do not name, and nothing for one before the TUI knows them.
+    pub fn box_word(&self, t: &ThreadView) -> Option<BoxWord> {
+        if !on_remote_box(t) {
+            return None;
+        }
+        match self.boxes.get(&t.box_name) {
+            Some(b) => b.word(),
+            None => self.boxes_known.then_some(BoxWord::NotConfigured),
+        }
+    }
+
+    /// A `hub.info` poll is to be sent, unless one is on its way (`false` then): records when
+    /// ([`AppState::info_sent`]), so its answer does not undo a live runner event that comes
+    /// after it.
+    pub fn send_info(&mut self) -> bool {
+        if self.info_pending {
+            return false;
+        }
+        self.info_pending = true;
+        self.info_sent = self.live_seq;
+        true
+    }
+
+    /// Takes the boxes of `hub.info`'s answer `info` ([`AppState::boxes`]); an answer without
+    /// them (a failed poll, an older hub) changes nothing. A box whose runner connected or
+    /// left after the poll was sent ([`AppState::box_live`]) keeps what that event said when
+    /// the answer disagrees on whether it is online (the answer is older), and stays when the
+    /// answer does not name it; otherwise the answer's entry replaces it, and a box it does not
+    /// name goes.
+    pub fn apply_boxes(&mut self, info: &Value) {
+        let Some(boxes) = info["boxes"].as_array() else {
+            return;
+        };
+        self.boxes_known = true;
+        let sent = self.info_sent;
+        let newer = |name: &str| self.box_live.get(name).is_some_and(|s| *s > sent);
+        let mut next: BTreeMap<String, BoxStatus> = BTreeMap::new();
+        for b in boxes {
+            let Some(name) = b["name"].as_str() else {
+                continue;
+            };
+            let said = BoxStatus::from_info(b);
+            let entry = match self.boxes.get(name) {
+                Some(live) if newer(name) && live.online != said.online => live.clone(),
+                _ => said,
+            };
+            next.insert(name.to_string(), entry);
+        }
+        for (name, live) in &self.boxes {
+            if !next.contains_key(name) && newer(name) {
+                next.insert(name.clone(), live.clone());
+            }
+        }
+        self.boxes = next;
+    }
+
+    /// A box's runner connected or left (`runner.connected` / `runner.disconnected`), told
+    /// before the next `hub.info` poll: the box is online, or offline. A box being switched
+    /// stays `switching` while its runner is away; one that comes back is on its new build.
+    /// Not during the replay: those are past connections, and `hub.info` says the present.
+    fn apply_runner(&mut self, connected: bool, runner: &twr_core::event::RunnerPayload) {
+        if self.catch_up.is_some() {
+            return;
+        }
+        self.live_seq += 1;
+        self.box_live.insert(runner.box_name.clone(), self.live_seq);
+        let b = self.boxes.entry(runner.box_name.clone()).or_default();
+        if connected {
+            if b.state == "switching" {
+                b.switch_pending = false;
+            }
+            b.state = "online".into();
+            b.online = true;
+            b.version = runner.version.clone().or(b.version.take());
+            b.refused = None;
+            b.protocol_mismatch = false;
+        } else {
+            if b.state != "switching" {
+                b.state = "offline".into();
+            }
+            b.online = false;
         }
     }
 
@@ -2327,7 +2554,7 @@ impl AppState {
             }
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
-                self.disk_pending = false;
+                self.info_pending = false;
                 if let Some(disk) = result["disk"].as_object() {
                     self.disk_low = disk
                         .iter()
@@ -2335,6 +2562,7 @@ impl AppState {
                         .filter_map(|(b, d)| Some((b.clone(), d["free"].as_u64()?)))
                         .collect();
                 }
+                self.apply_boxes(result);
             }
             // A failed call arrives as null: only the next poll is let go.
             "thread.activity" => {
@@ -9087,6 +9315,263 @@ pub(crate) mod tests {
         assert!(st.view.pins.is_empty());
         assert!(type_line(&mut st, "/pin orch").is_empty());
         assert_eq!(st.view.status.as_deref(), Some("no thread orch"));
+    }
+
+    /// One `hub.info` box: online unless `state` says otherwise.
+    pub(crate) fn info_box(name: &str, state: &str) -> Value {
+        serde_json::json!({
+            "name": name, "transport": "ssh", "state": state,
+            "online": state == "online" || state == "switching",
+            "version": "0.2.0", "refused": null, "last_error": null, "notes": [],
+            "os": "Linux", "arch": "x86_64", "build": "aaaa", "running_build": "aaaa",
+            "switch_pending": false, "agents": [],
+        })
+    }
+
+    /// What a box's token says, by its `hub.info` entry: `switching` first, then `update
+    /// pending`, then why it is not online; a protocol mismatch only from a refusal or error
+    /// that names a protocol, never from another build or version alone.
+    #[test]
+    fn a_box_word_follows_its_hub_info_entry() {
+        let word = |b: Value| BoxStatus::from_info(&b).word();
+        let with = |mut b: Value, k: &str, v: Value| {
+            b[k] = v;
+            b
+        };
+        assert_eq!(word(info_box("gpu", "online")), None);
+        // A box of another OS and CPU on another build and version, online: plain.
+        let cross = with(
+            with(info_box("mac", "online"), "running_build", "bbbb".into()),
+            "version",
+            "0.1.9".into(),
+        );
+        let cross = with(cross, "os", "Darwin".into());
+        assert_eq!(word(cross), None);
+        // A token box (no SSH fields) online, and offline.
+        let token = serde_json::json!({
+            "name": "pi", "transport": "token", "state": "online", "online": true,
+            "version": "0.2.0", "refused": null, "last_error": null, "notes": null,
+            "switch_pending": null, "agents": [],
+        });
+        assert_eq!(word(token.clone()), None);
+        let token = with(
+            with(token, "state", "offline".into()),
+            "online",
+            false.into(),
+        );
+        assert_eq!(word(token.clone()), Some(BoxWord::Offline));
+        // Refused for its protocol: a mismatch.
+        let refused = serde_json::json!({"at": "2026-10-17T10:00:00Z", "reason":
+            "a runner speaking protocol 6 was refused (the hub's is 7): update twr on box `pi`"});
+        assert_eq!(
+            word(with(token.clone(), "refused", refused)),
+            Some(BoxWord::Mismatch)
+        );
+        // Refused for its token: offline, not a mismatch.
+        let bad_token = serde_json::json!({"at": "2026-10-17T10:00:00Z", "reason":
+            "a runner was refused: its proof does not match this box's token"});
+        assert_eq!(
+            word(with(token, "refused", bad_token)),
+            Some(BoxWord::Offline)
+        );
+        // An online box being switched; one with a switch pending.
+        assert_eq!(word(info_box("gpu", "switching")), Some(BoxWord::Switching));
+        let pending = with(info_box("gpu", "online"), "switch_pending", true.into());
+        assert_eq!(word(pending.clone()), Some(BoxWord::UpdatePending));
+        // Switching wins over pending, pending over offline.
+        let both = with(info_box("gpu", "switching"), "switch_pending", true.into());
+        assert_eq!(word(both), Some(BoxWord::Switching));
+        let away = with(
+            with(pending, "state", "offline".into()),
+            "online",
+            false.into(),
+        );
+        assert_eq!(word(away), Some(BoxWord::UpdatePending));
+        for (state, want) in [
+            ("needs_install", BoxWord::NeedsInstall),
+            ("error", BoxWord::Error),
+            ("offline", BoxWord::Offline),
+            ("connecting", BoxWord::Reconnecting),
+        ] {
+            assert_eq!(word(info_box("gpu", state)), Some(want), "{state}");
+        }
+        // A cross-target box whose build speaks another protocol: `needs install` (what to do)
+        // wins over the mismatch that caused it.
+        let old = with(
+            info_box("mac", "needs_install"),
+            "last_error",
+            "box mac runs a twr build that speaks protocol 6, the hub 7: install this hub's \
+             build there: `twr box install mac`"
+                .into(),
+        );
+        assert_eq!(word(old), Some(BoxWord::NeedsInstall));
+        // An error that only mentions a protocol in passing is not one.
+        let ssh = with(
+            info_box("gpu", "offline"),
+            "last_error",
+            "ssh: the protocol banner was not read".into(),
+        );
+        assert_eq!(word(ssh), Some(BoxWord::Offline));
+    }
+
+    /// A thread on a box the hub's boxes do not name (removed since) is `not configured` once
+    /// a `hub.info` answer listed them, and says nothing before (no answer yet, or answers
+    /// without boxes); a box added back, or whose runner connects, is itself again. A local
+    /// thread never has a word.
+    #[test]
+    fn a_box_missing_from_the_hub_is_not_configured() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        let mut job = ThreadScript::new("t-job");
+        let mut created = job.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.box_name = "gpu".into();
+        }
+        let mut loc = ThreadScript::new("t-loc");
+        let mut local = loc.created("loc");
+        if let EventBody::ThreadCreated(p) = &mut local.body {
+            p.box_name = "local".into();
+        }
+        control(&mut st, &[created, local]);
+        let word = |st: &AppState, id: &str| st.box_word(st.registry.get(id).unwrap());
+        assert_eq!(word(&st, "t-job"), None);
+        st.apply_result("hub.info", &Value::Null);
+        st.apply_result("hub.info", &serde_json::json!({ "disk": {} }));
+        assert!(!st.boxes_known);
+        assert_eq!(word(&st, "t-job"), None);
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({ "boxes": [info_box("pi", "online")] }),
+        );
+        assert!(st.boxes_known);
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        assert_eq!(word(&st, "t-loc"), None);
+        // A failed poll after it changes nothing; an empty list leaves it unconfigured.
+        st.apply_result("hub.info", &Value::Null);
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [] }));
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        assert_eq!(word(&st, "t-loc"), None);
+        // Added back.
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({ "boxes": [info_box("gpu", "offline")] }),
+        );
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::Offline));
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [] }));
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        // Its runner connecting before the next poll names it.
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let up = hub.event(EventBody::RunnerConnected(RunnerPayload {
+            box_name: "gpu".into(),
+            ..Default::default()
+        }));
+        control(&mut st, &[up]);
+        assert_eq!(word(&st, "t-job"), None);
+        assert_eq!(BoxWord::NotConfigured.text(), "not configured");
+    }
+
+    /// `hub.info` polls replace the boxes (a failed one keeps them); `runner.connected` and
+    /// `runner.disconnected` change a box at once between polls, but not during the replay.
+    #[test]
+    fn runner_events_change_a_box_between_polls() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")], "disk": {}}),
+        );
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        st.apply_result("hub.info", &Value::Null);
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let runner = |name: &str| RunnerPayload {
+            box_name: name.into(),
+            version: Some("0.2.1".into()),
+            ..Default::default()
+        };
+        let up = hub.event(EventBody::RunnerConnected(runner("gpu")));
+        let down = hub.event(EventBody::RunnerDisconnected(runner("gpu")));
+        control(&mut st, std::slice::from_ref(&up));
+        assert_eq!(st.boxes["gpu"].word(), None);
+        assert_eq!(st.boxes["gpu"].version.as_deref(), Some("0.2.1"));
+        control(&mut st, std::slice::from_ref(&down));
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // A box being switched stays so while its runner is away; back, it is on its build.
+        let mut switching = info_box("gpu", "switching");
+        switching["switch_pending"] = true.into();
+        assert!(st.send_info());
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [switching] }));
+        control(&mut st, std::slice::from_ref(&down));
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Switching));
+        control(&mut st, std::slice::from_ref(&up));
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // A box live-added since the last poll.
+        let new = hub.event(EventBody::RunnerConnected(runner("pi")));
+        control(&mut st, &[new]);
+        assert_eq!(st.boxes["pi"].word(), None);
+        // The replay's connections are past ones.
+        let mut st = AppState::new();
+        st.apply_boxes(&serde_json::json!({"boxes": [info_box("gpu", "online")]}));
+        st.begin_catch_up(10);
+        control(&mut st, &[down]);
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // A poll says which boxes there are: one removed goes.
+        assert!(st.send_info());
+        st.apply_result("hub.info", &serde_json::json!({"boxes": []}));
+        assert!(st.boxes.is_empty());
+    }
+
+    /// A `hub.info` answer does not undo a runner event newer than its request: a poll sent
+    /// before a disconnect, answered after it, leaves the box offline (and one it no longer
+    /// names but the event did, there); a poll sent after the event applies; an answer that
+    /// agrees on the box being online or not applies whenever it was sent.
+    #[test]
+    fn an_older_poll_does_not_undo_a_runner_event() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let runner = |name: &str| RunnerPayload {
+            box_name: name.into(),
+            ..Default::default()
+        };
+        let online = || serde_json::json!({"boxes": [info_box("gpu", "online")]});
+        assert!(st.send_info());
+        st.apply_result("hub.info", &online());
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // Sent while online, answered after the box left.
+        assert!(st.send_info());
+        assert!(!st.send_info(), "one poll at a time");
+        let down = hub.event(EventBody::RunnerDisconnected(runner("gpu")));
+        control(&mut st, &[down]);
+        st.apply_result("hub.info", &online());
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // A box added after the poll was sent, which its answer does not name yet, stays.
+        assert!(st.send_info());
+        let pi_up = hub.event(EventBody::RunnerConnected(runner("pi")));
+        control(&mut st, &[pi_up]);
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")]}),
+        );
+        assert_eq!(st.boxes["pi"].word(), None);
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // An older answer that agrees still applies (what it adds: its state, version...).
+        assert!(st.send_info());
+        let up = hub.event(EventBody::RunnerConnected(runner("gpu")));
+        control(&mut st, &[up]);
+        let mut newer = info_box("gpu", "online");
+        newer["version"] = "0.2.9".into();
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [newer] }));
+        assert_eq!(st.boxes["gpu"].version.as_deref(), Some("0.2.9"));
+        // A poll sent after the event applies, whatever it says.
+        assert!(st.send_info());
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")]}),
+        );
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        assert!(!st.boxes.contains_key("pi"));
     }
 
     #[test]

@@ -40,7 +40,10 @@
 //!    runner's). A daemon that speaks another runner protocol was refused at its hello: the
 //!    next attempt passes `--replace` at once, so the relay replaces it with the build the hub
 //!    launches (its runtimes end; the reconciliation closes their threads with crash cards).
-//!    A daemon of another build that speaks the same protocol is served as it is and marked
+//!    When the build launched is the one refused (a box of another OS or CPU whose configured
+//!    build speaks another protocol, after a twr upgrade), it is not launched again: the box
+//!    is `needs_install` ("box <b> runs a twr build that speaks protocol <n>, the hub <m>:
+//!    install this hub's build there"), as when it has no build. A daemon of another build that speaks the same protocol is served as it is and marked
 //!    `switch_pending`, until the hub switches it (below). An attempt that is to replace the
 //!    daemon and fails before a session keeps that for the next one.
 //!
@@ -294,6 +297,17 @@ pub fn interactive_ssh_args(ssh: &str, remote: &str) -> Result<Vec<String>, Stri
     ssh_args_with(&options, ssh, remote)
 }
 
+/// [`interactive_ssh_args`] with a terminal on the box (`-t` instead of `-T`), for a command
+/// that talks to the user (`twr box login`, run with ssh's stdin, stdout and stderr the
+/// user's terminal): the other forced options and the refusals of the box's words stay.
+pub fn terminal_ssh_args(ssh: &str, remote: &str) -> Result<Vec<String>, String> {
+    let mut args = interactive_ssh_args(ssh, remote)?;
+    if let Some(t) = args.iter_mut().find(|a| *a == "-T") {
+        *t = "-t".to_string();
+    }
+    Ok(args)
+}
+
 fn ssh_args_with(options: &[&str], ssh: &str, remote: &str) -> Result<Vec<String>, String> {
     let words = ssh_words(ssh)?;
     Ok(options
@@ -347,48 +361,9 @@ impl Ssh {
 
 /// Waits for `child`, spawned as the leader of a process group of its own, to exit, kills
 /// what is left of that group (helpers a `ProxyCommand` or an ssh wrapper started there,
-/// which would otherwise outlive it), then reaps it: its exit status. The group is killed
-/// while the child is not reaped yet (it waits with `WNOWAIT`): until then its pid, which is
-/// the group's id, cannot name another process or group. Without that wait (it fails), the
-/// child is reaped without the kill.
-pub async fn finish_group(child: &mut Child) -> std::io::Result<std::process::ExitStatus> {
-    if let Some(pid) = child.id() {
-        let exited = tokio::task::spawn_blocking(move || exited_unreaped(pid)).await;
-        if matches!(exited, Ok(Ok(()))) {
-            // SAFETY: kill(2) with a negative pid signals that process group; no memory is
-            // passed. The group's id is the unreaped child's pid.
-            unsafe {
-                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-            }
-        }
-    }
-    child.wait().await
-}
-
-/// Blocks until process `pid` (a child of this process) has exited, without reaping it.
-fn exited_unreaped(pid: u32) -> std::io::Result<()> {
-    loop {
-        // SAFETY: an all-zero `siginfo_t` is a valid value; waitid(2) writes into it.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waitid(2) with a valid pointer to `info`; WNOWAIT leaves the child
-        // waitable (tokio reaps it).
-        let r = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if r == 0 {
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.kind() != std::io::ErrorKind::Interrupted {
-            return Err(e);
-        }
-    }
-}
+/// which would otherwise outlive it), then reaps it: shared with the box's probes
+/// ([`twr_adapters::process::finish_group`]).
+pub use twr_adapters::process::finish_group;
 
 impl Drop for Ssh {
     fn drop(&mut self) {
@@ -1856,7 +1831,11 @@ async fn dialed(
 
 /// How a session with box `name`'s daemon (launched: build `id`) that ended as `end` went for
 /// the next attempt: it replaces the daemon after a switch began (`switched`), and when the
-/// daemon spoke another protocol and is not the launched build (see the module docs).
+/// daemon spoke another protocol and is not the launched build (see the module docs). When the
+/// launched build itself speaks another protocol (a box of another OS or CPU whose configured
+/// build is older or newer than the hub), launching it again would only be refused again: the
+/// box needs this hub's build installed (`needs_install`, looked at again every
+/// [`INSTALL_RETRY`] or when `box.install` wakes the supervisor).
 fn session_ended(
     name: &str,
     id: &str,
@@ -1870,6 +1849,16 @@ fn session_ended(
         ..
     } = end;
     if let Some(p) = protocol_refused {
+        if hello.build.as_deref() == Some(id) {
+            return Attempt::Failed(
+                State::NeedsInstall,
+                format!(
+                    "box {name} runs a twr build that speaks protocol {p}, the hub {}: install \
+                     this hub's build there: `twr box install {name}`",
+                    twr_core::runner::PROTOCOL_VERSION
+                ),
+            );
+        }
         tracing::warn!(box_name = %name, protocol = p, daemon = ?hello.build, launched = id, "the box's daemon speaks another runner protocol: replacing it");
     }
     let replace = switched || (protocol_refused.is_some() && hello.build.as_deref() != Some(id));
@@ -2152,6 +2141,13 @@ mod tests {
             interactive_ssh_args("-p 2222  me@gpu", &remote).unwrap(),
             interactive
         );
+        // `twr box login`'s: the same with a terminal on the box.
+        let mut terminal = interactive.clone();
+        terminal[0] = "-t".to_string();
+        assert_eq!(
+            terminal_ssh_args("-p 2222  me@gpu", &remote).unwrap(),
+            terminal
+        );
         // Words that would forward something or change how ssh runs are refused, by every
         // builder.
         for bad in [
@@ -2162,6 +2158,7 @@ mod tests {
         ] {
             assert!(ssh_args(bad, &remote).is_err(), "{bad}");
             assert!(interactive_ssh_args(bad, &remote).is_err(), "{bad}");
+            assert!(terminal_ssh_args(bad, &remote).is_err(), "{bad}");
             assert!(ssh_command(bad, &remote).is_err(), "{bad}");
         }
         // Every variable part is quoted: a data directory with a quote, spaces or `$` stays
@@ -3208,6 +3205,62 @@ mod tests {
         n = next_refused_replaces(n, true, true);
         assert_eq!((n, replace_at_once(n, true)), (0, true));
         assert!(!replace_at_once(0, false));
+    }
+
+    /// A daemon refused for its protocol is replaced by the launched build, unless it is the
+    /// launched build (a cross-target box's configured one, from before a protocol bump):
+    /// then the box needs an install, and nothing is launched again meanwhile.
+    #[test]
+    fn a_launched_build_of_another_protocol_needs_an_install() {
+        let hello = |build: &str| DaemonHello {
+            v: 1,
+            box_name: "gpu".into(),
+            nonce: String::new(),
+            eph: String::new(),
+            build: Some(build.into()),
+        };
+        let refused = || SealedEnd {
+            protocol_refused: Some(6),
+            ..Default::default()
+        };
+        let launched = "00000000000000c6";
+        match session_ended("gpu", launched, refused(), &hello(launched), false) {
+            Attempt::Failed(State::NeedsInstall, why) => assert_eq!(
+                why,
+                format!(
+                    "box gpu runs a twr build that speaks protocol 6, the hub {}: install this \
+                     hub's build there: `twr box install gpu`",
+                    twr_core::runner::PROTOCOL_VERSION
+                )
+            ),
+            _ => panic!("not needs_install"),
+        }
+        assert!(matches!(
+            session_ended(
+                "gpu",
+                launched,
+                refused(),
+                &hello("00000000000000b5"),
+                false
+            ),
+            Attempt::Session {
+                welcomed: false,
+                replace: true
+            }
+        ));
+        assert!(matches!(
+            session_ended(
+                "gpu",
+                launched,
+                SealedEnd::default(),
+                &hello(launched),
+                false
+            ),
+            Attempt::Session {
+                welcomed: false,
+                replace: false
+            }
+        ));
     }
 
     #[test]

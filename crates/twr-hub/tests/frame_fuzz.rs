@@ -1,4 +1,4 @@
-//! Invariant fuzz for the runner protocol's frame decoding (`twr_core::runner`, protocol 6):
+//! Invariant fuzz for the runner protocol's frame decoding (`twr_core::runner`, protocol 7):
 //! what the hub and a runner do with each WebSocket message the other side (or anyone who
 //! reaches the hub's listener) sends.
 //!
@@ -366,6 +366,15 @@ fn runner_msg(rng: &mut Rng) -> RunnerMsg {
             runtimes: vec![string(rng)],
             worktrees: string(rng).into(),
             build: None,
+            agents: vec![twr_core::runner::AgentInfo {
+                runtime: string(rng),
+                found: true,
+                path: opt(rng, string),
+                version: opt(rng, string),
+                login: twr_core::runner::AgentLogin::LoggedIn,
+                method: opt(rng, string),
+                note: opt(rng, string),
+            }],
         }),
         3 | 4 => RunnerMsg::Event {
             thread: string(rng),

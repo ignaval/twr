@@ -169,11 +169,10 @@ impl GrokBuildAdapter {
         self
     }
 
-    /// The binary this adapter runs.
+    /// The binary this adapter runs ([`crate::resolve::select_program`]: this adapter's own,
+    /// else [`BIN_ENV`], else `grok`; an empty one counts as unset).
     pub fn bin(&self) -> PathBuf {
-        self.bin
-            .clone()
-            .or_else(|| std::env::var_os(BIN_ENV).map(PathBuf::from))
+        crate::resolve::select_program(NAME, self.bin.as_deref(), |k| std::env::var_os(k))
             .unwrap_or_else(|| PathBuf::from("grok"))
     }
 }

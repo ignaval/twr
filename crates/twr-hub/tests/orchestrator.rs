@@ -3820,3 +3820,120 @@ async fn a_card_never_moves_a_thread_into_a_mode_its_new_runtime_does_not_take()
     drop(rt);
     hub.shutdown().await;
 }
+
+/// The hub's own agent CLIs as a fake probe reports them: Claude Code's missing, Codex's
+/// there and signed in.
+fn fake_local_agents() -> twr_hub::hub::AgentProbe {
+    use futures::FutureExt;
+    use twr_core::runner::{AgentInfo, AgentLogin};
+    Arc::new(|| {
+        async {
+            vec![
+                AgentInfo {
+                    runtime: "claude-code".into(),
+                    note: Some("not found on PATH".into()),
+                    ..Default::default()
+                },
+                AgentInfo {
+                    runtime: "codex".into(),
+                    found: true,
+                    path: Some("/home/me/.local/bin/codex".into()),
+                    version: Some("codex-cli 0.160.0".into()),
+                    login: AgentLogin::LoggedIn,
+                    ..Default::default()
+                },
+            ]
+        }
+        .boxed()
+    })
+}
+
+/// The orchestrator starts a thread on a box it names (`thread.spawn` `box`, as `thread.new`
+/// takes it, with its errors); one on a runtime whose CLI the box reports missing is made,
+/// and the spawn's result warns. What it reads of the boxes' agents is their state only.
+#[tokio::test]
+async fn the_orchestrator_picks_a_box_and_is_warned_of_a_missing_agent() {
+    use twr_hub::hub::BoxView;
+    let env = Env::new();
+    let mut opts = env.opts(|_| {});
+    opts.agent_probe = Some(fake_local_agents());
+    let hub = Hub::open(opts).await.unwrap();
+    // Probed in the background as the hub started.
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hub's own probe");
+    assert_eq!(hub.info()["agents"][1]["path"], "/home/me/.local/bin/codex");
+    assert_eq!(
+        hub.info_for(BoxView::Limited)["agents"],
+        json!([
+            {"runtime": "claude-code", "found": false, "login": "unknown"},
+            {"runtime": "codex", "found": true, "login": "logged_in"},
+        ])
+    );
+    let spawn = |op: &'static str, runtime: &'static str, box_name: &'static str| {
+        let hub = hub.clone();
+        let request = NewThread {
+            project: env.repo().to_string_lossy().into_owned(),
+            runtime: Some(runtime.into()),
+            name: Some(op.into()),
+            box_name: Some(box_name.into()),
+            ..Default::default()
+        };
+        async move {
+            hub.begin_spawn(op, request, None, &Caller::Orchestrator)
+                .unwrap();
+            timeout(WAIT, async {
+                loop {
+                    let status = hub.spawn_status(op, &Caller::Orchestrator).unwrap();
+                    if status["status"] != "pending" {
+                        break status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let made = spawn("on-local", "claude-code", "local").await;
+    assert_eq!(made["status"], "complete", "{made}");
+    assert_eq!(made["thread"]["box_name"], "local");
+    let warning = "box local (the hub's machine) reports no `claude` on its PATH; the thread may \
+                   fail to start";
+    assert_eq!(made["warning"], warning, "{made}");
+    assert_eq!(made["thread"]["warning"], warning, "{made}");
+    let made = spawn("on-gpu", "claude-code", "gpu").await;
+    assert_eq!(made["status"], "error", "{made}");
+    assert_eq!(made["error"]["code"], codes::BOX_OFFLINE, "{made}");
+    assert!(
+        made["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no box \"gpu\" is configured"),
+        "{made}"
+    );
+    // `box.agents` of the hub's own box, as the orchestrator sees it; no fresh probe for it.
+    let local = hub
+        .box_agents("local", false, BoxView::Limited)
+        .await
+        .unwrap();
+    assert_eq!(
+        local["agents"][1],
+        json!({"runtime": "codex", "found": true, "login": "logged_in"})
+    );
+    assert_eq!(
+        hub.box_agents("local", true, BoxView::Limited)
+            .await
+            .unwrap_err()
+            .code,
+        codes::UNAUTHORIZED
+    );
+    // A user's fresh probe of the hub's own box.
+    let fresh = hub.box_agents("local", true, BoxView::Full).await.unwrap();
+    assert_eq!(fresh["agents"][1]["version"], "codex-cli 0.160.0");
+    hub.shutdown().await;
+}

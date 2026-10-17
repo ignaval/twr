@@ -26,11 +26,11 @@ use twr_core::config::{BoxConfig, BoxTransport, Config};
 use twr_core::event::*;
 use twr_core::proto::codes;
 use twr_core::runner::{
-    auth_proof, hub_errors, new_nonce, Hello, HubMsg, Inventory, Prover, RunnerMsg, Secret,
-    PROTOCOL_VERSION, SEALED_AUTH_PROOF,
+    auth_proof, hub_errors, new_nonce, AgentInfo, AgentLogin, CmdResult, Hello, HubMsg, Inventory,
+    Op, Prover, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 use twr_core::sealed::{hub_side, HubKey};
-use twr_hub::hub::SealedEnd;
+use twr_hub::hub::{AgentsPoll, BoxView, SealedEnd};
 use twr_hub::listener::{pre_auth_ws_config, RunnerListener};
 use twr_hub::{Caller, Hub, HubOptions, NewThread};
 use twr_runner::daemon::{request, Request};
@@ -155,6 +155,8 @@ impl Daemon {
         opts.welcome_timeout = Duration::from_secs(10);
         opts.shutdown_grace = Duration::from_secs(3);
         let mut o = opts.box_options();
+        // No real login shell or agent CLI under a test.
+        o.env = twr_runner::BoxEnv::none();
         o.adapters = with_fake();
         if !o.runtimes.iter().any(|r| r == "fake") {
             o.runtimes.push("fake".into());
@@ -880,5 +882,427 @@ async fn a_confirmed_card_whose_box_went_offline_says_so() {
     })
     .await;
     assert!(hub.thread_view(&b).is_ok(), "b is still there");
+    hub.shutdown().await;
+}
+
+/// An agent of a box's report.
+fn agent(runtime: &str, found: bool, login: AgentLogin) -> AgentInfo {
+    AgentInfo {
+        runtime: runtime.into(),
+        found,
+        path: found.then(|| format!("/home/u/.local/bin/{runtime}")),
+        version: found.then(|| "1.0.0".into()),
+        login,
+        method: (login == AgentLogin::LoggedIn).then(|| "claude.ai".into()),
+        note: (!found).then(|| "not found on PATH".into()),
+    }
+}
+
+/// The hub's next command on `ws`, its id and op, past the hub's own rounds (the trash's
+/// listing, the disk's reading), which are answered with a failure.
+async fn next_cmd<S>(ws: &mut WebSocketStream<S>) -> (String, Op)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    loop {
+        match next(ws).await {
+            Some(HubMsg::Cmd { cmd_id, op }) => match op {
+                Op::TrashList { .. } | Op::DiskUsage { .. } => {
+                    let failed = twr_core::runner::CmdError::new("failed", "not here");
+                    send(
+                        ws,
+                        &RunnerMsg::CmdResult(CmdResult::new(cmd_id, Err(failed))),
+                    )
+                    .await;
+                }
+                op => return (cmd_id, op),
+            },
+            other => panic!("expected a command, got {other:?}"),
+        }
+    }
+}
+
+async fn answer<S>(ws: &mut WebSocketStream<S>, cmd_id: &str, result: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    send(
+        ws,
+        &RunnerMsg::CmdResult(CmdResult::new(cmd_id, Ok(result))),
+    )
+    .await;
+}
+
+/// A box's agents reach the hub: its inventory's first, then its answer to the hub's poll
+/// (shortly after the welcome) and to `box.agents refresh` (users only). A user sees all of
+/// them, the orchestrator only each box's state and which agents it has, signed in or not.
+/// A thread on a runtime the box reports missing is still made, or moved there, with a
+/// warning. Once the box is offline, a refresh is `box_offline` and the last report stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boxs_agents_reach_the_hub_and_warn_its_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = hub_opts(dir.path(), config());
+    opts.agents_poll = AgentsPoll {
+        first: Duration::from_millis(300),
+        every: Duration::from_secs(3600),
+    };
+    let hub = Hub::open(opts).await.unwrap();
+    let (mut ws, served) = raw_sealed(&hub, BOX).await;
+    send(&mut ws, &hello(BOX, PROTOCOL_VERSION)).await;
+    assert!(matches!(
+        next(&mut ws).await,
+        Some(HubMsg::Challenge { .. })
+    ));
+    send(
+        &mut ws,
+        &RunnerMsg::Auth {
+            proof: SEALED_AUTH_PROOF.into(),
+        },
+    )
+    .await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Authenticated)));
+    let inv = Inventory {
+        version: "9.9.9-raw".into(),
+        runtimes: ["fake", "claude-code", "codex", "grok-build"]
+            .map(String::from)
+            .to_vec(),
+        worktrees: "/nonexistent".into(),
+        build: Some("0123456789abcdef".into()),
+        agents: vec![
+            agent("claude-code", true, AgentLogin::LoggedIn),
+            agent("codex", false, AgentLogin::Unknown),
+        ],
+        ..Default::default()
+    };
+    send(&mut ws, &RunnerMsg::Inventory(inv)).await;
+    assert!(matches!(next(&mut ws).await, Some(HubMsg::Welcome { .. })));
+    send(&mut ws, &RunnerMsg::Synced).await;
+    let h = hub.clone();
+    wait_for("the box online", move || online(&h, BOX)).await;
+
+    // The inventory's: all of it for the user, state and agents for the orchestrator.
+    let b = box_info(&hub, BOX);
+    assert_eq!(
+        b["agents"][0]["path"], "/home/u/.local/bin/claude-code",
+        "{b}"
+    );
+    assert_eq!(b["agents"][0]["method"], "claude.ai", "{b}");
+    assert_eq!(b["agents"][1]["note"], "not found on PATH", "{b}");
+    let limited = hub.info_for(BoxView::Limited);
+    let lb = limited["boxes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["name"] == BOX)
+        .unwrap()
+        .clone();
+    assert_eq!(
+        lb,
+        json!({
+            "name": BOX, "state": "online", "online": true, "version": "9.9.9-raw",
+            "agents": [
+                {"runtime": "claude-code", "found": true, "login": "logged_in"},
+                {"runtime": "codex", "found": false, "login": "unknown"},
+            ],
+        })
+    );
+    assert_eq!(limited["agents"], json!([]), "the hub probes none here");
+
+    // Shortly after the welcome the hub asks again (the runner's last probe): its answer is
+    // the box's report from then on, filtered as the probe filters (a box may say anything):
+    // an email as the sign-in method, a note of its own, runtimes twr has no CLI probe for,
+    // a runtime twice.
+    let (id, op) = next_cmd(&mut ws).await;
+    assert_eq!(op, Op::Agents { refresh: false });
+    let mut leaky = agent("claude-code", true, AgentLogin::LoggedIn);
+    leaky.method = Some("alice@example.com".into());
+    leaky.note = Some("signed in as alice@example.com (Acme Corp)".into());
+    let mut junk = agent("evil\u{1b}]0;owned\u{7}", true, AgentLogin::LoggedIn);
+    junk.method = Some("bob@example.com".into());
+    let mut codex_method = agent("codex", false, AgentLogin::Unknown);
+    codex_method.method = Some("claude.ai".into());
+    answer(
+        &mut ws,
+        &id,
+        json!([
+            leaky,
+            junk,
+            agent("pty", true, AgentLogin::LoggedIn),
+            agent("claude-code", false, AgentLogin::LoggedOut),
+            codex_method,
+            agent("grok-build", false, AgentLogin::Unknown),
+        ]),
+    )
+    .await;
+    let h = hub.clone();
+    wait_for("the poll's answer", move || {
+        box_info(&h, BOX)["agents"].as_array().map(Vec::len) == Some(3)
+    })
+    .await;
+    let b = box_info(&hub, BOX);
+    let runtimes: Vec<&str> = b["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["runtime"].as_str())
+        .collect();
+    assert_eq!(runtimes, ["claude-code", "codex", "grok-build"], "{b}");
+    assert_eq!(
+        b["agents"][0]["found"], true,
+        "the first entry of a runtime: {b}"
+    );
+    assert_eq!(b["agents"][0]["method"], "other", "{b}");
+    assert_eq!(
+        b["agents"][0]["note"], "the box reported something else",
+        "{b}"
+    );
+    assert!(b["agents"][1]["method"].is_null(), "{b}");
+    assert_eq!(b["agents"][1]["note"], "not found on PATH", "{b}");
+    assert!(!b.to_string().contains("example.com"), "{b}");
+
+    // A thread on a runtime the box reports missing is made, with a warning.
+    let new = |name: &str, runtime: &str| {
+        let hub = hub.clone();
+        let req = NewThread {
+            project: "/srv/api".into(),
+            runtime: Some(runtime.into()),
+            name: Some(name.into()),
+            box_name: Some(BOX.into()),
+            no_worktree: true,
+            ..Default::default()
+        };
+        tokio::spawn(async move { hub.new_thread(req, "test").await })
+    };
+    let made = new("on-codex", "codex");
+    let (id, op) = next_cmd(&mut ws).await;
+    assert!(matches!(op, Op::RepoRoot { .. }), "{op:?}");
+    answer(&mut ws, &id, Value::Null).await;
+    let t = made.await.unwrap().unwrap();
+    assert_eq!(t["box_name"], BOX);
+    assert_eq!(
+        t["warning"],
+        "box gpu reports no `codex` on its PATH; the thread may fail to start: run `twr box \
+         doctor gpu`"
+    );
+    let made = new("on-claude", "claude-code");
+    let (id, _) = next_cmd(&mut ws).await;
+    answer(&mut ws, &id, Value::Null).await;
+    let t = made.await.unwrap().unwrap();
+    assert!(t.get("warning").is_none(), "{t}");
+    // Moved to one the box reports missing: moved, with the warning; to one it has, without.
+    let moved = hub
+        .set_runtime_model("on-claude", Some("grok-build"), None, None, &user())
+        .unwrap();
+    assert_eq!(moved["runtime_changed"], true, "{moved}");
+    assert!(
+        moved["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with("box gpu reports no `grok` on its PATH")),
+        "{moved}"
+    );
+    let moved = hub
+        .set_runtime_model("on-codex", Some("claude-code"), None, None, &user())
+        .unwrap();
+    assert!(moved.get("warning").is_none(), "{moved}");
+    // A new model or effort on the same runtime restarts its CLI: the thread's own runtime is
+    // checked (allowed either way).
+    let grok = "box gpu reports no `grok` on its PATH";
+    let changed = hub
+        .set_runtime_model("on-claude", None, Some("grok-4.6"), None, &user())
+        .unwrap();
+    assert!(
+        changed["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(grok)),
+        "{changed}"
+    );
+    let changed = hub
+        .set_runtime_model("on-claude", None, None, Some("high"), &user())
+        .unwrap();
+    assert!(
+        changed["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(grok)),
+        "{changed}"
+    );
+    let changed = hub
+        .set_runtime_model("on-codex", None, Some("sonnet"), None, &user())
+        .unwrap();
+    assert!(changed.get("warning").is_none(), "{changed}");
+    // A new permission mode (re)starts the runtime too: the same warning.
+    let mode = hub.set_mode("on-claude", "read-only", &user()).unwrap();
+    assert_eq!(mode["changed"], true, "{mode}");
+    assert!(
+        mode["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(grok)),
+        "{mode}"
+    );
+    let mode = hub.set_mode("on-codex", "read-only", &user()).unwrap();
+    assert!(mode.get("warning").is_none(), "{mode}");
+
+    // A prompt that starts a thread's runtime: the same warning; one to a thread whose
+    // runtime runs already starts nothing, so none.
+    let sent = hub
+        .send(
+            "on-claude",
+            "hi",
+            TurnFrom::User,
+            Source::User("test".into()),
+        )
+        .unwrap();
+    let sent = serde_json::to_value(sent).unwrap();
+    assert!(
+        sent["warning"]
+            .as_str()
+            .is_some_and(|w| w.starts_with(grok)),
+        "{sent}"
+    );
+    let again = hub
+        .send(
+            "on-claude",
+            "more",
+            TurnFrom::User,
+            Source::User("test".into()),
+        )
+        .unwrap();
+    assert_eq!(again.warning, None, "{again:?}");
+    let fine = hub
+        .send(
+            "on-codex",
+            "hi",
+            TurnFrom::User,
+            Source::User("test".into()),
+        )
+        .unwrap();
+    assert_eq!(fine.warning, None, "{fine:?}");
+
+    // `box.agents`: what is known, as each caller sees it; a fresh probe for users only.
+    let known = hub.box_agents(BOX, false, BoxView::Limited).await.unwrap();
+    assert_eq!(known["box"], BOX);
+    assert_eq!(known["online"], true);
+    assert_eq!(
+        known["agents"][0],
+        json!({"runtime": "claude-code", "found": true, "login": "logged_in"})
+    );
+    let e = hub
+        .box_agents(BOX, true, BoxView::Limited)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
+    let h = hub.clone();
+    let fresh = tokio::spawn(async move { h.box_agents(BOX, true, BoxView::Full).await });
+    // (Past what the prompts above asked of the box: their runtimes' commands.)
+    let (id, op) = loop {
+        let (id, op) = next_cmd(&mut ws).await;
+        if matches!(op, Op::Agents { .. }) {
+            break (id, op);
+        }
+    };
+    assert_eq!(op, Op::Agents { refresh: true });
+    answer(
+        &mut ws,
+        &id,
+        json!([
+            agent("claude-code", true, AgentLogin::LoggedIn),
+            agent("codex", true, AgentLogin::LoggedOut),
+        ]),
+    )
+    .await;
+    let fresh = fresh.await.unwrap().unwrap();
+    assert_eq!(fresh["agents"][1]["found"], true, "{fresh}");
+    assert_eq!(fresh["agents"][1]["path"], "/home/u/.local/bin/codex");
+    assert_eq!(box_info(&hub, BOX)["agents"][1]["login"], "logged_out");
+    let e = hub
+        .box_agents("nope", false, BoxView::Full)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND);
+
+    // Offline: no fresh probe, the last report stays.
+    drop(ws);
+    served.await;
+    let h = hub.clone();
+    wait_for("the box offline", move || !online(&h, BOX)).await;
+    let e = hub.box_agents(BOX, true, BoxView::Full).await.unwrap_err();
+    assert_eq!(e.code, codes::BOX_OFFLINE);
+    let last = hub.box_agents(BOX, false, BoxView::Full).await.unwrap();
+    assert_eq!(last["online"], false);
+    assert_eq!(last["agents"][1]["login"], "logged_out");
+    hub.shutdown().await;
+}
+
+/// A box of another OS or CPU runs its configured build; after a twr upgrade that build speaks
+/// an older protocol, so the hub refuses its daemon. The hub does not launch that build again
+/// and again: the box needs an install (`twr box install`), said in its `last_error`, and is
+/// looked at again only when `box.install` wakes it (or after 5 minutes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
+    use futures::FutureExt;
+    use twr_hub::ssh_box::{BoxDialer, BoxIo};
+    const CONFIGURED: &str = "00000000000000c6";
+    let dir = tempfile::tempdir().unwrap();
+    // The hub's box key, made now: the stand-in daemon checks its holder.
+    let data = dir.path().join("hub");
+    std::fs::create_dir_all(&data).unwrap();
+    let key = HubKey::load_or_create(&data.join(twr_hub::ssh_box::BOX_KEY_FILE)).unwrap();
+    let public = key.public();
+    let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&dials);
+    // A daemon of the configured build, speaking the protocol before the hub's.
+    let dialer: BoxDialer = Arc::new(move |name: String, _replace: bool| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        async move {
+            let (hub_end, box_end) = tokio::io::duplex(1 << 16);
+            tokio::spawn(async move {
+                let Ok(sealed) =
+                    twr_core::sealed::daemon_side(box_end, &public, &name, Some(CONFIGURED)).await
+                else {
+                    return;
+                };
+                let Ok((mut ws, _)) =
+                    tokio_tungstenite::client_async("ws://twr-box/", sealed).await
+                else {
+                    return;
+                };
+                send(&mut ws, &hello(&name, PROTOCOL_VERSION - 1)).await;
+                let _ = next(&mut ws).await;
+            });
+            let io: Box<dyn BoxIo> = Box::new(hub_end);
+            Ok((io, CONFIGURED.to_string()))
+        }
+        .boxed()
+    });
+    let mut cfg = config();
+    cfg.boxes.get_mut(BOX).unwrap().build = Some(CONFIGURED.into());
+    let mut opts = hub_opts(dir.path(), cfg);
+    opts.box_dialer = Some(dialer);
+    let hub = Hub::open(opts).await.unwrap();
+    let want = format!(
+        "box gpu runs a twr build that speaks protocol {}, the hub {PROTOCOL_VERSION}: install \
+         this hub's build there: `twr box install gpu`",
+        PROTOCOL_VERSION - 1
+    );
+    let h = hub.clone();
+    let w = want.clone();
+    wait_for("needs_install", move || {
+        let b = box_info(&h, BOX);
+        b["state"] == "needs_install" && b["last_error"] == json!(w)
+    })
+    .await;
+    // Not launched again meanwhile.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(box_info(&hub, BOX)["state"], "needs_install");
+    // `box.install` wakes it: one more attempt (refused again here).
+    hub.box_install(BOX, &user()).await.unwrap();
+    let d = Arc::clone(&dials);
+    wait_for("another attempt", move || {
+        d.load(std::sync::atomic::Ordering::SeqCst) == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(box_info(&hub, BOX)["state"], "needs_install");
     hub.shutdown().await;
 }

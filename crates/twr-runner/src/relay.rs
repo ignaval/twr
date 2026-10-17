@@ -37,22 +37,25 @@
 //! session instead. When logind ends a user's processes with their last session
 //! (`KillUserProcesses=yes`) and the daemon runs in the ssh session (the user does not linger,
 //! or `systemd-run` failed), the relay warns: the daemon and its agents end with the ssh
-//! session. Each probe is best effort, bounded by
-//! [`PROBE_TIMEOUT`]: one that fails means "no". The relay then waits for the daemon to answer
-//! on its socket (at most [`RelayOptions::start_timeout`]), or fails with the end of its log.
+//! session; it warns too when `KillUserProcesses` can't be read on a box with logind
+//! (`loginctl` on `PATH`), since it may be on ([`kills_warning`]). Each probe is bounded by
+//! [`PROBE_TIMEOUT`] and leaves nothing running (`twr_adapters::process::run_bounded`); for lingering, one that
+//! fails means "no". The relay then waits for the daemon to answer on its socket (at most
+//! [`RelayOptions::start_timeout`]), or fails with the end of its log.
 //!
 //! `TWR_BOX_LAUNCHER=setsid` in the relay's environment ([`LAUNCHER_ENV`]) always starts the
 //! daemon in a new session, without probing logind or trying `systemd-run`: for tests (a
 //! daemon a test can find and stop) and for troubleshooting.
 //!
-//! # Stopping the daemon
+//! # Stopping the daemon, and its status
 //!
 //! `twr runner --stdio --stop` ([`stop`]) asks the daemon of the hub key and box to stop and
 //! waits until it has (at most [`RelayOptions::stop_timeout`]): its runtimes end, its data
 //! directory and worktrees stay. With no daemon running, it says so and succeeds. No socket is
 //! not proof of that: a daemon removes its socket first and then drains, holding its machine
 //! lock, so `--stop` (and a relay about to start a daemon) waits for that lock, within the
-//! same timeout.
+//! same timeout. `twr runner --stdio --status` ([`status`]) only prints the daemon's status
+//! line, or `no daemon`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -579,6 +582,14 @@ pub async fn stop(opts: &RelayOptions, note: &mut (dyn FnMut(&str) + Send)) -> a
     Ok(())
 }
 
+/// The status of the daemon of `opts`'s hub key and box (`twr runner --stdio --status`, which
+/// `twr box doctor` runs), `None` when none answers on its socket (none runs, or one is
+/// starting or shutting down). Nothing is started or stopped.
+pub async fn status(opts: &RelayOptions) -> anyhow::Result<Option<Status>> {
+    validate_box_name(&opts.box_name)?;
+    daemon_status(&opts.paths.socket).await
+}
+
 /// Copies `io` to `stream` and back. The relay ends when the daemon's side ends; the hub's
 /// end of input shuts the socket's write side and the relay goes on until the daemon closes.
 /// A failed copy is an end too (the hub's ssh gone, say), not an error: there is no one left
@@ -733,17 +744,19 @@ async fn start_daemon(
                         &["--user", "show", "-p", "ActiveState", "--value", &unit],
                     )
                     .await;
-                    let kills = kills_user_processes().await;
+                    let warning = kills_warning(kills_user_processes().await, true);
                     let (started, says) =
-                        after_systemd_run_failure(&e.to_string(), state.as_deref(), kills);
+                        after_systemd_run_failure(&e.to_string(), state.as_deref(), warning);
                     launched = started;
                     for line in says {
                         note(&line);
                     }
                 }
             }
-        } else if !lingers && kills_user_processes().await {
-            note(KILLS_WARNING);
+        } else if !lingers {
+            if let Some(w) = kills_warning(kills_user_processes().await, on_path("loginctl")) {
+                note(w);
+            }
         }
     }
     if !launched {
@@ -770,6 +783,24 @@ const KILLS_WARNING: &str = "twr-box: warning: logind ends your processes with y
      session. Run `loginctl enable-linger` on the box (systemd-run then starts the daemon \
      outside the session)";
 
+/// The relay's warning when logind's `KillUserProcesses` could not be read (no `busctl`, or
+/// its query failed) and the daemon runs in the ssh session: it may end with it.
+const KILLS_UNKNOWN_WARNING: &str = "twr-box: warning: couldn't read logind's \
+     KillUserProcesses; if it is on, the box daemon and its agents end with this ssh session \
+     unless you run `loginctl enable-linger` on the box";
+
+/// What the relay warns, once, when the daemon is to run in the ssh session: `kills` is
+/// logind's `KillUserProcesses` (`None`: it could not be read), `logind` whether the box has
+/// logind at all (`loginctl` on `PATH`). On: [`KILLS_WARNING`]; not known on a box with
+/// logind: [`KILLS_UNKNOWN_WARNING`]; off, or no logind: nothing.
+fn kills_warning(kills: Option<bool>, logind: bool) -> Option<&'static str> {
+    match kills {
+        Some(true) => Some(KILLS_WARNING),
+        None if logind => Some(KILLS_UNKNOWN_WARNING),
+        _ => None,
+    }
+}
+
 /// The transient unit a start runs the daemon of hub key `hub_key` and box `box_name` as:
 /// `twr-box-<hash>-<random>`, a new name each start, so a daemon of the same hub and box
 /// still stopping (its unit not gone yet) never collides with the new one.
@@ -786,8 +817,12 @@ fn unit_name(hub_key: &[u8; 32], box_name: &str) -> String {
 /// What a start does after `systemd-run` failed (`error`): whether the daemon was started all
 /// the same (its unit's `ActiveState`, `state`, is `active` or `activating`: `systemd-run`
 /// only did not answer in time), and the notes to print. Else it is started in a new session,
-/// with the KillUserProcesses warning when logind ends the user's processes (`kills`).
-fn after_systemd_run_failure(error: &str, state: Option<&str>, kills: bool) -> (bool, Vec<String>) {
+/// with `warning` ([`kills_warning`]) when there is one.
+fn after_systemd_run_failure(
+    error: &str,
+    state: Option<&str>,
+    warning: Option<&str>,
+) -> (bool, Vec<String>) {
     if matches!(state, Some("active" | "activating" | "reloading")) {
         return (
             true,
@@ -800,8 +835,8 @@ fn after_systemd_run_failure(error: &str, state: Option<&str>, kills: bool) -> (
         "twr-box: warning: systemd-run could not start the box daemon ({error}); starting it \
          in a new session instead"
     )];
-    if kills {
-        says.push(KILLS_WARNING.to_string());
+    if let Some(w) = warning {
+        says.push(w.to_string());
     }
     (false, says)
 }
@@ -968,21 +1003,16 @@ async fn systemd_run(unit: &str, program: &Path, args: &[OsString]) -> anyhow::R
 }
 
 /// The trimmed stdout of `program args` when it succeeds within [`PROBE_TIMEOUT`]; `None`
-/// otherwise (missing, failed, too slow).
+/// otherwise (missing, failed, too slow, too much output). A probe
+/// ([`twr_adapters::process::run_bounded`]): no terminal, and nothing it starts outlives it.
 async fn probe(program: &str, args: &[&str]) -> Option<String> {
+    use twr_adapters::process::{run_bounded, Bounded};
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    let out = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    cmd.args(args);
+    match run_bounded(cmd, PROBE_TIMEOUT, 64 << 10, |_| false).await {
+        Bounded::Exited(Some(0), out) => Some(String::from_utf8_lossy(&out).trim().to_string()),
+        _ => None,
+    }
 }
 
 /// Whether logind keeps this user's processes after their last session (`Linger=yes`).
@@ -993,8 +1023,10 @@ async fn lingers() -> bool {
         .is_some_and(|out| out == "Linger=yes")
 }
 
-/// Whether logind ends a user's processes with their last session (`KillUserProcesses`).
-async fn kills_user_processes() -> bool {
+/// Whether logind ends a user's processes with their last session (`KillUserProcesses`):
+/// `None` when it could not be read (no `busctl`, its query failed, or it said neither `b
+/// true` nor `b false`).
+async fn kills_user_processes() -> Option<bool> {
     probe(
         "busctl",
         &[
@@ -1006,7 +1038,11 @@ async fn kills_user_processes() -> bool {
         ],
     )
     .await
-    .is_some_and(|out| out == "b true")
+    .and_then(|out| match out.as_str() {
+        "b true" => Some(true),
+        "b false" => Some(false),
+        _ => None,
+    })
 }
 
 /// Whether an executable file `name` is in a directory of `$PATH`.
@@ -1593,15 +1629,36 @@ mod tests {
         assert_ne!(a, b);
         let hash = socket_hash(&twr_core::sealed::hub_id(&KEY), "gpu");
         assert!(a.starts_with(&format!("twr-box-{hash}-")), "{a}");
-        let (started, says) = after_systemd_run_failure("timed out", Some("activating"), true);
+        let on = kills_warning(Some(true), true);
+        let (started, says) = after_systemd_run_failure("timed out", Some("activating"), on);
         assert!(started);
         assert!(says[0].contains("unit started"), "{says:?}");
-        let (started, says) = after_systemd_run_failure("exit 1", Some("inactive"), true);
+        let (started, says) = after_systemd_run_failure("exit 1", Some("inactive"), on);
         assert!(!started);
         assert!(says[0].contains("in a new session instead"), "{says:?}");
         assert!(says[1].contains("KillUserProcesses=yes"), "{says:?}");
-        let (started, says) = after_systemd_run_failure("exit 1", None, false);
+        let off = kills_warning(Some(false), true);
+        let (started, says) = after_systemd_run_failure("exit 1", None, off);
         assert!(!started && says.len() == 1, "{says:?}");
+        // Not read: warned too (it may be on).
+        let unknown = kills_warning(None, true);
+        let (_, says) = after_systemd_run_failure("exit 1", None, unknown);
+        assert!(
+            says[1].contains("couldn't read logind's KillUserProcesses"),
+            "{says:?}"
+        );
+    }
+
+    /// The relay warns of logind ending the daemon with the ssh session when it says so, and
+    /// when it can't be read on a box with logind; only `b false`, or no logind at all, is
+    /// silent.
+    #[test]
+    fn logind_warnings_take_an_unknown_answer_as_a_risk() {
+        assert_eq!(kills_warning(Some(true), true), Some(KILLS_WARNING));
+        assert_eq!(kills_warning(Some(true), false), Some(KILLS_WARNING));
+        assert_eq!(kills_warning(None, true), Some(KILLS_UNKNOWN_WARNING));
+        assert_eq!(kills_warning(None, false), None);
+        assert_eq!(kills_warning(Some(false), true), None);
     }
 
     #[test]

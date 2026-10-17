@@ -28,7 +28,9 @@
 //! (code 0). A `--help` that could not be read is not cached ([`cli`]). A process that exits
 //! refusing its command line gets the same update hint as the last line of its stderr tail,
 //! after why `--help` was not read when it was not. The binary is `claude` on `PATH` unless
-//! [`BIN_ENV`] (or [`ClaudeCodeAdapter::with_bin`]) names another one.
+//! [`BIN_ENV`] (or [`ClaudeCodeAdapter::with_bin`]) names another one; the `PATH` is the
+//! runtime's ([`crate::resolve::resolve`]: its thread's `env`, which a runner fills with the
+//! login shell's), and the probe reads the binary found there.
 //!
 //! The process runs in `SpawnConfig::cwd` with `SpawnConfig::env` added and twr's secrets
 //! removed ([`crate::process::SCRUBBED_ENV`], inherited or configured; `attach` too), and, with
@@ -180,11 +182,10 @@ impl ClaudeCodeAdapter {
         self
     }
 
-    /// The binary this adapter runs.
+    /// The binary this adapter runs ([`crate::resolve::select_program`]: this adapter's own,
+    /// else [`BIN_ENV`], else `claude`; an empty one counts as unset).
     pub fn bin(&self) -> PathBuf {
-        self.bin
-            .clone()
-            .or_else(|| std::env::var_os(BIN_ENV).map(PathBuf::from))
+        crate::resolve::select_program(NAME, self.bin.as_deref(), |k| std::env::var_os(k))
             .unwrap_or_else(|| PathBuf::from("claude"))
     }
 }
@@ -200,13 +201,15 @@ fn missing_fix() -> String {
 /// front.
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// Why this box's `claude` (the adapter's binary: [`BIN_ENV`], else `claude` on `PATH`) cannot
-/// take a reasoning effort, when an earlier spawn probed it and its `--help` does not list
-/// `--effort` ([`cli::effort_refusal`]). Never probes: `None` when nothing is known yet (a
-/// spawn then refuses the effort itself, with the same hint).
-pub fn effort_refusal() -> Option<String> {
+/// Why the `claude` a thread with environment `env` and working directory `cwd` would run (the
+/// adapter's binary: [`BIN_ENV`], else `claude` on the `PATH` `env` gives, resolved in `cwd`, as
+/// a spawn resolves it) cannot take a reasoning effort, when an earlier spawn probed it and its
+/// `--help` does not list `--effort` ([`cli::effort_refusal`]). Never probes: `None` when
+/// nothing is known yet (a spawn then refuses the effort itself, with the same hint).
+pub fn effort_refusal(env: &[(String, String)], cwd: &std::path::Path) -> Option<String> {
     let bin = ClaudeCodeAdapter::new().bin();
-    let support = cli::cached(&bin, std::path::Path::new(""))?;
+    let resolved = crate::resolve::resolve(&bin, env, None, cwd);
+    let support = cli::cached(&resolved, cwd)?;
     cli::effort_refusal(&bin, &support)
 }
 
@@ -367,7 +370,9 @@ impl Adapter for ClaudeCodeAdapter {
             max_line: self.max_line,
         };
         let (handle, end) = AdapterHandle::pair();
-        match cli::lookup(&start.bin, &start.cfg.cwd, self.probe_timeout) {
+        // The binary the process will run, on the `PATH` it gets: what the probe reads.
+        let resolved = crate::resolve::resolve(&start.bin, &start.cfg.env, None, &start.cfg.cwd);
+        match cli::lookup(&resolved, &start.cfg.cwd, self.probe_timeout) {
             cli::Lookup::Known(help) => {
                 let started = start.launch(&help)?;
                 started.report_pid(&end);
@@ -384,7 +389,10 @@ impl Adapter for ClaudeCodeAdapter {
 
     fn attach_command(&self, cfg: &SpawnConfig, session_id: &str) -> Option<std::process::Command> {
         // Only what is already known of this box's binary (no probe here).
-        let known = cli::cached(&self.bin(), &cfg.cwd);
+        let known = cli::cached(
+            &crate::resolve::resolve(&self.bin(), &cfg.env, None, &cfg.cwd),
+            &cfg.cwd,
+        );
         self.interactive(cfg, session_id, known.as_ref())
     }
 
@@ -566,7 +574,7 @@ impl Start {
         process::check_wrapped(&cfg.wrap, bin, &cfg.env, &cfg.cwd, &missing_fix())?;
         let child = cmd
             .spawn()
-            .map_err(|e| process::start_error(e, bin, &cfg.cwd, &missing_fix()))?;
+            .map_err(|e| process::start_error(e, bin, &cfg.env, &cfg.cwd, &missing_fix()))?;
         let mut translator = Translator::new(TranslatorOptions {
             thinking: cfg.thinking,
             pid: child.id(),

@@ -15,7 +15,7 @@ Pick one per thread with `twr thread new --runtime`, per project with `[projects
 | `pty:<command>` | degraded | any interactive CLI in a pseudo-terminal, with guessed turns and prompts |
 | `fake` | test | scripted; only with `TWR_ENABLE_FAKE=1`, for tests and the [screenshots](development.md#screenshots) |
 
-The binaries are `claude`, `codex` and `grok` on `PATH`. `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` and `TWR_GROK_BIN` point twr at other ones. Every runtime runs in its own process group with twr's secrets, such as the runner and orchestrator tokens, removed from its environment.
+The binaries are `claude`, `codex` and `grok` on `PATH`. `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` and `TWR_GROK_BIN` point twr at other ones. On a remote box, the runner puts its login shell's `PATH` first ([runners.md](runners.md#agents-on-a-box)). Sign in with each agent's own CLI first: twr never runs a login by itself and never sees your keys. `twr box login <box> <agent>` starts the agent's own login on a remote box, in your terminal. Every runtime runs in its own process group with twr's secrets, such as the runner and orchestrator tokens, removed from its environment.
 
 ## What has been checked against the real CLIs
 
@@ -172,7 +172,7 @@ In `attach`, `{session}` stands for the thread's session id and `{mode}` for its
 
 `{model}` and `{effort}` stand for the thread's model and reasoning effort. Both are optional. Put each one in the same argument as its flag, as in `attach = "gemini --resume {session} --model={model}"`, because twr leaves that argument out for a thread that has no model or effort. A template with `{model}` or `{effort}` as a whole argument (`-m {model}`), or sharing an argument with another placeholder (`--settings=mode:{mode},effort:{effort}`), is refused when the thread is created: leaving that argument out would drop the flag or the other value with it. Without them, twr refuses to attach a thread whose model or effort changed since its session last ran: the agent's CLI would resume the session with the old ones. Use them only where the agent's interactive CLI applies the flag to a resumed session.
 
-Sign in with the agent's own CLI first. twr never runs its login.
+Sign in with the agent's own CLI first. twr never runs a login by itself and never sees your keys (`twr box login` starts only Claude Code's, Codex's and Grok Build's).
 
 When a turn fails, the error card quotes the agent's error, or says why it stopped, such as "gemini hit its output token limit (stopReason max_tokens)".
 

@@ -11,7 +11,8 @@
 //! - `cmd_results(cmd_id PRIMARY KEY, result, ts)`: the `cmd_result` of every command, for
 //!   dedup. `result` is NULL while the command runs; a NULL found when the spool opens means
 //!   the runner died during the command, and it becomes an `interrupted` error. A NULL is never
-//!   taken as leave to run the command again (its effect is unknown). Finished results are
+//!   taken as leave to run the command again (its effect is unknown); a command cancelled
+//!   before it began is forgotten instead ([`Spool::cmd_forget`]). Finished results are
 //!   kept for 24 hours, at most the newest [`CMD_RESULTS_KEEP`]; those of durable commands
 //!   (`send:` / `respond:` / `stop:` ids, [`twr_core::runner::is_durable_cmd_id`]), which the
 //!   hub resends until answered, for [`twr_core::runner::RESULT_RETENTION`] however many other
@@ -728,6 +729,17 @@ impl Spool {
                 Ok(CmdState::New)
             }
         }
+    }
+
+    /// Forgets `cmd_id` while it is recorded as running ([`Spool::cmd_begin`]) and has not
+    /// begun: a repeat of the id runs it. A finished result stays.
+    pub fn cmd_forget(&self, cmd_id: &str) -> anyhow::Result<()> {
+        let g = self.lock();
+        g.conn.execute(
+            "DELETE FROM cmd_results WHERE cmd_id = ?1 AND result IS NULL",
+            [cmd_id],
+        )?;
+        Ok(())
     }
 
     /// The stored result of `cmd_id`, if it finished.

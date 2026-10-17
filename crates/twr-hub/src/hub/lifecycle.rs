@@ -91,6 +91,8 @@ impl Hub {
             box_switch: opts.box_switch,
             box_install_lock: tokio::sync::Mutex::new(()),
             box_dialer: opts.box_dialer,
+            local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
+            agents_poll: opts.agents_poll,
             worktree_namespace: opts.worktree_namespace,
             listening: Default::default(),
             box_key: Default::default(),
@@ -539,8 +541,8 @@ fn local_host(opts: &HubOptions) -> Arc<dyn ThreadHost> {
     )
 }
 
-/// Starts the hub's background tasks: the notifier, the stall and git tickers. (Each remote
-/// box's own tasks start with it, `boxes::start_box`.)
+/// Starts the hub's background tasks: the notifier, the stall and git tickers, the hub's own
+/// agent probe. (Each remote box's own tasks start with it, `boxes::start_box`.)
 fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
     tokio::spawn(orch::notifier(Arc::downgrade(inner), notify_rx));
     tokio::spawn(super::background::ticker(Arc::downgrade(inner)));
@@ -560,6 +562,14 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
         tokio::spawn(super::disk::disk_ticker(
             Arc::downgrade(inner),
             inner.disk_tick,
+        ));
+    }
+    // The hub's own agent CLIs, in the background (`hub::box_agents`).
+    if inner.local_agents.probes() {
+        tokio::spawn(super::box_agents::local_ticker(
+            Arc::clone(&inner.local_agents),
+            inner.state.subscribe(),
+            inner.agents_poll.every,
         ));
     }
 }

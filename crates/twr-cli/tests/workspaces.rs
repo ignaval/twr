@@ -18,7 +18,10 @@ fn command(home: &Path, args: &[&str]) -> Command {
         .env("TWR_HOME", home)
         .env_remove("TWR_WORKSPACE")
         .env_remove("RUST_LOG")
-        .env("TWR_TEST_USER_TOKEN_FILE", test_token());
+        .env("TWR_TEST_USER_TOKEN_FILE", test_token())
+        // No hub or runner of a test runs the user's login shell or real agent CLIs.
+        .env("TWR_AGENT_PROBE", "off")
+        .env("TWR_BOX_PROBE", "off");
     c
 }
 
@@ -1418,7 +1421,31 @@ fn a_runner_keeps_its_data_in_the_root() {
         assert!(!made(&a.data_dir), "in workspace a's data");
         made(&root.data_dir).then_some(())
     });
-    let _ = runner.0.kill();
+    // Stopped as a user stops it (SIGTERM), not killed: it ends what it started, then exits
+    // (it starts no shell or agent CLI here: `TWR_BOX_PROBE=off`). A runner that has not
+    // listened for the signal yet (just started) ends by it.
+    let pid = runner.0.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(st) = runner.0.try_wait().unwrap() {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                st.code().is_some() || st.signal() == Some(15),
+                "the runner ended by {st}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runner did not stop on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A thread is never started in another workspace's worktree: that workspace's hub removes
