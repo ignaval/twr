@@ -750,6 +750,16 @@ impl Out {
             None => anyhow!("{what} failed (git killed by a signal): {msg}"),
         }
     }
+
+    /// [`Out::error`] without git's message: for a command whose message may quote the
+    /// repository's config (an invalid `remote.origin.fetch` holding a URL with a password,
+    /// say), which twr must not show or log.
+    fn error_without_message(&self, what: &str) -> anyhow::Error {
+        match self.code {
+            Some(c) => anyhow!("{what} failed (git exit {c})"),
+            None => anyhow!("{what} failed (git killed by a signal)"),
+        }
+    }
 }
 
 /// How a git command is run. Either way it runs in a process group of its own, and when it
@@ -847,7 +857,7 @@ enum Stop {
 /// hung file system), and keeps waiting: returning while one runs would let it change things
 /// its caller then takes for settled. When the process table cannot be read, gives up waiting
 /// for the group (with a warning); its leader is still reaped by the caller.
-async fn wait_group_gone(pgid: u32, what: &str) {
+pub(crate) async fn wait_group_gone(pgid: u32, what: &str) {
     let started = tokio::time::Instant::now();
     let mut warn_at = started + KILL_WARN_EVERY;
     let mut pause = Duration::from_millis(2);
@@ -1016,6 +1026,63 @@ impl LocalGit {
         tokio::time::timeout(within, rx.wait_for(|n| *n == 0))
             .await
             .is_ok_and(|r| r.is_ok())
+    }
+
+    /// The URL of the `origin` remote of the repository at `dir` as git resolves it (`git
+    /// remote get-url origin`: the `url.<base>.insteadOf` rewrites of the config applied; no
+    /// network, like every command here), or `None` when the repository has no `origin`. Its
+    /// text is the config's and may hold credentials: show it
+    /// [`redact`](twr_core::gitremote::redact)ed. Its error never holds git's message, which
+    /// may quote the config (`fatal: invalid refspec '<a URL with a password>'`), nor that of
+    /// any step before it (the listing of the repository's config twr reads to turn its
+    /// drivers off: `fatal: failed to expand user dir in: '<an include path>'`): it is one of a
+    /// few fixed messages, whatever failed.
+    pub async fn origin_url(&self, dir: &Path) -> anyhow::Result<Option<String>> {
+        const WHAT: &str = "git remote get-url origin";
+        let out = match self.git(dir, ["remote", "get-url", "origin"]).await {
+            Ok(out) => out,
+            Err(e) if was_killed(&e) => bail!("{WHAT} timed out and was killed"),
+            Err(e) => {
+                let missing = e.chain().any(|c| {
+                    c.downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                });
+                if missing {
+                    bail!("{WHAT} failed: git is not installed (not on the PATH)");
+                }
+                bail!("{WHAT} failed: git could not run there, or read the repository's config");
+            }
+        };
+        if out.ok {
+            let url = String::from_utf8_lossy(trim_newline(&out.stdout)).into_owned();
+            return Ok((!url.is_empty()).then_some(url));
+        }
+        if out.stderr.contains("No such remote") {
+            return Ok(None);
+        }
+        Err(out.error_without_message(WHAT))
+    }
+
+    /// Whether this git can be run at all (`git --version`, given 10 s): `Err` when it can't
+    /// (not installed: [`std::io::ErrorKind::NotFound`]), which [`GitOps::repo_root`] takes
+    /// for "no repository" and a search must not.
+    pub async fn runs(&self) -> std::io::Result<()> {
+        let mut c = tokio::process::Command::new(&self.bin);
+        c.arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = c.spawn()?;
+        match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(Ok(s)) if s.success() => Ok(()),
+            Ok(Ok(s)) => Err(std::io::Error::other(format!("git --version: {s}"))),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "git --version did not finish within 10 s",
+            )),
+        }
     }
 
     /// The trash directory, if set.
@@ -6083,6 +6150,55 @@ mod tests {
         // No git binary at all: no repositories.
         let none = LocalGit::with_bin(dir.path().join("no-such-git"));
         assert_eq!(none.repo_root(repo).await.unwrap(), None);
+    }
+
+    /// `origin_url`: the URL, none without an origin, and an error without git's message when
+    /// git fails, which quotes the config: an invalid `remote.origin.fetch` holding a URL with
+    /// a password is not in it.
+    #[tokio::test]
+    async fn origin_url_never_holds_git_s_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = LocalGit::default();
+        let repo = init_repo(&dir.path().join("repo"));
+        assert_eq!(g.origin_url(&repo).await.unwrap(), None);
+        run(&repo, &["remote", "add", "origin", "https://h.example/o/r"]);
+        assert_eq!(
+            g.origin_url(&repo).await.unwrap().as_deref(),
+            Some("https://h.example/o/r")
+        );
+        run(
+            &repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "https://user:SECRET@host/repo",
+            ],
+        );
+        let e = format!("{:#}", g.origin_url(&repo).await.unwrap_err());
+        assert!(e.contains("git remote get-url origin failed"), "{e}");
+        assert!(!e.contains("SECRET") && !e.contains("refspec"), "{e}");
+        // A step before it fails (the listing of the config twr reads first, which an include
+        // of a user that does not exist fails), quoting the config: not in it either.
+        let other = init_repo(&dir.path().join("other"));
+        run(
+            &other,
+            &["remote", "add", "origin", "https://h.example/o/r"],
+        );
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(other.join(".git/config"))
+            .unwrap();
+        std::io::Write::write_all(&mut config, b"[include]\n\tpath = ~nosuchuserSECRET/x\n")
+            .unwrap();
+        let e = format!("{:#}", g.origin_url(&other).await.unwrap_err());
+        assert!(e.contains("git remote get-url origin failed"), "{e}");
+        assert!(!e.contains("SECRET") && !e.contains("nosuchuser"), "{e}");
+        // No git at all: said so, still a fixed message.
+        let none = LocalGit::with_bin(dir.path().join("no-such-git"));
+        let e = format!("{:#}", none.origin_url(&repo).await.unwrap_err());
+        assert!(e.contains("not installed"), "{e}");
+        assert!(none.runs().await.is_err());
+        g.runs().await.unwrap();
     }
 
     /// `g` with its trash at `<dir>/trash`.

@@ -90,6 +90,7 @@ impl Hub {
             change_request_timeout: opts.change_request_timeout,
             box_switch: opts.box_switch,
             box_install_lock: tokio::sync::Mutex::new(()),
+            box_files_read_hook: opts.box_files_read_hook,
             box_dialer: opts.box_dialer,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,

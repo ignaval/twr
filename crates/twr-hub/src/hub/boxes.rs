@@ -23,7 +23,9 @@
 //!
 //! `box.add {name}` (users only) re-reads the hub's config file and the `boxes.toml` next to
 //! it ([`Config::load_with_boxes`]) and adds box `name` from them; `box.install {name}` wakes
-//! an SSH box's supervisor at once (a build was just installed on it).
+//! an SSH box's supervisor at once (a build was just installed on it); `box.projects {box}`
+//! takes a box's `[boxes.<name>.projects]` from them again (`twr box project` just recorded
+//! one), the only change to a box the hub takes without a restart besides its build.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard, Weak};
@@ -342,8 +344,9 @@ impl Hub {
     /// records there the build it installed for another OS or CPU); when they cannot be read,
     /// or no longer have the box, the build the hub knew stays. Only the build is taken: a box
     /// whose other settings changed there since the hub added it (its ssh destination, say,
-    /// where the CLI just installed, while the hub dials the old one) is `conflict`, nothing
-    /// changed: the hub takes a box's new settings when it restarts. `unauthorized` for the
+    /// where the CLI just installed, while the hub dials the old one; its projects aside,
+    /// which `box.projects` takes) is `conflict`, nothing changed: the hub takes a box's new
+    /// settings when it restarts. `unauthorized` for the
     /// orchestrator, `not_found` for a box the hub does not have, `bad_request` for a token
     /// box (or one the hub does not dial: a named workspace's).
     pub async fn box_install(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
@@ -381,7 +384,7 @@ impl Hub {
                 Ok(Ok(config)) => match config.boxes.get(name) {
                     Some(cfg) if cfg.transport() == BoxTransport::Ssh => {
                         let registered = self.inner.box_config(name);
-                        if registered.as_ref().map(without_build) != Some(without_build(cfg)) {
+                        if registered.as_ref().map(connection) != Some(connection(cfg)) {
                             return Err(rpc(
                                 codes::CONFLICT,
                                 format!(
@@ -411,6 +414,85 @@ impl Hub {
         }
         sbox.wake();
         Ok(json!({ "box": name }))
+    }
+
+    /// `box.projects {box}` (users only): box `name`'s projects (`[boxes.<name>.projects]`,
+    /// where each repository is on the box) read again from the hub's config file and the
+    /// `boxes.toml` next to it (`twr box project` just recorded one there), replacing the ones
+    /// the hub has for that box, and nothing else of it or of any other box; a new thread on
+    /// the box uses them from now on. Returns `{box, projects, repos}` (`projects` the names,
+    /// sorted; `repos` each one's `repo` as the hub has it now, by name). Serialized
+    /// with `box.install` from before the read to the change, so an older read is never
+    /// applied after a newer one. `unauthorized` for the orchestrator, `not_found` for a box
+    /// the hub does not have or the files no longer have, `unsupported` for a hub without a
+    /// config file, `bad_request` when the files do not parse, `conflict` when the box's
+    /// other settings there (its transport, `ssh`, token) differ from the ones the hub added it
+    /// with (nothing changed: restart the hub).
+    pub async fn box_projects(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
+        if caller.is_orchestrator() {
+            return Err(rpc(
+                codes::UNAUTHORIZED,
+                "only the user records projects on boxes (`twr box project`)",
+            ));
+        }
+        if !self.inner.has_remote(name) {
+            return Err(rpc(
+                codes::NOT_FOUND,
+                format!("the hub has no box {name:?}"),
+            ));
+        }
+        let Some(file) = self.inner.config_file.clone() else {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                "this hub was started without a config file to read boxes from",
+            ));
+        };
+        // One at a time (with `box.install`), from its read of the files to its change.
+        let _one = self.inner.box_install_lock.lock().await;
+        let config = tokio::task::spawn_blocking(move || {
+            Config::load_with_boxes(&file).map_err(|e| format!("{e:#}"))
+        })
+        .await
+        .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
+        .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if let Some(hook) = &self.inner.box_files_read_hook {
+            hook(name).await;
+        }
+        let Some(cfg) = config.boxes.get(name) else {
+            return Err(rpc(
+                codes::NOT_FOUND,
+                format!(
+                    "config.toml and boxes.toml no longer have box {name}: the hub keeps it as it                      was until it restarts"
+                ),
+            ));
+        };
+        let projects: Vec<&String> = cfg.projects.keys().collect();
+        // What each one is now, for the caller to compare with what it wrote.
+        let repos: serde_json::Map<String, Value> = cfg
+            .projects
+            .iter()
+            .map(|(p, c)| (p.clone(), json!(c.repo.to_string_lossy())))
+            .collect();
+        {
+            let mut boxes = self.inner.boxes_mut();
+            let Some(registered) = boxes.configs.get_mut(name) else {
+                return Err(rpc(
+                    codes::NOT_FOUND,
+                    format!("the hub has no box {name:?}"),
+                ));
+            };
+            if connection(registered) != connection(cfg) {
+                return Err(rpc(
+                    codes::CONFLICT,
+                    format!(
+                        "box {name}'s settings changed in the config files since the hub added                          it (its ssh destination, say): the hub does not take its projects until                          it reads them again. Restart the hub (`twr hub stop`, then `twr`)"
+                    ),
+                ));
+            }
+            registered.projects = cfg.projects.clone();
+        }
+        tracing::info!(box_name = %name, projects = ?projects, "box projects read again");
+        Ok(json!({ "box": name, "projects": projects, "repos": repos }))
     }
 
     /// Adds box `name` with `cfg` as `box.add` would, without reading any file (tests).
@@ -567,6 +649,11 @@ fn without_build(c: &BoxConfig) -> BoxConfig {
         build: None,
         ..c.clone()
     }
+}
+
+/// How the hub reaches box `c` ([`BoxConfig::connection`]).
+fn connection(c: &BoxConfig) -> BoxConfig {
+    c.connection()
 }
 
 /// How `hub.info` and `box.add` name a transport.

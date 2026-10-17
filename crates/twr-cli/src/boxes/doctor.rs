@@ -64,6 +64,9 @@ const BOX_SIDE_WAIT: Duration = Duration::from_secs(90);
 /// hub waits 30 s for the box).
 const REFRESH_WAIT: Duration = Duration::from_secs(45);
 
+/// Longest box home directory [`parse_inspect`] keeps.
+const HOME_MAX_BYTES: usize = 4096;
+
 /// The line [`inspect_script`]'s own lines follow.
 const DOCTOR_MARK: &str = "twr-doctor 1";
 
@@ -139,10 +142,11 @@ impl Check {
     }
 }
 
-/// Which build on the box runs the checks there and `twr box login` ([`pick_build`]).
+/// Which build on the box runs the checks there, `twr box login` and `twr box project`
+/// ([`pick_build`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum BuildSource {
+pub(super) enum BuildSource {
     /// The hub's own (the running hub's, else this twr's).
     Hub,
     /// The box's configured `build`.
@@ -152,7 +156,7 @@ enum BuildSource {
 }
 
 impl BuildSource {
-    fn said(self) -> &'static str {
+    pub(super) fn said(self) -> &'static str {
         match self {
             BuildSource::Hub => "the hub's build",
             BuildSource::Configured => "the box's configured build",
@@ -258,7 +262,7 @@ fn progress(json: bool, what: &str) {
 }
 
 /// What the running hub on `socket` says, asked within [`HUB_WAIT`]: never starts one.
-async fn running_hub(socket: &Path) -> HubBuild {
+pub(super) async fn running_hub(socket: &Path) -> HubBuild {
     match tokio::time::timeout(HUB_WAIT, HubBuild::of_running(socket)).await {
         Ok(h) => h,
         Err(_) => HubBuild::own(Some(format!(
@@ -288,15 +292,16 @@ fn box_projects(config: &Config, name: &str) -> Vec<(String, String)> {
 }
 
 /// The script of the first ssh: the hub's probe ([`ssh_box::probe_script`], in a subshell of
-/// its own: it may `exit`), then [`DOCTOR_MARK`] and `order=<build>` for each directory of the
-/// builds tree, newest first. With `repos` (doctor), also: `linger=` / `kill=` (Linux:
-/// logind's `Linger` of this user and `KillUserProcesses`, as the relay reads them), `git=`
-/// (`git --version` on the PATH ssh gives, as the box daemon's), `df=` (`df -Pk` of the data
-/// directory, or the nearest directory above it that exists), and `project.<i>=` (`git`, `notgit`
-/// or `missing`) for each repository of `repos`, in order. Each of those commands is bounded
+/// its own: it may `exit`), then [`DOCTOR_MARK`], `home=<$HOME>` (when absolute and printable)
+/// and `order=<build>` for each directory of the builds tree, newest first. With `repos`
+/// (doctor), also: `linger=` / `kill=` (Linux: logind's `Linger` of this user and
+/// `KillUserProcesses`, as the relay reads them), `git=` (`git --version` on the PATH ssh
+/// gives, as the box daemon's), `df=` (`df -Pk` of the data directory, or the nearest
+/// directory above it that exists), and `project.<i>=` (`git`, `notgit` or `missing`) for each
+/// repository of `repos`, in order. Each of those commands is bounded
 /// by [`BOX_COMMAND_SECS`] ([`bounded_prelude`]): one that hangs on the box (a `df` of a dead
 /// network mount) ends with doctor, not after it.
-fn inspect_script(repos: Option<&[String]>) -> String {
+pub(super) fn inspect_script(repos: Option<&[String]>) -> String {
     inspect_script_bounded(repos, BOX_COMMAND_SECS)
 }
 
@@ -330,6 +335,7 @@ fn inspect_script_bounded(repos: Option<&[String]>, secs: u32) -> String {
     let mut s = format!(
         "(\n{probe})\n\
          echo '{DOCTOR_MARK}'\n\
+         case ${{HOME:-}} in *[[:cntrl:]]*) ;; /*) printf 'home=%s\\n' \"$HOME\" ;; esac\n\
          case ${{XDG_DATA_HOME:-}} in /*) d=$XDG_DATA_HOME ;; *) d=${{HOME:-}}/.local/share ;; esac\n\
          ls -t \"$d/twr/runner/builds\" 2>/dev/null | sed 's/^/order=/'\n",
         probe = ssh_box::probe_script()
@@ -362,10 +368,12 @@ fn inspect_script_bounded(repos: Option<&[String]>, secs: u32) -> String {
 
 /// What the first ssh found ([`inspect_script`]).
 #[derive(Debug, Default)]
-struct Inspected {
-    probe: ssh_box::Probe,
+pub(super) struct Inspected {
+    pub(super) probe: ssh_box::Probe,
     /// The builds tree's directories, newest first (not all of them builds twr trusts).
-    newest_first: Vec<String>,
+    pub(super) newest_first: Vec<String>,
+    /// The box's home directory (`$HOME`, when absolute and printable; `twr box project`).
+    pub(super) home: Option<String>,
     /// logind's `Linger=yes|no` of this user (`none`: no `loginctl`), when asked (Linux).
     linger: Option<String>,
     /// `busctl`'s `KillUserProcesses` (`b true`), when there is `busctl` (Linux).
@@ -381,7 +389,7 @@ struct Inspected {
 /// Parses the first ssh's output `out` ([`inspect_script`]) with `projects` repositories
 /// asked: the probe ([`ssh_box::parse_probe`]: an error without its mark or an OS), then the
 /// lines after the last [`DOCTOR_MARK`] line, each value cut at [`ssh_box::NOTE_MAX_BYTES`].
-fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspected> {
+pub(super) fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspected> {
     let probe = ssh_box::parse_probe(out)?;
     let mut ins = Inspected {
         probe,
@@ -403,6 +411,15 @@ fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspected> {
             "kill" if ins.kill.is_none() => ins.kill = Some(cut(v)),
             "git" if ins.git.is_none() => ins.git = Some(cut(v)),
             "df" if ins.df.is_none() => ins.df = Some(cut(v)),
+            // Whole (a path cut short would be another one), absolute and printable only.
+            "home"
+                if ins.home.is_none()
+                    && v.starts_with('/')
+                    && v.len() <= HOME_MAX_BYTES
+                    && !v.chars().any(char::is_control) =>
+            {
+                ins.home = Some(v.to_string())
+            }
             _ => {
                 let i = k
                     .strip_prefix("project.")
@@ -420,7 +437,7 @@ fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspected> {
 /// box has it, else the box's configured one (`configured`), else the newest the box has
 /// (`newest_first`, the builds tree newest first; any it has when that order is not known).
 /// Only builds the probe trusts (`has`). `None` when it has none.
-fn pick_build(
+pub(super) fn pick_build(
     has: &BTreeSet<String>,
     newest_first: &[String],
     hub: Option<&str>,
@@ -445,14 +462,43 @@ fn pick_build(
 /// status line of the box daemon of that hub, or `no daemon`), then (a valid key, Linux) the
 /// active systemd user services the relay names for that daemon ([`unit_prefix`]: `systemctl
 /// --user list-units`, bounded by [`BOX_COMMAND_SECS`]; [`NO_SYSTEMCTL`] without
-/// `systemctl`); with `agents`, `twr runner --agents` (one JSON line).
+/// `systemctl`); with `agents`, `twr runner --agents` (one JSON line). Each `twr runner` is
+/// bounded too ([`BOX_STATUS_SECS`], [`BOX_AGENTS_SECS`], [`bounded_prelude`]): one that hangs
+/// on the box ends with doctor, not after it.
 fn box_side_script(data: &str, id: &str, status: Option<(&str, &str)>, agents: bool) -> String {
+    box_side_script_bounded(data, id, status, agents, BOX_STATUS_SECS, BOX_AGENTS_SECS)
+}
+
+/// How long `twr runner --stdio --status` may take on the box, in seconds
+/// ([`box_side_script`]).
+const BOX_STATUS_SECS: u32 = 20;
+
+/// How long `twr runner --agents` may take on the box, in seconds ([`box_side_script`]): its
+/// login shell (5 s) and each agent's commands (10 s, at once), and some.
+const BOX_AGENTS_SECS: u32 = 40;
+
+// All of the second ssh's commands end before doctor stops waiting for it.
+const _: () = assert!(
+    (BOX_STATUS_SECS + BOX_COMMAND_SECS + BOX_AGENTS_SECS) as u64 + 10 < BOX_SIDE_WAIT.as_secs()
+);
+
+/// [`box_side_script`] with its `twr runner` commands bounded by `status_secs` and
+/// `agents_secs` seconds.
+fn box_side_script_bounded(
+    data: &str,
+    id: &str,
+    status: Option<(&str, &str)>,
+    agents: bool,
+    status_secs: u32,
+    agents_secs: u32,
+) -> String {
     let exe = sh_word(&ssh_box::build_path(data, id));
     let mut s = String::new();
     if let Some((name, key)) = status {
+        s.push_str(&bounded_prelude(status_secs));
         s.push_str(&format!(
             "echo '{STATUS_MARK}'\n\
-             {exe} runner --stdio {} --hub-key {} --status </dev/null 2>/dev/null\n\
+             twr_b {exe} runner --stdio {} --hub-key {} --status </dev/null 2>/dev/null\n\
              echo \"{EXIT_MARK}$?\"\n",
             sh_word(&format!("--box={name}")),
             sh_word(key),
@@ -473,9 +519,10 @@ fn box_side_script(data: &str, id: &str, status: Option<(&str, &str)>, agents: b
         }
     }
     if agents {
+        s.push_str(&bounded_prelude(agents_secs));
         s.push_str(&format!(
             "echo '{AGENTS_MARK}'\n\
-             {exe} runner --agents </dev/null 2>/dev/null\n\
+             twr_b {exe} runner --agents </dev/null 2>/dev/null\n\
              echo \"{EXIT_MARK}$?\"\n"
         ));
     }
@@ -539,7 +586,7 @@ async fn run_box_side(name: &str, ssh: &str, script: &str) -> Result<String, Str
 
 /// Why a command of build `id` that exited `code` gave nothing usable: an older twr does not
 /// know the flag (clap's usage error, exit 2).
-fn box_side_failure(id: &str, flag: &str, code: Option<i32>) -> String {
+pub(super) fn box_side_failure(id: &str, flag: &str, code: Option<i32>) -> String {
     match code {
         Some(2) => format!("build {id} does not know `{flag}` (a twr older than this one)"),
         Some(c) => format!("`twr runner {flag}` of build {id} exited {c}"),
@@ -2199,6 +2246,7 @@ mod tests {
         let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), 0).unwrap();
         assert_eq!(ins.newest_first.len(), 2);
         assert!(ins.git.is_none());
+        assert_eq!(ins.home.as_deref(), home.to_str());
     }
 
     /// A box-side command that hangs (a `df` of a dead mount) is ended at the bound, with
@@ -2253,6 +2301,52 @@ mod tests {
         }
     }
 
+    /// The second ssh's `twr runner` commands that hang on the box are ended at their bound,
+    /// with the box's `timeout` and without one: the script ends with doctor, not after it,
+    /// and each section says it did not end well.
+    #[test]
+    fn the_box_side_runner_commands_are_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let id = "00000000000000aa";
+        let exe = std::path::PathBuf::from(ssh_box::build_path(data.to_str().unwrap(), id));
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let no_timeout = dir.path().join("no-timeout");
+        std::fs::create_dir(&no_timeout).unwrap();
+        let fake = no_timeout.join("timeout");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let script =
+            box_side_script_bounded(data.to_str().unwrap(), id, Some(("gpu", "ab")), true, 1, 1);
+        for extra in [None, Some(&no_timeout)] {
+            let dirs = match extra {
+                Some(d) => format!("{}:{path}", d.display()),
+                None => path.clone(),
+            };
+            let started = std::time::Instant::now();
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", dirs)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let took = started.elapsed();
+            assert!(out.status.success(), "{extra:?}");
+            assert!(took < Duration::from_secs(10), "{extra:?} took {took:?}");
+            let out = String::from_utf8_lossy(&out.stdout);
+            for mark in [STATUS_MARK, AGENTS_MARK] {
+                let (code, lines) = section(&out, mark).unwrap();
+                assert!(code.is_some_and(|c| c != 0), "{extra:?} {mark}: {code:?}");
+                assert!(lines.is_empty(), "{extra:?} {mark}: {lines:?}");
+            }
+        }
+    }
+
     /// Lines a login script prints, or the box makes up before the mark, are not read; values
     /// are cut.
     #[test]
@@ -2265,6 +2359,13 @@ mod tests {
         );
         let ins = parse_inspect(&out, 1).unwrap();
         assert_eq!(ins.newest_first, ["00000000000000aa"]);
+        assert_eq!(ins.home, None);
+        let ins = parse_inspect(
+            &format!("{out}home=relative\nhome=/h/me\nhome=/h/other\n"),
+            1,
+        )
+        .unwrap();
+        assert_eq!(ins.home.as_deref(), Some("/h/me"));
         assert_eq!(ins.git.as_deref().unwrap().len(), ssh_box::NOTE_MAX_BYTES);
         assert_eq!(ins.projects, [Some("git".into())]);
         assert_eq!(df_free(ins.df.as_deref().unwrap()), Some(2048 * 1024));

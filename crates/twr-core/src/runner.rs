@@ -118,6 +118,12 @@ pub const SEALED_AUTH_PROOF: &str = "";
 /// Largest WebSocket message either side accepts (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
 
+/// The most bytes the hub's machine reads from each of stdout and stderr of an ssh that runs a
+/// script or a `twr runner` report command on an SSH box (`twr_hub::ssh_box::SSH_OUTPUT_MAX`):
+/// what a box-side report prints must stay well below it
+/// (`twr_runner::repos::REPORT_MAX_BYTES`), a login script's chatter aside.
+pub const SSH_OUTPUT_MAX: usize = 64 * 1024;
+
 /// How long a runner keeps the result of a durable command ([`is_durable_cmd_id`]) at least,
 /// counted from when it ran: a repeat of the id within this time returns the stored result
 /// instead of running again. Other results are kept for a shorter time (a day, at most the
@@ -1733,7 +1739,9 @@ mod tests {
             "gpu",
             &rn,
             &hn,
-            &hub.to_uppercase().replace('A', "z")
+            // Uppercase hex in place of the first digit: a case-only variant when that digit
+            // is `a`, another proof otherwise; refused either way, whatever the random proof.
+            &format!("A{}", &hub[1..])
         ));
         assert!(!ok(Prover::Hub, "gpu", &rn, &hn, ""));
         let other = Secret::new("0123456789abcdef0123456789abcdeX");

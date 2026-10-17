@@ -3,7 +3,8 @@
 //! (`box.add`); `list` and `status` show `hub.info`'s boxes; `install` puts a twr build on an
 //! SSH box (the hub's own, a release's for another OS or CPU, or a file) and has the hub
 //! connect again (`box.install`); `remove` takes a box out of `boxes.toml`; `doctor` checks a
-//! box and `login` starts an agent CLI's login on it ([`doctor`]).
+//! box and `login` starts an agent CLI's login on it ([`doctor`]); `project` finds (or clones)
+//! a project's repository on a box and records where it is ([`project`]).
 //!
 //! The probes run ssh in the user's terminal, with the hub's ssh options but without
 //! `BatchMode` ([`twr_hub::ssh_box::interactive_ssh_args`]), so ssh can ask about an unknown
@@ -32,6 +33,7 @@ use super::{
 };
 
 mod doctor;
+mod project;
 
 /// How long `twr box add` and `twr box install` wait for the box to come online.
 const ONLINE_WAIT: Duration = Duration::from_secs(90);
@@ -152,6 +154,44 @@ pub(super) enum BoxCmd {
         #[arg(value_parser = ["claude", "claude-code", "codex", "grok", "grok-build"])]
         agent: String,
     },
+    /// Find a project's repository on a box, or clone it there, and record where it is
+    /// (`[boxes.<box>.projects.<project>] repo`, in boxes.toml), so that `twr thread new
+    /// <project> --box <box>` uses it. The project is a configured one, or a repository folder
+    /// name under project_roots, as `twr thread new` finds it on this machine. Without
+    /// options, the box's twr build (as `twr box doctor` picks it) looks at the path the
+    /// repository has under your home here, under the box's home, then under the box's
+    /// ~/code, ~/src, ... for a repository of that folder name, and reads each one's origin. When
+    /// exactly one has the project's origin and the search was complete, it asks y/N (--yes:
+    /// it doesn't) and records it; otherwise it lists them, and --path picks one. --path
+    /// records the repository there once the box says it is one (its top level). --clone runs
+    /// `git clone` of the project's origin on the box, in this terminal, with the box's own git
+    /// credentials (no agent forwarding), then records the clone; it needs a terminal. twr
+    /// never fetches. A running hub takes the change at once.
+    Project {
+        /// The box's name.
+        name: String,
+        /// The project: a configured project, or a repository folder name under project_roots.
+        project: String,
+        /// The repository's absolute path on the box (its top level).
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["clone", "remove"])]
+        path: Option<String>,
+        /// Clone the project's origin on the box (https://, ssh:// or user@host:path, without
+        /// credentials), in this terminal, then record the clone.
+        #[arg(long, conflicts_with = "remove")]
+        clone: bool,
+        /// With --clone: the clone's own new directory on the box, as `git clone <url> <dir>`
+        /// takes it (its parent must exist; its name: letters, digits, `-`, `_` and `.`).
+        /// Default: where the repository is under your home here, under the box's home; else
+        /// ~/code/<the repository's folder name>.
+        #[arg(long, value_name = "DIR", requires = "clone")]
+        into: Option<String>,
+        /// Remove the project's entry for the box.
+        #[arg(long)]
+        remove: bool,
+        /// Record (or clone) without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// Runs `twr box ...` for the hub on `socket` of `paths`'s workspace, whose config (with
@@ -178,6 +218,26 @@ pub(super) async fn run(
         }
         BoxCmd::Login { name, agent } => {
             return doctor::login(config, paths, socket, &name, &agent).await
+        }
+        BoxCmd::Project {
+            name,
+            project,
+            path,
+            clone,
+            into,
+            remove,
+            yes,
+        } => {
+            let req = project::Request {
+                name,
+                project,
+                path,
+                clone,
+                into,
+                remove,
+                yes,
+            };
+            return project::project(config, paths, socket, req).await;
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -715,13 +775,17 @@ async fn add(
         outln!("the hub has box {name} from {} already", file.display());
     }
     match wait_online(&mut c, name, false, None).await? {
-        Online::Yes(b) => online_note(name, &b),
+        Online::Yes(b) => {
+            online_note(name, &b);
+            project_hints(config, name);
+        }
         Online::NeedsInstall(b) if !same => {
             outln!(
                 "box {name} needs a twr build for {}: run `twr box install {name}`",
                 target_label(&probe)
             );
             print_reason(&b);
+            project_hints(config, name);
         }
         Online::NeedsInstall(b) => {
             print_reason(&b);
@@ -729,6 +793,33 @@ async fn add(
         }
     }
     Ok(())
+}
+
+/// What `twr box add` says of the projects configured for box `name` (`[projects.<p>] box`):
+/// how to find each on the box and record where it is.
+fn project_hints(config: &Config, name: &str) {
+    let lines = project_hint_lines(config, name);
+    if lines.is_empty() {
+        return;
+    }
+    outln!(
+        "projects configured for box {name}: find each one's repository on the box and record \
+         it with"
+    );
+    for l in lines {
+        outln!("  {l}");
+    }
+}
+
+/// [`project_hints`]'s commands.
+fn project_hint_lines(config: &Config, name: &str) -> Vec<String> {
+    use twr_core::paths::sh_word;
+    config
+        .projects
+        .iter()
+        .filter(|(_, p)| p.box_name.as_deref() == Some(name))
+        .map(|(p, _)| format!("twr box project {} {}", sh_word(name), sh_word(p)))
+        .collect()
 }
 
 /// How waiting for a box ended.
@@ -1066,12 +1157,17 @@ async fn install(
     refuse_agent_action("install twr on boxes")?;
     default_workspace_only(paths, "install")?;
     twr_core::runner::validate_box_name(name)?;
-    let Some(cfg) = config.boxes.get(name) else {
+    let Some(loaded) = config.boxes.get(name) else {
         bail!(
             "there is no box {name} in config.toml or boxes.toml (`twr box add {name} <ssh \
              destination>` adds one)"
         );
     };
+    let file = paths.boxes_file();
+    // One snapshot of the box, read from its file now, drives both the ssh below and the
+    // record's comparison.
+    let (cfg, in_boxes_file) = box_snapshot(&paths.config_file, &file, name, loaded)?;
+    let cfg = &cfg;
     if cfg.transport() != BoxTransport::Ssh {
         bail!(
             "box {name} is a token box: its runner connects to the hub, and you install twr on \
@@ -1079,8 +1175,6 @@ async fn install(
         );
     }
     let ssh = cfg.ssh.clone().unwrap_or_default();
-    let file = paths.boxes_file();
-    let in_boxes_file = BoxesFile::load(&file)?.boxes.contains_key(name);
     if let Some(b) = binary {
         // Read now: a path that is wrong fails before any ssh.
         std::fs::metadata(b).with_context(|| format!("reading {}", b.display()))?;
@@ -1164,11 +1258,45 @@ async fn install(
     reconnect(socket, paths, name, Some(&id)).await
 }
 
+/// Box `name` as its file has it now (boxes.toml, else config.toml): the one snapshot a
+/// command that changes it (`twr box install`, `twr box project`) works from, its ssh to the
+/// box and its write both, and whether it is in boxes.toml (else in config.toml, which twr
+/// does not edit). Refused when the box's connection settings there
+/// ([`BoxConfig::connection`]) are not those of `loaded` (the box as the command's config was
+/// loaded, earlier), or the box is in neither file now.
+pub(super) fn box_snapshot(
+    config_file: &Path,
+    file: &Path,
+    name: &str,
+    loaded: &BoxConfig,
+) -> anyhow::Result<(BoxConfig, bool)> {
+    let (start, in_file) = match BoxesFile::load(file)?.boxes.get(name) {
+        Some(b) => (b.clone(), true),
+        None => match Config::load(config_file)?.boxes.get(name) {
+            Some(b) => (b.clone(), false),
+            None => bail!(
+                "box {name} was removed from {} meanwhile: nothing was changed",
+                file.display()
+            ),
+        },
+    };
+    if start.connection() != loaded.connection() {
+        bail!(
+            "box {name} changed in {} while twr read its config (its ssh destination or \
+             settings): nothing was changed; run the command again",
+            if in_file { file } else { config_file }.display()
+        );
+    }
+    Ok((start, in_file))
+}
+
 /// Records build `id`, just installed over ssh to box `name` as configured by `used`, as the
 /// box's `build` in boxes.toml (`file`, next to `config_file`), under the file's lock: only
-/// while the box there is still the one installed to (everything of it but its `build` as in
-/// `used`: a box removed and added again meanwhile, with another destination say, would get a
-/// build of another machine). Refused otherwise, with the file left as it is.
+/// while the box there is still the one installed to (its connection settings,
+/// [`BoxConfig::connection`], as in `used`: a box removed and added again meanwhile, with
+/// another destination say, would get a build of another machine; a project recorded
+/// meanwhile, `twr box project`, is no other box). Refused otherwise, with the file left as it
+/// is.
 fn record_installed_build(
     config_file: &Path,
     file: &Path,
@@ -1184,11 +1312,7 @@ fn record_installed_build(
             file.display()
         );
     };
-    let without_build = |c: &BoxConfig| BoxConfig {
-        build: None,
-        ..c.clone()
-    };
-    if without_build(b) != without_build(used) {
+    if b.connection() != used.connection() {
         bail!(
             "box {name} changed in {} while twr was installing on it (its ssh destination or \
              settings): build {id} was not recorded and stays on the box it went to; run `twr \
@@ -1764,11 +1888,89 @@ mod tests {
             BoxesFile::load(&file).unwrap().boxes["gpu"],
             ssh("me@other", None)
         );
+        // A project recorded meanwhile (`twr box project`): the same box, recorded, the
+        // project kept.
+        let mut with_project = ssh("me@gpu", Some("0000000000000002"));
+        with_project.projects.insert(
+            "api".into(),
+            twr_core::config::BoxProjectConfig {
+                repo: "/h/api".into(),
+                runtime: None,
+            },
+        );
+        save(with_project.clone());
+        record_installed_build(&config, &file, "gpu", &used, "0000000000000004").unwrap();
+        let now = BoxesFile::load(&file).unwrap().boxes["gpu"].clone();
+        assert_eq!(now.build.as_deref(), Some("0000000000000004"));
+        assert_eq!(now.projects, with_project.projects);
         // Removed: refused too.
         BoxesFile::default().save(&file).unwrap();
         let e =
             record_installed_build(&config, &file, "gpu", &used, "0000000000000003").unwrap_err();
         assert!(format!("{e:#}").contains("was removed"), "{e:#}");
+    }
+
+    /// `twr box install`'s snapshot is the file's box now, refused when its connection
+    /// settings moved since the config was loaded (a project or a build alone does not).
+    #[test]
+    fn the_install_snapshot_is_the_file_s_box_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let file = BoxesFile::path_for(&config);
+        std::fs::write(&config, "").unwrap();
+        let ssh = |dest: &str| BoxConfig {
+            transport: Some(BoxTransport::Ssh),
+            ssh: Some(dest.into()),
+            ..BoxConfig::default()
+        };
+        let save = |c: &BoxConfig| {
+            let mut b = BoxesFile::default();
+            b.boxes.insert("gpu".into(), c.clone());
+            b.save(&file).unwrap();
+        };
+        let loaded = ssh("me@a");
+        let mut more = loaded.clone();
+        more.build = Some("0123456789abcdef".into());
+        more.projects.insert(
+            "api".into(),
+            twr_core::config::BoxProjectConfig {
+                repo: "/h/api".into(),
+                runtime: None,
+            },
+        );
+        save(&more);
+        assert_eq!(
+            box_snapshot(&config, &file, "gpu", &loaded).unwrap(),
+            (more, true)
+        );
+        save(&ssh("me@b"));
+        let e = box_snapshot(&config, &file, "gpu", &loaded).unwrap_err();
+        assert!(format!("{e:#}").contains("changed in"), "{e:#}");
+        BoxesFile::default().save(&file).unwrap();
+        std::fs::write(
+            &config,
+            "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"me@a\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            box_snapshot(&config, &file, "gpu", &loaded).unwrap(),
+            (loaded, false)
+        );
+    }
+
+    #[test]
+    fn box_add_names_the_projects_configured_for_the_box() {
+        let config: Config = Config::from_toml_str(
+            "[projects.api]\nrepo = \"/h/api\"\nbox = \"gpu\"\n\
+             [projects.web]\nrepo = \"/h/web\"\n\
+             [projects.\"my app\"]\nrepo = \"/h/app\"\nbox = \"gpu\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_hint_lines(&config, "gpu"),
+            ["twr box project gpu api", "twr box project gpu 'my app'"]
+        );
+        assert!(project_hint_lines(&config, "other").is_empty());
     }
 
     #[test]

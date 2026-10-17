@@ -107,6 +107,8 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+// Parsed once per process: `twr runner`'s many hidden flags make its variant the largest.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Run the hub in the foreground (logs to stderr). `twr hub stop` stops a running hub.
@@ -435,7 +437,9 @@ enum Cmd {
         #[arg(
             long,
             value_name = "URL",
-            required_unless_present_any = ["stdio", "daemon", "agents", "login", "exec"]
+            required_unless_present_any = [
+                "stdio", "daemon", "agents", "login", "exec", "find_repo", "clone_repo"
+            ]
         )]
         hub: Option<String>,
         /// File holding the box's token (`[boxes.<name>] token` on the hub, at least 16
@@ -447,7 +451,7 @@ enum Cmd {
         #[arg(
             long = "box",
             value_name = "NAME",
-            required_unless_present_any = ["agents", "login", "exec"]
+            required_unless_present_any = ["agents", "login", "exec", "find_repo", "clone_repo"]
         )]
         box_name: Option<String>,
         /// Data directory for the spool and worktrees (default: the twr data directory).
@@ -595,6 +599,95 @@ enum Cmd {
             ]
         )]
         exec_args: Vec<String>,
+        /// Print, as JSON, the git repositories on this box that could be the hub's repository
+        /// of folder name --name (`twr box project`): the --hint path, then those under the
+        /// default project roots in this home, each with its `origin` and whether that names
+        /// --origin's repository ([`twr_runner::repos::find_repo`]). Reads only, no network.
+        #[arg(
+            long,
+            hide = true,
+            requires = "repo_name",
+            group = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec"
+            ]
+        )]
+        find_repo: bool,
+        /// With --find-repo: the hub repository's `origin` URL (without credentials).
+        #[arg(
+            long,
+            hide = true,
+            value_name = "URL",
+            requires = "find_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "clone_repo"
+            ]
+        )]
+        origin: Option<String>,
+        /// With --find-repo: the path on this box to look at first.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "PATH",
+            requires = "find_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "clone_repo"
+            ]
+        )]
+        hint: Option<PathBuf>,
+        /// Clone --url into a new directory --parent/--name in this terminal, then print
+        /// `twr-clone-path <path>` (`twr box project --clone`; checks:
+        /// [`twr_runner::repos::clone_repo`]). Needs a terminal.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["repo_name", "clone_url", "clone_parent"],
+            group = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_repo: bool,
+        /// With --clone-repo: the URL (https://, ssh:// or user@host:path, no credentials).
+        #[arg(
+            long = "url",
+            hide = true,
+            value_name = "URL",
+            requires = "clone_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_url: Option<String>,
+        /// With --clone-repo: the directory the clone goes in.
+        #[arg(
+            long = "parent",
+            hide = true,
+            value_name = "DIR",
+            requires = "clone_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_parent: Option<PathBuf>,
+        /// With --find-repo or --clone-repo: the repository's folder name.
+        #[arg(
+            long = "name",
+            hide = true,
+            value_name = "NAME",
+            requires = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec"
+            ]
+        )]
+        repo_name: Option<String>,
         /// With --daemon: the socket to listen on (`--socket` is the hub socket's).
         #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
         daemon_socket: Option<PathBuf>,
@@ -892,8 +985,18 @@ fn main() -> ExitCode {
         })
     );
     // The relay's read of stdin is a blocking task, which a runtime's graceful shutdown would
-    // wait on after the daemon's side ended: it leaves without it.
-    let relaying = matches!(cli.cmd, Some(Cmd::Runner { stdio: true, .. }));
+    // wait on after the daemon's side ended: it leaves without it. So does `--find-repo`, past
+    // its deadline, without a walk of the box's folders that hangs (a dead network mount).
+    let relaying = matches!(
+        cli.cmd,
+        Some(
+            Cmd::Runner { stdio: true, .. }
+                | Cmd::Runner {
+                    find_repo: true,
+                    ..
+                }
+        )
+    );
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
     if matches!(cli.cmd, Some(Cmd::ClaudeMemoryGuard)) {
@@ -1113,6 +1216,37 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             login: Some(agent),
             ..
         }) => return runner_login(&agent).await,
+        Some(Cmd::Runner {
+            cmd: None,
+            find_repo: true,
+            repo_name: Some(name),
+            origin,
+            hint,
+            ..
+        }) => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|h| h.is_absolute());
+            let report = twr_runner::repos::find_repo(
+                &twr_runner::local::LocalGit::default(),
+                home.as_deref(),
+                &name,
+                origin.as_deref(),
+                hint.as_deref(),
+                tokio::time::Instant::now() + twr_runner::repos::FIND_DEADLINE,
+            )
+            .await?;
+            outln!("{}", serde_json::to_string(&report)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            clone_repo: true,
+            repo_name: Some(name),
+            clone_url: Some(url),
+            clone_parent: Some(parent),
+            ..
+        }) => return runner_clone(&url, &parent, &name).await,
         Some(Cmd::Runner {
             cmd: None,
             exec: Some(runtime),
@@ -3379,6 +3513,30 @@ async fn runner_login(agent: &str) -> anyhow::Result<ExitCode> {
     // Only returns when it could not run it.
     let e = cmd.exec();
     bail!("running `{shown}`: {e}")
+}
+
+/// `twr runner --clone-repo --url <url> --parent <dir> --name <name>` (`twr box project
+/// --clone` runs it over ssh with a terminal): [`twr_runner::repos::clone_repo`], git talking
+/// to the user's terminal, then a newline and `twr-clone-path <path>` as the last line
+/// ([`twr_runner::repos::CLONE_PATH_MARK`]). Refused without a terminal on stdin and stdout,
+/// after a URL twr does not clone (which needs no terminal to be told so).
+async fn runner_clone(url: &str, parent: &Path, name: &str) -> anyhow::Result<ExitCode> {
+    use std::io::IsTerminal;
+    twr_core::gitremote::RemoteUrl::parse(url).map_err(|e| anyhow!("{e}"))?;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "`twr runner --clone-repo` needs a terminal on stdin and stdout: git may ask you \
+             things (`twr box project <box> <project> --clone` runs it with one)"
+        );
+    }
+    let path = twr_runner::repos::clone_repo(url, parent, name).await?;
+    // On a line of its own, whatever git's output (a hook's) left unfinished.
+    outln!(
+        "\n{} {}",
+        twr_runner::repos::CLONE_PATH_MARK,
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `twr runner --exec <runtime> [--path <PATH>] [--env NAME=VALUE]... [--unset NAME]... --
@@ -7065,9 +7223,10 @@ mod tests {
         assert!(!probes_own_agents(true, None));
     }
 
-    /// The box-side probes of `twr box doctor` / `twr box login`: `--agents` and `--login
-    /// <agent>` take no other runner flag and not each other; `--status` goes with the
-    /// relay's box and hub key only. Hidden from help.
+    /// The box-side probes of `twr box doctor` / `twr box login` / `twr box project`:
+    /// `--agents`, `--login <agent>`, `--find-repo` and `--clone-repo` take no other runner
+    /// flag and not each other; `--status` goes with the relay's box and hub key only. Hidden
+    /// from help.
     #[test]
     fn the_box_probe_flags_parse() {
         let key = "ab".repeat(32);
@@ -7188,8 +7347,80 @@ mod tests {
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
+        // `--find-repo` and `--clone-repo` take their own operands and no other runner flag.
+        let c = parse(&[
+            "--find-repo",
+            "--name=api",
+            "--origin=git@github.com:o/api.git",
+            "--hint=/home/me/code/api",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { find_repo: true, clone_repo: false, repo_name: Some(n), origin: Some(o), hint: Some(h), box_name: None, hub: None, .. })
+                if n == "api" && o == "git@github.com:o/api.git" && h == Path::new("/home/me/code/api")
+        ));
+        let c = parse(&["--find-repo", "--name", "api"]).unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner {
+                find_repo: true,
+                origin: None,
+                hint: None,
+                ..
+            })
+        ));
+        let c = parse(&[
+            "--clone-repo",
+            "--url",
+            "https://h/o/api",
+            "--parent",
+            "/home/me/code",
+            "--name",
+            "api",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { clone_repo: true, find_repo: false, clone_url: Some(u), clone_parent: Some(p), repo_name: Some(n), .. })
+                if u == "https://h/o/api" && p == Path::new("/home/me/code") && n == "api"
+        ));
+        let clone = ["--clone-repo", "--url=u", "--parent=/p", "--name=n"];
+        for bad in [
+            vec!["--find-repo"],
+            vec!["--name", "api"],
+            vec!["--find-repo", "--name=a", "--url=u"],
+            vec!["--find-repo", "--name=a", "--parent=/p"],
+            vec!["--find-repo", "--name=a", "--box", "b"],
+            vec!["--find-repo", "--name=a", "--hub", "ws://h:1"],
+            vec!["--find-repo", "--name=a", "--agents"],
+            vec!["--find-repo", "--name=a", "--exec=codex"],
+            vec!["--origin=u"],
+            vec!["--hint=/p"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--name=a"],
+            vec!["--clone-repo", "--url=u", "--name=n"],
+            vec!["--clone-repo", "--parent=/p", "--name=n"],
+            vec!["--clone-repo", "--url=u", "--parent=/p"],
+            vec!["--url=u", "--parent=/p", "--name=n"],
+            [&clone[..], &["--find-repo"]].concat(),
+            [&clone[..], &["--origin=o"]].concat(),
+            [&clone[..], &["--login", "codex"]].concat(),
+            [&clone[..], &["--box", "b"]].concat(),
+            [&relay[..], &["--find-repo", "--name=a"]].concat(),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
         let help = cli_help_page().1;
-        for flag in ["--agents", "--login", "--status", "--exec"] {
+        for flag in [
+            "--agents",
+            "--login",
+            "--status",
+            "--exec",
+            "--find-repo",
+            "--clone-repo",
+            "--hint",
+            "--origin",
+        ] {
             assert!(!help.contains(flag), "{flag}");
         }
     }

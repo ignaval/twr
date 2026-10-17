@@ -166,7 +166,7 @@ const SESSION_NOTES_MAX: usize = 1000;
 /// The most bytes read from each of stdout and stderr of an ssh that runs a script on the box
 /// (probe, upload, prune; `twr box add` and `twr box install` too): a box that prints more (a
 /// login script without end, say) fails the attempt, and its ssh is killed.
-pub const SSH_OUTPUT_MAX: usize = 64 * 1024;
+pub const SSH_OUTPUT_MAX: usize = twr_core::runner::SSH_OUTPUT_MAX;
 
 /// While an outage is younger than this, attempts are at most [`SHORT_OUTAGE_CAP`] apart.
 const SHORT_OUTAGE: Duration = Duration::from_secs(60);

@@ -376,6 +376,11 @@ pub struct HubOptions {
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
     pub box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// Test hook: awaited with the box's name by `box.projects` once it has read the config
+    /// files, before it compares and applies what it read (a slow read). Never set outside
+    /// tests.
+    #[doc(hidden)]
+    pub box_files_read_hook: Option<BoxFilesReadHook>,
     /// How the hub probes its own box's agent CLIs (`hub.info` `agents`, `box.agents local`;
     /// [`own_agent_probe`] for `twr hub`); `None` (the default, and tests): it probes none and
     /// reports none.
@@ -388,6 +393,11 @@ pub struct HubOptions {
 /// [`HubOptions::marker_read_hook`].
 #[doc(hidden)]
 pub type MarkerReadHook = Arc<dyn Fn(u32) + Send + Sync>;
+
+/// [`HubOptions::box_files_read_hook`].
+#[doc(hidden)]
+pub type BoxFilesReadHook =
+    Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// [`HubOptions::reap_job_group_hook`]: given the group's id and its leader's start time.
 #[doc(hidden)]
@@ -434,6 +444,7 @@ impl HubOptions {
             reap_job_group_hook: None,
             job_members_hook: None,
             box_dialer: None,
+            box_files_read_hook: None,
             agent_probe: None,
             agents_poll: AgentsPoll::default(),
         }
@@ -625,9 +636,12 @@ struct Inner {
     config_file: Option<PathBuf>,
     /// [`HubOptions::change_request_timeout`], for the remote boxes added later.
     change_request_timeout: Duration,
-    /// Serializes `box.install`s: each reads the files, compares and applies, so a slower
-    /// one's older read can't be applied after a newer one's (`hub::boxes`).
+    /// Serializes `box.install`s and `box.projects`: each reads the files, compares and
+    /// applies, so a slower one's older read can't be applied after a newer one's
+    /// (`hub::boxes`).
     box_install_lock: tokio::sync::Mutex<()>,
+    /// [`HubOptions::box_files_read_hook`].
+    box_files_read_hook: Option<BoxFilesReadHook>,
     /// [`HubOptions::box_switch`].
     box_switch: crate::ssh_box::SwitchTiming,
     /// [`HubOptions::box_dialer`].

@@ -757,6 +757,183 @@ async fn boxes_are_added_while_the_hub_runs() {
     assert!(format!("{e:#}").contains("boxes.lab.ssh"), "{e:#}");
 }
 
+/// `box.projects` reads a box's projects again from config.toml and boxes.toml (`twr box
+/// project` recorded one there) and replaces those of that box only: a new thread on it uses
+/// them at once, and the result says what each one's repo is now. A box whose other settings
+/// changed there is a conflict, nothing taken (and
+/// projects alone no longer make `box.install` one). Reloads run one at a time from their read
+/// to their change: one whose read is slow is applied before the next one reads, so the older
+/// file is never applied last. Users only; a box the hub or the files do not have, files that
+/// do not parse, a hub without a config file are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn box_projects_are_read_again_while_the_hub_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let config_file = cfg_dir.join("config.toml");
+    let boxes_file = cfg_dir.join("boxes.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::create_dir_all(&b).unwrap();
+    let lab_token = "lab-token-0123456789abcdef0123456789";
+    // Box `far` at `ssh` with `projects`, and box `lab` with project `lab-only` at `lab`.
+    let files = |ssh: &str, projects: &[(&str, &Path)], lab: &Path| {
+        let mut f = format!("[boxes.far]\ntransport = \"ssh\"\nssh = \"{ssh}\"\n");
+        for (name, repo) in projects {
+            f.push_str(&format!(
+                "\n[boxes.far.projects.{name}]\nrepo = \"{}\"\n",
+                repo.display()
+            ));
+        }
+        f.push_str(&format!(
+            "\n[boxes.lab]\ntoken = \"{lab_token}\"\n\n[boxes.lab.projects.lab-only]\nrepo = \
+             \"{}\"\n",
+            lab.display()
+        ));
+        std::fs::write(&boxes_file, f).unwrap();
+    };
+    let ssh = "me@far.invalid";
+    files(ssh, &[("api", &a)], &a);
+    // The slow read: armed, the next `box.projects` says it has read the files, then waits.
+    type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    let gate: Arc<std::sync::Mutex<Option<Gate>>> = Arc::default();
+    let mut opts = hub_opts(dir.path(), Config::load_with_boxes(&config_file).unwrap());
+    opts.config_file = Some(config_file.clone());
+    let g = Arc::clone(&gate);
+    opts.box_files_read_hook = Some(Arc::new(move |_name: &str| {
+        let armed = g.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((read, release)) = armed {
+                let _ = read.send(());
+                let _ = release.await;
+            }
+        })
+    }));
+    let hub = Hub::open(opts).await.unwrap();
+    let repo_of =
+        |hub: &Hub, b: &str, p: &str| hub.config_show()["boxes"][b]["projects"][p]["repo"].clone();
+    let shown = |p: &Path| json!(p.to_string_lossy());
+    assert_eq!(repo_of(&hub, "far", "api"), shown(&a));
+
+    // Applied: that box's projects, nothing of the other's.
+    files(ssh, &[("api", &b), ("web", &a)], &b);
+    assert_eq!(
+        hub.box_projects("far", &user()).await.unwrap(),
+        json!({
+            "box": "far",
+            "projects": ["api", "web"],
+            "repos": {"api": shown(&b), "web": shown(&a)}
+        })
+    );
+    assert_eq!(repo_of(&hub, "far", "api"), shown(&b));
+    assert_eq!(repo_of(&hub, "far", "web"), shown(&a));
+    assert_eq!(repo_of(&hub, "lab", "lab-only"), shown(&a));
+    // A new thread on the box uses them.
+    let key = HubKey::generate().unwrap();
+    let daemon = Daemon::start(&dir.path().join("far"), &key, "far").await;
+    let _served = connect(&hub, &daemon.socket, &key, "far").await;
+    let h = hub.clone();
+    wait_for("far online", move || online(&h, "far")).await;
+    let t = hub
+        .new_thread(
+            NewThread {
+                project: "web".into(),
+                runtime: Some("fake".into()),
+                name: Some("on-far".into()),
+                box_name: Some("far".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+    assert_eq!(t["repo"], shown(&a), "{t}");
+
+    // The box's connection changed in the files: a conflict, nothing taken.
+    files("me@elsewhere.invalid", &[("api", &a)], &a);
+    let e = hub.box_projects("far", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{}", e.message);
+    assert!(
+        e.message.contains("`twr hub stop`, then `twr`"),
+        "{}",
+        e.message
+    );
+    assert_eq!(repo_of(&hub, "far", "api"), shown(&b));
+    // Projects that differ alone do not make `box.install` a conflict.
+    files(ssh, &[("api", &a)], &a);
+    assert_eq!(
+        hub.box_install("far", &user()).await.unwrap(),
+        json!({"box": "far"})
+    );
+
+    // A slow reload of an older file, then a reload of a newer one: the newer one is last.
+    let (read_tx, read_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    *gate.lock().unwrap() = Some((read_tx, release_rx));
+    files(ssh, &[("old", &a)], &a);
+    let h = hub.clone();
+    let older = tokio::spawn(async move { h.box_projects("far", &user()).await });
+    tokio::time::timeout(WAIT, read_rx).await.unwrap().unwrap();
+    files(ssh, &[("new", &b)], &a);
+    let h = hub.clone();
+    let newer = tokio::spawn(async move { h.box_projects("far", &user()).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !newer.is_finished(),
+        "the newer reload ran while the older one was reading"
+    );
+    release_tx.send(()).unwrap();
+    let older = older.await.unwrap().unwrap();
+    let newer = newer.await.unwrap().unwrap();
+    assert_eq!(older["projects"], json!(["old"]));
+    assert_eq!(newer["projects"], json!(["new"]));
+    assert_eq!(older["repos"], json!({"old": shown(&a)}));
+    assert_eq!(newer["repos"], json!({"new": shown(&b)}));
+    let far_projects = hub.config_show()["boxes"]["far"]["projects"].clone();
+    assert_eq!(
+        far_projects,
+        json!({"new": {"repo": shown(&b), "runtime": null}})
+    );
+
+    // Refusals.
+    let e = hub
+        .box_projects("far", &Caller::Orchestrator)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
+    assert!(twr_hub::server::METHODS.contains(&"box.projects"));
+    assert!(!twr_hub::server::AGENT_METHODS.contains(&"box.projects"));
+    assert!(!twr_hub::server::ORCHESTRATOR_METHODS.contains(&"box.projects"));
+    let e = hub.box_projects("nope", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
+    let e = hub.box_projects("local", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
+    std::fs::write(&boxes_file, "[boxes.far\n").unwrap();
+    let e = hub.box_projects("far", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    std::fs::write(&boxes_file, "").unwrap();
+    let e = hub.box_projects("far", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
+    assert!(
+        e.message.contains("no longer have box far"),
+        "{}",
+        e.message
+    );
+    assert_eq!(repo_of(&hub, "far", "new"), shown(&b));
+    drop(daemon);
+    hub.shutdown().await;
+
+    // A hub without a config file reads none.
+    let hub = Hub::open(hub_opts(&dir.path().join("nofile"), config()))
+        .await
+        .unwrap();
+    let e = hub.box_projects(BOX, &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    hub.shutdown().await;
+}
+
 /// Concurrent adds of one box: one adds it, the others find it there as the files say
 /// (`already`), and the hub has one such box (with one supervisor).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

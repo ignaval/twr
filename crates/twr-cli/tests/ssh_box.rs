@@ -7,8 +7,10 @@
 //! `TWR_ENABLE_FAKE=1` for the fake runtime, which the threads run; `PATH` is this test's
 //! without the directories that hold an agent CLI (`claude`, `codex`, `grok`), after the box's
 //! own `bin`, where a test puts fake ones). A destination `down@...` fails as an unreachable
-//! host does. The box is this machine, so the hub uploads this build of twr into the fake
-//! home, and the box daemon runs from there.
+//! host does. With `-t` and a terminal on its stdin, it runs the command with a terminal of its
+//! own (`script`), as ssh does, its output on the fake ssh's stdout; `TWR_TEST_CLONE_ALLOW_FILE`
+//! reaches the box when set. The box is this machine, so the hub uploads this build of twr
+//! into the fake home, and the box daemon runs from there.
 //!
 //! Linux only: the test finds the box's processes in `/proc`.
 #![cfg(target_os = "linux")]
@@ -59,6 +61,9 @@ struct Setup {
     home: PathBuf,
     /// The box's `HOME`.
     box_home: PathBuf,
+    /// The `HOME` of `twr box project` ([`Setup::project`]): the hub machine's home, where
+    /// `project_roots` are.
+    hub_home: PathBuf,
     /// The fake ssh.
     ssh: PathBuf,
     /// One line per run of the fake ssh: its pid, the destination and the remote command
@@ -71,8 +76,10 @@ impl Setup {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         let box_home = dir.path().join("box");
+        let hub_home = dir.path().join("hubhome");
         std::fs::create_dir_all(&home).unwrap();
         std::fs::create_dir_all(&box_home).unwrap();
+        std::fs::create_dir_all(&hub_home).unwrap();
         let ssh = dir.path().join("fake-ssh");
         let log = dir.path().join("ssh.log");
         // The box finds only the agent CLIs a test puts in its `bin`.
@@ -104,10 +111,12 @@ impl Setup {
 log='{log}'
 dest=
 dashdash=
+tty=
 while [ $# -gt 0 ]; do
   case $1 in
     --) dashdash=1; shift; break ;;
-    -T|-t|-n|-q|-v|-a|-x|-k) shift ;;
+    -t) tty=1; shift ;;
+    -T|-n|-q|-v|-a|-x|-k) shift ;;
     -o|-p|-l|-i|-F) [ $# -ge 2 ] || {{ echo "fake ssh: $1 needs a value" >&2; exit 255; }}; shift 2 ;;
     -o?*|-p?*|-l?*|-i?*|-F?*) shift ;;
     -*) echo "fake ssh: unknown option $1" >&2; exit 255 ;;
@@ -121,7 +130,11 @@ cmd="$*"
 printf '%s\t%s\t%s\n' "$$" "$dest" "$(printf '%s' "$cmd" | tr '\n\t' '  ')" >> "$log"
 case $dest in down@*) echo "ssh: connect to host ${{dest#*@}} port 22: Connection refused" >&2; exit 255 ;; esac
 cd '{box_home}' || exit 255
-exec env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_FAKE=1 sh -c "$cmd"
+set -- env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_FAKE=1 \
+  ${{TWR_TEST_CLONE_ALLOW_FILE:+TWR_TEST_CLONE_ALLOW_FILE=$TWR_TEST_CLONE_ALLOW_FILE}}
+# `-t` with a terminal here: the command gets a terminal of its own, as ssh gives it one.
+if [ -n "$tty" ] && [ -t 0 ]; then exec "$@" script -qec "$cmd" /dev/null; fi
+exec "$@" sh -c "$cmd"
 "#,
                 log = log.display(),
                 box_home = box_home.display(),
@@ -133,6 +146,7 @@ exec env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_F
             _dir: dir,
             home,
             box_home,
+            hub_home,
             ssh,
             log,
         }
@@ -1003,4 +1017,816 @@ fn box_login_is_refused_to_agents_and_without_a_terminal() {
     let e = t.fails(&["box", "login", "gpu", "acp"]);
     assert!(e.contains("invalid value"), "{e}");
     assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+}
+
+// -------------------------------------------------------------------------------------------
+// twr box project
+// -------------------------------------------------------------------------------------------
+
+/// This build of twr, copied once (mode 0700) for the boxes the tests set up without a hub.
+fn box_build() -> &'static Path {
+    static BUILD: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let exe = dir.join("twr");
+        std::fs::copy(TWR, &exe).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        exe
+    })
+}
+
+/// A git repository at `dir` with `origin` as its origin: its canonical path.
+fn repo_with_origin(dir: &Path, origin: &str) -> PathBuf {
+    let repo = init_repo(dir);
+    twr_core::testkit::git::run(&repo, &["remote", "add", "origin", origin]);
+    repo
+}
+
+impl Setup {
+    /// Box gpu (`fake@box`) in boxes.toml, with this build of twr in its builds directory
+    /// (as the hub would install it), and no hub.
+    fn box_without_hub(&self) {
+        std::fs::write(
+            self.paths().boxes_file(),
+            "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"fake@box\"\n",
+        )
+        .unwrap();
+        let id = twr_core::build_id_of(Path::new(TWR)).unwrap();
+        let mut dir = self.box_home.clone();
+        for part in [".local", "share", "twr", "runner", "builds", id.as_str()] {
+            dir.push(part);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let exe = dir.join("twr");
+        if std::fs::hard_link(box_build(), &exe).is_err() {
+            std::fs::copy(box_build(), &exe).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+
+    /// `twr box project <args>` with the hub machine's `HOME`.
+    fn project(&self, args: &[&str]) -> Output {
+        let mut all = vec!["box", "project"];
+        all.extend_from_slice(args);
+        self.command(&all)
+            .env("HOME", &self.hub_home)
+            .output()
+            .expect("running twr")
+    }
+
+    /// `twr box project <args>` with a terminal on its stdin and stdout (`script`), with the
+    /// hub machine's `HOME` and `env`: whether it succeeded, and what it printed.
+    fn project_in_terminal(&self, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
+        let line: Vec<String> = [TWR, "box", "project"]
+            .iter()
+            .chain(args)
+            .map(|w| twr_core::paths::sh_word(w))
+            .collect();
+        let mut c = Command::new("script");
+        c.args(["-qec", &line.join(" "), "/dev/null"])
+            .env("TWR_HOME", &self.home)
+            .env("TWR_SSH", &self.ssh)
+            .env("TWR_TEST_USER_TOKEN_FILE", test_token())
+            .env("HOME", &self.hub_home)
+            .env_remove("TWR_WORKSPACE")
+            .env_remove("RUST_LOG")
+            .stdin(Stdio::null());
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().expect("running script");
+        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+        text.push_str(&String::from_utf8_lossy(&out.stderr));
+        (out.status.success(), text.replace('\r', ""))
+    }
+
+    /// Box gpu's `[boxes.gpu.projects]` in boxes.toml, as (project, repo).
+    fn box_projects(&self) -> Vec<(String, PathBuf)> {
+        let file = twr_core::config::BoxesFile::load(&self.paths().boxes_file()).unwrap();
+        file.boxes
+            .get("gpu")
+            .map(|b| {
+                b.projects
+                    .iter()
+                    .map(|(p, c)| (p.clone(), c.repo.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The text of `out`, stdout then stderr.
+fn said(out: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+/// `twr box project` with a hub: the project (a folder name under the hub's project_roots) is
+/// found on the box at the path it has under the hub's home, under the box's home (another
+/// repository of that name, with another origin, aside), recorded, and active at once: `twr
+/// thread new api --box gpu` makes a thread there. `twr box add` named the projects configured
+/// for the box. `--remove` takes it out, and the hub with it: a new thread is refused with the
+/// hint again.
+#[test]
+fn box_project_records_and_the_hub_takes_it() {
+    let t = Setup::new();
+    let _cleanup = BoxProcesses(t.box_home.clone());
+    let paths = t.paths();
+    std::fs::write(
+        &paths.config_file,
+        format!(
+            "[projects.web]\nrepo = \"{}\"\nbox = \"gpu\"\n",
+            t.hub_home.join("code/web").display()
+        ),
+    )
+    .unwrap();
+    let _hub = t.start_hub(1);
+    let out = t.ok(&["box", "add", "gpu", "fake@box", "--yes"]);
+    assert!(
+        out.contains("projects configured for box gpu: find each one's repository on the box"),
+        "{out}"
+    );
+    assert!(out.contains("  twr box project gpu web\n"), "{out}");
+
+    repo_with_origin(&t.hub_home.join("code/api"), "git@github.com:o/api.git");
+    let there = repo_with_origin(&t.box_home.join("code/api"), "https://github.com/o/api");
+    let other = repo_with_origin(&t.box_home.join("src/api"), "https://github.com/x/api");
+    // Before: the box does not have it.
+    let e = t.fails(&["thread", "new", "api", "--box", "gpu", "--runtime", "fake"]);
+    assert!(e.contains("twr box project gpu api"), "{e}");
+
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("origin git@github.com:o/api.git"),
+        "the hub's origin: {text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  {} (origin https://github.com/o/api, the project's; where it is under your home \
+             here)",
+            there.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  {} (origin https://github.com/x/api)",
+            other.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "recorded and active: project api on box gpu is {}; `twr thread new api --box gpu` \
+             uses it",
+            there.display()
+        )),
+        "{text}"
+    );
+    assert_eq!(t.box_projects(), [("api".to_string(), there.clone())]);
+    // The search ran with the box's build, the hint and the origin (no credentials).
+    let runs = t.ssh_runs();
+    let find = runs
+        .iter()
+        .find(|(_, _, c)| c.contains("--find-repo"))
+        .unwrap();
+    assert!(
+        find.2
+            .contains(&format!("--hint={}", t.box_home.join("code/api").display())),
+        "{find:?}"
+    );
+    assert!(
+        find.2.contains("--origin=git@github.com:o/api.git"),
+        "{find:?}"
+    );
+
+    let created = t.ok(&[
+        "thread",
+        "new",
+        "api",
+        "--box",
+        "gpu",
+        "--runtime",
+        "fake",
+        "--name",
+        "on-box",
+    ]);
+    assert!(created.starts_with("created on-box ("), "{created}");
+
+    // Again: it is recorded already, and nothing changes.
+    let out = t.project(&["gpu", "api", "--yes"]);
+    assert!(said(&out).contains("is recorded as"), "{}", said(&out));
+
+    let out = t.project(&["gpu", "api", "--remove"]);
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains("removed and active: project api on box gpu is no longer recorded"),
+        "{text}"
+    );
+    assert!(t.box_projects().is_empty());
+    let e = t.fails(&["thread", "new", "api", "--box", "gpu", "--runtime", "fake"]);
+    assert!(e.contains("twr box project gpu api"), "{e}");
+    // Nothing more to remove.
+    let out = t.project(&["gpu", "api", "--remove"]);
+    assert!(!out.status.success());
+    assert!(said(&out).contains("has no [boxes.gpu.projects.api] to remove"));
+}
+
+/// `twr box project` without a hub (the box has this build of twr): a configured project not
+/// at its home-mapped path is found by its origin under the box's ~/code and recorded; several
+/// repositories with the origin are listed, nothing recorded; without --yes and a terminal,
+/// nothing is recorded either; `--path` records only a repository's top level; quotes, `;`,
+/// `$`, spaces and `$(...)` in paths reach the box as they are and run nothing; a search cut
+/// short records nothing.
+#[test]
+fn box_project_finds_lists_and_refuses() {
+    let t = Setup::new();
+    let paths = t.paths();
+    t.box_without_hub();
+    let origin = "git@github.com:o/api.git";
+    let hub_repo = repo_with_origin(&t.hub_home.join("work/api"), origin);
+    std::fs::write(
+        &paths.config_file,
+        format!("[projects.api]\nrepo = \"{}\"\n", hub_repo.display()),
+    )
+    .unwrap();
+    let code = repo_with_origin(&t.box_home.join("code/api"), "https://github.com/o/api.git");
+
+    // Found by its origin under ~/code (nothing at ~/work/api on the box).
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(&format!(
+            "looking on box gpu for repository folder api: at {}/work/api",
+            t.box_home.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "recorded: project api on box gpu is {} (no hub runs",
+            code.display()
+        )),
+        "{text}"
+    );
+    assert_eq!(t.box_projects(), [("api".to_string(), code.clone())]);
+    let out = t.project(&["gpu", "api", "--remove"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(t.box_projects().is_empty());
+
+    // Without --yes and a terminal: listed, not recorded.
+    let out = t.project(&["gpu", "api"]);
+    let text = said(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("without confirmation"), "{text}");
+    assert!(text.contains("pass --yes"), "{text}");
+    assert!(t.box_projects().is_empty());
+
+    // Several with the origin: listed, nothing recorded.
+    let src = repo_with_origin(&t.box_home.join("src/org/api"), origin);
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let text = said(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains(&code.display().to_string()), "{text}");
+    assert!(text.contains(&src.display().to_string()), "{text}");
+    assert!(
+        text.contains(
+            "nothing was recorded: 2 have the project's origin. Pick one with `twr box project \
+             gpu api --path <path>`"
+        ),
+        "{text}"
+    );
+    assert!(t.box_projects().is_empty());
+
+    // --path: a directory inside the repository is refused; its top level is recorded.
+    std::fs::create_dir_all(src.join("sub")).unwrap();
+    let sub = src.join("sub");
+    let out = t.project(&["gpu", "api", "--path", sub.to_str().unwrap()]);
+    let text = said(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("not its top level"), "{text}");
+    let out = t.project(&["gpu", "api", "--path", "relative/api"]);
+    assert!(said(&out).contains("not an absolute path on the box"));
+    let nowhere = t.box_home.join("nowhere");
+    let out = t.project(&["gpu", "api", "--path", nowhere.to_str().unwrap()]);
+    assert!(
+        said(&out).contains("is not in a git repository"),
+        "{}",
+        said(&out)
+    );
+    assert!(t.box_projects().is_empty());
+    let out = t.project(&["gpu", "api", "--path", src.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(t.box_projects(), [("api".to_string(), src.clone())]);
+
+    // Paths with quotes, `;`, `$`, spaces and `$(...)`: intact, and nothing runs.
+    let odd = "it's; $HOME \"q\" $(touch pwned) `touch pwned2` a b";
+    let weird = repo_with_origin(&t.box_home.join(odd).join("api"), origin);
+    let out = t.project(&["gpu", "api", "--path", weird.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(t.box_projects(), [("api".to_string(), weird.clone())]);
+    // The home-mapped hint too: a project whose repository is under such a folder here.
+    let hub_web = repo_with_origin(&t.hub_home.join(odd).join("web"), "https://h.example/o/web");
+    let box_web = repo_with_origin(&t.box_home.join(odd).join("web"), "https://h.example/o/web");
+    std::fs::write(
+        &paths.config_file,
+        format!(
+            "[projects.api]\nrepo = \"{}\"\n[projects.web]\nrepo = {}\n",
+            hub_repo.display(),
+            serde_json::to_string(hub_web.to_str().unwrap()).unwrap()
+        ),
+    )
+    .unwrap();
+    let out = t.project(&["gpu", "web", "--yes"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(t
+        .box_projects()
+        .contains(&("web".to_string(), box_web.clone())));
+    for dir in [&t.box_home, &t.hub_home, &t.home] {
+        for f in ["pwned", "pwned2"] {
+            assert!(!dir.join(f).exists(), "{} ran", dir.join(f).display());
+        }
+    }
+
+    // A search cut short (too many folders under ~/code): listed, nothing recorded.
+    t.project(&["gpu", "api", "--remove"]);
+    std::fs::remove_dir_all(&src).unwrap();
+    for i in 0..twr_core::project_lookup::MAX_DIRS + 2 {
+        std::fs::create_dir(t.box_home.join(format!("code/g{i:04}"))).unwrap();
+    }
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let text = said(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains(&code.display().to_string()), "{text}");
+    assert!(text.contains("the search was incomplete"), "{text}");
+    assert!(!t.box_projects().iter().any(|(p, _)| p == "api"));
+}
+
+/// A search on the box whose report is incomplete records nothing: a repository there whose
+/// origin git cannot read (next to one with the project's origin) is listed as such, and may
+/// have been the project's. An explicit `--path` of a repository whose origin is longer than
+/// what the CLI reads of ssh is checked and recorded all the same (the origin shown cut), and
+/// so is the search's unique match once the unreadable one is gone.
+#[test]
+fn box_project_records_nothing_from_an_incomplete_search() {
+    let t = Setup::new();
+    t.box_without_hub();
+    repo_with_origin(&t.hub_home.join("code/api"), "git@github.com:o/api.git");
+    let code = repo_with_origin(&t.box_home.join("code/api"), "https://github.com/o/api");
+    let unread = init_repo(&t.box_home.join("src/api"));
+    let config = unread.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[remote \"origin\"]\n\turl\n");
+    std::fs::write(&config, text).unwrap();
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let text = said(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "  {} (origin https://github.com/o/api, the project's",
+            code.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "  {} (its origin could not be read)",
+            unread.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("the search was incomplete"), "{text}");
+    assert!(t.box_projects().is_empty());
+
+    // --path of one whose origin alone is more than ssh's output may be.
+    let huge = format!("https://h.example/o/{}", "a".repeat(100_000));
+    let big = repo_with_origin(&t.box_home.join("big/api"), &huge);
+    let out = t.project(&["gpu", "api", "--path", big.to_str().unwrap()]);
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("aaa..."), "{text}");
+    assert!(text.len() < 50_000, "{}", text.len());
+    assert_eq!(t.box_projects(), [("api".to_string(), big.clone())]);
+    t.project(&["gpu", "api", "--remove"]);
+
+    // The unreadable one gone: the one match is recorded.
+    std::fs::remove_dir_all(&unread).unwrap();
+    let out = t.project(&["gpu", "api", "--yes"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(t.box_projects(), [("api".to_string(), code)]);
+}
+
+/// `twr box project` is the user's alone, in the default workspace, and `--clone` needs a
+/// terminal: refused before any ssh.
+#[test]
+fn box_project_guards_come_first() {
+    let t = Setup::new();
+    t.box_without_hub();
+    repo_with_origin(&t.hub_home.join("code/api"), "https://h.example/o/api");
+    let out = t
+        .command(&["box", "project", "gpu", "api"])
+        .env("HOME", &t.hub_home)
+        .env("TWR_AGENT", "worker:1")
+        .env_remove("TWR_TEST_USER_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let e = said(&out);
+    assert!(e.contains("agents cannot record projects on boxes"), "{e}");
+    let out = t.project(&["gpu", "api", "--clone", "--yes"]);
+    assert!(!out.status.success());
+    let e = said(&out);
+    assert!(e.contains("needs a terminal on stdin and stdout"), "{e}");
+    t.ok(&["ws", "new", "other"]);
+    let out = t
+        .command(&["-w", "other", "box", "project", "gpu", "api"])
+        .env("HOME", &t.hub_home)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        said(&out).contains("boxes belong to the default workspace's hub"),
+        "{}",
+        said(&out)
+    );
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+    assert!(t.box_projects().is_empty());
+}
+
+/// `twr runner --find-repo --origin` and `--clone-repo --url` (what `twr box project` runs on
+/// a box) refuse a URL whose password holds `@`, `:`, `?`, `#` or `/` without showing any
+/// part of it: the URL is shown redacted, the reason quotes nothing of it.
+#[test]
+fn runner_repo_commands_never_show_a_password() {
+    let t = Setup::new();
+    let parent = t.box_home.join("code");
+    std::fs::create_dir_all(&parent).unwrap();
+    for (url, shown, why) in [
+        (
+            "me:PW1@LEAKED-SECRET@host:repo",
+            "me:***@host:repo",
+            "more than one `@`",
+        ),
+        (
+            "https://u:PW1:LEAKED@SECRET@host/r",
+            "https://***@host/r",
+            "more than one `@`",
+        ),
+        (
+            "ssh://git:PW1@LEAKED@SECRET@host:22/r",
+            "ssh://git:***@host:22/r",
+            "more than one `@`",
+        ),
+        (
+            "ssh://git:PW1/LEAKED@SECRET@host/r",
+            "ssh://git:***@host/r",
+            "an `@` after the host",
+        ),
+        ("me:PW1?LEAKED#x@SECRET@host:r", "me:***@host:r", "query"),
+        (
+            "me:PW1@LEAKED:x@host:r",
+            "me:***@host:r",
+            "an `@` after the host",
+        ),
+    ] {
+        let origin = format!("--origin={url}");
+        let find = ["runner", "--find-repo", "--name=api", origin.as_str()];
+        let url_arg = format!("--url={url}");
+        let parent_arg = format!("--parent={}", parent.display());
+        let clone = [
+            "runner",
+            "--clone-repo",
+            url_arg.as_str(),
+            parent_arg.as_str(),
+            "--name=api",
+        ];
+        for args in [&find[..], &clone[..]] {
+            let out = t.command(args).env("HOME", &t.box_home).output().unwrap();
+            assert!(!out.status.success(), "{args:?}");
+            let e = said(&out);
+            assert!(e.contains(why), "{args:?}: {e}");
+            assert!(e.contains(&format!("{shown:?}")), "{args:?}: {e}");
+            for secret in ["PW1", "LEAKED", "SECRET"] {
+                assert!(!e.contains(secret), "{args:?}: {e}");
+            }
+        }
+    }
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 0);
+}
+
+/// `twr box project --clone`, in a terminal: an origin with credentials, or a `file://` one,
+/// is refused before any ssh (the credentials never shown); an https one is cloned on the box
+/// in that terminal (a local bare repository behind it, through the box's git config and the
+/// debug-only `file` seam) under the home-mapped folder, and recorded (a hook of the box's that
+/// prints without a newline notwithstanding). `--into <dir>` is the
+/// clone's own new directory, of any folder name, as `git clone <url> <dir>` takes it.
+#[test]
+fn box_project_clones_in_the_terminal() {
+    let t = Setup::new();
+    t.box_without_hub();
+    let hub_repo = repo_with_origin(
+        &t.hub_home.join("code/api"),
+        "https://me:hunter2@example.invalid/o/api.git",
+    );
+    let (ok, out) = t.project_in_terminal(&["gpu", "api", "--clone", "--yes"], &[]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("password or a token"), "{out}");
+    assert!(out.contains("Clone it on box gpu yourself"), "{out}");
+    assert!(!out.contains("hunter2"), "{out}");
+    // A password holding `@` (and `:`): refused as ambiguous, no part of it shown.
+    for origin in [
+        "me:hunter2@SEC2@example.invalid:o/api.git",
+        "https://u:hunter2:SEC2@SEC3@example.invalid/o/api.git",
+    ] {
+        twr_core::testkit::git::run(&hub_repo, &["remote", "set-url", "origin", origin]);
+        let (ok, out) = t.project_in_terminal(&["gpu", "api", "--clone", "--yes"], &[]);
+        assert!(!ok, "{out}");
+        assert!(out.contains("more than one `@`"), "{out}");
+        assert!(out.contains("Clone it on box gpu yourself"), "{out}");
+        assert!(!out.contains("hunter2") && !out.contains("SEC"), "{out}");
+    }
+    twr_core::testkit::git::run(
+        &hub_repo,
+        &["remote", "set-url", "origin", "file:///srv/api.git"],
+    );
+    let (ok, out) = t.project_in_terminal(&["gpu", "api", "--clone", "--yes"], &[]);
+    assert!(!ok, "{out}");
+    assert!(out.contains("file://"), "{out}");
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
+
+    // A clone that works: the box's git reaches a local bare repository for that URL.
+    let url = "https://example.invalid/o/api.git";
+    twr_core::testkit::git::run(&hub_repo, &["remote", "set-url", "origin", url]);
+    let bare = t.box_home.join("bare.git");
+    twr_core::testkit::git::run(
+        &t.box_home,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            hub_repo.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ],
+    );
+    // A post-checkout hook of the box's that prints without a newline: the mark still starts
+    // a line of its own.
+    let hooks = t.box_home.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    std::fs::write(
+        hooks.join("post-checkout"),
+        "#!/bin/sh\nprintf 'hook ready'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        hooks.join("post-checkout"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    std::fs::write(
+        t.box_home.join(".gitconfig"),
+        format!(
+            "[url \"file://{}\"]\n\tinsteadOf = {url}\n[core]\n\thooksPath = {}\n",
+            bare.display(),
+            hooks.display()
+        ),
+    )
+    .unwrap();
+    let code = t.box_home.join("code");
+    std::fs::create_dir(&code).unwrap();
+    std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (ok, out) = t.project_in_terminal(
+        &["gpu", "api", "--clone", "--yes"],
+        &[("TWR_TEST_CLONE_ALLOW_FILE", "1")],
+    );
+    let target = code.join("api");
+    assert!(ok, "{out}");
+    assert!(out.contains("hook ready"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "twr clones {url} into {} on box gpu",
+            target.display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("with the box's own git credentials"), "{out}");
+    assert!(
+        out.contains(&format!("twr-clone-path {}", target.display())),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "recorded: project api on box gpu is {}",
+            target.display()
+        )),
+        "{out}"
+    );
+    assert!(target.join("README.md").is_file());
+    assert_eq!(t.box_projects(), [("api".to_string(), target.clone())]);
+    let runs = t.ssh_runs();
+    assert!(
+        runs.iter().any(|(_, _, c)| c.contains("--clone-repo")
+            && c.contains(&format!("--url={url}"))
+            && c.contains(&format!("--parent={}", code.display()))
+            && c.contains("--name=api")),
+        "{runs:?}"
+    );
+    // The target exists now: a second clone is refused on the box, and nothing changes.
+    let (ok, out) = t.project_in_terminal(
+        &["gpu", "api", "--clone", "--yes"],
+        &[("TWR_TEST_CLONE_ALLOW_FILE", "1")],
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("exists already"), "{out}");
+    assert_eq!(t.box_projects(), [("api".to_string(), target)]);
+
+    // --into: a new directory of another name, in an existing one.
+    let srv = t.box_home.join("srv");
+    std::fs::create_dir(&srv).unwrap();
+    std::fs::set_permissions(&srv, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let copy = srv.join("api-copy");
+    let into = format!("{}/", copy.display());
+    let (ok, out) = t.project_in_terminal(
+        &["gpu", "api", "--clone", "--into", &into, "--yes"],
+        &[("TWR_TEST_CLONE_ALLOW_FILE", "1")],
+    );
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!(
+            "twr clones {url} into {} on box gpu",
+            copy.display()
+        )),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!(
+            "recorded: project api on box gpu is {}",
+            copy.display()
+        )),
+        "{out}"
+    );
+    assert!(copy.join("README.md").is_file());
+    assert!(!copy.join("api").exists());
+    assert_eq!(t.box_projects(), [("api".to_string(), copy.clone())]);
+    let runs = t.ssh_runs();
+    assert!(
+        runs.iter().any(|(_, _, c)| c.contains("--clone-repo")
+            && c.contains(&format!("--parent={}", srv.display()))
+            && c.contains("--name=api-copy")),
+        "{runs:?}"
+    );
+    // It exists now: refused, not cloned into it.
+    let (ok, out) = t.project_in_terminal(
+        &[
+            "gpu",
+            "api",
+            "--clone",
+            "--into",
+            copy.to_str().unwrap(),
+            "--yes",
+        ],
+        &[("TWR_TEST_CLONE_ALLOW_FILE", "1")],
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("exists already"), "{out}");
+    assert!(!copy.join("api").exists());
+    // A last component that is not a folder name: refused before any ssh.
+    let before = t.ssh_runs().len();
+    let dots = format!("{}/..", srv.display());
+    let (ok, out) = t.project_in_terminal(
+        &["gpu", "api", "--clone", "--into", &dots, "--yes"],
+        &[("TWR_TEST_CLONE_ALLOW_FILE", "1")],
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("not a folder name twr makes"), "{out}");
+    assert_eq!(t.ssh_runs().len(), before);
+    assert_eq!(t.box_projects(), [("api".to_string(), copy)]);
+}
+
+/// git's message when it cannot read an origin quotes the repository's config: an invalid
+/// `remote.origin.fetch` holding a URL with a password, on the hub's repository and on one on
+/// the box. Neither `twr box project` nor the box's report shows any of it, and the search
+/// is incomplete.
+#[test]
+fn box_project_never_shows_git_s_message_about_an_origin() {
+    let t = Setup::new();
+    t.box_without_hub();
+    let origin = "https://github.com/o/api";
+    let fetch = |repo: &Path, secret: &str| {
+        twr_core::testkit::git::run(
+            repo,
+            &[
+                "config",
+                "remote.origin.fetch",
+                &format!("https://user:{secret}@host/repo"),
+            ],
+        );
+    };
+    let hub_repo = repo_with_origin(&t.hub_home.join("code/api"), origin);
+    fetch(&hub_repo, "SECRET1");
+    let code = repo_with_origin(&t.box_home.join("code/api"), origin);
+    let src = repo_with_origin(&t.box_home.join("src/api"), origin);
+    fetch(&src, "SECRET2");
+    let out = t
+        .command(&["box", "project", "gpu", "api", "--yes"])
+        .env("HOME", &t.hub_home)
+        .env("RUST_LOG", "debug")
+        .output()
+        .unwrap();
+    let text = said(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "could not read the origin of {}: git remote get-url origin failed (git exit",
+            hub_repo.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains(&code.display().to_string()), "{text}");
+    assert!(
+        text.contains(&format!(
+            "  {} (its origin could not be read)",
+            src.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        !text.contains("SECRET") && !text.contains("refspec"),
+        "{text}"
+    );
+    assert!(t.box_projects().is_empty());
+
+    // The box's report itself, with its logs on.
+    let origin_arg = format!("--origin={origin}");
+    let out = t
+        .command(&["runner", "--find-repo", "--name=api", &origin_arg])
+        .env("HOME", &t.box_home)
+        .env("RUST_LOG", "debug")
+        .output()
+        .unwrap();
+    let text = said(&out);
+    assert!(out.status.success(), "{text}");
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["complete"], false, "{text}");
+    assert!(
+        !text.contains("SECRET") && !text.contains("refspec"),
+        "{text}"
+    );
+}
+
+/// A repository folder on the box that can be listed but not searched (mode 0644) next to one
+/// with the project's origin: the search is incomplete (that one may be the project's), and
+/// nothing is recorded.
+#[test]
+fn box_project_records_nothing_when_a_folder_cannot_be_searched() {
+    if twr_core::paths::effective_uid() == 0 {
+        eprintln!("root searches any folder: skipped");
+        return;
+    }
+    let t = Setup::new();
+    t.box_without_hub();
+    let origin = "https://github.com/o/api";
+    repo_with_origin(&t.hub_home.join("code/api"), origin);
+    let code = repo_with_origin(&t.box_home.join("code/api"), origin);
+    let hidden = repo_with_origin(&t.box_home.join("src/api"), origin);
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let out = t.project(&["gpu", "api", "--yes"]);
+    let origin_arg = format!("--origin={origin}");
+    let report = t
+        .command(&["runner", "--find-repo", "--name=api", &origin_arg])
+        .env("HOME", &t.box_home)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let text = said(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "  {} (origin {origin}, the project's",
+            code.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("the search was incomplete"), "{text}");
+    assert!(t.box_projects().is_empty());
+    let report: Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(report["complete"], false, "{report}");
+    assert_eq!(
+        report["candidates"].as_array().unwrap().len(),
+        1,
+        "{report}"
+    );
+
+    // Searchable again, and not a repository any more: the one match is recorded.
+    std::fs::remove_dir_all(hidden.join(".git")).unwrap();
+    let out = t.project(&["gpu", "api", "--yes"]);
+    assert!(out.status.success(), "{}", said(&out));
+    assert_eq!(t.box_projects(), [("api".to_string(), code)]);
 }

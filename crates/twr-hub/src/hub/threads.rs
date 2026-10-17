@@ -9,6 +9,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use twr_core::config::Config;
 use twr_core::event::*;
+use twr_core::paths::sh_word;
 use twr_core::proto::{codes, RpcError};
 
 use super::lifecycle::data_dir_of;
@@ -19,6 +20,33 @@ use super::{
 };
 use crate::host::ThreadHost;
 use crate::remote::BoxOp;
+
+/// What to do about project `project` that box `box_name` does not have: `twr box project`
+/// finds its repository there (or clones it, in the user's terminal) and records where.
+fn box_project_hint(box_name: &str, project: &str) -> String {
+    format!(
+        "run `twr box project {} {}` to find or clone it there",
+        sh_word(box_name),
+        sh_word(project)
+    )
+}
+
+/// `e`, a remote box's refusal of a new thread's repository, with [`box_project_hint`] when the
+/// directory is not on the box (git's `cannot change to '<dir>'`) and `project` is a name (not
+/// a path given as it is).
+fn missing_on_box(e: RpcError, box_name: &str, project: &str) -> RpcError {
+    if !e.message.contains("cannot change to") || Path::new(project).is_absolute() {
+        return e;
+    }
+    RpcError {
+        message: format!(
+            "project {project:?} is not on box {box_name:?} ({}): {}",
+            e.message,
+            box_project_hint(box_name, project)
+        ),
+        ..e
+    }
+}
 
 impl Core {
     /// `thread.stop` of thread `id` for `caller` (see [`Hub::stop_thread_by`]).
@@ -181,7 +209,9 @@ impl Hub {
     /// configured (`[boxes.<name>]`) and online: its runner makes the worktree, so a thread on
     /// an offline box is refused (`box_offline`, nothing appended). On a remote box the project
     /// is `[boxes.<name>.projects.<project>]`, else `[projects.<project>]` (its `repo` taken as
-    /// a path on that box), else an absolute path on that box. On the hub's own box a plain
+    /// a path on that box), else an absolute path on that box; a project the box does not
+    /// have (neither, or a repository path not there) says to run `twr box project <box>
+    /// <project>`, which finds or clones it there and records it. On the hub's own box a plain
     /// name that is none of these is looked up under `project_roots` ([`find_project`]); the
     /// repository found is then the project's absolute path, and the result says so
     /// (`project_found`).
@@ -228,7 +258,10 @@ impl Hub {
         .await;
         let mut core = self.inner.core();
         reservation.release(&mut core);
-        let workspace = workspace?;
+        let workspace = workspace.map_err(|e| match remote {
+            true => missing_on_box(e, &box_name, &req.project),
+            false => e,
+        })?;
         if core.shutting_down {
             drop(core);
             workspace.discard(&self.inner, &box_name, &host, op.take());
@@ -581,8 +614,9 @@ impl Hub {
                             "{:?} is neither a project configured for box {box_name:?} \
                              ([boxes.{box_name}.projects.<name>] or [projects.<name>]) nor an \
                              absolute path on it (folder names are looked up only on the hub's \
-                             own machine)",
-                            req.project
+                             own machine): {}",
+                            req.project,
+                            box_project_hint(box_name, &req.project)
                         ),
                     ));
                 }
