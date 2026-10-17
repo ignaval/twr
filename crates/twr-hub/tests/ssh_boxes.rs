@@ -148,6 +148,7 @@ impl Daemon {
                 hub_key: key.public(),
                 lock: paths.lock.clone(),
                 build: twr_core::build_id().map(str::to_string),
+                launch: Some("detached".into()),
             },
         );
         opts.ping_interval = Duration::from_millis(500);
@@ -349,6 +350,8 @@ async fn a_sealed_box_runs_turns_and_a_restarted_hub_takes_its_session_over() {
         "{b}"
     );
     assert_eq!(b["version"], twr_runner::client::version());
+    // How the daemon says it was started (for users only).
+    assert_eq!(b["launch"], "detached", "{b}");
     let project = dir.path().join("proj");
     std::fs::create_dir_all(&project).unwrap();
     let req = NewThread {
@@ -1149,6 +1152,7 @@ async fn a_boxs_agents_reach_the_hub_and_warn_its_threads() {
             agent("claude-code", true, AgentLogin::LoggedIn),
             agent("codex", false, AgentLogin::Unknown),
         ],
+        launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
         ..Default::default()
     };
     send(&mut ws, &RunnerMsg::Inventory(inv)).await;
@@ -1165,6 +1169,10 @@ async fn a_boxs_agents_reach_the_hub_and_warn_its_threads() {
     );
     assert_eq!(b["agents"][0]["method"], "claude.ai", "{b}");
     assert_eq!(b["agents"][1]["note"], "not found on PATH", "{b}");
+    assert_eq!(
+        b["launch"], "launchd tools.twr.box.0123456789abcdef.0a1b2c3d",
+        "{b}"
+    );
     let limited = hub.info_for(BoxView::Limited);
     let lb = limited["boxes"]
         .as_array()
@@ -1416,7 +1424,7 @@ async fn a_boxs_agents_reach_the_hub_and_warn_its_threads() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     use futures::FutureExt;
-    use twr_hub::ssh_box::{BoxDialer, BoxIo};
+    use twr_hub::ssh_box::{BoxDialer, BoxIo, Dial};
     const CONFIGURED: &str = "00000000000000c6";
     let dir = tempfile::tempdir().unwrap();
     // The hub's box key, made now: the stand-in daemon checks its holder.
@@ -1427,7 +1435,7 @@ async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&dials);
     // A daemon of the configured build, speaking the protocol before the hub's.
-    let dialer: BoxDialer = Arc::new(move |name: String, _replace: bool| {
+    let dialer: BoxDialer = Arc::new(move |name: String, _dial: Dial| {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move {
             let (hub_end, box_end) = tokio::io::duplex(1 << 16);

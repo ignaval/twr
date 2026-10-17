@@ -43,9 +43,47 @@
 //! fails means "no". The relay then waits for the daemon to answer on its socket (at most
 //! [`RelayOptions::start_timeout`]), or fails with the end of its log.
 //!
+//! On macOS the daemon is started as a launchd job in the user's GUI session instead
+//! ([`launchd`]: `launchctl bootstrap gui/<uid>`, a new label each start), where the agents it
+//! runs can read the user's login keychain (Claude Code's login is there); from ssh they
+//! can't. With no one logged in at the Mac's screen (no GUI session), or when launchd does not
+//! take the job, it is started in a new session, with a note that names `twr box restart
+//! <box>`.
+//!
 //! `TWR_BOX_LAUNCHER=setsid` in the relay's environment ([`LAUNCHER_ENV`]) always starts the
-//! daemon in a new session, without probing logind or trying `systemd-run`: for tests (a
-//! daemon a test can find and stop) and for troubleshooting.
+//! daemon in a new session, without probing logind or trying `systemd-run` or launchd: for
+//! tests (a daemon a test can find and stop) and for troubleshooting.
+//! `TWR_BOX_LAUNCHER=launchd` always starts it with launchd, never in a new session instead (an
+//! error when that fails, and off macOS).
+//!
+//! A daemon started in a new session gets the relay's environment but `XPC_SERVICE_NAME` and
+//! `INVOCATION_ID`, which tell a daemon that launchd or systemd started it
+//! ([`crate::daemon::own_launch`]).
+//!
+//! # One start at a time
+//!
+//! A relay that is to start, replace or restart the daemon first takes the daemon's start
+//! lock ([`DaemonPaths::start_lock`], `<hash>.start.lock` beside the socket, `flock`), and
+//! holds it while it checks the daemon again, cleans up (launchd: jobs of this box that ended,
+//! plists a relay left), starts it and waits for it to answer (or fail): two relays never start
+//! two daemons, nor clean up each other's job. One that finds the daemon as it wants it uses it
+//! without the lock.
+//!
+//! `--restart` ([`RelayOptions::restart`]) stops the daemon that answers, whatever its build,
+//! and starts a new one, under that lock; then relays as usual (`twr box restart`, after a
+//! login at a Mac's screen: the new daemon runs in the GUI session).
+//!
+//! Stopping a daemon may take its whole shutdown ([`STOP_TIMEOUT`], 330 s: a repository change
+//! it runs is finished first), and a relay may wait for another's start before its own: the
+//! longest a relay that replaces or restarts the daemon takes before it relays is
+//! [`START_WORST`], that of any other relay (which may still wait for another's start, for a
+//! daemon that is shutting down, and start one) [`PLAIN_START_WORST`] ([`relay_worst`]: every
+//! `launchctl` or probe call of a start is bounded too, [`LAUNCH_BUDGET`], and so is each
+//! request to the daemon's socket); the hub's deadline to open the channel of each attempt
+//! covers the one it may meet. While it waits, the relay says so every [`PROGRESS_EVERY`],
+//! with how long it has: the hub shows these lines as the box's notes, and `twr box restart`
+//! prints them. A relay whose hub went away while it waited for another's start (its ssh
+//! gone: the end of its input) ends there, and starts or stops nothing.
 //!
 //! # Stopping the daemon, and its status
 //!
@@ -67,9 +105,88 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use crate::client::{machine_lock_path_in, validate_box_name};
 use crate::daemon::{request, Request, Status};
 
+pub mod launchd;
+
 /// How long each probe of the box's session setup (`loginctl`, `busctl`, `systemd-run`) may
 /// take.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a started daemon may take to answer on its socket ([`RelayOptions::start_timeout`]
+/// by default).
+pub const START_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a daemon asked to stop may take to end ([`RelayOptions::stop_timeout`] by
+/// default): its whole shutdown, a repository change it finishes first included
+/// ([`crate::client::SHUTDOWN_BUDGET`], 330 s).
+pub const STOP_TIMEOUT: Duration = crate::client::SHUTDOWN_BUDGET;
+
+/// How often a relay that waits for the daemon (to stop, to settle) or for another relay's
+/// start says again that it does, and for how long it has ([`RelayOptions::progress_every`] by
+/// default): the hub shows these notes, and `twr box restart` prints them.
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(30);
+
+/// The longest the launcher's own calls take before the daemon is waited for: launchd's
+/// ([`launchd::CALLS_BUDGET`]), or the probes and `systemd-run` of a start on Linux (at most
+/// four, each [`PROBE_TIMEOUT`] and `twr_adapters::process::REAP_LIMIT`).
+pub const LAUNCH_BUDGET: Duration = {
+    let systemd = 4 * (PROBE_TIMEOUT.as_secs() + twr_adapters::process::REAP_LIMIT.as_secs());
+    let launchd = launchd::CALLS_BUDGET.as_secs();
+    Duration::from_secs(if launchd > systemd { launchd } else { systemd })
+};
+
+/// The longest one request to the daemon's socket takes ([`crate::daemon::REQUEST_TIMEOUT`]),
+/// in seconds: each wait below may end with one that began just before its deadline.
+const REQUEST_SECS: u64 = crate::daemon::REQUEST_TIMEOUT.as_secs();
+
+/// The longest one relay's start of the daemon under its start lock takes, with stop timeout
+/// `stop` and start timeout `start` (what another relay waits for, [`RelayOptions::start_lock_wait`]):
+/// the daemon's status asked again under the lock (a request), waiting for a daemon that is
+/// shutting down or starting to settle (`stop`, and the request it may end with), stopping it
+/// (a restart or a replace: the `stop` request, then `stop`), the launcher's calls
+/// ([`LAUNCH_BUDGET`]), and the new daemon's answer (`start`, and the request it may end with).
+pub const fn start_work(stop: Duration, start: Duration) -> Duration {
+    Duration::from_secs(
+        2 * stop.as_secs() + LAUNCH_BUDGET.as_secs() + start.as_secs() + 4 * REQUEST_SECS,
+    )
+}
+
+/// [`start_work`] of a relay that never stops the daemon (neither `--replace` nor `--restart`:
+/// a daemon that answers once it settled is used as it is): no `stop` request and no wait for
+/// one to stop.
+const fn start_work_without_stop(stop: Duration, start: Duration) -> Duration {
+    Duration::from_secs(start_work(stop, start).as_secs() - stop.as_secs() - REQUEST_SECS)
+}
+
+/// The longest a relay takes before it relays, with stop timeout `stop` and start timeout
+/// `start`, one that may stop the daemon (`stops`: `--replace`, `--restart`) or not: the
+/// builds references' lock ([`REFS_LOCK_WAIT`]) and the daemon's status (a request) before the
+/// start lock, another relay's start it waits for ([`start_work`]), its own start (one that
+/// may stop the daemon: [`start_work`]; else less), and the request that connects it to the
+/// daemon. ([`RelayOptions::start_worst`].)
+pub const fn relay_worst(stop: Duration, start: Duration, stops: bool) -> Duration {
+    let own = if stops {
+        start_work(stop, start)
+    } else {
+        start_work_without_stop(stop, start)
+    };
+    Duration::from_secs(
+        REFS_LOCK_WAIT.as_secs()
+            + 2 * REQUEST_SECS
+            + start_work(stop, start).as_secs()
+            + own.as_secs(),
+    )
+}
+
+/// The longest a relay that is to replace or restart the daemon takes before it relays, with
+/// the default timeouts ([`relay_worst`]): another relay's start it waits for (one the hub gave
+/// up on and that still runs, say), then its own. The hub's deadline to open the channel of an
+/// attempt that replaces or restarts the daemon covers it.
+pub const START_WORST: Duration = relay_worst(STOP_TIMEOUT, START_TIMEOUT, true);
+
+/// [`START_WORST`] of a relay that neither replaces nor restarts the daemon (it may still
+/// start one, after waiting for another relay's start, or for a daemon that is shutting down
+/// to end): the hub's deadline to open the channel of an ordinary attempt covers it.
+pub const PLAIN_START_WORST: Duration = relay_worst(STOP_TIMEOUT, START_TIMEOUT, false);
 
 /// Lines of the daemon's log shown when it does not start.
 const LOG_TAIL_LINES: usize = 20;
@@ -140,6 +257,19 @@ impl DaemonPaths {
             lock,
         })
     }
+
+    /// The daemon's start lock ([`StartLock`]): `<hash>.start.lock` beside its socket
+    /// (`<hash>.sock`).
+    pub fn start_lock(&self) -> PathBuf {
+        let stem = self
+            .socket
+            .file_stem()
+            .map(|s| s.to_os_string())
+            .unwrap_or_default();
+        let mut name = stem;
+        name.push(".start.lock");
+        self.socket.with_file_name(name)
+    }
 }
 
 /// The first 16 hex digits of the SHA-256 of `hub_id`, a NUL byte and `box_name`: names the
@@ -159,15 +289,19 @@ pub fn socket_hash(hub_id: &str, box_name: &str) -> String {
 /// How the relay starts a daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Launcher {
-    /// As the module docs say: `systemd-run` when the user lingers (Linux), else in a new
-    /// session.
+    /// As the module docs say: `systemd-run` when the user lingers (Linux), a launchd job in
+    /// the GUI session (macOS), else in a new session.
     Auto,
     /// Always in a new session, without probing the box's session setup (tests).
     Setsid,
+    /// Always a launchd job in the GUI session, never in a new session instead: an error when
+    /// that fails, and off macOS.
+    Launchd,
 }
 
 /// The relay's environment variable that picks how it starts a daemon: `setsid` is
-/// [`Launcher::Setsid`]; anything else, or nothing, [`Launcher::Auto`].
+/// [`Launcher::Setsid`], `launchd` [`Launcher::Launchd`]; anything else, or nothing,
+/// [`Launcher::Auto`].
 pub const LAUNCHER_ENV: &str = "TWR_BOX_LAUNCHER";
 
 impl Launcher {
@@ -175,6 +309,7 @@ impl Launcher {
     pub fn from_env(value: Option<&std::ffi::OsStr>) -> Launcher {
         match value {
             Some(v) if v == "setsid" => Launcher::Setsid,
+            Some(v) if v == "launchd" => Launcher::Launchd,
             _ => Launcher::Auto,
         }
     }
@@ -189,6 +324,9 @@ pub struct RelayOptions {
     pub hub_key: [u8; 32],
     /// Replace a daemon of another build than this one (`--replace`, [`decide`]).
     pub replace: bool,
+    /// Stop the daemon that answers, whatever its build, and start a new one (`--restart`,
+    /// [`decide`]).
+    pub restart: bool,
     /// Where the daemon lives.
     pub paths: DaemonPaths,
     /// The executable started as the daemon (`runner --daemon ...`): this one
@@ -200,6 +338,8 @@ pub struct RelayOptions {
     pub start_timeout: Duration,
     /// How long a daemon asked to stop may take to let go of its socket and its lock.
     pub stop_timeout: Duration,
+    /// How often a wait says again that it waits ([`PROGRESS_EVERY`]).
+    pub progress_every: Duration,
     /// The build the hub launched (`--build`, the build id of this relay's executable as the
     /// hub knows it): taken as this relay's own when it cannot read its executable, so that
     /// `--replace` still tells another build's daemon apart ([`decide`]).
@@ -209,19 +349,39 @@ pub struct RelayOptions {
 impl RelayOptions {
     /// The options for box `box_name` and hub key `hub_key`: paths from the environment
     /// ([`DaemonPaths::resolve`]), this executable as the daemon, the launcher
-    /// [`LAUNCHER_ENV`] asks for, 15 s to start, 60 s to stop.
+    /// [`LAUNCHER_ENV`] asks for, [`START_TIMEOUT`] to start, [`STOP_TIMEOUT`] to stop, no
+    /// restart.
     pub fn new(box_name: &str, hub_key: [u8; 32], replace: bool) -> anyhow::Result<RelayOptions> {
         Ok(RelayOptions {
             box_name: box_name.to_string(),
             hub_key,
             replace,
+            restart: false,
             paths: DaemonPaths::resolve(&hub_key, box_name)?,
             program: std::env::current_exe().context("finding this twr's executable")?,
             launcher: Launcher::from_env(std::env::var_os(LAUNCHER_ENV).as_deref()),
-            start_timeout: Duration::from_secs(15),
-            stop_timeout: Duration::from_secs(60),
+            start_timeout: START_TIMEOUT,
+            stop_timeout: STOP_TIMEOUT,
+            progress_every: PROGRESS_EVERY,
             build: None,
         })
+    }
+
+    /// How long a relay waits for another's start of the daemon ([`StartLock`]): long enough
+    /// for one that waits for a daemon to settle, stops one, cleans up and starts one
+    /// ([`start_work`]).
+    pub fn start_lock_wait(&self) -> Duration {
+        start_work(self.stop_timeout, self.start_timeout)
+    }
+
+    /// The longest this relay takes before it relays ([`relay_worst`]: [`START_WORST`] with
+    /// the defaults and `--replace` or `--restart`, else [`PLAIN_START_WORST`]).
+    pub fn start_worst(&self) -> Duration {
+        relay_worst(
+            self.stop_timeout,
+            self.start_timeout,
+            self.replace || self.restart,
+        )
     }
 
     /// This relay's build: its executable's ([`twr_core::build_id`]), else the one the hub
@@ -267,14 +427,18 @@ pub enum Decision {
     Use,
     /// Stop the one that answers and start this build.
     Replace,
+    /// Stop the one that answers, whatever its build, and start a new one (`--restart`).
+    Restart,
 }
 
 /// What to do with the daemon that answered with `running` (`None`: none did), for the hub
-/// with id `hub_id`, this relay being build `own_build` and `--replace` given or not:
+/// with id `hub_id`, this relay being build `own_build`, `--replace` and `--restart` given or
+/// not:
 ///
 /// - none: start one;
 /// - one of another hub key: an error (the socket is named after the hub key: whatever
 ///   answers there is not that hub's daemon);
+/// - with `--restart`, restart it, whatever its build;
 /// - with `--replace`, one of another build than this one (or of an unknown one): replace it,
 ///   whatever its version or protocol (the hub asks for it when it wants its own build);
 ///   when this relay's own build is unknown, nothing tells the two apart: use it;
@@ -285,6 +449,7 @@ pub fn decide(
     hub_id: &str,
     own_build: Option<&str>,
     replace: bool,
+    restart: bool,
 ) -> anyhow::Result<Decision> {
     let Some(running) = running else {
         return Ok(Decision::Start);
@@ -295,6 +460,9 @@ pub fn decide(
              something else listens there",
             running.hub_id
         );
+    }
+    if restart {
+        return Ok(Decision::Restart);
     }
     match own_build {
         Some(own) if replace && running.build.as_deref() != Some(own) => Ok(Decision::Replace),
@@ -313,13 +481,14 @@ pub async fn relay(opts: RelayOptions) -> anyhow::Result<()> {
     .await
 }
 
-/// [`relay`] over `io` (the hub's side), its notes to `note`: finds, starts or replaces the
-/// daemon ([`decide`]), connects to it and copies bytes both ways until the daemon's side ends
-/// (or both have). The hub's end of input is passed on (the socket's write side shut), and
-/// the daemon then closes its side.
+/// [`relay`] over `io` (the hub's side), its notes to `note`: finds, starts, replaces or
+/// restarts the daemon ([`decide`]; anything but using it under its start lock, [`StartLock`],
+/// and decided again there), connects to it and copies bytes both ways until the daemon's
+/// side ends (or both have). The hub's end of input is passed on (the socket's write side
+/// shut), and the daemon then closes its side.
 pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
     opts: RelayOptions,
-    io: IO,
+    mut io: IO,
     note: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<()> {
     validate_box_name(&opts.box_name)?;
@@ -329,47 +498,101 @@ pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
         tracing::warn!(error = %format!("{e:#}"), "recording this build in the builds references failed");
     }
     let socket = &opts.paths.socket;
+    let decision = |running: Option<&Status>| {
+        decide(
+            running,
+            &hub_id,
+            opts.own_build(),
+            opts.replace,
+            opts.restart,
+        )
+    };
     let mut running = daemon_status(socket).await?;
-    loop {
-        match decide(running.as_ref(), &hub_id, opts.own_build(), opts.replace)? {
-            Decision::Use => {}
-            Decision::Start => {
-                // No socket, the lock held: a daemon shutting down (it removed its socket
-                // first) or starting (it takes the lock before it binds). The one shutting
-                // down ends first; the one starting is decided about once it answers.
-                if !lock_free(&opts.paths.lock) {
-                    note("twr-box: the box daemon is shutting down or starting: waiting");
-                    if let Settled::Answers(st) =
-                        wait_settled(&opts, "is still shutting down or starting").await?
-                    {
-                        running = Some(st);
-                        continue;
+    // What the hub sent before the daemon's hello (nothing, as it speaks second), passed on.
+    let mut early = Vec::new();
+    if decision(running.as_ref())? != Decision::Use {
+        // Held until the daemon answers (or the start failed); decided again under it: another
+        // relay may have started or replaced the daemon meanwhile.
+        let _start = take_start_lock(&opts, &mut io, &mut early, note).await?;
+        running = daemon_status(socket).await?;
+        loop {
+            match decision(running.as_ref())? {
+                Decision::Use => {}
+                Decision::Start => {
+                    // No socket, the lock held: a daemon shutting down (it removed its socket
+                    // first) or starting (it takes the lock before it binds). The one shutting
+                    // down ends first; the one starting is decided about once it answers.
+                    if !lock_free(&opts.paths.lock) {
+                        note(&settling_note(&opts));
+                        if let Settled::Answers(st) =
+                            wait_settled(&opts, "is still shutting down or starting", note).await?
+                        {
+                            running = Some(st);
+                            continue;
+                        }
                     }
+                    let started = start_daemon(&opts, note).await?;
+                    note(&format!(
+                        "twr-box: started the box daemon {}",
+                        started.build_label()
+                    ));
                 }
-                let started = start_daemon(&opts, note).await?;
-                note(&format!(
-                    "twr-box: started the box daemon {}",
-                    started.build_label()
-                ));
+                d @ (Decision::Replace | Decision::Restart) => {
+                    let old = running.take().expect("a daemon to replace answered");
+                    note(&stopping_note(&opts, &old));
+                    stop_daemon(&opts, note).await?;
+                    let started = start_daemon(&opts, note).await?;
+                    let (did, how) = match d {
+                        Decision::Replace => ("replaced", "with"),
+                        _ => ("restarted", "as"),
+                    };
+                    note(&format!(
+                        "twr-box: {did} the box daemon {} {how} {}",
+                        old.build_label(),
+                        started.build_label()
+                    ));
+                }
             }
-            Decision::Replace => {
-                let old = running.expect("a daemon to replace answered");
-                stop_daemon(&opts).await?;
-                let started = start_daemon(&opts, note).await?;
-                note(&format!(
-                    "twr-box: replaced the box daemon {} with {}",
-                    old.build_label(),
-                    started.build_label()
-                ));
-            }
+            break;
         }
-        break;
     }
     let (stream, _) = request(socket, Request::Connect)
         .await
         .with_context(|| format!("connecting to the box daemon on {}", socket.display()))?;
-    pump(io, stream).await;
+    pump(io, stream, early).await;
     Ok(())
+}
+
+/// [`StartLock::take`], unless the hub's side of `io` ends first: the hub gave up on this
+/// attempt (its ssh, and so this relay's input, is gone), and a relay no one waits for does not
+/// go on to start or stop the daemon once it has the lock (an error). The hub sends nothing
+/// before the daemon's hello, so whatever `io` gives meanwhile is kept in `early` (for the
+/// daemon, first) and the watch ends there.
+async fn take_start_lock<IO: AsyncRead + Unpin>(
+    opts: &RelayOptions,
+    io: &mut IO,
+    early: &mut Vec<u8>,
+    note: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<StartLock> {
+    use tokio::io::AsyncReadExt;
+    let take = StartLock::take(opts, note);
+    tokio::pin!(take);
+    let mut buf = [0u8; 4096];
+    loop {
+        tokio::select! {
+            biased;
+            lock = &mut take => return lock,
+            // (A read cut short here keeps what it read for the next one: `Stdin`'s, a
+            // duplex's.)
+            read = io.read(&mut buf), if early.is_empty() => match read {
+                Ok(0) | Err(_) => bail!(
+                    "the hub's side of this relay ended (its ssh is gone) while it waited for \
+                     another relay's start of the box daemon: starting nothing"
+                ),
+                Ok(n) => early.extend_from_slice(&buf[..n]),
+            },
+        }
+    }
 }
 
 /// Adds this relay's build to hub `hub_id`'s reference for box `box_name` in the builds
@@ -556,8 +779,8 @@ pub async fn stop(opts: &RelayOptions, note: &mut (dyn FnMut(&str) + Send)) -> a
     // runtimes and repository changes holding its machine lock; one starting holds the lock
     // before it binds its socket (it is asked to stop once it answers).
     if running.is_none() && !lock_free(&opts.paths.lock) {
-        note("twr-box: the box daemon is shutting down or starting: waiting");
-        match wait_settled(opts, "is still shutting down or starting").await? {
+        note(&settling_note(opts));
+        match wait_settled(opts, "is still shutting down or starting", note).await? {
             Settled::Gone => {
                 note("twr-box: the box daemon has ended");
                 return Ok(());
@@ -573,8 +796,9 @@ pub async fn stop(opts: &RelayOptions, note: &mut (dyn FnMut(&str) + Send)) -> a
         return Ok(());
     };
     // (Only to refuse a socket that answers for another hub key.)
-    decide(Some(&running), &hub_id, None, false)?;
-    stop_daemon(opts).await?;
+    decide(Some(&running), &hub_id, None, false, false)?;
+    note(&stopping_note(opts, &running));
+    stop_daemon(opts, note).await?;
     note(&format!(
         "twr-box: stopped the box daemon {}",
         running.build_label()
@@ -590,15 +814,22 @@ pub async fn status(opts: &RelayOptions) -> anyhow::Result<Option<Status>> {
     daemon_status(&opts.paths.socket).await
 }
 
-/// Copies `io` to `stream` and back. The relay ends when the daemon's side ends; the hub's
-/// end of input shuts the socket's write side and the relay goes on until the daemon closes.
-/// A failed copy is an end too (the hub's ssh gone, say), not an error: there is no one left
-/// to tell.
-async fn pump<IO: AsyncRead + AsyncWrite + Unpin>(io: IO, stream: tokio::net::UnixStream) {
+/// Copies `io` to `stream` (after `early`, what was read of `io` already) and back. The relay
+/// ends when the daemon's side ends; the hub's end of input shuts the socket's write side and
+/// the relay goes on until the daemon closes. A failed copy is an end too (the hub's ssh gone,
+/// say), not an error: there is no one left to tell.
+async fn pump<IO: AsyncRead + AsyncWrite + Unpin>(
+    io: IO,
+    stream: tokio::net::UnixStream,
+    early: Vec<u8>,
+) {
     let (mut input, mut output) = tokio::io::split(io);
     let (mut from_daemon, mut to_daemon) = stream.into_split();
     let up = async {
-        let r = tokio::io::copy(&mut input, &mut to_daemon).await;
+        let r = match to_daemon.write_all(&early).await {
+            Ok(()) => tokio::io::copy(&mut input, &mut to_daemon).await,
+            Err(e) => Err(e),
+        };
         let _ = to_daemon.shutdown().await;
         r
     };
@@ -635,9 +866,65 @@ fn gone(e: &std::io::Error) -> bool {
     )
 }
 
+/// The note of a relay about to wait for a daemon with its lock held and no socket answering.
+fn settling_note(opts: &RelayOptions) -> String {
+    format!(
+        "twr-box: the box daemon is shutting down or starting: waiting (at most {} s)",
+        opts.stop_timeout.as_secs()
+    )
+}
+
+/// The note of a relay about to stop daemon `running`.
+fn stopping_note(opts: &RelayOptions, running: &Status) -> String {
+    format!(
+        "twr-box: stopping the box daemon {} (its runtimes end, and a repository change it runs \
+         is finished first: at most {} s)",
+        running.build_label(),
+        opts.stop_timeout.as_secs()
+    )
+}
+
+/// Says through `note`, every [`RelayOptions::progress_every`] of a wait that began at
+/// `since` and may last `within`, that it still waits `for_what`.
+struct Progress {
+    since: tokio::time::Instant,
+    next: tokio::time::Instant,
+    every: Duration,
+    within: Duration,
+}
+
+impl Progress {
+    fn new(opts: &RelayOptions, within: Duration) -> Progress {
+        let since = tokio::time::Instant::now();
+        Progress {
+            since,
+            next: since + opts.progress_every,
+            every: opts.progress_every,
+            within,
+        }
+    }
+
+    fn tick(&mut self, note: &mut (dyn FnMut(&str) + Send), for_what: &str) {
+        let now = tokio::time::Instant::now();
+        if now < self.next {
+            return;
+        }
+        self.next = now + self.every;
+        note(&format!(
+            "twr-box: still waiting {for_what} ({} s of at most {} s)",
+            (now - self.since).as_secs(),
+            self.within.as_secs()
+        ));
+    }
+}
+
 /// Asks the daemon to stop and waits (at most [`RelayOptions::stop_timeout`]) until nothing
-/// listens on its socket and its machine lock is free (the process is gone).
-async fn stop_daemon(opts: &RelayOptions) -> anyhow::Result<()> {
+/// listens on its socket and its machine lock is free (the process is gone), saying through
+/// `note` as it waits ([`Progress`]).
+async fn stop_daemon(
+    opts: &RelayOptions,
+    note: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<()> {
     match request(&opts.paths.socket, Request::Stop).await {
         Ok(_) => {}
         Err(e) if gone(&e) => {}
@@ -650,14 +937,19 @@ async fn stop_daemon(opts: &RelayOptions) -> anyhow::Result<()> {
             })
         }
     }
-    wait_gone(opts, "did not stop within that of being asked to").await
+    wait_gone(opts, "did not stop within that of being asked to", note).await
 }
 
 /// Waits (at most [`RelayOptions::stop_timeout`]) until nothing listens on the daemon's socket
 /// and its machine lock is free: the daemon has ended, its runtimes and repository changes
 /// drained. On timeout an error saying the daemon `still` (`is still shutting down`, say).
-async fn wait_gone(opts: &RelayOptions, still: &str) -> anyhow::Result<()> {
+async fn wait_gone(
+    opts: &RelayOptions,
+    still: &str,
+    note: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + opts.stop_timeout;
+    let mut progress = Progress::new(opts, opts.stop_timeout);
     loop {
         let listening = tokio::net::UnixStream::connect(&opts.paths.socket)
             .await
@@ -665,6 +957,10 @@ async fn wait_gone(opts: &RelayOptions, still: &str) -> anyhow::Result<()> {
         if !listening && lock_free(&opts.paths.lock) {
             return Ok(());
         }
+        progress.tick(
+            note,
+            "for the box daemon to stop (it drains its runtimes and repository changes)",
+        );
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "the box daemon {still} ({:?}; its socket {}, its lock {} still held): see {}",
@@ -688,10 +984,15 @@ enum Settled {
 
 /// Waits (at most [`RelayOptions::stop_timeout`]) until the daemon of `opts` either answers
 /// on its socket (one that was starting: [`Settled::Answers`]) or has ended, its lock free
-/// ([`Settled::Gone`]). On timeout an error saying the daemon `still` (`is still shutting
-/// down or starting`, say).
-async fn wait_settled(opts: &RelayOptions, still: &str) -> anyhow::Result<Settled> {
+/// ([`Settled::Gone`]), saying through `note` as it waits ([`Progress`]). On timeout an error
+/// saying the daemon `still` (`is still shutting down or starting`, say).
+async fn wait_settled(
+    opts: &RelayOptions,
+    still: &str,
+    note: &mut (dyn FnMut(&str) + Send),
+) -> anyhow::Result<Settled> {
     let deadline = tokio::time::Instant::now() + opts.stop_timeout;
+    let mut progress = Progress::new(opts, opts.stop_timeout);
     loop {
         if let Some(st) = daemon_status(&opts.paths.socket).await? {
             return Ok(Settled::Answers(st));
@@ -699,6 +1000,10 @@ async fn wait_settled(opts: &RelayOptions, still: &str) -> anyhow::Result<Settle
         if lock_free(&opts.paths.lock) {
             return Ok(Settled::Gone);
         }
+        progress.tick(
+            note,
+            "for the box daemon to finish shutting down or starting",
+        );
         if tokio::time::Instant::now() >= deadline {
             bail!(
                 "the box daemon {still} ({:?}; its socket {}, its lock {} still held): see {}",
@@ -709,6 +1014,68 @@ async fn wait_settled(opts: &RelayOptions, still: &str) -> anyhow::Result<Settle
             );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A relay's hold on the start of its daemon (see the module docs): an exclusive `flock` on
+/// [`DaemonPaths::start_lock`] (made 0600 in the socket's directory, which is made private
+/// first), let go when dropped (or when the relay ends: the lock is the open file's).
+struct StartLock {
+    _file: std::fs::File,
+}
+
+impl StartLock {
+    /// Takes the start lock of `opts`'s daemon, waiting at most
+    /// [`RelayOptions::start_lock_wait`] for another relay to let go of it (with a note that
+    /// it waits).
+    async fn take(
+        opts: &RelayOptions,
+        note: &mut (dyn FnMut(&str) + Send),
+    ) -> anyhow::Result<StartLock> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = opts.paths.start_lock();
+        if let Some(dir) = path.parent() {
+            crate::daemon::ensure_socket_dir(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .with_context(|| format!("opening the box daemon's start lock {}", path.display()))?;
+        let within = opts.start_lock_wait();
+        let deadline = tokio::time::Instant::now() + within;
+        let mut said = false;
+        let mut progress = Progress::new(opts, within);
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(StartLock { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()))
+                }
+            }
+            if !said {
+                note(&format!(
+                    "twr-box: another relay is starting the box daemon: waiting (at most {} s)",
+                    within.as_secs()
+                ));
+                said = true;
+            }
+            progress.tick(note, "for another relay's start of the box daemon");
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "another relay has been starting the box daemon for {within:?} (it holds {}): \
+                     see {}",
+                    path.display(),
+                    opts.paths.log.display()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -729,36 +1096,22 @@ async fn start_daemon(
     twr_core::paths::ensure_private_dir(&opts.paths.data_dir)?;
     let args = opts.daemon_args();
     let mut child = None;
-    let mut launched = false;
-    if opts.launcher == Launcher::Auto && cfg!(target_os = "linux") {
-        let lingers = lingers().await;
-        if lingers && on_path("systemd-run") {
-            let unit = unit_name(&opts.hub_key, &opts.box_name);
-            match systemd_run(&unit, &opts.program, &args).await {
-                Ok(()) => launched = true,
-                Err(e) => {
-                    // One that did not answer in time may have started all the same: no
-                    // second daemon then.
-                    let state = probe(
-                        "systemctl",
-                        &["--user", "show", "-p", "ActiveState", "--value", &unit],
-                    )
-                    .await;
-                    let warning = kills_warning(kills_user_processes().await, true);
-                    let (started, says) =
-                        after_systemd_run_failure(&e.to_string(), state.as_deref(), warning);
-                    launched = started;
-                    for line in says {
-                        note(&line);
-                    }
-                }
-            }
-        } else if !lingers {
-            if let Some(w) = kills_warning(kills_user_processes().await, on_path("loginctl")) {
-                note(w);
-            }
+    let ctl = launchd::Launchctl::system();
+    let vars = || std::env::vars_os().collect();
+    let launched = match opts.launcher {
+        Launcher::Setsid => false,
+        Launcher::Launchd if !cfg!(target_os = "macos") => bail!(
+            "{LAUNCHER_ENV}=launchd: launchd starts the box daemon on macOS only, and this box \
+             runs {}",
+            std::env::consts::OS
+        ),
+        Launcher::Launchd => launchd::start(opts, &args, true, &ctl, vars(), note).await?,
+        Launcher::Auto if cfg!(target_os = "macos") => {
+            launchd::start(opts, &args, false, &ctl, vars(), note).await?
         }
-    }
+        Launcher::Auto if cfg!(target_os = "linux") => start_systemd(opts, &args, note).await,
+        Launcher::Auto => false,
+    };
     if !launched {
         child = Some(
             spawn_setsid(&opts.program, &args)
@@ -774,6 +1127,45 @@ async fn start_daemon(
         });
     }
     started
+}
+
+/// On Linux ([`Launcher::Auto`]), starts the daemon (`program args`) as a transient user
+/// service when the user lingers and `systemd-run` is on `PATH` (see the module docs): whether
+/// it did (its unit runs). Else (or when `systemd-run` failed and its unit does not run) the
+/// caller starts it in a new session, with the warnings given to `note`.
+async fn start_systemd(
+    opts: &RelayOptions,
+    args: &[OsString],
+    note: &mut (dyn FnMut(&str) + Send),
+) -> bool {
+    let lingers = lingers().await;
+    if lingers && on_path("systemd-run") {
+        let unit = unit_name(&opts.hub_key, &opts.box_name);
+        match systemd_run(&unit, &opts.program, args).await {
+            Ok(()) => return true,
+            Err(e) => {
+                // One that did not answer in time may have started all the same: no second
+                // daemon then.
+                let state = probe(
+                    "systemctl",
+                    &["--user", "show", "-p", "ActiveState", "--value", &unit],
+                )
+                .await;
+                let warning = kills_warning(kills_user_processes().await, true);
+                let (started, says) =
+                    after_systemd_run_failure(&e.to_string(), state.as_deref(), warning);
+                for line in says {
+                    note(&line);
+                }
+                return started;
+            }
+        }
+    } else if !lingers {
+        if let Some(w) = kills_warning(kills_user_processes().await, on_path("loginctl")) {
+            note(w);
+        }
+    }
+    false
 }
 
 /// The relay's warning when logind ends the user's processes with their last session and
@@ -901,7 +1293,14 @@ fn log_tail(log: &Path) -> String {
     }
 }
 
-/// Starts `program args` in a new session (`setsid`), stdin, stdout and stderr `/dev/null`.
+/// The variable launchd sets to a job's label ([`crate::daemon::own_launch`]).
+const LAUNCHD_JOB_ENV: &str = "XPC_SERVICE_NAME";
+
+/// The variable systemd sets in a unit's processes ([`crate::daemon::own_launch`]).
+const SYSTEMD_INVOCATION_ENV: &str = "INVOCATION_ID";
+
+/// Starts `program args` in a new session (`setsid`), stdin, stdout and stderr `/dev/null`,
+/// without [`LAUNCHD_JOB_ENV`] and [`SYSTEMD_INVOCATION_ENV`].
 fn spawn_setsid(program: &Path, args: &[OsString]) -> std::io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     extern "C" {
@@ -909,6 +1308,9 @@ fn spawn_setsid(program: &Path, args: &[OsString]) -> std::io::Result<std::proce
     }
     let mut cmd = std::process::Command::new(program);
     cmd.args(args)
+        // (What tells a daemon that launchd or systemd started it: not so.)
+        .env_remove(LAUNCHD_JOB_ENV)
+        .env_remove(SYSTEMD_INVOCATION_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -927,13 +1329,16 @@ fn spawn_setsid(program: &Path, args: &[OsString]) -> std::io::Result<std::proce
 
 /// Variables of the relay's environment that do not go to a daemon `systemd-run` starts
 /// ([`systemd_run_args`]): those of the ssh connection the relay serves, which the daemon
-/// outlives, and the token runner's token (never set here; never passed on either).
+/// outlives, the token runner's token (never set here; never passed on either), and those
+/// that tell a daemon how it was started (systemd sets the unit's own).
 const NOT_PASSED_ON: &[&str] = &[
     "SSH_CONNECTION",
     "SSH_CLIENT",
     "SSH_TTY",
     "SSH_ORIGINAL_COMMAND",
     crate::client::TOKEN_ENV,
+    LAUNCHD_JOB_ENV,
+    SYSTEMD_INVOCATION_ENV,
 ];
 
 /// The arguments of `systemd-run` that start `program args` as the transient user service
@@ -1079,6 +1484,16 @@ mod tests {
         paths: &DaemonPaths,
         after: Duration,
     ) -> std::sync::Arc<std::sync::Mutex<Vec<Request>>> {
+        draining_daemon(paths, after, Duration::ZERO)
+    }
+
+    /// [`starting_daemon`], which after a `stop` request (its socket gone at once) holds its
+    /// lock for `drain` more, as a daemon finishing a repository change does.
+    fn draining_daemon(
+        paths: &DaemonPaths,
+        after: Duration,
+        drain: Duration,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<Request>>> {
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let lock = std::fs::File::create(&paths.lock).unwrap();
         lock.lock().unwrap();
@@ -1097,6 +1512,7 @@ mod tests {
                 if req == Request::Stop {
                     drop(listener);
                     let _ = std::fs::remove_file(&socket);
+                    tokio::time::sleep(drain).await;
                     drop(lock);
                     return;
                 }
@@ -1105,13 +1521,24 @@ mod tests {
         seen
     }
 
+    /// Options with short timeouts, the socket (and the start lock) in a private directory in
+    /// `dir`, as the relay makes it.
     fn quick_opts(dir: &Path) -> RelayOptions {
+        use std::os::unix::fs::DirBuilderExt;
+        let sockets = dir.join("sockets");
+        if !sockets.is_dir() {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&sockets)
+                .unwrap();
+        }
         RelayOptions {
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
+            restart: false,
             paths: DaemonPaths {
-                socket: dir.join("d.sock"),
+                socket: sockets.join("d.sock"),
                 data_dir: dir.join("data"),
                 lock: dir.join("box.lock"),
                 log: dir.join("data/daemon.log"),
@@ -1121,6 +1548,7 @@ mod tests {
             launcher: Launcher::Setsid,
             start_timeout: Duration::from_secs(1),
             stop_timeout: Duration::from_secs(10),
+            progress_every: PROGRESS_EVERY,
             build: None,
         }
     }
@@ -1160,6 +1588,195 @@ mod tests {
         assert_eq!(seen.lock().unwrap().last(), Some(&Request::Connect));
     }
 
+    /// A relay that is to start the daemon while another holds its start lock waits for it
+    /// (and says so), then decides again: the daemon the other started answers by then, and is
+    /// used (no second one).
+    #[tokio::test]
+    async fn a_relay_waits_for_anothers_start_and_decides_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let held = std::fs::File::create(opts.paths.start_lock()).unwrap();
+        held.lock().unwrap();
+        let seen = starting_daemon(&opts.paths, Duration::from_millis(300));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        let (io, _hub) = tokio::io::duplex(1024);
+        let mut notes = Vec::new();
+        relay_with(opts, io, &mut |l: &str| notes.push(l.to_string()))
+            .await
+            .unwrap();
+        release.join().unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].starts_with("twr-box: another relay is starting the box daemon: waiting"),
+            "{notes:?}"
+        );
+        assert_eq!(seen.lock().unwrap().last(), Some(&Request::Connect));
+    }
+
+    /// `--restart` stops the daemon that answers, whatever its build (the same as this relay's
+    /// here), and starts another, under the start lock, which is free again once the start
+    /// failed (there is no program to start here).
+    #[tokio::test]
+    async fn a_restart_stops_the_daemon_then_starts_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = RelayOptions {
+            restart: true,
+            ..quick_opts(dir.path())
+        };
+        let seen = starting_daemon(&opts.paths, Duration::ZERO);
+        while daemon_status(&opts.paths.socket).await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (io, _hub) = tokio::io::duplex(1024);
+        let lock = opts.paths.start_lock();
+        let e = relay_with(opts, io, &mut |_: &str| {}).await.unwrap_err();
+        assert!(
+            format!("{e:#}").contains("starting the box daemon"),
+            "{e:#}"
+        );
+        assert!(seen.lock().unwrap().contains(&Request::Stop));
+        let f = std::fs::File::open(&lock).unwrap();
+        assert!(f.try_lock().is_ok(), "the start lock was kept");
+    }
+
+    /// A restart whose daemon takes long to stop (it finishes a repository change, holding its
+    /// lock) waits for it within the stop timeout, saying as it waits, before it starts one.
+    #[tokio::test]
+    async fn a_restart_waits_for_a_slow_shutdown_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = RelayOptions {
+            restart: true,
+            progress_every: Duration::from_millis(100),
+            ..quick_opts(dir.path())
+        };
+        let seen = draining_daemon(&opts.paths, Duration::ZERO, Duration::from_millis(800));
+        while daemon_status(&opts.paths.socket).await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (io, _hub) = tokio::io::duplex(1024);
+        let mut notes = Vec::new();
+        let e = relay_with(opts, io, &mut |l: &str| notes.push(l.to_string()))
+            .await
+            .unwrap_err();
+        // Stopped (there is no program to start a new one here).
+        assert!(
+            format!("{e:#}").contains("starting the box daemon"),
+            "{e:#}"
+        );
+        assert!(seen.lock().unwrap().contains(&Request::Stop));
+        assert!(
+            notes[0].starts_with("twr-box: stopping the box daemon")
+                && notes[0].contains("at most 10 s"),
+            "{notes:?}"
+        );
+        let waiting = notes
+            .iter()
+            .filter(|n| n.starts_with("twr-box: still waiting for the box daemon to stop ("))
+            .count();
+        assert!(waiting >= 3, "{notes:?}");
+    }
+
+    /// The default budgets: a daemon's whole shutdown to stop (a repository change it finishes
+    /// included), and the longest a relay may take before it relays, which the hub's opening
+    /// deadline of each attempt covers: one that replaces or restarts the daemon, and one that
+    /// does not (it may still wait for another relay's start, then for a daemon shutting down,
+    /// and start one), every request to the daemon's socket and the builds references' lock
+    /// counted.
+    #[test]
+    fn the_budgets_cover_a_daemons_whole_shutdown() {
+        assert_eq!(STOP_TIMEOUT, Duration::from_secs(330));
+        assert!(STOP_TIMEOUT > twr_core::git::GIT_CHANGE_TIMEOUT);
+        assert_eq!(STOP_TIMEOUT, launchd::EXIT_TIMEOUT);
+        let opts = RelayOptions::new("gpu", KEY, false).unwrap();
+        assert_eq!(opts.stop_timeout, STOP_TIMEOUT);
+        assert_eq!(opts.start_worst(), PLAIN_START_WORST);
+        let replace = RelayOptions::new("gpu", KEY, true).unwrap();
+        assert_eq!(replace.start_worst(), START_WORST);
+        let restart = RelayOptions {
+            restart: true,
+            ..RelayOptions::new("gpu", KEY, false).unwrap()
+        };
+        assert_eq!(restart.start_worst(), START_WORST);
+        assert!(LAUNCH_BUDGET >= launchd::CALLS_BUDGET);
+        let request = crate::daemon::REQUEST_TIMEOUT;
+        // Under the lock: the status again; a settle (and its last request); a stop request and
+        // the stop; the launcher; the start (and its last request).
+        let work = 2 * STOP_TIMEOUT + LAUNCH_BUDGET + START_TIMEOUT + 4 * request;
+        assert_eq!(opts.start_lock_wait(), work);
+        // Around it: the references' lock, the status before the lock, the connect after.
+        let around = REFS_LOCK_WAIT + 2 * request;
+        assert_eq!(START_WORST, around + 2 * work);
+        assert_eq!(
+            PLAIN_START_WORST,
+            around + work + (work - STOP_TIMEOUT - request)
+        );
+        assert!(PLAIN_START_WORST > work + STOP_TIMEOUT + START_TIMEOUT + LAUNCH_BUDGET);
+    }
+
+    /// A relay whose hub went away (the end of its input: its ssh is gone) while another relay
+    /// held the start lock ends there, without waiting for the lock: it starts nothing. What the
+    /// hub sent before then (it sends nothing before the daemon's hello) is not lost: passed on
+    /// to the daemon first.
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_does_not_queue_for_the_start_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let held = std::fs::File::create(opts.paths.start_lock()).unwrap();
+        held.lock().unwrap();
+        let (io, hub) = tokio::io::duplex(1024);
+        drop(hub);
+        let mut notes = Vec::new();
+        let start = std::time::Instant::now();
+        let e = relay_with(opts, io, &mut |l: &str| notes.push(l.to_string()))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("the hub's side of this relay ended"),
+            "{e:#}"
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        drop(held);
+
+        // Bytes before the lock (unexpected, but kept): the daemon gets them first.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let held = std::fs::File::create(opts.paths.start_lock()).unwrap();
+        held.lock().unwrap();
+        let seen = starting_daemon(&opts.paths, Duration::from_millis(300));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(700));
+            drop(held);
+        });
+        let (io, mut hub) = tokio::io::duplex(1024);
+        hub.write_all(b"early").await.unwrap();
+        relay_with(opts, io, &mut |_: &str| {}).await.unwrap();
+        release.join().unwrap();
+        assert_eq!(seen.lock().unwrap().last(), Some(&Request::Connect));
+    }
+
+    /// `TWR_BOX_LAUNCHER=launchd` off macOS: an error, never a start in a new session.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn launchd_forced_off_macos_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = RelayOptions {
+            launcher: Launcher::Launchd,
+            ..quick_opts(dir.path())
+        };
+        let (io, _hub) = tokio::io::duplex(1024);
+        let e = relay_with(opts, io, &mut |_: &str| {})
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("TWR_BOX_LAUNCHER=launchd") && e.contains("macOS only"),
+            "{e}"
+        );
+    }
+
     /// A daemon that removed its socket but still holds its machine lock (draining) is not
     /// gone: `--stop` waits for the lock, says so, and fails when it outlasts the stop
     /// timeout; with no lock held, nothing runs.
@@ -1176,11 +1793,13 @@ mod tests {
             box_name: "gpu".into(),
             hub_key: KEY,
             replace: false,
+            restart: false,
             paths: paths.clone(),
             program: dir.path().join("twr"),
             launcher: Launcher::Setsid,
             start_timeout: Duration::from_secs(1),
             stop_timeout,
+            progress_every: PROGRESS_EVERY,
             build: None,
         };
         let mut notes = Vec::new();
@@ -1222,7 +1841,8 @@ mod tests {
         release.join().unwrap();
     }
 
-    /// `TWR_BOX_LAUNCHER=setsid` forces the setsid launch; anything else is the usual one.
+    /// `TWR_BOX_LAUNCHER=setsid` forces the setsid launch, `launchd` launchd; anything else is
+    /// the usual one.
     #[test]
     fn launcher_from_env() {
         use std::ffi::OsStr;
@@ -1230,7 +1850,17 @@ mod tests {
             Launcher::from_env(Some(OsStr::new("setsid"))),
             Launcher::Setsid
         );
-        for v in [Some("systemd-run"), Some(""), Some("SETSID"), None] {
+        assert_eq!(
+            Launcher::from_env(Some(OsStr::new("launchd"))),
+            Launcher::Launchd
+        );
+        for v in [
+            Some("systemd-run"),
+            Some(""),
+            Some("SETSID"),
+            Some("LAUNCHD"),
+            None,
+        ] {
             assert_eq!(
                 Launcher::from_env(v.map(OsStr::new)),
                 Launcher::Auto,
@@ -1264,6 +1894,13 @@ mod tests {
         assert!(p.lock.starts_with("/home/u/.local/state/twr/runner-locks"));
         // Short enough for macOS's socket paths under a usual home.
         assert!(p.socket.as_os_str().len() < 80);
+        // The start lock is beside the socket.
+        assert_eq!(
+            p.start_lock(),
+            PathBuf::from(format!(
+                "/home/u/.local/state/twr/box-daemons/{hash}.start.lock"
+            ))
+        );
 
         let xdg = DaemonPaths::resolve_in(
             &KEY,
@@ -1350,43 +1987,64 @@ mod tests {
         let other_protocol = status(Some("aaaaaaaaaaaaaaaa"), 5);
         let unknown = status(None, 6);
         for replace in [false, true] {
-            assert_eq!(decide(None, id, me, replace).unwrap(), Decision::Start);
-            assert_eq!(decide(Some(&same), id, me, replace).unwrap(), Decision::Use);
+            assert_eq!(
+                decide(None, id, me, replace, false).unwrap(),
+                Decision::Start
+            );
+            assert_eq!(
+                decide(Some(&same), id, me, replace, false).unwrap(),
+                Decision::Use
+            );
             // Without our own build nothing tells them apart.
             assert_eq!(
-                decide(Some(&other), id, None, replace).unwrap(),
+                decide(Some(&other), id, None, replace, false).unwrap(),
                 Decision::Use
             );
         }
-        assert_eq!(decide(Some(&other), id, me, false).unwrap(), Decision::Use);
         assert_eq!(
-            decide(Some(&other_protocol), id, me, false).unwrap(),
+            decide(Some(&other), id, me, false, false).unwrap(),
             Decision::Use
         );
         assert_eq!(
-            decide(Some(&unknown), id, me, false).unwrap(),
+            decide(Some(&other_protocol), id, me, false, false).unwrap(),
             Decision::Use
         );
         assert_eq!(
-            decide(Some(&other), id, me, true).unwrap(),
+            decide(Some(&unknown), id, me, false, false).unwrap(),
+            Decision::Use
+        );
+        assert_eq!(
+            decide(Some(&other), id, me, true, false).unwrap(),
             Decision::Replace
         );
         assert_eq!(
-            decide(Some(&other_protocol), id, me, true).unwrap(),
+            decide(Some(&other_protocol), id, me, true, false).unwrap(),
             Decision::Replace
         );
         assert_eq!(
-            decide(Some(&unknown), id, me, true).unwrap(),
+            decide(Some(&unknown), id, me, true, false).unwrap(),
             Decision::Replace
         );
         let foreign = Status {
             hub_id: "0000000000000000".into(),
-            ..same
+            ..same.clone()
         };
-        let e = decide(Some(&foreign), id, me, true)
+        let e = decide(Some(&foreign), id, me, true, false)
             .unwrap_err()
             .to_string();
         assert!(e.contains("not this hub's (fedcba9876543210)"), "{e}");
+        // `--restart`: whatever answers for this hub key is restarted, whatever its build; none
+        // is started; another hub key's is still refused.
+        for running in [&same, &other, &other_protocol, &unknown] {
+            for (own, replace) in [(me, false), (me, true), (None, false)] {
+                assert_eq!(
+                    decide(Some(running), id, own, replace, true).unwrap(),
+                    Decision::Restart
+                );
+            }
+        }
+        assert_eq!(decide(None, id, me, false, true).unwrap(), Decision::Start);
+        assert!(decide(Some(&foreign), id, me, false, true).is_err());
     }
 
     /// `systemd-run` gets the relay's environment by name, never a value, without the ssh
@@ -1514,6 +2172,7 @@ mod tests {
         assert_eq!(got, odd);
     }
 
+    #[cfg(target_os = "linux")]
     fn rand_tag() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -48,14 +48,17 @@
 //! SIGKILL to what is left, and every member waited for. A clone that failed or was stopped
 //! then removes the directory it made, whatever git left in it (only this user can write in
 //! it), while it is still that directory (the same device and inode, a directory of this
-//! user's, mode 0700), reached through the parent held open and removed without following a
-//! symbolic link in it; a directory that replaced it is left as it is. A clone that succeeded
+//! user's, mode 0700), reached through the parent held open and removed through descriptors
+//! alone (each directory listed and emptied as it is held open, [`Dir::listed`], on macOS as on
+//! Linux), without following a symbolic link in it or leaving its file system; a directory that
+//! replaced it is left as it is. A clone that succeeded
 //! must still be that directory and its repository's top level (git, run in it through the
 //! parent held open, says so), in the parent held open, which must still be the directory at
 //! the parent's path (one moved meanwhile keeps the clone, left there and not recorded); its
 //! canonical path is the result. twr never fetches afterwards.
 
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::ffi::OsStr;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::time::Duration;
@@ -68,6 +71,7 @@ use twr_core::gitremote::{redact, RemoteUrl};
 use twr_core::paths::{check_ancestors, effective_uid};
 use twr_core::project_lookup::{self, is_plain_name};
 
+use crate::local::dirfd::{self, Dir};
 use crate::local::{LocalGit, SAFE_CONFIG};
 
 /// Most candidates one search reports (and reads an `origin` of); a search that found more is
@@ -394,8 +398,9 @@ pub struct CloneTarget {
     /// Canonical (in a canonical parent).
     path: PathBuf,
     /// The parent, held open as it was checked: what the target is made, checked and removed
-    /// in ([`CloneTarget::held`]), whatever its path names meanwhile.
-    parent: std::fs::File,
+    /// in (by its name there: `mkdirat`, `fstatat`, `openat`), whatever its path names
+    /// meanwhile.
+    parent: Dir,
     /// The target's name in it.
     name: String,
     /// Its device and inode as made: what cleaning up checks it still is.
@@ -423,10 +428,10 @@ pub fn reserve_clone(url: &str, parent: &Path, name: &str) -> anyhow::Result<Clo
         dev: 0,
         ino: 0,
     };
-    let at = target.held();
+    let name = OsStr::new(&target.name);
     // Mode 0700 as it is made (a umask only takes bits away): never, not even for a moment,
     // a directory another user could put something in while git fills it.
-    if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&at) {
+    if let Err(e) = target.parent.make_dir(name, 0o700) {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             bail!(
                 "{} exists already: twr clones only into a new directory (pick another place, \
@@ -436,11 +441,12 @@ pub fn reserve_clone(url: &str, parent: &Path, name: &str) -> anyhow::Result<Clo
         }
         return Err(anyhow!("making {}: {e}", target.path.display()));
     }
-    let meta = std::fs::symlink_metadata(&at)
+    let meta = target
+        .entry()
         .with_context(|| format!("reading {}", target.path.display()))?;
     if let Err(why) = check_made(&meta) {
         // (Removed only while it is a directory, empty: `remove_dir` takes no other.)
-        let left = match meta.is_dir() && std::fs::remove_dir(&at).is_ok() {
+        let left = match meta.dir && target.parent.remove_dir(name).is_ok() {
             true => "removed again",
             false => "left as it is",
         };
@@ -449,21 +455,49 @@ pub fn reserve_clone(url: &str, parent: &Path, name: &str) -> anyhow::Result<Clo
             target.path.display()
         );
     }
-    (target.dev, target.ino) = (meta.dev(), meta.ino());
+    (target.dev, target.ino) = (meta.dev, meta.ino);
     Ok(target)
+}
+
+/// What [`check_made`] reads of a directory entry: from `fstatat` without following a symbolic
+/// link ([`CloneTarget::entry`]), or from the metadata of the directory opened.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    /// A symbolic link (only an `fstatat` sees one).
+    symlink: bool,
+    /// A directory.
+    dir: bool,
+    uid: u32,
+    /// Its permission bits (and set-ID and sticky bits).
+    mode: u32,
+    dev: u64,
+    ino: u64,
+}
+
+impl From<&std::fs::Metadata> for Seen {
+    fn from(m: &std::fs::Metadata) -> Seen {
+        Seen {
+            symlink: m.file_type().is_symlink(),
+            dir: m.is_dir(),
+            uid: m.uid(),
+            mode: m.mode() & 0o7777,
+            dev: m.dev(),
+            ino: m.ino(),
+        }
+    }
 }
 
 /// Why `meta`, a clone's target as [`reserve_clone`] made it, is not the directory it asked
 /// for: one (not a symbolic link), this user's, mode 0700 (the umask may have taken bits of
 /// this user's away; a set-group-ID bit the parent passes on is fine).
-fn check_made(meta: &std::fs::Metadata) -> Result<(), String> {
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+fn check_made(meta: &Seen) -> Result<(), String> {
+    if meta.symlink || !meta.dir {
         return Err("not a directory".into());
     }
-    if meta.uid() != effective_uid() {
-        return Err(format!("it belongs to uid {}", meta.uid()));
+    if meta.uid != effective_uid() {
+        return Err(format!("it belongs to uid {}", meta.uid));
     }
-    let mode = meta.permissions().mode() & 0o777;
+    let mode = meta.mode & 0o777;
     if mode != 0o700 {
         return Err(format!(
             "its mode is {mode:03o}, not 700 (does the umask take this user's bits away?)"
@@ -474,7 +508,7 @@ fn check_made(meta: &std::fs::Metadata) -> Result<(), String> {
 
 /// `parent`, canonical, when a clone may go in it (see the module docs), and the directory
 /// itself, held open.
-fn check_parent(parent: &Path) -> anyhow::Result<(PathBuf, std::fs::File)> {
+fn check_parent(parent: &Path) -> anyhow::Result<(PathBuf, Dir)> {
     let shown = parent.display();
     if !parent.is_absolute() {
         bail!("{shown} is not an absolute path");
@@ -503,15 +537,8 @@ fn check_parent(parent: &Path) -> anyhow::Result<(PathBuf, std::fs::File)> {
     }
     check_ancestors(parent)?;
     let canonical = std::fs::canonicalize(parent).with_context(|| format!("resolving {shown}"))?;
-    let held = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&canonical)
-            .with_context(|| format!("opening {shown}"))?
-    };
-    let again = held.metadata()?;
+    let held = Dir::open(&canonical).with_context(|| format!("opening {shown}"))?;
+    let again = held.file().metadata()?;
     if (again.dev(), again.ino()) != (meta.dev(), meta.ino()) {
         bail!("{shown} changed while it was checked");
     }
@@ -529,19 +556,39 @@ impl CloneTarget {
         &self.url
     }
 
-    /// The target in the parent this process holds open: through `/proc/self/fd` where there
-    /// is one (Linux), so that no change to the directories above the parent (a group may be
-    /// able to write to one: [`check_ancestors`]) makes it name another directory; else its
-    /// path.
-    fn held(&self) -> PathBuf {
+    /// The target's entry in the parent held open (`fstatat`, a symbolic link not followed),
+    /// whatever the directories above the parent now are (a group may be able to write to
+    /// one: [`check_ancestors`]).
+    // (`st_dev` and `st_mode` are of other types on macOS.)
+    #[allow(clippy::unnecessary_cast)]
+    fn entry(&self) -> std::io::Result<Seen> {
         use std::os::fd::AsRawFd;
-        let fds = Path::new("/proc/self/fd");
-        if fds.is_dir() {
-            fds.join(self.parent.as_raw_fd().to_string())
-                .join(&self.name)
-        } else {
-            self.path.clone()
+        let name = std::ffi::CString::new(self.name.as_str())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: an all-zero `stat` is a valid value; fstatat(2) writes into it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: fstatat(2) of a NUL-terminated name in a descriptor this process holds open,
+        // with a valid pointer to `st`.
+        let r = unsafe {
+            libc::fstatat(
+                self.parent.file().as_raw_fd(),
+                name.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r == -1 {
+            return Err(std::io::Error::last_os_error());
         }
+        let kind = st.st_mode & libc::S_IFMT;
+        Ok(Seen {
+            symlink: kind == libc::S_IFLNK,
+            dir: kind == libc::S_IFDIR,
+            uid: st.st_uid,
+            mode: st.st_mode as u32 & 0o7777,
+            dev: st.st_dev as u64,
+            ino: st.st_ino as u64,
+        })
     }
 
     /// The `git clone` to run (see the module docs), with this process's stdin, stdout and
@@ -562,7 +609,7 @@ impl CloneTarget {
         use std::os::fd::AsRawFd;
         let mut c = tokio::process::Command::new("git");
         without_git_env(&mut c);
-        let parent = self.parent.as_raw_fd();
+        let parent = self.parent.file().as_raw_fd();
         // SAFETY: fchdir(2) is async-signal-safe and the closure allocates nothing (an
         // `io::Error` of an OS error does not); the descriptor is this process's, open while
         // `self` is (closed in git as it execs: `O_CLOEXEC`).
@@ -629,14 +676,14 @@ impl CloneTarget {
         };
         let dir = self.open_made().map_err(|why| refused(&why))?;
         // (git's message is not shown: it may quote the user's git config.)
-        let top = top_level(&dir)
+        let top = top_level(dir.file())
             .await
             .map_err(|_| refused("`git rev-parse --show-toplevel` failed there"))?;
         let same = |m: &std::fs::Metadata, dev: u64, ino: u64| (m.dev(), m.ino()) == (dev, ino);
         if !std::fs::symlink_metadata(&top).is_ok_and(|m| same(&m, self.dev, self.ino)) {
             return Err(refused("that is not a repository's top level now"));
         }
-        let held = self.parent.metadata().map_err(|e| {
+        let held = self.parent.file().metadata().map_err(|e| {
             refused(&format!(
                 "the directory it was made in could not be read ({e})"
             ))
@@ -659,45 +706,33 @@ impl CloneTarget {
     /// The target, opened in the parent held open (no symbolic link followed), while it is
     /// still the directory [`reserve_clone`] made (the same device and inode, as made:
     /// [`check_made`]); else why not.
-    fn open_made(&self) -> Result<std::fs::File, String> {
-        use std::os::fd::{AsRawFd, FromRawFd};
+    fn open_made(&self) -> Result<Dir, String> {
         let gone = "it is not the directory twr made any more";
-        let name = std::ffi::CString::new(self.name.as_str()).map_err(|_| gone.to_string())?;
-        // SAFETY: openat(2) of a NUL-terminated name in a descriptor this process holds open;
-        // the descriptor it returns is owned by the `File` made of it alone.
-        let fd = unsafe {
-            libc::openat(
-                self.parent.as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd == -1 {
-            let e = std::io::Error::last_os_error();
-            return Err(format!("{gone} (opening it: {e})"));
-        }
-        // SAFETY: `fd` was just opened, and nothing else owns it.
-        let dir = unsafe { std::fs::File::from_raw_fd(fd) };
+        let dir = self
+            .parent
+            .dir(OsStr::new(&self.name))
+            .map_err(|e| format!("{gone} (opening it: {e})"))?;
         let meta = dir
+            .file()
             .metadata()
             .map_err(|e| format!("it could not be read ({e})"))?;
         if (meta.dev(), meta.ino()) != (self.dev, self.ino) {
             return Err(gone.into());
         }
-        check_made(&meta).map_err(|why| format!("{gone}: {why}"))?;
+        check_made(&Seen::from(&meta)).map_err(|why| format!("{gone}: {why}"))?;
         Ok(dir)
     }
 
     /// `Err` (why) unless the target, reached in the parent held open, is still the
     /// directory [`reserve_clone`] made: the same device and inode, and as made
     /// ([`check_made`]). (`Ok(None)`: it is gone.)
-    fn still_made(&self) -> Result<Option<std::fs::Metadata>, String> {
-        let meta = match std::fs::symlink_metadata(self.held()) {
+    fn still_made(&self) -> Result<Option<Seen>, String> {
+        let meta = match self.entry() {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("it could not be read ({e})")),
         };
-        if (meta.dev(), meta.ino()) != (self.dev, self.ino) {
+        if (meta.dev, meta.ino) != (self.dev, self.ino) {
             return Err("it is not the directory twr made any more".into());
         }
         check_made(&meta)
@@ -707,15 +742,63 @@ impl CloneTarget {
 
     /// Removes the target, whatever git left in it (only this user can write in a directory of
     /// theirs of mode 0700), when it is still the directory [`reserve_clone`] made
-    /// ([`CloneTarget::still_made`]), in the parent held open; `remove_dir_all` follows no
-    /// symbolic link in it. Gone already is fine.
+    /// ([`CloneTarget::still_made`], then [`CloneTarget::open_made`]), in the parent held open:
+    /// emptied through the directory opened ([`remove_contents`]), then removed by its name in
+    /// the parent. Gone already is fine.
     pub fn clean_up(&self) -> anyhow::Result<()> {
         match self.still_made() {
-            Ok(None) => Ok(()),
-            Ok(Some(_)) => std::fs::remove_dir_all(self.held()).map_err(Into::into),
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
             Err(why) => bail!("{why}"),
         }
+        let dir = self.open_made().map_err(|why| anyhow!("{why}"))?;
+        remove_contents(&dir, self.dev)?;
+        drop(dir);
+        self.parent.remove_dir(OsStr::new(&self.name))?;
+        Ok(())
     }
+}
+
+/// Removes everything in `dir`, a clone's target as made, whatever it is (a `.git` directory,
+/// a partial checkout), through descriptors alone: each directory held open and listed through
+/// its descriptor ([`Dir::listed`]), each entry unlinked by its name in it, a directory opened
+/// there (no symbolic link followed: a link is removed, never what it names), made readable,
+/// writable and searchable by its owner when it is not, emptied the same way and removed.
+/// Refuses (an error, what is left stays) a directory on another file system than `dev` (a
+/// mount point). Each level holds a descriptor open while it empties the next.
+fn remove_contents(dir: &Dir, dev: u64) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    for name in dir.listed()? {
+        let unlinked = match dir.unlink(&name) {
+            Ok(()) => continue,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => e,
+        };
+        let sub = match dir.dir(&name) {
+            Ok(d) => d,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                dir.open_up(&name)?;
+                dir.dir(&name)?
+            }
+            Err(e) if dirfd::not_a_dir(&e) => return Err(unlinked),
+            Err(e) => return Err(e),
+        };
+        let meta = sub.file().metadata()?;
+        if meta.dev() != dev {
+            return Err(std::io::Error::other(format!(
+                "{} is another file system (a mount point)",
+                sub.shown().display()
+            )));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o700 != 0o700 {
+            sub.file()
+                .set_permissions(std::fs::Permissions::from_mode(mode | 0o700))?;
+        }
+        remove_contents(&sub, dev)?;
+        dir.remove_dir(&name)?;
+    }
+    Ok(())
 }
 
 /// Removes the session's git variables (a `GIT_DIR`, `GIT_CONFIG_*`, `GIT_SSH_COMMAND`, ...)
@@ -866,12 +949,35 @@ async fn clone_repo_with(
 /// failed, or was stopped, the whole group is killed and waited for (every member gone,
 /// [`crate::local::wait_group_gone`]) before this returns, so that cleaning up after it races
 /// no helper of it still writing in the target: the group is signalled while its leader has
-/// exited but is not reaped yet (`waitid` with `WNOWAIT`), so its id names no other group. One
-/// that succeeded leaves its group as it is (a credential cache daemon git started stays).
+/// exited but is not reaped yet (`waitid` with `WNOWAIT`, [`exited_unreaped`]), so its id names
+/// no other group. One that succeeded leaves its group as it is (a credential cache daemon git
+/// started stays) on Linux; elsewhere what `waitid` reports of the leader is not trusted (macOS
+/// does not fill it in reliably), so the group is killed whatever the status (fail closed: a
+/// credential cache daemon is stopped after a successful clone too, and git starts another
+/// when it needs one). The status returned is always the reap's.
+///
+/// Should that wait fail: with `ECHILD` the leader is no longer this process's to wait for
+/// (something else reaped it, so its id may name another process): its group is not signalled
+/// again (the wait's answer is looked at before each signal of a stop, and wins over a stop
+/// that comes at the same time), and the reap's error is returned
+/// ([`twr_adapters::process::ownership_lost`]: nothing signals it after that, this future's
+/// drop included); otherwise it is still this process's and not reaped (only this function
+/// reaps it), so its group is killed (the leader with it, exited or not) and waited for before
+/// the reap. Dropped before it returns, it kills the group (while it still owns its leader).
 pub(crate) async fn run_group(
+    cmd: tokio::process::Command,
+    stop: impl std::future::Future<Output = libc::c_int>,
+    grace: Duration,
+) -> std::io::Result<ExitStatus> {
+    run_group_with(cmd, stop, grace, exited_unreaped).await
+}
+
+/// [`run_group`], `wait` standing for [`exited_unreaped`] (tests make it fail).
+async fn run_group_with(
     mut cmd: tokio::process::Command,
     stop: impl std::future::Future<Output = libc::c_int>,
     grace: Duration,
+    wait: impl FnOnce(u32) -> std::io::Result<bool> + Send + 'static,
 ) -> std::io::Result<ExitStatus> {
     // SAFETY: isatty, tcgetpgrp and getpgrp only read; no memory is passed.
     let hand_over = unsafe { libc::isatty(0) == 1 && libc::tcgetpgrp(0) == libc::getpgrp() };
@@ -901,8 +1007,9 @@ pub(crate) async fn run_group(
             Ok(())
         });
     }
-    // A backstop: should this future be dropped, the leader is not left running.
-    cmd.kill_on_drop(true);
+    // Not the `Child`'s `kill_on_drop`: it would signal the leader's id even once something
+    // else reaped it. The group guard below is the backstop.
+    cmd.kill_on_drop(false);
     // Whatever happens from here on, the terminal comes back (a child that handed it over and
     // then failed to exec included).
     let _terminal = hand_over.then_some(TerminalBack);
@@ -910,19 +1017,38 @@ pub(crate) async fn run_group(
     let Some(pid) = child.id() else {
         return child.wait().await;
     };
-    let mut leader = tokio::task::spawn_blocking(move || exited_unreaped(pid));
+    // A backstop: should this future be dropped, the group (the leader in it) is not left
+    // running. Disarmed once the leader is reaped, here or (ownership lost) elsewhere.
+    let mut guard = GroupGuard(Some(pid));
+    let mut leader = tokio::task::spawn_blocking(move || wait(pid));
     tokio::pin!(stop);
+    // The leader first: a wait that has answered (an `ECHILD` above all) is seen before a stop
+    // that came at the same time signals anything.
     let (exited, stopped) = tokio::select! {
+        biased;
         r = &mut leader => (r, false),
         sig = &mut stop => {
-            // Not reaped (only this task reaps it, below): `pid` still names its group.
-            signal_group(pid, sig);
-            if sig != libc::SIGTERM {
-                signal_group(pid, libc::SIGTERM);
-            }
+            // What the leader's wait said by now, if it has: signalled only while it does not
+            // say the leader is gone to something else (not reaped here: only this task reaps
+            // it, below, so until then `pid` still names its group).
             let mut exited = None;
+            for sig in [Some(sig), (sig != libc::SIGTERM).then_some(libc::SIGTERM)]
+                .into_iter()
+                .flatten()
+            {
+                if exited.is_none() && leader.is_finished() {
+                    exited = Some((&mut leader).await);
+                }
+                if exited.as_ref().is_some_and(lost) {
+                    break;
+                }
+                signal_group(pid, sig);
+            }
             let ended = tokio::time::timeout(grace, async {
-                let r = (&mut leader).await;
+                let r = match exited.take() {
+                    Some(r) => r,
+                    None => (&mut leader).await,
+                };
                 let waitable = matches!(r, Ok(Ok(_)));
                 exited = Some(r);
                 if waitable {
@@ -931,7 +1057,7 @@ pub(crate) async fn run_group(
             })
             .await
             .is_ok();
-            if !ended {
+            if !ended && !exited.as_ref().is_some_and(lost) {
                 tracing::debug!(pid, "git clone did not end within its grace: killing its group");
                 signal_group(pid, libc::SIGKILL);
             }
@@ -944,16 +1070,52 @@ pub(crate) async fn run_group(
     };
     let succeeded = matches!(exited, Ok(Ok(true)));
     if stopped || !succeeded {
-        if matches!(exited, Ok(Ok(_))) {
-            signal_group(pid, libc::SIGKILL);
-            crate::local::wait_group_gone(pid, "git clone").await;
-        } else {
-            // `waitid` failed: whether the leader exited is not known, so its id is not
-            // signalled again (it might have been reaped by now); its own kill below.
-            let _ = child.start_kill();
+        match &exited {
+            r if lost(r) => {
+                // Not this process's child any more: its id may name another group by now.
+                tracing::warn!(pid, "waitid: git clone is not this process's child any more; its group is not signalled again");
+            }
+            r => {
+                if let Ok(Err(e)) = r {
+                    tracing::warn!(pid, error = %e, "waitid failed: killing git clone's process group before reaping it");
+                }
+                // Not reaped (only this function reaps it): `pid` still names its group.
+                signal_group(pid, libc::SIGKILL);
+                crate::local::wait_group_gone(pid, "git clone").await;
+            }
         }
     }
-    child.wait().await
+    let status = child.wait().await;
+    match &status {
+        Ok(_) => guard.0 = None,
+        Err(e) if twr_adapters::process::ownership_lost(e) => {
+            tracing::warn!(
+                pid,
+                "git clone was reaped by something else: its group is not signalled"
+            );
+            guard.0 = None;
+        }
+        Err(_) => {}
+    }
+    status
+}
+
+/// Whether `r`, the result of [`run_group`]'s wait for the leader, says it is not this
+/// process's child any more (`ECHILD`): its id is then not signalled again.
+fn lost(r: &Result<std::io::Result<bool>, tokio::task::JoinError>) -> bool {
+    matches!(r, Ok(Err(e)) if twr_adapters::process::ownership_lost(e))
+}
+
+/// Kills process group `.0` when dropped ([`run_group`] dropped before it returns), unless
+/// cleared first (its leader reaped: the id may be another process's by then).
+struct GroupGuard(Option<u32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            signal_group(pgid, libc::SIGKILL);
+        }
+    }
 }
 
 /// Sends `sig` to process group `pgid` (its leader this process's child, not reaped).
@@ -969,7 +1131,9 @@ fn signal_group(pgid: u32, sig: libc::c_int) {
 }
 
 /// Blocks until child `pid` has exited, without reaping it (`waitid` with `WNOWAIT`): whether
-/// it exited with status 0.
+/// it is known to have exited with status 0, which only Linux says (macOS does not fill in
+/// `waitid`'s status reliably: `false` there, whatever it was; [`run_group`] then fails
+/// closed).
 fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
     loop {
         // SAFETY: an all-zero `siginfo_t` is a valid value; waitid(2) writes into it.
@@ -985,7 +1149,9 @@ fn exited_unreaped(pid: u32) -> std::io::Result<bool> {
         };
         if r == 0 {
             // SAFETY: waitid filled `info` for an exited child: `si_status` is its status.
-            return Ok(info.si_code == libc::CLD_EXITED && unsafe { info.si_status() } == 0);
+            return Ok(cfg!(target_os = "linux")
+                && info.si_code == libc::CLD_EXITED
+                && unsafe { info.si_status() } == 0);
         }
         let e = std::io::Error::last_os_error();
         if e.kind() != std::io::ErrorKind::Interrupted {
@@ -1023,7 +1189,7 @@ impl Drop for TerminalBack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsStr;
+    use std::os::unix::fs::DirBuilderExt;
     use std::process::Stdio;
     use twr_core::testkit::git::{init_repo, run};
 
@@ -1315,6 +1481,45 @@ mod tests {
         assert!(parent.join("c").is_dir());
     }
 
+    /// A failed clone's directory is removed through the parent held open, not through its
+    /// path: with the parent renamed and another directory put at its path (holding an entry
+    /// of the target's name), the target, a partial `.git`, a read-only directory and a
+    /// symbolic link in it, goes from the parent where it now is, and what is at the path
+    /// stays as it is.
+    #[tokio::test]
+    async fn a_failed_clone_is_removed_in_its_parent_wherever_that_went() {
+        let d = tempfile::tempdir().unwrap();
+        let parent = parent(d.path());
+        let fail = || -> std::io::Result<ExitStatus> {
+            use std::os::unix::process::ExitStatusExt;
+            Ok(ExitStatus::from_raw(128 << 8))
+        };
+        let t = reserve_clone("https://h/r", &parent, "a").unwrap();
+        std::fs::create_dir_all(t.path().join(".git/objects/pack")).unwrap();
+        std::fs::write(t.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(t.path().join("src/ro")).unwrap();
+        std::fs::write(t.path().join("src/ro/file"), "x").unwrap();
+        std::fs::set_permissions(
+            t.path().join("src/ro"),
+            std::fs::Permissions::from_mode(0o500),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/", t.path().join("src/root")).unwrap();
+        let moved = d.path().join("moved");
+        std::fs::rename(&parent, &moved).unwrap();
+        // Another directory at the parent's path, with its own `a` (and a `.git` in it).
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&parent)
+            .unwrap();
+        std::fs::create_dir_all(parent.join("a/.git")).unwrap();
+        std::fs::write(parent.join("a/keep"), "x").unwrap();
+        let e = format!("{:#}", t.finish(fail()).await.unwrap_err());
+        assert!(e.contains("nothing was left"), "{e}");
+        assert!(!moved.join("a").exists(), "the target was not removed");
+        assert!(parent.join("a/keep").is_file() && parent.join("a/.git").is_dir());
+    }
+
     /// Runs test `name` of this test binary again, alone, in a child process with `env` and
     /// umask `umask`: whether it passed, and what it printed.
     fn rerun(name: &str, env: &[(&str, &Path)], umask: libc::mode_t) -> (bool, String) {
@@ -1372,7 +1577,7 @@ mod tests {
         let t = reserve_clone("https://h/r", &parent, "r").unwrap();
         let meta = std::fs::symlink_metadata(t.path()).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o700);
-        check_made(&meta).unwrap();
+        check_made(&Seen::from(&meta)).unwrap();
     }
 
     #[test]
@@ -1380,7 +1585,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("x");
         std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
-        let meta = |p: &Path| std::fs::symlink_metadata(p).unwrap();
+        let meta = |p: &Path| Seen::from(&std::fs::symlink_metadata(p).unwrap());
         check_made(&meta(&p)).unwrap();
         for (mode, says) in [(0o770, "770"), (0o500, "500"), (0o701, "701")] {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1524,6 +1729,159 @@ mod tests {
         assert!(status.success());
         let helper = written_pid(&file).await;
         assert!(running(helper));
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
+    }
+
+    /// When `waitid` cannot be trusted or fails (injected): a git that exited 0 but whose status
+    /// `waitid` does not vouch for (as on macOS) has its group killed all the same (fail
+    /// closed), the status still the reap's (success); one whose wait fails while it runs, or
+    /// after it ended on a stop, has its whole group killed and waited for before the reap (a
+    /// helper that ignores SIGTERM included); with `ECHILD` (not this process's child any
+    /// more) its group is not signalled, and the status is the reap's (an error when something
+    /// else did reap it).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_untrusted_or_failed_waitid_fails_closed() {
+        let d = tempfile::tempdir().unwrap();
+        let forever = || std::future::pending::<libc::c_int>();
+        let grace = Duration::from_secs(5);
+        // Exited 0, the status not vouched for: its helper is killed, success still reported.
+        let file = d.path().join("unvouched");
+        let unvouched = |pid| exited_unreaped(pid).map(|_| false);
+        let status = run_group_with(fake_git(&file, "exit 0"), forever(), grace, unvouched)
+            .await
+            .unwrap();
+        assert!(status.success(), "{status:?}");
+        assert!(
+            !running(written_pid(&file).await),
+            "the helper outlived its git"
+        );
+        // The wait fails at once, git still running: its group is killed, git included.
+        let file = d.path().join("failed-wait");
+        let written = file.clone();
+        let einval = move |_| {
+            // (Once git started its helper: the group is what is killed.)
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !written.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+        };
+        let start = std::time::Instant::now();
+        let status = run_group_with(fake_git(&file, "wait"), forever(), grace, einval)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGKILL)
+        );
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(
+            !running(written_pid(&file).await),
+            "the helper outlived its git"
+        );
+        // Stopped, git ends on its signal, then its wait fails: its group (a helper that
+        // ignores SIGTERM) is killed.
+        let file = d.path().join("stopped");
+        let mut git = tokio::process::Command::new("sh");
+        git.arg("-c")
+            .arg(
+                "(trap '' TERM HUP; exec sleep 300) </dev/null >/dev/null 2>&1 & echo $! > \
+                 \"$0.tmp\" && mv \"$0.tmp\" \"$0\"; wait",
+            )
+            .arg(&file)
+            .stdin(Stdio::null());
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let stop = async move {
+            let _ = rx.await;
+            libc::SIGTERM
+        };
+        let after_exit = |pid| {
+            exited_unreaped(pid)?;
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        };
+        let trigger = {
+            let file = file.clone();
+            async move {
+                let pid = written_pid(&file).await;
+                tx.send(()).unwrap();
+                pid
+            }
+        };
+        let (status, helper) = tokio::join!(run_group_with(git, stop, grace, after_exit), trigger);
+        assert!(!status.unwrap().success());
+        assert!(!running(helper), "the helper outlived its stopped git");
+        // ECHILD: not signalled, the reap's status reported.
+        let file = d.path().join("not-mine");
+        let echild = |pid| {
+            exited_unreaped(pid)?;
+            Err(std::io::Error::from_raw_os_error(libc::ECHILD))
+        };
+        let status = run_group_with(fake_git(&file, "exit 3"), forever(), grace, echild)
+            .await
+            .unwrap();
+        assert_eq!(status.code(), Some(3));
+        let helper = written_pid(&file).await;
+        assert!(
+            running(helper),
+            "a group no longer known to be its was signalled"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
+        // Reaped by something else first (for real): `waitid` and the reap fail with ECHILD,
+        // the error is returned, and nothing signals the group (the helper runs on).
+        let file = d.path().join("reaped-elsewhere");
+        let reaped_elsewhere = |pid: u32| {
+            let mut status = 0;
+            // SAFETY: waitpid(2) of this test's child, with a valid pointer to `status`.
+            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            assert_eq!(r, pid as libc::pid_t);
+            exited_unreaped(pid)
+        };
+        let e = run_group_with(
+            fake_git(&file, "exit 3"),
+            forever(),
+            grace,
+            reaped_elsewhere,
+        )
+        .await
+        .unwrap_err();
+        assert!(twr_adapters::process::ownership_lost(&e), "{e}");
+        let helper = written_pid(&file).await;
+        assert!(
+            running(helper),
+            "the group of a git reaped elsewhere was signalled"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
+        // Reaped elsewhere, and a stop that comes once the wait has said so: the wait's answer
+        // is seen first, and the stop signals nothing (the helper runs on).
+        let file = d.path().join("reaped-then-stopped");
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let reaped_then_told = move |pid: u32| {
+            let mut status = 0;
+            // SAFETY: waitpid(2) of this test's child, with a valid pointer to `status`.
+            let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            assert_eq!(r, pid as libc::pid_t);
+            let answer = exited_unreaped(pid);
+            let _ = tx.send(());
+            answer
+        };
+        let stop = async move {
+            let _ = rx.await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            libc::SIGHUP
+        };
+        let e = run_group_with(fake_git(&file, "exit 3"), stop, grace, reaped_then_told)
+            .await
+            .unwrap_err();
+        assert!(twr_adapters::process::ownership_lost(&e), "{e}");
+        let helper = written_pid(&file).await;
+        assert!(
+            running(helper),
+            "a stop signalled the group of a git reaped elsewhere"
+        );
         // SAFETY: kill(2) of the helper this test started.
         unsafe { libc::kill(helper as libc::pid_t, libc::SIGKILL) };
     }

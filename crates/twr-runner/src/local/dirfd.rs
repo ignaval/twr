@@ -11,11 +11,14 @@
 //! opened by path), or a repository made while it deletes. A mount point is no symlink: the
 //! deletion runs only on Linux and macOS, where a worktree with one in it is not deleted at all
 //! (`trash::mounts_inside`), and it stops at a directory on another file system. (Off Linux a
-//! directory is listed by the path it was reached by, [`Dir::names`].)
+//! directory is listed by the path it was reached by, [`Dir::names`]; [`Dir::listed`] lists one
+//! through its descriptor everywhere, for a clone's cleanup, `crate::repos`.)
 //!
-//! No `libc` (twr-runner has it on macOS only, for the mount list): the calls are declared
-//! here, and their flags spelled out per OS and architecture (as `twr-hub`'s `hub::context`
-//! does). Where they are not, [`Dir::open`] fails and nothing is changed this way.
+//! The calls are declared here, and their flags spelled out per OS and architecture (as
+//! `twr-hub`'s `hub::context` does). Where they are not, [`Dir::open`] fails and nothing is
+//! changed this way. The listing through a descriptor ([`Dir::listed`]) takes `fdopendir` and
+//! `readdir` from `libc` instead: their `dirent` differs per system, and so do their symbols
+//! (`$INODE64` on an Intel Mac).
 
 use std::ffi::{c_char, c_int, CString, OsStr, OsString};
 use std::fs::File;
@@ -170,6 +173,7 @@ pub fn not_a_dir(e: &io::Error) -> bool {
 
 /// A directory held open, with the path it was reached by (for messages, and for listing it
 /// where there is no other way, [`Dir::names`]).
+#[derive(Debug)]
 pub struct Dir {
     file: File,
     path: PathBuf,
@@ -210,7 +214,7 @@ impl Dir {
     }
 
     /// Removes its entry `name`, an empty directory.
-    pub(super) fn remove_dir(&self, name: &OsStr) -> io::Result<()> {
+    pub(crate) fn remove_dir(&self, name: &OsStr) -> io::Result<()> {
         let c = entry(name)?;
         // SAFETY: as in `dir`.
         done(unsafe { unlinkat(self.file.as_raw_fd(), c.as_ptr(), sys()?.remove_dir) }).map(drop)
@@ -324,7 +328,7 @@ impl Dir {
 
     /// Makes its entry `name` readable, writable and searchable by its owner alone (a symlink
     /// is not followed: an error).
-    pub(super) fn open_up(&self, name: &OsStr) -> io::Result<()> {
+    pub(crate) fn open_up(&self, name: &OsStr) -> io::Result<()> {
         let c = entry(name)?;
         // SAFETY: as in `dir`.
         done(unsafe { fchmodat(self.file.as_raw_fd(), c.as_ptr(), 0o700, sys()?.no_follow) })
@@ -347,6 +351,56 @@ impl Dir {
         }))
     }
 
+    /// The names of its entries (`.` and `..` left out), read through its descriptor on every
+    /// system: `fdopendir` of a duplicate of it, rewound first (a duplicate shares its read
+    /// position). Never by a path: the directory held, wherever it is now and whatever is at the
+    /// path it was reached by.
+    pub(crate) fn listed(&self) -> io::Result<Vec<OsString>> {
+        sys()?;
+        /// Closes the stream (and with it the duplicate) when dropped.
+        struct Stream(*mut libc::DIR);
+        impl Drop for Stream {
+            fn drop(&mut self) {
+                // SAFETY: a stream `fdopendir` opened, closed once.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+        // SAFETY: fcntl(2) duplicating a descriptor this `Dir` holds open; the duplicate is
+        // owned here (closed below, or by the stream made of it).
+        let fd = done(unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) })?;
+        // SAFETY: `fd` is open and a directory's; on success the stream owns it.
+        let dir = unsafe { libc::fdopendir(fd) };
+        if dir.is_null() {
+            let e = io::Error::last_os_error();
+            // SAFETY: `fd` is still this function's (fdopendir failed).
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let stream = Stream(dir);
+        // SAFETY: a stream just opened.
+        unsafe { libc::rewinddir(stream.0) };
+        let mut names = Vec::new();
+        loop {
+            // `readdir` says an error only through `errno`.
+            set_errno(0);
+            // SAFETY: a stream open until `stream` is dropped; the entry it returns is read
+            // before the next call.
+            let ent = unsafe { libc::readdir(stream.0) };
+            if ent.is_null() {
+                let e = io::Error::last_os_error();
+                return match e.raw_os_error() {
+                    Some(0) | None => Ok(names),
+                    Some(_) => Err(e),
+                };
+            }
+            // SAFETY: `d_name` of the entry `readdir` returned is NUL-terminated.
+            let name = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+            if name != b"." && name != b".." {
+                names.push(OsStr::from_bytes(name).to_os_string());
+            }
+        }
+    }
+
     /// A path to it. On Linux through its descriptor (`/proc/self/fd/<n>`: the directory held,
     /// wherever it is now); elsewhere the path it was reached by, which a listing reads only
     /// names from (every change is made relative to the directory held, and one emptied of only
@@ -360,7 +414,7 @@ impl Dir {
     }
 
     /// The path it was reached by.
-    pub(super) fn shown(&self) -> &Path {
+    pub(crate) fn shown(&self) -> &Path {
         &self.path
     }
 
@@ -368,6 +422,22 @@ impl Dir {
     pub fn file(&self) -> &File {
         &self.file
     }
+}
+
+/// Sets this thread's `errno`.
+fn set_errno(v: c_int) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: the calling thread's `errno`, always a valid location.
+    unsafe {
+        *libc::__errno_location() = v;
+    }
+    #[cfg(target_os = "macos")]
+    // SAFETY: as above.
+    unsafe {
+        *libc::__error() = v;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = v;
 }
 
 #[cfg(test)]
@@ -448,4 +518,36 @@ fn rename_new(from: c_int, a: &CString, to: c_int, b: &CString) -> io::Result<()
 fn rename_new(_: c_int, _: &CString, _: c_int, _: &CString) -> io::Result<()> {
     sys().map(drop)?;
     Err(io::Error::from(io::ErrorKind::Unsupported))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`Dir::listed`] lists the directory held through its descriptor: the same names every
+    /// time (a listing does not leave the next one part way), and the directory's own names
+    /// after it was renamed and another one put at its path.
+    #[test]
+    fn a_held_directory_is_listed_through_its_descriptor() {
+        let d = tempfile::tempdir().unwrap();
+        let at = d.path().join("held");
+        std::fs::create_dir(&at).unwrap();
+        for n in ["a", "b", ".git"] {
+            std::fs::write(at.join(n), "").unwrap();
+        }
+        let dir = Dir::open(&at).unwrap();
+        let sorted = |mut v: Vec<OsString>| {
+            v.sort();
+            v
+        };
+        let want: Vec<OsString> = [".git", "a", "b"].map(OsString::from).to_vec();
+        assert_eq!(sorted(dir.listed().unwrap()), want);
+        assert_eq!(sorted(dir.listed().unwrap()), want);
+        std::fs::rename(&at, d.path().join("moved")).unwrap();
+        std::fs::create_dir(&at).unwrap();
+        std::fs::write(at.join("other"), "").unwrap();
+        assert_eq!(sorted(dir.listed().unwrap()), want);
+        let file = dir.dir(OsStr::new(".git")).unwrap_err();
+        assert!(not_a_dir(&file), "{file}");
+    }
 }

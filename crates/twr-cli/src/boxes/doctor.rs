@@ -16,7 +16,12 @@
 //!   status line (`twr runner --stdio --status`, SSH boxes; on Linux with the daemon's active
 //!   systemd unit, if any, for the logind check) and the agent probe (`twr runner
 //!   --agents`: the login shell's `PATH`, each agent's path, version and login state), in a
-//!   second ssh in this terminal, within [`BOX_SIDE_WAIT`] ([`box_side_script`]).
+//!   second ssh in this terminal, within [`BOX_SIDE_WAIT`] ([`box_side_script`]);
+//! - on a Mac: whether someone is logged in at its screen (`launchctl print gui/<uid>`, exit
+//!   113 only meaning no one is), and, only while the box is connected (`online`: the hub
+//!   keeps what a daemon said after it is gone), how its daemon was started and Claude Code's
+//!   login as the daemon sees it, asked again through the hub first (`box.agents` with
+//!   `refresh`, within [`REFRESH_WAIT`]) ([`macos_checks`], [`daemon_view`]).
 //!
 //! What ssh prints is read as [`super::ssh_here`] reads it: stdout bounded
 //! ([`ssh_box::SSH_OUTPUT_MAX`]), stderr shown cleaned and bounded; every value kept from it
@@ -60,8 +65,8 @@ const HUB_WAIT: Duration = Duration::from_secs(15);
 /// then each agent's commands 10 s, at once).
 const BOX_SIDE_WAIT: Duration = Duration::from_secs(90);
 
-/// How long `twr box login` waits for the hub to have the box probe its agents again (the
-/// hub waits 30 s for the box).
+/// How long `twr box login` (and doctor, on a Mac) waits for the hub to have the box probe
+/// its agents again (the hub waits 30 s for the box).
 const REFRESH_WAIT: Duration = Duration::from_secs(45);
 
 /// Longest box home directory [`parse_inspect`] keeps.
@@ -115,7 +120,7 @@ impl Mark {
 #[derive(Debug, Clone, Serialize)]
 struct Check {
     /// What was checked: `hub`, `ssh_batch`, `ssh`, `box`, `build`, `daemon`, `logind`,
-    /// `login_shell`, `agent`, `git`, `disk`, `project`.
+    /// `macos`, `login_shell`, `agent`, `git`, `disk`, `project`.
     check: &'static str,
     /// Which one (the agent's command, the project's name), for `agent` and `project`.
     item: Option<String>,
@@ -132,6 +137,7 @@ impl Check {
             "ssh_batch" => "ssh without prompting",
             "ssh" => "ssh in this terminal",
             "login_shell" => "login shell",
+            "macos" => "macOS",
             other => other,
         };
         match (&self.item, self.check) {
@@ -292,8 +298,10 @@ fn box_projects(config: &Config, name: &str) -> Vec<(String, String)> {
 }
 
 /// The script of the first ssh: the hub's probe ([`ssh_box::probe_script`], in a subshell of
-/// its own: it may `exit`), then [`DOCTOR_MARK`], `home=<$HOME>` (when absolute and printable)
-/// and `order=<build>` for each directory of the builds tree, newest first. With `repos`
+/// its own: it may `exit`), then [`DOCTOR_MARK`], `home=<$HOME>` (when absolute and printable),
+/// `order=<build>` for each directory of the builds tree, newest first, and on a Mac `gui=`
+/// with the exit status of `launchctl print gui/<uid>` (0: someone is logged in at the Mac's
+/// screen, so a GUI session exists, as the relay checks it). With `repos`
 /// (doctor), also: `linger=` / `kill=` (Linux: logind's `Linger` of this user and
 /// `KillUserProcesses`, as the relay reads them), `git=` (`git --version` on the PATH ssh
 /// gives, as the box daemon's), `df=` (`df -Pk` of the data directory, or the nearest
@@ -310,8 +318,13 @@ const BOX_COMMAND_SECS: u32 = 10;
 
 /// The shell function `twr_b`, which runs its arguments as a command for at most `secs`
 /// seconds: with `timeout` where the box has one that takes `timeout <secs> <command>` (GNU,
-/// BusyBox), else in the background, killed by a watcher once `secs` pass. The watcher's
-/// output goes to `/dev/null`, so a `$(...)` around `twr_b` does not wait for it.
+/// BusyBox), else (a Mac) in the background, killed by a watcher once `secs` pass. The watcher
+/// is a subshell whose `sleep` is its own child: stopped (`TERM`), it ends that `sleep` and
+/// reaps it before it exits, so stopping it leaves nothing running. `twr_b` stops it and waits
+/// for it as soon as the command has ended, before it returns; so the watcher's `kill -9`
+/// comes only after its whole `sleep`, while the command has not ended (bar one ending at that
+/// very moment). Its output goes to `/dev/null`, so a `$(...)` around `twr_b` does not wait
+/// for it.
 fn bounded_prelude(secs: u32) -> String {
     format!(
         "if timeout 5 true >/dev/null 2>&1; then\n\
@@ -320,10 +333,14 @@ fn bounded_prelude(secs: u32) -> String {
          \x20 twr_b() {{\n\
          \x20   \"$@\" &\n\
          \x20   twr_p=$!\n\
-         \x20   ( sleep {secs}; kill -9 \"$twr_p\" ) >/dev/null 2>&1 &\n\
+         \x20   (\n\
+         \x20     trap 'case $! in \"$twr_p\") ;; *) kill \"$!\"; wait \"$!\" ;; esac; exit 0' TERM\n\
+         \x20     sleep {secs} &\n\
+         \x20     wait \"$!\" && kill -9 \"$twr_p\"\n\
+         \x20   ) >/dev/null 2>&1 &\n\
          \x20   twr_w=$!\n\
          \x20   wait \"$twr_p\"; twr_s=$?\n\
-         \x20   kill \"$twr_w\" >/dev/null 2>&1\n\
+         \x20   kill \"$twr_w\" >/dev/null 2>&1; wait \"$twr_w\" 2>/dev/null\n\
          \x20   return \"$twr_s\"\n\
          \x20 }}\n\
          fi\n"
@@ -340,11 +357,16 @@ fn inspect_script_bounded(repos: Option<&[String]>, secs: u32) -> String {
          ls -t \"$d/twr/runner/builds\" 2>/dev/null | sed 's/^/order=/'\n",
         probe = ssh_box::probe_script()
     );
+    s.push_str(&bounded_prelude(secs));
+    s.push_str(
+        "if [ \"$(uname -s 2>/dev/null)\" = Darwin ]; then\n\
+         \x20 twr_b /bin/launchctl print \"gui/$(id -u)\" </dev/null >/dev/null 2>&1; echo \"gui=$?\"\n\
+         fi\n",
+    );
     let Some(repos) = repos else {
         s.push_str("exit 0\n");
         return s;
     };
-    s.push_str(&bounded_prelude(secs));
     s.push_str(
         "if [ \"$(uname -s 2>/dev/null)\" = Linux ]; then\n\
          \x20 if command -v loginctl >/dev/null 2>&1; then echo \"linger=$(twr_b loginctl show-user \"$(id -u)\" -p Linger 2>/dev/null)\"; else echo 'linger=none'; fi\n\
@@ -378,6 +400,8 @@ pub(super) struct Inspected {
     linger: Option<String>,
     /// `busctl`'s `KillUserProcesses` (`b true`), when there is `busctl` (Linux).
     kill: Option<String>,
+    /// The exit status of `launchctl print gui/<uid>` (a Mac).
+    gui: Option<String>,
     /// `git --version`, empty without git.
     git: Option<String>,
     /// `df -Pk`'s line of the data directory.
@@ -409,6 +433,7 @@ pub(super) fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspec
             "order" if twr_core::valid_build_id(v) => ins.newest_first.push(v.to_string()),
             "linger" if ins.linger.is_none() => ins.linger = Some(cut(v)),
             "kill" if ins.kill.is_none() => ins.kill = Some(cut(v)),
+            "gui" if ins.gui.is_none() => ins.gui = Some(cut(v)),
             "git" if ins.git.is_none() => ins.git = Some(cut(v)),
             "df" if ins.df.is_none() => ins.df = Some(cut(v)),
             // Whole (a path cut short would be another one), absolute and printable only.
@@ -791,7 +816,24 @@ pub(super) async fn doctor(
             stop.as_deref(),
         );
     }
-    agents_checks(&mut r, name, &hub, pick.as_ref(), side.as_ref());
+    let mac = probe.os == "Darwin";
+    if mac {
+        macos_checks(&mut r, name, &ins, &hub, ssh_transport);
+    }
+    let view = if mac {
+        daemon_view(socket, &hub, name, json).await
+    } else {
+        DaemonView::NotAsked
+    };
+    agents_checks(
+        &mut r,
+        name,
+        &hub,
+        &view,
+        pick.as_ref(),
+        side.as_ref(),
+        ssh_transport,
+    );
     match ins.git.as_deref().filter(|g| !g.is_empty()) {
         Some(g) => r.add("git", Mark::Ok, g.to_string(), None),
         None => r.add(
@@ -1412,15 +1454,234 @@ fn logind_check(
     }
 }
 
+/// Whether a Mac has a GUI session (someone logged in at its screen) by `gui`, the exit status
+/// of `launchctl print gui/<uid>` ([`Inspected::gui`]), as the relay reads it: 0 is one, 113
+/// (no such domain) none; anything else is not known (`None`: not asked, a `launchctl` that
+/// failed otherwise or isn't there, 127, or one cut short by its bound, GNU `timeout`'s 124 or
+/// a signal).
+fn gui_session(gui: Option<&str>) -> Option<bool> {
+    match gui?.trim().parse::<i32>().ok()? {
+        0 => Some(true),
+        113 => Some(false),
+        _ => None,
+    }
+}
+
+/// How box `name`'s daemon was started, as it says (`launch` of `b`, its `hub.info` entry),
+/// on a Mac (`mac`) or not: whether that is as wanted (`Some(true)`; `Some(false)`: a Mac's
+/// daemon that runs from ssh; `None`: not known), what is said of it, and the fix. Only while
+/// the box is connected (`online`): the hub keeps the last daemon's word while the box is
+/// offline, and that daemon may be gone.
+pub(super) fn launch_verdict(
+    name: &str,
+    b: &Value,
+    mac: bool,
+) -> (Option<bool>, String, Option<String>) {
+    if b["state"] != "online" {
+        return (
+            None,
+            format!(
+                "not known: the box is not connected (it is {})",
+                super::str_of(&b["state"])
+            ),
+            None,
+        );
+    }
+    match b["launch"].as_str() {
+        Some(l) if l.starts_with("launchd ") => (
+            Some(true),
+            format!(
+                "the box daemon runs as the launchd job {}, in the GUI session of whoever is \
+                 logged in at the Mac's screen",
+                &l["launchd ".len()..]
+            ),
+            None,
+        ),
+        Some(l) if l.starts_with("systemd ") => (
+            Some(true),
+            format!(
+                "the box daemon runs as the systemd user service {}",
+                &l["systemd ".len()..]
+            ),
+            None,
+        ),
+        Some("detached") if mac => (
+            Some(false),
+            "the daemon runs from ssh, so Claude Code can't read its keychain login".into(),
+            Some(format!(
+                "log in at the Mac's screen (or turn on automatic login), then `twr box restart \
+                 {name}`"
+            )),
+        ),
+        Some("detached") => (
+            Some(true),
+            "the box daemon runs in a session of its own".into(),
+            None,
+        ),
+        Some(other) => (
+            None,
+            format!("the box daemon says it was started as {other:?}, which twr doesn't know"),
+            None,
+        ),
+        None if b["version"].is_null() => (
+            None,
+            "not known: no box daemon has reported to this hub yet".into(),
+            None,
+        ),
+        None => (
+            None,
+            "the box daemon didn't say how it was started (a twr older than this one)".into(),
+            None,
+        ),
+    }
+}
+
+/// A Mac's own checks (box `name`): a GUI session (someone logged in at its screen, `ins`), and
+/// how the box daemon was started, as it told the hub (`hub.info` `launch`, while the box is
+/// connected; not known without a hub, or for a token box, whose runner you start yourself).
+fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, ssh_transport: bool) {
+    let restart = if ssh_transport {
+        format!("then `twr box restart {name}`")
+    } else {
+        "then restart the box's `twr runner` from there".into()
+    };
+    match gui_session(ins.gui.as_deref()) {
+        Some(true) => r.add_item(
+            "macos",
+            Some("GUI session"),
+            Mark::Ok,
+            if ssh_transport {
+                "someone is logged in at the Mac's screen: the box daemon can run in that GUI \
+                 session (a launchd job), where Claude Code can read its keychain login"
+            } else {
+                "someone is logged in at the Mac's screen: a runner you start in that GUI \
+                 session (from a terminal there) can read Claude Code's keychain login"
+            }
+            .into(),
+            None,
+        ),
+        Some(false) => r.add_item(
+            "macos",
+            Some("GUI session"),
+            Mark::Fail,
+            format!(
+                "no one is logged in at the Mac's screen (`launchctl print gui/<uid>` found no \
+                 GUI session): {}",
+                if ssh_transport {
+                    "the box daemon then runs from ssh, where Claude Code can't read its \
+                     keychain login"
+                } else {
+                    "a runner you start from ssh can't read Claude Code's keychain login"
+                }
+            ),
+            Some(format!(
+                "log in at the Mac's screen, or turn on automatic login (System Settings, Users \
+                 & Groups) so it logs in after a restart; {restart}"
+            )),
+        ),
+        None => r.add_item(
+            "macos",
+            Some("GUI session"),
+            Mark::Warn,
+            format!(
+                "couldn't tell whether someone is logged in at the Mac's screen (`launchctl \
+                 print gui/<uid>`: {})",
+                ins.gui
+                    .as_deref()
+                    .map_or_else(|| "no answer".to_string(), |c| format!("exit {c}"))
+            ),
+            None,
+        ),
+    }
+    if !ssh_transport {
+        return;
+    }
+    let Some(b) = hub.box_entry(name) else {
+        r.add_item(
+            "macos",
+            Some("daemon launch"),
+            Mark::Warn,
+            "how the box daemon was started is not known: no hub runs that has the box".into(),
+            None,
+        );
+        return;
+    };
+    let (good, said, fix) = launch_verdict(name, b, true);
+    let mark = match good {
+        Some(true) => Mark::Ok,
+        _ => Mark::Warn,
+    };
+    r.add_item("macos", Some("daemon launch"), mark, said, fix);
+}
+
+/// What a Mac's box daemon (a token box's runner) says of its agent CLIs, which doctor takes
+/// over ssh's probe for Claude Code ([`daemon_view`]).
+#[derive(Debug, Clone, PartialEq)]
+enum DaemonView {
+    /// Not asked: not a Mac.
+    NotAsked,
+    /// Not known, and why: the box is not connected (the hub keeps what a daemon it no longer
+    /// reaches said), or no hub runs that has it.
+    Unknown(String),
+    /// What it says: probed again just now (through the hub, `box.agents` with `refresh`), or,
+    /// when that failed (why), as it last reported them on its connection.
+    Agents(Vec<AgentInfo>, Option<String>),
+}
+
+/// [`DaemonView`] of box `name`, by the hub on `socket` (`hub`, its `hub.info`): only while
+/// the box is connected (`online`); the agents probed again first (within [`REFRESH_WAIT`],
+/// as `twr box login` asks), else as the box last reported them on its connection.
+async fn daemon_view(socket: &Path, hub: &HubBuild, name: &str, json: bool) -> DaemonView {
+    let Some(b) = hub.box_entry(name) else {
+        return DaemonView::Unknown(
+            if hub.info.is_some() {
+                "the running hub has no such box"
+            } else {
+                "no hub runs that has the box"
+            }
+            .into(),
+        );
+    };
+    if b["state"] != "online" {
+        return DaemonView::Unknown(format!(
+            "the box is not connected (it is {})",
+            super::str_of(&b["state"])
+        ));
+    }
+    progress(
+        json,
+        &format!("asking box {name} through the hub how its agents are..."),
+    );
+    let asked = async {
+        let mut c = connect(socket).await?;
+        c.call("box.agents", json!({ "box": name, "refresh": true }))
+            .await
+    };
+    match tokio::time::timeout(REFRESH_WAIT, asked).await {
+        Ok(Ok(v)) => DaemonView::Agents(agents_of(&v), None),
+        Ok(Err(e)) => DaemonView::Agents(super::box_agents(b), Some(format!("{e:#}"))),
+        Err(_) => DaemonView::Agents(
+            super::box_agents(b),
+            Some(format!(
+                "the hub did not answer within {} s",
+                REFRESH_WAIT.as_secs()
+            )),
+        ),
+    }
+}
+
 /// The login shell's `PATH` and each agent CLI, from the agent probe in `side` (the second
 /// ssh's output); without one, the agents as the box last reported them to the hub, when it
-/// did.
+/// did. On a Mac (`view` asked), Claude Code as the box daemon (`ssh_transport`; else the
+/// box's runner) sees it, when that is known ([`DaemonView`]).
 fn agents_checks(
     r: &mut Report,
     name: &str,
     hub: &HubBuild,
+    view: &DaemonView,
     pick: Option<&(String, BuildSource)>,
     side: Option<&Result<String, String>>,
+    ssh_transport: bool,
 ) {
     let probed = match (pick, side) {
         (Some((id, _)), Some(Ok(out))) => match section(out, AGENTS_MARK) {
@@ -1462,11 +1723,108 @@ fn agents_checks(
         }
     };
     login_shell_check(r, &report.login_path);
-    for a in &report.agents {
-        agent_check(r, name, a);
+    // On a Mac, Claude Code as the box daemon sees it (through the hub, while the box is
+    // connected) over the probe's over ssh, found or not: the keychain can answer each
+    // differently, and the daemon looks the CLI up on the PATH it started with.
+    let who = if ssh_transport {
+        "the box daemon"
+    } else {
+        "the box's runner"
+    };
+    let (daemon, said): (&[AgentInfo], String) = match view {
+        DaemonView::Agents(d, None) => (d, format!(" (as {who} reported it)")),
+        DaemonView::Agents(d, Some(why)) => {
+            r.add(
+                "agent",
+                Mark::Warn,
+                format!(
+                    "the hub could not have box {name} probe its agents now ({why}): Claude \
+                     Code below is as {who} last reported it"
+                ),
+                None,
+            );
+            (d, format!(" (as {who} last reported it)"))
+        }
+        _ => (&[], String::new()),
+    };
+    let mut agents = report.agents;
+    for a in &mut agents {
+        let claude = a.runtime == twr_adapters::claude_code::NAME;
+        if let (true, DaemonView::Unknown(why)) = (claude, view) {
+            agent_check_said(
+                r,
+                name,
+                a,
+                &format!(
+                    " (over ssh, which on a Mac may not read the keychain: how {who} sees it is \
+                     not known, {why})"
+                ),
+            );
+            continue;
+        }
+        let seen = claude
+            .then(|| daemon.iter().find(|d| d.runtime == a.runtime))
+            .flatten();
+        let Some(d) = seen else {
+            agent_check(r, name, a);
+            continue;
+        };
+        if !d.found && a.found {
+            // Installed since the daemon started (or on a PATH it does not have): a daemon
+            // started now finds it.
+            let command = agent_name(&a.runtime);
+            r.add_item(
+                "agent",
+                Some(command),
+                Mark::Warn,
+                format!(
+                    "{}{said}, but over ssh it is found ({}): {who} looks it up on the PATH it \
+                     started with, so its threads can't run it",
+                    agent_said(d),
+                    agent_said(a)
+                ),
+                Some(if ssh_transport {
+                    format!("`twr box restart {name}` starts a daemon that finds it")
+                } else {
+                    "restart the box's `twr runner` (from a shell whose PATH finds it)".into()
+                }),
+            );
+        } else {
+            agent_check_said(r, name, d, &said);
+        }
+        if d.found && a.found && d.login != a.login {
+            r.add_item(
+                "agent",
+                Some(agent_name(&a.runtime)),
+                Mark::Warn,
+                format!(
+                    "over ssh it says {}, {who} {}: on a Mac, Claude Code keeps its login in the \
+                     keychain, which {} in the GUI session reads, and ssh only while it is \
+                     unlocked; {who}'s view is the one its threads get",
+                    login_word(a.login),
+                    login_word(d.login),
+                    if ssh_transport {
+                        "a box daemon running (a launchd job)"
+                    } else {
+                        "a runner started"
+                    }
+                ),
+                None,
+            );
+        }
+        *a = d.clone();
     }
     r.login_path = Some(report.login_path);
-    r.agents = Some(report.agents);
+    r.agents = Some(agents);
+}
+
+/// A login state in words.
+fn login_word(l: AgentLogin) -> &'static str {
+    match l {
+        AgentLogin::LoggedIn => "logged in",
+        AgentLogin::LoggedOut => "logged out",
+        AgentLogin::Unknown => "the login is not known",
+    }
 }
 
 /// How asking the box's login shell for its `PATH` went (`twr runner --agents`).
@@ -1508,6 +1866,11 @@ fn login_shell_check(r: &mut Report, lp: &LoginPathReport) {
 
 /// One agent CLI of box `name`.
 fn agent_check(r: &mut Report, name: &str, a: &AgentInfo) {
+    agent_check_said(r, name, a, "");
+}
+
+/// [`agent_check`], with `from` after what is said of the agent (who said it).
+fn agent_check_said(r: &mut Report, name: &str, a: &AgentInfo, from: &str) {
     let command = agent_name(&a.runtime).to_string();
     let (mark, fix) = match (a.found, a.login) {
         (false, _) => (
@@ -1533,7 +1896,13 @@ fn agent_check(r: &mut Report, name: &str, a: &AgentInfo) {
             )),
         ),
     };
-    r.add_item("agent", Some(&command), mark, agent_said(a), fix);
+    r.add_item(
+        "agent",
+        Some(&command),
+        mark,
+        format!("{}{from}", agent_said(a)),
+        fix,
+    );
 }
 
 /// Free disk in the box's data directory (`df`, `df -Pk`'s line) against `[threads]
@@ -1601,6 +1970,20 @@ fn login_ssh_args(ssh: &str, data: &str, id: &str, agent: &str) -> anyhow::Resul
 const KEYCHAIN_NOTE: &str = "On a Mac, Claude Code keeps its login in the login keychain, which \
                              a login over ssh reaches only while it is unlocked: if the login \
                              does not stick, log in at the Mac once";
+
+/// What `twr box login` says before Claude Code's login on Mac box `name` (of `transport`)
+/// that no one is logged in at: the box daemon's Claude Code can't read it yet.
+fn no_gui_login_note(name: &str, transport: BoxTransport) -> String {
+    let restart = match transport {
+        BoxTransport::Ssh => format!("`twr box restart {name}`"),
+        BoxTransport::Token => "restart the box's `twr runner` there".to_string(),
+    };
+    format!(
+        "No one is logged in at the Mac's screen: a login made now isn't readable by the box \
+         daemon's Claude Code until someone logs in there and the daemon is restarted \
+         ({restart}), since only a daemon in that GUI session reads the keychain."
+    )
+}
 
 /// `twr box login` (see [`super::BoxCmd::Login`]).
 pub(super) async fn login(
@@ -1687,6 +2070,9 @@ pub(super) async fn login(
          twr doesn't see what you type"
     );
     if mac && runtime == twr_adapters::claude_code::NAME {
+        if gui_session(ins.gui.as_deref()) == Some(false) {
+            outln!("{}", no_gui_login_note(name, cfg.transport()));
+        }
         outln!("{KEYCHAIN_NOTE}.");
     }
     let status = tokio::process::Command::new(ssh_box::ssh_program())
@@ -1713,26 +2099,7 @@ pub(super) async fn login(
         LoginVerdict::Missing if daemon && status.success() => {
             // `--login` found the CLI (on the login shell's PATH as it is now), the daemon,
             // which read that PATH when it started, does not.
-            let restart = match (cfg.transport(), hub_key(paths)?) {
-                (BoxTransport::Ssh, Some(key)) => format!(
-                    "stop it with `{}` (its agents stop with it; the hub starts a new daemon \
-                     when it connects again, within a minute, and their next prompts resume \
-                     them)",
-                    super::stop_command(ssh, &id, name, &key)?
-                ),
-                (BoxTransport::Ssh, None) => "stop it (`twr box remove` prints how), and the \
-                    hub starts a new one when it connects again"
-                    .to_string(),
-                (BoxTransport::Token, _) => {
-                    "restart the box's `twr runner` (its agents stop with it)".to_string()
-                }
-            };
-            outln!(
-                "the login found {command} on box {name}, but the box daemon doesn't: it reads \
-                 the login shell's PATH once, when it starts, so a PATH entry added since is \
-                 not in it. To have it read the PATH again, {restart}; then `twr box doctor \
-                 {name}`"
-            );
+            outln!("{}", daemon_missing_note(cfg.transport(), name, &command));
         }
         LoginVerdict::Missing => outln!(
             "{from} doesn't find {command} on box {name} (its login shell's PATH included): \
@@ -1761,6 +2128,26 @@ pub(super) async fn login(
     } else {
         ExitCode::from(1)
     })
+}
+
+/// What `twr box login` says when its login found `command` on box `name` (of `transport`)
+/// but the box's daemon (or runner) does not: it read the login shell's PATH when it started,
+/// so restarting it reads the PATH again (`twr box restart` for an SSH box).
+fn daemon_missing_note(transport: BoxTransport, name: &str, command: &str) -> String {
+    let restart = match transport {
+        BoxTransport::Ssh => format!(
+            "run `twr box restart {name}` (it stops the daemon and its agents and starts a new \
+             one; their next prompts resume them)"
+        ),
+        BoxTransport::Token => {
+            "restart the box's `twr runner` (its agents stop with it)".to_string()
+        }
+    };
+    format!(
+        "the login found {command} on box {name}, but the box daemon doesn't: it reads the login \
+         shell's PATH once, when it starts, so a PATH entry added since is not in it. To have it \
+         read the PATH again, {restart}; then `twr box doctor {name}`"
+    )
 }
 
 /// What `twr box login` makes of the agent's state after the login ([`login_verdict`]).
@@ -2301,6 +2688,77 @@ mod tests {
         }
     }
 
+    /// Without `timeout` (a Mac), a bounded command that ends early leaves nothing behind: its
+    /// watcher's `sleep` ends with the watcher, before `twr_b` returns (each `sleep` the
+    /// watchers start writes its pid into a file; none of them runs afterwards), and its exit
+    /// status is the command's. Under `sh` and, where there is one, `bash` (a Mac's `/bin/sh`).
+    #[test]
+    fn a_bounded_command_that_ends_early_leaves_no_watcher_behind() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::env::var("PATH").unwrap_or_default();
+        let real_sleep = std::env::split_paths(&path)
+            .map(|d| d.join("sleep"))
+            .find(|p| p.is_file())
+            .expect("a sleep on PATH");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let write = |name: &str, body: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        write("timeout", "exit 1".into());
+        write(
+            "sleep",
+            format!(
+                "echo $$ >> \"$TWR_TEST_PIDS\"\nexec {} \"$@\"",
+                real_sleep.display()
+            ),
+        );
+        let shells: Vec<&str> = ["sh", "bash"]
+            .into_iter()
+            .filter(|sh| {
+                std::process::Command::new(sh)
+                    .args(["-c", "exit 0"])
+                    .status()
+                    .is_ok_and(|s| s.success())
+            })
+            .collect();
+        for sh in shells {
+            let pids = dir.path().join(format!("{sh}.pids"));
+            let script = format!(
+                "{prelude}\
+                 twr_b sh -c 'until [ -s \"$0\" ]; do {real} 0.05; done' \"$TWR_TEST_PIDS\"\n\
+                 echo \"first=$?\"\n\
+                 twr_b sh -c 'exit 3'\n\
+                 echo \"second=$?\"\n\
+                 for p in $(cat \"$TWR_TEST_PIDS\"); do\n\
+                 \x20 if kill -0 \"$p\" 2>/dev/null; then echo \"left=$p\"; kill \"$p\"; fi\n\
+                 done\n",
+                prelude = bounded_prelude(30),
+                real = real_sleep.display(),
+            );
+            let started = std::time::Instant::now();
+            let out = std::process::Command::new(sh)
+                .arg("-c")
+                .arg(&script)
+                .env("PATH", format!("{}:{path}", bin.display()))
+                .env("TWR_TEST_PIDS", &pids)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(started.elapsed() < Duration::from_secs(20), "{sh}: {said}");
+            assert_eq!(said, "first=0\nsecond=3\n", "{sh}");
+            let started = std::fs::read_to_string(&pids).unwrap();
+            assert!(
+                !started.trim().is_empty(),
+                "{sh}: no watcher's sleep started"
+            );
+        }
+    }
+
     /// The second ssh's `twr runner` commands that hang on the box are ended at their bound,
     /// with the box's `timeout` and without one: the script ends with doctor, not after it,
     /// and each section says it did not end well.
@@ -2663,5 +3121,418 @@ mod tests {
             ]
         );
         assert!(box_projects(&c, "other").is_empty());
+    }
+
+    /// A Mac's GUI session from `launchctl print gui/<uid>`'s exit status, as the relay reads
+    /// it: 0 is one, 113 (no such domain) none; any other failure (a `launchctl` that failed
+    /// otherwise or isn't there), a command cut short by its bound, or none asked: not known.
+    #[test]
+    fn a_macs_gui_session_is_read_from_launchctl() {
+        assert_eq!(gui_session(Some("0")), Some(true));
+        assert_eq!(gui_session(Some("113")), Some(false));
+        for unknown in [
+            Some("1"),
+            Some("5"),
+            Some("127"),
+            Some("124"),
+            Some("137"),
+            Some(""),
+            Some("x"),
+            None,
+        ] {
+            assert_eq!(gui_session(unknown), None, "{unknown:?}");
+        }
+        // The script asks only on a Mac: a `uname` that says Darwin, a `launchctl` that fails.
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            bin.join("uname"),
+            "#!/bin/sh\ncase $1 in -s) echo Darwin ;; *) echo arm64 ;; esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(bin.join("uname"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let run = |path: &str| {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(inspect_script(None))
+                .env("HOME", dir.path())
+                .env("PATH", path)
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            parse_inspect(&String::from_utf8_lossy(&out.stdout), 0).unwrap()
+        };
+        let path = std::env::var("PATH").unwrap();
+        let mac = run(&format!("{}:{path}", bin.display()));
+        assert_eq!(mac.probe.os, "Darwin");
+        // (`/bin/launchctl` is not there off a Mac: the shell's 127.)
+        if !Path::new("/bin/launchctl").exists() {
+            assert_eq!(mac.gui.as_deref(), Some("127"));
+            assert_eq!(gui_session(mac.gui.as_deref()), None);
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(run(&path).gui, None);
+        }
+    }
+
+    /// How the daemon was started, as doctor and `twr box restart` say it: a Mac's daemon run
+    /// from ssh is not as wanted, and the fix restarts it. Only while the box is connected
+    /// (what the hub keeps from a daemon it no longer reaches is not known to be so); a box
+    /// connected without a word of it: a daemon older than this twr, or none reported yet.
+    #[test]
+    fn the_daemons_launch_is_judged() {
+        let entry = |launch: Option<&str>| json!({"name": "mac", "state": "online", "version": "0.2.0", "launch": launch});
+        let (ok, said, fix) = launch_verdict(
+            "mac",
+            &entry(Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d")),
+            true,
+        );
+        assert_eq!(ok, Some(true));
+        assert!(said.contains("launchd job tools.twr.box.0123456789abcdef.0a1b2c3d"));
+        assert!(fix.is_none());
+        let (ok, said, fix) = launch_verdict("mac", &entry(Some("detached")), true);
+        assert_eq!(ok, Some(false));
+        assert_eq!(
+            said,
+            "the daemon runs from ssh, so Claude Code can't read its keychain login"
+        );
+        assert!(fix.unwrap().ends_with("`twr box restart mac`"));
+        assert_eq!(
+            launch_verdict("gpu", &entry(Some("detached")), false).0,
+            Some(true)
+        );
+        let (ok, said, _) =
+            launch_verdict("gpu", &entry(Some("systemd twr-box-ab-cd.service")), false);
+        assert_eq!(ok, Some(true));
+        assert!(said.contains("systemd user service twr-box-ab-cd.service"));
+        let (ok, said, _) = launch_verdict("gpu", &entry(None), true);
+        assert_eq!(ok, None);
+        assert!(said.contains("a twr older than this one"), "{said}");
+        let mut never = entry(None);
+        never["version"] = Value::Null;
+        let (ok, said, _) = launch_verdict("gpu", &never, true);
+        assert_eq!(ok, None);
+        assert_eq!(
+            said,
+            "not known: no box daemon has reported to this hub yet"
+        );
+        // Offline (the hub keeps the last word): not known, whatever it was.
+        let mut gone = entry(Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d"));
+        gone["state"] = json!("offline");
+        let (ok, said, fix) = launch_verdict("mac", &gone, true);
+        assert_eq!(ok, None);
+        assert_eq!(said, "not known: the box is not connected (it is offline)");
+        assert!(fix.is_none());
+    }
+
+    /// doctor's macOS group: the GUI session, then the daemon's launch from the hub's view
+    /// (unknown without a hub); a Mac with no one at its screen fails.
+    #[test]
+    fn the_macos_group_says_what_a_mac_needs() {
+        let mut r = Report::new("mac", true);
+        let ins = Inspected {
+            gui: Some("0".into()),
+            ..Inspected::default()
+        };
+        let hub = HubBuild::of_info(json!({"version": "0.2.0", "boxes": [
+            {"name": "mac", "state": "online", "launch": "detached", "os": "Darwin"}
+        ]}));
+        macos_checks(&mut r, "mac", &ins, &hub, true);
+        let got: Vec<(String, Mark)> = r.checks.iter().map(|c| (c.label(), c.result)).collect();
+        assert_eq!(
+            got,
+            [
+                ("macOS GUI session".to_string(), Mark::Ok),
+                ("macOS daemon launch".to_string(), Mark::Warn)
+            ]
+        );
+        assert!(r.checks[1].message.contains("runs from ssh"));
+        let mut r = Report::new("mac", true);
+        let ins = Inspected {
+            gui: Some("113".into()),
+            ..Inspected::default()
+        };
+        macos_checks(&mut r, "mac", &ins, &HubBuild::own(None), true);
+        assert_eq!(r.checks[0].result, Mark::Fail);
+        assert!(
+            r.checks[0]
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("automatic login")
+                && r.checks[0]
+                    .fix
+                    .as_deref()
+                    .unwrap()
+                    .contains("`twr box restart mac`")
+        );
+        assert_eq!(r.checks[1].result, Mark::Warn);
+        assert!(
+            r.checks[1].message.contains("no hub runs"),
+            "{:?}",
+            r.checks
+        );
+        assert_eq!(r.failed(), 1);
+        // The box offline: the hub's `launch` is the last daemon's, not known to be so now.
+        let mut r = Report::new("mac", true);
+        let ins = Inspected {
+            gui: Some("0".into()),
+            ..Inspected::default()
+        };
+        let offline = HubBuild::of_info(json!({"version": "0.2.0", "boxes": [
+            {"name": "mac", "state": "offline", "launch": "launchd tools.twr.box.a.b",
+             "os": "Darwin", "version": "0.2.0"}
+        ]}));
+        macos_checks(&mut r, "mac", &ins, &offline, true);
+        assert_eq!(r.checks[1].result, Mark::Warn);
+        assert_eq!(
+            r.checks[1].message,
+            "not known: the box is not connected (it is offline)"
+        );
+        // A failed `launchctl` is no answer, not "no one is logged in".
+        let mut r = Report::new("mac", true);
+        let ins = Inspected {
+            gui: Some("127".into()),
+            ..Inspected::default()
+        };
+        macos_checks(&mut r, "mac", &ins, &offline, true);
+        assert_eq!(r.checks[0].result, Mark::Warn);
+        assert!(
+            r.checks[0].message.contains("couldn't tell"),
+            "{:?}",
+            r.checks
+        );
+        // A token box: a runner you start, no box daemon from ssh.
+        for gui in ["0", "113"] {
+            let mut r = Report::new("lab", true);
+            let ins = Inspected {
+                gui: Some(gui.into()),
+                ..Inspected::default()
+            };
+            macos_checks(&mut r, "lab", &ins, &HubBuild::own(None), false);
+            assert_eq!(r.checks.len(), 1, "{:?}", r.checks);
+            let c = &r.checks[0];
+            assert!(
+                c.message.contains("a runner you start") && !c.message.contains("box daemon"),
+                "{c:?}"
+            );
+        }
+        let note = no_gui_login_note("mac", BoxTransport::Ssh);
+        assert!(
+            note.contains("No one is logged in at the Mac's screen")
+                && note.contains("`twr box restart mac`"),
+            "{note}"
+        );
+    }
+
+    /// On a Mac, Claude Code's login is the box daemon's view (through the hub) when it has
+    /// one, with a note when ssh's says otherwise (the keychain); other agents, and a box that
+    /// is no Mac, keep the probe's.
+    #[test]
+    fn a_macs_claude_login_is_the_daemons() {
+        let probe = json!({"agents": [
+            {"runtime": "claude-code", "found": true, "login": "logged_out"},
+            {"runtime": "codex", "found": true, "login": "logged_out"},
+        ]});
+        let side: Result<String, String> = Ok(format!("{AGENTS_MARK}\n{probe}\n{EXIT_MARK}0\n"));
+        let hub = HubBuild::of_info(json!({"version": "0.2.0", "boxes": [
+            {"name": "mac", "state": "online", "agents": [
+                {"runtime": "claude-code", "found": true, "login": "logged_in",
+                 "method": "claude.ai"},
+                {"runtime": "codex", "found": true, "login": "logged_in"},
+            ]}
+        ]}));
+        let pick = ("0123456789abcdef".to_string(), BuildSource::Hub);
+        let daemon = DaemonView::Agents(
+            super::super::box_agents(hub.box_entry("mac").unwrap()),
+            None,
+        );
+        let mut r = Report::new("mac", true);
+        agents_checks(&mut r, "mac", &hub, &daemon, Some(&pick), Some(&side), true);
+        let agents: Vec<(String, Mark, String)> = r
+            .checks
+            .iter()
+            .filter(|c| c.check == "agent")
+            .map(|c| (c.label(), c.result, c.message.clone()))
+            .collect();
+        assert_eq!(agents.len(), 3, "{agents:?}");
+        assert_eq!(agents[0].0, "claude");
+        assert_eq!(agents[0].1, Mark::Ok);
+        assert!(
+            agents[0].2.ends_with("(as the box daemon reported it)"),
+            "{agents:?}"
+        );
+        assert_eq!(agents[1].1, Mark::Warn);
+        assert!(
+            agents[1]
+                .2
+                .contains("over ssh it says logged out, the box daemon logged in")
+                && agents[1].2.contains("keychain"),
+            "{agents:?}"
+        );
+        assert_eq!(
+            (agents[2].0.as_str(), agents[2].1),
+            ("codex", Mark::Warn),
+            "{agents:?}"
+        );
+        assert_eq!(r.agents.as_ref().unwrap()[0].login, AgentLogin::LoggedIn);
+        // Not a Mac: the probe's.
+        let mut r = Report::new("mac", true);
+        agents_checks(
+            &mut r,
+            "mac",
+            &hub,
+            &DaemonView::NotAsked,
+            Some(&pick),
+            Some(&side),
+            true,
+        );
+        let marks: Vec<Mark> = r
+            .checks
+            .iter()
+            .filter(|c| c.check == "agent")
+            .map(|c| c.result)
+            .collect();
+        assert_eq!(marks, [Mark::Warn, Mark::Warn]);
+        // The box not connected: ssh's view, saying so (not what the hub kept).
+        let mut r = Report::new("mac", true);
+        let unknown = DaemonView::Unknown("the box is not connected (it is offline)".into());
+        agents_checks(
+            &mut r,
+            "mac",
+            &hub,
+            &unknown,
+            Some(&pick),
+            Some(&side),
+            true,
+        );
+        let claude = r.checks.iter().find(|c| c.check == "agent").unwrap();
+        assert_eq!(claude.result, Mark::Warn);
+        assert!(
+            claude.message.starts_with("logged out")
+                && claude.message.contains("over ssh")
+                && claude
+                    .message
+                    .contains("how the box daemon sees it is not known, the box is not connected"),
+            "{claude:?}"
+        );
+        assert_eq!(r.agents.as_ref().unwrap()[0].login, AgentLogin::LoggedOut);
+        // The refresh failed: as the daemon last reported it, said so.
+        let mut r = Report::new("mac", true);
+        let stale = DaemonView::Agents(
+            super::super::box_agents(hub.box_entry("mac").unwrap()),
+            Some("no answer".into()),
+        );
+        agents_checks(&mut r, "mac", &hub, &stale, Some(&pick), Some(&side), true);
+        let said: Vec<&str> = r
+            .checks
+            .iter()
+            .filter(|c| c.check == "agent")
+            .map(|c| c.message.as_str())
+            .collect();
+        assert!(said[0].contains("could not have box mac probe its agents now (no answer)"));
+        assert!(
+            said[1].ends_with("(as the box daemon last reported it)"),
+            "{said:?}"
+        );
+        // A token box: its runner's view.
+        let mut r = Report::new("mac", true);
+        agents_checks(
+            &mut r,
+            "mac",
+            &hub,
+            &daemon,
+            Some(&pick),
+            Some(&side),
+            false,
+        );
+        let said: Vec<&str> = r
+            .checks
+            .iter()
+            .filter(|c| c.check == "agent")
+            .map(|c| c.message.as_str())
+            .collect();
+        assert!(
+            said[0].ends_with("(as the box's runner reported it)"),
+            "{said:?}"
+        );
+        assert!(
+            said[1].contains("the box's runner logged in") && !said[1].contains("daemon"),
+            "{said:?}"
+        );
+    }
+
+    /// A login that finds the CLI the daemon does not: an SSH box's daemon is restarted with
+    /// `twr box restart`, a token box's runner by hand.
+    #[test]
+    fn a_daemon_that_misses_the_cli_is_restarted() {
+        let ssh = daemon_missing_note(BoxTransport::Ssh, "mac", "claude");
+        assert!(
+            ssh.contains("To have it read the PATH again, run `twr box restart mac`")
+                && ssh.ends_with("then `twr box doctor mac`")
+                && !ssh.contains("--stop"),
+            "{ssh}"
+        );
+        let token = daemon_missing_note(BoxTransport::Token, "lab", "claude");
+        assert!(
+            token.contains("restart the box's `twr runner`") && !token.contains("twr box restart"),
+            "{token}"
+        );
+    }
+
+    /// On a Mac, a daemon that does not find Claude Code is believed over ssh's probe that does
+    /// (installed since the daemon started, on a PATH it does not have): a warning that says
+    /// both, and `twr box restart`; when neither finds it, the usual install fix.
+    #[test]
+    fn a_macs_daemon_that_does_not_find_claude_is_believed() {
+        let probe = json!({"agents": [
+            {"runtime": "claude-code", "found": true, "login": "logged_in",
+             "path": "/opt/homebrew/bin/claude"},
+        ]});
+        let side: Result<String, String> = Ok(format!("{AGENTS_MARK}\n{probe}\n{EXIT_MARK}0\n"));
+        let hub = HubBuild::of_info(json!({"version": "0.2.0", "boxes": [
+            {"name": "mac", "state": "online", "agents": [
+                {"runtime": "claude-code", "found": false, "login": "unknown"},
+            ]}
+        ]}));
+        let pick = ("0123456789abcdef".to_string(), BuildSource::Hub);
+        let daemon = DaemonView::Agents(
+            super::super::box_agents(hub.box_entry("mac").unwrap()),
+            None,
+        );
+        let mut r = Report::new("mac", true);
+        agents_checks(&mut r, "mac", &hub, &daemon, Some(&pick), Some(&side), true);
+        let agents: Vec<_> = r.checks.iter().filter(|c| c.check == "agent").collect();
+        assert_eq!(agents.len(), 1, "{:?}", r.checks);
+        let c = agents[0];
+        assert_eq!((c.label(), c.result), ("claude".to_string(), Mark::Warn));
+        assert!(
+            c.message
+                .starts_with("not installed (as the box daemon reported it), but over ssh it is found (logged in")
+                && c.message.contains("at /opt/homebrew/bin/claude"),
+            "{}",
+            c.message
+        );
+        assert_eq!(
+            c.fix.as_deref(),
+            Some("`twr box restart mac` starts a daemon that finds it")
+        );
+        assert!(!r.agents.as_ref().unwrap()[0].found);
+        // Neither finds it: install it.
+        let probe = json!({"agents": [
+            {"runtime": "claude-code", "found": false, "login": "unknown"},
+        ]});
+        let side: Result<String, String> = Ok(format!("{AGENTS_MARK}\n{probe}\n{EXIT_MARK}0\n"));
+        let mut r = Report::new("mac", true);
+        agents_checks(&mut r, "mac", &hub, &daemon, Some(&pick), Some(&side), true);
+        let c = r.checks.iter().find(|c| c.check == "agent").unwrap();
+        assert!(
+            c.message == "not installed (as the box daemon reported it)"
+                && c.fix.as_deref().unwrap().contains("install claude there"),
+            "{c:?}"
+        );
     }
 }

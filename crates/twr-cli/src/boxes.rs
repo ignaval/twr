@@ -2,9 +2,10 @@
 //! SSH (`[boxes.<name>] transport = "ssh"`, in `boxes.toml`) and adds it to the running hub
 //! (`box.add`); `list` and `status` show `hub.info`'s boxes; `install` puts a twr build on an
 //! SSH box (the hub's own, a release's for another OS or CPU, or a file) and has the hub
-//! connect again (`box.install`); `remove` takes a box out of `boxes.toml`; `doctor` checks a
-//! box and `login` starts an agent CLI's login on it ([`doctor`]); `project` finds (or clones)
-//! a project's repository on a box and records where it is ([`project`]).
+//! connect again (`box.install`); `restart` has the hub restart an SSH box's daemon
+//! (`box.restart`); `remove` takes a box out of `boxes.toml`; `doctor` checks a box and `login`
+//! starts an agent CLI's login on it ([`doctor`]); `project` finds (or clones) a project's
+//! repository on a box and records where it is ([`project`]).
 //!
 //! The probes run ssh in the user's terminal, with the hub's ssh options but without
 //! `BatchMode` ([`twr_hub::ssh_box::interactive_ssh_args`]), so ssh can ask about an unknown
@@ -38,17 +39,37 @@ mod project;
 /// How long `twr box add` and `twr box install` wait for the box to come online.
 const ONLINE_WAIT: Duration = Duration::from_secs(90);
 
+/// How long `twr box restart` waits for the box to come back on a new daemon: an attempt of
+/// the hub's that is under way when the request lands (it is not cut short: a session it opens
+/// sees the restart asked for and ends; the request's wake ends any backoff after it), then
+/// the attempt that carries the restart out, each at most [`ssh_box::ATTEMPT_WORST`] (the
+/// probe, an upload of the hub's build, the channel of a dial that replaces or restarts the
+/// daemon: [`ssh_box::REPLACE_OPEN_TIMEOUT`], the relay's whole stop and start, and the
+/// WebSocket's handshake), and [`ONLINE_WAIT`] for the rest (the welcome). About an hour and
+/// twenty minutes at most; the box's notes, printed as they come, say what it waits for.
+const RESTART_WAIT: Duration =
+    Duration::from_secs(2 * ssh_box::ATTEMPT_WORST.as_secs() + ONLINE_WAIT.as_secs());
+
 /// How long `twr box install` waits for a box that is online on another build to run the one
-/// it installed: the hub switches it once it has been quiet for 2 minutes
-/// ([`ssh_box::SWITCH_QUIET`]), looking every 30 s, and gives its runtimes up to 2 minutes to
-/// exit.
-const SWITCH_WAIT: Duration = Duration::from_secs(360);
+/// it installed: an attempt under way when it asks, the box quiet for 2 minutes
+/// ([`ssh_box::SWITCH_QUIET`], looked at every [`ssh_box::SWITCH_CHECK`]), its runtimes given
+/// up to [`ssh_box::SWITCH_DRAIN`] to exit, then the attempt that replaces the daemon, each
+/// attempt at most [`ssh_box::ATTEMPT_WORST`], and [`ONLINE_WAIT`] for the rest. (How long the
+/// box takes to be quiet is the user's: past that, the wait says how it goes.)
+const SWITCH_WAIT: Duration = Duration::from_secs(
+    2 * ssh_box::ATTEMPT_WORST.as_secs()
+        + ssh_box::SWITCH_QUIET.as_secs()
+        + ssh_box::SWITCH_CHECK.as_secs()
+        + ssh_box::SWITCH_DRAIN.as_secs()
+        + ONLINE_WAIT.as_secs(),
+);
 
 /// How often they look.
 const ONLINE_POLL: Duration = Duration::from_millis(500);
 
 /// How long `twr box install` takes a `needs_install` it reads for the state from before its
-/// `box.install`, while the hub has not shown another one.
+/// `box.install`, while the hub has not shown another one (and `twr box restart` an `error` or
+/// `needs_install` for the state from before its `box.restart`: [`RestartWait`]).
 const STALE_NEEDS_INSTALL: Duration = Duration::from_secs(10);
 
 /// How long the check that ssh works without prompting may take.
@@ -104,18 +125,41 @@ pub(super) enum BoxCmd {
     },
     /// Install twr on an SSH box and have the hub connect to it again. On a box of the hub's OS
     /// and CPU the hub installs its own build. On another one: with --binary, that file;
-    /// otherwise, when the hub runs a release, the release's archive for the box (its signed
-    /// checksums verified as `twr update` verifies them), unpacked on the box. The build is
-    /// recorded as the box's `build` in boxes.toml (a box of config.toml: the line to add is
-    /// printed). Asks y/N before uploading (without a terminal, only with --yes). Waits up to
-    /// 90 s for the box to come online.
+    /// with --from-box, a twr already on the box (built there with
+    /// docs/tools/dev-install.sh, say); otherwise, when the hub runs a release, the release's
+    /// archive for the box (its signed checksums verified as `twr update` verifies them),
+    /// unpacked on the box. The build is recorded as the box's `build` in boxes.toml (a box of
+    /// config.toml: the line to add is printed). Asks y/N before installing (without a
+    /// terminal, only with --yes). Waits up to 90 s for the box to come online; a box online
+    /// on another build is switched once it has been quiet for 2 minutes, and that is waited
+    /// for too (at most about an hour and a half, printing the box's notes meanwhile).
     Install {
         /// The box's name.
         name: String,
         /// A twr executable built for the box's OS and CPU, to upload instead of a release's.
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "from_box")]
         binary: Option<PathBuf>,
+        /// A twr executable already on the box, by its absolute path there (on the box,
+        /// `command -v twr` or `echo ~/.local/bin/twr` prints it), copied into the builds
+        /// directory with its checks.
+        #[arg(long, value_name = "PATH ON THE BOX")]
+        from_box: Option<String>,
         /// Upload without asking.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Restart an SSH box's daemon: the hub ends its connection to the box and connects again,
+    /// having the box stop its daemon (and the agents it runs) and start a new one. On a Mac,
+    /// after someone logged in at its screen, the new daemon runs in that GUI session, where
+    /// Claude Code can read its keychain login. Asks y/N first (without a terminal, only with
+    /// --yes), then waits for the box to come back online (as long as the hub's attempts may
+    /// take: an hour and twenty minutes at most, when the old daemon has a repository change
+    /// to finish and a build to upload, printing the box's notes meanwhile) and says how its
+    /// daemon was started.
+    Restart {
+        /// The box's name.
+        name: String,
+        /// Restart without asking.
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -209,9 +253,20 @@ pub(super) async fn run(
         }
         BoxCmd::List { json } => list(socket, json).await?,
         BoxCmd::Status { name, json } => status(socket, &name, json).await?,
-        BoxCmd::Install { name, binary, yes } => {
-            install(config, paths, socket, &name, binary.as_deref(), yes).await?
+        BoxCmd::Install {
+            name,
+            binary,
+            from_box,
+            yes,
+        } => {
+            let from = match (binary, from_box) {
+                (Some(b), _) => Some(InstallFrom::Binary(b)),
+                (None, Some(p)) => Some(InstallFrom::Box(p)),
+                (None, None) => None,
+            };
+            install(config, paths, socket, &name, from, yes).await?
         }
+        BoxCmd::Restart { name, yes } => restart(config, paths, socket, &name, yes).await?,
         BoxCmd::Remove { name } => remove(paths, socket, &name).await?,
         BoxCmd::Doctor { name, json } => {
             return doctor::doctor(config, paths, socket, &name, json).await
@@ -738,6 +793,11 @@ async fn add(
             std::env::consts::ARCH
         ),
     }
+    if probe.os == "Darwin" {
+        for l in mac_needs(name, &hub.version) {
+            outln!("{l}");
+        }
+    }
     outln!(
         "- The hub connects to the box over ssh and starts a twr box daemon there, which runs \
          the box's threads and keeps them running while the hub is away."
@@ -795,6 +855,36 @@ async fn add(
     Ok(())
 }
 
+/// What `twr box add` says a Mac (box `name`) needs, the hub running twr `version`: someone
+/// logged in at its screen (the box daemon runs in that GUI session, where Claude Code can
+/// read its keychain login), a twr build of the hub's commit for macOS, and the agents logged
+/// in at the Mac itself.
+fn mac_needs(name: &str, version: &str) -> Vec<String> {
+    let build = match dev_commit(version) {
+        Some(commit) => format!(
+            "  - a twr build of the hub's commit ({commit}) for macOS: the hub runs a development \
+             build, so build it on the Mac (docs/tools/dev-install.sh in a checkout of that \
+             commit), then `twr box install {name} --from-box <its absolute path on the Mac>`;"
+        ),
+        None => format!(
+            "  - a twr build for macOS: `twr box install {name}` downloads release v{version}'s \
+             for the Mac and installs it there;"
+        ),
+    };
+    vec![
+        "- The box is a Mac. It needs:".to_string(),
+        "  - someone logged in at the Mac's screen: the box daemon runs as a launchd job in \
+         that GUI session, where Claude Code can read its keychain login (from ssh alone it \
+         can't). Turn on automatic login if the Mac may restart with no one there;"
+            .to_string(),
+        build,
+        format!(
+            "  - its agents logged in at the Mac itself (Claude Code keeps its login in the \
+             keychain); `twr box doctor {name}` checks all of this once the box is added."
+        ),
+    ]
+}
+
 /// What `twr box add` says of the projects configured for box `name` (`[projects.<p>] box`):
 /// how to find each on the box and record where it is.
 fn project_hints(config: &Config, name: &str) {
@@ -835,9 +925,10 @@ enum Online {
 /// just asked to try again, so a `needs_install` counts only once it has shown another state
 /// or after [`STALE_NEEDS_INSTALL`]. `want`: the build just installed, which the box must run
 /// (`running_build`) to count as online; while it runs another one (`switch_pending`, then
-/// `switching`, as the hub switches it once quiet) the wait goes on, at most [`SWITCH_WAIT`].
-/// An error on timeout or when the hub's box key is unusable (state `error`), after printing
-/// the state, the last error and the notes.
+/// `switching`, as the hub switches it once quiet) the wait goes on, at most [`SWITCH_WAIT`],
+/// printing the box's notes that come meanwhile (the relay's, as it stops and starts the
+/// daemon). An error on timeout or when the hub's box key is unusable (state `error`), after
+/// printing the state, the last error and the notes.
 async fn wait_online(
     c: &mut Client,
     name: &str,
@@ -854,11 +945,22 @@ async fn wait_online(
     let mut shown_error: Option<String> = None;
     let mut shown_running: Option<String> = None;
     let mut moved = !after_install;
+    // (The notes until the first look: only those that follow are news.)
+    let mut notes: Option<Vec<String>> = None;
     let last = loop {
         let info = c.call("hub.info", Value::Null).await?;
         let Some(b) = find_box(&info, name).cloned() else {
             bail!("the hub has no box {name}");
         };
+        if want.is_some() {
+            let now = notes_of(&b);
+            if let Some(before) = &notes {
+                for n in new_notes(before, &now) {
+                    outln!("  {n}");
+                }
+            }
+            notes = Some(now);
+        }
         let state = str_of(&b["state"]).to_string();
         if state != shown_state {
             outln!("box {name}: {state}");
@@ -1113,6 +1215,14 @@ fn status_text(b: &Value) -> String {
     if let Some(oa) = os_arch(b) {
         line("os/arch:", &oa);
     }
+    // (Only while the box is connected is it its daemon's word: the verdict says so.)
+    if b["launch"].is_string() {
+        let (_, said, fix) = doctor::launch_verdict(str_of(&b["name"]), b, b["os"] == "Darwin");
+        match fix {
+            Some(fix) => line("launch:", &format!("{said}: {fix}")),
+            None => line("launch:", &said),
+        }
+    }
     if let Some(e) = b["last_error"].as_str() {
         line("last error:", e);
     }
@@ -1145,13 +1255,21 @@ fn status_text(b: &Value) -> String {
     out
 }
 
+/// What `twr box install` installs on a box of another OS or CPU, when not the release's.
+enum InstallFrom {
+    /// A file here, uploaded (`--binary`).
+    Binary(PathBuf),
+    /// A file on the box, by its absolute path there (`--from-box`).
+    Box(String),
+}
+
 /// `twr box install` (see [`BoxCmd::Install`]).
 async fn install(
     config: &Config,
     paths: &Paths,
     socket: &Path,
     name: &str,
-    binary: Option<&Path>,
+    from: Option<InstallFrom>,
     yes: bool,
 ) -> anyhow::Result<()> {
     refuse_agent_action("install twr on boxes")?;
@@ -1175,17 +1293,25 @@ async fn install(
         );
     }
     let ssh = cfg.ssh.clone().unwrap_or_default();
-    if let Some(b) = binary {
+    match &from {
         // Read now: a path that is wrong fails before any ssh.
-        std::fs::metadata(b).with_context(|| format!("reading {}", b.display()))?;
+        Some(InstallFrom::Binary(b)) => {
+            std::fs::metadata(b).with_context(|| format!("reading {}", b.display()))?;
+        }
+        Some(InstallFrom::Box(p)) => check_box_path(name, p)?,
+        None => {}
     }
     let (probe, data) = probe(name, &ssh).await?;
     if same_target(&probe) {
-        if binary.is_some() {
+        if let Some(f) = &from {
             bail!(
                 "box {name} is {} like the hub: the hub runs its own build there, and installs \
-                 it itself (run `twr box install {name}` without --binary)",
-                target_label(&probe)
+                 it itself (run `twr box install {name}` without {})",
+                target_label(&probe),
+                match f {
+                    InstallFrom::Binary(_) => "--binary",
+                    InstallFrom::Box(_) => "--from-box",
+                }
             );
         }
         outln!("box {name} has the hub's OS and CPU: the hub installs its own build there");
@@ -1219,9 +1345,15 @@ async fn install(
         );
     }
     let reference = hub_reference(paths, name)?;
-    let id = match binary {
-        Some(path) => {
+    let id = match &from {
+        Some(InstallFrom::Binary(path)) => {
             install_binary(name, &ssh, &data, path, &hub, consent, reference.as_deref()).await?
+        }
+        Some(InstallFrom::Box(path)) => {
+            if let Some(why) = home_here(path, &data) {
+                errln!("twr: warning: {why}");
+            }
+            install_from_box(name, &ssh, &data, path, &hub, consent, reference.as_deref()).await?
         }
         None => {
             install_release(
@@ -1360,6 +1492,216 @@ async fn reconnect(
     }
 }
 
+/// `twr box restart` (see [`BoxCmd::Restart`]): asks first, then `box.restart` (starting the
+/// hub when none runs), and waits for the box to come back on a newer connection
+/// ([`restarted`]), saying how its new daemon was started.
+async fn restart(
+    config: &Config,
+    paths: &Paths,
+    socket: &Path,
+    name: &str,
+    yes: bool,
+) -> anyhow::Result<()> {
+    refuse_agent_action("restart box daemons")?;
+    default_workspace_only(paths, "restart")?;
+    twr_core::runner::validate_box_name(name)?;
+    let Some(cfg) = config.boxes.get(name) else {
+        bail!("there is no box {name} in config.toml or boxes.toml (`twr box list` lists them)");
+    };
+    if cfg.transport() != BoxTransport::Ssh {
+        bail!(
+            "box {name} is a token box: its runner connects to the hub; restart that `twr \
+             runner` on the box yourself"
+        );
+    }
+    let mut ask = ask_on_stderr;
+    let consent = consent(yes, &mut ask);
+    if matches!(consent, Consent::NoTerminal) {
+        bail!(
+            "not restarting box {name}'s daemon without confirmation (no terminal to ask on): \
+             pass --yes"
+        );
+    }
+    outln!(
+        "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
+         threads' runtimes end as when a box's runner restarts: each such thread shows a crash, \
+         a turn running then is cut short, and the thread's next prompt resumes its session."
+    );
+    if !confirm(
+        consent,
+        &format!("Restart box {name}'s daemon? [y/N] "),
+        &format!("not restarting box {name}'s daemon without confirmation"),
+    )? {
+        outln!("box {name} not restarted");
+        return Ok(());
+    }
+    wait_for_hub(socket, paths).await?;
+    let mut c = connect(socket).await?;
+    // (The notes until now: only those that follow are news.)
+    let info = c.call("hub.info", Value::Null).await?;
+    let before = find_box(&info, name);
+    let watch = RestartWait::new(before);
+    let before = before.map(notes_of).unwrap_or_default();
+    let asked = c.call("box.restart", json!({ "box": name })).await;
+    let replaced = match asked {
+        Ok(v) => v["epoch"].as_u64(),
+        Err(e) => {
+            let not_found = e
+                .downcast_ref::<RpcError>()
+                .is_some_and(|r| r.code == codes::NOT_FOUND);
+            if not_found {
+                bail!(
+                    "the running hub has no box {name}: add it with `twr box add`, or restart \
+                     the hub (`twr hub stop`, then `twr`)"
+                );
+            }
+            return Err(e);
+        }
+    };
+    outln!(
+        "restarting box {name}'s daemon: the hub connects again, and the relay on the box stops \
+         the daemon (a repository change it runs is finished first: up to {} s) and starts a new \
+         one. Waiting up to {} minutes; the box's notes follow.",
+        twr_runner::relay::STOP_TIMEOUT.as_secs(),
+        RESTART_WAIT.as_secs().div_ceil(60)
+    );
+    let b = wait_restarted(&mut c, name, replaced, before, watch).await?;
+    let version = b["version"].as_str().unwrap_or("of an unknown version");
+    outln!("box {name} is back online with a new daemon: twr {version}");
+    let (_, said, fix) = doctor::launch_verdict(name, &b, b["os"] == "Darwin");
+    match fix {
+        Some(fix) => outln!("{said}: {fix}"),
+        None => outln!("{said}"),
+    }
+    Ok(())
+}
+
+/// Whether box entry `b` of `hub.info` is online on a connection made after a restart asked
+/// for while connection `replaced` was up (`None`: none was): none pending, a newer epoch.
+fn restarted(b: &Value, replaced: Option<u64>) -> bool {
+    b["state"] == "online"
+        && b["restart_pending"] != true
+        && b["epoch"]
+            .as_u64()
+            .is_some_and(|e| replaced.is_none_or(|r| e > r))
+}
+
+/// Whether the `error` or `needs_install` that `twr box restart` sees is the outcome of the
+/// restart it asked for, not the state from before it (a box repaired since, say, which the
+/// restart is to bring back): only once the hub has shown another state since the request
+/// (it wakes the supervisor, whose attempt is `connecting` first), or another last error than
+/// the one before it, or after [`STALE_NEEDS_INSTALL`] (an attempt that failed between two
+/// looks).
+struct RestartWait {
+    /// The box's last error before the request.
+    error_before: Option<String>,
+    /// The hub has shown that it went on since the request.
+    moved: bool,
+}
+
+impl RestartWait {
+    /// Before a restart is asked for, with box entry `before` of `hub.info` (`None`: the hub
+    /// has none).
+    fn new(before: Option<&Value>) -> RestartWait {
+        RestartWait {
+            error_before: before.and_then(|b| b["last_error"].as_str().map(str::to_string)),
+            moved: false,
+        }
+    }
+
+    /// Whether box entry `b`, seen `elapsed` after the restart was asked for, ends the wait
+    /// with a failure: it is `error` or `needs_install`, as the outcome of the restart.
+    fn failed(&mut self, b: &Value, elapsed: Duration) -> bool {
+        let failure = matches!(str_of(&b["state"]), "error" | "needs_install");
+        self.moved |= !failure || b["last_error"].as_str() != self.error_before.as_deref();
+        failure && (self.moved || elapsed >= STALE_NEEDS_INSTALL)
+    }
+}
+
+/// The notes of box entry `b` of `hub.info`, oldest first.
+fn notes_of(b: &Value) -> Vec<String> {
+    b["notes"]
+        .as_array()
+        .map(|n| n.iter().map(|n| str_of(n).to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Of a box's notes `now`, those that came after `before` (the notes when last looked at):
+/// the hub keeps only the latest, so `now` starts with the end of `before` (as much of it as
+/// is still kept), and what follows that is new. All of `now` when nothing of `before` is left.
+fn new_notes<'a>(before: &[String], now: &'a [String]) -> &'a [String] {
+    let kept = (0..=before.len().min(now.len()))
+        .rev()
+        .find(|&k| before[before.len() - k..] == now[..k])
+        .unwrap_or(0);
+    &now[kept..]
+}
+
+/// Waits for box `name` to be [`restarted`] (at most [`RESTART_WAIT`], looking every
+/// [`ONLINE_POLL`]), printing each new state and last error once, and the box's notes that
+/// follow `notes` (those of the relay as it stops and starts the daemon): its entry. An error
+/// on timeout, when the hub cannot connect to it (`error`) or it needs a twr build
+/// (`needs_install`) as the outcome of the restart (`watch`), after printing the state, the
+/// last error and the notes.
+async fn wait_restarted(
+    c: &mut Client,
+    name: &str,
+    replaced: Option<u64>,
+    mut notes: Vec<String>,
+    mut watch: RestartWait,
+) -> anyhow::Result<Value> {
+    let start = tokio::time::Instant::now();
+    let mut shown_state = String::new();
+    let mut shown_error: Option<String> = None;
+    let last = loop {
+        let info = c.call("hub.info", Value::Null).await?;
+        let Some(b) = find_box(&info, name).cloned() else {
+            bail!("the hub has no box {name}");
+        };
+        let now = notes_of(&b);
+        for n in new_notes(&notes, &now) {
+            outln!("  {n}");
+        }
+        notes = now;
+        if restarted(&b, replaced) {
+            return Ok(b);
+        }
+        // (Still on the connection being replaced: not news.)
+        let state = match str_of(&b["state"]) {
+            "online" => "restarting",
+            s => s,
+        }
+        .to_string();
+        if state != shown_state {
+            outln!("box {name}: {state}");
+            shown_state = state.clone();
+        }
+        let error = b["last_error"].as_str().map(str::to_string);
+        if error.is_some() && error != shown_error {
+            outln!("  last error: {}", error.as_deref().unwrap_or_default());
+            shown_error = error;
+        }
+        if watch.failed(&b, start.elapsed()) {
+            print_reason(&b);
+            if state == "needs_install" {
+                bail!("box {name} needs a twr build: `twr box install {name}`");
+            }
+            bail!("the hub cannot connect to box {name}");
+        }
+        if start.elapsed() >= RESTART_WAIT {
+            break b;
+        }
+        tokio::time::sleep(ONLINE_POLL).await;
+    };
+    print_reason(&last);
+    bail!(
+        "box {name} is not back online after {} s (it is {}); `twr box status {name}` shows how \
+         it goes",
+        RESTART_WAIT.as_secs(),
+        str_of(&last["state"])
+    )
+}
+
 /// The hub's builds reference for box `name` ([`ssh_box::ref_name`]), when the hub has its box
 /// key: an install adds the build to it, so that no hub's prune removes the build before this
 /// hub runs it (a switch may wait for the box to be quiet).
@@ -1411,6 +1753,103 @@ async fn install_binary(
     let (code, out) = ssh_here(ssh, &ssh_box::sh_c(&script), Some(path)).await?;
     let (answer, version) = ssh_box::upload_answer(&out);
     upload_result(name, code, answer.as_deref())?;
+    version_note(name, version.as_deref(), hub);
+    Ok(Some(id))
+}
+
+/// Refuses `--from-box` path `path` for box `name` unless it is absolute, printable and on one
+/// line: the box's script quotes it, and the user reads it back.
+fn check_box_path(name: &str, path: &str) -> anyhow::Result<()> {
+    if path.chars().any(char::is_control) {
+        bail!("--from-box: the path holds a control character");
+    }
+    if !path.starts_with('/') {
+        bail!(
+            "--from-box {path:?}: give the twr executable's absolute path on box {name}: on the \
+             box, `command -v twr` prints it (or `echo ~/.local/bin/twr`, for the one \
+             docs/tools/dev-install.sh installs)"
+        );
+    }
+    Ok(())
+}
+
+/// Why `--from-box` path `path` may be a path of this machine rather than of the box, whose
+/// data directory is `data`: it is under this machine's home (a `~` the shell expanded here,
+/// say) and the box's data directory is not.
+fn home_here(path: &str, data: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok().filter(|h| h.starts_with('/'))?;
+    let home = format!("{}/", home.trim_end_matches('/'));
+    (path.starts_with(&home) && !data.starts_with(&home)).then(|| {
+        format!(
+            "{path} is under your home here ({home}), which is not the box's: a `~` you typed \
+             was expanded by your shell here. Give the box's absolute path: on the box, \
+             `command -v twr` prints it (or `echo ~/.local/bin/twr`)"
+        )
+    })
+}
+
+/// Copies the twr executable at `path` on box `name` into its builds directory under `data`
+/// ([`ssh_box::from_box_install_script`]: the same checks as an upload, its SHA-256 and size
+/// compared with the copy's) and returns its build id, once the user agreed (`consent`);
+/// `None` when they did not. Its version is shown, and compared with the hub's (`hub`). The
+/// build is added to the hub's builds reference `reference` ([`hub_reference`]).
+#[allow(clippy::too_many_arguments)]
+async fn install_from_box(
+    name: &str,
+    ssh: &str,
+    data: &str,
+    path: &str,
+    hub: &HubBuild,
+    consent: Consent<'_>,
+    reference: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    outln!(
+        "{path} on box {name} is copied to {}/<its build id>/twr, checked, and the hub runs it \
+         there",
+        ssh_box::builds_dir(data)
+    );
+    if !confirm(
+        consent,
+        &format!("Install it on box {name}? [y/N] "),
+        &format!("not installing twr on box {name} without confirmation"),
+    )? {
+        return Ok(None);
+    }
+    let mut script = ssh_box::from_box_install_script(data, path, &upload_tag()?);
+    if let Some(r) = reference {
+        // (Run only once the script got to its end: `$id` is what it installed.)
+        script.push_str(&ssh_box::install_ref_script(data, r, "\"$id\""));
+    }
+    let (code, out) = ssh_here(ssh, &ssh_box::sh_c(&script), None).await?;
+    let (answer, version) = ssh_box::upload_answer(&out);
+    match (code, answer.as_deref()) {
+        (Some(0), Some(a)) if a.starts_with("ok ") => {}
+        (Some(ssh_box::UPLOAD_MISMATCH), Some(why)) => {
+            bail!("box {name} refused to install {path}: {why}; nothing was installed")
+        }
+        (code, _) => {
+            let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
+            bail!("installing {path} on box {name} failed ({code}): see ssh's message above")
+        }
+    }
+    let id = answer
+        .as_deref()
+        .and_then(|a| a.strip_prefix("ok "))
+        .filter(|id| twr_core::valid_build_id(id))
+        .ok_or_else(|| anyhow!("box {name} did not say which build it installed"))?
+        .to_string();
+    outln!(
+        "installed build {id} on box {name}, at {}",
+        ssh_box::build_path(data, &id)
+    );
+    version_note(name, version.as_deref(), hub);
+    Ok(Some(id))
+}
+
+/// What `twr box install` says of the version a build installed on box `name` gave
+/// (`version`), against the hub's (`hub`): the box connects only if both speak the same
+/// runner protocol, which the handshake decides.
+fn version_note(name: &str, version: Option<&str>, hub: &HubBuild) {
     let want = format!("twr {}", hub.version);
     match version {
         Some(v) if v == want => outln!("box {name} runs it as {v}"),
@@ -1423,7 +1862,6 @@ async fn install_binary(
         }
         None => {}
     }
-    Ok(Some(id))
 }
 
 /// Downloads the release archive of the hub's version for `target`, verified, uploads it to
@@ -1531,17 +1969,19 @@ fn dev_refusal(name: &str, version: &str, commit: &str, target: &str) -> String 
     let how = if target.ends_with("-linux-musl") {
         format!(
             "in a checkout of that commit, `TWR_BUILD={commit} cargo zigbuild --release \
-             --locked -p twr-cli --target {target}` builds it (target/{target}/release/twr)"
+             --locked -p twr-cli --target {target}` builds it (target/{target}/release/twr); \
+             then run `twr box install {name} --binary <path>`"
         )
     } else {
-        "on the Mac, build it from that commit with docs/tools/dev-install.sh and copy the twr \
-         binary here"
-            .to_string()
+        format!(
+            "on the Mac, in a checkout of that commit, docs/tools/dev-install.sh builds it and \
+             installs it as ~/.local/bin/twr; then run `twr box install {name} --from-box \
+             <its absolute path on the Mac>`"
+        )
     };
     format!(
         "the hub runs a development build (twr {version}), which has no release to download for \
-         box {name} ({target}). Build twr of the same commit for {target}: {how}; then run `twr \
-         box install {name} --binary <path>`"
+         box {name} ({target}). Build twr of the same commit for {target}: {how}"
     )
 }
 
@@ -1739,6 +2179,7 @@ mod tests {
             "aarch64-apple-darwin",
         );
         assert!(mac.contains("docs/tools/dev-install.sh"), "{mac}");
+        assert!(mac.contains("`twr box install mac --from-box "), "{mac}");
     }
 
     #[test]
@@ -1780,6 +2221,38 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("os/arch:        linux/x86_64\n"), "{s}");
+        assert!(!s.contains("launch:"), "{s}");
+        // How the daemon was started, as it says.
+        let mut systemd = ssh.clone();
+        systemd["launch"] = json!("systemd twr-box-0123-abcd.service");
+        assert!(
+            status_text(&systemd).contains(
+                "launch:         the box daemon runs as the systemd user service \
+                 twr-box-0123-abcd.service\n"
+            ),
+            "{}",
+            status_text(&systemd)
+        );
+        let mut mac = ssh.clone();
+        mac["os"] = json!("Darwin");
+        mac["launch"] = json!("detached");
+        let m = status_text(&mac);
+        assert!(
+            m.contains(
+                "launch:         the daemon runs from ssh, so Claude Code can't read its keychain \
+                 login: log in at the Mac's screen (or turn on automatic login), then `twr box \
+                 restart gpu`\n"
+            ),
+            "{m}"
+        );
+        // Offline: what the last daemon said is no longer known to be so.
+        let mut gone = mac.clone();
+        gone["state"] = json!("offline");
+        let g = status_text(&gone);
+        assert!(
+            g.contains("launch:         not known: the box is not connected (it is offline)\n"),
+            "{g}"
+        );
         assert!(
             s.contains(
                 "agents:         (as the box last reported them)\n  \
@@ -1995,5 +2468,148 @@ mod tests {
         assert!(format!("{e:#}").contains("needs `ssh`"), "{e:#}");
         let merged = Config::load_with_boxes(&config).unwrap();
         assert_eq!(merged.boxes["gpu"].ssh.as_deref(), Some("me@gpu"));
+    }
+
+    /// The notes printed while a restart is waited for are those that came since the last
+    /// look, the hub keeping only the latest; and the restart's wait (and an install's for a
+    /// switch) covers an attempt under way when it asks, then the one that does what it asked:
+    /// each a probe, an upload and the hub's deadline for a replacing channel (the relay's
+    /// whole stop and start), and the WebSocket's handshake; the switch's quiet and drain
+    /// besides.
+    #[test]
+    fn a_restart_prints_the_new_notes_and_waits_long_enough() {
+        let v = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(new_notes(&v(&["a", "b"]), &v(&["a", "b", "c"])), v(&["c"]));
+        assert_eq!(
+            new_notes(&v(&["a", "b", "c"]), &v(&["b", "c", "d"])),
+            v(&["d"])
+        );
+        assert!(new_notes(&v(&["a", "b"]), &v(&["a", "b"])).is_empty());
+        assert_eq!(new_notes(&v(&["a"]), &v(&["x", "y"])), v(&["x", "y"]));
+        assert_eq!(new_notes(&[], &v(&["x"])), v(&["x"]));
+        assert_eq!(new_notes(&v(&["w", "w"]), &v(&["w", "w", "w"])), v(&["w"]));
+        let attempt = ssh_box::PROBE_TIMEOUT
+            + ssh_box::UPLOAD_TIMEOUT
+            + ssh_box::REPLACE_OPEN_TIMEOUT
+            + ssh_box::WS_TIMEOUT;
+        assert_eq!(ssh_box::ATTEMPT_WORST, attempt);
+        assert!(ssh_box::REPLACE_OPEN_TIMEOUT >= ssh_box::PLAIN_OPEN_TIMEOUT);
+        assert!(RESTART_WAIT >= 2 * attempt);
+        assert!(RESTART_WAIT > 4 * twr_runner::relay::STOP_TIMEOUT);
+        assert!(
+            SWITCH_WAIT
+                >= 2 * attempt
+                    + ssh_box::SWITCH_QUIET
+                    + ssh_box::SWITCH_CHECK
+                    + ssh_box::SWITCH_DRAIN
+        );
+        // What the help and the docs say: about an hour and twenty minutes, and an hour and a
+        // half at most.
+        assert_eq!(RESTART_WAIT.as_secs().div_ceil(60), 81);
+        assert_eq!(SWITCH_WAIT.as_secs().div_ceil(60), 86);
+    }
+
+    /// A restart is over once the box is online on a newer connection with none pending.
+    #[test]
+    fn a_restart_is_over_on_a_newer_connection() {
+        let b = |state: &str, epoch: Option<u64>, pending: bool| json!({"state": state, "epoch": epoch, "restart_pending": pending});
+        assert!(restarted(&b("online", Some(4), false), Some(3)));
+        assert!(!restarted(&b("online", Some(3), false), Some(3)));
+        assert!(!restarted(&b("online", Some(4), true), Some(3)));
+        assert!(!restarted(&b("offline", None, false), Some(3)));
+        assert!(!restarted(&b("connecting", Some(4), false), Some(3)));
+        // None was up when it was asked for: any connection that carried it out.
+        assert!(restarted(&b("online", Some(1), false), None));
+        assert!(!restarted(&b("online", Some(1), true), None));
+    }
+
+    /// Restarting a box repaired since it failed: the `error` or `needs_install` from before
+    /// the request does not end the wait, until the hub has gone on (another state, another
+    /// last error) or for longer than a stale state lasts; one the restart's attempt ends in
+    /// does.
+    #[test]
+    fn a_restart_fails_only_on_its_own_attempt() {
+        let b = |state: &str, error: &str| json!({"state": state, "last_error": error});
+        let soon = Duration::from_millis(500);
+        for state in ["error", "needs_install"] {
+            // The state from before, then the restart's attempt, which fails again.
+            let before = b(state, "the old reason");
+            let mut w = RestartWait::new(Some(&before));
+            assert!(!w.failed(&before, Duration::ZERO), "{state}");
+            assert!(!w.failed(&before, soon), "{state}");
+            assert!(
+                !w.failed(&b("connecting", "the old reason"), soon),
+                "{state}"
+            );
+            assert!(w.failed(&b(state, "the old reason"), soon), "{state}");
+            // Repaired: the attempt is connecting, then online (not a failure).
+            let mut w = RestartWait::new(Some(&before));
+            assert!(!w.failed(&before, Duration::ZERO), "{state}");
+            assert!(
+                !w.failed(&b("connecting", "the old reason"), soon),
+                "{state}"
+            );
+            assert!(!w.failed(&b("online", "the old reason"), soon), "{state}");
+            // An attempt that failed between two looks, for another reason.
+            let mut w = RestartWait::new(Some(&before));
+            assert!(w.failed(&b(state, "a new reason"), soon), "{state}");
+            // For the same one: once the state from before would have changed.
+            let mut w = RestartWait::new(Some(&before));
+            assert!(!w.failed(&before, soon), "{state}");
+            assert!(w.failed(&before, STALE_NEEDS_INSTALL), "{state}");
+        }
+        // Online when asked for: a failure after that is the restart's.
+        let mut w = RestartWait::new(Some(&json!({"state": "online", "last_error": null})));
+        assert!(!w.failed(&json!({"state": "online", "last_error": null}), soon));
+        assert!(w.failed(&b("error", "ssh failed"), soon));
+    }
+
+    /// What `twr box add` says a Mac needs, for a release hub and a development one.
+    #[test]
+    fn a_mac_box_is_told_what_it_needs() {
+        let release = mac_needs("mac", "0.2.0").join("\n");
+        assert!(
+            release.contains("logged in at the Mac's screen"),
+            "{release}"
+        );
+        assert!(release.contains("automatic login"), "{release}");
+        assert!(
+            release.contains("`twr box install mac` downloads release v0.2.0's"),
+            "{release}"
+        );
+        assert!(release.contains("logged in at the Mac itself"), "{release}");
+        let dev = mac_needs("mac", "0.2.0+dev.abc1234").join("\n");
+        assert!(dev.contains("docs/tools/dev-install.sh"), "{dev}");
+        assert!(dev.contains("`twr box install mac --from-box "), "{dev}");
+        assert!(dev.contains("(abc1234)"), "{dev}");
+    }
+
+    /// `--from-box` takes an absolute path of the box's, and warns about one under this
+    /// machine's home (a `~` the shell expanded here).
+    #[test]
+    fn from_box_paths_are_the_boxs() {
+        assert!(check_box_path("mac", "/Users/me/.local/bin/twr").is_ok());
+        let e = check_box_path("mac", "~/.local/bin/twr").unwrap_err();
+        assert!(
+            format!("{e:#}").contains("absolute path on box mac")
+                && format!("{e:#}").contains("on the box, `command -v twr` prints it"),
+            "{e:#}"
+        );
+        assert!(check_box_path("mac", "/a\nb").is_err());
+        let home = std::env::var("HOME").unwrap();
+        let here = format!("{}/.local/bin/twr", home.trim_end_matches('/'));
+        let w = home_here(&here, "/Users/someone/.local/share").unwrap();
+        assert!(
+            w.contains("expanded by your shell here")
+                && w.contains("`command -v twr` prints it")
+                && !w.contains("quote"),
+            "{w}"
+        );
+        assert_eq!(
+            home_here(&here, &format!("{home}/.local/share")),
+            None,
+            "the box shares this home"
+        );
+        assert_eq!(home_here("/opt/twr", "/Users/someone/.local/share"), None);
     }
 }

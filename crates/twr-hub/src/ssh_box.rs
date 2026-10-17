@@ -31,9 +31,14 @@
 //!    [--replace]` ([`connect_command`]): the relay on the box, which starts the box daemon if
 //!    none runs. Its stderr lines are the box's `notes` (the latest [`NOTES_KEPT`]; the newest
 //!    that reads like an error is its `last_error`). The hub opens the sealed channel over the
-//!    child's stdout and stdin ([`twr_core::sealed::hub_side`], [`OPEN_TIMEOUT`], which covers
-//!    starting the daemon), accepts a WebSocket inside it with the small pre-authentication
-//!    limits, and serves it as the box's runner connection (`Hub::serve_sealed_runner`).
+//!    child's stdout and stdin ([`twr_core::sealed::hub_side`], within [`open_timeout`]:
+//!    [`OPEN_TIMEOUT`] for ssh and the key exchange, and the longest the relay may take before
+//!    it relays, which may include waiting for another relay's start and starting the daemon,
+//!    [`PLAIN_OPEN_TIMEOUT`], and stopping the old one too when the attempt replaces or
+//!    restarts it, [`REPLACE_OPEN_TIMEOUT`]; the relay's notes say what it waits for
+//!    meanwhile), accepts a WebSocket inside it
+//!    with the small pre-authentication limits, and serves it as the box's runner connection
+//!    (`Hub::serve_sealed_runner`).
 //! 5. When the session ends: the ssh child is killed (its whole process group), and the next
 //!    attempt follows a backoff ([`backoff_delay`]: 1 s doubling, at most 5 s apart during the
 //!    first minute of an outage, then at most 30 s; reset by a welcomed session, as a token
@@ -90,6 +95,20 @@
 //! runtimes' exits close their threads as plainly stopped (no crash card; their queues are
 //! kept and dispatched), and the new hub's supervisor finds the box `switch_pending` again.
 //!
+//! **Restarting the daemon** (`box.restart`, `twr box restart`: after someone logged in at a
+//! Mac's screen, say, so that a new daemon starts in the GUI session): the hub asks for a
+//! restart ([`SshBox::request_restart`], counted) and wakes the supervisor. A welcomed session
+//! that sees a restart asked for and not carried out ends (`Hub::end_box_session`: the box is
+//! offline meanwhile, and its operations get `box_offline`), and the next attempt goes at once
+//! with `--restart` ([`Dial::restart`]): the relay stops whatever daemon answers for this hub
+//! key, whatever its build, and starts a new one under its start lock. Once the channel to the
+//! new daemon is open, the restarts asked for until that attempt began are carried out; one
+//! asked for during it is carried out by the next. Nothing races the supervisor: the restart
+//! is its own next connection. The daemon's runtimes end with it, as with any runner restart:
+//! the reconciliation of the next connection closes the threads whose runtime is gone as
+//! crashed (`hub::runners`), and each one's next prompt resumes its session. `hub.info` shows the box's `restart_pending` until then, and its
+//! connection's `epoch`, which the next connection makes larger.
+//!
 //! **ssh** ([`ssh_args`]): `TWR_SSH`, else `ssh` on `PATH`, with the hub's environment (its
 //! `SSH_AUTH_SOCK` among it), never prompting (`BatchMode=yes`), with forwarding of every kind
 //! and local commands turned off so that the user's `~/.ssh/config` cannot add any
@@ -113,7 +132,7 @@
 //! **Tests** dial a box through [`HubOptions::box_dialer`](crate::HubOptions::box_dialer)
 //! instead of ssh: no probe, upload or relay; the dialer gives the stream to the daemon and the
 //! build the hub is to take for the one it launched (so a test makes a daemon "of another
-//! build"), and is told whether the attempt replaces the daemon.
+//! build"), and is told whether the attempt replaces or restarts the daemon ([`Dial`]).
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
@@ -141,9 +160,50 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long an upload of the hub's executable may take, its checks included.
 pub const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// How long the box may take to open the sealed channel once ssh runs: connecting, starting
-/// the daemon when none runs (the relay waits up to 15 s for it) and the key exchange.
+/// How long ssh and the key exchange may take to open the sealed channel, beside what the
+/// relay on the box does before it relays (the daemon's start: [`open_timeout`] adds the
+/// longest that takes).
 pub const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long the box may take to open the sealed channel of an ordinary attempt (neither
+/// `--replace` nor `--restart`): [`OPEN_TIMEOUT`] and the longest such a relay takes before it
+/// relays ([`twr_runner::relay::PLAIN_START_WORST`]: another relay's start it waits for, a
+/// daemon shutting down it waits for, its own start of one, launchd's calls on a Mac included;
+/// the relay's notes say how it goes meanwhile).
+pub const PLAIN_OPEN_TIMEOUT: Duration =
+    Duration::from_secs(OPEN_TIMEOUT.as_secs() + twr_runner::relay::PLAIN_START_WORST.as_secs());
+
+/// How long the box may take to open the sealed channel of an attempt that replaces or
+/// restarts its daemon (`--replace`, `--restart`): [`OPEN_TIMEOUT`] and the longest the relay
+/// takes before it relays ([`twr_runner::relay::START_WORST`]: another relay's start it waits
+/// for, then stopping the daemon, which finishes a repository change first, and starting one;
+/// the relay's notes say how it goes meanwhile). Giving up earlier would leave that relay
+/// stopping or starting the daemon while the next attempt's relay waits for it.
+pub const REPLACE_OPEN_TIMEOUT: Duration =
+    Duration::from_secs(OPEN_TIMEOUT.as_secs() + twr_runner::relay::START_WORST.as_secs());
+
+/// How long an attempt of kind `dial` may take to open the sealed channel:
+/// [`PLAIN_OPEN_TIMEOUT`], or [`REPLACE_OPEN_TIMEOUT`] when it replaces or restarts the
+/// daemon.
+pub fn open_timeout(dial: Dial) -> Duration {
+    if dial.replace || dial.restart {
+        REPLACE_OPEN_TIMEOUT
+    } else {
+        PLAIN_OPEN_TIMEOUT
+    }
+}
+
+/// The longest one attempt takes to bring a box online (`twr box restart` and `twr box
+/// install` wait for two: one under way when they ask, then the one that does what they
+/// asked): the probe ([`PROBE_TIMEOUT`]), an upload of the hub's build ([`UPLOAD_TIMEOUT`]),
+/// the channel of one that replaces or restarts the daemon ([`REPLACE_OPEN_TIMEOUT`], the
+/// longest), and the WebSocket's handshake ([`WS_TIMEOUT`]).
+pub const ATTEMPT_WORST: Duration = Duration::from_secs(
+    PROBE_TIMEOUT.as_secs()
+        + UPLOAD_TIMEOUT.as_secs()
+        + REPLACE_OPEN_TIMEOUT.as_secs()
+        + WS_TIMEOUT.as_secs(),
+);
 
 /// How long the WebSocket handshake inside the channel may take.
 pub const WS_TIMEOUT: Duration = Duration::from_secs(15);
@@ -222,11 +282,22 @@ pub trait BoxIo: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> BoxIo for T {}
 
+/// How an attempt has the relay treat the box's daemon: as it finds it (the default), replacing
+/// one of another build, or restarting whatever runs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dial {
+    /// Replace a daemon of another build than the one launched (`--replace`).
+    pub replace: bool,
+    /// Stop the daemon that answers, whatever its build, and start a new one (`--restart`,
+    /// `twr box restart`; it covers a replace).
+    pub restart: bool,
+}
+
 /// [`crate::HubOptions::box_dialer`] (tests): given the box's name and whether the attempt
-/// replaces its daemon (as `--replace` would), a stream to the daemon and the build the hub
-/// takes for the one it launched there.
+/// replaces or restarts its daemon ([`Dial`], as `--replace` and `--restart` would), a stream
+/// to the daemon and the build the hub takes for the one it launched there.
 pub type BoxDialer = Arc<
-    dyn Fn(String, bool) -> BoxFuture<'static, std::io::Result<(Box<dyn BoxIo>, String)>>
+    dyn Fn(String, Dial) -> BoxFuture<'static, std::io::Result<(Box<dyn BoxIo>, String)>>
         + Send
         + Sync,
 >;
@@ -321,7 +392,8 @@ fn ssh_args_with(options: &[&str], ssh: &str, remote: &str) -> Result<Vec<String
 
 /// A background ssh ([`ssh_args`]; an error when the box's words are refused) of
 /// [`ssh_program`]: no stdin, stdout and stderr piped, its own process group, the child killed
-/// when dropped (the hub's own ssh children also kill their group).
+/// when dropped (run through [`Ssh`], which kills the whole group instead, and nothing once
+/// something else reaped the child).
 pub fn ssh_command(ssh: &str, remote: &str) -> Result<Command, String> {
     let mut c = Command::new(ssh_program());
     c.args(ssh_args(ssh, remote)?)
@@ -339,23 +411,40 @@ pub fn sh_c(script: &str) -> String {
 }
 
 /// A spawned ssh ([`ssh_command`]: the leader of a process group of its own) whose whole
-/// process group is killed when it is dropped unreaped (the child itself with it:
-/// `kill_on_drop`), and when it ends ([`Ssh::finish`]).
+/// process group, the child with it, is killed when it is dropped unreaped, and when it ends
+/// ([`Ssh::finish`]). Not once something else reaped the child
+/// ([`twr_adapters::process::ownership_lost`]): its id may name another process or group by
+/// then, so nothing signals it again (the `Child`'s own `kill_on_drop`, which would, is
+/// turned off: the group's kill covers the child).
 pub struct Ssh {
     /// The ssh process.
     pub child: Child,
+    /// Whether the child is still this process's to signal (not reaped by something else).
+    owned: bool,
 }
 
 impl Ssh {
     /// Spawns `c`, which makes its child a process group's leader (`process_group(0)`).
     pub fn spawn(mut c: Command) -> std::io::Result<Ssh> {
-        Ok(Ssh { child: c.spawn()? })
+        c.kill_on_drop(false);
+        Ok(Ssh {
+            child: c.spawn()?,
+            owned: true,
+        })
     }
 
     /// Waits for ssh to end, kills what is left of its process group, then reaps it
-    /// ([`finish_group`]): its exit status.
+    /// ([`finish_group`]): its exit status. An error for which
+    /// [`twr_adapters::process::ownership_lost`] holds (something else reaped it) leaves its
+    /// id alone from then on, dropping included.
     pub async fn finish(&mut self) -> std::io::Result<std::process::ExitStatus> {
-        finish_group(&mut self.child).await
+        let r = finish_group(&mut self.child).await;
+        if let Err(e) = &r {
+            if twr_adapters::process::ownership_lost(e) {
+                self.owned = false;
+            }
+        }
+        r
     }
 }
 
@@ -367,7 +456,11 @@ pub use twr_adapters::process::finish_group;
 
 impl Drop for Ssh {
     fn drop(&mut self) {
-        // Only while the child is not reaped: its pid (its group's id) is still its own.
+        // Only while the child is not reaped (by this process or anything else): its pid (its
+        // group's id) is still its own.
+        if !self.owned {
+            return;
+        }
         if let Some(pid) = self.child.id() {
             // SAFETY: kill(2) with a negative pid signals that process group; no memory is
             // passed.
@@ -742,6 +835,57 @@ pub fn release_install_script(
     )
 }
 
+/// The script `twr box install --from-box` installs a twr executable already on the box with
+/// (built there with `docs/tools/dev-install.sh`, say): `src` must be an absolute path to a
+/// regular file (or a link to one); the builds tree must be safe to use ([`TREE_FNS`]); its
+/// SHA-256 (the box must have `sha256sum` or `shasum`) and size are read, and its build id is
+/// the head of that digest; it is copied into a temporary file in that build's directory
+/// (umask 077), whose size and SHA-256 must be the same (a file that changed meanwhile is
+/// refused), made executable (0700), its `--version` reported (`twr-upload: version <what it
+/// says>`: it must run and say `twr <something>`; the hub's protocol decides at the handshake
+/// whether it serves), and moved to `<builds>/<id>/twr`. Its last line is `twr-upload: ok
+/// <id>`, or `twr-upload: <what is wrong>` with exit status 3 (the temporary file removed).
+pub fn from_box_install_script(data: &str, src: &str, tag: &str) -> String {
+    let builds = sh_quote(&builds_dir(data));
+    let src = sh_quote(src);
+    let tmp = sh_quote(&format!(".twr.upload.{tag}"));
+    let len = twr_core::BUILD_ID_LEN;
+    let data = sh_quote(data);
+    format!(
+        "umask 077\n\
+         b={builds}\n\
+         s={src}\n\
+         t=\n\
+         {TREE_FNS}\
+         unsafe() {{ [ -z \"$t\" ] || rm -f -- \"$t\"; echo \"{UPLOAD_MARK}not safe to install into: $1 $2\"; exit {UPLOAD_MISMATCH}; }}\n\
+         bad() {{ [ -z \"$t\" ] || rm -f -- \"$t\"; echo \"{UPLOAD_MARK}$1\"; exit {UPLOAD_MISMATCH}; }}\n\
+         {DIGEST_FN}\
+         case $s in /*) ;; *) bad \"$s is not an absolute path\" ;; esac\n\
+         [ -f \"$s\" ] || bad \"$s is not a regular file on the box\"\n\
+         tree {data}\n\
+         digest \"$s\" \"$s\" || bad 'the box has neither sha256sum nor shasum to check it with'\n\
+         want=$h\n\
+         size=$(wc -c < \"$s\" | tr -d ' ')\n\
+         case $size in ''|*[!0-9]*) bad \"$s cannot be read\" ;; esac\n\
+         id=$(printf '%s' \"$want\" | cut -c1-{len})\n\
+         mkdir -p -- \"$b/$id\" || exit 1\n\
+         tree {data}\n\
+         owned \"$b/$id\" d\n\
+         t=\"$b/$id\"/{tmp}\n\
+         cp -- \"$s\" \"$t\" || bad \"$s cannot be copied\"\n\
+         got=$(wc -c < \"$t\" | tr -d ' ')\n\
+         [ \"$got\" = \"$size\" ] || bad \"the copy has $got bytes, not $size: $s changed meanwhile\"\n\
+         digest \"$t\" 'the copy' || bad 'the copy cannot be checked'\n\
+         [ \"$h\" = \"$want\" ] || bad \"the copy's SHA-256 is not that of $s: it changed meanwhile\"\n\
+         chmod 700 \"$t\" || bad 'it cannot be made executable'\n\
+         v=$(\"$t\" --version 2>&1 | head -n 1)\n\
+         case $v in 'twr '?*) ;; *) bad \"it does not run on the box: $v\" ;; esac\n\
+         echo \"{UPLOAD_MARK}version $v\"\n\
+         mv -f -- \"$t\" \"$b/$id/twr\" || bad 'it cannot be moved into place'\n\
+         echo \"{UPLOAD_MARK}ok $id\"\n"
+    )
+}
+
 /// The answer of an upload script ([`upload_script`], [`install_script`],
 /// [`release_install_script`]) in its output `out`: the text after the last `twr-upload: `
 /// mark, and the version it reported (`twr-upload: version <v>`), if any.
@@ -780,9 +924,10 @@ pub fn stop_script(id: &str, name: &str, hub_key: &str) -> Result<String, String
 
 /// The command that runs the relay of box `name` with build `id` under `data`:
 /// `exec '<build>' runner --stdio '--box=<name>' --hub-key '<hex>' '--build=<id>'
-/// [--replace]` (the name joined to its flag: never taken for an option; `--build` tells the
-/// relay its own build when it cannot read its executable).
-pub fn connect_command(data: &str, id: &str, name: &str, hub_key: &str, replace: bool) -> String {
+/// [--replace|--restart]` (the name joined to its flag: never taken for an option; `--build`
+/// tells the relay its own build when it cannot read its executable). A restart ([`Dial`])
+/// covers a replace, so it is the only flag then.
+pub fn connect_command(data: &str, id: &str, name: &str, hub_key: &str, dial: Dial) -> String {
     let mut c = format!(
         "exec {} runner --stdio {} --hub-key {} {}",
         sh_quote(&build_path(data, id)),
@@ -790,7 +935,9 @@ pub fn connect_command(data: &str, id: &str, name: &str, hub_key: &str, replace:
         sh_quote(hub_key),
         sh_quote(&format!("--build={id}")),
     );
-    if replace {
+    if dial.restart {
+        c.push_str(" --restart");
+    } else if dial.replace {
         c.push_str(" --replace");
     }
     c
@@ -1105,6 +1252,9 @@ pub struct Status {
     /// speaks the hub's protocol), or than the one `twr box install` recorded since: it is
     /// switched to that one once quiet (see the module docs).
     pub switch_pending: bool,
+    /// A restart of the box's daemon was asked for (`box.restart`) and no connection has
+    /// carried it out yet (see the module docs).
+    pub restart_pending: bool,
 }
 
 /// An SSH box the hub dials: its settings, its state, and its supervisor.
@@ -1126,6 +1276,10 @@ pub struct SshBox {
     /// to switch to. Not tried again while the box runs that build and the switch would be to
     /// that one (until the hub restarts).
     failed_switch: Mutex<Option<(Option<String>, String)>>,
+    /// How many restarts of the box's daemon were asked for (`box.restart`), and how many of
+    /// them a connection has carried out (see the module docs).
+    restarts: watch::Sender<u64>,
+    restarted: Mutex<u64>,
 }
 
 impl std::fmt::Debug for SshBox {
@@ -1146,6 +1300,8 @@ impl SshBox {
             task: Mutex::default(),
             switching_to: Mutex::default(),
             failed_switch: Mutex::default(),
+            restarts: watch::Sender::new(0),
+            restarted: Mutex::default(),
         }
     }
 
@@ -1160,7 +1316,41 @@ impl SshBox {
 
     /// The box's state now.
     pub fn status(&self) -> Status {
-        self.st().clone()
+        let mut st = self.st().clone();
+        st.restart_pending = self.restart_wanted().is_some();
+        st
+    }
+
+    /// Asks for a restart of the box's daemon (`box.restart`, see the module docs): a session
+    /// that is up ends, and the next attempt, at once, has the relay restart the daemon.
+    pub fn request_restart(&self) {
+        self.restarts.send_modify(|n| *n = n.saturating_add(1));
+        self.remark("restarting the box daemon (`twr box restart`)".into());
+        self.wake();
+    }
+
+    /// The restarts asked for so far, when a connection has not carried them all out.
+    fn restart_wanted(&self) -> Option<u64> {
+        let asked = *self.restarts.borrow();
+        (asked > self.restarts_done()).then_some(asked)
+    }
+
+    /// How many restarts a connection has carried out.
+    fn restarts_done(&self) -> u64 {
+        *self.restarted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A connection opened by an attempt that restarted the daemon (`--restart`) for the
+    /// first `asked` restarts asked for.
+    fn restarts_carried_out(&self, asked: u64) {
+        let mut done = self.restarted.lock().unwrap_or_else(|e| e.into_inner());
+        *done = (*done).max(asked);
+    }
+
+    /// Waits until a restart is asked for that no connection has carried out.
+    async fn restart_asked(&self) {
+        let mut asked = self.restarts.subscribe();
+        let _ = asked.wait_for(|n| *n > self.restarts_done()).await;
     }
 
     /// `[boxes.<name>] build` from now on (`box.install` read the files again: `twr box
@@ -1335,7 +1525,9 @@ async fn supervise(weak: WeakHub, rbox: RemoteBox, sbox: Arc<SshBox>) {
                 sbox.set_state(State::Offline);
                 replace = r;
                 refused_replaces = next_refused_replaces(refused_replaces, welcomed, r);
-                if replace_at_once(refused_replaces, r) {
+                // (A restart asked for goes at once too: the session it ended was welcomed,
+                // or the one that carried out the restarts asked for before it began.)
+                if replace_at_once(refused_replaces, r) || sbox.restart_wanted().is_some() {
                     Duration::ZERO
                 } else {
                     backoff.next()
@@ -1687,9 +1879,15 @@ async fn connect(
     replace: bool,
 ) -> Attempt {
     let name = rbox.name();
+    // The restarts asked for until now, which this attempt carries out ([`SshBox::restarts`]).
+    let restart = sbox.restart_wanted();
+    let dial = Dial {
+        replace,
+        restart: restart.is_some(),
+    };
     // (The relay adds its build to this hub's builds reference as it starts, and this hub's
     // prune after the welcome sets the whole reference: [`prune_script`].)
-    let remote = connect_command(data, id, name, &key.public_hex(), replace);
+    let remote = connect_command(data, id, name, &key.public_hex(), dial);
     let mut cmd = match ssh_command(&sbox.ssh, &remote) {
         Ok(c) => c,
         Err(why) => return Attempt::Failed(State::Offline, refused_words(sbox, &why)),
@@ -1722,6 +1920,8 @@ async fn connect(
         Some(data),
         id,
         follows_config,
+        restart,
+        open_timeout(dial),
         tokio::io::join(stdout, stdin),
     );
     tokio::pin!(session, reader);
@@ -1816,14 +2016,33 @@ async fn dialed(
     replace: bool,
 ) -> Attempt {
     let name = rbox.name();
-    let (io, id) = match dial(name.to_string(), replace).await {
+    let restart = sbox.restart_wanted();
+    let how = Dial {
+        replace,
+        restart: restart.is_some(),
+    };
+    let (io, id) = match dial(name.to_string(), how).await {
         Ok(d) => d,
         Err(e) => return Attempt::Failed(State::Offline, format!("dialing box {name}: {e}")),
     };
     sbox.st().build = Some(id.clone());
     // (The dialer's build stands for the configured one when the box has that one.)
     let follows_config = sbox.configured_build().as_deref() == Some(id.as_str());
-    match session(hub, rbox, sbox, key, None, &id, follows_config, io).await {
+    let within = open_timeout(how);
+    match session(
+        hub,
+        rbox,
+        sbox,
+        key,
+        None,
+        &id,
+        follows_config,
+        restart,
+        within,
+        io,
+    )
+    .await
+    {
         Ok((end, hello, switched)) => session_ended(name, &id, end, &hello, switched),
         Err(why) => Attempt::Failed(State::Offline, why),
     }
@@ -1865,12 +2084,36 @@ fn session_ended(
     Attempt::Session { welcomed, replace }
 }
 
+/// Opens the sealed channel over `io` with box `name`'s daemon (through its relay), giving up
+/// after `within` ([`open_timeout`]).
+async fn open_channel<IO>(
+    io: IO,
+    key: &HubKey,
+    name: &str,
+    within: Duration,
+) -> Result<(twr_core::sealed::SealedStream<IO>, DaemonHello), String>
+where
+    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match tokio::time::timeout(within, twr_core::sealed::hub_side(io, key, name)).await {
+        Ok(Ok(o)) => Ok(o),
+        Ok(Err(e)) => Err(format!("box {name}: {e:#}")),
+        Err(_) => Err(format!(
+            "box {name} did not open the channel within {} s",
+            within.as_secs()
+        )),
+    }
+}
+
 /// One session over `io` (ssh's stdout and stdin, or a test dialer's stream) with the daemon
-/// of box `rbox`, launched as build `id` (the box's configured build: `follows_config`): the
-/// sealed channel, the WebSocket inside it and the runner connection, served to its end. Once
-/// it is welcomed: `switch_pending`, the removal of old builds under `data` (when known), and
-/// the switch when it is pending, or, following the configured build, once another one is
-/// recorded ([`SshBox::set_build`]; see the module docs). How it ended, the daemon's hello,
+/// of box `rbox`, launched as build `id` (the box's configured build: `follows_config`) and,
+/// with `restart`, restarted for that many restarts asked for: the sealed channel (opened
+/// within `open_within`: [`open_timeout`]; once it is
+/// open, those restarts are carried out), the WebSocket inside it and the runner connection,
+/// served to its end. Once it is welcomed: `switch_pending`, the removal of old builds under
+/// `data` (when known), and the switch when it is pending, or, following the configured build,
+/// once another one is recorded ([`SshBox::set_build`]; see the module docs); and its end as
+/// soon as a restart is asked for that it did not carry out. How it ended, the daemon's hello,
 /// and whether a switch began.
 #[allow(clippy::too_many_arguments)]
 async fn session<IO>(
@@ -1881,24 +2124,19 @@ async fn session<IO>(
     data: Option<&str>,
     id: &str,
     follows_config: bool,
+    restart: Option<u64>,
+    open_within: Duration,
     io: IO,
 ) -> Result<(SealedEnd, DaemonHello, bool), String>
 where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let name = rbox.name();
-    let opened =
-        tokio::time::timeout(OPEN_TIMEOUT, twr_core::sealed::hub_side(io, key, name)).await;
-    let (sealed, hello) = match opened {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => return Err(format!("box {name}: {e:#}")),
-        Err(_) => {
-            return Err(format!(
-                "box {name} did not open the channel within {} s",
-                OPEN_TIMEOUT.as_secs()
-            ))
-        }
-    };
+    let (sealed, hello) = open_channel(io, key, name, open_within).await?;
+    // The relay answered, so it restarted the daemon (it relays only once it has).
+    if let Some(asked) = restart {
+        sbox.restarts_carried_out(asked);
+    }
     let ws = tokio::time::timeout(
         WS_TIMEOUT,
         tokio_tungstenite::accept_async_with_config(
@@ -1916,7 +2154,8 @@ where
     let (welcomed_tx, welcomed_rx) = oneshot::channel();
     let served = hub.serve_sealed_session(ws, name, welcomed_tx);
     let switched = AtomicBool::new(false);
-    // Ends only once a switch asked the session to end; else the session's end ends it.
+    // Ends only once a switch or a restart asked the session to end; else the session's end
+    // ends it.
     let after_welcome = async {
         let Ok(build) = welcomed_rx.await else {
             return std::future::pending().await;
@@ -1934,34 +2173,45 @@ where
             tracing::info!(box_name = %name, launched = id, running = ?build, "the box runs another build than the hub launched (switch pending)");
         }
         sbox.check_switch(build.as_deref());
-        if let Some(data) = data {
-            prune(sbox, data, &ref_name(&key.id(), name), id, build.as_deref()).await;
-        }
-        // (A switch that did not take is not tried again for the same builds.)
-        let worth = |to: &str| !sbox.switch_failed(build.as_deref(), to);
-        let to = if pending && worth(id) {
-            id.to_string()
-        } else if follows_config {
-            // Until `twr box install` records another build for the box.
-            loop {
-                let want = configured.borrow_and_update().clone();
-                if let Some(want) =
-                    want.filter(|w| Some(w.as_str()) != build.as_deref() && worth(w))
-                {
-                    break want;
-                }
-                if configured.changed().await.is_err() {
-                    return std::future::pending().await;
-                }
-            }
-        } else {
-            return std::future::pending().await;
+        // A restart asked for (now, or before this attempt carried out the ones it knew of).
+        let restart = async {
+            sbox.restart_asked().await;
+            hub.end_box_session(name, "restarting the box's daemon (`twr box restart`)");
         };
-        if !pending {
-            sbox.st().switch_pending = true;
-            tracing::info!(box_name = %name, running = ?build, installed = %to, "another build was installed for the box (switch pending)");
+        let switch = async {
+            if let Some(data) = data {
+                prune(sbox, data, &ref_name(&key.id(), name), id, build.as_deref()).await;
+            }
+            // (A switch that did not take is not tried again for the same builds.)
+            let worth = |to: &str| !sbox.switch_failed(build.as_deref(), to);
+            let to = if pending && worth(id) {
+                id.to_string()
+            } else if follows_config {
+                // Until `twr box install` records another build for the box.
+                loop {
+                    let want = configured.borrow_and_update().clone();
+                    if let Some(want) =
+                        want.filter(|w| Some(w.as_str()) != build.as_deref() && worth(w))
+                    {
+                        break want;
+                    }
+                    if configured.changed().await.is_err() {
+                        return std::future::pending().await;
+                    }
+                }
+            } else {
+                return std::future::pending().await;
+            };
+            if !pending {
+                sbox.st().switch_pending = true;
+                tracing::info!(box_name = %name, running = ?build, installed = %to, "another build was installed for the box (switch pending)");
+            }
+            switch_when_quiet(hub, sbox, name, &to, &switched).await;
+        };
+        tokio::select! {
+            () = restart => {}
+            () = switch => {}
         }
-        switch_when_quiet(hub, sbox, name, &to, &switched).await;
     };
     tokio::pin!(served);
     let end = tokio::select! {
@@ -2089,18 +2339,39 @@ mod tests {
 
     #[test]
     fn ssh_never_prompts_or_forwards_and_quotes_the_remote_command() {
+        let replace = Dial {
+            replace: true,
+            restart: false,
+        };
         let remote = connect_command(
             "/home/me/.local/share",
             "0123456789abcdef",
             "gpu",
             "ab",
-            true,
+            replace,
         );
         assert_eq!(
             remote,
             "exec '/home/me/.local/share/twr/runner/builds/0123456789abcdef/twr' runner --stdio \
              '--box=gpu' --hub-key 'ab' '--build=0123456789abcdef' --replace"
         );
+        // A restart covers a replace: its flag alone.
+        for replace in [false, true] {
+            let restart = connect_command(
+                "/home/me/.local/share",
+                "0123456789abcdef",
+                "gpu",
+                "ab",
+                Dial {
+                    replace,
+                    restart: true,
+                },
+            );
+            assert!(
+                restart.ends_with("'--build=0123456789abcdef' --restart"),
+                "{restart}"
+            );
+        }
         let args = ssh_args("-p 2222  me@gpu", &remote).unwrap();
         assert_eq!(
             args,
@@ -2163,8 +2434,14 @@ mod tests {
         }
         // Every variable part is quoted: a data directory with a quote, spaces or `$` stays
         // one word, unexpanded.
-        let odd = connect_command("/srv/it's $HOME", "0123456789abcdef", "gpu", "ab", false);
-        assert!(!odd.contains("--replace"));
+        let odd = connect_command(
+            "/srv/it's $HOME",
+            "0123456789abcdef",
+            "gpu",
+            "ab",
+            Dial::default(),
+        );
+        assert!(!odd.contains("--replace") && !odd.contains("--restart"));
         let (code, out) = sh(
             &format!(
                 "set -- {}; printf '%s\\n' \"$@\"",
@@ -2858,6 +3135,69 @@ mod tests {
             .exists());
     }
 
+    /// `--from-box`'s script copies a twr already on the box into the builds directory under
+    /// its own build id, checked, and says its version; a relative path, a directory, a file
+    /// that does not run as twr, and a builds tree others can write to are refused, leaving
+    /// nothing behind.
+    #[test]
+    fn a_build_on_the_box_is_copied_in_checked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let data_s = data.to_str().unwrap();
+        let exe = dir.path().join("built").join("twr");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "#!/bin/sh\necho 'twr 0.2.0+dev.abc1234'\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let id = twr_core::build_id_of(&exe).unwrap();
+        let script = |src: &str| from_box_install_script(data_s, src, "t");
+        let (code, out) = sh(&script(exe.to_str().unwrap()), None, &[]);
+        assert_eq!(code, 0, "{out}");
+        assert_eq!(
+            upload_answer(&out),
+            (
+                Some(format!("ok {id}")),
+                Some("twr 0.2.0+dev.abc1234".to_string())
+            )
+        );
+        let put = data.join("twr/runner/builds").join(&id).join("twr");
+        assert_eq!(std::fs::read(&put).unwrap(), std::fs::read(&exe).unwrap());
+        assert_eq!(
+            std::fs::metadata(&put).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Again: the same build, in place.
+        let (code, out) = sh(&script(exe.to_str().unwrap()), None, &[]);
+        assert_eq!(code, 0, "{out}");
+        let refused = |src: &str, says: &str| {
+            let (code, out) = sh(&script(src), None, &[]);
+            assert_eq!(code, UPLOAD_MISMATCH, "{out}");
+            let answer = upload_answer(&out).0.unwrap();
+            assert!(answer.contains(says), "{answer}");
+        };
+        refused("built/twr", "is not an absolute path");
+        refused(
+            dir.path().to_str().unwrap(),
+            "is not a regular file on the box",
+        );
+        let junk = dir.path().join("junk");
+        std::fs::write(&junk, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&junk, std::fs::Permissions::from_mode(0o755)).unwrap();
+        refused(junk.to_str().unwrap(), "it does not run on the box");
+        let junk_dir = data
+            .join("twr/runner/builds")
+            .join(twr_core::build_id_of(&junk).unwrap());
+        let left: Vec<_> = std::fs::read_dir(&junk_dir).unwrap().collect();
+        assert!(left.is_empty(), "{left:?}");
+        // A builds tree others can write to: nothing is copied into it.
+        let builds = data.join("twr/runner/builds");
+        std::fs::set_permissions(&builds, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::remove_dir_all(builds.join(&id)).unwrap();
+        refused(exe.to_str().unwrap(), "not safe to install into");
+        assert!(!builds.join(&id).exists());
+        std::fs::set_permissions(&builds, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     /// The release archive's script checks the archive's size and SHA-256, unpacks `twr`,
     /// checks its version and puts it under its own build id; a changed archive or another
     /// version is refused and leaves nothing behind.
@@ -3353,8 +3693,9 @@ mod tests {
 
     /// What an ssh leaves in its process group (a `ProxyCommand`'s helper, a wrapper's) ends
     /// with it: after a script's ssh completed ([`run_ssh_command`]), after a session's ssh
-    /// ended ([`Ssh::finish`]), and when one is dropped while it runs. The helper here is a
-    /// `sleep` that the fake ssh leaves running in the background, its pid in a file.
+    /// ended ([`Ssh::finish`]), and when one is dropped while it runs; but not once something
+    /// else reaped the ssh (its id is no longer its own). The helper here is a `sleep` that the
+    /// fake ssh leaves running in the background, its pid in a file.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_ssh_leaves_nothing_of_its_group_behind() {
@@ -3429,6 +3770,102 @@ mod tests {
         }
         drop(ssh);
         gone(&pid_file);
+        // One reaped by something else first: neither `finish` nor the drop signals its id
+        // (the helper in its group runs on).
+        let pid_file = dir.path().join("reaped.pid");
+        let mut ssh = Ssh::spawn(cmd(&pid_file, false)).unwrap();
+        let pid = ssh.child.id().unwrap() as libc::pid_t;
+        let reaped = tokio::task::spawn_blocking(move || {
+            let mut status = 0;
+            // SAFETY: waitpid(2) of this test's child, with a valid pointer to `status`.
+            unsafe { libc::waitpid(pid, &mut status, 0) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reaped, pid);
+        // Within the bound a session's end gives it (`connect`): the loss is known (and the id
+        // let go of) before that timeout could drop the wait.
+        let e = tokio::time::timeout(Duration::from_millis(500), ssh.finish())
+            .await
+            .expect("finish returns at once once the ssh was reaped elsewhere")
+            .unwrap_err();
+        assert!(twr_adapters::process::ownership_lost(&e), "{e}");
+        assert!(!ssh.owned);
+        drop(ssh);
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            alive(helper),
+            "the group of an ssh reaped elsewhere was killed"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper, libc::SIGKILL) };
+    }
+
+    /// The channel of an attempt that replaces or restarts the daemon may take as long as the
+    /// relay's slowest start (another relay's start, then a daemon that finishes a repository
+    /// change before it stops, then a new one), and that of an ordinary attempt as long as its
+    /// relay's (another relay's start, a daemon shutting down, then its own start of one: on a
+    /// Mac with launchd's calls), each with [`OPEN_TIMEOUT`] for ssh and the key exchange; the
+    /// opening waits for a slow relay within its deadline and gives up at it.
+    #[tokio::test]
+    async fn a_restart_waits_for_a_slow_shutdown_to_open_the_channel() {
+        let restart = Dial {
+            restart: true,
+            ..Dial::default()
+        };
+        let replace = Dial {
+            replace: true,
+            ..Dial::default()
+        };
+        assert_eq!(open_timeout(Dial::default()), PLAIN_OPEN_TIMEOUT);
+        assert_eq!(
+            PLAIN_OPEN_TIMEOUT,
+            OPEN_TIMEOUT + twr_runner::relay::PLAIN_START_WORST
+        );
+        // Another relay's start (a stop in it), a shutdown waited for, and a start of its own.
+        assert!(
+            twr_runner::relay::PLAIN_START_WORST
+                > 3 * twr_runner::client::SHUTDOWN_BUDGET
+                    + twr_runner::relay::LAUNCH_BUDGET
+                    + twr_runner::relay::START_TIMEOUT
+        );
+        assert_eq!(open_timeout(restart), REPLACE_OPEN_TIMEOUT);
+        assert_eq!(open_timeout(replace), REPLACE_OPEN_TIMEOUT);
+        assert_eq!(
+            REPLACE_OPEN_TIMEOUT,
+            OPEN_TIMEOUT + twr_runner::relay::START_WORST
+        );
+        // Two daemon shutdowns (the one waited for under another relay's start, and its own
+        // stop) at least.
+        assert!(twr_runner::relay::START_WORST > 4 * twr_runner::client::SHUTDOWN_BUDGET);
+        let key = HubKey::generate().unwrap();
+        // The daemon answers once the relay has stopped the old one.
+        let slow = |key: &HubKey| {
+            let (hub, daemon) = tokio::io::duplex(64 << 10);
+            let public = key.public();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                twr_core::sealed::daemon_side(daemon, &public, "gpu", None).await
+            });
+            (hub, task)
+        };
+        let (io, daemon) = slow(&key);
+        let opened = open_channel(io, &key, "gpu", open_timeout(restart)).await;
+        assert!(opened.is_ok(), "{:?}", opened.err());
+        assert!(daemon.await.unwrap().is_ok());
+        let (io, _daemon) = slow(&key);
+        let e = open_channel(io, &key, "gpu", Duration::from_millis(200))
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            e.starts_with("box gpu did not open the channel within "),
+            "{e}"
+        );
     }
 
     /// A supervisor that does not end by itself is aborted and joined: once `ended` returns,

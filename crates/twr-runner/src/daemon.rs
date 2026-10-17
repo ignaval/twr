@@ -47,6 +47,16 @@
 //! session being served, so a slow or hostile peer holds up nothing; at most
 //! [`MAX_ADMITTING`] connections open at once. A daemon never backs off: it waits for the hub
 //! to come.
+//!
+//! # How it was started
+//!
+//! The daemon tells from its own environment at start how it was started ([`own_launch`]),
+//! and says so in its inventory ([`twr_core::runner::Inventory::launch`]): `launchd <label>`
+//! when launchd runs it as a job of the relay's (`XPC_SERVICE_NAME`, which launchd sets to a
+//! job's label, starts with `tools.twr.box.`), `systemd <unit>` when systemd does
+//! (`INVOCATION_ID` set, and its unit in `/proc/self/cgroup` one of the relay's,
+//! `twr-box-...service`), else `detached`. Never from a file a relay wrote: the relay strips
+//! both variables from a daemon it starts itself ([`crate::relay`]).
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -320,12 +330,47 @@ impl Drop for DaemonSocket {
     }
 }
 
+/// How this daemon was started (see the module docs): [`launch_of`] its own
+/// `XPC_SERVICE_NAME`, whether `INVOCATION_ID` is set, and on Linux `/proc/self/cgroup`.
+pub fn own_launch() -> String {
+    let xpc = std::env::var("XPC_SERVICE_NAME").ok();
+    let invocation = std::env::var_os("INVOCATION_ID").is_some_and(|v| !v.is_empty());
+    let cgroup = (cfg!(target_os = "linux") && invocation)
+        .then(|| std::fs::read_to_string("/proc/self/cgroup").ok())
+        .flatten();
+    launch_of(xpc.as_deref(), invocation, cgroup.as_deref())
+}
+
+/// How a daemon was started, from its `XPC_SERVICE_NAME` (`xpc`), whether its
+/// `INVOCATION_ID` is set (`invocation`) and its `/proc/self/cgroup` (`cgroup`): `launchd
+/// <label>` for a label of the relay's (`tools.twr.box.`), `systemd <unit>` for a unit of the
+/// relay's (`twr-box-...service`, the last component of a cgroup path that is one), else
+/// `detached`; always a [`twr_core::runner::valid_launch`].
+pub fn launch_of(xpc: Option<&str>, invocation: bool, cgroup: Option<&str>) -> String {
+    let valid = |l: String| twr_core::runner::valid_launch(&l).then_some(l);
+    let launchd = xpc
+        .filter(|l| l.starts_with(crate::relay::launchd::LABEL_PREFIX))
+        .and_then(|l| valid(format!("launchd {l}")));
+    let systemd = || {
+        cgroup?
+            .lines()
+            .filter_map(|l| l.splitn(3, ':').nth(2))
+            .filter_map(|path| path.rsplit('/').next())
+            .find(|unit| unit.starts_with("twr-box-") && unit.ends_with(".service"))
+            .and_then(|unit| valid(format!("systemd {unit}")))
+    };
+    launchd
+        .or_else(|| invocation.then(systemd).flatten())
+        .unwrap_or_else(|| "detached".into())
+}
+
 /// Makes `dir` the daemon socket's directory: creates it with mode 0700 (and its missing
 /// parents), then refuses it unless it is a directory of this user's that group and others
 /// cannot access, on a path only this user or root can change
 /// ([`twr_core::paths::check_ancestors`]). An existing directory is refused rather than
-/// restricted: what was in it while it was open to others may not be the daemon's.
-fn ensure_socket_dir(dir: &Path) -> anyhow::Result<()> {
+/// restricted: what was in it while it was open to others may not be the daemon's. (The relay
+/// makes it too, for its start lock.)
+pub(crate) fn ensure_socket_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)
@@ -439,6 +484,7 @@ pub(crate) async fn accept_loop(
         socket = %socket.path.display(),
         box_name = %opts.box_name,
         hub = %opts.hub_url,
+        launch = daemon.launch.as_deref().unwrap_or("-"),
         "the box daemon is listening"
     );
     loop {
@@ -715,6 +761,46 @@ mod tests {
         assert_eq!(mine.hub_id, twr_core::sealed::hub_id(&key));
         assert_eq!(mine.protocol, PROTOCOL_VERSION);
         assert_eq!(mine.build.as_deref(), twr_core::build_id());
+    }
+
+    /// A daemon tells its launch from its own environment: a launchd label of the relay's, a
+    /// systemd unit of the relay's (with `INVOCATION_ID`), else detached.
+    #[test]
+    fn a_daemon_tells_how_it_was_started() {
+        let label = "tools.twr.box.0123456789abcdef.0a1b2c3d";
+        assert_eq!(
+            launch_of(Some(label), false, None),
+            format!("launchd {label}")
+        );
+        let v2 = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/\
+                  twr-box-0123456789abcdef-0a1b2c3d.service\n";
+        let v1 = "12:pids:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/\
+                  user@1000.service/twr-box-0123456789abcdef-0a1b2c3d.service\n";
+        for cgroup in [v2, v1] {
+            assert_eq!(
+                launch_of(None, true, Some(cgroup)),
+                "systemd twr-box-0123456789abcdef-0a1b2c3d.service"
+            );
+            // Without `INVOCATION_ID` (an inherited cgroup line is not enough).
+            assert_eq!(launch_of(None, false, Some(cgroup)), "detached");
+        }
+        let ssh = "0::/user.slice/user-1000.slice/session-4.scope\n";
+        for (xpc, inv, cgroup) in [
+            (None, false, None),
+            (Some("0"), false, None),
+            (Some("application.com.apple.Terminal.123"), false, None),
+            (Some("tools.twr.box.x y"), false, None),
+            (None, true, Some(ssh)),
+            (None, true, None),
+            (None, true, Some("0::/user.slice/twr-box-x.scope\n")),
+        ] {
+            assert_eq!(
+                launch_of(xpc, inv, cgroup),
+                "detached",
+                "{xpc:?} {cgroup:?}"
+            );
+        }
+        assert!(twr_core::runner::valid_launch(&own_launch()));
     }
 
     /// A line is read up to its `\n` and no further; too long, cut short or not UTF-8 is an

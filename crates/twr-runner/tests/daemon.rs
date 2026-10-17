@@ -275,6 +275,7 @@ fn daemon_opts(paths: &DaemonPaths, key: &[u8; 32]) -> RunnerOptions {
             hub_key: *key,
             lock: paths.lock.clone(),
             build: twr_core::build_id().map(str::to_string),
+            launch: None,
         },
     );
     o.ping_interval = Duration::from_millis(200);
@@ -723,11 +724,13 @@ async fn the_relay_starts_the_daemon_and_relays_to_it() {
         box_name: BOX.into(),
         hub_key: key.public(),
         replace: true,
+        restart: false,
         paths: paths.clone(),
         program,
         launcher: Launcher::Setsid,
         start_timeout: Duration::from_secs(60),
         stop_timeout: Duration::from_secs(60),
+        progress_every: twr_runner::relay::PROGRESS_EVERY,
         build: None,
     };
     let notes: Arc<Mutex<Vec<String>>> = Arc::default();
@@ -797,7 +800,13 @@ async fn the_relay_starts_the_daemon_and_relays_to_it() {
         .unwrap();
     assert_eq!(
         stop_notes,
-        [format!("twr-box: stopped the box daemon {build}")]
+        [
+            format!(
+                "twr-box: stopping the box daemon {build} (its runtimes end, and a repository \
+                 change it runs is finished first: at most 60 s)"
+            ),
+            format!("twr-box: stopped the box daemon {build}")
+        ]
     );
     hub.wait("the exit", |s| s.committed.iter().any(|c| c.2 == "exited"))
         .await;
