@@ -51,6 +51,8 @@ struct HubState {
     /// The frame lost with a dropped connection.
     lost: Option<(String, u64)>,
     connections: u64,
+    /// When each connection that authenticated was welcomed.
+    welcomed_at: Vec<std::time::Instant>,
     closed: u64,
 }
 
@@ -147,6 +149,7 @@ impl FakeHub {
             let mut s = self.state();
             s.epoch += 1;
             s.connections += 1;
+            s.welcomed_at.push(std::time::Instant::now());
             s.inventories.push(inv);
             (
                 HubMsg::Welcome {
@@ -844,6 +847,57 @@ async fn the_spool_is_private_and_the_token_never_logged() {
     );
     assert!(!logs.contains(TOKEN), "{logs}");
     assert!(!logs.contains("wrong-token-7c9d"), "{logs}");
+}
+
+/// A runner whose token comes from a file and that the hub refuses reads the file again, and
+/// watches it while it waits: a new token installed there (`twr runner install-token`) brings
+/// it online within a poll or two, not after `refused_retry`. Timed between the fake hub's own
+/// records (the refused connection's end, the welcome), not by polling.
+#[tokio::test]
+async fn a_refused_runner_takes_a_new_token_from_its_file_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = FakeHub::start().await;
+    let file = dir.path().join("gpu.token");
+    let wrong = Secret::new("wrong-token-0123456789abcdef");
+    twr_runner::client::write_token_file(&file, &wrong, false, &mut || Ok(false)).unwrap();
+    let mut o = opts(&hub, dir.path());
+    o.token = twr_runner::client::read_token_file(&file).unwrap();
+    o.token_file = Some(file.clone());
+    o.refused_retry = Duration::from_secs(120);
+    let lbox = open_box(dir.path());
+    let run = start(o, lbox);
+    hub.wait("a refused hello", |s| s.unanswered_at.len() == 1)
+        .await;
+    // A token file that fails the checks is not taken: the runner keeps waiting.
+    std::fs::write(&file, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(hub.state().unanswered_at.len(), 1);
+    assert!(hub.state().welcomed_at.is_empty());
+    let stored =
+        twr_runner::client::write_token_file(&file, &Secret::new(TOKEN), false, &mut || Ok(true))
+            .unwrap();
+    assert_eq!(stored, twr_runner::client::Stored::Replaced);
+    wait_for_within(
+        "the runner online with the new token",
+        Duration::from_secs(30),
+        || !hub.state().welcomed_at.is_empty(),
+    )
+    .await;
+    let (refused_end, welcomed) = {
+        let s = hub.state();
+        (s.unanswered_at[0], s.welcomed_at[0])
+    };
+    let gap = welcomed - refused_end;
+    assert!(gap < Duration::from_secs(10), "{gap:?}");
+    assert_eq!(hub.state().unanswered_at.len(), 1);
+    run.shutdown().await;
+    let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("the token file changed: connecting with the new token"),
+        "{logs}"
+    );
+    assert!(!logs.contains(wrong.expose()), "{logs}");
 }
 
 #[tokio::test]

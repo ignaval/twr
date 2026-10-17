@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use twr_core::event::*;
 
+use super::runners::Fence;
 use super::{
     twr_ext_map, AdapterScope, Batch, Core, Exit, Inner, Live, PendingExit, Planned,
-    RuntimeExiting, HUB_SHUTDOWN,
+    RuntimeExiting, TakenExit, HUB_SHUTDOWN,
 };
 use crate::store;
 
@@ -292,12 +293,64 @@ impl Core {
         exit_code: Option<i32>,
         stderr_tail: String,
     ) -> Option<PendingExit> {
-        let mut live = self.remove_live(thread, generation)?;
+        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, None)
+    }
+
+    /// [`Core::begin_exit`] of an exit a runner connection brought (its `exited` frame, or a
+    /// runtime the reconciliation at its `synced` found lost): the exit carries the
+    /// connection's `fence`, and the thread keeps the runtime it took, to be put back should
+    /// the box's token change before the closing sequence commits ([`ThreadRt::taken`]).
+    ///
+    /// [`ThreadRt::taken`]: super::ThreadRt::taken
+    pub(super) fn begin_exit_on(
+        &mut self,
+        thread: &str,
+        generation: u64,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        fence: &Fence,
+    ) -> Option<PendingExit> {
+        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, Some(fence))
+    }
+
+    /// Puts back the runtimes of the exits whose connection proved a token its box no longer
+    /// has ([`Fence::revoked`]), as they were before their exit began: live, not exiting.
+    /// Nothing else changed since (those exits recorded nothing, and record nothing now:
+    /// `supervisor::close_exited`). Called by `box.token` in the step under the core lock
+    /// that changes the token (`runners::set_box_token`), so the box's next connection
+    /// finds them back.
+    pub(super) fn put_back_revoked_exits(&mut self) {
+        for (thread, rt) in &mut self.rt {
+            if !rt.taken.as_ref().is_some_and(|t| t.fence.revoked()) {
+                continue;
+            }
+            if let Some(taken) = rt.taken.take() {
+                tracing::info!(
+                    thread,
+                    "an exit a connection brought whose token the box no longer has: the \
+                     runtime put back (the box's next connection reports it again)"
+                );
+                rt.live = Some(*taken.live);
+                rt.exiting = false;
+            }
+        }
+    }
+
+    fn begin_exit_keeping(
+        &mut self,
+        thread: &str,
+        generation: u64,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        fence: Option<&Fence>,
+    ) -> Option<PendingExit> {
+        let live = self.remove_live(thread, generation)?;
         let rt = self.rt(thread);
         rt.exiting = true;
         // A runtime the hub gave up on ([`give_up_runtime`]) crashed, whatever else asked it to
-        // stop meanwhile (a hub shutdown), unless the user did.
-        let given_up = live.given_up.take();
+        // stop meanwhile (a hub shutdown), unless the user did. (Left in the runtime, which an
+        // exit that is put back keeps as it was.)
+        let given_up = live.given_up.clone();
         // A durable `thread.stop` counts even when this runtime was taken over after a hub
         // restart (the in-memory flag is then gone).
         let stopped = rt.stop_requested || (live.stop_requested && given_up.is_none());
@@ -321,7 +374,7 @@ impl Core {
             },
         };
         let restart = stopped && given_up.is_none() && rt_restart(self, thread);
-        Some(PendingExit {
+        let exit = PendingExit {
             exit,
             log_runtime: live.log_runtime,
             attach_client,
@@ -331,9 +384,16 @@ impl Core {
             park: parking,
             crash,
             runner_ack: None,
-            fence: None,
+            fence: fence.cloned(),
             at: None,
-        })
+        };
+        if let Some(fence) = fence {
+            self.rt(thread).taken = Some(TakenExit {
+                live: Box::new(live),
+                fence: fence.clone(),
+            });
+        }
+        Some(exit)
     }
 
     /// The closing sequence of `exit`, planned from the state now (at each attempt to record
@@ -383,6 +443,7 @@ impl Core {
         release_live(hub);
         if let Some(rt) = self.rt.get_mut(thread) {
             rt.exiting = false;
+            rt.taken = None;
             if closed {
                 rt.restart_reason = None;
             }

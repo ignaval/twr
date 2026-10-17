@@ -3,6 +3,7 @@
 #[macro_use]
 mod term;
 mod boxes;
+mod dial_in;
 mod pretty;
 #[cfg(test)]
 mod test_support;
@@ -18,7 +19,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use twr_core::blob::hydrate_deep;
 use twr_core::client::Client;
-use twr_core::config::Config;
+use twr_core::config::{BoxesFile, Config};
 use twr_core::event::{Event, DELETE_KEY, HUB_THREAD};
 use twr_core::git::human_bytes;
 use twr_core::paths::{check_socket_path, sh_word, Paths, DEFAULT_WORKSPACE, WORKSPACE_ENV};
@@ -426,8 +427,9 @@ enum Cmd {
         cmd: boxes::BoxCmd,
     },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
-    /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner token` prints a new
-    /// token for `[boxes.<name>] token`.
+    /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>`
+    /// stores a dial-in box's token here; `twr runner token` prints a new token for
+    /// `[boxes.<name>] token`.
     #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Runner {
         #[command(subcommand)]
@@ -446,7 +448,9 @@ enum Cmd {
         hub: Option<String>,
         /// File holding the box's token (`[boxes.<name>] token` on the hub, at least 16
         /// characters); it must not be accessible by other users (`chmod 600`). Default:
-        /// `$TWR_RUNNER_TOKEN`.
+        /// `$TWR_RUNNER_TOKEN`, else the file `twr runner install-token` writes
+        /// (`~/.config/twr/runner-tokens/<box>.token`). A token from a file is read again
+        /// after the hub refuses the runner, so a new one there is used without a restart.
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
         /// Box name (as configured on the hub).
@@ -714,6 +718,29 @@ enum RunnerCmd {
     /// Print a new random token (32 bytes from the OS, hex): put it in the hub's
     /// `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`).
     Token,
+    /// On a dial-in box: store the box's token (`twr box add --dial-in` or `twr box token` on
+    /// the hub prints it) in `~/.config/twr/runner-tokens/<box>.token` (mode 0600), where `twr
+    /// runner` finds it. Asks for it at a prompt that does not show it, or reads it from a
+    /// pipe. With --hub, prints the command that runs the runner and a service to paste that
+    /// keeps it running (a systemd user unit, or a LaunchAgent on a Mac).
+    InstallToken {
+        /// The box's name on the hub.
+        #[arg(value_name = "BOX")]
+        box_name: String,
+        /// The hub's runner URL: `wss://host:port`, or `ws://` to a loopback host (an SSH
+        /// tunnel's end).
+        #[arg(long, value_name = "URL")]
+        hub: Option<String>,
+        /// For `wss://`: trust only this CA certificate (PEM), as `twr runner --ca`.
+        #[arg(long, value_name = "PEM")]
+        ca: Option<PathBuf>,
+        /// Store the token in this file instead (its directory must exist).
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// Replace another token stored for the box without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1380,6 +1407,26 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Cmd::Runner {
+            cmd:
+                Some(RunnerCmd::InstallToken {
+                    box_name,
+                    hub,
+                    ca,
+                    token_file,
+                    yes,
+                }),
+            ..
+        }) => {
+            dial_in::install_token(dial_in::InstallToken {
+                box_name,
+                hub,
+                ca,
+                token_file,
+                yes,
+            })?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
             cmd: None,
             hub,
             token_file,
@@ -1394,6 +1441,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 bail!("twr runner needs --hub and --box");
             };
             let data_dir = data_dir.unwrap_or_else(|| paths.data_dir.clone());
+            let default_token = paths.runner_token_file(&box_name);
             let mut opts = twr_runner::RunnerOptions::new(
                 hub,
                 twr_core::runner::Secret::default(),
@@ -1402,7 +1450,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
             opts.ca_file = ca;
             opts.allow_insecure = allow_insecure;
-            run_runner(opts, token_file).await?;
+            run_runner(opts, token_file, default_token).await?;
             return Ok(ExitCode::SUCCESS);
         }
         // Before the config is loaded: a config this twr cannot read must not stop an update
@@ -1569,7 +1617,7 @@ async fn run_simple(
             by,
         } => usage_threads(&socket, json, since.as_deref(), by.as_deref()).await,
         Cmd::Usage { json, .. } => usage(&socket, json).await,
-        Cmd::Hub { cmd: None } => run_hub(paths, config.clone(), socket).await,
+        Cmd::Hub { cmd: None } => run_hub(paths, socket).await,
         Cmd::Hub {
             cmd:
                 Some(HubCmd::Stop {
@@ -2278,7 +2326,9 @@ fn resume_outcome(thread: &str, r: &Value) -> String {
     out
 }
 
-async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Result<()> {
+/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config is read again
+/// under boxes.toml's lock ([`read_config_locked`]), held until the socket is bound.
+async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
@@ -2292,7 +2342,12 @@ async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Resul
     if let Some(dir) = paths.orchestrator_dir() {
         twr_core::paths::ensure_private_dir(&dir)?;
     }
+    let (config, boxes_lock) = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
+    };
     let mut opts = HubOptions::new(paths.db_file(), config);
+    opts.boxes_lock = boxes_lock;
     opts.config_file = Some(paths.config_file.clone());
     opts.instance_name = paths.instance_name();
     opts.workspace = paths.workspace.clone();
@@ -2313,7 +2368,68 @@ async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Resul
         opts.agent_probe = Some(twr_hub::hub::own_agent_probe());
     }
     opts.worktree_namespace = paths.worktree_namespace();
+    if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
+        opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
+            Box::pin(async {
+                let _ = tokio::task::spawn_blocking(|| hub_test_gate(HUB_STOP_GATE_ENV)).await;
+            })
+        }));
+    }
     twr_hub::run(opts, socket).await
+}
+
+/// The config of `paths` as a starting hub reads it: under the lock of boxes.toml
+/// ([`BoxesFile::lock`]), which the hub keeps until its socket is bound
+/// ([`HubOptions::boxes_lock`]). `twr box remove` and `twr box token --rotate` edit boxes.toml
+/// under that lock, then ask the hub on the socket to take the change (`box.token`); one that
+/// finds no socket made its edit before this read, never between this read and the bind,
+/// where the hub would start with the old token and nobody would tell it. The lock is waited
+/// for: those commands hold it only while they read, check and save the file, never while
+/// they wait for a hub or for the user. A lock file that can't be opened (a read-only config
+/// directory) is logged and the hub starts without it: no twr command can edit boxes.toml
+/// there either, since each takes the lock first.
+fn read_config_locked(
+    paths: &Paths,
+) -> anyhow::Result<(Config, Option<twr_core::config::BoxesLock>)> {
+    let file = paths.boxes_file();
+    let lock = BoxesFile::lock(&file)
+        .inspect_err(|e| {
+            let file = file.display();
+            tracing::warn!(error = %format!("{e:#}"), "starting without the lock of {file}");
+        })
+        .ok();
+    let config = Config::load_from(paths)?;
+    hub_test_gate(HUB_START_GATE_ENV);
+    Ok((config, lock))
+}
+
+/// `TWR_TEST_HUB_START_GATE=<file>`, for tests of a starting hub: right after it read its
+/// config ([`read_config_locked`]), the hub waits at the gate ([`hub_test_gate`]).
+const HUB_START_GATE_ENV: &str = "TWR_TEST_HUB_START_GATE";
+
+/// `TWR_TEST_HUB_STOP_GATE=<file>`, for tests of a hub shutting down: right after it removed
+/// its socket ([`twr_hub::HubOptions::socket_removed_hook`]), the hub waits at the gate
+/// ([`hub_test_gate`]).
+const HUB_STOP_GATE_ENV: &str = "TWR_TEST_HUB_STOP_GATE";
+
+/// The test gate `<file>` that `env` names: the hub creates `<file>.reached` and waits while
+/// `<file>` exists (at most a minute). Only in a test's throwaway hub
+/// ([`test_token_trusted`]): ignored by an installed twr.
+fn hub_test_gate(env: &str) {
+    let Some(gate) = std::env::var_os(env).filter(|_| test_token_trusted()) else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    let mut reached = gate.clone().into_os_string();
+    reached.push(".reached");
+    if let Err(e) = std::fs::write(&reached, b"") {
+        tracing::warn!(error = %e, "{env}: cannot create {}", Path::new(&reached).display());
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// `TWR_AGENT_PROBE`: `off` keeps the hub from probing its own box's agent CLIs (no
@@ -3420,14 +3536,16 @@ async fn hub_version_note(new_exe: &Path, socket: Option<PathBuf>, paths: &Paths
 }
 
 /// `twr runner`: serves the hub from this box until SIGINT / SIGTERM, with `opts` but their
-/// token, which comes from `--token-file` (mode 0600) or `$TWR_RUNNER_TOKEN` and is never
-/// logged; the variable is removed from the environment first thing, so nothing the runner
-/// starts inherits it. A token shorter than [`twr_core::runner::TOKEN_GOOD_LEN`] is warned
-/// about (one too short to use is refused). A SIGINT or SIGTERM is listened for from the
-/// start: one that comes while it starts stops it before it connects ([`twr_runner::run`]).
+/// token, which comes from `--token-file` (mode 0600), `$TWR_RUNNER_TOKEN` or the box's
+/// default file `default_token` ([`dial_in::runner_token`]) and is never logged; the variable
+/// is removed from the environment first thing, so nothing the runner starts inherits it. A
+/// token shorter than [`twr_core::runner::TOKEN_GOOD_LEN`] is warned about (one too short to
+/// use is refused). A SIGINT or SIGTERM is listened for from the start: one that comes while
+/// it starts stops it before it connects ([`twr_runner::run`]).
 async fn run_runner(
     mut opts: twr_runner::RunnerOptions,
     token_file: Option<PathBuf>,
+    default_token: PathBuf,
 ) -> anyhow::Result<()> {
     let shutdown = twr_runner::Shutdown::install();
     let env_token = twr_runner::client::take_token_env();
@@ -3439,21 +3557,15 @@ async fn run_runner(
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let token = match token_file {
-        Some(p) => twr_runner::client::read_token_file(&p)?,
-        None => env_token.ok_or_else(|| {
-            anyhow!(
-                "no runner token: pass --token-file or set {}",
-                twr_runner::client::TOKEN_ENV
-            )
-        })?,
-    };
+    let (token, file) =
+        dial_in::runner_token(token_file, env_token, default_token, &opts.box_name)?;
     // Too short a token is refused (`RunnerOptions::validate`); a short one only warned about.
     if let Ok(Some(warning)) = twr_core::runner::check_token_len(token.expose(), "the runner token")
     {
         tracing::warn!("{warning}");
     }
     opts.token = token;
+    opts.token_file = file;
     twr_runner::run(opts, shutdown).await
 }
 
@@ -7195,6 +7307,76 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// `twr runner install-token <box>` takes its own --hub, --ca, --token-file and --yes,
+    /// and none of the runner's other flags.
+    #[test]
+    fn the_install_token_subcommand_parses() {
+        let c = Cli::try_parse_from([
+            "twr",
+            "runner",
+            "install-token",
+            "gpu",
+            "--hub",
+            "wss://hub:7878",
+            "--ca",
+            "ca.pem",
+            "--token-file",
+            "t",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Cmd::Runner {
+            cmd:
+                Some(RunnerCmd::InstallToken {
+                    box_name,
+                    hub,
+                    ca,
+                    token_file,
+                    yes: true,
+                }),
+            hub: None,
+            box_name: None,
+            ..
+        }) = c.cmd
+        else {
+            panic!("{:?}", c.cmd)
+        };
+        assert_eq!(box_name, "gpu");
+        assert_eq!(hub.as_deref(), Some("wss://hub:7878"));
+        assert_eq!(ca, Some(PathBuf::from("ca.pem")));
+        assert_eq!(token_file, Some(PathBuf::from("t")));
+        let c = Cli::try_parse_from(["twr", "runner", "install-token", "gpu"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                cmd: Some(RunnerCmd::InstallToken {
+                    hub: None,
+                    yes: false,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["twr", "runner", "install-token"]).is_err());
+        for extra in [
+            &["--allow-insecure"][..],
+            &["--box", "b"],
+            &["--data-dir", "d"],
+        ] {
+            let args = [&["twr", "runner", "install-token", "gpu"][..], extra].concat();
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from([
+            "twr",
+            "runner",
+            "--hub",
+            "ws://h:1",
+            "install-token",
+            "gpu"
+        ])
+        .is_err());
     }
 
     /// The SSH box's relay (`--stdio`) and daemon (`--daemon`) take a box and a hub key, none

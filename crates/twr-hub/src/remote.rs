@@ -6,7 +6,10 @@
 //! [`RunnerMsg::CmdResult`](twr_core::runner::RunnerMsg::CmdResult) once per command id.
 //!
 //! **Transports.** A token box's runner proves its token on the hub's listener
-//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). An SSH or a command box
+//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). The token can change
+//! while the hub runs (`box.token`, [`RemoteBox::set_token`]): a handshake proves one
+//! snapshot of it ([`RemoteBox::token_snapshot`]) and connects only while that is still the
+//! box's token, and a change removes the connection that proved the old one. An SSH or a command box
 //! has no token: its only connections are the sealed ones the hub's own supervisor opens
 //! (`Hub::serve_sealed_runner`), so on the listener it is a box the hub does not know (a
 //! random proof, then `unauthorized`). Its threads' branches take the namespace of the hub's
@@ -286,9 +289,6 @@ struct Inner {
     /// How the box connects: a token box's runner dials the listener, an SSH box's daemon is
     /// dialed by the hub (see the module docs).
     transport: BoxTransport,
-    /// The token box's token (empty for an SSH or a command box, and for a token box
-    /// configured without one: none of them is accepted on the listener).
-    token: Secret,
     /// How `twr attach` reaches it: its `ssh` (a token box's may have none), or its command.
     link: Option<BoxLink>,
     /// Namespace of its threads' branches (`twr/<namespace>/<name>`; `None`: `twr/<name>`).
@@ -345,6 +345,50 @@ pub struct Refusal {
     pub reason: String,
 }
 
+/// A token box's token as one handshake uses it ([`RemoteBox::token_snapshot`]): the token
+/// and its generation.
+#[derive(Clone)]
+pub struct BoxToken {
+    secret: Secret,
+    gen: u64,
+}
+
+impl BoxToken {
+    /// The token's generation (raised by each change, [`RemoteBox::set_token`]).
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+}
+
+/// What [`RemoteBox::set_token`] did: whether the token changed, and the epoch of the
+/// connection it removed (the box was connected).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TokenSet {
+    pub changed: bool,
+    pub dropped: Option<u64>,
+}
+
+/// What [`RemoteBox::connect`] did with a new authenticated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connect {
+    /// It is the box's connection now, with this epoch.
+    Connected(u64),
+    /// The hub has numbered every epoch of the box: nothing changed, refuse it.
+    Exhausted,
+    /// The box's token changed since its handshake proved it: nothing changed, refuse it.
+    TokenChanged,
+}
+
+impl Connect {
+    /// The new connection's epoch, when it was taken.
+    pub fn epoch(self) -> Option<u64> {
+        match self {
+            Connect::Connected(e) => Some(e),
+            Connect::Exhausted | Connect::TokenChanged => None,
+        }
+    }
+}
+
 /// The box's current connection.
 struct Conn {
     epoch: u64,
@@ -353,6 +397,14 @@ struct Conn {
 
 #[derive(Default)]
 struct State {
+    /// The token box's token (empty for an SSH or a command box, for a token box configured
+    /// without one, and once revoked: none of them is accepted on the listener), and its
+    /// generation, raised by each change ([`RemoteBox::set_token`]).
+    token: Secret,
+    token_gen: u64,
+    /// The last epoch numbered before the token last changed: the connections up to it proved
+    /// a token the box no longer has ([`RemoteBox::revoked`]).
+    revoked_through: u64,
     conn: Option<Conn>,
     last_epoch: u64,
     /// Synced and reconciled: commands may be sent.
@@ -547,10 +599,12 @@ impl RemoteBox {
             inner: Arc::new(Inner {
                 name,
                 transport,
-                token,
                 link,
                 branch_namespace: None,
-                state: Mutex::new(State::default()),
+                state: Mutex::new(State {
+                    token,
+                    ..State::default()
+                }),
                 gens: AtomicU64::new(1),
                 rejected: AtomicU64::new(0),
                 orphans: Notify::new(),
@@ -686,14 +740,31 @@ impl RemoteBox {
         &self.inner.name
     }
 
+    /// The box's token as it is now, with its generation: what one handshake proves both ways
+    /// ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]) and then connects with
+    /// ([`RemoteBox::connect`]), so a token that changes meanwhile refuses that connection.
+    pub fn token_snapshot(&self) -> BoxToken {
+        let st = self.state();
+        BoxToken {
+            secret: st.token.clone(),
+            gen: st.token_gen,
+        }
+    }
+
     /// The hub's handshake proof for this box over the runner's and the hub's nonces
-    /// ([`twr_core::runner::auth_proof`] by [`Prover::Hub`]); `None` for a box without a token
-    /// (it accepts no runner on the listener), an SSH box among them.
-    pub fn hub_proof(&self, runner_nonce: &str, hub_nonce: &str) -> Option<String> {
+    /// ([`twr_core::runner::auth_proof`] by [`Prover::Hub`]) with `token` (a
+    /// [`RemoteBox::token_snapshot`]); `None` for a box without a token (it accepts no runner
+    /// on the listener), an SSH box among them.
+    pub fn hub_proof(
+        &self,
+        token: &BoxToken,
+        runner_nonce: &str,
+        hub_nonce: &str,
+    ) -> Option<String> {
         let token_box = self.inner.transport == BoxTransport::Token;
-        (token_box && !self.inner.token.is_empty()).then(|| {
+        (token_box && !token.secret.is_empty()).then(|| {
             auth_proof(
-                &self.inner.token,
+                &token.secret,
                 Prover::Hub,
                 &self.inner.name,
                 runner_nonce,
@@ -702,18 +773,67 @@ impl RemoteBox {
         })
     }
 
-    /// Whether `proof` is the runner's handshake proof for this box over these nonces
-    /// (constant time; a box without a token accepts none, an SSH box none either).
-    pub fn checks_runner_proof(&self, runner_nonce: &str, hub_nonce: &str, proof: &str) -> bool {
+    /// Whether `proof` is the runner's handshake proof for this box over these nonces with
+    /// `token` (a [`RemoteBox::token_snapshot`]; constant time; a box without a token accepts
+    /// none, an SSH box none either).
+    pub fn checks_runner_proof(
+        &self,
+        token: &BoxToken,
+        runner_nonce: &str,
+        hub_nonce: &str,
+        proof: &str,
+    ) -> bool {
         self.inner.transport == BoxTransport::Token
             && check_auth_proof(
-                &self.inner.token,
+                &token.secret,
                 Prover::Runner,
                 &self.inner.name,
                 runner_nonce,
                 hub_nonce,
                 proof,
             )
+    }
+
+    /// A token box takes `token` (empty: none, so no runner is accepted on the listener),
+    /// under the state lock. When it differs from the box's token: it is stored, its
+    /// generation raised (a handshake that proved the old one is refused at
+    /// [`RemoteBox::connect`]), and the current connection, if any, is removed as
+    /// [`RemoteBox::disconnect`] removes one (requests in flight fail `box_offline`, the box
+    /// is not ready) and closed. A connection removed here is no longer current, so nothing it
+    /// sends commits any more, and its own end later changes nothing. An SSH or a command box
+    /// has no token: nothing changes. The caller (`box.token`) does this under the hub's core
+    /// lock and takes the box offline there in the same step.
+    pub fn set_token(&self, token: Secret) -> TokenSet {
+        if self.inner.transport != BoxTransport::Token {
+            return TokenSet::default();
+        }
+        let mut st = self.state();
+        if st.token.ct_eq(token.expose()) {
+            return TokenSet::default();
+        }
+        st.token = token;
+        st.token_gen += 1;
+        st.revoked_through = st.last_epoch;
+        let dropped = st.conn.take().map(|old| {
+            old.tx.send(HubMsg::Error {
+                code: hub_errors::UNAUTHORIZED.into(),
+                message: "the box's token changed: this connection is no longer accepted".into(),
+            });
+            old.tx.close("the box's token changed");
+            old.epoch
+        });
+        if dropped.is_some() {
+            st.ready = false;
+            st.drop_requests(&self.inner.name);
+        }
+        drop(st);
+        if dropped.is_some() {
+            self.inner.settled.notify_waiters();
+        }
+        TokenSet {
+            changed: true,
+            dropped,
+        }
     }
 
     /// What the latest inventory said (kept while the box is offline).
@@ -724,6 +844,13 @@ impl RemoteBox {
     /// Whether the box is connected, synced and reconciled.
     pub fn is_ready(&self) -> bool {
         self.state().ready
+    }
+
+    /// Whether connection `epoch` proved a token the box no longer has: it was numbered
+    /// before the token last changed ([`RemoteBox::set_token`]), so what it sent is a revoked
+    /// runner's.
+    pub fn revoked(&self, epoch: u64) -> bool {
+        epoch <= self.state().revoked_through
     }
 
     /// Whether `epoch` is the current connection.
@@ -891,14 +1018,21 @@ impl RemoteBox {
     }
 
     /// Takes a new authenticated connection (see the module docs): fences the previous one,
-    /// fails requests in flight, and returns the new epoch. Not ready yet. `None` (nothing
-    /// changed; the connection is to be refused) once the hub has numbered `u64::MAX`
-    /// connections of this box.
-    pub fn connect(&self, inv: &Inventory, tx: ConnTx) -> Option<u64> {
-        *self.refusal_slot() = None;
+    /// fails requests in flight, and returns the new epoch ([`Connect::Connected`]). Not ready
+    /// yet. Nothing changes, and the connection is to be refused, once the hub has numbered
+    /// `u64::MAX` connections of this box ([`Connect::Exhausted`]), or when `token_gen` (the
+    /// generation of the token its handshake proved, [`RemoteBox::token_snapshot`]; `None` for
+    /// a sealed connection, which proves no token) is no longer the box's
+    /// ([`Connect::TokenChanged`]: [`RemoteBox::set_token`] ran meanwhile).
+    pub fn connect(&self, inv: &Inventory, tx: ConnTx, token_gen: Option<u64>) -> Connect {
         let mut st = self.state();
+        if token_gen.is_some_and(|g| g != st.token_gen) {
+            return Connect::TokenChanged;
+        }
         // The hub's own counter, never the runner's `epoch_hint` (see the module docs).
-        let epoch = st.last_epoch.checked_add(1)?;
+        let Some(epoch) = st.last_epoch.checked_add(1) else {
+            return Connect::Exhausted;
+        };
         if let Some(old) = st.conn.take() {
             tracing::warn!(
                 box_name = %self.inner.name,
@@ -934,8 +1068,9 @@ impl RemoteBox {
                 .filter(|l| twr_core::runner::valid_launch(l)),
         });
         drop(st);
+        *self.refusal_slot() = None;
         self.inner.settled.notify_waiters();
-        Some(epoch)
+        Connect::Connected(epoch)
     }
 
     /// The box is synced and reconciled on connection `epoch`. In this order: stops the
@@ -2203,9 +2338,9 @@ mod tests {
             ..Default::default()
         };
         let (first, first_closed) = conn();
-        assert_eq!(b.connect(&hello, first), Some(1));
+        assert_eq!(b.connect(&hello, first, None), Connect::Connected(1));
         let (second, _) = conn();
-        assert_eq!(b.connect(&hello, second), Some(2));
+        assert_eq!(b.connect(&hello, second, None), Connect::Connected(2));
         assert!(first_closed.borrow().is_some(), "the first is fenced");
         assert!(!b.is_current(1) && b.is_current(2));
         // The first connection's end leaves its replacement alone.
@@ -2214,12 +2349,107 @@ mod tests {
 
         b.state().last_epoch = u64::MAX - 1;
         let (last, last_closed) = conn();
-        assert_eq!(b.connect(&Inventory::default(), last), Some(u64::MAX));
+        assert_eq!(
+            b.connect(&Inventory::default(), last, None),
+            Connect::Connected(u64::MAX)
+        );
         let (extra, extra_closed) = conn();
-        assert_eq!(b.connect(&hello, extra), None);
+        assert_eq!(b.connect(&hello, extra, None), Connect::Exhausted);
         assert!(b.is_current(u64::MAX), "the current connection stays");
         assert!(last_closed.borrow().is_none(), "and is not fenced");
         assert!(extra_closed.borrow().is_none());
+    }
+
+    /// A new token raises the token's generation and removes the box's connection: closed,
+    /// no longer current, its requests failed `box_offline`, its own end a no-op. A
+    /// connection whose handshake proved the old token is refused and changes nothing (the
+    /// current connection, the refusal shown). The same token again changes nothing; an SSH
+    /// box has no token to set.
+    #[tokio::test]
+    async fn a_new_token_drops_the_connection_and_refuses_handshakes_of_the_old_one() {
+        let b = RemoteBox::new("gpu", Secret::new("old-token-0123456789"), None);
+        let before = b.token_snapshot();
+        let (tx, _rx) = mpsc::channel(4);
+        let (close, closed) = watch::channel(None);
+        let epoch = b
+            .connect(
+                &Inventory::default(),
+                ConnTx::new(tx, close),
+                Some(before.gen()),
+            )
+            .epoch()
+            .unwrap();
+        assert!(b.set_ready(epoch, &[], Vec::new()));
+        let request = tokio::spawn(b.git().repo_root(PathBuf::from("/r")));
+        for _ in 0..500 {
+            if !b.state().pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(b.state().pending.len(), 1, "the request waits");
+
+        // The same token: nothing.
+        let same = b.set_token(Secret::new("old-token-0123456789"));
+        assert_eq!(same, TokenSet::default());
+        assert!(b.is_current(epoch) && closed.borrow().is_none());
+
+        let set = b.set_token(Secret::new("new-token-0123456789"));
+        assert_eq!(
+            set,
+            TokenSet {
+                changed: true,
+                dropped: Some(epoch)
+            }
+        );
+        let after = b.token_snapshot();
+        assert_eq!(after.gen(), before.gen() + 1);
+        assert!(!b.is_current(epoch) && !b.is_ready());
+        assert!(closed.borrow().is_some(), "its connection is closed");
+        let e = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("offline"), "{e:#}");
+        assert!(!b.disconnect(epoch), "its own end changes nothing");
+        let (n1, n2) = ("a".repeat(64), "b".repeat(64));
+        assert!(b.hub_proof(&before, &n1, &n2) != b.hub_proof(&after, &n1, &n2));
+
+        // A handshake that proved the old token, connecting after the change: refused.
+        b.note_refusal("earlier");
+        let (late, late_closed) = conn();
+        assert_eq!(
+            b.connect(&Inventory::default(), late, Some(before.gen())),
+            Connect::TokenChanged
+        );
+        assert_eq!(b.epoch(), None);
+        assert!(late_closed.borrow().is_none());
+        assert!(b.refusal().is_some(), "the refusal shown stays");
+        // One that proved the new one connects.
+        let (good, _) = conn();
+        let next = b.connect(&Inventory::default(), good, Some(after.gen()));
+        assert_eq!(next, Connect::Connected(epoch + 1));
+        assert!(b.refusal().is_none());
+
+        // Revoked: no token, no proof, nothing accepted.
+        let set = b.set_token(Secret::default());
+        assert_eq!(set.dropped, Some(epoch + 1));
+        let none = b.token_snapshot();
+        assert_eq!(b.hub_proof(&none, &n1, &n2), None);
+        let proof = auth_proof(
+            &Secret::new("new-token-0123456789"),
+            Prover::Runner,
+            "gpu",
+            &n1,
+            &n2,
+        );
+        assert!(!b.checks_runner_proof(&none, &n1, &n2, &proof));
+        assert!(b.checks_runner_proof(&after, &n1, &n2, &proof));
+
+        let ssh = RemoteBox::new_ssh("far", "me@far".into());
+        assert_eq!(ssh.set_token(Secret::new("x")), TokenSet::default());
+        assert_eq!(ssh.token_snapshot().gen(), 0);
     }
 
     #[test]
@@ -2271,7 +2501,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (close, _closed) = watch::channel(None);
         let epoch = b
-            .connect(&Inventory::default(), ConnTx::new(tx, close))
+            .connect(&Inventory::default(), ConnTx::new(tx, close), None)
+            .epoch()
             .unwrap();
         assert!(b.set_ready(epoch, &[], Vec::new()));
         let agent = |login: twr_core::runner::AgentLogin| twr_core::runner::AgentInfo {
@@ -2486,7 +2717,10 @@ mod tests {
                 worktrees: dir.path().into(),
                 ..Default::default()
             };
-            let epoch = b.connect(&inv, ConnTx::new(tx, close)).unwrap();
+            let epoch = b
+                .connect(&inv, ConnTx::new(tx, close), None)
+                .epoch()
+                .unwrap();
             assert!(b.set_ready(epoch, &[], Vec::new()));
             let answer = {
                 let b = b.clone();
@@ -2549,8 +2783,9 @@ mod tests {
                 },
             );
             assert_eq!(b.transport(), BoxTransport::Command);
-            assert_eq!(b.hub_proof("a", "b"), None);
-            assert!(!b.checks_runner_proof("a", "b", ""));
+            let token = b.token_snapshot();
+            assert_eq!(b.hub_proof(&token, "a", "b"), None);
+            assert!(!b.checks_runner_proof(&token, "a", "b", ""));
             let (tx, mut rx) = mpsc::channel(4);
             let (close, _closed) = watch::channel(None);
             let inv = Inventory {
@@ -2558,7 +2793,10 @@ mod tests {
                 worktrees: "/w".into(),
                 ..Default::default()
             };
-            let epoch = b.connect(&inv, ConnTx::new(tx, close)).unwrap();
+            let epoch = b
+                .connect(&inv, ConnTx::new(tx, close), None)
+                .epoch()
+                .unwrap();
             assert!(b.set_ready(epoch, &[], Vec::new()));
             let e = b
                 .attach_command("claude-code", &cfg, "s1", &Command::new("claude"), None)

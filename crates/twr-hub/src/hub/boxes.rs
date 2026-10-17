@@ -9,7 +9,8 @@
 //! and lets go at once). The write lock is taken only to add a box ([`register_box`]), never
 //! with the core lock held: the name is checked and the box inserted under that one write
 //! lock, so of two adds of one name exactly one wins and the other changes nothing. A box,
-//! once added, stays until the hub restarts: removing or changing one needs a restart.
+//! once added, stays until the hub restarts: removing or changing one needs a restart, but for
+//! a token box's token (`box.token`, below).
 //!
 //! **Startup and live add** take the same path: [`admit_box`] (a valid name, not `local`, the
 //! transport rules of [`Config::validate`], a token of at least
@@ -28,13 +29,18 @@
 //! again (`twr box project` just recorded one), the only change to a box the hub takes
 //! without a restart besides its build;
 //! `box.restart {box}` has such a box's supervisor restart its daemon ([`crate::ssh_box`],
-//! "Restarting the daemon").
+//! "Restarting the daemon"); `box.token {box}` has a token box take its token from them again,
+//! or none when they no longer give it one (`twr box token --rotate`, `twr box remove`), and
+//! drops its runner connection when that changed it: rotation and revocation are live. The
+//! four that read the files (`box.add`, `box.install`, `box.projects`, `box.token`) run one
+//! at a time, each from its read to its change (`Inner::box_files_lock`): a removal's
+//! `box.token` never runs between a `box.add`'s read of the removed box and its registration.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard, Weak};
 
 use serde_json::{json, Value};
-use twr_core::config::{BoxConfig, BoxTransport, Config};
+use twr_core::config::{error_without_values, BoxConfig, BoxTransport, Config};
 use twr_core::proto::{codes, RpcError};
 use twr_core::runner::Secret;
 use twr_core::sealed::HubKey;
@@ -288,7 +294,8 @@ impl Hub {
     /// the orchestrator, `unsupported` in a named workspace (boxes belong to the default
     /// workspace's hub) or for a hub that has no config file, `bad_request` when the files do
     /// not parse or the box is refused, `not_found` when neither file has the box, `conflict`
-    /// when the hub has a box of that name with other settings.
+    /// when the hub has a box of that name with other settings. Serialized with `box.token`,
+    /// `box.install` and `box.projects` from the read to the registration.
     pub async fn box_add(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
@@ -311,12 +318,19 @@ impl Hub {
                 "this hub was started without a config file to read boxes from",
             ));
         };
+        // One at a time (with `box.token` and the others), from the read to the registration:
+        // a removal's `box.token` either finds the box registered, and revokes it, or comes
+        // first, and this read no longer finds it.
+        let _one = self.inner.box_files_lock.lock().await;
         let config = tokio::task::spawn_blocking(move || {
-            Config::load_with_boxes(&file).map_err(|e| format!("{e:#}"))
+            Config::load_with_boxes(&file).map_err(|e| error_without_values(&e))
         })
         .await
         .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
         .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        if let Some(hook) = &self.inner.box_files_read_hook {
+            hook(name).await;
+        }
         let Some(cfg) = config.boxes.get(name).cloned() else {
             return Err(rpc(
                 codes::NOT_FOUND,
@@ -394,8 +408,9 @@ impl Hub {
                 ),
             ));
         };
-        // One at a time, from its read of the files to its change.
-        let _one = self.inner.box_install_lock.lock().await;
+        // One at a time (with `box.add` and the others), from its read of the files to its
+        // change.
+        let _one = self.inner.box_files_lock.lock().await;
         if let Some(file) = self.inner.config_file.clone() {
             let read = tokio::task::spawn_blocking(move || Config::load_with_boxes(&file)).await;
             match read {
@@ -423,7 +438,7 @@ impl Hub {
                     }
                 },
                 Ok(Err(e)) => {
-                    tracing::warn!(box_name = %name, error = %format!("{e:#}"), "box.install: the config cannot be read; keeping the box's build")
+                    tracing::warn!(box_name = %name, error = %error_without_values(&e), "box.install: the config cannot be read; keeping the box's build")
                 }
                 Err(e) => {
                     tracing::warn!(box_name = %name, error = %e, "box.install: reading the config failed")
@@ -494,13 +509,13 @@ impl Hub {
     /// `boxes.toml` next to it (`twr box project` just recorded one there), replacing the ones
     /// the hub has for that box, and nothing else of it or of any other box; a new thread on
     /// the box uses them from now on. Returns `{box, projects, repos}` (`projects` the names,
-    /// sorted; `repos` each one's `repo` as the hub has it now, by name). Serialized
-    /// with `box.install` from before the read to the change, so an older read is never
-    /// applied after a newer one. `unauthorized` for the orchestrator, `not_found` for a box
-    /// the hub does not have or the files no longer have, `unsupported` for a hub without a
-    /// config file, `bad_request` when the files do not parse, `conflict` when the box's
-    /// other settings there (its transport, `ssh`, token) differ from the ones the hub added it
-    /// with (nothing changed: restart the hub).
+    /// sorted; `repos` each one's `repo` as the hub has it now, by name). Serialized with
+    /// `box.add`, `box.install` and `box.token` from before the read to the change, so an
+    /// older read is never applied after a newer one. `unauthorized` for the orchestrator,
+    /// `not_found` for a box the hub does not have or the files no longer have, `unsupported`
+    /// for a hub without a config file, `bad_request` when the files do not parse, `conflict`
+    /// when the box's other settings there (its transport, `ssh`, token) differ from the ones
+    /// the hub added it with (nothing changed: restart the hub).
     pub async fn box_projects(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
@@ -520,10 +535,11 @@ impl Hub {
                 "this hub was started without a config file to read boxes from",
             ));
         };
-        // One at a time (with `box.install`), from its read of the files to its change.
-        let _one = self.inner.box_install_lock.lock().await;
+        // One at a time (with `box.install` and the others), from its read of the files to its
+        // change.
+        let _one = self.inner.box_files_lock.lock().await;
         let config = tokio::task::spawn_blocking(move || {
-            Config::load_with_boxes(&file).map_err(|e| format!("{e:#}"))
+            Config::load_with_boxes(&file).map_err(|e| error_without_values(&e))
         })
         .await
         .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
@@ -535,7 +551,8 @@ impl Hub {
             return Err(rpc(
                 codes::NOT_FOUND,
                 format!(
-                    "config.toml and boxes.toml no longer have box {name}: the hub keeps it as it                      was until it restarts"
+                    "config.toml and boxes.toml no longer have box {name}: the hub keeps it as it \
+                     was until it restarts"
                 ),
             ));
         };
@@ -558,7 +575,9 @@ impl Hub {
                 return Err(rpc(
                     codes::CONFLICT,
                     format!(
-                        "box {name}'s settings changed in the config files since the hub added                          it (its ssh destination, say): the hub does not take its projects until                          it reads them again. Restart the hub (`twr hub stop`, then `twr`)"
+                        "box {name}'s settings changed in the config files since the hub added \
+                         it (its ssh destination, say): the hub does not take its projects until \
+                         it reads them again. Restart the hub (`twr hub stop`, then `twr`)"
                     ),
                 ));
             }
@@ -566,6 +585,106 @@ impl Hub {
         }
         tracing::info!(box_name = %name, projects = ?projects, "box projects read again");
         Ok(json!({ "box": name, "projects": projects, "repos": repos }))
+    }
+
+    /// `box.token {box}` (users only): token box `name` takes the token the hub's config file
+    /// and the `boxes.toml` next to it give it now, read again (`twr box token --rotate` or
+    /// `twr box remove` just changed them): the files' token when they have the box as a token
+    /// box with a token, else none (revoked: no runner of the box is accepted). The hub's
+    /// token is only ever the files' token, or none. A token shorter than
+    /// [`twr_core::runner::TOKEN_MIN_LEN`] is not taken: the old one is revoked all the same,
+    /// and the answer is `bad_request` with why; a short one is taken with a warning, as at
+    /// startup. A change drops the box's runner connection at once (the box goes offline) and
+    /// refuses a handshake that proved the old token (`hub::runners`). Nothing else of the box
+    /// changes; the configuration the hub compares `box.add`, `box.install` and
+    /// `box.projects` against takes the same token. Returns `{box, changed, accepting}`
+    /// (`accepting`: the box has a token now), never the token. Serialized with `box.add`,
+    /// `box.install` and `box.projects` from before the box is looked up to the change (a
+    /// `box.add` that read the old files ends before it, or reads the new ones). `unauthorized`
+    /// for the orchestrator, `unsupported` in a named workspace or for a hub without a config
+    /// file, `not_found` for a box the hub does not have, `bad_request` for a box the hub
+    /// connects to (ssh or command: it has no token) or files that do not parse.
+    pub async fn box_token(&self, name: &str, caller: &Caller) -> Result<Value, RpcError> {
+        if caller.is_orchestrator() {
+            return Err(rpc(
+                codes::UNAUTHORIZED,
+                "only the user changes box tokens (`twr box token`, `twr box remove`)",
+            ));
+        }
+        if let Some(w) = &self.inner.workspace {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                format!(
+                    "boxes belong to the default workspace's hub, not workspace {w}'s: run it \
+                     without -w"
+                ),
+            ));
+        }
+        let Some(file) = self.inner.config_file.clone() else {
+            return Err(rpc(
+                codes::UNSUPPORTED,
+                "this hub was started without a config file to read boxes from",
+            ));
+        };
+        // One at a time (with `box.add` and the others), from before the box is looked up to
+        // the change: a `box.add` that read the box's token before a removal has registered
+        // it by then, and is revoked here.
+        let _one = self.inner.box_files_lock.lock().await;
+        let Some(rbox) = self.inner.remote(name) else {
+            return Err(rpc(
+                codes::NOT_FOUND,
+                format!("the hub has no box {name:?}"),
+            ));
+        };
+        if rbox.transport() != BoxTransport::Token {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                format!(
+                    "box {name} is a box the hub connects to (ssh or command): it has no token"
+                ),
+            ));
+        }
+        let config = tokio::task::spawn_blocking(move || {
+            Config::load_with_boxes(&file).map_err(|e| error_without_values(&e))
+        })
+        .await
+        .map_err(|e| rpc(codes::INTERNAL, format!("reading the config: {e}")))?
+        .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+        let files = config
+            .boxes
+            .get(name)
+            .filter(|c| c.transport() == BoxTransport::Token)
+            .and_then(|c| c.token.clone());
+        // The files' token, checked as at startup; one too short is not taken.
+        let (token, warning, refused) = match files {
+            Some(t) => {
+                match twr_core::runner::check_token_len(&t, &format!("boxes.{name}.token")) {
+                    Ok(w) => (Some(t), w, None),
+                    Err(e) => (None, None, Some(e)),
+                }
+            }
+            None => (None, None, None),
+        };
+        let accepting = token.is_some();
+        let changed = runners::set_box_token(
+            &self.inner,
+            &rbox,
+            Secret::new(token.clone().unwrap_or_default()),
+        );
+        if let Some(c) = self.inner.boxes_mut().configs.get_mut(name) {
+            c.token = token;
+        }
+        if let Some(w) = warning {
+            self.inner.warn(w);
+        }
+        tracing::info!(box_name = %name, changed, accepting, "box token read again");
+        if let Some(e) = refused {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                format!("{e}; the hub no longer accepts box {name}'s runner"),
+            ));
+        }
+        Ok(json!({ "box": name, "changed": changed, "accepting": accepting }))
     }
 
     /// Adds box `name` with `cfg` as `box.add` would, without reading any file (tests).

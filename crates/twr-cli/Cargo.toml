@@ -23,6 +23,8 @@ anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 hex.workspace = true
+# `term::read_hidden_line`: the terminal's settings (termios).
+libc.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true

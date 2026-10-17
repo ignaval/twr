@@ -89,8 +89,9 @@ impl Hub {
             config_file: opts.config_file,
             change_request_timeout: opts.change_request_timeout,
             box_switch: opts.box_switch,
-            box_install_lock: tokio::sync::Mutex::new(()),
+            box_files_lock: tokio::sync::Mutex::new(()),
             box_files_read_hook: opts.box_files_read_hook,
+            socket_removed_hook: opts.socket_removed_hook,
             box_dialer: opts.box_dialer,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
@@ -218,6 +219,14 @@ impl Hub {
                 false
             }
         });
+    }
+
+    /// [`HubOptions::socket_removed_hook`], when set: `server::serve` awaits it once the
+    /// socket is removed.
+    pub(crate) async fn socket_removed(&self) {
+        if let Some(hook) = &self.inner.socket_removed_hook {
+            hook().await;
+        }
     }
 
     /// Waits, at most `within`, until no operation that changes the repositories or worktrees

@@ -5674,3 +5674,348 @@ async fn a_remote_attach_refuses_a_session_id_that_reads_as_an_option() {
     assert!(h.hub().get_thread(&t).unwrap()["attached"].is_null());
     h.shutdown().await;
 }
+
+// ------------------------------------------------------------------------------------------
+// Live token changes (`box.token`)
+// ------------------------------------------------------------------------------------------
+
+/// A hub with the runner listener whose box `gpu` comes from `boxes.toml` (token `token`)
+/// next to a `config.toml` it reads boxes from (`box.add`, `box.token`): the hub, and the
+/// `boxes.toml`.
+async fn hub_with_boxes_file(dir: &Path, token: &str) -> (TestHub, PathBuf) {
+    let cfg_dir = dir.join("cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let config_file = cfg_dir.join("config.toml");
+    let boxes_file = cfg_dir.join("boxes.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{token}\"\n")).unwrap();
+    let mut cfg = Config::load_with_boxes(&config_file).unwrap();
+    cfg.hub.listen = Some("127.0.0.1:0".into());
+    let mut opts = hub_opts(dir, cfg);
+    opts.config_file = Some(config_file);
+    (TestHub::start_opts(opts).await, boxes_file)
+}
+
+/// A raw runner of the box with `token`, online.
+async fn raw_online_with(h: &TestHub, token: &str) -> RawWs {
+    let mut ws = raw(&h.url).await;
+    raw_hello(&mut ws, hello(token)).await;
+    let Some(HubMsg::Welcome { .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    h.online().await;
+    ws
+}
+
+async fn box_token(h: &TestHub, caller: Caller) -> Result<Value, twr_core::proto::RpcError> {
+    h.run(|hub| async move { hub.box_token(BOX, &caller).await })
+        .await
+}
+
+/// A rotated token is taken live: `box.token` after the files changed drops the box's runner
+/// connection at once (offline, `runner.disconnected`), the runner with the old token is
+/// refused from then on, and one with the new token gets the box online; `box.projects` after
+/// it is no conflict (the hub compares against the token it runs with). Files without the box
+/// revoke it: nothing changes back, no runner is accepted. Users only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_token_change_is_taken_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let new = "gpu-token-rotated-0123456789abcdef";
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    assert_eq!(h.hub().info()["listening"], true);
+    let box_dir = dir.path().join("box");
+    let r = Runner::start(runner_opts(&h.url, &box_dir), open_box(&box_dir));
+    h.online().await;
+
+    // The files as they are: nothing changes.
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": false, "accepting": true}));
+    assert!(h.hub().boxes()[0].1, "still online");
+
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{new}\"\n")).unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": true}));
+    assert!(!v.to_string().contains(new));
+    // Offline in the same step, and its end recorded once.
+    assert!(!h.hub().boxes()[0].1, "offline at once");
+    assert_eq!(count(&log(h.hub(), HUB_THREAD), "runner.disconnected"), 1);
+    // The runner with the old token tries again and is refused.
+    wait_for("the old runner refused", || {
+        h.hub().box_refusal(BOX).is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!h.hub().boxes()[0].1, "the old token stays refused");
+    r.shutdown().await;
+    assert_eq!(count(&log(h.hub(), HUB_THREAD), "runner.disconnected"), 1);
+
+    let mut o = runner_opts(&h.url, &box_dir);
+    o.token = Secret::new(new);
+    let r = Runner::start(o, open_box(&box_dir));
+    h.online().await;
+    let v = h
+        .run(|hub| async move { hub.box_projects(BOX, &Caller::user("test")).await })
+        .await
+        .unwrap();
+    assert_eq!(v["box"], BOX);
+    // The orchestrator may not.
+    let e = box_token(&h, Caller::Orchestrator).await.unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{}", e.message);
+    assert!(h.hub().boxes()[0].1, "nothing changed");
+
+    // Files without the box: revoked.
+    std::fs::write(&boxes_file, "").unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": false}));
+    assert!(!h.hub().boxes()[0].1);
+    r.shutdown().await;
+    for token in [TOKEN, new] {
+        let mut ws = raw(&h.url).await;
+        let (nonce, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
+        let Some(HubMsg::Challenge { nonce: hub, proof }) = m else {
+            panic!("no challenge: {m:?}")
+        };
+        let token = Secret::new(token);
+        assert!(!check_auth_proof(
+            &token,
+            Prover::Hub,
+            BOX,
+            &nonce,
+            &hub,
+            &proof
+        ));
+        let mine = auth_proof(&token, Prover::Runner, BOX, &nonce, &hub);
+        raw_send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+        let m = raw_expect(&mut ws).await;
+        assert!(
+            matches!(&m, Some(HubMsg::Error { code, .. }) if code == hub_errors::UNAUTHORIZED),
+            "{m:?}"
+        );
+    }
+    // Revoked twice: no change.
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": false, "accepting": false}));
+    assert_eq!(count(&log(h.hub(), HUB_THREAD), "runner.disconnected"), 2);
+    let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains(new), "the token is never logged");
+    h.shutdown().await;
+}
+
+/// A token in the files that is too short is not taken: the old one is revoked all the same
+/// (the box's runner dropped, no runner accepted with either), and the answer says why without
+/// the token. A short one (16 to 31 characters) is taken, with the hub's warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_token_too_short_revokes_the_old_one_and_takes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let _old = raw_online_with(&h, TOKEN).await;
+    // It loads (the config's checks leave the length to the hub).
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"x\"\n")).unwrap();
+    let e = box_token(&h, Caller::user("test")).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(e.message.contains("is too short"), "{}", e.message);
+    assert!(e.message.contains("no longer accepts"), "{}", e.message);
+    assert!(!e.message.contains("\"x\""), "{}", e.message);
+    assert!(!h.hub().boxes()[0].1, "the old token's runner is dropped");
+    for token in [TOKEN, "x"] {
+        let mut ws = raw(&h.url).await;
+        let (nonce, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
+        let Some(HubMsg::Challenge { nonce: hub, .. }) = m else {
+            panic!("no challenge: {m:?}")
+        };
+        let mine = auth_proof(&Secret::new(token), Prover::Runner, BOX, &nonce, &hub);
+        raw_send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+        let m = raw_expect(&mut ws).await;
+        assert!(
+            matches!(&m, Some(HubMsg::Error { code, .. }) if code == hub_errors::UNAUTHORIZED),
+            "{token}: {m:?}"
+        );
+    }
+    // A short one is taken, with a warning.
+    let short = "gpu-token-short-0123";
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{short}\"\n")).unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": true}));
+    let warnings = h.hub().info()["warnings"].to_string();
+    assert!(warnings.contains("boxes.gpu.token is short"), "{warnings}");
+    let _short = raw_online_with(&h, short).await;
+    h.shutdown().await;
+}
+
+/// Files that do not parse, a token on the offending line (a typo in a hand edit), in either
+/// file: `box.token` answers `bad_request` saying where and what, never the line or the
+/// value; nothing changes (the box's runner stays).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_token_read_of_broken_files_quotes_no_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let config_file = boxes_file.with_file_name("config.toml");
+    let _ws = raw_online_with(&h, TOKEN).await;
+    let secret = "gpu-token-typo-0123456789abcdef";
+    for (file, broken) in [
+        (&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{secret}\n")),
+        (
+            &boxes_file,
+            format!("[boxes.{BOX}]\ntransport = \"{secret}\"\n"),
+        ),
+        (
+            &config_file,
+            format!("default_runtime = \"fake\"\n[boxes.x]\ntoken = \"{secret}\n"),
+        ),
+    ] {
+        let before = std::fs::read_to_string(file).unwrap();
+        std::fs::write(file, &broken).unwrap();
+        let e = box_token(&h, Caller::user("test")).await.unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+        assert!(!e.message.contains(secret), "{}", e.message);
+        assert!(e.message.contains("line "), "{}", e.message);
+        let e = h
+            .run(|hub| async move { hub.box_add(BOX, &Caller::user("test")).await })
+            .await
+            .unwrap_err();
+        assert!(!e.message.contains(secret), "{}", e.message);
+        std::fs::write(file, before).unwrap();
+    }
+    assert!(h.hub().boxes()[0].1, "nothing changed");
+    h.shutdown().await;
+}
+
+/// A handshake that proved the old token, and finishes after `box.token` took a new one, is
+/// refused (`unauthorized`, a refusal shown for the box) instead of connecting with a token the
+/// hub no longer accepts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_handshake_that_overlaps_a_token_change_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let new = "gpu-token-rotated-0123456789abcdef";
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let token = Secret::new(TOKEN);
+    let mut ws = raw(&h.url).await;
+    let (nonce, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
+    let Some(HubMsg::Challenge { nonce: hub, proof }) = m else {
+        panic!("no challenge: {m:?}")
+    };
+    assert!(check_auth_proof(
+        &token,
+        Prover::Hub,
+        BOX,
+        &nonce,
+        &hub,
+        &proof
+    ));
+    // The token changes between the hub's challenge and the runner's proof.
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{new}\"\n")).unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v["changed"], true);
+    let mine = auth_proof(&token, Prover::Runner, BOX, &nonce, &hub);
+    raw_send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+    // Its proof was over the token its handshake read: authenticated, then refused.
+    let m = raw_expect(&mut ws).await;
+    assert!(matches!(m, Some(HubMsg::Authenticated)), "{m:?}");
+    raw_send(&mut ws, &RunnerMsg::Inventory(Inventory::default())).await;
+    match raw_expect(&mut ws).await {
+        Some(HubMsg::Error { code, message }) => {
+            assert_eq!(code, hub_errors::UNAUTHORIZED, "{message}");
+            assert!(message.contains("token changed"), "{message}");
+        }
+        other => panic!("expected unauthorized, got {other:?}"),
+    }
+    assert!(raw_expect(&mut ws).await.is_none());
+    let r = h.hub().box_refusal(BOX).expect("a refusal of the box");
+    assert!(r.reason.contains("token changed"), "{}", r.reason);
+    assert!(!h.hub().boxes()[0].1);
+    assert_eq!(count(&log(h.hub(), HUB_THREAD), "runner.connected"), 0);
+    // The new token connects.
+    let _new = raw_online_with(&h, new).await;
+    h.shutdown().await;
+}
+
+/// A `box.add` that read the box's token before a removal, and registers it after, does not
+/// bring the removed token back: the removal's `box.token` waits for the add (one at a time,
+/// from the add's read to its registration), then finds the box and revokes it. The old token
+/// stays refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_box_add_that_read_a_removed_box_does_not_bring_its_token_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    let config_file = cfg_dir.join("config.toml");
+    let boxes_file = cfg_dir.join("boxes.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    std::fs::write(&boxes_file, "").unwrap();
+    let mut cfg = Config::load_with_boxes(&config_file).unwrap();
+    cfg.hub.listen = Some("127.0.0.1:0".into());
+    let mut opts = hub_opts(dir.path(), cfg);
+    opts.config_file = Some(config_file);
+    // The slow read: armed, the next `box.add` says it has read the files, then waits.
+    type Gate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    let gate: Arc<Mutex<Option<Gate>>> = Arc::default();
+    let g = Arc::clone(&gate);
+    opts.box_files_read_hook = Some(Arc::new(move |_name: &str| {
+        let armed = g.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((read, release)) = armed {
+                let _ = read.send(());
+                let _ = release.await;
+            }
+        })
+    }));
+    let h = TestHub::start_opts(opts).await;
+
+    // `twr box add` wrote the box; its `box.add` reads it and waits.
+    std::fs::write(&boxes_file, format!("[boxes.{BOX}]\ntoken = \"{TOKEN}\"\n")).unwrap();
+    let (read_tx, read_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    *gate.lock().unwrap() = Some((read_tx, release_rx));
+    let hub = h.hub().clone();
+    let add =
+        h.rt.as_ref()
+            .unwrap()
+            .spawn(async move { hub.box_add(BOX, &Caller::user("test")).await });
+    tokio::time::timeout(WAIT, read_rx)
+        .await
+        .expect("box.add read the files")
+        .unwrap();
+    // `twr box remove` takes it out of the files and asks the hub to revoke it.
+    std::fs::write(&boxes_file, "").unwrap();
+    let hub = h.hub().clone();
+    let token =
+        h.rt.as_ref()
+            .unwrap()
+            .spawn(async move { hub.box_token(BOX, &Caller::user("test")).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!token.is_finished(), "box.token waits for the box.add");
+    release_tx.send(()).unwrap();
+    let v = tokio::time::timeout(WAIT, add)
+        .await
+        .expect("box.add ends")
+        .unwrap()
+        .unwrap();
+    assert_eq!(v["already"], false, "{v}");
+    let v = tokio::time::timeout(WAIT, token)
+        .await
+        .expect("box.token ends")
+        .unwrap()
+        .unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": false}));
+
+    // The removed token is refused.
+    let mut ws = raw(&h.url).await;
+    let (nonce, m) = raw_hello_only(&mut ws, BOX, PROTOCOL_VERSION).await;
+    let Some(HubMsg::Challenge { nonce: hub, .. }) = m else {
+        panic!("no challenge: {m:?}")
+    };
+    let mine = auth_proof(&Secret::new(TOKEN), Prover::Runner, BOX, &nonce, &hub);
+    raw_send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+    let m = raw_expect(&mut ws).await;
+    assert!(
+        matches!(&m, Some(HubMsg::Error { code, .. }) if code == hub_errors::UNAUTHORIZED),
+        "{m:?}"
+    );
+    assert!(!h
+        .hub()
+        .boxes()
+        .iter()
+        .any(|(n, online, _)| n == BOX && *online));
+    h.shutdown().await;
+}

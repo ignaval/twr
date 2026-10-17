@@ -2154,6 +2154,7 @@ mod tests {
     #[test]
     fn git_has_the_terminal_and_ctrl_c_stops_it_alone() {
         use std::io::Write as _;
+        use std::os::unix::process::CommandExt;
         if std::process::Command::new("script")
             .arg("--version")
             .output()
@@ -2169,14 +2170,27 @@ mod tests {
             twr_core::paths::sh_word(exe.to_str().unwrap())
         );
         let log = std::fs::File::create(d.path().join("log")).unwrap();
-        let mut script = std::process::Command::new("script")
+        let mut script = std::process::Command::new("script");
+        script
             .args(["-qec", &line, "/dev/null"])
             .env("TWR_TEST_FG_DIR", d.path())
             .stdin(Stdio::piped())
             .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
-            .unwrap();
+            .stderr(log);
+        // The terminal's session starts with Ctrl-C's SIGINT at its default action, as a
+        // login's does. Ignored by whatever ran the tests (a background job of a shell without
+        // job control ignores it), it would stay ignored through every exec: `script`, its
+        // shell (which cannot undo it), the child and `sleep`, which the ^C then does not stop.
+        // SAFETY: signal(2) is async-signal-safe; nothing else runs between fork and exec.
+        unsafe {
+            script.pre_exec(|| {
+                if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut script = script.spawn().unwrap();
         let mut typed = script.stdin.take().unwrap();
         let shown = || std::fs::read_to_string(d.path().join("log")).unwrap_or_default();
         let stat = d.path().join("stat");

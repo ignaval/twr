@@ -368,6 +368,15 @@ impl Paths {
         crate::config::BoxesFile::path_for(&self.config_file)
     }
 
+    /// Where `twr runner install-token <box>` keeps a dial-in box's token on the box, and
+    /// where `twr runner` looks for it by default: `runner-tokens/<box>.token` next to the
+    /// config file (`~/.config/twr/runner-tokens/`, `$TWR_HOME/runner-tokens/`).
+    pub fn runner_token_file(&self, box_name: &str) -> PathBuf {
+        self.config_file
+            .with_file_name("runner-tokens")
+            .join(format!("{box_name}.token"))
+    }
+
     /// SQLite database file.
     pub fn db_file(&self) -> PathBuf {
         self.data_dir.join("twr.db")
@@ -773,6 +782,27 @@ mod tests {
         assert_eq!(p.db_file(), PathBuf::from("/tmp/th/data/twr.db"));
         assert_eq!(p.worktrees_dir(), PathBuf::from("/tmp/th/data/worktrees"));
         assert_eq!(p.hub_log(), PathBuf::from("/tmp/th/data/hub.log"));
+        assert_eq!(
+            p.runner_token_file("gpu"),
+            PathBuf::from("/tmp/th/runner-tokens/gpu.token")
+        );
+    }
+
+    /// A runner's default token file is next to the config file, whatever the workspace.
+    #[test]
+    fn runner_token_files_are_next_to_the_config() {
+        let p = Paths::resolve(env(&[("HOME", "/home/u")])).unwrap();
+        assert_eq!(
+            p.runner_token_file("gpu"),
+            PathBuf::from("/home/u/.config/twr/runner-tokens/gpu.token")
+        );
+        let p = Paths::resolve(env(&[("HOME", "/home/u"), ("XDG_CONFIG_HOME", "/cfg")])).unwrap();
+        assert_eq!(
+            p.runner_token_file("gpu"),
+            PathBuf::from("/cfg/twr/runner-tokens/gpu.token")
+        );
+        let w = p.workspace("a").unwrap();
+        assert_eq!(w.runner_token_file("gpu"), p.runner_token_file("gpu"));
     }
 
     #[test]

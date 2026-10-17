@@ -5,10 +5,11 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, build, runner_protocol, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.info`          | -                                                   | `{version, build, runner_protocol, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
 //! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
+//! | `box.token`         | `{box}` (users only)                                | `{box, changed, accepting}`: token box `box` takes its token from `config.toml` / `boxes.toml` again, or none when they no longer give it one; a change drops its runner connection (`hub::boxes`). Never the token |
 //! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
@@ -179,8 +180,8 @@
 //! `trash.empty` purges items now and `trash.restore` puts a thread back (`hub::trash`): users
 //! only, not in `ORCHESTRATOR_METHODS`, and the hub refuses the orchestrator identity as
 //! well. Items are purged `[trash] keep_days` after their deletion. `box.add`,
-//! `box.install` and `box.restart` change the hub's boxes (`hub::boxes`): users only too,
-//! refused to the orchestrator and to agents alike.
+//! `box.install`, `box.restart`, `box.projects` and `box.token` change the hub's boxes
+//! (`hub::boxes`): users only too, refused to the orchestrator and to agents alike.
 //! `thread.send` succeeds once the prompt is queued (`queued` is its queue row id, and `ref`
 //! too: the message's ref); if dispatching it then failed, `dispatch_error` says why and the
 //! prompt stays queued. `say` returns the same `ref` when it queued the message (`send`,
@@ -504,7 +505,11 @@ pub async fn serve(
     }
     drop(listener);
     // Right away: a client that finds no socket may start a new hub while this one drains.
+    // This hub still takes runners until it exits, and holds its data directory's lock until
+    // then: a command that must reach every hub that may accept a box's runner (`twr box
+    // remove`, `twr box token`) waits for that lock when it finds no socket.
     socket.remove();
+    hub.socket_removed().await;
     hub.shutdown().await;
     let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
         while conns.join_next().await.is_some() {}
@@ -631,6 +636,7 @@ pub const METHODS: &[&str] = &[
     "box.install",
     "box.restart",
     "box.projects",
+    "box.token",
     "box.agents",
     "notify.looking",
     "usage.get",
@@ -1024,7 +1030,7 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
-            | "box.restart" | "box.projects" => {
+            | "box.restart" | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1843,6 +1849,17 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             }
             let p: BoxProjectsParams = params(p)?;
             hub.box_projects(&p.box_name, caller).await
+        }
+        // Reads the box's token from them again.
+        "box.token" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BoxTokenParams {
+                #[serde(rename = "box")]
+                box_name: String,
+            }
+            let p: BoxTokenParams = params(p)?;
+            hub.box_token(&p.box_name, caller).await
         }
         "context.read" => {
             let p: ProjectParams = params(p)?;

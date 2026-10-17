@@ -138,11 +138,8 @@ pub(super) async fn project(
         );
     }
     let Some(link) = BoxLink::of(cfg) else {
-        bail!(
-            "box {name} has no ssh destination ([boxes.{name}] ssh), so twr cannot look on it: \
-             add [boxes.{name}.projects.{}] repo = \"<path on the box>\" yourself",
-            toml_key(project)
-        );
+        // A dial-in box: twr can't look on it, so only a path given is recorded, unchecked.
+        return dial_in(&entry, socket, req.path.as_deref(), req.clone).await;
     };
     let link = &link;
     if req.clone {
@@ -204,6 +201,42 @@ pub(super) async fn project(
         req.yes,
     )
     .await
+}
+
+/// `twr box project` of `entry`'s box, a dial-in one (no `ssh`), which twr can't look on:
+/// `path` (`--path`) recorded without checking ([`record`]: boxes.toml, then `box.projects`);
+/// without one, or with `--clone` (`clone`), refused before anything is written.
+async fn dial_in(
+    entry: &Entry<'_>,
+    socket: &Path,
+    path: Option<&str>,
+    clone: bool,
+) -> anyhow::Result<ExitCode> {
+    let name = entry.box_name;
+    let Some(path) = path.filter(|_| !clone) else {
+        bail!(
+            "twr can't look on box {name} (dial-in: its runner connects to the hub): give the \
+             repository's path there with --path (`twr box project {} {} --path <path on the \
+             box>`); a dial-in box's repository is cloned there by hand",
+            sh_word(name),
+            sh_word(entry.project)
+        );
+    };
+    check_box_path(path)?;
+    if entry.recorded() == Some(Path::new(path)) {
+        outln!(
+            "project {} on box {name} is recorded as {path} already",
+            entry.project
+        );
+        tell_hub(entry, socket, Some(path)).await;
+        return Ok(ExitCode::SUCCESS);
+    }
+    outln!(
+        "recorded without checking: twr can't look on a dial-in box (a thread on box {name} fails \
+         at its start when {path} is not the repository's top level)"
+    );
+    record(entry, socket, path).await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Refuses `twr box project --clone` without a terminal on stdin (`stdin`) and stdout
@@ -1696,6 +1729,50 @@ mod tests {
         )
         .unwrap();
         assert!(Entry::new(&config, &file, "gpu", "api", &loaded).is_err());
+    }
+
+    /// On a dial-in box (no `ssh`), `--path` is recorded without looking (no hub runs here:
+    /// nothing to tell), the same path again is no change, and without `--path`, or with
+    /// `--clone`, nothing is recorded.
+    #[tokio::test]
+    async fn a_dial_in_box_records_a_path_unchecked() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let file = BoxesFile::path_for(&config);
+        std::fs::write(&config, "").unwrap();
+        let lab = BoxConfig {
+            token: Some("t".repeat(64)),
+            ..BoxConfig::default()
+        };
+        let mut b = BoxesFile::default();
+        b.boxes.insert("lab".into(), lab.clone());
+        b.save(&file).unwrap();
+        let socket = dir.path().join("no-hub.sock");
+        let entry = Entry::new(&config, &file, "lab", "api", &lab).unwrap();
+        for (path, clone) in [(None, false), (None, true)] {
+            let e = dial_in(&entry, &socket, path, clone).await.unwrap_err();
+            assert!(
+                format!("{e:#}").contains("give the repository's path there with --path"),
+                "{e:#}"
+            );
+        }
+        assert!(dial_in(&entry, &socket, Some("code/api"), false)
+            .await
+            .is_err());
+        assert!(BoxesFile::load(&file).unwrap().boxes["lab"]
+            .projects
+            .is_empty());
+        dial_in(&entry, &socket, Some("/srv/api"), false)
+            .await
+            .unwrap();
+        let now = BoxesFile::load(&file).unwrap().boxes["lab"].clone();
+        assert_eq!(now.projects["api"].repo, PathBuf::from("/srv/api"));
+        assert_eq!(now.token, lab.token);
+        let entry = Entry::new(&config, &file, "lab", "api", &lab).unwrap();
+        dial_in(&entry, &socket, Some("/srv/api"), false)
+            .await
+            .unwrap();
+        assert_eq!(BoxesFile::load(&file).unwrap().boxes["lab"], now);
     }
 
     #[test]

@@ -42,7 +42,9 @@
 //! # Optional: what `twr box login` and `twr box project --clone` run in your terminal.
 //! terminal_command = ["docker", "exec", "-i", "-t", "twr-sandbox"]
 //!
-//! # A box whose runner connects to the hub's listener (`[hub] listen`) with a token.
+//! # A box whose runner connects to the hub's listener (`[hub] listen`) with a token: a
+//! # dial-in box. `twr box add lab --dial-in --hub <url>` writes one to boxes.toml, with a new
+//! # token, and `twr runner install-token lab` stores the token on the box.
 //! [boxes.lab]
 //! token = "..."                 # the runner's token (`--token-file` / TWR_RUNNER_TOKEN); never logged
 //!                               # or sent (16 characters at least; `twr runner token` prints one)
@@ -292,15 +294,23 @@ pub struct NotifyConfig {
 pub fn exposed_config_warning(config: &Config, file: &Path, mode: u32) -> Option<String> {
     let secrets =
         config.boxes.values().any(|b| b.token.is_some()) || !config.notify.command.is_empty();
+    exposed_file_warning(
+        file,
+        mode,
+        secrets.then_some("a box token or a [notify] command"),
+    )
+}
+
+/// The warning for `file` with permission bits `mode` when it `holds` a secret (what, in
+/// words) and group or others can access it.
+fn exposed_file_warning(file: &Path, mode: u32, holds: Option<&str>) -> Option<String> {
     let mode = mode & 0o777;
-    (secrets && mode & 0o077 != 0).then(|| {
-        format!(
-            "{} holds a box token or a [notify] command and other users can access it (mode \
-             {mode:03o}): run `chmod 600 {}`",
-            file.display(),
-            crate::paths::sh_word(&file.to_string_lossy())
-        )
-    })
+    let holds = holds.filter(|_| mode & 0o077 != 0)?;
+    Some(format!(
+        "{} holds {holds} and other users can access it (mode {mode:03o}): run `chmod 600 {}`",
+        file.display(),
+        crate::paths::sh_word(&file.to_string_lossy())
+    ))
 }
 
 /// Longest `[notify] timeout_secs`.
@@ -1242,17 +1252,16 @@ impl Config {
         roots.iter().filter_map(|r| expand_home(r, home)).collect()
     }
 
-    /// What the hub warns about when it starts with this config, read from `file` (`hub.info`
-    /// `warnings`, and its log): box tokens shorter than [`crate::runner::TOKEN_GOOD_LEN`],
-    /// and a file holding a box token or a `[notify]` command that other users can access
-    /// ([`exposed_config_warning`]). Without a file, or one whose mode cannot be read, only
-    /// the config itself is checked.
+    /// What the hub warns about when it starts with this config, read from `file` and the
+    /// `boxes.toml` next to it ([`Config::load_with_boxes`]; `hub.info` `warnings`, and its
+    /// log): box tokens shorter than [`crate::runner::TOKEN_GOOD_LEN`], and either file when it
+    /// holds a secret and other users can access it ([`exposed_config_warning`]). Each file is
+    /// judged by its own secrets: `file`'s are the tokens of the boxes `boxes.toml` does not
+    /// hold, and `[notify]`; `boxes.toml`'s are its tokens. Without a file only the config
+    /// itself is checked; a file whose mode cannot be read is not.
     pub fn warnings(&self, file: Option<&Path>) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
-        let file_mode = file.and_then(|f| {
-            let mode = std::fs::metadata(f).ok()?.permissions().mode();
-            Some((f, mode))
-        });
+        let mode_of = |f: &Path| Some(std::fs::metadata(f).ok()?.permissions().mode());
         let mut out: Vec<String> = self
             .boxes
             .iter()
@@ -1263,7 +1272,26 @@ impl Config {
                     .flatten()
             })
             .collect();
-        out.extend(file_mode.and_then(|(file, mode)| exposed_config_warning(self, file, mode)));
+        let Some(file) = file else {
+            return out;
+        };
+        let boxes_file = BoxesFile::path_for(file);
+        // (A `boxes.toml` that does not load: the config could not have loaded either.)
+        let added = BoxesFile::load(&boxes_file).unwrap_or_default().boxes;
+        let own = self
+            .boxes
+            .iter()
+            .any(|(name, b)| b.token.is_some() && !added.contains_key(name))
+            || !self.notify.command.is_empty();
+        let own = own.then_some("a box token or a [notify] command");
+        out.extend(mode_of(file).and_then(|mode| exposed_file_warning(file, mode, own)));
+        let theirs = added
+            .values()
+            .any(|b| b.token.is_some())
+            .then_some("a box token");
+        out.extend(
+            mode_of(&boxes_file).and_then(|mode| exposed_file_warning(&boxes_file, mode, theirs)),
+        );
         out
     }
 
@@ -1396,9 +1424,10 @@ pub struct BoxesFile {
 /// What [`BoxesFile::save`] writes at the top of `boxes.toml` (comments in the file are not
 /// kept: twr rewrites it whole).
 const BOXES_FILE_HEADER: &str = "\
-# Written by twr: `twr box add`, `twr box remove`, `twr box install` and `twr box project`
-# change this file, and rewrite it whole (comments are not kept). Configure anything else in
-# config.toml, next to it; a box named in both files is an error.
+# Written by twr: `twr box add`, `twr box remove`, `twr box install`, `twr box project` and
+# `twr box token --rotate` change this file, and rewrite it whole (comments are not kept). It
+# may hold box tokens: keep it private (mode 0600). Configure anything else in config.toml,
+# next to it; a box named in both files is an error.
 ";
 
 impl BoxesFile {
@@ -1580,9 +1609,120 @@ impl BoxesLock {
     }
 }
 
+/// `e`, an error loading the config files (`{e:#}`), without what of their text it quotes, for
+/// a message that leaves the hub (an RPC's error, a log line): a TOML parse error shows the
+/// offending line, which may be a token's (`token = "..."` with a typo), and names a value it
+/// refused (`unknown variant `...``). Of such an error, the source excerpt (its `|` gutter
+/// lines) is left out, and each quoted or backticked span of
+/// [`crate::runner::TOKEN_MIN_LEN`] characters or more (shorter ones are no token the hub
+/// takes) is replaced with `…`; where it is (the file, its line and column) and what is wrong
+/// stay. twr's own checks of the loaded config ([`Config::validate`]) quote no token and are
+/// kept whole.
+pub fn error_without_values(e: &anyhow::Error) -> String {
+    let full = format!("{e:#}");
+    if !full.contains("TOML parse error") {
+        return full;
+    }
+    let gutter = |l: &str| {
+        let t = l
+            .trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit());
+        t.trim_start().starts_with('|')
+    };
+    full.lines()
+        .filter(|l| !gutter(l))
+        .map(redact_long_spans)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `line` with each span between two `"` or two `` ` `` of [`crate::runner::TOKEN_MIN_LEN`]
+/// characters or more replaced with `…` ([`error_without_values`]).
+fn redact_long_spans(line: &str) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(start) = rest.find(['"', '`']) {
+        let quote = rest[start..].chars().next().unwrap_or('"');
+        out.push_str(&rest[..=start]);
+        let after = &rest[start + 1..];
+        match after.find(quote) {
+            Some(end) => {
+                let span = &after[..end];
+                if span.chars().count() >= crate::runner::TOKEN_MIN_LEN {
+                    out.push('…');
+                } else {
+                    out.push_str(span);
+                }
+                out.push(quote);
+                rest = &after[end + 1..];
+            }
+            // An unclosed quote: what follows it may be a value too.
+            None => {
+                if after.chars().count() >= crate::runner::TOKEN_MIN_LEN {
+                    out.push('…');
+                } else {
+                    out.push_str(after);
+                }
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An error loading the files that leaves the hub holds no value of theirs: a token on a
+    /// line TOML can't parse, one in a refused value, in either file; where and what stay.
+    #[test]
+    fn config_errors_leave_values_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let boxes = BoxesFile::path_for(&config);
+        let secret = "s3cretTOKENvalue0123456789";
+        let cases = [
+            format!("[boxes.lab]\ntoken = \"{secret}\n"),
+            format!("[boxes.lab]\ntransport = \"{secret}\"\n"),
+            format!("[boxes.lab]\ntoken = '{secret}\n"),
+            format!("[boxes.lab]\nssh = 5 # {secret}\n"),
+        ];
+        for (file, other) in [(&config, &boxes), (&boxes, &config)] {
+            for case in &cases {
+                std::fs::write(file, case).unwrap();
+                std::fs::write(other, "").unwrap();
+                let e = Config::load_with_boxes(&config).unwrap_err();
+                assert!(
+                    format!("{e:#}").contains("s3cret"),
+                    "the raw error quotes it: {e:#}"
+                );
+                let said = error_without_values(&e);
+                assert!(!said.contains("s3cret"), "{said}");
+                assert!(said.contains("line 2"), "{said}");
+                assert!(said.contains(&file.display().to_string()), "{said}");
+            }
+        }
+        assert_eq!(
+            redact_long_spans("unknown variant `0123456789abcdef`, expected one of `token`"),
+            "unknown variant `…`, expected one of `token`"
+        );
+        assert_eq!(
+            redact_long_spans("box \"gpu\" and \"x"),
+            "box \"gpu\" and \"x"
+        );
+        // twr's own checks, which quote no token, are kept whole.
+        std::fs::write(
+            &boxes,
+            "[boxes.fwd]\ntransport = \"ssh\"\nssh = \"-A me@fwd.example\"\n",
+        )
+        .unwrap();
+        std::fs::write(&config, "").unwrap();
+        let e = Config::load_with_boxes(&config).unwrap_err();
+        assert!(format!("{e:#}").contains("-A me@fwd.example"), "{e:#}");
+        assert_eq!(error_without_values(&e), format!("{e:#}"));
+    }
 
     /// `[threads] cpu_weight` / `memory_high` and `[projects.<name>] trim_idle_after` are
     /// checked when the config loads.
@@ -2493,7 +2633,7 @@ mod tests {
         assert!(text.starts_with("# Written by twr"), "{text}");
         assert!(text.contains("config.toml"), "{text}");
         assert!(
-            !text.contains("token") && !text.contains("projects]\n\n"),
+            !text.contains("\ntoken") && !text.contains("projects]\n\n"),
             "{text}"
         );
         // It loads as part of the config next to it.
@@ -2603,6 +2743,45 @@ mod tests {
         assert_eq!(mode, 0o600, "{cmd}");
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(notify.warnings(Some(&p)).is_empty());
+    }
+
+    /// Each file is judged by its own secrets: a token only in `boxes.toml` does not make a
+    /// readable `config.toml` a warning, and a readable `boxes.toml` holding one is, naming
+    /// it. A token in `config.toml` still names `config.toml`.
+    #[test]
+    fn each_config_file_is_judged_by_its_own_secrets() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let boxes = BoxesFile::path_for(&config);
+        let token = "k".repeat(32);
+        let chmod = |p: &Path, mode: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        std::fs::write(&config, "default_runtime = \"fake\"\n").unwrap();
+        std::fs::write(&boxes, format!("[boxes.lab]\ntoken = \"{token}\"\n")).unwrap();
+        chmod(&config, 0o644);
+        chmod(&boxes, 0o600);
+        let merged = Config::load_with_boxes(&config).unwrap();
+        assert_eq!(merged.warnings(Some(&config)), Vec::<String>::new());
+
+        chmod(&boxes, 0o644);
+        let w = merged.warnings(Some(&config));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with(&boxes.display().to_string()), "{w:?}");
+        assert!(w[0].contains("holds a box token and"), "{w:?}");
+        assert!(w[0].contains("(mode 644)"), "{w:?}");
+
+        // A token in config.toml: that file's warning, and boxes.toml's own.
+        std::fs::write(&config, format!("[boxes.gpu]\ntoken = \"{token}\"\n")).unwrap();
+        let merged = Config::load_with_boxes(&config).unwrap();
+        let w = merged.warnings(Some(&config));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].starts_with(&config.display().to_string()), "{w:?}");
+        assert!(w[1].starts_with(&boxes.display().to_string()), "{w:?}");
+        chmod(&boxes, 0o600);
+        chmod(&config, 0o600);
+        assert_eq!(merged.warnings(Some(&config)), Vec::<String>::new());
     }
 
     #[test]
