@@ -92,8 +92,9 @@
 //! sessions the inventory reported as running, minus the runs whose `exited` frame the replay
 //! brought (the inventory as of the end of the replay):
 //! - the log shows a live runtime the runner does not run: closing sequence, `thread.crashed`
-//!   ("the runner lost the process", e.g. it restarted; `thread.stopped` when a `thread.stop`
-//!   asked for it) — unless the hub is still waiting for that session's `spawn` / `resume`
+//!   ("the runner lost the process", e.g. it restarted; `thread.stopped` when a stop was
+//!   asked for it: a `thread.stop`, or a settings restart or a box switch, with its reason) —
+//!   unless the hub is still waiting for that session's `spawn` / `resume`
 //!   (sent again once the box is ready). A crash gets its reactions (block_kind, error item,
 //!   the automatic retry when due) but nothing from the queue;
 //! - the runner runs a session the hub does not (the log says stopped, parked, attached or
@@ -1482,7 +1483,8 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
                         && !v.parked
                         && v.attached.is_none() =>
                 {
-                    // A runtime the user asked to stop is closed as stopped.
+                    // A runtime whose stop was asked for (a `thread.stop`, a settings restart,
+                    // a box switch) is closed as stopped, with that stop's reason.
                     let exit = if stop_requested {
                         Exit::Stopped
                     } else {
@@ -1501,7 +1503,14 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
                                 tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot react to a lost runtime");
                             }
                         }
-                        Ok(()) => {}
+                        // The stop's reason (a switch's, a settings restart's) went into the
+                        // closing sequence and ends with the runtime, as `finish_exit` clears an
+                        // exit's: a later stop must not take it over.
+                        Ok(()) => {
+                            if let Some(rt) = core.rt.get_mut(&v.id) {
+                                rt.restart_reason = None;
+                            }
+                        }
                         Err(e) => {
                             tracing::error!(thread = %v.id, error = %format!("{e:#}"), "cannot close a lost runtime")
                         }

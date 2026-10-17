@@ -15,22 +15,28 @@
 //! `thread.stop` during the drain leaves its thread stopped, and a new thread, a park or a
 //! deletion on the box during the drain is refused (`box_offline`, the box is switching); a
 //! busy box (a running turn, an open permission) is not switched until it is quiet. A restart
-//! (`box.restart`) reconnects at once with a dial that restarts the daemon.
+//! (`box.restart`) reconnects at once with a dial that restarts the daemon. A daemon of another
+//! protocol (a stand-in that opens the channel and says so, in front of the daemon that runs
+//! the runtimes) is replaced at once, its runtimes recorded as stopped for the switch: their
+//! threads end `box_upgrade`, whether the new daemon replays their exits or has nothing of
+//! them, a user's stop stays plain, and that stop's reason does not outlive the runtime.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::FutureExt;
+use futures::{FutureExt, SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, watch};
+use tokio_tungstenite::tungstenite::Message;
 use twr_adapters::FakeAdapter;
 use twr_core::adapter::{Adapter, Answer};
 use twr_core::config::{BoxConfig, BoxTransport, Config};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
+use twr_core::runner::{new_nonce, Hello, RunnerMsg, PROTOCOL_VERSION};
 use twr_core::sealed::{hub_side, HubKey};
 use twr_hub::hub::SealedEnd;
 use twr_hub::listener::pre_auth_ws_config;
@@ -319,6 +325,130 @@ fn dialer(side: Arc<tokio::sync::Mutex<BoxSide>>, hold: watch::Receiver<bool>) -
     })
 }
 
+/// The build of the box's daemon that speaks another protocol, and that protocol (one the hub
+/// refuses: older than the handshake of protocol 6).
+const OLD: &str = "00000000000000d5";
+const OLD_PROTOCOL: u32 = 5;
+
+/// A box whose daemon speaks another runner protocol, as the test dialer of
+/// [`replacing_dialer`] sees it.
+struct OldBox {
+    dir: PathBuf,
+    hub_key: [u8; 32],
+    /// The daemon that runs the first hub's runtimes: it stands for the old one, whose
+    /// connections speak [`OLD_PROTOCOL`] ([`old_daemon`]), until a dial replaces it.
+    daemon: Option<Daemon>,
+    /// The builds the dials that replace the daemon start, in turn (then this binary's).
+    builds: std::collections::VecDeque<String>,
+    replaced: bool,
+    /// Threads whose spooled frames the first replace loses: the new daemon has nothing of
+    /// their runtimes (neither running nor to replay).
+    lose: Vec<String>,
+    /// Whether each dial was to replace the daemon.
+    dials: Vec<bool>,
+}
+
+/// The dialer of a box whose daemon speaks [`OLD_PROTOCOL`]: dial `n` (from 0) waits until
+/// `allowed` is above `n`; until a dial replaces it, the daemon's connections speak that
+/// protocol ([`old_daemon`]); a dial that replaces it stops it (its runtimes stop, their exits
+/// spooled), drops what the spool holds of the threads [`OldBox::lose`] names, and starts a
+/// daemon of the next of [`OldBox::builds`] on the same data directory. The hub is told it
+/// launched this binary's build.
+fn replacing_dialer(
+    side: Arc<tokio::sync::Mutex<OldBox>>,
+    allowed: watch::Receiver<usize>,
+) -> BoxDialer {
+    Arc::new(move |name: String, dial: Dial| {
+        let side = Arc::clone(&side);
+        let mut allowed = allowed.clone();
+        async move {
+            assert_eq!(name, BOX);
+            // (Not under the lock: the test reads the dials meanwhile.)
+            let n = side.lock().await.dials.len();
+            let _ = allowed.wait_for(|a| *a > n).await;
+            let mut side = side.lock().await;
+            side.dials.push(dial.replace);
+            if dial.replace {
+                if let Some(old) = side.daemon.take() {
+                    old.stop().await;
+                }
+                if !side.replaced {
+                    lose_frames(&side.dir, &side.lose);
+                }
+                let build = side
+                    .builds
+                    .pop_front()
+                    .unwrap_or_else(|| own_build().to_string());
+                side.daemon = Some(Daemon::start_as(&side.dir, side.hub_key, &build).await);
+                side.replaced = true;
+            }
+            let io: Box<dyn BoxIo> = if side.replaced {
+                let socket = side.daemon.as_ref().expect("a daemon").socket.clone();
+                let (stream, _) = request(&socket, Request::Connect)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+                Box::new(stream)
+            } else {
+                Box::new(old_daemon(side.hub_key))
+            };
+            Ok((io, own_build().to_string()))
+        }
+        .boxed()
+    })
+}
+
+/// A connection to the box's old daemon, of build [`OLD`]: it opens the sealed channel and
+/// says it speaks [`OLD_PROTOCOL`], which the hub refuses.
+fn old_daemon(hub_key: [u8; 32]) -> tokio::io::DuplexStream {
+    let (hub_end, box_end) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let Ok(sealed) = twr_core::sealed::daemon_side(box_end, &hub_key, BOX, Some(OLD)).await
+        else {
+            return;
+        };
+        let Ok((mut ws, _)) = tokio_tungstenite::client_async("ws://twr-box/", sealed).await else {
+            return;
+        };
+        let hello = RunnerMsg::Hello(Hello {
+            box_name: BOX.into(),
+            protocol: OLD_PROTOCOL,
+            nonce: new_nonce().unwrap(),
+        });
+        let _ = ws
+            .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await;
+        // Until the hub's refusal closes it.
+        while let Some(Ok(_)) = ws.next().await {}
+    });
+    hub_end
+}
+
+/// Removes what the spool of the box daemon under `dir` holds of `threads` (the daemon is
+/// stopped), as if those frames had never been written: their runtimes' frames, their exits
+/// among them, are lost, and each thread's next frame takes the first lost one's `rseq` (the
+/// hub's watermark is just below it).
+fn lose_frames(dir: &Path, threads: &[String]) {
+    if threads.is_empty() {
+        return;
+    }
+    let db = rusqlite::Connection::open(dir.join("data").join(format!("runner-{BOX}.db"))).unwrap();
+    for t in threads {
+        let first: Option<i64> = db
+            .query_row("SELECT MIN(rseq) FROM outbox WHERE thread = ?1", [t], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let first = first.unwrap_or_else(|| panic!("the spool holds nothing of {t}"));
+        db.execute("DELETE FROM outbox WHERE thread = ?1", [t])
+            .unwrap();
+        db.execute(
+            "UPDATE rseq_alloc SET next = ?2 WHERE thread = ?1",
+            rusqlite::params![t, first],
+        )
+        .unwrap();
+    }
+}
+
 /// The first hub: connected to `daemon` without a supervisor, it makes threads `names` on the
 /// box and runs a turn on each (their runtimes stay up, idle); with `ask`, the first thread's
 /// next turn then waits on a permission. It shuts down (the runtimes keep running on the
@@ -329,6 +459,19 @@ async fn first_hub(
     key: &HubKey,
     names: &[&str],
     ask: bool,
+) -> Vec<String> {
+    first_hub_with(dir, daemon, key, names, ask, false).await
+}
+
+/// [`first_hub`], and with `busy`, the last thread's next turn runs on when the hub shuts down
+/// (it ran a tool and sleeps for a minute).
+async fn first_hub_with(
+    dir: &Path,
+    daemon: &Daemon,
+    key: &HubKey,
+    names: &[&str],
+    ask: bool,
+    busy: bool,
 ) -> Vec<String> {
     let hub = Hub::open(hub_opts(dir)).await.unwrap();
     let served = connect(&hub, daemon, key).await;
@@ -357,6 +500,12 @@ async fn first_hub(
         hub.send(&ids[0], "!perm Bash rm -rf build", TurnFrom::User, user())
             .unwrap();
         until_turn_event(&hub, &ids[0], "attention.raised", 2).await;
+    }
+    if busy {
+        let last = ids.last().unwrap();
+        hub.send(last, "!tool Bash ls\n!sleep 60000", TurnFrom::User, user())
+            .unwrap();
+        until_turn_event(&hub, last, "agent.tool_result", 2).await;
     }
     hub.shutdown().await;
     let _ = tokio::time::timeout(WAIT, served).await;
@@ -551,12 +700,10 @@ async fn a_quiet_box_switches_to_the_launched_build() {
         b["state"] == "online" && b["switch_pending"] == false
     })
     .await;
+    let (h, n) = (hub.clone(), format!("now on build {}", own_build()));
+    wait_for("the switch's end note", move || has_note(&h, &n)).await;
     let b = box_info(&hub);
     assert_eq!(b["build"], own_build(), "{b}");
-    assert!(
-        has_note(&hub, &format!("now on build {}", own_build())),
-        "{b}"
-    );
     assert_eq!(side.lock().await.dials, [false, true]);
     // The queued prompt runs once, on its session.
     until_turn_event(&hub, queued, "turn.ended", 2).await;
@@ -1061,5 +1208,198 @@ async fn a_restart_reconnects_to_a_new_daemon() {
     let hub = Hub::open(opts).await.unwrap();
     let e = hub.box_restart(BOX, &caller).unwrap_err();
     assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    hub.shutdown().await;
+}
+
+/// The box's daemon speaks a runner protocol the hub cannot serve (a hub upgrade across a
+/// protocol bump), so the hub refuses it and replaces it at once. Before the replace, the hub
+/// records the box's runtimes as stopped for the switch: the old daemon's exits, which the new
+/// one replays, close their threads `box_upgrade`, not crashed (no crash card, no error item,
+/// queues kept): the running turn ends `interrupted`, the prompt queued while the box was
+/// away runs on its own on the resumed session, and the next prompt of an idle thread resumes
+/// its session. A thread the user stopped meanwhile keeps a plain stop and stays stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemon_of_another_protocol_is_replaced_without_crash_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start(&box_dir, key.public()).await;
+    let ids = first_hub_with(
+        dir.path(),
+        &daemon,
+        &key,
+        &["idle", "queued", "stopped", "busy"],
+        false,
+        true,
+    )
+    .await;
+    let (idle, queued, stopped, busy) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+
+    let (allow, allowed) = watch::channel(0usize);
+    let side = Arc::new(tokio::sync::Mutex::new(OldBox {
+        dir: box_dir.clone(),
+        hub_key: key.public(),
+        daemon: Some(daemon),
+        builds: Default::default(),
+        replaced: false,
+        lose: Vec::new(),
+        dials: Vec::new(),
+    }));
+    let mut opts = hub_opts(dir.path());
+    opts.box_dialer = Some(replacing_dialer(Arc::clone(&side), allowed));
+    let hub = Hub::open(opts).await.unwrap();
+    let session = |t: &str| hub.get_thread(t).unwrap()["session_id"].clone();
+    let sessions: Vec<Value> = ids.iter().map(|t| session(t)).collect();
+    assert!(sessions.iter().all(Value::is_string), "{sessions:?}");
+    // While the box is away: a prompt is queued, and a stop is asked for (its runtime is
+    // still on the box).
+    let sent = hub
+        .send(queued, "after the replace", TurnFrom::User, user())
+        .unwrap();
+    assert_eq!((sent.turn, sent.pending), (None, 1), "{sent:?}");
+    let stop = hub.stop_thread(stopped, "test").unwrap();
+    assert_eq!(stop["stopping"], true, "{stop}");
+
+    // The first dial reaches the old daemon, which is refused; the replace waits.
+    allow.send(1).unwrap();
+    let note = format!(
+        "the box's daemon speaks runner protocol {OLD_PROTOCOL}, which this hub (protocol \
+         {PROTOCOL_VERSION}) cannot serve: replacing it; its 3 agent(s) stop, and each \
+         thread's next prompt resumes its session (1 running turn(s) cut)"
+    );
+    let (h, n) = (hub.clone(), note.clone());
+    wait_for("the replace's note", move || has_note(&h, &n)).await;
+    assert_eq!(box_info(&hub)["state"], "switching", "{}", box_info(&hub));
+    for t in &ids {
+        assert!(stop_reasons(&hub, t).is_empty(), "{t}");
+    }
+    allow.send(2).unwrap();
+
+    let h = hub.clone();
+    wait_for("the box online on the new daemon", move || {
+        online(&h) && box_info(&h)["state"] == "online"
+    })
+    .await;
+    assert_eq!(side.lock().await.dials, [false, true]);
+    // The switch's end notes it after the reconcile has put the box online.
+    let (h, n) = (hub.clone(), format!("now on build {}", own_build()));
+    wait_for("the switch's end note", move || has_note(&h, &n)).await;
+    // The queued prompt runs once, on its session, without anyone acting.
+    until_turn_event(&hub, queued, "turn.ended", 2).await;
+    let prompts: Vec<String> = events(&hub, queued)
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::TurnStarted(t) => Some(t.prompt.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prompts, ["alpha beta", "after the replace"]);
+    assert_eq!(session(queued), sessions[1]);
+    // The running turn was cut.
+    let ended: Vec<TurnResult> = events(&hub, busy)
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::TurnEnded(t) if e.turn == Some(2) => Some(t.result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ended, [TurnResult::Interrupted]);
+    for t in [idle, queued, busy] {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(hub.get_thread(t).unwrap()["stopped"], false, "{t}");
+    }
+    // The stopped one stays stopped: a plain stop, nothing more run.
+    assert_eq!(stop_reasons(&hub, stopped), [None]);
+    assert_eq!(hub.get_thread(stopped).unwrap()["stopped"], true);
+    assert_eq!(count(&hub, stopped, "turn.started"), 1);
+    for t in &ids {
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+        assert_eq!(error_items(&hub, t), 0, "{t}");
+    }
+    // The idle and the busy ones resume their sessions on their next prompt.
+    for (i, t) in [(0, idle), (3, busy)] {
+        hub.send(t, "gamma", TurnFrom::User, user()).unwrap();
+        until_turn_event(&hub, t, "turn.ended", if i == 0 { 2 } else { 3 }).await;
+        assert_eq!(session(t), sessions[i], "{t}");
+    }
+    hub.shutdown().await;
+}
+
+/// A runtime the replaced daemon's successor has nothing of (neither running nor in its
+/// replay) is closed by the reconciliation as stopped for the switch too, and that stop's
+/// reason ends with it: the next prompt resumes the session, a mode change then restarts the
+/// runtime (`mode_change`), and the box's next switch (its new daemon runs another build than
+/// the one launched) is not held up by a runtime that looks stopped already.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runtime_the_new_daemon_lost_ends_stopped_and_its_reason_with_it() {
+    const NEXT: &str = "00000000000000e1";
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start(&box_dir, key.public()).await;
+    let ids = first_hub(dir.path(), &daemon, &key, &["lost"], false).await;
+    let lost = &ids[0];
+
+    let (_allow, allowed) = watch::channel(usize::MAX);
+    let side = Arc::new(tokio::sync::Mutex::new(OldBox {
+        dir: box_dir.clone(),
+        hub_key: key.public(),
+        daemon: Some(daemon),
+        builds: [NEXT.to_string()].into(),
+        replaced: false,
+        lose: vec![lost.clone()],
+        dials: Vec::new(),
+    }));
+    let mut opts = hub_opts(dir.path());
+    opts.box_dialer = Some(replacing_dialer(Arc::clone(&side), allowed));
+    // Quiet long enough that the resume and the mode change below come first: each step
+    // follows the last within milliseconds, so 5 s leaves room on a loaded machine.
+    opts.box_switch = SwitchTiming {
+        quiet: Duration::from_secs(5),
+        check: Duration::from_millis(50),
+        drain: Duration::from_secs(20),
+    };
+    let hub = Hub::open(opts).await.unwrap();
+    let session = hub.get_thread(lost).unwrap()["session_id"].clone();
+    assert!(session.is_string(), "{session}");
+    let h = hub.clone();
+    wait_for("the box online on the new daemon", move || {
+        online(&h) && box_info(&h)["running_build"] == NEXT
+    })
+    .await;
+    assert_eq!(stop_reasons(&hub, lost), [upgrade()]);
+    assert_eq!(hub.get_thread(lost).unwrap()["stopped"], false);
+    assert_eq!(count(&hub, lost, "thread.crashed"), 0);
+    assert_eq!(error_items(&hub, lost), 0);
+
+    // The next prompt resumes the session.
+    hub.send(lost, "gamma", TurnFrom::User, user()).unwrap();
+    until_turn_event(&hub, lost, "turn.ended", 2).await;
+    assert_eq!(hub.get_thread(lost).unwrap()["session_id"], session);
+    // A mode change restarts the runtime.
+    let r = hub.set_mode(lost, "manual", &Caller::user("test")).unwrap();
+    assert_eq!(r["applies"], "now", "{r}");
+    let h = hub.clone();
+    let t = lost.clone();
+    wait_for("the mode change's restart", move || {
+        stop_reasons(&h, &t).len() == 2
+    })
+    .await;
+    assert_eq!(
+        stop_reasons(&hub, lost),
+        [upgrade(), Some(MODE_RESTART_REASON.to_string())]
+    );
+    // The box is switched to the launched build once quiet.
+    let h = hub.clone();
+    wait_for("the box on the launched build", move || {
+        online(&h) && box_info(&h)["running_build"] == own_build()
+    })
+    .await;
+    assert_eq!(side.lock().await.dials, [false, true, true]);
+    assert!(has_note(
+        &hub,
+        &format!("switching to build {}", own_build())
+    ));
+    assert_eq!(count(&hub, lost, "thread.crashed"), 0);
     hub.shutdown().await;
 }

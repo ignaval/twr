@@ -927,6 +927,17 @@ impl ThreadRt {
     fn giving_up(&self) -> bool {
         self.live.as_ref().is_some_and(|l| l.given_up.is_some()) || self.reaping > 0
     }
+
+    /// Its runtime is being stopped or restarted already, for whatever reason: a stop was asked
+    /// for (a `thread.stop`, a settings restart, a box switch), its exit is being recorded, or
+    /// the hub gave up on it.
+    fn stopping(&self) -> bool {
+        self.exiting
+            || self.stop_requested
+            || self.restart_reason.is_some()
+            || self.giving_up()
+            || self.live.as_ref().is_some_and(|l| l.stop_requested)
+    }
 }
 
 /// An `attach.begin` in progress or granted.

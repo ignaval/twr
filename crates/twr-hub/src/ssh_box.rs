@@ -45,7 +45,15 @@
 //!    first minute of an outage, then at most 30 s; reset by a welcomed session, as a token
 //!    runner's). A daemon that speaks another runner protocol was refused at its hello: the
 //!    next attempt passes `--replace` at once, so the relay replaces it with the build the hub
-//!    launches (its runtimes end; the reconciliation closes their threads with crash cards).
+//!    launches. Its runtimes end with it, and the hub cannot tell what they were doing, so it
+//!    first records every runtime the log shows on the box as stopped for the switch and sets
+//!    the box's `switching` gate (`Hub::begin_blind_box_switch`, `hub::box_switch`; the notes
+//!    say so): the exits the new daemon replays, and the reconciliation for a runtime it has
+//!    nothing of, close their threads as `thread.stopped` with `ext.twr.reason` =
+//!    `box_upgrade`, as a switch does (below), not with crash cards. Their open turns end
+//!    `interrupted`, their queues are kept, and each thread's next prompt resumes its session.
+//!    A runtime the user asked to stop stays a plain stop. Only a refusal on the hub's own
+//!    connection does this (a token box's refusal comes before any proof).
 //!    When the build launched is the one refused (a box of another OS or CPU whose configured
 //!    build speaks another protocol, after a twr upgrade), it is not launched again: the box
 //!    is `needs_install` ("box <b> runs a twr build that speaks protocol <n>, the hub <m>:
@@ -2415,7 +2423,7 @@ async fn connect(
             if let Some(why) = sbox.link.failure(name, code, &lines) {
                 sbox.st().last_error = Some(why);
             }
-            session_ended(name, id, end, &hello, switched)
+            after_session(hub, sbox, id, end, &hello, switched)
         }
         Err(why) => {
             let why = match sbox.link.failure(name, code, &lines) {
@@ -2501,9 +2509,48 @@ async fn dialed(
     )
     .await
     {
-        Ok((end, hello, switched)) => session_ended(name, &id, end, &hello, switched),
+        Ok((end, hello, switched)) => after_session(hub, sbox, &id, end, &hello, switched),
         Err(why) => Attempt::Failed(State::Offline, why),
     }
+}
+
+/// [`session_ended`] of a session of box `sbox`, and when the next attempt is to replace a
+/// daemon refused for its protocol, the hub first records the box's runtimes as stopped for
+/// the switch (`Hub::begin_blind_box_switch`; see the module docs), and the notes say so.
+fn after_session(
+    hub: &Hub,
+    sbox: &SshBox,
+    id: &str,
+    end: SealedEnd,
+    hello: &DaemonHello,
+    switched: bool,
+) -> Attempt {
+    let name = sbox.name();
+    let refused = end.protocol_refused;
+    let attempt = session_ended(name, id, end, hello, switched);
+    if let (Some(p), Attempt::Session { replace: true, .. }) = (refused, &attempt) {
+        let mut note = format!(
+            "the box's daemon speaks runner protocol {p}, which this hub (protocol {}) cannot \
+             serve: replacing it",
+            twr_core::runner::PROTOCOL_VERSION
+        );
+        match hub.begin_blind_box_switch(name) {
+            Some((0, _)) => {}
+            Some((k, running)) => {
+                note.push_str(&format!(
+                    "; its {k} agent(s) stop, and each thread's next prompt resumes its session"
+                ));
+                if running > 0 {
+                    note.push_str(&format!(" ({running} running turn(s) cut)"));
+                }
+            }
+            None => {
+                note.push_str("; its agents could not be recorded as stopped (their threads crash)")
+            }
+        }
+        sbox.remark(note);
+    }
+    attempt
 }
 
 /// How a session with box `name`'s daemon (launched: build `id`) that ended as `end` went for
