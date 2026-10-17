@@ -16,6 +16,9 @@ fn twr_cmd() -> Command {
     let mut c = Command::new(TWR);
     c.env_remove("TWR_WORKSPACE");
     c.env("TWR_TEST_USER_TOKEN_FILE", test_token());
+    // No hub or runner of a test runs the user's login shell or real agent CLIs.
+    c.env("TWR_AGENT_PROBE", "off");
+    c.env("TWR_BOX_PROBE", "off");
     c
 }
 
@@ -1367,6 +1370,17 @@ fn info_prints_the_hub_and_its_orchestrator() {
     let v: Value = serde_json::from_str(&ok(home, &["info", "--json"])).unwrap();
     assert_eq!(v["orchestrator"]["runtime"], "fake");
     assert_eq!(v["instance"], instance);
+}
+
+/// A hub started with `TWR_AGENT_PROBE=off` (every test's: [`twr_cmd`]) runs none of the
+/// user's agent CLIs: its own box's agents stay not reported.
+#[test]
+fn a_hub_without_its_agent_probe_reports_no_local_agents() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let _hub = start_hub_with(home, &[("TWR_AGENT_PROBE", "off")]);
+    let v: Value = serde_json::from_str(&ok(home, &["info", "--json"])).unwrap();
+    assert_eq!(v["agents"], serde_json::json!([]), "{v}");
 }
 
 #[test]

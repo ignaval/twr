@@ -5,9 +5,10 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, switch_pending}], client, identity, warnings}` |
+//! | `hub.info`          | -                                                   | `{version, build, runner_protocol, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, switch_pending, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
+//! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
@@ -232,7 +233,7 @@ use twr_core::proto::{
 use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
-    wait_state, AgentPeer, AgentWhy, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
+    wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
     StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
@@ -627,6 +628,7 @@ pub const METHODS: &[&str] = &[
     "config.show",
     "box.add",
     "box.install",
+    "box.agents",
     "notify.looking",
     "usage.get",
     "usage.threads",
@@ -686,6 +688,7 @@ pub const METHODS: &[&str] = &[
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hello",
     "hub.info",
+    "box.agents",
     "config.show",
     "thread.new",
     "thread.spawn",
@@ -762,6 +765,7 @@ pub const AGENT_METHODS: &[&str] = &[
     "job.list",
     "job.log",
     "hub.info",
+    "box.agents",
     "thread.list",
     "thread.activity",
     "usage.get",
@@ -1038,6 +1042,17 @@ async fn connection(
             }
             "hello" => {
                 let result = hello(&hub, &mut conn, req.params).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            // What the caller sees of the box depends on who it is (`hub::box_agents`).
+            "box.agents" => {
+                let result = box_agents(&hub, &conn, &caller, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -2142,6 +2157,31 @@ fn no_longer_orchestrator() -> RpcError {
     )
 }
 
+/// How much of the boxes `caller` on `conn` sees: everything for a user, a box's state and
+/// agents for the orchestrator and a thread's agent (`hub::box_agents`).
+fn box_view(conn: &Conn, caller: &Caller) -> BoxView {
+    if caller.is_orchestrator() || conn.restricted().is_some() {
+        BoxView::Limited
+    } else {
+        BoxView::Full
+    }
+}
+
+/// `box.agents {box, refresh?}` for `caller` on `conn` (`refresh`: users only).
+async fn box_agents(hub: &Hub, conn: &Conn, caller: &Caller, p: Value) -> Result<Value, RpcError> {
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BoxAgentsParams {
+        #[serde(rename = "box")]
+        box_name: String,
+        #[serde(default)]
+        refresh: bool,
+    }
+    let p: BoxAgentsParams = params(p)?;
+    hub.box_agents(&p.box_name, p.refresh, box_view(conn, caller))
+        .await
+}
+
 fn call(
     hub: &Hub,
     conn: &mut Conn,
@@ -2152,7 +2192,8 @@ fn call(
     let client = conn.client.clone();
     match method {
         "hub.info" => {
-            let mut info = hub.info();
+            // The orchestrator and agents see less of the boxes (`hub::box_agents`).
+            let mut info = hub.info_for(box_view(conn, caller));
             info["client"] = json!(client);
             info["identity"] = json!(conn.identity(caller));
             Ok(info)

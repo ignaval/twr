@@ -282,8 +282,11 @@ fn opts(hub: &FakeHub, dir: &Path) -> RunnerOptions {
     o
 }
 
-/// The built-in adapters with the fake one (production registries leave it out).
+/// The built-in adapters with the fake one (production registries leave it out), and no
+/// login shell asked or agent CLI probed (`box_options` asks the user's): no real shell or
+/// agent CLI runs under a test.
 fn with_fake(mut o: LocalBoxOptions) -> LocalBoxOptions {
+    o.env = twr_runner::BoxEnv::none();
     o.adapters = Arc::new(|n: &str| {
         twr_adapters::registry_with(true)
             .into_iter()
@@ -778,6 +781,15 @@ async fn a_restarted_runner_replays_its_spool_and_continues_rseq() {
         lbox.spool().next_rseq("t1").unwrap(),
         hub.committed("t1").len() as u64 + 1
     );
+}
+
+/// A test's box asks no login shell and probes no agent CLI, though a runner's own box
+/// options ask the user's.
+#[test]
+fn a_tests_box_asks_nothing_of_the_users_environment() {
+    let o = RunnerOptions::new("ws://127.0.0.1:1/", Secret::new(TOKEN), BOX, "/nonexistent");
+    assert_eq!(o.box_options().env, twr_runner::BoxEnv::user());
+    assert_eq!(with_fake(o.box_options()).env, twr_runner::BoxEnv::none());
 }
 
 #[tokio::test]

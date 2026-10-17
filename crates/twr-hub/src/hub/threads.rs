@@ -13,9 +13,9 @@ use twr_core::proto::{codes, RpcError};
 
 use super::lifecycle::data_dir_of;
 use super::{
-    append_err, find_project, git, internal, orch, project_read, rpc, runtime_spec, twr_ext_map,
-    Batch, BatchPrompt, Caller, Core, Exit, Hub, Inner, NewThread, Planned, SendOutcome, LOCAL_BOX,
-    MAX_ALIASES,
+    append_err, box_agents, find_project, git, internal, orch, project_read, rpc, runtime_spec,
+    twr_ext_map, Batch, BatchPrompt, Caller, Core, Exit, Hub, Inner, NewThread, Planned,
+    SendOutcome, LOCAL_BOX, MAX_ALIASES,
 };
 use crate::host::ThreadHost;
 use crate::remote::BoxOp;
@@ -207,7 +207,7 @@ impl Hub {
         let mode = self.thread_mode(&req, caller, &runtime)?;
         let model = thread_model(&req, cfg)?;
         let local = !host.is_remote();
-        let effort = thread_effort(&req, &runtime, local)?;
+        let effort = thread_effort(&req, &runtime)?;
         if caller.is_orchestrator() && !target.configured {
             self.refuse_orchestrator_dir(&host, &target.repo, remote)
                 .await?;
@@ -243,6 +243,22 @@ impl Hub {
                 match local {
                     true => self.refuse_other_workspace(Path::new(d)),
                     false => Ok(()),
+                }
+            })
+            .and_then(|()| {
+                // The effort against the `claude` the thread's spawn will run: resolved with
+                // its environment in its directory, as the spawn resolves it.
+                let env = cfg.thread_env(target.configured.then_some(target.project.as_str()));
+                match effort.as_ref().and_then(|_| {
+                    runtime_spec::effort_refusal(
+                        &runtime,
+                        local,
+                        &env,
+                        Path::new(&workspace.worktree),
+                    )
+                }) {
+                    Some(why) => Err(rpc(codes::BAD_REQUEST, why)),
+                    None => Ok(()),
                 }
             });
         if let Err(e) = refused {
@@ -318,6 +334,11 @@ impl Hub {
         }
         let view = core.view(&id)?.clone();
         let mut out = core.thread_json(&view);
+        // Advisory: the box's last report says its agent CLI is not there (`hub::box_agents`).
+        if let Some(w) = box_agents::agent_warning(&self.inner, &box_name, &view.runtime) {
+            tracing::info!(thread = %id, box_name = %box_name, "{w}");
+            out["warning"] = json!(w);
+        }
         if let Ok(done) = created {
             if let Some(row) = done.queued.first() {
                 let sent = core.dispatch_queued(&self.inner, &id, *row);
@@ -893,21 +914,14 @@ fn thread_model(req: &NewThread, cfg: &Config) -> Result<Option<String>, RpcErro
 }
 
 /// The reasoning effort of a new thread on `runtime`: `effort` canonicalized
-/// (`runtime_spec::canonical_effort`; unset, blank or `default`: the runtime's default), and
-/// refused for a Claude Code thread on the hub's own box (`local`) whose installed version is
-/// known not to take one (`runtime_spec::effort_refusal`).
-fn thread_effort(req: &NewThread, runtime: &str, local: bool) -> Result<Option<String>, RpcError> {
+/// (`runtime_spec::canonical_effort`; unset, blank or `default`: the runtime's default). Once
+/// its directory is made, `thread.new` refuses it for a Claude Code thread on the hub's own box
+/// whose `claude` is known not to take one (`runtime_spec::effort_refusal`).
+fn thread_effort(req: &NewThread, runtime: &str) -> Result<Option<String>, RpcError> {
     let Some(effort) = &req.effort else {
         return Ok(None);
     };
-    let effort =
-        runtime_spec::canonical_effort(effort, runtime).map_err(|e| rpc(codes::BAD_REQUEST, e))?;
-    if effort.is_some() {
-        if let Some(why) = runtime_spec::effort_refusal(runtime, local) {
-            return Err(rpc(codes::BAD_REQUEST, why));
-        }
-    }
-    Ok(effort)
+    runtime_spec::canonical_effort(effort, runtime).map_err(|e| rpc(codes::BAD_REQUEST, e))
 }
 
 impl Hub {

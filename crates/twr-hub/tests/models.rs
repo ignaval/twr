@@ -935,3 +935,80 @@ async fn clears_are_fine_with_a_move_to_another_runtime() {
     );
     hub.shutdown().await;
 }
+
+/// The effort is checked against the `claude` the thread's spawn would run: a project whose
+/// `env` `PATH` names another `claude` (known not to list `--effort`) is refused at
+/// `thread.new` and `thread.set_model`; a thread without that `PATH` is not.
+#[tokio::test]
+async fn the_effort_is_checked_against_the_threads_own_claude() {
+    use twr_adapters::claude_code::cli::{lookup, Lookup};
+    if std::env::var_os("TWR_CLAUDE_BIN").is_some_and(|v| !v.is_empty()) {
+        eprintln!("skipped: TWR_CLAUDE_BIN names the binary, the PATH does not choose it");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // An older `claude` in the project's own `PATH`: options listed, `--effort` not.
+    let bin = root.join("old-claude");
+    std::fs::create_dir(&bin).unwrap();
+    let src = root.join("claude.src");
+    std::fs::write(
+        &src,
+        "#!/bin/sh\ncase \"$1\" in\n--help) printf 'Options:\\n  --model <model>  Model\\n  \
+         -p, --print  Print\\n';;\n--version) echo '2.1.100 (Claude Code)';;\nesac\n",
+    )
+    .unwrap();
+    // Copied, not written in place: a fork elsewhere holding it open would make exec'ing it
+    // fail (ETXTBSY).
+    let st = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&src)
+        .arg(bin.join("claude"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let repo = root.join("proj");
+    std::fs::create_dir(&repo).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    // What an earlier spawn of that thread read of it (the hub never probes for this).
+    let env = vec![("PATH".to_string(), path.clone())];
+    let resolved = twr_adapters::resolve::resolve(Path::new("claude"), &env, None, &repo);
+    if let Lookup::Probe(p) = lookup(&resolved, &repo, WAIT) {
+        p.wait().await;
+    }
+    let mut o = opts(&root);
+    o.config.projects.insert(
+        "old".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            env: [("PATH".to_string(), path)].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let req = |effort: Option<&str>| NewThread {
+        project: "old".into(),
+        runtime: Some("claude-code".into()),
+        name: Some(format!("old-{}", effort.unwrap_or("none"))),
+        effort: effort.map(str::to_string),
+        no_worktree: true,
+        ..Default::default()
+    };
+    let e = hub.new_thread(req(Some("high")), "test").await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
+    assert!(e.message.contains("does not support --effort"), "{e}");
+    assert!(e.message.contains("2.1.100"), "{e}");
+    // Nothing was recorded: the name is free.
+    assert!(hub.thread_view("old-high").is_err());
+    hub.new_thread(req(None), "test").await.unwrap();
+    let e = hub
+        .set_model("old-none", None, Some("high"), &user())
+        .unwrap_err();
+    assert!(e.message.contains("does not support --effort"), "{e}");
+    // A thread of another directory, without that `PATH`: its `claude` is not known.
+    let mut other = new_req(&root, "elsewhere", "claude-code");
+    other.effort = Some("high".into());
+    let v = hub.new_thread(other, "test").await.unwrap();
+    assert_eq!(v["effort"], "high", "{v}");
+    hub.shutdown().await;
+}

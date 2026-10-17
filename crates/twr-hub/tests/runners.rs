@@ -624,6 +624,7 @@ async fn raw_hello(ws: &mut RawWs, h: Hello) {
         runtimes: h.runtimes,
         worktrees: h.worktrees,
         build: None,
+        agents: Vec::new(),
     };
     raw_send(ws, &RunnerMsg::Inventory(inv)).await;
 }

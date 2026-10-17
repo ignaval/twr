@@ -112,6 +112,7 @@ mod append;
 mod attach;
 mod attention;
 mod background;
+mod box_agents;
 mod box_switch;
 mod boxes;
 mod closing;
@@ -160,6 +161,9 @@ pub use agents::{
 pub use append::{rejection, InvalidEvent};
 pub use attach::AttachGrant;
 pub use attention::Relay;
+pub use box_agents::{
+    own_agent_probe, AgentProbe, AgentsPoll, BoxView, AGENTS_EVERY, AGENTS_FIRST, AGENTS_TIMEOUT,
+};
 pub(crate) use boxes::WeakHub;
 pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
@@ -372,6 +376,13 @@ pub struct HubOptions {
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
     pub box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// How the hub probes its own box's agent CLIs (`hub.info` `agents`, `box.agents local`;
+    /// [`own_agent_probe`] for `twr hub`); `None` (the default, and tests): it probes none and
+    /// reports none.
+    pub agent_probe: Option<AgentProbe>,
+    /// When the hub asks the remote boxes for their agent CLIs, and probes its own again
+    /// ([`AgentsPoll::default`]; tests shorten it).
+    pub agents_poll: AgentsPoll,
 }
 
 /// [`HubOptions::marker_read_hook`].
@@ -423,6 +434,8 @@ impl HubOptions {
             reap_job_group_hook: None,
             job_members_hook: None,
             box_dialer: None,
+            agent_probe: None,
+            agents_poll: AgentsPoll::default(),
         }
     }
 }
@@ -565,6 +578,11 @@ pub struct SendOutcome {
     /// The thread is parked: the prompt waits in the queue until `thread.resume`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub parked: bool,
+    /// Advisory: no runtime of the thread runs, so this prompt starts (or resumes) one, now
+    /// or once it is dispatched, and the thread's box reports its agent's CLI missing
+    /// (`hub::box_agents`). The prompt is queued either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// `ext.twr.reason` of the `thread.stopped` the hub records for a runtime its own shutdown
@@ -614,6 +632,10 @@ struct Inner {
     box_switch: crate::ssh_box::SwitchTiming,
     /// [`HubOptions::box_dialer`].
     box_dialer: Option<crate::ssh_box::BoxDialer>,
+    /// The hub's own box's agent CLIs ([`HubOptions::agent_probe`], `hub::box_agents`).
+    local_agents: Arc<box_agents::LocalAgents>,
+    /// [`HubOptions::agents_poll`].
+    agents_poll: AgentsPoll,
     /// [`HubOptions::worktree_namespace`]: the branch namespace of the hub's own box, also the
     /// SSH boxes' ([`crate::remote`]).
     worktree_namespace: Option<String>,
@@ -1398,8 +1420,23 @@ impl Core {
         if from == TurnFrom::User {
             batch.user_send();
         }
+        // Read before the dispatch, which may start it.
+        let starts = self.rt.get(id).and_then(|r| r.live.as_ref()).is_none();
         let queued = self.commit_prompts(hub, batch)?;
-        Ok(self.dispatch_queued(hub, id, queued))
+        let mut out = self.dispatch_queued(hub, id, queued);
+        if starts {
+            out.warning = self.start_warning(hub, id);
+        }
+        Ok(out)
+    }
+
+    /// What a change that starts or restarts thread `id`'s runtime is warned of: its box
+    /// reports the runtime's CLI missing (`hub::box_agents`).
+    fn start_warning(&self, hub: &Inner, id: &str) -> Option<String> {
+        let view = self.registry.get(id)?;
+        let w = box_agents::agent_warning(hub, &view.box_name, &view.runtime)?;
+        tracing::info!(thread = %id, box_name = %view.box_name, "{w}");
+        Some(w)
     }
 
     /// Checks that thread `id` can take `prompt` now and adds it to `batch` (queued when the
@@ -1499,6 +1536,7 @@ impl Core {
             pending,
             dispatch_error,
             parked,
+            warning: None,
         }
     }
 
@@ -2091,18 +2129,32 @@ impl Hub {
             .unwrap_or(twr_core::paths::DEFAULT_WORKSPACE)
     }
 
-    /// `hub.info`.
+    /// `hub.info` as a user sees it ([`Hub::info_for`]).
     pub fn info(&self) -> Value {
+        self.info_for(BoxView::Full)
+    }
+
+    /// `hub.info` as `view` sees it: the orchestrator and agents see less of the boxes and
+    /// their agents (`hub::box_agents`).
+    pub fn info_for(&self, view: BoxView) -> Value {
         // Read before taking the core: the hub's machine, where its local threads run.
         let load = twr_core::load::Load::sample_cached().map(|l| l.to_json());
-        let boxes = self.boxes_json();
+        let boxes: Vec<Value> = self
+            .boxes_json()
+            .into_iter()
+            .map(|b| box_agents::project_box(b, view))
+            .collect();
+        let agents = self.local_agents_json(view);
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
         let core = self.inner.core();
         json!({
             "boxes": boxes,
+            "agents": agents,
             "version": twr_core::version(),
             "build": build,
+            // The runner protocol its boxes' runners must speak (`twr box doctor` compares).
+            "runner_protocol": twr_core::runner::PROTOCOL_VERSION,
             "pid": std::process::id(),
             "db": self.inner.db_path,
             "instance": self.inner.instance_name,

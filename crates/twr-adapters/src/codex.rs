@@ -214,11 +214,10 @@ impl CodexAdapter {
         self
     }
 
-    /// The binary this adapter runs.
+    /// The binary this adapter runs ([`crate::resolve::select_program`]: this adapter's own,
+    /// else [`BIN_ENV`], else `codex`; an empty one counts as unset).
     pub fn bin(&self) -> PathBuf {
-        self.bin
-            .clone()
-            .or_else(|| std::env::var_os(BIN_ENV).map(PathBuf::from))
+        crate::resolve::select_program(NAME, self.bin.as_deref(), |k| std::env::var_os(k))
             .unwrap_or_else(|| PathBuf::from("codex"))
     }
 }
@@ -818,22 +817,13 @@ pub fn thread_params(cfg: &SpawnConfig) -> anyhow::Result<Open> {
     })
 }
 
-/// `bin` resolved through `PATH` when it has no directory part.
-fn resolve(bin: &Path) -> Option<PathBuf> {
-    if bin.components().count() > 1 {
-        return Some(bin.to_path_buf());
-    }
-    std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join(bin))
-        .find(|p| p.is_file())
-}
-
 /// The program to record as `ext.twr.exe`: `bin`, unless it is a script (`#!`), whose process
-/// shows the interpreter as `argv[0]`.
-fn exe_of(bin: &Path) -> Option<String> {
-    let path = resolve(bin)?;
+/// shows the interpreter as `argv[0]`. `found` is the file it resolved to
+/// ([`crate::resolve::resolve`], on the runtime's `PATH`).
+fn exe_of(bin: &Path, found: Option<&Path>) -> Option<String> {
+    let path = found?;
     let mut head = [0u8; 2];
-    let n = std::fs::File::open(&path)
+    let n = std::fs::File::open(path)
         .and_then(|mut f| f.read(&mut head))
         .ok()?;
     (n < 2 || &head != b"#!").then(|| bin.to_string_lossy().into_owned())
@@ -926,7 +916,7 @@ impl Adapter for CodexAdapter {
         process::check_wrapped(&cfg.wrap, &bin, &cfg.env, &cfg.cwd, &missing_fix())?;
         let child = cmd
             .spawn()
-            .map_err(|e| process::start_error(e, &bin, &cfg.cwd, &missing_fix()))?;
+            .map_err(|e| process::start_error(e, &bin, &cfg.env, &cfg.cwd, &missing_fix()))?;
         tracing::info!(
             thread = %cfg.thread,
             pid = ?child.id(),
@@ -938,7 +928,12 @@ impl Adapter for CodexAdapter {
             TranslatorOptions {
                 thinking: cfg.thinking,
                 pid: child.id(),
-                exe: exe_of(&bin),
+                exe: exe_of(
+                    &bin,
+                    crate::resolve::resolve(&bin, &cfg.env, None, &cfg.cwd)
+                        .found
+                        .as_deref(),
+                ),
                 client_version: env!("CARGO_PKG_VERSION").into(),
             },
             open,
@@ -1725,9 +1720,17 @@ mod tests {
         std::fs::write(&script, "#!/bin/sh\n").unwrap();
         let binary = dir.join("binary");
         std::fs::write(&binary, [0x7f, b'E', b'L', b'F']).unwrap();
-        assert_eq!(exe_of(&script), None);
-        assert_eq!(exe_of(&binary), Some(binary.to_string_lossy().into_owned()));
-        assert_eq!(exe_of(Path::new("/nonexistent/codex")), None);
+        assert_eq!(exe_of(&script, Some(&script)), None);
+        assert_eq!(
+            exe_of(&binary, Some(&binary)),
+            Some(binary.to_string_lossy().into_owned())
+        );
+        // A bare name is recorded as named, once it resolved to a binary.
+        assert_eq!(
+            exe_of(Path::new("codex"), Some(&binary)),
+            Some("codex".to_string())
+        );
+        assert_eq!(exe_of(Path::new("/nonexistent/codex"), None), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

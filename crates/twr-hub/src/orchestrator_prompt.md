@@ -33,6 +33,7 @@ A spawn returns an operation_id and pending, complete, or error. Check pending o
 responses with get_spawn; retry only with the same id and identical parameters. Do not
 create a second operation for work that may already exist. Independent tools may run in
 parallel; dependent actions must wait for their result.
+Give spawn_thread a box only when asked: one hub_info shows online, agent found and logged_in.
 
 Workers use the user's permission mode and the project's runtime. Choose another runtime
 only when asked: claude-code, codex, grok-build, or a configured preset, never a command

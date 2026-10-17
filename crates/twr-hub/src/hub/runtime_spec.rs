@@ -359,13 +359,19 @@ pub(crate) fn clear_refusal(
     ))
 }
 
-/// Why a thread of `runtime` on the hub's own box (`local`) cannot run with a reasoning
-/// effort, as far as the hub knows without probing: the installed Claude Code does not list
-/// `--effort` (`twr_adapters::claude_code::effort_refusal`, from what an earlier spawn read).
-/// A remote box's binaries are not known here (a spawn there refuses it itself).
-pub(crate) fn effort_refusal(runtime: &str, local: bool) -> Option<String> {
+/// Why a thread of `runtime` on the hub's own box (`local`), with the environment `env` and
+/// working directory `cwd` it is spawned with, cannot run with a reasoning effort, as far as
+/// the hub knows without probing: the Claude Code it would run does not list `--effort`
+/// (`twr_adapters::claude_code::effort_refusal`, from what an earlier spawn read). A remote
+/// box's binaries are not known here (a spawn there refuses it itself).
+pub(crate) fn effort_refusal(
+    runtime: &str,
+    local: bool,
+    env: &[(String, String)],
+    cwd: &std::path::Path,
+) -> Option<String> {
     (local && runtime == twr_adapters::claude_code::NAME)
-        .then(twr_adapters::claude_code::effort_refusal)
+        .then(|| twr_adapters::claude_code::effort_refusal(env, cwd))
         .flatten()
 }
 
@@ -602,8 +608,9 @@ mod tests {
         );
         assert_eq!(model_error("claude-fable-5-1"), None);
         // Only a local Claude Code thread is checked against its binary.
-        assert_eq!(effort_refusal("codex", true), None);
-        assert_eq!(effort_refusal("claude-code", false), None);
+        let root = std::path::Path::new("/");
+        assert_eq!(effort_refusal("codex", true, &[], root), None);
+        assert_eq!(effort_refusal("claude-code", false, &[], root), None);
     }
 
     /// A clear back to the runtime's default is refused only for a thread with a session whose

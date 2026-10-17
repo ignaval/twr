@@ -14,6 +14,9 @@ fn twr_cmd() -> Command {
     let mut c = Command::new(TWR);
     c.env_remove("TWR_WORKSPACE");
     c.env("TWR_TEST_USER_TOKEN_FILE", test_token());
+    // No hub or runner of a test runs the user's login shell or real agent CLIs.
+    c.env("TWR_AGENT_PROBE", "off");
+    c.env("TWR_BOX_PROBE", "off");
     c
 }
 

@@ -2162,7 +2162,9 @@ impl Core {
             .map_err(|e| rpc(codes::BAD_REQUEST, e))?
             .flatten();
         if effort.is_some() {
-            if let Some(why) = runtime_spec::effort_refusal(&runtime, true) {
+            // As the orchestrator is spawned: its directory, no configured environment.
+            let cwd = orchestrator_cwd(&hub.config);
+            if let Some(why) = runtime_spec::effort_refusal(&runtime, true, &[], &cwd) {
                 return Err(rpc(codes::BAD_REQUEST, why));
             }
         }

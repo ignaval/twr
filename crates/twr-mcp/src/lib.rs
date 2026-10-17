@@ -19,7 +19,9 @@
 //! `spawn_thread` has no `mode`: the thread gets the user's permission mode. Its `runtime` (and
 //! `set_model`'s) may only be a built-in agent runtime or a `[runtimes.<name>]` preset the user
 //! configured, never a command line (the hub refuses anything else from the orchestrator);
-//! without one the thread gets the project's runtime. `delete_thread` deletes nothing itself:
+//! without one the thread gets the project's runtime. Its `box` may be any box the hub has
+//! (`thread.new`'s, with its errors); `hub_info` shows the orchestrator each box's state and
+//! agent CLIs, nothing more (the hub's projection). `delete_thread` deletes nothing itself:
 //! the hub raises one delete card for all the threads named, which only the user answers;
 //! confirmed, the threads go to the trash. `list_trash` lists the trash (read only: only the
 //! user restores or purges items). `get_usage` says how much of each subscription's usage
@@ -194,6 +196,10 @@ pub struct SpawnThreadParams {
     /// Reasoning effort (defaults to the runtime's own); the values set_model lists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The box (machine) to run it on: `local` (the hub's own) or a configured box as hub_info
+    /// lists it. Defaults to the project's box, else `local`.
+    #[serde(default, rename = "box", skip_serializing_if = "Option::is_none")]
+    pub box_name: Option<String>,
     /// Retry key. Reuse this id and identical parameters after a lost response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -962,7 +968,7 @@ impl TwrMcp {
                           (2-4 words) saying what the thread does, unique among the threads, \
                           such as notifications-design or review-last-3 (letters, digits, \
                           ., _ and -; it also names the branch twr/<name>). Returns \
-                          {thread_name, thread, send?, machine_load?}: the \
+                          {thread_name, thread, send?, machine_load?, warning?}: the \
                           thread's name, the thread, with a prompt the send result, and when \
                           this machine is busy or saturated, machine_load saying how loaded. Its \
                           permission mode (threads.default_mode) is the user's setting; you \
@@ -978,7 +984,13 @@ impl TwrMcp {
                           opened. Errors: `ambiguous` lists the matching repositories (ask the \
                           user which one, then pass its absolute path); `not_found` names the \
                           folders searched (ask the user for the absolute path; they can also \
-                          add it to their config). Never guess a path or a similar name."
+                          add it to their config). Never guess a path or a similar name. \
+                          `box` runs it on another machine: a box hub_info lists (or `local`, \
+                          the hub's own), when the user asks for one; choose one that is \
+                          online and whose agents show the runtime found and logged_in. A box \
+                          that is not configured or not online is `box_offline`. Without `box`: \
+                          the project's box, else local. A `warning` in the result means the \
+                          box reports the runtime's CLI missing: tell the user."
     )]
     async fn spawn_thread(
         &self,
@@ -1465,12 +1477,15 @@ impl TwrMcp {
 
     #[tool(
         description = "What the running hub reports about itself: {version, pid, started_at, \
-                       threads, open_attention, orchestrator, boxes: [{name, transport, state, \
-                       online, version, refused, last_error, notes, os, arch, build, \
-                       running_build, switch_pending}], identity (its workspace and home), \
-                       load}. load is how loaded the hub's machine is, where its local threads \
-                       run: {level: calm | busy | \
-                       saturated, summary, cpu_pressure, memory_pressure, io_pressure (the \
+                       threads, open_attention, orchestrator, boxes: [{name, state, online, \
+                       version, agents}], agents, identity (its workspace and home), load}. \
+                       boxes are the other machines threads can run on (spawn_thread `box`); \
+                       state is online, offline, connecting, switching, needs_install or \
+                       error. agents (top level: the hub's own machine, `local`) are the agent \
+                       CLIs a box has: [{runtime, found, login: logged_in | logged_out | \
+                       unknown}], empty until the box has reported them. load is how loaded \
+                       the hub's machine is, where its local threads run: {level: calm | busy \
+                       | saturated, summary, cpu_pressure, memory_pressure, io_pressure (the \
                        share of the last 10 s that work waited, %), load1, cores}, or null. \
                        JSON.",
         annotations(read_only_hint = true)
@@ -1683,6 +1698,30 @@ pub async fn serve_stdio(socket: PathBuf, pages: Vec<(String, String)>) -> anyho
 mod tests {
     use super::*;
     use tokio::io::AsyncBufReadExt;
+
+    /// A `thread.set_model` result's `warning` (the box reports the runtime's CLI missing)
+    /// reaches the orchestrator with the rest of it.
+    #[test]
+    fn a_set_model_warning_reaches_the_orchestrator() {
+        let w = "box gpu reports no `grok` on its PATH; the thread may fail to start: run `twr \
+                 box doctor gpu`";
+        let r = json!({"thread_name": "w1", "thread": "T1", "runtime": "grok-build",
+                       "runtime_changed": true, "warning": w});
+        let v: Value = serde_json::from_str(&AboutThread::result(&r)).unwrap();
+        assert_eq!(v["warning"], w, "{v}");
+        assert_eq!(v["thread_name"], "w1");
+        // So does a `thread.send` that starts the runtime, and a `thread.set_mode` that
+        // restarts it.
+        for r in [
+            json!({"thread_name": "w1", "thread": "T1", "queued": 3, "ref": 3, "turn": 2,
+                   "pending": 0, "warning": w}),
+            json!({"thread_name": "w1", "thread": "T1", "mode": "auto", "changed": true,
+                   "applies": "now", "warning": w}),
+        ] {
+            let v: Value = serde_json::from_str(&AboutThread::result(&r)).unwrap();
+            assert_eq!(v["warning"], w, "{v}");
+        }
+    }
 
     #[tokio::test]
     async fn lines_longer_than_the_cap_fail_the_read() {

@@ -19,8 +19,8 @@ use twr_core::event::{AttentionReason, TurnFrom, TurnResult, HUB_THREAD};
 use twr_core::reduce::{AttentionItem, RequestContext, ThreadStatus, ThreadView};
 
 use crate::app::{
-    grid_columns, provider_label, reason_label, site_label, summary_str, AppState, DecisionRow,
-    Entry, EscDoes, NoticeLevel, Screen, DECISIONS_CAP, PROVIDERS, TWR_TOOL,
+    grid_columns, on_remote_box, provider_label, reason_label, site_label, summary_str, AppState,
+    BoxWord, DecisionRow, Entry, EscDoes, NoticeLevel, Screen, DECISIONS_CAP, PROVIDERS, TWR_TOOL,
 };
 use crate::edit::{cluster_width, clusters};
 use crate::icon;
@@ -1032,31 +1032,99 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
     rows
 }
 
-/// "Threads": one line per thread, `api · running · editing src/main.rs`.
+/// "Threads": one line per thread, `api · running · editing src/main.rs`, with the box token
+/// of a thread whose box is not simply online (`api · idle · @gpu offline · idle`). That token
+/// and the status keep their place: the name and the activity are cut first
+/// ([`compact_row_spans`]).
 fn compact_thread_rows(state: &AppState, width: usize) -> CompactRows {
     state
         .compact_threads()
         .into_iter()
         .map(|id| {
             let name = compact_name(state, &id);
-            let status = state.registry.get(&id).map(card_status).unwrap_or_default();
+            let thread = state.registry.get(&id);
+            let status = thread.map(card_status).unwrap_or_default();
+            // The box token only when the box is not simply online: phone rows stay short.
+            let token = thread
+                .filter(|t| state.box_word(t).is_some())
+                .and_then(|t| box_token(state, t));
             let activity = state
                 .activity
                 .get(&id)
                 .map(|a| a.activity.clone())
                 .unwrap_or_default();
-            let mut spans = vec![
-                Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" · "),
-                Span::styled(status, Style::default().fg(Color::Cyan)),
-            ];
-            if !activity.is_empty() {
-                spans.push(Span::raw(" · "));
-                spans.push(Span::styled(activity, Style::default().fg(Color::DarkGray)));
-            }
+            let spans = compact_row_spans(name, status, token.as_ref(), activity, width);
             (id, Line::from(cut_spans(spans, width)))
         })
         .collect()
+}
+
+/// A compact Threads row, `name · status · token · activity`, fitted to `width` with the
+/// status and a box token (a box not simply online: `@gpu offline`) kept first: the activity
+/// is cut or dropped, then the name cut (to one cell, `…`), then the box's name
+/// ([`BoxToken::fit`]), then the status (cut, then dropped); the box's state goes last.
+/// Without a token, as given (the row is cut at its end).
+fn compact_row_spans(
+    name: String,
+    status: String,
+    token: Option<&BoxToken>,
+    activity: String,
+    width: usize,
+) -> Vec<Span<'static>> {
+    use crate::edit::width as cells;
+    const SEP: usize = 3; // " · "
+    let row = |name: String, status: String, token: Vec<Span<'static>>, activity: String| {
+        let mut spans = vec![Span::styled(
+            name,
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        // (Dropped only to leave a token its room.)
+        if !status.is_empty() || token.is_empty() {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(status, Style::default().fg(Color::Cyan)));
+        }
+        if !token.is_empty() {
+            spans.push(Span::raw(" · "));
+            spans.extend(token);
+        }
+        if !activity.is_empty() {
+            spans.push(Span::raw(" · "));
+            spans.push(Span::styled(activity, Style::default().fg(Color::DarkGray)));
+        }
+        spans
+    };
+    let Some(token) = token else {
+        return row(name, status, Vec::new(), activity);
+    };
+    let room = width.saturating_sub(cells(&status) + token.width() + 2 * SEP);
+    if room >= 1 {
+        let whole = token.fit(usize::MAX);
+        if cells(&name) >= room {
+            return row(truncate_cells(&name, room), status, whole, String::new());
+        }
+        let left = room - cells(&name);
+        let activity = if activity.is_empty() || left <= SEP {
+            String::new()
+        } else {
+            truncate_cells(&activity, left - SEP)
+        };
+        return row(name, status, whole, activity);
+    }
+    // The name down to one cell, then the box's name, then the status.
+    let name = truncate_cells(&name, 1);
+    let left = width.saturating_sub(cells(&name) + 2 * SEP);
+    if cells(&status) + token.min_width() <= left {
+        let token = token.fit(left - cells(&status));
+        return row(name, status, token, String::new());
+    }
+    let room = left.saturating_sub(token.min_width());
+    if room >= 1 {
+        let status = truncate_cells(&status, room);
+        return row(name, status, token.fit(token.min_width()), String::new());
+    }
+    // No room for the status: the token gets what is left.
+    let token = token.fit(width.saturating_sub(cells(&name) + SEP));
+    row(name, String::new(), token, String::new())
 }
 
 /// What a compact list calls card `id`: its thread's name, `twr` for the hub's card,
@@ -1613,9 +1681,9 @@ fn render_card(
     }
 
     let inner = block.inner(area);
-    let (body, attn) = card_parts(state, t, usize::from(inner.width));
+    let (body, attn, head) = card_parts(state, t, usize::from(inner.width));
     let status_row = body.first().filter(|_| icon::is_working(t)).cloned();
-    let (rows, drawn) = card_rows(body, attn, inner.height, inner.width);
+    let (rows, drawn) = card_rows(body, attn, head, inner.height, inner.width);
     if let Some(cells) = shows_icon(&rows, status_row.as_ref()) {
         note_icon(panes, state, &t.id, inner, cells);
     }
@@ -1666,18 +1734,14 @@ fn note_icon(panes: &mut Panes, state: &AppState, thread: &str, inner: Rect, cel
 /// The text of a worker's card `width` cells wide inside, in rows: status (with its report's
 /// grade, [`card_status`]), runtime and model; git; then one slot ([`slot_lines`]): apart, the
 /// top attention item ([`attention_rows`]), or else what it is doing or what it came to. (Its
-/// project is in its title, [`card_block`].)
+/// project is in its title, [`card_block`].) With how many of the rows lead ([`head_rows`]).
 fn card_parts(
     state: &AppState,
     t: &ThreadView,
     width: usize,
-) -> (Vec<Line<'static>>, Option<Arc<AttnRows>>) {
-    let runtime = if t.runtime.is_empty() {
-        "?".to_string()
-    } else {
-        t.runtime.clone()
-    };
-    let mut lines = status_lines(t, runtime, width, working_icon(state, t));
+) -> (Vec<Line<'static>>, Option<Arc<AttnRows>>, usize) {
+    let mut lines = status_lines(t, box_token(state, t), width, working_icon(state, t));
+    let head = head_rows(state, t, lines.len());
     // The git state on one row, cut with `…`: the slot keeps the rows the card has.
     if let Some(g) = &t.git {
         lines.push(Line::from(cut_spans(git_line(g).spans, width)));
@@ -1686,7 +1750,18 @@ fn card_parts(
     if attn.is_none() {
         lines.extend(slot_lines(state, t, width));
     }
-    (lines, attn)
+    (lines, attn, head)
+}
+
+/// How many of the `status` header rows of `t`'s card or tile ([`status_lines`]) come before
+/// an attention item's note and how many more wait ([`fit_rows`]): all of them when its box
+/// is not simply online (the box token is on the last), else none.
+fn head_rows(state: &AppState, t: &ThreadView, status: usize) -> usize {
+    if state.box_word(t).is_some() {
+        status
+    } else {
+        0
+    }
 }
 
 /// Whether `t` is at work: a turn running, background tasks left, a request open or its CLI
@@ -1760,18 +1835,19 @@ fn card_status(t: &ThreadView) -> String {
 }
 
 /// The rows a card `height` rows tall and `width` wide shows of `body` and `attn`
-/// ([`fit_rows`]), and the item it shows in full (id and revision), if any. A body cut short
-/// (a long report) ends in `…`.
+/// ([`fit_rows`], the first `head` rows of `body` before the item's extra rows), and the item
+/// it shows in full (id and revision), if any. A body cut short (a long report) ends in `…`.
 fn card_rows(
     body: Vec<Line<'static>>,
     attn: Option<Arc<AttnRows>>,
+    head: usize,
     height: u16,
     width: u16,
 ) -> (Vec<Line<'static>>, Option<(String, u64)>) {
     let height = usize::from(height);
     match attn {
         Some(a) => {
-            let (rows, whole) = fit_rows(body, &a.core, &a.extra, height);
+            let (rows, whole) = fit_rows(body, &a.core, &a.extra, head, height);
             (
                 rows,
                 (whole && a.exact && a.complete).then(|| a.item.clone()),
@@ -1799,20 +1875,23 @@ fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
 
 /// The rows of a card `height` rows tall: `body`, then `core` (an attention item: its badge
 /// and summary, then its options), then `extra` (its note, how many more wait). When they do
-/// not all fit, `core` is kept whole first, then `extra`, and the body gives way from its end.
-/// Returns the rows and whether `core` is drawn whole. Only the rows drawn are copied: an
-/// item's rows are kept between frames ([`WrapCache`]) and may be many.
+/// not all fit, `core` is kept whole first, then the first `head` rows of `body` (a header
+/// whose box token says the box is not online, [`head_rows`]), then `extra`, and the body
+/// gives way from its end. Returns the rows and whether `core` is drawn whole. Only the rows
+/// drawn are copied: an item's rows are kept between frames ([`WrapCache`]) and may be many.
 fn fit_rows(
     body: Vec<Line<'static>>,
     core: &[Line<'static>],
     extra: &[Line<'static>],
+    head: usize,
     height: usize,
 ) -> (Vec<Line<'static>>, bool) {
     if core.len() > height {
         return (core[..height].to_vec(), false);
     }
     let room = height - core.len();
-    let extra_n = extra.len().min(room);
+    let head = head.min(body.len()).min(room);
+    let extra_n = extra.len().min(room - head);
     let body_n = body.len().min(room - extra_n);
     let mut rows: Vec<Line<'static>> = body.into_iter().take(body_n).collect();
     rows.extend_from_slice(core);
@@ -2083,17 +2162,125 @@ fn git_line(g: &GitSnapshot) -> Line<'static> {
     Line::from(spans)
 }
 
-/// `runtime@box` (just the runtime for the default box, `?` when unknown).
-fn runtime_box(t: &ThreadView) -> String {
-    let runtime = if t.runtime.is_empty() {
+/// The runtime of `t` as its card, tile and dive header say it: `?` when unknown.
+fn runtime_name(t: &ThreadView) -> &str {
+    if t.runtime.is_empty() {
         "?"
     } else {
         t.runtime.as_str()
+    }
+}
+
+/// The box token of a thread on a remote box ([`box_token`]): `@box`, then, when the box is
+/// not simply online, what it is ([`crate::app::BoxStatus::word`]: `@gpu offline`), colored
+/// (red for what keeps its threads from running until someone acts, yellow for what passes by
+/// itself, dim yellow for an update waiting). Where it does not fit whole, its box's name is
+/// cut, never its word ([`BoxToken::fit`]).
+#[derive(Debug, Clone)]
+struct BoxToken {
+    /// The box's name (up to 64 characters).
+    name: String,
+    /// What the box is when not simply online.
+    word: Option<BoxWord>,
+}
+
+impl BoxToken {
+    /// Its width whole, in cells: `@gpu offline` takes 12.
+    fn width(&self) -> usize {
+        1 + crate::edit::width(&self.name) + self.word_width()
+    }
+
+    /// The cells its word takes with the space before it (` offline`): none when online.
+    fn word_width(&self) -> usize {
+        self.word.map_or(0, |w| 1 + crate::edit::width(w.text()))
+    }
+
+    /// Its narrowest with the word whole: the name cut to `…` (`@… offline`).
+    fn min_width(&self) -> usize {
+        2 + self.word_width()
+    }
+
+    /// It within `width` cells: whole when it fits, else its box's name cut by display cells
+    /// with `…` so the word stays whole (`@gpu-wo… offline`), else (narrower than
+    /// [`BoxToken::min_width`]) cut at its end.
+    fn fit(&self, width: usize) -> Vec<Span<'static>> {
+        let room = width.saturating_sub(1 + self.word_width());
+        let name = if room >= 1 {
+            truncate_cells(&self.name, room)
+        } else {
+            self.name.clone()
+        };
+        let mut spans = vec![Span::raw(format!("@{name}"))];
+        if let Some(word) = self.word {
+            spans.push(Span::styled(
+                format!(" {}", word.text()),
+                box_word_style(word),
+            ));
+        }
+        cut_spans(spans, width)
+    }
+
+    /// [`BoxToken::fit`] as text.
+    fn text(&self, width: usize) -> String {
+        self.fit(width).iter().map(|s| s.content.as_ref()).collect()
+    }
+}
+
+/// The box token of `t` when it runs on a remote box ([`BoxToken`]). None for a local thread:
+/// `@local` is never shown.
+fn box_token(state: &AppState, t: &ThreadView) -> Option<BoxToken> {
+    on_remote_box(t).then(|| BoxToken {
+        name: t.box_name.clone(),
+        word: state.box_word(t),
+    })
+}
+
+/// `runtime@box[ state] · model` ([`status_lines`]) within `width` cells, `sep` the style of
+/// its ` · `. Without a box token, cut at its end. With one, the token gives way last: the
+/// model is cut (`codex@gpu offline · gpt…`) or dropped, then the runtime is cut (`co…@gpu
+/// offline`) or dropped, then the box's name is cut ([`BoxToken::fit`]: `@gp… offline`).
+fn runtime_model_spans(
+    runtime: &str,
+    token: Option<&BoxToken>,
+    model: String,
+    sep: Style,
+    width: usize,
+) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(runtime.to_string())];
+    let Some(token) = token else {
+        spans.extend([Span::styled(" · ", sep), Span::raw(model)]);
+        return cut_spans(spans, width);
     };
-    if t.box_name.is_empty() {
-        runtime.to_string()
-    } else {
-        format!("{runtime}@{}", t.box_name)
+    let head = crate::edit::width(runtime) + token.width();
+    spans.extend(token.fit(usize::MAX));
+    // Cut at its end while that leaves the token whole and its `…` apart from the token.
+    if head + 2 <= width {
+        spans.extend([Span::styled(" · ", sep), Span::raw(model)]);
+        return cut_spans(spans, width);
+    }
+    if head <= width {
+        return spans;
+    }
+    let room = width.saturating_sub(token.width());
+    if room >= 1 {
+        let mut spans = vec![Span::raw(truncate_cells(runtime, room))];
+        spans.extend(token.fit(usize::MAX));
+        return spans;
+    }
+    token.fit(width)
+}
+
+/// The color of a box token's word ([`box_token`]).
+fn box_word_style(word: BoxWord) -> Style {
+    let yellow = Style::default().fg(Color::Yellow);
+    match word {
+        BoxWord::Switching | BoxWord::Reconnecting => yellow,
+        BoxWord::UpdatePending => yellow.add_modifier(Modifier::DIM),
+        BoxWord::Mismatch
+        | BoxWord::NeedsInstall
+        | BoxWord::Error
+        | BoxWord::NotConfigured
+        | BoxWord::Offline => Style::default().fg(Color::Red),
     }
 }
 
@@ -2160,12 +2347,14 @@ pub fn model_full(t: &ThreadView) -> String {
 }
 
 /// The header of a card or tile: `status · runtime · model` on one line when it fits in
-/// `width`, else the status, then `runtime · model` (cut with `…`). The working icon, if
-/// any, comes first; it never adds a row: a line that fits without it is cut at its end
-/// (the model gives way) to make room for it.
+/// `width`, else the status, then `runtime · model` (cut with `…`). The runtime carries the
+/// box token, which gives way last ([`runtime_model_spans`]: the model, then the runtime, then
+/// the box's name, never the box's state). The working icon, if any, comes first; it never
+/// adds a row: a line that fits without it is cut at its end (the model gives way) to make
+/// room for it.
 fn status_lines(
     t: &ThreadView,
-    runtime: String,
+    token: Option<BoxToken>,
     width: usize,
     working: Option<Span<'static>>,
 ) -> Vec<Line<'static>> {
@@ -2184,32 +2373,30 @@ fn status_lines(
             .add_modifier(Modifier::BOLD),
     );
     let model = model_label(t);
+    let runtime = runtime_name(t);
+    let token_width = token.as_ref().map_or(0, BoxToken::width);
     let one = crate::edit::width(&status_text)
         + 3
-        + crate::edit::width(&runtime)
+        + crate::edit::width(runtime)
+        + token_width
         + 3
         + crate::edit::width(&model);
     if one <= width {
-        lead.extend(cut_spans(
-            vec![
-                status_span,
-                Span::styled(" · ", dim),
-                Span::raw(runtime),
-                Span::styled(" · ", dim),
-                Span::raw(model),
-            ],
-            room,
+        let rest = room.saturating_sub(crate::edit::width(&status_text) + 3);
+        let mut spans = vec![status_span, Span::styled(" · ", dim)];
+        spans.extend(runtime_model_spans(
+            runtime,
+            token.as_ref(),
+            model,
+            dim,
+            rest,
         ));
+        lead.extend(cut_spans(spans, room));
         return vec![Line::from(lead)];
     }
     lead.push(status_span);
-    vec![
-        Line::from(lead),
-        Line::from(Span::raw(truncate_cells(
-            &format!("{runtime} · {model}"),
-            width,
-        ))),
-    ]
+    let spans = runtime_model_spans(runtime, token.as_ref(), model, Style::default(), width);
+    vec![Line::from(lead), Line::from(spans)]
 }
 
 /// `spans` cut to `width` characters, the last one shown being `…` when they are cut.
@@ -2711,7 +2898,7 @@ fn render_hub_card(
     }
     let inner = block.inner(area);
     let (body, attn) = hub_card_parts(state, usize::from(inner.width));
-    let (rows, drawn) = card_rows(body, attn, inner.height, inner.width);
+    let (rows, drawn) = card_rows(body, attn, 0, inner.height, inner.width);
     frame.render_widget(Paragraph::new(rows).block(block), area);
     drawn
 }
@@ -2890,7 +3077,8 @@ fn render_tile(
         1 => "1 turn".to_string(),
         n => format!("{n} turns"),
     };
-    let mut lines = status_lines(t, runtime_box(t), inner_width, working_icon(state, t));
+    let mut lines = status_lines(t, box_token(state, t), inner_width, working_icon(state, t));
+    let head = head_rows(state, t, lines.len());
     // The turn count (and what the turns spent) after the git state, which is cut (`…`) to
     // leave it room.
     let turns = match t.spent.short() {
@@ -2908,7 +3096,7 @@ fn render_tile(
     let inner = block.inner(area);
     let status_row = lines.first().filter(|_| icon::is_working(t)).cloned();
     if let Some(attn) = attention_rows(state, &t.id, usize::from(inner.width), true) {
-        let (rows, drawn) = card_rows(lines, Some(attn), inner.height, inner.width);
+        let (rows, drawn) = card_rows(lines, Some(attn), head, inner.height, inner.width);
         if let Some(cells) = shows_icon(&rows, status_row.as_ref()) {
             note_icon(panes, state, &t.id, inner, cells);
         }
@@ -2920,7 +3108,7 @@ fn render_tile(
     }
     // Then the slot, as on a card: what it does or what it came to, cut to the tile.
     lines.extend(slot_lines(state, t, inner_width));
-    let (rows, _) = card_rows(lines, None, inner.height, inner.width);
+    let (rows, _) = card_rows(lines, None, 0, inner.height, inner.width);
     // Not when the tile's one row is cut (`…` in its place).
     if let Some(cells) = shows_icon(&rows, status_row.as_ref()) {
         note_icon(panes, state, &t.id, inner, cells);
@@ -4572,78 +4760,211 @@ pub fn target_fill(dive: bool) -> Style {
 
 /// The main pane's header for `width` columns: its label, `ORCHESTRATOR` or, in a dive,
 /// `talking to <name>`, and the details that fit after it (two columns apart): in a dive the
-/// runtime, model, mode and what Esc does ([`esc_words`]: how to get back, when the next Esc
-/// leaves the dive), shortened as needed; in the orchestrator conversation the runtime and the
-/// full model id the runtime reports, cut to fit. Before an orchestrator thread exists, the
-/// one the hub would start, which starts with the first message. A label wider than `width`
-/// is cut, with no details; in a dive, before that, the label is the thread's name alone (cut
-/// as needed) so that what Esc does still fits.
+/// runtime with the box token ([`box_token`]), model, mode and what Esc does ([`esc_words`]:
+/// how to get back, when the next Esc leaves the dive), shortened as needed ([`dive_title`]);
+/// in the orchestrator conversation the runtime and the full model id the runtime reports,
+/// cut to fit. Before an orchestrator thread exists, the one the hub would start, which starts
+/// with the first message. A label wider than `width` is cut, with no details.
 pub fn main_title(state: &AppState, width: usize) -> (String, String) {
-    let label = match state.dived() {
-        Some(t) => format!("talking to {}", t.name),
-        None => "ORCHESTRATOR".to_string(),
-    };
-    let (esc_long, back) = esc_words(state);
     if let Some(t) = state.dived() {
-        let room = width.saturating_sub(back.len() + 2);
-        if label.chars().count() > room && room >= 1 {
-            return (truncate(&t.name, room), back.to_string());
-        }
+        return dive_title(state, t, width);
     }
-    let used = label.chars().count();
+    let label = "ORCHESTRATOR".to_string();
+    let used = crate::edit::width(&label);
     if used > width {
-        return (truncate(&label, width), String::new());
+        return (truncate_cells(&label, width), String::new());
     }
     let room = width.saturating_sub(used + 2);
-    let detail = match state.dived() {
-        Some(t) => {
-            let rt = if t.runtime.is_empty() {
+    let full = match (state.orchestrator(), &state.view.orch_default) {
+        (Some(o), _) => format!(
+            "{} · {}",
+            if o.runtime.is_empty() {
                 "?"
             } else {
-                t.runtime.as_str()
-            };
-            let model = model_label(t);
-            let mode = if t.mode.is_empty() {
-                String::new()
-            } else {
-                format!(" · mode {}", t.mode)
-            };
-            [
-                format!("{rt} · {model}{mode} · {esc_long}"),
-                format!("{rt} · {model}{mode} · {back}"),
-                format!("{} · {back}", mode.trim_start_matches(" · ")),
-                back.to_string(),
-            ]
-            .into_iter()
-            .map(|v| v.trim_start_matches(" · ").to_string())
-            .find(|v| v.chars().count() <= room)
-            .unwrap_or_default()
-        }
-        None => {
-            let full = match (state.orchestrator(), &state.view.orch_default) {
-                (Some(o), _) => format!(
-                    "{} · {}",
-                    if o.runtime.is_empty() {
-                        "?"
-                    } else {
-                        &o.runtime
-                    },
-                    model_full(o)
-                ),
-                (None, Some((rt, model))) => format!(
-                    "{rt} · {} · starts with your first message",
-                    model.as_deref().unwrap_or("default model")
-                ),
-                (None, None) => "starts with your first message".to_string(),
-            };
-            if room >= 6 {
-                truncate(&full, room)
-            } else {
-                String::new()
-            }
-        }
+                &o.runtime
+            },
+            model_full(o)
+        ),
+        (None, Some((rt, model))) => format!(
+            "{rt} · {} · starts with your first message",
+            model.as_deref().unwrap_or("default model")
+        ),
+        (None, None) => "starts with your first message".to_string(),
+    };
+    let detail = if room >= 6 {
+        truncate_cells(&full, room)
+    } else {
+        String::new()
     };
     (label, detail)
+}
+
+/// [`main_title`] in a dive into `t` ([`dive_header`]).
+fn dive_title(state: &AppState, t: &ThreadView, width: usize) -> (String, String) {
+    let h = dive_header(state, t, width);
+    (h.label, h.detail)
+}
+
+/// [`main_title`] with its details as spans on the header's style `band`
+/// ([`render_band`]): in a dive, the box token's state word keeps its color
+/// ([`box_word_style`]: red, yellow, dim yellow), as on the cards and tiles.
+fn main_title_spans(state: &AppState, width: usize, band: Style) -> (String, Vec<Span<'static>>) {
+    let Some(t) = state.dived() else {
+        let (label, detail) = main_title(state, width);
+        return (label, vec![Span::styled(detail, band)]);
+    };
+    let h = dive_header(state, t, width);
+    let token: String = h.token.iter().map(|s| s.content.as_ref()).collect();
+    let at = (!token.is_empty()).then(|| h.detail.find(&token)).flatten();
+    let Some(at) = at else {
+        return (h.label, vec![Span::styled(h.detail, band)]);
+    };
+    let mut spans = vec![Span::styled(h.detail[..at].to_string(), band)];
+    spans.extend(
+        h.token
+            .into_iter()
+            .map(|s| Span::styled(s.content, band.patch(s.style))),
+    );
+    spans.push(Span::styled(h.detail[at + token.len()..].to_string(), band));
+    spans.retain(|s| !s.content.is_empty());
+    (h.label, spans)
+}
+
+/// A dive header ([`dive_header`]).
+struct DiveHeader {
+    /// `talking to <name>`, or the name cut.
+    label: String,
+    /// What follows it.
+    detail: String,
+    /// How much of its box token it shows.
+    shown: TokenShown,
+    /// The box token's spans as `detail` shows them (none when it shows none).
+    token: Vec<Span<'static>>,
+}
+
+/// How much of its box token a dive header shows ([`dive_header`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TokenShown {
+    /// None: a local thread, or no room.
+    Not,
+    /// With its box's name cut ([`BoxToken::fit`]).
+    Cut,
+    /// Whole.
+    Whole,
+}
+
+/// [`main_title`] in a dive into `t`, `width` cells wide (measured in display cells):
+/// `talking to <name>` and the first of these that fits: runtime with the box token, model,
+/// mode and what Esc does (long, then short); for a box not simply online, the token with the
+/// mode, then the token alone, each with `Esc: back`; then the mode, then `Esc: back` alone. A
+/// box's state (R9) comes before the label: when no detail with the token fits after `talking
+/// to <name>`, the label becomes the name, cut as needed, with the token and `Esc: back`, then
+/// the token alone, then the token with its box's name cut (`@gp… offline`, the two names
+/// sharing the room left). Likewise what Esc does: the label gives way to the name (cut) before
+/// it does. With how much of the box token it shows, and its spans.
+fn dive_header(state: &AppState, t: &ThreadView, width: usize) -> DiveHeader {
+    let cells = crate::edit::width;
+    let label = format!("talking to {}", t.name);
+    let (esc_long, back) = esc_words(state);
+    let rt = runtime_name(t);
+    let token = box_token(state, t);
+    let whole = token
+        .as_ref()
+        .map(|k| k.text(usize::MAX))
+        .unwrap_or_default();
+    let whole_spans = token
+        .as_ref()
+        .map(|k| k.fit(usize::MAX))
+        .unwrap_or_default();
+    let header =
+        |label: String, detail: String, shown: TokenShown, token: Vec<Span<'static>>| DiveHeader {
+            label,
+            detail,
+            shown,
+            token,
+        };
+    let with_whole = |label: String, detail: String| {
+        if token.is_some() {
+            header(label, detail, TokenShown::Whole, whole_spans.clone())
+        } else {
+            header(label, detail, TokenShown::Not, Vec::new())
+        }
+    };
+    let model = model_label(t);
+    let mode = if t.mode.is_empty() {
+        String::new()
+    } else {
+        format!(" · mode {}", t.mode)
+    };
+    let not_online = state.box_word(t).is_some();
+    let clean = |v: String| v.trim_start_matches(" · ").to_string();
+    let with_token: Vec<String> = [
+        Some(format!("{rt}{whole} · {model}{mode} · {esc_long}")),
+        Some(format!("{rt}{whole} · {model}{mode} · {back}")),
+        not_online.then(|| format!("{whole}{mode} · {back}")),
+        not_online.then(|| format!("{whole} · {back}")),
+    ]
+    .into_iter()
+    .flatten()
+    .map(clean)
+    .collect();
+    let fits = |v: &String, room: usize| cells(v) <= room;
+    let used = cells(&label);
+    if used <= width {
+        let room = width.saturating_sub(used + 2);
+        if let Some(d) = with_token.iter().find(|v| fits(v, room)) {
+            return with_whole(label, d.clone());
+        }
+    }
+    // The box's state before the label: the name alone, cut, with the token.
+    if let Some(token) = token.as_ref().filter(|_| not_online) {
+        for d in with_token[2..].iter().chain([&whole]) {
+            let need = cells(d) + 2;
+            if width > need {
+                return with_whole(truncate_cells(&t.name, width - need), d.clone());
+            }
+        }
+        // Its box's name cut too: the thread's name and the box's share what is left.
+        let room = width.saturating_sub(2);
+        if room > token.min_width() {
+            let name = cells(&t.name)
+                .min((room - token.min_width()).div_ceil(2))
+                .max(1);
+            return header(
+                truncate_cells(&t.name, name),
+                token.text(room - name),
+                TokenShown::Cut,
+                token.fit(room - name),
+            );
+        }
+    }
+    let room = width.saturating_sub(cells(back) + 2);
+    if used > room && room >= 1 {
+        return header(
+            truncate_cells(&t.name, room),
+            back.to_string(),
+            TokenShown::Not,
+            Vec::new(),
+        );
+    }
+    if used > width {
+        return header(
+            truncate_cells(&label, width),
+            String::new(),
+            TokenShown::Not,
+            Vec::new(),
+        );
+    }
+    let room = width.saturating_sub(used + 2);
+    let detail = [
+        format!("{} · {back}", mode.trim_start_matches(" · ")),
+        back.to_string(),
+    ]
+    .into_iter()
+    .map(clean)
+    .find(|v| fits(v, room))
+    .unwrap_or_default();
+    header(label, detail, TokenShown::Not, Vec::new())
 }
 
 /// What the next Esc does in a dive ([`AppState::esc_does`]), long and short: it returns to
@@ -4722,7 +5043,7 @@ fn render_orch_banner(
     let inner = block.inner(area);
     panes.add(PaneId::Thread(orch.to_string()), inner);
     let attn = attention_rows(state, orch, usize::from(inner.width), false);
-    let (rows, drawn) = card_rows(Vec::new(), attn, inner.height, inner.width);
+    let (rows, drawn) = card_rows(Vec::new(), attn, 0, inner.height, inner.width);
     frame.render_widget(Paragraph::new(rows).block(block), area);
     record(panes, orch, drawn, inner);
 }
@@ -4954,7 +5275,8 @@ fn hub_detail(state: &AppState, panes: &Panes) -> bool {
 /// The main pane's header band over `area` (one row): filled with where a typed line goes
 /// ([`target_fill`]), its label bold ([`main_title`]), the details after it, the working
 /// icon first while the thread shown works (`working`), and `(request selected, Esc follows)`
-/// at the right while a request is selected and there is room for it (a view scrolled up
+/// at the right while a request is selected and there is room for it, unless it would leave
+/// less of the box token of a box not simply online ([`dive_header`]) (a view scrolled up
 /// says so on the pane's bottom border, [`below_text`]).
 fn render_band(
     frame: &mut Frame,
@@ -4999,16 +5321,24 @@ fn render_band(
     } else {
         ""
     };
-    let suffix = if room >= wanted.len() + 16 {
+    let mut suffix = if room >= wanted.len() + 16 {
         wanted
     } else {
         ""
     };
+    // It gives way before the box token of a box not simply online.
+    if let Some(t) = state.dived().filter(|t| state.box_word(t).is_some()) {
+        let token = |width: usize| dive_header(state, t, width).shown;
+        if !suffix.is_empty() && token(room - suffix.len() - 2) < token(room) {
+            suffix = "";
+        }
+    }
     let gap = if suffix.is_empty() { 0 } else { 2 };
-    let (label, detail) = main_title(state, room - suffix.len() - gap);
+    let (label, detail) = main_title_spans(state, room - suffix.len() - gap, band);
     spans.push(Span::styled(label, band.add_modifier(Modifier::BOLD)));
-    if !detail.is_empty() {
-        spans.push(Span::styled(format!("  {detail}"), band));
+    if detail.iter().any(|s| !s.content.is_empty()) {
+        spans.push(Span::styled("  ", band));
+        spans.extend(detail);
     }
     if !suffix.is_empty() {
         let used = Line::from(spans.clone()).width();
@@ -10017,7 +10347,7 @@ mod tests {
                 .join("\n")
         };
         let beta = tile(0);
-        assert!(beta.contains("waiting · fake@local"), "{beta}");
+        assert!(beta.contains("waiting · fake · "), "{beta}");
         assert!(beta.contains(" proj · beta "), "{beta}");
         assert!(beta.contains("no git snapshot · 1 turn"), "{beta}");
         assert!(beta.contains(" PERMISSION  Bash: rm -rf target"));
@@ -10026,7 +10356,7 @@ mod tests {
         assert!(!beta.contains("no report yet"), "{beta}");
         let eps = tile(3);
         // Done, with its report's grade; the report takes the rows left, here all of it.
-        assert!(eps.contains("done ✓ · fake@local"), "{eps}");
+        assert!(eps.contains("done ✓ · fake · "), "{eps}");
         assert!(eps.contains("twr/eps · changes made · ↑2 ↓1"), "{eps}");
         assert!(
             eps.contains("│Rewrote the README quick start and the"),
@@ -10639,14 +10969,14 @@ mod tests {
         assert!(lines[3].contains("› not started"), "{}", screen(&lines));
         assert!(!lines[4].contains("proj"), "{}", screen(&lines));
 
-        // Grid: tiles carry the box too, and fall back to two lines when narrow.
+        // Grid: tiles say the same (a local box is not named), on two lines when narrow.
         st.view.screen = Screen::Grid;
         let lines = draw(&st, 180, 30);
         let s = screen(&lines);
-        assert!(s.contains("idle · claude-code@local · opus-4-1"), "{s}");
-        assert!(s.contains("idle · pty@local · default model"), "{s}");
+        assert!(s.contains("idle · claude-code · opus-4-1"), "{s}");
+        assert!(s.contains("idle · pty · default model"), "{s}");
         assert!(s.contains("grid · 4 threads"), "no orchestrator tile: {s}");
-        let lines = draw(&st, 32, 30);
+        let lines = draw(&st, 28, 30);
         let at = lines
             .iter()
             .position(|l| l.starts_with("┏ proj · ops "))
@@ -10654,7 +10984,7 @@ mod tests {
         let body = |i: usize| lines[at + i].trim_matches(['┃', ' ']).to_string();
         assert_eq!(
             [body(1), body(2)],
-            ["idle", "claude-code@local · opus-4-1"],
+            ["idle", "claude-code · opus-4-1"],
             "{}",
             screen(&lines)
         );
@@ -10674,6 +11004,937 @@ mod tests {
                 .any(|l| l.contains("› 1 claude-code") && l.contains("(current)")),
             "{s}"
         );
+    }
+
+    /// `job` on box `gpu` (codex, reporting `gpt-5-codex`) and `loc` on the hub's own box
+    /// (claude-code, `sonnet`); `gpu` as `hub.info`'s entry `gpu` says it ([`box_snapshot`]).
+    fn box_threads(gpu: Value) -> AppState {
+        box_threads_working(gpu, false)
+    }
+
+    /// [`box_threads`], with `job` at work when `working`.
+    fn box_threads_working(gpu: Value, working: bool) -> AppState {
+        box_threads_listed(Some(gpu), working)
+    }
+
+    /// [`box_threads_working`], the boxes as `hub.info` says them when `gpu` is given, else not
+    /// known yet (no `hub.info` answer).
+    fn box_threads_listed(gpu: Option<Value>, working: bool) -> AppState {
+        use crate::app::tests::control;
+        let mut st = AppState::new();
+        let mut job = ThreadScript::new("t-job");
+        let mut created = job.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "codex".into();
+            p.box_name = "gpu".into();
+        }
+        let mut started = job.started("s");
+        if let EventBody::ThreadStarted(p) = &mut started.body {
+            p.ext = serde_json::json!({"codex": {"model": "gpt-5-codex"}})
+                .as_object()
+                .cloned();
+        }
+        let mut loc = ThreadScript::new("t-loc");
+        loc.at(10);
+        let mut local = loc.created("loc");
+        if let EventBody::ThreadCreated(p) = &mut local.body {
+            p.runtime = "claude-code".into();
+            p.ext = serde_json::json!({"twr": {"model": "sonnet"}})
+                .as_object()
+                .cloned();
+        }
+        let mut evs = vec![created, started];
+        if working {
+            evs.push(job.turn_started("go"));
+        }
+        evs.push(local);
+        control(&mut st, &evs);
+        if let Some(gpu) = gpu {
+            st.apply_boxes(&box_snapshot(gpu));
+        }
+        st.set_focus(Some("t-job".into()));
+        st
+    }
+
+    /// The entry of [`box_cases`] for a box the hub no longer has (removed after its threads
+    /// were made): [`box_snapshot`] leaves it out.
+    fn removed_box(name: &str) -> Value {
+        serde_json::json!({ "name": name, "removed": true })
+    }
+
+    /// A `hub.info` answer whose boxes are `entry` (none for a [`removed_box`]) and another
+    /// box, `pi`, online.
+    fn box_snapshot(entry: Value) -> Value {
+        let pi = crate::app::tests::info_box("pi", "online");
+        if entry["removed"] == true {
+            serde_json::json!({ "boxes": [pi] })
+        } else {
+            serde_json::json!({ "boxes": [entry, pi] })
+        }
+    }
+
+    /// `gpu`'s `hub.info` entry in each state a token tells apart, with what the token adds
+    /// after `@gpu` ([`removed_box`]: the hub's boxes do not name it).
+    fn box_cases() -> Vec<(Value, &'static str)> {
+        use crate::app::tests::info_box;
+        let with = |mut b: Value, k: &str, v: Value| {
+            b[k] = v;
+            b
+        };
+        let refused = serde_json::json!({"at": "2026-10-17T10:00:00Z", "reason":
+            "a runner speaking protocol 6 was refused (the hub's is 7): update twr on box `gpu`"});
+        vec![
+            (info_box("gpu", "online"), ""),
+            // Another build of the same protocol, online: plain too.
+            (
+                with(info_box("gpu", "online"), "running_build", "bbbb".into()),
+                "",
+            ),
+            (info_box("gpu", "switching"), " switching"),
+            (
+                with(info_box("gpu", "online"), "switch_pending", true.into()),
+                " update pending",
+            ),
+            (info_box("gpu", "needs_install"), " needs install"),
+            (info_box("gpu", "error"), " error"),
+            (removed_box("gpu"), " not configured"),
+            (
+                with(info_box("gpu", "offline"), "refused", refused),
+                " twr mismatch",
+            ),
+            (info_box("gpu", "offline"), " offline"),
+            (info_box("gpu", "connecting"), " reconnecting"),
+        ]
+    }
+
+    /// A thread on a remote box carries its box token on its card, its tile, its compact row
+    /// (only when the box is not simply online) and the dive header, in every state; a local
+    /// thread never names its box; the cards keep their heights.
+    #[test]
+    fn a_remote_thread_shows_its_box_token() {
+        use crate::app::CompactPane;
+        let areas = |st: &AppState| -> Vec<(PaneId, Rect)> {
+            st.view
+                .panes
+                .panes
+                .iter()
+                .filter(|p| matches!(p.id, PaneId::Thread(_)))
+                .map(|p| (p.id.clone(), p.area))
+                .collect()
+        };
+        let mut heights = None;
+        for (gpu, word) in box_cases() {
+            let mut st = box_threads(gpu);
+            // Stack cards, wide: one header line.
+            let lines = draw_panes(&mut st, 160, 40);
+            let c = pane_text(&st, &lines, &card("t-job"));
+            let want = format!("idle · codex@gpu{word} · gpt-5-codex");
+            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            let l = pane_text(&st, &lines, &card("t-loc"));
+            assert!(l.contains("idle · claude-code · sonnet"), "{l}");
+            assert!(!l.contains('@'), "{l}");
+            // Narrow: two header lines, the same heights whatever the token says.
+            let narrow = draw_panes(&mut st, 30, 40);
+            let both = (areas(&st), {
+                draw_panes(&mut st, 160, 40);
+                areas(&st)
+            });
+            assert!(!both.0.is_empty() && !both.1.is_empty());
+            match &heights {
+                None => heights = Some(both),
+                Some(h) => assert_eq!(h, &both, "{word:?}"),
+            }
+            let at = narrow
+                .iter()
+                .position(|l| l.starts_with("┏ proj · job "))
+                .unwrap_or_else(|| panic!("{}", screen(&narrow)));
+            let body = |i: usize| narrow[at + i].trim_matches(['┃', ' ']).to_string();
+            assert_eq!(body(1), "idle", "{}", screen(&narrow));
+            // The model gives way first.
+            let second = format!("codex@gpu{word} · gpt-5-codex");
+            if second.chars().count() <= 28 {
+                assert_eq!(body(2), second, "{}", screen(&narrow));
+            } else {
+                assert!(
+                    body(2).starts_with(&format!("codex@gpu{word}")) && body(2).ends_with('…'),
+                    "{}",
+                    screen(&narrow)
+                );
+            }
+
+            // Grid tiles.
+            st.view.screen = Screen::Grid;
+            // (On one line, or two when the tile is narrower than the line.)
+            let g = screen(&draw(&st, 180, 30));
+            assert!(g.contains(&second), "{second:?} missing:\n{g}");
+            assert!(g.contains("idle · claude-code · sonnet"), "{g}");
+            assert!(!g.contains("@local"), "{g}");
+            st.view.screen = Screen::Stack;
+
+            // Compact Threads rows: the token only when the box is not simply online.
+            st.view.compact = Some(true);
+            st.view.compact_pane = CompactPane::Threads;
+            let rows = draw(&st, 50, 20);
+            let job = rows.iter().find(|r| r.contains("job · ")).unwrap();
+            if word.is_empty() {
+                assert_eq!(job.trim_end(), "job · idle", "{}", screen(&rows));
+            } else {
+                assert_eq!(
+                    job.trim_end(),
+                    format!("job · idle · @gpu{word}"),
+                    "{}",
+                    screen(&rows)
+                );
+            }
+            let loc = rows.iter().find(|r| r.contains("loc · ")).unwrap();
+            assert_eq!(loc.trim_end(), "loc · idle", "{}", screen(&rows));
+            st.view.compact = Some(false);
+
+            // The dive header, wide and narrow: the token of a box not simply online stays.
+            st.dive("t-job");
+            assert_eq!(
+                main_title(&st, 200).1,
+                format!(
+                    "codex@gpu{word} · gpt-5-codex · mode manual · Esc returns to the \
+                     orchestrator"
+                )
+            );
+            let short = main_title(&st, 56).1;
+            if word.is_empty() {
+                assert_eq!(short, "mode manual · Esc: back");
+            } else {
+                let full = format!("@gpu{word} · mode manual · Esc: back");
+                let want = if full.chars().count() <= 40 {
+                    full
+                } else {
+                    format!("@gpu{word} · Esc: back")
+                };
+                assert_eq!(short, want);
+            }
+            st.dive("t-loc");
+            assert_eq!(
+                main_title(&st, 200).1,
+                "claude-code · sonnet · mode manual · Esc returns to the orchestrator"
+            );
+            assert_eq!(main_title(&st, 40).1, "mode manual · Esc: back");
+            // A phone's 40 columns: a box not simply online keeps its state, the label giving
+            // way to the name.
+            st.dive("t-job");
+            let narrow = main_title(&st, 40);
+            if word.is_empty() {
+                assert_eq!(
+                    narrow,
+                    ("talking to job".into(), "mode manual · Esc: back".into())
+                );
+            } else {
+                // (`talking to job` and two columns leave 24 for it.)
+                let token = format!("@gpu{word} · Esc: back");
+                let label = if token.chars().count() <= 24 {
+                    "talking to job"
+                } else {
+                    "job"
+                };
+                assert_eq!(narrow, (label.into(), token));
+            }
+        }
+    }
+
+    /// A persisted thread whose box was removed: before the TUI has the hub's boxes its card,
+    /// tile, compact row and dive header say nothing of the box (it may be fine); once
+    /// `hub.info` lists the boxes without it, each says `not configured`, in red.
+    #[test]
+    fn a_removed_box_is_not_configured_once_the_boxes_are_known() {
+        use crate::app::CompactPane;
+        let shows = |st: &mut AppState, word: &str| {
+            let lines = draw_panes(st, 160, 40);
+            let c = pane_text(st, &lines, &card("t-job"));
+            let want = format!("idle · codex@gpu{word} · gpt-5-codex");
+            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            st.view.screen = Screen::Grid;
+            let g = screen(&draw(st, 180, 30));
+            let want = format!("codex@gpu{word} · gpt-5-codex");
+            assert!(g.contains(&want), "{want:?} missing:\n{g}");
+            st.view.screen = Screen::Stack;
+            st.view.compact = Some(true);
+            st.view.compact_pane = CompactPane::Threads;
+            let rows = draw(st, 50, 20);
+            let job = rows.iter().find(|r| r.contains("job · ")).unwrap();
+            let want = if word.is_empty() {
+                "job · idle".to_string()
+            } else {
+                format!("job · idle · @gpu{word}")
+            };
+            assert_eq!(job.trim_end(), want, "{}", screen(&rows));
+            st.view.compact = Some(false);
+            st.dive("t-job");
+            assert_eq!(
+                main_title(st, 200).1,
+                format!(
+                    "codex@gpu{word} · gpt-5-codex · mode manual · Esc returns to the \
+                     orchestrator"
+                )
+            );
+            let short = main_title(st, 56).1;
+            if word.is_empty() {
+                assert_eq!(short, "mode manual · Esc: back");
+            } else {
+                // (Too long beside the label for the mode too.)
+                assert_eq!(short, format!("@gpu{word} · Esc: back"));
+            }
+            st.dive("t-loc");
+            assert_eq!(
+                main_title(st, 200).1,
+                "claude-code · sonnet · mode manual · Esc returns to the orchestrator"
+            );
+            st.back();
+            st.set_focus(Some("t-job".into()));
+        };
+        // No `hub.info` answer yet, or one without boxes (an older hub): nothing.
+        let mut st = box_threads_listed(None, false);
+        shows(&mut st, "");
+        st.apply_boxes(&serde_json::json!({ "instance": "x" }));
+        shows(&mut st, "");
+        // The hub's boxes, without `gpu`.
+        st.apply_boxes(&box_snapshot(removed_box("gpu")));
+        shows(&mut st, " not configured");
+        // In red, on the card.
+        let buf = draw_buf(&st, 160, 40);
+        let (x, y) = (0..40u16)
+            .find_map(|y| {
+                let row: String = (0..160u16).map(|x| buf[(x, y)].symbol()).collect();
+                row.find("codex@gpu not configured").map(|i| {
+                    let at = row[..i + "codex@gpu ".len()].chars().count();
+                    (u16::try_from(at).unwrap(), y)
+                })
+            })
+            .expect("the card's box token");
+        for dx in 0..u16::try_from("not configured".len()).unwrap() {
+            assert_eq!(buf[(x + dx, y)].fg, Color::Red, "{dx}");
+        }
+        // No boxes at all: still not configured; the box added back: plain again.
+        st.apply_boxes(&serde_json::json!({ "boxes": [] }));
+        shows(&mut st, " not configured");
+        st.apply_boxes(&box_snapshot(crate::app::tests::info_box("gpu", "online")));
+        shows(&mut st, "");
+    }
+
+    /// A compact Threads row of a long-named thread keeps its status and its box's state at
+    /// phone widths (30 and 40 columns), in every state: the name is cut first.
+    #[test]
+    fn a_compact_row_keeps_its_box_state_at_phone_widths() {
+        use crate::app::CompactPane;
+        let long = "review-last-3-remote-worker";
+        for (gpu, word) in box_cases() {
+            let mut st = box_threads(gpu);
+            let mut s = ThreadScript::new("t-long");
+            s.at(20);
+            let mut created = s.created(long);
+            if let EventBody::ThreadCreated(p) = &mut created.body {
+                p.runtime = "codex".into();
+                p.box_name = "gpu".into();
+            }
+            crate::app::tests::control(&mut st, &[created]);
+            st.view.compact = Some(true);
+            st.view.compact_pane = CompactPane::Threads;
+            for width in [30u16, 40] {
+                let rows = draw(&st, width, 20);
+                let rows: Vec<&str> = rows.iter().map(|r| r.trim_end()).collect();
+                if word.is_empty() {
+                    assert!(
+                        rows.iter().any(|r| r.starts_with("review-last-3")),
+                        "{rows:#?}"
+                    );
+                    assert!(rows.iter().all(|r| !r.contains("@gpu")), "{rows:#?}");
+                    continue;
+                }
+                // Both threads on gpu (`job` and the long one): status and state there, the
+                // name cut to make room (at 30 columns, down to `…` beside the longest
+                // states).
+                let tail = format!(" · idle · @gpu{word}");
+                let remote: Vec<&&str> = rows.iter().filter(|r| r.ends_with(&tail)).collect();
+                assert_eq!(remote.len(), 2, "{width} {word}: {rows:#?}");
+                for r in &remote {
+                    assert!(crate::edit::width(r) <= usize::from(width), "{r:?}");
+                }
+                if width == 40 {
+                    assert!(
+                        remote.iter().any(|r| r.starts_with("review-")),
+                        "{word}: {rows:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A thread's box token follows the box at once: a `runner.disconnected` makes it
+    /// `offline`, a `runner.connected` plain again, a working card's line cut at its end (the
+    /// model) to make room for the icon keeps the token.
+    #[test]
+    fn a_box_token_follows_its_runner_and_keeps_its_place() {
+        use crate::app::tests::{control, info_box};
+        use twr_core::event::RunnerPayload;
+        let mut st = box_threads(info_box("gpu", "online"));
+        let mut hub = ThreadScript::new(HUB_THREAD);
+        let runner = RunnerPayload {
+            box_name: "gpu".into(),
+            ..Default::default()
+        };
+        let down = hub.event(EventBody::RunnerDisconnected(runner.clone()));
+        control(&mut st, &[down]);
+        let lines = draw_panes(&mut st, 160, 40);
+        let c = pane_text(&st, &lines, &card("t-job"));
+        assert!(c.contains("idle · codex@gpu offline · gpt-5-codex"), "{c}");
+        let up = hub.event(EventBody::RunnerConnected(runner));
+        control(&mut st, &[up]);
+        let lines = draw_panes(&mut st, 160, 40);
+        let c = pane_text(&st, &lines, &card("t-job"));
+        assert!(c.contains("idle · codex@gpu · gpt-5-codex"), "{c}");
+        // Exactly as wide as the line: with the working icon, the model gives way.
+        let st = box_threads_working(info_box("gpu", "offline"), true);
+        let job = st.registry.get("t-job").unwrap();
+        let line = status_lines(
+            job,
+            box_token(&st, job),
+            "running · codex@gpu offline · gpt-5-codex".chars().count(),
+            Some(Span::raw("_")),
+        );
+        assert_eq!(line.len(), 1);
+        let text = line[0].to_string();
+        assert!(
+            text.starts_with("_ running · codex@gpu offline · gpt") && text.ends_with('…'),
+            "{text}"
+        );
+    }
+
+    /// One thread `t-job` named `name` on box `box_name` (codex, reporting `gpt-5-codex`),
+    /// with the events `then` adds after its start; its box as `hub.info`'s `entry` says it
+    /// (renamed `box_name`).
+    fn on_box(
+        name: &str,
+        box_name: &str,
+        mut entry: Value,
+        then: impl FnOnce(&mut ThreadScript) -> Vec<twr_core::event::Event>,
+    ) -> AppState {
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-job");
+        let mut created = s.created(name);
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "codex".into();
+            p.box_name = box_name.into();
+        }
+        let mut started = s.started("s");
+        if let EventBody::ThreadStarted(p) = &mut started.body {
+            p.ext = serde_json::json!({"codex": {"model": "gpt-5-codex"}})
+                .as_object()
+                .cloned();
+        }
+        let mut evs = vec![created, started];
+        evs.extend(then(&mut s));
+        crate::app::tests::control(&mut st, &evs);
+        entry["name"] = box_name.into();
+        st.apply_boxes(&box_snapshot(entry));
+        st.set_focus(Some("t-job".into()));
+        st
+    }
+
+    /// Box names short and long, up to the 64 characters a box's name may have.
+    fn box_names() -> Vec<String> {
+        vec![
+            "gpu".into(),
+            "gpubox7".into(),
+            "gpu-box-123".into(),
+            "gpu-workstation-01".into(),
+            "box-".repeat(16),
+        ]
+    }
+
+    /// Whether `row` shows the box token of box `name` saying `word` (` offline`, or nothing
+    /// for a box online): whole (`@gpu offline`), or with the box's name cut (`@gp… offline`,
+    /// `@… offline`); the word always whole.
+    fn has_token(row: &str, name: &str, word: &str) -> bool {
+        row.match_indices('@').any(|(at, _)| {
+            let rest = &row[at + 1..];
+            if rest.starts_with(&format!("{name}{word}")) {
+                return true;
+            }
+            rest.find(&format!("…{word}"))
+                .is_some_and(|i| name.starts_with(&rest[..i]))
+        })
+    }
+
+    /// A card's or tile's header cut to its width cuts the model first, then the runtime,
+    /// then the box's name, never the box's state: at a card's narrowest (28 cells inside), a
+    /// 30-column tile, the side column's 32 and a tile's narrowest (38), idle or working, for
+    /// box names up to 64 characters and every state. Every row fits.
+    #[test]
+    fn a_card_header_cut_keeps_the_box_state() {
+        use crate::app::tests::info_box;
+        let cells = crate::edit::width;
+        for name in box_names() {
+            for (entry, word) in box_cases() {
+                for working in [false, true] {
+                    let st = on_box("job", &name, entry.clone(), |s| {
+                        if working {
+                            vec![s.turn_started("go")]
+                        } else {
+                            Vec::new()
+                        }
+                    });
+                    let job = st.registry.get("t-job").unwrap();
+                    for width in [28usize, 32, 38] {
+                        let icon = working.then(|| Span::raw("_"));
+                        let rows: Vec<String> = status_lines(job, box_token(&st, job), width, icon)
+                            .iter()
+                            .map(|l| l.to_string())
+                            .collect();
+                        let what = format!("{name:?}{word} {width} {working}: {rows:#?}");
+                        assert!(rows.iter().all(|r| cells(r) <= width), "{what}");
+                        let last = rows.last().unwrap();
+                        assert!(has_token(last, &name, word), "{what}");
+                        // The runtime stays while the whole token leaves it room.
+                        let head = format!("codex@{name}{word}");
+                        if cells(&head) <= width && rows.len() == 2 {
+                            assert!(last.starts_with(&head), "{what}");
+                        }
+                        // The box's name is cut only once the runtime is gone.
+                        if !last.contains(&format!("@{name}{word}")) {
+                            assert!(last.starts_with('@'), "{what}");
+                        }
+                    }
+                }
+            }
+        }
+        // The bug cases: a token exactly as wide as the row, and one a cell narrower, are not
+        // cut at their end.
+        let at = |name: &str, state: &str, width: usize| {
+            let st = on_box("job", name, info_box(name, state), |_| Vec::new());
+            let job = st.registry.get("t-job").unwrap();
+            status_lines(job, box_token(&st, job), width, None)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        let upd = |name: &str, width| {
+            let mut e = info_box(name, "online");
+            e["switch_pending"] = true.into();
+            let st = on_box("job", name, e, |_| Vec::new());
+            let job = st.registry.get("t-job").unwrap();
+            status_lines(job, box_token(&st, job), width, None)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(upd("gpubox7", 28), ["idle", "codex@gpubox7 update pending"]);
+        assert_eq!(
+            upd("gpu-box-123", 32),
+            ["idle", "codex@gpu-box-123 update pending"]
+        );
+        assert_eq!(
+            upd("gpu-box-12", 32),
+            ["idle", "codex@gpu-box-12 update pending"]
+        );
+        assert_eq!(
+            upd("gpu-box-123", 28),
+            ["idle", "…@gpu-box-123 update pending"]
+        );
+        assert_eq!(
+            at("gpu-workstation-01", "needs_install", 32),
+            ["idle", "@gpu-workstation-… needs install"]
+        );
+        // A local thread's header is cut at its end, as ever.
+        let st = box_threads(info_box("gpu", "online"));
+        let loc = st.registry.get("t-loc").unwrap();
+        assert_eq!(
+            status_lines(loc, box_token(&st, loc), 12, None)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>(),
+            ["idle", "claude-code…"]
+        );
+    }
+
+    /// The same, drawn: a card at its narrowest (30 columns), in the side column (34), a
+    /// 30-column tile and a tile at its narrowest (40) show the box's state whole whatever the
+    /// box's name, and the card keeps its height.
+    #[test]
+    fn cards_and_tiles_show_the_box_state_with_a_long_box_name() {
+        let mut heights: HashMap<(u16, bool), u16> = HashMap::new();
+        for name in box_names() {
+            for (entry, word) in box_cases() {
+                let mut st = on_box("job", &name, entry.clone(), |_| Vec::new());
+                for (screen_, width) in [
+                    (Screen::Stack, 30u16),
+                    (Screen::Stack, 100),
+                    (Screen::Grid, 30),
+                    (Screen::Grid, 40),
+                ] {
+                    st.view.screen = screen_;
+                    let lines = draw_panes(&mut st, width, 40);
+                    let pane = pane_text(&st, &lines, &card("t-job"));
+                    assert!(
+                        pane.lines().any(|r| has_token(r, &name, word)),
+                        "{name:?}{word} {screen_:?} {width}:\n{pane}"
+                    );
+                    let h = st.view.panes.get(&card("t-job")).unwrap().area.height;
+                    let first = *heights.entry((width, screen_ == Screen::Grid)).or_insert(h);
+                    assert_eq!(h, first, "{name}{word} {screen_:?} {width}");
+                }
+            }
+        }
+    }
+
+    /// A tall card with a request whose summary wraps to 5 rows, its options, why the agent
+    /// asks and how many more wait: the row with the box token of a box not online stays
+    /// before the why and the count (the request is whole first); a box online, or a local
+    /// thread, gives way as before. A tile (no why, no count: `(+1)` after the summary) keeps
+    /// the request whole and its header rows first.
+    #[test]
+    fn a_tall_card_keeps_the_box_state_before_the_requests_note() {
+        use crate::app::tests::info_box;
+        let raise = |s: &mut ThreadScript, id: &str| {
+            let mut perm = s.raise(id, AttentionReason::Permission);
+            if let EventBody::AttentionRaised(p) = &mut perm.body {
+                p.summary = format!("Allow shell: {}", "x".repeat(120));
+                p.options = vec!["allow".into(), "deny".into()];
+                p.ext = serde_json::json!({"codex": {"reason": "Git metadata is outside"}})
+                    .as_object()
+                    .cloned();
+            }
+            perm
+        };
+        for (state, kept) in [
+            ("offline", true),
+            ("needs_install", true),
+            ("online", false),
+        ] {
+            let mut st = on_box("job", "gpubox7", info_box("gpubox7", state), |s| {
+                vec![s.turn_started("go"), raise(s, "pm1"), raise(s, "pm2")]
+            });
+            // The side column at 100 columns: 34 wide, 32 inside, 9 rows.
+            let attn = attention_rows(&st, "t-job", 32, false).unwrap();
+            assert_eq!(attn.core.len(), 6, "5 rows of summary and the options");
+            assert_eq!(attn.extra.len(), 2, "why and +1 more");
+            let lines = draw_panes(&mut st, 100, 40);
+            let pane = pane_text(&st, &lines, &card("t-job"));
+            let rows: Vec<&str> = pane.lines().collect();
+            assert_eq!(rows.len(), usize::from(CARD_HEIGHT), "{pane}");
+            assert!(rows[1].contains("waiting"), "{pane}");
+            assert!(pane.contains("1 allow"), "{pane}");
+            let word = if state == "offline" {
+                " offline"
+            } else if state == "needs_install" {
+                " needs install"
+            } else {
+                ""
+            };
+            assert_eq!(
+                pane.lines().any(|r| has_token(r, "gpubox7", word)),
+                kept,
+                "{state}: {pane}"
+            );
+            if kept {
+                assert!(rows[2].contains(&format!("codex@gpubox7{word}")), "{pane}");
+                assert!(pane.contains("why: Git"), "{pane}");
+                assert!(!pane.contains("+1 more"), "{pane}");
+            } else {
+                assert!(
+                    pane.contains("why: Git") && pane.contains("+1 more"),
+                    "{pane}"
+                );
+            }
+            // The tile at 40 columns: the request whole, the header from its start.
+            st.view.screen = Screen::Grid;
+            let lines = draw_panes(&mut st, 40, 40);
+            let tile = pane_text(&st, &lines, &card("t-job"));
+            assert!(tile.contains("1 allow") && tile.contains("(+1)"), "{tile}");
+            assert!(tile.lines().nth(1).unwrap().contains("waiting"), "{tile}");
+        }
+    }
+
+    /// A compact Threads row of a long-named thread at 30 columns keeps its box's state
+    /// whatever its status (`done ✓`, `running (1 bg)`, `waiting`) and box name: the name is
+    /// cut first, then the box's name, then the status; never wider than the row.
+    #[test]
+    fn a_compact_row_cuts_the_box_name_then_the_status() {
+        use crate::app::CompactPane;
+        use twr_core::event::{Grade, TaskUpdated};
+        let cells = crate::edit::width;
+        let long = "review-last-3-remote-worker";
+        type Then = fn(&mut ThreadScript) -> Vec<twr_core::event::Event>;
+        let statuses: [(&str, Then); 3] = [
+            ("done ✓", |s| {
+                vec![
+                    s.turn_started("go"),
+                    s.turn_ended(TurnResult::Completed),
+                    s.report(Some(1), Grade::Success),
+                ]
+            }),
+            ("running (1 bg)", |s| {
+                vec![
+                    s.turn_started("go"),
+                    s.event(EventBody::TaskUpdated(TaskUpdated {
+                        task_id: "t1".into(),
+                        running: true,
+                        ..Default::default()
+                    })),
+                ]
+            }),
+            ("waiting", |s| {
+                vec![
+                    s.turn_started("go"),
+                    s.raise("p1", AttentionReason::Permission),
+                ]
+            }),
+        ];
+        for (status, then) in statuses {
+            for name in [
+                "gpu".to_string(),
+                "gpu-workstation-01".into(),
+                "box-".repeat(16),
+            ] {
+                for (entry, word) in box_cases().into_iter().filter(|(_, w)| !w.is_empty()) {
+                    let mut st = on_box(long, &name, entry, then);
+                    st.view.compact = Some(true);
+                    st.view.compact_pane = CompactPane::Threads;
+                    let rows = draw(&st, 30, 20);
+                    let row = rows
+                        .iter()
+                        .map(|r| r.trim_end())
+                        .find(|r| r.contains('@'))
+                        .unwrap_or_else(|| panic!("{}", screen(&rows)));
+                    let what = format!("{status} {name:?}{word}: {row:?}");
+                    assert!(cells(row) <= 30, "{what}");
+                    assert!(has_token(row, &name, word), "{what}");
+                    // The status whole while the token at its narrowest leaves it room.
+                    if 1 + 3 + cells(status) + 3 + 2 + cells(word) <= 30 {
+                        assert!(row.contains(&format!(" · {status} · @")), "{what}");
+                    }
+                }
+            }
+        }
+        // The longest state beside the longest status: the status gives way last.
+        let then = statuses[1].1;
+        let mut e = crate::app::tests::info_box("gpu", "online");
+        e["switch_pending"] = true.into();
+        let mut st = on_box(long, "gpu", e, then);
+        st.view.compact = Some(true);
+        st.view.compact_pane = CompactPane::Threads;
+        let rows = draw(&st, 30, 20);
+        assert!(
+            rows.iter()
+                .any(|r| r.trim_end() == "… · runni… · @… update pending"),
+            "{}",
+            screen(&rows)
+        );
+        let mut st = on_box(
+            long,
+            "gpu",
+            crate::app::tests::info_box("gpu", "offline"),
+            then,
+        );
+        st.view.compact = Some(true);
+        st.view.compact_pane = CompactPane::Threads;
+        let rows = draw(&st, 40, 20);
+        assert!(
+            rows.iter()
+                .any(|r| r.trim_end() == "review-… · running (1 bg) · @gpu offline"),
+            "{}",
+            screen(&rows)
+        );
+    }
+
+    /// The dive header as drawn at a phone's 30 and 40 columns, idle and working (the
+    /// working icon takes two more cells from the header's details), keeps the box's state of
+    /// a box not simply online, for short and long thread and box names: the label gives
+    /// way to the name, then `Esc: back` goes, then the box's name is cut. Where not even
+    /// `@… <state>` fits beside a name, a header without the token, within the row.
+    #[test]
+    fn the_dive_header_keeps_the_box_state_at_phone_widths() {
+        use crate::app::tests::info_box;
+        let cells = crate::edit::width;
+        let band = |st: &AppState, width: u16| -> String {
+            let rows = draw(st, width, 20);
+            rows.iter()
+                .find(|r| r.contains("‹ back"))
+                .unwrap_or_else(|| panic!("{}", screen(&rows)))
+                .trim_end()
+                .to_string()
+        };
+        for thread in ["job", "review-last-3-remote-worker"] {
+            for name in box_names() {
+                for (entry, word) in box_cases().into_iter().filter(|(_, w)| !w.is_empty()) {
+                    for working in [false, true] {
+                        let mut st = on_box(thread, &name, entry.clone(), |s| {
+                            if working {
+                                vec![s.turn_started("go")]
+                            } else {
+                                Vec::new()
+                            }
+                        });
+                        st.dive("t-job");
+                        for width in [30u16, 40] {
+                            let row = band(&st, width);
+                            let what =
+                                format!("{thread} {name:?}{word} {working} {width}: {row:?}");
+                            // What the band leaves the header: ` ‹ back  ` and a cell at
+                            // the end, the icon and a space while it works.
+                            let room = usize::from(width) - 10 - if working { 2 } else { 0 };
+                            let (label, detail) = main_title(&st, room);
+                            assert!(cells(&label) + 2 + cells(&detail) <= room, "{what}");
+                            assert!(row.ends_with(&detail) && row.contains(&label), "{what}");
+                            if 1 + 2 + 2 + cells(word) <= room {
+                                assert!(has_token(&detail, &name, word), "{what}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let header = |thread: &str, name: &str, working: bool, width: u16| {
+            let mut st = on_box(thread, name, info_box(name, "offline"), |s| {
+                if working {
+                    vec![s.turn_started("go")]
+                } else {
+                    Vec::new()
+                }
+            });
+            st.dive("t-job");
+            band(&st, width)
+        };
+        assert!(header("job", "gpu", false, 30).ends_with("‹ back  job  @gpu offline"));
+        assert!(header("job", "gpu", false, 40).ends_with("‹ back  job  @gpu offline · Esc: back"));
+        let row = header("job", "gpu-workstation-01", true, 30);
+        assert!(row.ends_with("‹ back  job  @gpu… offline"), "{row}");
+        let row = header(
+            "review-last-3-remote-worker",
+            "gpu-workstation-01",
+            true,
+            30,
+        );
+        assert!(row.ends_with("‹ back  re…  @gpu… offline"), "{row}");
+    }
+
+    /// The dive header measures in display cells: a name of wide characters never makes it
+    /// wider than it is given, for a local thread and one on a box offline.
+    #[test]
+    fn the_dive_header_measures_display_cells() {
+        use crate::app::tests::info_box;
+        let cells = crate::edit::width;
+        for name in ["gpu", "gpu-workstation-01"] {
+            for state in ["online", "offline", "needs_install"] {
+                let mut st = on_box("測試測試-worker", name, info_box(name, state), |_| {
+                    Vec::new()
+                });
+                st.dive("t-job");
+                for width in 4..90 {
+                    let (label, detail) = main_title(&st, width);
+                    let used = cells(&label)
+                        + if detail.is_empty() {
+                            0
+                        } else {
+                            2 + cells(&detail)
+                        };
+                    assert!(
+                        used <= width,
+                        "{name} {state} {width}: {label:?} {detail:?}"
+                    );
+                }
+            }
+        }
+        let mut st = on_box(
+            "測試測試-worker",
+            "local",
+            info_box("local", "online"),
+            |_| Vec::new(),
+        );
+        st.dive("t-job");
+        assert_eq!(
+            main_title(&st, 80),
+            (
+                "talking to 測試測試-worker".into(),
+                "codex · gpt-5-codex · mode manual · Esc: back".into()
+            )
+        );
+        assert_eq!(
+            main_title(&st, 20),
+            ("測試測試…".into(), "Esc: back".into())
+        );
+    }
+
+    /// The dive header colors its box token's state word as the cards and tiles do (red for
+    /// offline, error, needs install and a mismatch; yellow for switching and reconnecting;
+    /// dim yellow for an update pending) on the header's background, whole or with its box's
+    /// name cut, while the rest of the header keeps the header's own colors.
+    #[test]
+    fn the_dive_header_colors_the_box_state() {
+        let band = target_fill(true);
+        for (entry, word) in box_cases().into_iter().filter(|(_, w)| !w.is_empty()) {
+            let (fg, dim) = match word {
+                " switching" | " reconnecting" => (Color::Yellow, false),
+                " update pending" => (Color::Yellow, true),
+                _ => (Color::Red, false),
+            };
+            for (name, width) in [("gpu", 120u16), ("gpu-workstation-01", 30)] {
+                let mut entry = entry.clone();
+                entry["name"] = name.into();
+                let mut st = on_box("job", name, entry, |_| Vec::new());
+                st.dive("t-job");
+                let buf = draw_buf(&st, width, 20);
+                let (y, row) = (0..20u16)
+                    .map(|y| {
+                        let row: String = (0..width).map(|x| buf[(x, y)].symbol()).collect();
+                        (y, row)
+                    })
+                    .find(|(_, r)| r.contains("‹ back"))
+                    .unwrap();
+                let what = format!("{name}{word} {width}: {row:?}");
+                assert!(has_token(&row, name, word), "{what}");
+                let col = |byte: usize| u16::try_from(row[..byte].chars().count()).unwrap();
+                let at = row.find('@').unwrap();
+                let from = at + row[at..].find(word).unwrap();
+                let to = from + word.len();
+                // `‹ back` up to the word: the header's colors.
+                for x in col(row.find("‹ back").unwrap())..col(from) {
+                    assert_eq!(buf[(x, y)].fg, band.fg.unwrap(), "{what} {x}");
+                    assert_eq!(buf[(x, y)].bg, band.bg.unwrap(), "{what} {x}");
+                }
+                for x in col(from)..col(to) {
+                    let c = &buf[(x, y)];
+                    assert_eq!(c.fg, fg, "{what} {x}");
+                    assert_eq!(c.bg, band.bg.unwrap(), "{what} {x}");
+                    assert_eq!(c.modifier.contains(Modifier::DIM), dim, "{what} {x}");
+                    assert!(!c.modifier.contains(Modifier::BOLD), "{what} {x}");
+                }
+                // What follows the token in the header keeps the header's colors.
+                let end = row[to..].find("  ").map_or(row.len(), |i| to + i);
+                for x in col(to)..col(end) {
+                    assert_eq!(buf[(x, y)].fg, band.fg.unwrap(), "{what} {x}");
+                    assert_eq!(buf[(x, y)].bg, band.bg.unwrap(), "{what} {x}");
+                }
+            }
+        }
+    }
+
+    /// In a dive into a thread whose box is not online, the header keeps the box token: the
+    /// `(request selected, Esc follows)` hint (never shown in a dive: no request is selected
+    /// there) does not take its place.
+    #[test]
+    fn the_request_hint_never_takes_the_box_tokens_place() {
+        use crate::app::tests::info_box;
+        let mut st = on_box("job", "gpu", info_box("gpu", "offline"), |s| {
+            vec![
+                s.turn_started("go"),
+                s.raise("p1", AttentionReason::Permission),
+            ]
+        });
+        st.view.request = Some("p1".into());
+        st.dive("t-job");
+        for width in [40u16, 60, 80, 120] {
+            let rows = draw(&st, width, 20);
+            let band = rows.iter().find(|r| r.contains("‹ back")).unwrap();
+            assert!(band.contains("@gpu offline"), "{width}: {band}");
+            assert!(!band.contains("request selected"), "{width}: {band}");
+        }
     }
 
     /// A thread's reasoning effort follows its model on its card, its tile and the dive
@@ -10699,10 +11960,7 @@ mod tests {
         assert!(c.contains("idle · claude-code · sonnet · high"), "{c}");
         st.view.screen = Screen::Grid;
         let g = screen(&draw(&st, 180, 30));
-        assert!(
-            g.contains("idle · claude-code@local · sonnet · high"),
-            "{g}"
-        );
+        assert!(g.contains("idle · claude-code · sonnet · high"), "{g}");
         st.view.screen = Screen::Stack;
         st.dive("t-web");
         let d = screen(&draw(&st, 160, 30));
@@ -11322,11 +12580,22 @@ mod tests {
             vec![l("status"), l("project")],
             &[l("Q"), l("1 a")],
             &[l("note")],
+            0,
             3,
         );
         assert!(whole);
         assert_eq!(text(&rows), ["Q", "1 a", "note"]);
-        let (_, whole) = fit_rows(vec![], &[l("Q"), l("1 a")], &[], 1);
+        // A header row kept first (a box token saying the box is not online): the note gives
+        // way to it.
+        let (rows, _) = fit_rows(
+            vec![l("status"), l("project")],
+            &[l("Q"), l("1 a")],
+            &[l("note")],
+            1,
+            3,
+        );
+        assert_eq!(text(&rows), ["status", "Q", "1 a"]);
+        let (_, whole) = fit_rows(vec![], &[l("Q"), l("1 a")], &[], 0, 1);
         assert!(!whole);
     }
 

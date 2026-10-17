@@ -19,7 +19,7 @@ use twr_core::runner::{
 use twr_core::sealed::{hub_side, HubKey};
 use twr_runner::daemon::{request, Request};
 use twr_runner::relay::{DaemonPaths, Launcher, RelayOptions};
-use twr_runner::{DaemonOptions, LocalBox, LocalBoxOptions, RunnerOptions};
+use twr_runner::{BoxEnv, DaemonOptions, LocalBox, LocalBoxOptions, RunnerOptions};
 
 const BOX: &str = "gpu";
 
@@ -220,8 +220,10 @@ fn init_logs() {
         .try_init();
 }
 
-/// The built-in adapters with the fake one (production registries leave it out).
+/// The built-in adapters with the fake one (production registries leave it out), and no real
+/// login shell or agent CLI asked.
 fn with_fake(mut o: LocalBoxOptions) -> LocalBoxOptions {
+    o.env = twr_runner::BoxEnv::none();
     o.adapters = Arc::new(|n: &str| {
         twr_adapters::registry_with(true)
             .into_iter()
@@ -292,11 +294,18 @@ struct Daemon {
 
 impl Daemon {
     async fn start(dir: &Path, key: &HubKey) -> Daemon {
+        Daemon::start_with(dir, key, BoxEnv::none()).await
+    }
+
+    /// [`Daemon::start`] asking its environment as `env` says.
+    async fn start_with(dir: &Path, key: &HubKey, env: BoxEnv) -> Daemon {
         init_logs();
         let paths = paths(dir);
         let opts = daemon_opts(&paths, &key.public());
         assert!(opts.validate().is_ok(), "a daemon needs no token or URL");
-        let lbox = LocalBox::open(with_fake(opts.box_options())).unwrap();
+        let mut o = with_fake(opts.box_options());
+        o.env = env;
+        let lbox = LocalBox::open(o).unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(twr_runner::run_with(opts, lbox.clone(), async move {
             let _ = rx.await;
@@ -821,4 +830,500 @@ async fn the_relay_starts_the_daemon_and_relays_to_it() {
             key.id()
         )]
     );
+}
+
+/// Creates the executable `path` with `content` without this process holding it open for
+/// writing (a fork holding it would make exec'ing it fail with ETXTBSY): `cp` writes it.
+fn install(path: &Path, content: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let src = path.with_extension("src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Log lines, kept for a test to read.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The agent results of `cmd_id`, once answered.
+async fn agents_result(hub: &Hub, cmd_id: &str) -> Vec<twr_core::runner::AgentInfo> {
+    hub.wait(cmd_id, |s| s.results.iter().any(|r| r.cmd_id == cmd_id))
+        .await;
+    let s = hub.state();
+    let r = s.results.iter().find(|r| r.cmd_id == cmd_id).unwrap();
+    assert!(r.ok, "{r:?}");
+    serde_json::from_value(r.result.clone().unwrap()).unwrap()
+}
+
+/// A box's agents and login PATH over the daemon, as the hub sees them: the login shell (a
+/// noisy one) is asked in the background, the agents probed at start reach the inventory of
+/// the next connection, `agents` answers what is known and probes again on `refresh`; a
+/// runtime gets the login PATH before the runner's, unless its thread sets one. No account
+/// detail reaches a result or a log line.
+#[tokio::test]
+async fn the_box_reports_its_agents_and_runtimes_get_the_login_path() {
+    use twr_core::runner::AgentLogin;
+    const EMAIL: &str = "someone.secret@example.com";
+    let logs = Captured::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .finish();
+    let _logs = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let d = dir.path().display();
+    install(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             --version*) echo '2.1.302 (Claude Code)';;\n\
+             'auth status') echo '{{\"loggedIn\": true, \"authMethod\": \"claude.ai\", \
+             \"email\": \"{EMAIL}\", \"orgName\": \"Secret Org\"}}';;\n\
+             *) exit 9;;\nesac\n"
+        ),
+    );
+    install(
+        &bin.join("codex"),
+        &format!(
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             --version*) echo 'codex-cli 0.160.0';;\n\
+             'login status') [ -f {d}/codex-in ] || exit 1;;\n\
+             *) exit 9;;\nesac\n"
+        ),
+    );
+    install(&bin.join("grok"), "#!/bin/sh\necho 'grok 1.0.46'\n");
+    // A login shell (asked as bash is) whose profile prints a banner and puts `bin` first.
+    let shell = dir.path().join("bash");
+    install(
+        &shell,
+        &format!(
+            "#!/bin/sh\necho 'Welcome to the box'\nPATH='{}':\"$PATH\"; export PATH\n\
+             shift; script=$1; shift; exec /bin/sh -c \"$script\" \"$@\"\n",
+            bin.display()
+        ),
+    );
+    let key = HubKey::generate().unwrap();
+    let env = BoxEnv {
+        login_shell: Some(twr_adapters::resolve::LoginShell::Posix(shell)),
+        probe_agents: true,
+        // No `TWR_*_BIN` this test inherits: its fake agents, whatever the environment.
+        bin_vars: Some(Vec::new()),
+    };
+    let d = Daemon::start_with(dir.path(), &key, env).await;
+    // Probed in the background as the daemon started.
+    wait_for("the first probe", || !d.lbox.agents().is_empty()).await;
+    let login = d.lbox.login_path().await.expect("the login shell's PATH");
+    assert_eq!(login.entries()[0], bin);
+
+    let hub = Hub::default();
+    let conn = hub.connect(&d.paths.socket, &key).await;
+    hub.wait("synced", |s| s.synced == 1).await;
+    let inventory = hub.state().inventories[0].agents.clone();
+    let by = |agents: &[twr_core::runner::AgentInfo], rt: &str| {
+        agents.iter().find(|a| a.runtime == rt).cloned().unwrap()
+    };
+    let claude = by(&inventory, "claude-code");
+    assert_eq!(
+        (claude.found, claude.login, claude.method.as_deref()),
+        (true, AgentLogin::LoggedIn, Some("claude.ai"))
+    );
+    assert_eq!(claude.path, Some(bin.join("claude").display().to_string()));
+    assert_eq!(by(&inventory, "codex").login, AgentLogin::LoggedOut);
+    assert_eq!(
+        by(&inventory, "grok-build").version.as_deref(),
+        Some("grok 1.0.46")
+    );
+
+    // What is known, then probed again on request.
+    conn.cmd("a1", Op::Agents { refresh: false });
+    assert_eq!(agents_result(&hub, "a1").await, inventory);
+    std::fs::write(dir.path().join("codex-in"), "").unwrap();
+    conn.cmd("a2", Op::Agents { refresh: false });
+    assert_eq!(
+        by(&agents_result(&hub, "a2").await, "codex").login,
+        AgentLogin::LoggedOut
+    );
+    conn.cmd("a3", Op::Agents { refresh: true });
+    assert_eq!(
+        by(&agents_result(&hub, "a3").await, "codex").login,
+        AgentLogin::LoggedIn
+    );
+    assert_eq!(by(&d.lbox.agents(), "codex").login, AgentLogin::LoggedIn);
+
+    // A runtime gets the login PATH before the runner's; one whose thread sets a PATH, that.
+    let out = |n: &str| dir.path().join(format!("path-{n}"));
+    let pty = |thread: &str, env: Vec<(String, String)>| Op::Spawn {
+        thread: thread.into(),
+        runtime: "pty".into(),
+        cfg: WireSpawnConfig {
+            cwd: dir.path().to_path_buf(),
+            env,
+            ..Default::default()
+        },
+        prompt: None,
+        run: None,
+    };
+    let command = |n: &str| {
+        serde_json::json!([
+            "/bin/sh",
+            "-c",
+            format!("printf '%s' \"$PATH\" > '{}'", out(n).display())
+        ])
+        .to_string()
+    };
+    conn.cmd(
+        "s1",
+        pty(
+            "t1",
+            vec![(twr_adapters::pty::COMMAND_ENV.into(), command("login"))],
+        ),
+    );
+    conn.cmd(
+        "s2",
+        pty(
+            "t2",
+            vec![
+                ("PATH".into(), "/thread/bin".into()),
+                (twr_adapters::pty::COMMAND_ENV.into(), command("thread")),
+            ],
+        ),
+    );
+    for n in ["login", "thread"] {
+        wait_for(n, || {
+            std::fs::read_to_string(out(n)).is_ok_and(|s| !s.is_empty())
+        })
+        .await;
+    }
+    let got = std::fs::read_to_string(out("login")).unwrap();
+    assert!(got.starts_with(&format!("{}:", bin.display())), "{got}");
+    assert_eq!(
+        got,
+        login
+            .merged(std::env::var_os("PATH").as_deref())
+            .to_string_lossy()
+    );
+    assert_eq!(
+        std::fs::read_to_string(out("thread")).unwrap(),
+        "/thread/bin"
+    );
+
+    // Nothing of the account in a result or a log line.
+    let results = serde_json::to_string(&hub.state().results).unwrap();
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("probed an agent CLI"), "{logs}");
+    assert!(
+        logs.contains("the login shell's PATH goes before"),
+        "{logs}"
+    );
+    for secret in [EMAIL, "Secret Org", "Welcome to the box"] {
+        assert!(!results.contains(secret), "{secret} in {results}");
+        assert!(!logs.contains(secret), "{secret} in the logs");
+    }
+}
+
+/// A box that asks nothing of its environment (tests, the default) answers no agents, and
+/// its runtimes keep the runner's PATH.
+#[tokio::test]
+async fn a_box_without_an_environment_reports_no_agents() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = HubKey::generate().unwrap();
+    let d = Daemon::start(dir.path(), &key).await;
+    assert!(d.lbox.login_path().await.is_none());
+    let hub = Hub::default();
+    let conn = hub.connect(&d.paths.socket, &key).await;
+    conn.cmd("a1", Op::Agents { refresh: true });
+    assert!(agents_result(&hub, "a1").await.is_empty());
+    assert!(hub.state().inventories[0].agents.is_empty());
+}
+
+/// A remote attach's command (`attach_info`) is resolved as a spawn's: on the login shell's
+/// PATH before the runner's, unless the thread configures a PATH, which it keeps. Nothing
+/// else the hub sent reaches it.
+#[tokio::test]
+async fn an_attach_command_gets_the_login_path_as_a_spawn_does() {
+    use twr_core::runner::{decode_result, AttachInfo};
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    install(&bin.join("grok"), "#!/bin/sh\necho 'grok 1.0.46'\n");
+    // A login shell (asked as bash is) that puts `bin` first.
+    let shell = dir.path().join("bash");
+    install(
+        &shell,
+        &format!(
+            "#!/bin/sh\nPATH='{}':\"$PATH\"; export PATH\n\
+             shift; script=$1; shift; exec /bin/sh -c \"$script\" \"$@\"\n",
+            bin.display()
+        ),
+    );
+    init_logs();
+    let mut o = with_fake(LocalBoxOptions::new(&dir.path().join("data"), BOX));
+    o.env = BoxEnv {
+        login_shell: Some(twr_adapters::resolve::LoginShell::Posix(shell)),
+        probe_agents: false,
+        bin_vars: Some(Vec::new()),
+    };
+    let lbox = LocalBox::open(o).unwrap();
+    let login = lbox.login_path().await.expect("the login shell's PATH");
+    let attach = |id: &str, env: Vec<(String, String)>| {
+        let lbox = lbox.clone();
+        let id = id.to_string();
+        let cwd = dir.path().to_path_buf();
+        async move {
+            let r = lbox
+                .handle_cmd(
+                    &id,
+                    Op::AttachInfo {
+                        thread: "t1".into(),
+                        runtime: twr_adapters::grok_build::NAME.into(),
+                        cfg: WireSpawnConfig {
+                            cwd,
+                            env,
+                            ..Default::default()
+                        },
+                        session_id: "sess".into(),
+                    },
+                )
+                .await;
+            let info: AttachInfo = decode_result(r.into_outcome().unwrap()).unwrap();
+            info
+        }
+    };
+    let path_of = |info: &AttachInfo| {
+        info.env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .and_then(|(_, v)| v.clone())
+    };
+    let info = attach("a1", vec![("SECRET_OF_THE_HUB".into(), "x".into())]).await;
+    assert_eq!(
+        path_of(&info).as_deref(),
+        Some(
+            login
+                .merged(std::env::var_os("PATH").as_deref())
+                .to_string_lossy()
+                .as_ref()
+        ),
+        "{info:?}"
+    );
+    assert!(
+        info.env.iter().all(|(k, _)| k != "SECRET_OF_THE_HUB"),
+        "{info:?}"
+    );
+    let info = attach(
+        "a2",
+        vec![
+            ("PATH".into(), "/thread/bin".into()),
+            ("SECRET_OF_THE_HUB".into(), "x".into()),
+        ],
+    )
+    .await;
+    assert_eq!(path_of(&info).as_deref(), Some("/thread/bin"), "{info:?}");
+    assert!(
+        info.env.iter().all(|(k, _)| k != "SECRET_OF_THE_HUB"),
+        "{info:?}"
+    );
+}
+
+/// A connection replaced while a runtime's start waits for the login shell's `PATH` (asked
+/// once, slow here: it answers only once `gate` exists) leaves nothing of the command
+/// behind: the next inventory has no ghost in `in_flight`, and the hub's replay of the same
+/// id on the new connection starts the runtime (once, a repeat answering the same result)
+/// instead of answering `interrupted`.
+async fn a_start_waiting_for_the_login_path_survives_a_replaced_connection(op: Op) {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let shell = dir.path().join("bash");
+    install(
+        &shell,
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 80 ]; do sleep 0.05; i=$((i+1)); done\n\
+             shift; script=$1; shift; exec /bin/sh -c \"$script\" \"$@\"\n",
+            gate.display()
+        ),
+    );
+    let key = HubKey::generate().unwrap();
+    let env = BoxEnv {
+        login_shell: Some(twr_adapters::resolve::LoginShell::Posix(shell)),
+        probe_agents: false,
+        bin_vars: Some(Vec::new()),
+    };
+    let d = Daemon::start_with(dir.path(), &key, env).await;
+    let hub = Hub::default();
+    let first = hub.connect(&d.paths.socket, &key).await;
+    first.cmd("c1", op.clone());
+    // The reader takes the command and waits for the login shell.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        d.lbox.live_count(),
+        0,
+        "the runtime started before the PATH"
+    );
+
+    let second = hub.connect(&d.paths.socket, &key).await;
+    wait_for("the first connection to end", || first.ended()).await;
+    {
+        let s = hub.state();
+        let inv = s.inventories.last().unwrap();
+        assert!(inv.in_flight.is_empty(), "{inv:?}");
+        assert!(inv.running.is_empty(), "{inv:?}");
+        assert!(s.results.is_empty(), "{:?}", s.results);
+    }
+    // The hub replays the command it got no answer for.
+    second.cmd("c1", op.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    std::fs::write(&gate, "").unwrap();
+    hub.wait("the replay's answer", |s| {
+        s.results.iter().any(|r| r.cmd_id == "c1")
+    })
+    .await;
+    let answer = hub.state().results[0].clone();
+    assert!(answer.ok, "{answer:?}");
+    hub.wait("the runtime's start", |s| {
+        s.committed
+            .iter()
+            .any(|c| c.0 == "t1" && c.2 == "thread.started")
+    })
+    .await;
+
+    // Once: a repeat answers the same, and the next connection sees one runtime and nothing
+    // in flight.
+    second.cmd("c1", op);
+    hub.wait("the repeat's answer", |s| {
+        s.results.iter().filter(|r| r.cmd_id == "c1").count() == 2
+    })
+    .await;
+    assert_eq!(hub.state().results[1], answer);
+    let _third = hub.connect(&d.paths.socket, &key).await;
+    wait_for("the second connection to end", || second.ended()).await;
+    let s = hub.state();
+    let inv = s.inventories.last().unwrap();
+    assert!(inv.in_flight.is_empty(), "{inv:?}");
+    assert_eq!(inv.running.len(), 1, "{inv:?}");
+    assert_eq!(d.lbox.live_count(), 1);
+    let starts = s
+        .committed
+        .iter()
+        .filter(|c| c.0 == "t1" && c.2 == "thread.started")
+        .count();
+    assert_eq!(starts, 1, "{:?}", s.committed);
+}
+
+#[tokio::test]
+async fn a_spawn_waiting_for_the_login_path_survives_a_replaced_connection() {
+    a_start_waiting_for_the_login_path_survives_a_replaced_connection(spawn_op("t1", "a turn"))
+        .await;
+}
+
+#[tokio::test]
+async fn a_resume_waiting_for_the_login_path_survives_a_replaced_connection() {
+    a_start_waiting_for_the_login_path_survives_a_replaced_connection(Op::Resume {
+        thread: "t1".into(),
+        runtime: "fake".into(),
+        cfg: WireSpawnConfig {
+            cwd: std::env::temp_dir(),
+            ..Default::default()
+        },
+        session_id: "no-such-session".into(),
+        run: None,
+    })
+    .await;
+}
+
+/// A command whose execution is dropped part way (its task cancelled) is settled: not in
+/// flight any more; run when repeated if it had not begun (it waited for one of the
+/// [`twr_runner::lbox::MAX_CONCURRENT_OPS`] permits), answered `interrupted` if it had (its effect
+/// is unknown). Here every permit is held by an agent probe waiting for a slow login shell.
+#[tokio::test]
+async fn a_cancelled_command_is_settled() {
+    use twr_core::runner::cmd_errors;
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let shell = dir.path().join("bash");
+    install(
+        &shell,
+        &format!(
+            "#!/bin/sh\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 80 ]; do sleep 0.05; i=$((i+1)); done\n\
+             shift; script=$1; shift; exec /bin/sh -c \"$script\" \"$@\"\n",
+            gate.display()
+        ),
+    );
+    init_logs();
+    let mut o = with_fake(LocalBoxOptions::new(&dir.path().join("data"), BOX));
+    o.env = BoxEnv {
+        login_shell: Some(twr_adapters::resolve::LoginShell::Posix(shell)),
+        probe_agents: true,
+        // No agent CLI runs: each names a file that is not there.
+        bin_vars: Some(
+            twr_adapters::resolve::BUILTIN_AGENTS
+                .iter()
+                .map(|(.., var)| (var.to_string(), dir.path().join("none").into_os_string()))
+                .collect(),
+        ),
+    };
+    let lbox = LocalBox::open(o).unwrap();
+    let probe = |id: String| {
+        let lbox = lbox.clone();
+        tokio::spawn(async move { lbox.handle_cmd(&id, Op::Agents { refresh: true }).await })
+    };
+    let held: Vec<_> = (0..twr_runner::lbox::MAX_CONCURRENT_OPS)
+        .map(|i| probe(format!("p{i}")))
+        .collect();
+    wait_for("every permit held", || {
+        lbox.in_flight().len() == twr_runner::lbox::MAX_CONCURRENT_OPS
+    })
+    .await;
+    // One more waits for a permit; another, begun, waits for the login shell.
+    let waiting = probe("x".into());
+    wait_for("the next command", || {
+        lbox.in_flight().contains(&"x".to_string())
+    })
+    .await;
+    waiting.abort();
+    let _ = waiting.await;
+    let mut held = held.into_iter();
+    let begun = held.next().unwrap();
+    begun.abort();
+    let _ = begun.await;
+    let in_flight = lbox.in_flight();
+    assert!(!in_flight.contains(&"x".to_string()), "{in_flight:?}");
+    assert!(!in_flight.contains(&"p0".to_string()), "{in_flight:?}");
+
+    std::fs::write(&gate, "").unwrap();
+    for h in held {
+        assert!(h.await.unwrap().ok);
+    }
+    let x = lbox.handle_cmd("x", Op::Agents { refresh: false }).await;
+    assert!(
+        x.ok,
+        "the command that never began runs when repeated: {x:?}"
+    );
+    let p0 = lbox.handle_cmd("p0", Op::Agents { refresh: false }).await;
+    assert_eq!(
+        p0.error.as_ref().map(|e| e.code.as_str()),
+        Some(cmd_errors::INTERRUPTED),
+        "{p0:?}"
+    );
+    assert!(lbox.in_flight().is_empty(), "{:?}", lbox.in_flight());
 }

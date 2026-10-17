@@ -4,9 +4,11 @@
 //! the remote command, logs each run, and runs the command with `sh -c` in a fake box
 //! environment (`HOME` a directory of the test's, no `XDG_*`, `TWR_BOX_LAUNCHER=setsid` so the
 //! relay starts the daemon in a session of its own, never with `systemd-run`, and
-//! `TWR_ENABLE_FAKE=1` for the fake runtime, which the threads run). The box is this machine,
-//! so the hub uploads this build of twr into the fake home, and the box daemon runs from
-//! there.
+//! `TWR_ENABLE_FAKE=1` for the fake runtime, which the threads run; `PATH` is this test's
+//! without the directories that hold an agent CLI (`claude`, `codex`, `grok`), after the box's
+//! own `bin`, where a test puts fake ones). A destination `down@...` fails as an unreachable
+//! host does. The box is this machine, so the hub uploads this build of twr into the fake
+//! home, and the box daemon runs from there.
 //!
 //! Linux only: the test finds the box's processes in `/proc`.
 #![cfg(target_os = "linux")]
@@ -73,7 +75,22 @@ impl Setup {
         std::fs::create_dir_all(&box_home).unwrap();
         let ssh = dir.path().join("fake-ssh");
         let log = dir.path().join("ssh.log");
-        let path = std::env::var("PATH").unwrap_or_default();
+        // The box finds only the agent CLIs a test puts in its `bin`.
+        let agents = ["claude", "codex", "grok"];
+        let kept: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|d| !agents.iter().any(|a| d.join(a).exists()))
+                .collect();
+        for tool in ["sh", "git", "setsid"] {
+            assert!(
+                kept.iter().any(|d| d.join(tool).exists()),
+                "no {tool} on PATH once the agent CLIs' directories are left out"
+            );
+        }
+        let path = std::env::join_paths(std::iter::once(box_home.join("bin")).chain(kept))
+            .unwrap()
+            .into_string()
+            .unwrap();
         for p in [&box_home, &log] {
             assert!(!p.to_str().unwrap().contains('\''));
         }
@@ -102,6 +119,7 @@ done
 [ -n "$dashdash" ] && [ $# -gt 0 ] || {{ echo "fake ssh: no -- before the remote command" >&2; exit 255; }}
 cmd="$*"
 printf '%s\t%s\t%s\n' "$$" "$dest" "$(printf '%s' "$cmd" | tr '\n\t' '  ')" >> "$log"
+case $dest in down@*) echo "ssh: connect to host ${{dest#*@}} port 22: Connection refused" >&2; exit 255 ;; esac
 cd '{box_home}' || exit 255
 exec env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_FAKE=1 sh -c "$cmd"
 "#,
@@ -124,6 +142,15 @@ exec env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_F
         Paths::with_home(&self.home)
     }
 
+    /// Puts a fake agent CLI `name` on the box's PATH: a sh script with `body`.
+    fn box_agent(&self, name: &str, body: &str) {
+        let bin = self.box_home.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let file = bin.join(name);
+        std::fs::write(&file, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     /// `twr` with this setup's environment (the hub it starts inherits it).
     fn command(&self, args: &[&str]) -> Command {
         let mut c = Command::new(TWR);
@@ -135,6 +162,12 @@ exec env -i HOME='{box_home}' PATH='{path}' TWR_BOX_LAUNCHER=setsid TWR_ENABLE_F
             .env("TWR_TEST_USER_TOKEN_FILE", test_token())
             .env_remove("TWR_WORKSPACE")
             .env_remove("RUST_LOG")
+            // Nothing of the user's agent overrides: the hub's own agent probe and what the
+            // tests' commands run never pick another program for them.
+            .env_remove("TWR_CLAUDE_BIN")
+            .env_remove("TWR_CODEX_BIN")
+            .env_remove("TWR_GROK_BIN")
+            .env("TWR_AGENT_PROBE", "off")
             .stdin(Stdio::null());
         c
     }
@@ -572,6 +605,12 @@ impl Setup {
         .env_remove("TWR_TEST_USER_TOKEN_FILE")
         .env_remove("TWR_WORKSPACE")
         .env_remove("RUST_LOG")
+        // Nothing of the user's agent overrides: the hub's own agent probe and what the
+        // tests' commands run never pick another program for them.
+        .env_remove("TWR_CLAUDE_BIN")
+        .env_remove("TWR_CODEX_BIN")
+        .env_remove("TWR_GROK_BIN")
+        .env("TWR_AGENT_PROBE", "off")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -601,7 +640,11 @@ fn adding_a_box_starts_the_hub_when_none_runs() {
     assert!(ok, "{out}");
     assert!(out.contains("the hub has box gpu from "), "{out}");
     assert!(out.contains("box gpu is online: twr "), "{out}");
-    let status = t.box_status("gpu");
+    // As the user: this test's own clients may be a thread's agent to that hub, which sees a
+    // box's state and agents only.
+    let (ok, out) = t.detached(&["box", "status", "gpu", "--json"]);
+    assert!(ok, "{out}");
+    let status: Value = serde_json::from_str(&out).unwrap();
     assert_eq!(status["state"], "online", "{status}");
     assert_eq!(status["transport"], "ssh", "{status}");
     assert_eq!(t.relays().len(), 1, "{:?}", t.ssh_runs());
@@ -674,4 +717,290 @@ fn box_remove_repairs_boxes_toml() {
     assert!(e.contains("which twr does not edit"), "{e}");
     let e = t.fails(&["box", "remove", "nope"]);
     assert!(e.contains("there is no box nope"), "{e}");
+}
+
+/// `box.agents {box, refresh: true}` straight to the hub on `socket`, as the user.
+fn box_agents_refresh(socket: &Path, name: &str) -> Value {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut c = twr_core::client::Client::connect(socket).await.unwrap();
+        let token = std::fs::read_to_string(test_token()).unwrap();
+        c.hello(json!({"client": "test", "user_token": token}))
+            .await
+            .unwrap();
+        c.call("box.agents", json!({ "box": name, "refresh": true }))
+            .await
+            .unwrap()
+    })
+}
+
+/// A fake Claude Code that is logged in: its status names an account, which twr never shows.
+const CLAUDE_LOGGED_IN: &str = r#"case "$1 $2" in
+  "--version ") echo '2.1.0 (Claude Code)' ;;
+  "auth status") echo '{"loggedIn": true, "authMethod": "claude.ai", "email": "someone@example.com", "orgName": "Secret Org"}' ;;
+  *) exit 1 ;;
+esac
+"#;
+
+/// A fake Codex that is logged out.
+const CODEX_LOGGED_OUT: &str = r#"case "$1 $2" in
+  "--version ") echo 'codex-cli 0.50.0' ;;
+  "login status") echo 'Not logged in'; exit 1 ;;
+  *) exit 1 ;;
+esac
+"#;
+
+/// `twr box doctor` of an SSH box: with the hub running and the box online, every check
+/// passes but the agents' (Claude logged in, Codex logged out with how to log in, no Grok)
+/// and the login shell's (no SHELL on the fake box); `--json` says the same, the build used
+/// and the agents; no account detail anywhere. `twr box list` and `status` show the agents
+/// once the box reported them. With the hub stopped, doctor still checks the box (its daemon
+/// outlives the hub); a project whose repository is missing on the box fails (exit 1), and so
+/// does a box ssh cannot reach.
+#[test]
+fn box_doctor_checks_a_box_with_and_without_the_hub() {
+    let t = Setup::new();
+    let _cleanup = BoxProcesses(t.box_home.clone());
+    t.box_agent("claude", CLAUDE_LOGGED_IN);
+    t.box_agent("codex", CODEX_LOGGED_OUT);
+    let paths = t.paths();
+    let mut hub = Some(t.start_hub(1));
+    t.ok(&["box", "add", "gpu", "fake@box", "--yes"]);
+    let id = twr_core::build_id_of(Path::new(TWR)).unwrap();
+    let bin = t.box_home.join("bin");
+
+    let out = t.twr(&["box", "doctor", "gpu"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let said = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(out.status.success(), "{text}\n{said}");
+    for line in [
+        "✓ hub: box gpu is online: twr ".to_string(),
+        "✓ ssh without prompting: works".to_string(),
+        "✓ ssh in this terminal: reaches the box: linux/".to_string(),
+        format!("✓ build: the hub's build {id} is on the box; the checks below run it"),
+        format!("✓ daemon: a box daemon runs: build {id}, runner protocol "),
+        "! login shell: the login shell's PATH was not read (SHELL is not set)".to_string(),
+        format!(
+            "✓ claude: logged in (claude.ai), 2.1.0 (Claude Code), at {}/claude",
+            bin.display()
+        ),
+        format!(
+            "! codex: logged out, codex-cli 0.50.0, at {}/codex\n    fix: `twr box login gpu codex`",
+            bin.display()
+        ),
+        "! grok: not installed (not found on PATH)".to_string(),
+        "✓ git: git version ".to_string(),
+        "box gpu: nothing failed".to_string(),
+    ] {
+        assert!(text.contains(&line), "{line:?} in:\n{text}");
+    }
+    for secret in ["example.com", "Secret Org"] {
+        assert!(!text.contains(secret) && !said.contains(secret), "{text}");
+    }
+
+    // A box where the user lingers and logind ends a session's processes, but the daemon was
+    // started in a session (here the relay's setsid, as when `systemd-run` fails): lingering
+    // is no proof it outlives the hub's ssh. Its unit, once listed, is (fakes of loginctl,
+    // busctl and systemctl on the box).
+    let key = twr_core::sealed::HubKey::load_or_create(
+        &paths.data_dir.join(twr_hub::ssh_box::BOX_KEY_FILE),
+    )
+    .unwrap();
+    let unit = format!(
+        "twr-box-{}-1a2b3c4d.service",
+        twr_runner::relay::socket_hash(&key.id(), "gpu")
+    );
+    let listed = t.box_home.join("units");
+    t.box_agent("loginctl", "echo Linger=yes\n");
+    t.box_agent("busctl", "echo 'b true'\n");
+    t.box_agent(
+        "systemctl",
+        &format!(
+            "[ \"$1 $2\" = '--user list-units' ] || exit 1\ncat '{}' 2>/dev/null\nexit 0\n",
+            listed.display()
+        ),
+    );
+    let out = t.twr(&["box", "doctor", "gpu"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    assert!(
+        text.contains(
+            "! logind: you linger, but the box daemon runs outside a systemd user service"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("systemd-run --user --expand-environment=no"),
+        "{text}"
+    );
+    std::fs::write(
+        &listed,
+        format!("{unit} loaded active running twr box daemon\n"),
+    )
+    .unwrap();
+    let out = t.twr(&["box", "doctor", "gpu"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        text.contains(&format!(
+            "✓ logind: you linger on the box, and the box daemon runs as the systemd user \
+             service {unit}"
+        )),
+        "{text}"
+    );
+    for fake in ["loginctl", "busctl", "systemctl"] {
+        std::fs::remove_file(bin.join(fake)).unwrap();
+    }
+
+    let out = t.ok(&["box", "doctor", "gpu", "--json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["box"], "gpu", "{v}");
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["build"], json!({"id": id, "source": "hub"}), "{v}");
+    assert_eq!(v["login_path"]["error"], "SHELL is not set", "{v}");
+    let agents = v["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 3, "{v}");
+    assert_eq!(agents[0]["runtime"], "claude-code", "{v}");
+    assert_eq!(agents[0]["login"], "logged_in", "{v}");
+    assert_eq!(agents[0]["method"], "claude.ai", "{v}");
+    assert_eq!(agents[1]["login"], "logged_out", "{v}");
+    assert_eq!(agents[2]["found"], false, "{v}");
+    for c in v["checks"].as_array().unwrap() {
+        let mut keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["check", "fix", "item", "message", "result"], "{c}");
+        assert!(
+            ["ok", "warn", "fail"].contains(&c["result"].as_str().unwrap()),
+            "{c}"
+        );
+    }
+    let codex = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["item"] == "codex")
+        .unwrap();
+    assert_eq!(codex["check"], "agent");
+    assert_eq!(codex["result"], "warn");
+    assert_eq!(codex["fix"], "`twr box login gpu codex`");
+    assert!(!out.contains("example.com"), "{out}");
+
+    // The agents in `twr box list` and `status`, once the box reported them.
+    let refreshed = box_agents_refresh(&paths.socket, "gpu");
+    assert_eq!(
+        refreshed["agents"].as_array().unwrap().len(),
+        3,
+        "{refreshed}"
+    );
+    let list = t.ok(&["box", "list"]);
+    assert!(list.lines().next().unwrap().ends_with("AGENTS"), "{list}");
+    let row = list.lines().find(|l| l.starts_with("gpu ")).unwrap();
+    assert!(row.ends_with("claude ✓ codex ✗ grok -"), "{list}");
+    let status = t.ok(&["box", "status", "gpu"]);
+    assert!(
+        status.contains(&format!(
+            "  claude: logged in (claude.ai), 2.1.0 (Claude Code), at {}/claude\n",
+            bin.display()
+        )),
+        "{status}"
+    );
+    assert!(
+        status.contains("  grok: not installed (not found on PATH)\n"),
+        "{status}"
+    );
+    assert_eq!(t.box_status("gpu")["agents"][1]["login"], "logged_out");
+
+    // The hub stopped: the box is still checked, and its daemon still runs.
+    t.ok(&["hub", "stop"]);
+    hub.take().unwrap().exited();
+    let out = t.twr(&["box", "doctor", "gpu"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("! hub: no hub runs"), "{text}");
+    assert!(
+        text.contains(&format!("✓ daemon: a box daemon runs: build {id}")),
+        "{text}"
+    );
+    assert!(text.contains("✓ claude: logged in"), "{text}");
+    assert!(text.contains("box gpu: nothing failed"), "{text}");
+
+    // Projects of the box: one that is there, one that is not.
+    let repo = init_repo(&t.box_home.join("repo"));
+    let mut boxes = std::fs::read_to_string(paths.boxes_file()).unwrap();
+    boxes.push_str(&format!(
+        "\n[boxes.gpu.projects.api]\nrepo = \"{}\"\n\n[boxes.gpu.projects.gone]\nrepo = \"{}\"\n",
+        repo.display(),
+        t.box_home.join("gone").display()
+    ));
+    std::fs::write(paths.boxes_file(), boxes).unwrap();
+    let out = t.twr(&["box", "doctor", "gpu"]);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains(&format!(
+            "✓ project api: {} is a git repository",
+            repo.display()
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "✗ project gone: {}/gone does not exist on the box",
+            t.box_home.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("box gpu: 1 check failed"), "{text}");
+
+    // A box ssh cannot reach: ssh fails, and nothing on the box is checked.
+    let mut boxes = std::fs::read_to_string(paths.boxes_file()).unwrap();
+    boxes.push_str("\n[boxes.down]\ntransport = \"ssh\"\nssh = \"down@box\"\n");
+    std::fs::write(paths.boxes_file(), boxes).unwrap();
+    let out = t.twr(&["box", "doctor", "down", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["agents"], Value::Null, "{v}");
+    let failed: Vec<&str> = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["result"] == "fail")
+        .map(|c| c["check"].as_str().unwrap())
+        .collect();
+    assert_eq!(failed, ["ssh_batch", "ssh"], "{v}");
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("Connection refused"), "{said}");
+}
+
+/// `twr box login` is the user's alone, and needs a terminal: refused before any ssh.
+#[test]
+fn box_login_is_refused_to_agents_and_without_a_terminal() {
+    let t = Setup::new();
+    std::fs::write(
+        t.paths().boxes_file(),
+        "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"fake@box\"\n",
+    )
+    .unwrap();
+    let out = t
+        .command(&["box", "login", "gpu", "claude"])
+        .env("TWR_AGENT", "worker:1")
+        .env_remove("TWR_TEST_USER_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let e = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        e.contains("agents cannot log agent CLIs in on boxes"),
+        "{e}"
+    );
+    // No terminal (stdin is /dev/null here).
+    let e = t.fails(&["box", "login", "gpu", "codex"]);
+    assert!(e.contains("needs a terminal on stdin and stdout"), "{e}");
+    // Not an agent twr logs in.
+    let e = t.fails(&["box", "login", "gpu", "acp"]);
+    assert!(e.contains("invalid value"), "{e}");
+    assert!(t.ssh_runs().is_empty(), "{:?}", t.ssh_runs());
 }

@@ -36,7 +36,7 @@ ssh runs with `BatchMode=yes`, so it never prompts, and with every kind of forwa
 
 - **ssh to the box without a prompt, from the hub's environment.** The hub never answers a prompt. Load the key into an ssh-agent the hub can use (a hub that `twr` starts inherits your shell's `SSH_AUTH_SOCK`; a hub started by a service has no agent unless you give it one), or use a key without a passphrase. Accept the box's host key once, which `twr box add` lets you do. A refused key shows in `twr box status <name>` as the last error.
 - **A POSIX login shell** for your user on the box (`sh`, `bash`, `zsh`): the hub quotes its commands for one.
-- **The agent CLIs on the box, logged in.** The daemon starts them with the environment of a non-interactive ssh command on the box. Check with `ssh <box> 'command -v claude codex'`; set `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` or `TWR_GROK_BIN` where that shell sets its environment otherwise.
+- **The agent CLIs on the box, logged in.** The daemon starts them with the environment of a non-interactive ssh command on the box, with your login shell's `PATH` put first ([Agents on a box](#agents-on-a-box)). `twr box doctor <box>` shows what the box finds, and `twr box login <box> <agent>` logs an agent in from your terminal. Set `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` or `TWR_GROK_BIN` where that shell sets its environment to point at another binary.
 - **The repositories on the box.** Give a thread an absolute path on the box (`twr thread new /srv/code/api --box gpu`), or name a project whose `repo` is a path on the box. `boxes.toml` may hold the box's projects too: twr keeps every table of a box there when it rewrites the file, but not comments.
 
 Threads on an SSH box get the branch names of threads on the hub's own box (`twr/<name>`). Two hubs on different machines that use one repository on one box can collide on them.
@@ -45,10 +45,12 @@ Threads on an SSH box get the branch names of threads on the hub's own box (`twr
 
 | Command | What it does |
 | --- | --- |
-| `twr box list [--json]` | the hub's boxes: name, transport (`ssh` or `token`), state, the twr version its runner reported, OS/CPU |
-| `twr box status <name> [--json]` | everything the hub knows of one: state, version, the build it launched, a pending switch, OS/CPU, the last error, the latest notes (newest last), a connection the hub refused |
+| `twr box list [--json]` | the hub's boxes: name, transport (`ssh` or `token`), state, the twr version its runner reported, OS/CPU, and its agent CLIs as the box last reported them (`claude ✓ codex ✗ grok ?`: logged in, logged out, not known; `-` not installed) |
+| `twr box status <name> [--json]` | everything the hub knows of one: state, version, the build it launched, a pending switch, OS/CPU, the last error, the latest notes (newest last), a connection the hub refused, and each agent CLI's path, version and login |
 | `twr box install <name> [--binary <path>] [--yes]` | install twr on an SSH box and have the hub connect again ([below](#another-os-or-cpu)) |
 | `twr box remove <name>` | take the box out of `boxes.toml` |
+| `twr box doctor <name> [--json]` | check the box and say how to fix what is wrong, with or without a hub ([Check a box](#check-a-box)) |
+| `twr box login <name> <agent>` | start an agent CLI's own login on the box, in your terminal ([Log an agent in on a box](#log-an-agent-in-on-a-box)) |
 
 States: `connecting` (probing, installing, opening the connection), `online`, `offline` (between attempts), `needs_install` (run `twr box install <name>`), `switching` (see below) and `error` (the hub's box key can't be loaded).
 
@@ -145,8 +147,9 @@ Description=twr runner for box gpu
 
 [Service]
 ExecStart=%h/.local/bin/twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file %h/.config/twr/gpu.token
-# A service reads no shell startup file: put every agent CLI's folder on PATH, or set
-# TWR_CLAUDE_BIN, TWR_CODEX_BIN or TWR_GROK_BIN to its full path.
+# A service reads no shell startup file. The runner asks your login shell for its PATH
+# (when SHELL is set and is sh, bash, zsh, ksh or fish); otherwise put every agent CLI's
+# folder on PATH here, or set TWR_CLAUDE_BIN, TWR_CODEX_BIN or TWR_GROK_BIN to its full path.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # Stop the runner first and let it stop its runtimes and finish a repository change (up to
 # 5 minutes) before systemd kills what is left.
@@ -159,7 +162,7 @@ RestartSec=10
 WantedBy=default.target
 ```
 
-Enable each with `systemctl --user daemon-reload` and `systemctl --user enable --now <name>`, and run `loginctl enable-linger` on both machines so user services run without a login session. `systemctl --user stop` stops the runner the way Ctrl-C does: it stops its runtimes and lets a repository change in progress finish. `KillMode=mixed` makes systemd signal only the runner at first; the default would signal the runtimes and git at the same moment. Check that the agents start with `systemctl --user status twr-runner-gpu` and `journalctl --user -u twr-runner-gpu`: an agent the service can't find fails its thread's start with "not found on PATH".
+Enable each with `systemctl --user daemon-reload` and `systemctl --user enable --now <name>`, and run `loginctl enable-linger` on both machines so user services run without a login session. `systemctl --user stop` stops the runner the way Ctrl-C does: it stops its runtimes and lets a repository change in progress finish. `KillMode=mixed` makes systemd signal only the runner at first; the default would signal the runtimes and git at the same moment. Check that the agents start with `systemctl --user status twr-runner-gpu` and `journalctl --user -u twr-runner-gpu`: an agent the service can't find fails its thread's start with "not found on PATH". `twr box list` shows which agents the runner found once it is connected.
 
 #### Over Tailscale
 
@@ -189,6 +192,49 @@ With TLS the runner connects to `wss://host:7878`. It trusts the public web root
 
 The runner has a matching rule. It connects over plain `ws://` only to a loopback host: `localhost`, an address in `127.0.0.0/8`, `[::1]`, or an IPv4-mapped loopback address such as `[::ffff:127.0.0.1]`, which is where an SSH tunnel ends. For any other host, every event and command would cross the network in clear text, and someone on the path could take over the connection once it is authenticated, so the runner refuses to start and suggests `wss://` or a tunnel. It only checks the host as written: a name that resolves to a loopback address doesn't count. On a network you trust, `--allow-insecure` lifts the refusal.
 
+## Agents on a box
+
+A box tells the hub which agent CLIs it has (`claude`, `codex`, `grok`), at which version, and whether each is logged in: `twr box list`, `twr box status <box>`, and `hub.info` for the TUI and the orchestrator. The runner probes them as it starts and every 10 minutes, and the hub asks again 30 seconds after the box connects and every 10 minutes after that. Each probe runs `<cli> --version` and the CLI's own status command (`claude auth status`, `codex login status`; Grok Build has none, so its login shows as not known), each for at most 10 seconds, without a terminal. twr keeps whether it is logged in and, for Claude Code, how (`claude.ai`, `console`, `api-key`, `bedrock`, `vertex`). It never keeps or shows the account's email, organization or plan.
+
+A thread started on a box that reports its runtime's CLI missing is still made, with a warning: "box gpu reports no `claude` on its PATH; the thread may fail to start: `twr box doctor gpu`". The same warning comes with whatever starts or restarts the runtime there: a move or new model (`twr model`), a new permission mode (`twr mode`), and a prompt to a thread whose runtime isn't running (`twr send`). A thread or project `env` can give it a `PATH` of its own.
+
+### The login shell's PATH
+
+A runner started by ssh, systemd or cron has a thin `PATH`: no `~/.local/bin`, no npm or nvm folder, and many `.bashrc` files return early when the shell is not interactive. So the runner (an SSH box's daemon, or `twr runner`) asks your login shell for its `PATH` once, in the background as it starts: `$SHELL -lic` with a `printf` of `$PATH` for `sh`, `dash`, `bash`, `zsh`, `ksh` and `mksh` (interactive too, so a `.bashrc` that stops early for other shells runs), and `fish -lic` with `string join : $PATH`. The shell gets no terminal and no input, and 5 seconds. It prints the `PATH` between two markers made of a fresh random value; anything else your startup files print is ignored, and a value with a control character is refused. Its absolute entries (at most 128) go before the runner's own `PATH`, each once, in every runtime's environment. A thread's or project's `env` `PATH` still wins, and `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN` and `TWR_GROK_BIN` still come first. The runtimes, the agent probe, `twr box login` and `twr attach` on an SSH box all resolve the CLI the same way. On a token box, `twr attach` runs the CLI from the `PATH` an ssh command gets there; so does an SSH box whose runner did not say which twr build it runs (a runner of an older twr): the hub logs that once for the box.
+
+Its limits:
+
+- `csh` and `tcsh` are not asked (their syntax differs), nor is a shell twr doesn't know. The runtimes then get the runner's own `PATH`: put the agents there, or name them with `TWR_*_BIN`.
+- Without `SHELL` set (some service managers and `env -i` leave it out), nothing is asked.
+- A login shell that takes longer than 5 seconds, or prints more than 16 KiB before the `PATH`, is not waited for.
+- It is read once per runner start. An agent installed in a folder already on it is found at once; for a new folder, restart `twr runner`. An SSH box's daemon reads it again when it next starts (after a new twr build, or a reboot of the box). `twr box doctor` asks the login shell afresh, so it can find an agent the daemon doesn't yet.
+
+The hub's own box (`local`) asks no login shell: its runtimes get the hub's environment, which a hub started from your shell already has.
+
+### Check a box
+
+`twr box doctor <box>` says what is wrong with a box and how to fix it. It works without a hub and with the box offline: each check prints as it ends, `✓` when fine, `!` when worth a look, `✗` when it failed, with a `fix:` line where there is one. It exits 1 when a check failed. `--json` prints the checks (`{check, item, result: ok|warn|fail, message, fix}`), the build it ran (`{id, source: hub|configured|newest}`), the login shell's `PATH` report and the agents.
+
+- **hub.** When a hub runs, what it says of the box: its state and last error, its twr version and build against the hub's, a pending switch, a refused connection.
+- **ssh without prompting.** ssh to the box as the hub runs it (`BatchMode`).
+- **ssh in this terminal.** The hub's probe, run with ssh in your terminal, so ssh may ask about the host key or for a passphrase. It finds the box's OS and CPU, its data directory, whether the builds folder is safe to use, and the builds there.
+- **build.** The twr build on the box that runs the checks below: the hub's when it's there, else the box's configured `build`, else the newest one there. Doctor says which. When something answers on the hub's socket but does not say which build it runs, the hub's build is unknown: the configured or newest build runs the checks, and doctor says why.
+- **daemon** (SSH boxes). Whether this hub's box daemon runs (`twr runner --stdio --status`), with its build and runner protocol.
+- **logind** (Linux). Whether you linger, whether logind ends your processes with your last session, and whether the running daemon is in its systemd user service (an active `twr-box-<hash>-*` unit). Lingering alone is not enough: when `systemd-run` failed, the daemon runs in a session, and if logind ends your processes it ends with the hub's ssh.
+- **login shell** and each agent. `twr runner --agents` on the box says whether the login shell gave its `PATH`, and each CLI's path, version and login. The fix says how to install it or log it in.
+- **git** and **disk.** `git --version` on the box, and the free space where it keeps its data, against `[threads] disk_warn_gb`.
+- **project.** Each project configured for the box (`[boxes.<box>.projects.*]`, and `[projects.*]` with `box = "<box>"`) has its repository there, and it is a git repository.
+
+What ssh and the box print is bounded and shows with its control characters escaped, as for `twr box add`. Each command doctor runs on the box (`loginctl`, `busctl`, `git`, `df`) gets at most 10 seconds (with the box's `timeout`, else killed in the background), so one that hangs ends with doctor. What the box reports of its agents is filtered as the probe filters it (see `hub.info` `agents`), whatever twr build reported it.
+
+### Log an agent in on a box
+
+`twr box login <box> <agent>` (`claude`, `codex` or `grok`) starts the agent's own login on the box, in your terminal: `claude auth login`, `codex login --device-auth` or `grok login --device-auth` (a device code works over ssh, where no browser opens). twr never runs a login by itself and never sees what you type: ssh runs with a terminal (`-t`), with forwarding off as for the hub's ssh, and your terminal talks to the agent's login directly. On the box, the twr build `twr box doctor` would pick runs `twr runner --login <agent>`, which finds the CLI as the box's runner would (`TWR_*_BIN`, then the login shell's `PATH`) and runs its login in place of itself.
+
+It needs a terminal on stdin and stdout, and only you can run it: an agent's `twr box login` is refused. When the login ends, it asks whether the agent is logged in: the box daemon, through the hub (`box.agents` with `refresh`), when a hub runs and has the box, else the box over ssh. It says when that disagrees with how the login ended, and exits 0 once the agent is logged in, or, for an agent without a status command (Grok), once a login that ended without an error leaves the CLI found. It exits 1 when the daemon doesn't find the CLI. That happens when you installed it, or changed your startup files, after the daemon started: the daemon reads the login shell's `PATH` only when it starts. The message then gives the command that stops the daemon; the hub starts a new one when it connects again, which reads the `PATH` afresh.
+
+On a Mac, Claude Code keeps its login in the login keychain, which a login over ssh reaches only while it is unlocked. If the login doesn't stick, log in at the Mac once.
+
 ## When the connection drops
 
 The runner spools events to disk while it's disconnected and replays them in order when it reconnects. The hub records each event exactly once, at the time the runner captured it, so a replayed backlog keeps its original times.
@@ -209,8 +255,10 @@ A runner the hub refuses, or whose hub can't prove it knows the token, waits at 
 
 `twr attach <thread>` on a remote thread pauses the runtime through its runner and runs the agent's CLI over `ssh -t <ssh> -- <command>`, in the thread's directory on the box. That ssh forwards nothing either, whatever your `~/.ssh/config` says: no agent, X11, Kerberos credentials, ports or tunnel (`-o ClearAllForwardings=yes -o ForwardAgent=no -o ForwardX11=no -o PermitLocalCommand=no -o Tunnel=no` before the `ssh` words, `-a -x -k` after them). The CLI you attach to is an agent's, and must not reach your ssh agent any more than the box's runtimes can: a `git push` from the attached session uses the box's own keys. It needs `[boxes.<name>] ssh`, and a POSIX login shell for that user on the box (`sh`, `bash`, `zsh`): the hub quotes the command for one, and a `fish` or `csh` login shell would read it differently. The `ssh` value may start with extra options, as in `-p 2222 me@host`. The hub builds that command with the thread's mode, model and effort as they are. It never trims them to what the hub's own `claude` supports, since the box may run another version. A `claude` on the box that lacks an option (an old one without `--effort`) refuses the command line in your terminal: run `claude update` there.
 
+On an SSH box the command runs the box's own twr, the build its daemon runs: `sh -c` finds it in the box's builds folder and runs `twr runner --exec <runtime> -- <arguments>`. It looks for the agent's CLI the way a new thread's runtime would: `TWR_CLAUDE_BIN` (or `TWR_CODEX_BIN`, `TWR_GROK_BIN`) first, then the thread's `PATH` when its `env` sets one, else your login shell's `PATH` before the ssh session's. The arguments (session id, mode, model, effort) are still the hub's, and the runner's answer only offers the working directory. On a token box the hub's command runs as it is, so the CLI has to be on the `PATH` an ssh command gets there. Runtimes without a CLI of their own (an `acp` preset's template) run as the hub builds them on either kind of box.
+
 ## Protocol
 
-The runner protocol lives in `twr_core::runner`. The hub refuses a runner that speaks another protocol version, so the box stays offline until twr on it is updated to the hub's version (the refusal, logged on both sides, says which side is older). Protocol 6 brought the challenge-response handshake: a runner from before it is refused, and a runner of 6 or later facing an older hub is refused as if its token were wrong. Update both sides together.
+The runner protocol lives in `twr_core::runner`. The hub refuses a runner that speaks another protocol version, so the box stays offline until twr on it is updated to the hub's version (the refusal, logged on both sides, says which side is older). Protocol 6 brought the challenge-response handshake: a runner from before it is refused, and a runner of 6 or later facing an older hub is refused as if its token were wrong. Protocol 7 added the agents op (`Op::Agents`), which the hub sends every box: an SSH box of the hub's OS and CPU switches to the new build by itself, a box of another OS or CPU needs `twr box install <box>` (it shows `needs_install` until then), and a token runner must be updated by hand, `twr update` on the box, then restart it. Update both sides together.
 
 Before a connection has authenticated, the hub takes small messages only, gives it 15 seconds from the accept for the TLS and WebSocket handshakes and the proofs, and keeps at most 16 such connections at once, 4 per address that isn't loopback. After that the runner sends its inventory (running sessions, spooled frames), which may be large. A connection that sends no protocol message for 90 seconds is closed. WebSocket pings don't count; the runner's own pings, every 20 seconds, do. [SKILL.md](../SKILL.md#runners-and-remote-boxes) describes what a hub client sees: online and offline events, delivery and acknowledgement, reconciliation, and attach.

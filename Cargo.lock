@@ -2893,6 +2893,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "libc",
  "portable-pty",
  "serde_json",
  "tempfile",

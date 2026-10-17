@@ -11,6 +11,8 @@ description = "Agent runtime adapters for twr"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# Probes' process groups: setsid, waitid without reaping, killpg (`process`).
+libc.workspace = true
 portable-pty.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

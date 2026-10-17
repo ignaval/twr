@@ -129,7 +129,7 @@ impl Hub {
                     out["machine_load"] = json!(note);
                 }
                 out["thread"] = core.thread_json(thread);
-                for key in ["send", "project_found"] {
+                for key in ["send", "project_found", "warning"] {
                     if let Some(value) = out.get(key).cloned() {
                         out["thread"][key] = value;
                     }
@@ -151,7 +151,7 @@ impl Hub {
         let core = self.inner.core();
         let stored = if result["status"] == "complete" {
             let mut compact = json!({"status":"complete", "thread":{"id":result["thread"]["id"]}});
-            for key in ["send", "project_found"] {
+            for key in ["send", "project_found", "warning"] {
                 if let Some(value) = result["thread"].get(key) {
                     compact[key] = value.clone();
                 }

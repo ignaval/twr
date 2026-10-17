@@ -62,7 +62,11 @@ impl Core {
         let (id, view, canonical) = self.mode_target(query, mode)?;
         if caller.is_orchestrator() {
             if let Gate::Propose(_) = self.mode_check(&id, &canonical)? {
-                return Ok(self.propose_mode(&id, &canonical));
+                let mut out = self.propose_mode(&id, &canonical);
+                if let Some(w) = self.start_warning(hub, &id) {
+                    out["warning"] = json!(w);
+                }
+                return Ok(out);
             }
         }
         let mut batch = Batch::default();
@@ -198,6 +202,12 @@ impl Core {
         }
         if let Some(e) = dispatch_error {
             out["dispatch_error"] = json!(e);
+        }
+        // Advisory: the runtime the change (re)starts is one its box reports missing.
+        if applies != "never" {
+            if let Some(w) = self.start_warning(hub, id) {
+                out["warning"] = json!(w);
+            }
         }
         out
     }

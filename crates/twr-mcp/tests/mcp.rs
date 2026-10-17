@@ -497,6 +497,7 @@ async fn hello_and_tool_list() {
     assert_eq!(
         props("spawn_thread"),
         [
+            "box",
             "effort",
             "model",
             "name",
@@ -675,6 +676,28 @@ async fn hello_and_tool_list() {
     for want in ["Always pass `name`", "kebab-case", "notifications-design"] {
         assert!(spawn.contains(want), "{want:?} missing: {spawn}");
     }
+    // How to choose a box, from what hub_info says of them.
+    for want in [
+        "`box`",
+        "hub_info",
+        "online",
+        "logged_in",
+        "box_offline",
+        "warning",
+    ] {
+        assert!(spawn.contains(want), "{want:?} missing: {spawn}");
+    }
+    let info = desc("hub_info");
+    for want in [
+        "boxes: [{name, state, online, version, agents}]",
+        "[{runtime, found, login: logged_in | logged_out | unknown}]",
+        "needs_install",
+    ] {
+        assert!(info.contains(want), "{want:?} missing: {info}");
+    }
+    for gone in ["last_error", "notes", "running_build"] {
+        assert!(!info.contains(gone), "{gone:?} in: {info}");
+    }
     // A rename keeps the worktree and branch, and the new name goes in the thread tags.
     let rename = desc("rename_thread");
     for want in [
@@ -735,10 +758,10 @@ async fn each_tool_sends_the_expected_request() {
         ),
         (
             "spawn_thread",
-            json!({ "project":"twr", "name":"fix-ci", "prompt":"fix the build", "runtime":"codex", "model":"gpt-6.1-sol", "effort":"xhigh", "operation_id":"op1" }),
+            json!({ "project":"twr", "name":"fix-ci", "prompt":"fix the build", "runtime":"codex", "model":"gpt-6.1-sol", "effort":"xhigh", "box":"gpu", "operation_id":"op1" }),
             vec![(
                 "thread.spawn",
-                json!({"operation_id":"op1", "request":{"project":"twr", "name":"fix-ci", "runtime":"codex", "model":"gpt-6.1-sol", "effort":"xhigh"}, "prompt":"fix the build"}),
+                json!({"operation_id":"op1", "request":{"project":"twr", "name":"fix-ci", "runtime":"codex", "model":"gpt-6.1-sol", "effort":"xhigh", "box":"gpu"}, "prompt":"fix the build"}),
             )],
         ),
         (
@@ -1908,6 +1931,29 @@ async fn spawn_errors_are_tool_errors_and_pending_results_preserve_the_retry_id(
             text(&r)
         );
     }
+    // A thread made on a box that reports its runtime's CLI missing: the hub's warning
+    // reaches the orchestrator.
+    let warning = "box gpu reports no `codex` on its PATH; the thread may fail to start: run \
+                   `twr box doctor gpu`";
+    *h.mock.spawn_result.lock().unwrap() = Some(json!({
+        "status": "complete",
+        "thread": {"id": "T9", "name": "w9", "box": "gpu", "warning": warning},
+        "warning": warning,
+    }));
+    let r = h
+        .call(
+            "spawn_thread",
+            json!({"project": "twr", "name": "w9", "box": "gpu", "operation_id": "on-gpu"}),
+        )
+        .await;
+    assert!(!is_error(&r), "{}", text(&r));
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(v["warning"], warning, "{v}");
+    assert_eq!(
+        h.mock.calls().last().unwrap().1["request"]["box"],
+        "gpu",
+        "the box goes to the hub"
+    );
 }
 
 #[tokio::test]

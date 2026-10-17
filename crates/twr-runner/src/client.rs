@@ -282,9 +282,10 @@ impl RunnerOptions {
         o
     }
 
-    /// The box options these runner options imply (built-in adapters, and the box's machine
+    /// The box options these runner options imply (built-in adapters, the box's machine
     /// lock: [`machine_lock_path`], or a daemon's [`DaemonOptions::lock`], which its relay
-    /// resolved).
+    /// resolved; the user's login shell asked for its `PATH` and the agents probed:
+    /// [`crate::BoxEnv::user`]).
     pub fn box_options(&self) -> LocalBoxOptions {
         let mut o = LocalBoxOptions::new(&self.data_dir, &self.box_name);
         o.machine_lock = match &self.daemon {
@@ -295,6 +296,7 @@ impl RunnerOptions {
         if let Some(w) = &self.worktrees_dir {
             o.worktrees = w.clone();
         }
+        o.env = crate::BoxEnv::user();
         o
     }
 
@@ -477,6 +479,12 @@ pub async fn run_with(
         Some(d) => Some(crate::daemon::DaemonSocket::bind(&d.socket).await?),
         None => None,
     };
+    // The login shell's PATH and the agents, in the background: never before the connection.
+    let environment = tokio::spawn({
+        let lbox = lbox.clone();
+        async move { lbox.environment_loop().await }
+    });
+    let _environment = AbortOnDrop(environment);
     let (stop_tx, stop_rx) = watch::channel(false);
     // A daemon's `stop` request (it stores its wakeup: none is lost).
     let asked = Notify::new();
@@ -523,6 +531,15 @@ pub async fn run_with(
     }
     tracing::info!("runner stopped");
     Ok(())
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// While an outage is younger than this, reconnects are at most [`SHORT_OUTAGE_CAP`] apart.
@@ -1076,6 +1093,8 @@ async fn handshake<S: HubStream>(
             Some(d) => d.build.clone(),
             None => twr_core::build_id().map(str::to_string),
         },
+        // What is known: none before the first probe ended (`Op::Agents` asks later).
+        agents: lbox.agents(),
     });
     sink.send(text(&inventory)?)
         .await
