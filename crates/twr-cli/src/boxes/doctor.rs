@@ -50,7 +50,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use serde::Serialize;
 use serde_json::{json, Value};
-use twr_core::config::{BoxTransport, Config};
+use twr_core::config::{BoxTransport, BoxesFile, Config};
 use twr_core::paths::{sh_word, Paths};
 use twr_core::runner::{AgentInfo, AgentLogin, AgentsReport, LoginPathReport};
 use twr_hub::ssh_box::{self, BoxLink, Input};
@@ -681,14 +681,26 @@ pub(super) async fn doctor(
     hub_checks(&mut r, name, &hub, dialed);
 
     let Some(link) = link else {
-        r.add(
-            "ssh",
-            Mark::Warn,
-            "the box has no ssh destination: only the hub's view was checked".into(),
-            Some(format!(
-                "set `ssh` in [boxes.{name}] (`me@host`) to have the box itself checked"
-            )),
-        );
+        // A dial-in box (a token box without `ssh`): twr can't reach it. The hub's view, the
+        // listener its runner connects to, its token, its agents as its runner sees them.
+        let in_file = BoxesFile::load(&paths.boxes_file())
+            .map(|f| f.boxes.contains_key(name))
+            .unwrap_or(true);
+        dial_in_checks(&mut r, config, in_file, name, cfg, &hub);
+        let view = daemon_view(socket, &hub, name, json).await;
+        dial_in_agents(&mut r, name, &view);
+        for (project, repo) in box_projects(config, name) {
+            r.add_item(
+                "project",
+                Some(&project),
+                Mark::Warn,
+                format!(
+                    "{repo}: not checked (twr can't look on a dial-in box; a thread there fails \
+                     at its start when the path is wrong)"
+                ),
+                None,
+            );
+        }
         return r.finish();
     };
     let link = &link;
@@ -974,7 +986,15 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
                          runner protocol)",
                         hub.version
                     ),
-                    dialed.then(|| format!("`twr box install {name}` installs the hub's")),
+                    Some(if dialed {
+                        format!("`twr box install {name}` installs the hub's")
+                    } else {
+                        format!(
+                            "on the box: {}, then restart its runner ({})",
+                            super::token::update_hint(&hub.version),
+                            super::token::restart_hint(name)
+                        )
+                    }),
                 );
             }
         }
@@ -1002,13 +1022,18 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
             with_error(format!("the hub cannot connect to box {name}")),
             None,
         ),
+        // (A refusal, below, says what to do about it.)
         other => r.add(
             "hub",
             Mark::Fail,
             with_error(format!("box {name} is {other}")),
-            (!dialed).then(|| {
-                "start the box's runner (`twr runner --hub ... --box ...`, docs/runners.md)"
-                    .to_string()
+            (!dialed && !b["refused"].is_object()).then(|| {
+                format!(
+                    "start the runner on the box (`twr runner --hub <the hub's URL> \
+                     --box={name}`, or its service: `systemctl --user start \
+                     twr-runner-{name}.service`; macOS: `launchctl kickstart \
+                     gui/$(id -u)/tools.twr.runner.{name}`)"
+                )
             }),
         ),
     }
@@ -1026,17 +1051,156 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
         );
     }
     if let Some(refused) = b["refused"].as_object() {
+        let reason = super::str_of(&refused["reason"]);
         r.add(
             "hub",
             Mark::Fail,
             format!(
-                "the hub refused a connection of box {name} ({}): {}",
+                "the hub refused a connection of box {name} ({}): {reason}",
                 super::super::trash_time(&refused["at"]),
-                super::str_of(&refused["reason"])
             ),
+            (!dialed)
+                .then(|| super::token::refusal_fix(name, reason, &hub.version))
+                .flatten(),
+        );
+    }
+}
+
+/// A dial-in box's own checks (box `name`, `cfg` in `config`; `in_file`: in boxes.toml): that
+/// twr can't reach it (`ssh`), the hub's runner listener its runner connects to (the running
+/// hub's `listening`, else the config's `[hub] listen`), and its token (there, long enough;
+/// never shown).
+fn dial_in_checks(
+    r: &mut Report,
+    config: &Config,
+    in_file: bool,
+    name: &str,
+    cfg: &twr_core::config::BoxConfig,
+    hub: &HubBuild,
+) {
+    r.add(
+        "ssh",
+        Mark::Ok,
+        "dial-in box: the hub can't reach it, so only the hub's view is checked".into(),
+        None,
+    );
+    let listen = config.hub.listen.as_deref();
+    let set_it = "set [hub] listen in config.toml and restart the hub (`twr hub stop`, then \
+                  `twr`; docs/runners.md#dial-in-boxes)";
+    let (mark, said, fix) = match (&hub.info, listen) {
+        (Some(info), _) => match info["listening"].as_bool() {
+            Some(true) => (
+                Mark::Ok,
+                format!(
+                    "the running hub listens for runners{}",
+                    listen.map(|l| format!(" ({l})")).unwrap_or_default()
+                ),
+                None,
+            ),
+            Some(false) => (
+                Mark::Fail,
+                "the running hub does not listen for runners: the box's runner can't connect"
+                    .to_string(),
+                Some(match listen {
+                    Some(_) => "[hub] listen is set, but the hub started before: restart it \
+                                (`twr hub stop`, then `twr`)"
+                        .to_string(),
+                    None => set_it.to_string(),
+                }),
+            ),
+            None => (
+                Mark::Warn,
+                "the running hub did not say whether it listens for runners (an older hub): not \
+                 known"
+                    .to_string(),
+                None,
+            ),
+        },
+        (None, Some(l)) => (
+            Mark::Ok,
+            format!("[hub] listen = {l}: a hub started now listens there"),
+            None,
+        ),
+        (None, None) => (
+            Mark::Fail,
+            "[hub] listen is not set: a hub started now does not listen for runners".to_string(),
+            Some(set_it.to_string()),
+        ),
+    };
+    r.add("listener", mark, said, fix);
+    let make = if in_file {
+        format!("`twr box token {name} --rotate` makes a new one")
+    } else {
+        format!(
+            "put a new one in config.toml's [boxes.{name}] (`twr runner token` makes one), then \
+             `twr box token {name} --reload`"
+        )
+    };
+    match cfg.token.as_deref().filter(|t| !t.is_empty()) {
+        None => r.add(
+            "token",
+            Mark::Fail,
+            format!("box {name} has no token: no runner of it is accepted"),
+            Some(make),
+        ),
+        Some(t) => match twr_core::runner::check_token_len(t, &format!("box {name}'s token")) {
+            Err(e) => r.add("token", Mark::Fail, e, Some(make)),
+            Ok(Some(w)) => r.add("token", Mark::Warn, w, Some(make)),
+            Ok(None) => r.add(
+                "token",
+                Mark::Ok,
+                format!(
+                    "box {name} has a token of {} characters (not shown)",
+                    t.chars().count()
+                ),
+                None,
+            ),
+        },
+    }
+}
+
+/// A dial-in box's agent CLIs as its runner sees them, asked again through the hub while it is
+/// connected ([`daemon_view`]); not known otherwise.
+fn dial_in_agents(r: &mut Report, name: &str, view: &DaemonView) {
+    let (agents, from) = match view {
+        DaemonView::Agents(a, None) => (a, " (as the box's runner sees it)".to_string()),
+        DaemonView::Agents(a, Some(why)) => {
+            r.add(
+                "agent",
+                Mark::Warn,
+                format!(
+                    "the hub could not have box {name} probe its agents now ({why}): as its \
+                     runner last reported them"
+                ),
+                None,
+            );
+            (a, " (as the box's runner last reported it)".to_string())
+        }
+        DaemonView::Unknown(why) => {
+            r.add(
+                "agent",
+                Mark::Warn,
+                format!("the box's agent CLIs are not known: {why}"),
+                Some(format!(
+                    "start the box's runner; then `twr box doctor {name}` asks it"
+                )),
+            );
+            return;
+        }
+        DaemonView::NotAsked => return,
+    };
+    if agents.is_empty() {
+        r.add(
+            "agent",
+            Mark::Warn,
+            "the box's runner reported no agent CLIs".into(),
             None,
         );
     }
+    for a in agents {
+        agent_check_said(r, name, a, &from);
+    }
+    r.agents = Some(agents.clone());
 }
 
 /// Why doctor's probe of box `name` through `link` failed with exit `code` and stderr `err`
@@ -2099,7 +2263,8 @@ pub(super) async fn login(
     let Some(link) = BoxLink::of(cfg) else {
         bail!(
             "box {name} has no ssh destination ([boxes.{name}] ssh): log in on the box itself \
-             with `{command} {login_args}`"
+             with `{command} {login_args}`, then `twr box doctor {name}` shows its login as the \
+             box's runner sees it"
         );
     };
     let link = &link;
@@ -2458,6 +2623,220 @@ mod tests {
         // Whether a hub runs is unknown: so is its protocol.
         let (_, msg) = check(&HubBuild::own(Some("no answer".into())), mine);
         assert!(msg.contains("whether they match is unknown"), "{msg}");
+    }
+
+    /// A dial-in box's report: the listener (the running hub's word, else the config's), its
+    /// token (missing ✗, short !, never shown), the hub's view with box-side fixes (another
+    /// version, a protocol refusal, a proof refusal, offline without one), and its agents as
+    /// its runner sees them.
+    #[test]
+    fn a_dial_in_box_is_checked_from_the_hub() {
+        use twr_core::config::BoxConfig;
+        let token_box = |token: Option<&str>| BoxConfig {
+            token: token.map(str::to_string),
+            ..BoxConfig::default()
+        };
+        let listen = Config::from_toml_str("[hub]\nlisten = \"127.0.0.1:7878\"\n").unwrap();
+        let none = Config::default();
+        let run = |config: &Config, hub: &HubBuild, cfg: &BoxConfig, in_file: bool| {
+            let mut r = Report::new("lab", true);
+            dial_in_checks(&mut r, config, in_file, "lab", cfg, hub);
+            r.checks
+        };
+        let find = |checks: &[Check], what: &str| {
+            checks
+                .iter()
+                .find(|c| c.check == what)
+                .cloned()
+                .unwrap_or_else(|| panic!("no {what}: {checks:?}"))
+        };
+        let good = "f".repeat(64);
+        let hub = |listening: Option<bool>, entry: Value| {
+            let mut info = json!({"version": "0.2.0", "boxes": [entry]});
+            if let Some(l) = listening {
+                info["listening"] = l.into();
+            }
+            HubBuild::of_info(info)
+        };
+        let offline = json!({"name": "lab", "state": "offline", "refused": null});
+        // Listening, a good token.
+        let c = run(
+            &listen,
+            &hub(Some(true), offline.clone()),
+            &token_box(Some(&good)),
+            true,
+        );
+        assert_eq!(find(&c, "ssh").result, Mark::Ok);
+        assert!(find(&c, "ssh").message.starts_with("dial-in box"));
+        let l = find(&c, "listener");
+        assert_eq!(
+            (l.result, l.message.as_str()),
+            (
+                Mark::Ok,
+                "the running hub listens for runners (127.0.0.1:7878)"
+            )
+        );
+        let t = find(&c, "token");
+        assert_eq!(t.result, Mark::Ok);
+        assert!(!t.message.contains(&good), "{}", t.message);
+        // Not listening: set, but the hub started before; or not set at all.
+        let l = find(
+            &run(
+                &listen,
+                &hub(Some(false), offline.clone()),
+                &token_box(Some(&good)),
+                true,
+            ),
+            "listener",
+        );
+        assert_eq!(l.result, Mark::Fail);
+        assert!(l.fix.unwrap().contains("the hub started before"));
+        let l = find(
+            &run(
+                &none,
+                &hub(Some(false), offline.clone()),
+                &token_box(Some(&good)),
+                true,
+            ),
+            "listener",
+        );
+        assert!(l
+            .fix
+            .unwrap()
+            .starts_with("set [hub] listen in config.toml"));
+        // An older hub: not known. No hub: the config's.
+        assert_eq!(
+            find(
+                &run(
+                    &listen,
+                    &hub(None, offline.clone()),
+                    &token_box(Some(&good)),
+                    true
+                ),
+                "listener"
+            )
+            .result,
+            Mark::Warn
+        );
+        assert_eq!(
+            find(
+                &run(&listen, &HubBuild::own(None), &token_box(Some(&good)), true),
+                "listener"
+            )
+            .result,
+            Mark::Ok
+        );
+        assert_eq!(
+            find(
+                &run(&none, &HubBuild::own(None), &token_box(Some(&good)), true),
+                "listener"
+            )
+            .result,
+            Mark::Fail
+        );
+        // No token, a short one, one too short; the fix per file.
+        let t = find(
+            &run(&listen, &HubBuild::own(None), &token_box(None), true),
+            "token",
+        );
+        assert_eq!(t.result, Mark::Fail);
+        assert_eq!(
+            t.fix.as_deref(),
+            Some("`twr box token lab --rotate` makes a new one")
+        );
+        let short = "s".repeat(20);
+        let t = find(
+            &run(
+                &listen,
+                &HubBuild::own(None),
+                &token_box(Some(&short)),
+                false,
+            ),
+            "token",
+        );
+        assert_eq!(t.result, Mark::Warn);
+        assert!(!t.message.contains(&short));
+        assert!(t.fix.unwrap().contains("`twr box token lab --reload`"));
+        assert_eq!(
+            find(
+                &run(&listen, &HubBuild::own(None), &token_box(Some("x")), true),
+                "token"
+            )
+            .result,
+            Mark::Fail
+        );
+
+        // The hub's view, with what to do on the box.
+        let view = |entry: Value| {
+            let mut r = Report::new("lab", true);
+            hub_checks(&mut r, "lab", &hub(Some(true), entry), false);
+            r.checks
+        };
+        let c = view(offline);
+        assert!(
+            c[0].fix.as_deref().unwrap().starts_with(
+                "start the runner on the box (`twr runner --hub <the hub's URL> --box=lab`"
+            ),
+            "{c:?}"
+        );
+        let c = view(
+            json!({"name": "lab", "state": "offline", "refused": {"at": "2026-10-17T09:00:00Z", "reason": "a runner speaking protocol 6 was refused (the hub's is 7): update twr on box `lab`"}}),
+        );
+        assert_eq!(c[0].fix, None, "the refusal says what to do: {c:?}");
+        let fix = c[1].fix.as_deref().unwrap();
+        assert!(
+            fix.contains("`twr update --version v0.2.0`")
+                && fix.contains("systemctl --user restart twr-runner-lab.service"),
+            "{fix}"
+        );
+        let c = view(
+            json!({"name": "lab", "state": "offline", "refused": {"at": "2026-10-17T09:00:00Z", "reason": "a runner was refused: its proof does not match this box's token"}}),
+        );
+        assert!(
+            c[1].fix
+                .as_deref()
+                .unwrap()
+                .contains("`twr runner install-token lab` with the token `twr box token lab`"),
+            "{c:?}"
+        );
+        let c =
+            view(json!({"name": "lab", "state": "online", "version": "0.1.9", "refused": null}));
+        assert_eq!(c[1].result, Mark::Warn);
+        assert!(
+            c[1].fix
+                .as_deref()
+                .unwrap()
+                .contains("on the box: twr 0.2.0 (`twr update --version v0.2.0`"),
+            "{c:?}"
+        );
+
+        // Agents as the runner sees them; not known while it is not connected.
+        let mut r = Report::new("lab", true);
+        let claude = AgentInfo {
+            runtime: twr_adapters::claude_code::NAME.into(),
+            found: true,
+            login: AgentLogin::LoggedOut,
+            ..AgentInfo::default()
+        };
+        dial_in_agents(&mut r, "lab", &DaemonView::Agents(vec![claude], None));
+        assert_eq!(r.checks[0].result, Mark::Warn);
+        assert!(
+            r.checks[0]
+                .message
+                .ends_with("(as the box's runner sees it)"),
+            "{:?}",
+            r.checks
+        );
+        assert_eq!(r.agents.as_ref().map(Vec::len), Some(1));
+        let mut r = Report::new("lab", true);
+        dial_in_agents(
+            &mut r,
+            "lab",
+            &DaemonView::Unknown("the box is not connected (it is offline)".into()),
+        );
+        assert!(r.checks[0]
+            .message
+            .contains("not known: the box is not connected"));
     }
 
     /// `twr box login` succeeds only when the agent is logged in, or found with an unknown

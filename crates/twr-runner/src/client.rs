@@ -34,7 +34,10 @@
 //! logged ([`twr_core::runner::Secret`] redacts itself). A hub that cannot prove it knows the
 //! token (a wrong URL, a different token, or another process listening on the port, such as
 //! another user's on a loopback port an SSH tunnel did not get) gets nothing but the hello,
-//! and the runner tries again later.
+//! and the runner tries again later. A token from a file is read again after such a refusal,
+//! and the file watched while the runner waits: a new token installed there (`twr runner
+//! install-token`, after the hub's `twr box token --rotate`) is used at once, without a
+//! restart.
 //!
 //! A daemon has no token: its connections are sealed channels the hub's key opened
 //! ([`twr_core::sealed`]), so the hub is proven before the WebSocket starts, and the
@@ -137,13 +140,48 @@ pub const O_NONBLOCK: i32 = 0x0004;
 pub const O_NONBLOCK: i32 = 0;
 
 /// Reads the token from `path` (`twr runner --token-file`), trimmed of surrounding whitespace.
-/// Refused when the file is not a regular file, is readable or writable by group or others
-/// (it must be `chmod 600` or stricter), is empty, or is larger than 64 KiB. It is opened
-/// without blocking (`O_NONBLOCK`: a FIFO or a device at the path cannot hold the runner up)
-/// and checked on the opened descriptor, so what is read is what was checked.
+/// Refused when the file is not a regular file, belongs to another user, is readable or
+/// writable by group or others (it must be `chmod 600` or stricter), is empty, or is larger
+/// than 64 KiB. It is opened without blocking (`O_NONBLOCK`: a FIFO or a device at the path
+/// cannot hold the runner up) and checked on the opened descriptor, so what is read is what
+/// was checked.
 pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
+    read_token_file_stamped(path).map(|(token, _)| token)
+}
+
+/// What says that a token file changed ([`dial_loop`] watches it): its device, inode, size,
+/// and modification and change times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> FileStamp {
+        use std::os::unix::fs::MetadataExt;
+        FileStamp {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// The stamp of the file at `path` now (`None` when it can't be read: missing, say).
+    fn at(path: &std::path::Path) -> Option<FileStamp> {
+        std::fs::metadata(path).ok().map(|m| FileStamp::of(&m))
+    }
+}
+
+/// [`read_token_file`], with the stamp of the file it read (taken on the opened descriptor).
+fn read_token_file_stamped(path: &std::path::Path) -> anyhow::Result<(Secret, FileStamp)> {
     use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)
@@ -154,6 +192,14 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
         .with_context(|| format!("reading the token file {}", path.display()))?;
     if !meta.is_file() {
         bail!("the token file {} is not a regular file", path.display());
+    }
+    let me = twr_core::paths::effective_uid();
+    if meta.uid() != me {
+        bail!(
+            "the token file {} belongs to another user (uid {}; the runner runs as uid {me})",
+            path.display(),
+            meta.uid()
+        );
     }
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -174,7 +220,140 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
     if token.is_empty() {
         bail!("the token file {} is empty", path.display());
     }
-    Ok(Secret::new(token))
+    Ok((Secret::new(token), FileStamp::of(&meta)))
+}
+
+/// What [`write_token_file`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// There was no token file: it holds the token now.
+    New,
+    /// The file held this token already: left as it was.
+    Same,
+    /// The file held something else (another token, or a file the runner can't use): it holds
+    /// the token now.
+    Replaced,
+    /// The file held something else, and replacing it was declined: left as it was.
+    Kept,
+}
+
+/// Writes `token` to the token file `path` (`twr runner install-token`), private to this user
+/// (mode 0600). With `make_dir` (the default path, [`twr_core::paths::Paths::runner_token_file`]),
+/// its directory is made private first ([`twr_core::paths::ensure_private_dir`]: 0700, its
+/// owner and the directories above it checked); otherwise the directory must exist. A file
+/// that holds the same token is left as it is ([`Stored::Same`]); one that holds anything else
+/// is replaced only when `replace` says yes (it asks the user), else left ([`Stored::Kept`]).
+///
+/// The check, the question and the write happen under an exclusive `flock` of
+/// `.<file name>.lock` in the same directory, so two of them never interleave: the file
+/// `replace` agreed to replace is the one replaced, and of two that find no file, the second
+/// finds the first's. The token is written to a new file in the same directory (created
+/// exclusively, 0600) and synced; it then takes `path`'s place: linked there when there was no
+/// file (which fails if one appeared, written by hand meanwhile), renamed over it otherwise.
+/// The directory is synced: a runner reading the file sees the old token or the new one, never
+/// part of one. Nothing is left behind on an error. No message holds the token.
+pub fn write_token_file(
+    path: &std::path::Path,
+    token: &Secret,
+    make_dir: bool,
+    replace: &mut dyn FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<Stored> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("{} is not a file path", path.display());
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    };
+    if make_dir {
+        twr_core::paths::ensure_private_dir(dir)?;
+    }
+    let _lock = lock_beside(dir, name)?;
+    let stored = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::New,
+        Err(e) => return Err(anyhow!("reading {}: {e}", path.display())),
+        Ok(_) => match read_token_file(path) {
+            Ok(old) if old.ct_eq(token.expose()) => return Ok(Stored::Same),
+            _ if replace()? => Stored::Replaced,
+            _ => return Ok(Stored::Kept),
+        },
+    };
+    let nonce = twr_core::runner::new_nonce()?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), &nonce[..16]));
+    // Removes the temporary file unless it was renamed into place.
+    struct Tmp<'a>(&'a std::path::Path, bool);
+    impl Drop for Tmp<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let mut guard = Tmp(&tmp, false);
+    f.write_all(token.expose().as_bytes())
+        .and_then(|()| f.write_all(b"\n"))
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    if stored == Stored::New {
+        // Never over a file that appeared since it was looked for: linked, not renamed.
+        std::fs::hard_link(&tmp, path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow!(
+                "{} appeared while the token was written: nothing was stored; run the command \
+                 again",
+                path.display()
+            ),
+            _ => anyhow!("creating {}: {e}", path.display()),
+        })?;
+    } else {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+        guard.1 = true;
+    }
+    drop(guard);
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))?;
+    Ok(stored)
+}
+
+/// An exclusive `flock` of `.<name>.lock` in `dir` (made 0600 when missing), held until it
+/// drops: [`write_token_file`]'s.
+fn lock_beside(dir: &std::path::Path, name: &std::ffi::OsStr) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut lock = std::ffi::OsString::from(".");
+    lock.push(name);
+    lock.push(".lock");
+    let lock = dir.join(lock);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock)
+        .with_context(|| format!("opening {}", lock.display()))?;
+    loop {
+        // SAFETY: flock on a descriptor this function owns; no memory is passed.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e).with_context(|| format!("locking {}", lock.display()));
+        }
+    }
 }
 
 /// How long a runner's shutdown waits for its runtimes by default
@@ -257,6 +436,11 @@ pub struct RunnerOptions {
     /// Run as an SSH box's daemon: accept the hub's sealed connections on a Unix socket
     /// instead of dialing `hub_url` with the token.
     pub daemon: Option<DaemonOptions>,
+    /// The file `token` was read from (`--token-file`, or the default one `twr runner
+    /// install-token` writes), when it came from one: after the hub refuses the runner, it is
+    /// read again, and watched while the runner waits, so a new token installed there is used
+    /// at once ([`dial_loop`]).
+    pub token_file: Option<PathBuf>,
 }
 
 impl RunnerOptions {
@@ -284,6 +468,7 @@ impl RunnerOptions {
             ca_file: None,
             allow_insecure: false,
             daemon: None,
+            token_file: None,
         }
     }
 
@@ -333,22 +518,41 @@ impl RunnerOptions {
         }
         twr_core::runner::check_token_len(self.token.expose(), "the runner token")
             .map_err(anyhow::Error::msg)?;
-        let lower = self.hub_url.to_ascii_lowercase();
-        if lower.starts_with("ws://") {
-            let host = url_host(&self.hub_url)?;
-            if !self.allow_insecure && !is_loopback_host(&host) {
-                bail!(
-                    "refusing plain ws:// to {host}: the box token and every event would cross the \
-                     network in clear text. Use wss:// (with --ca <pem> for a private CA), an SSH \
-                     tunnel to a loopback port (--hub ws://127.0.0.1:<port>), or --allow-insecure \
-                     on a network you trust"
-                );
-            }
-        } else if !lower.starts_with("wss://") {
-            bail!("the hub URL must start with ws:// or wss://");
-        }
-        Ok(())
+        check_hub_url(&self.hub_url, self.allow_insecure)
     }
+}
+
+/// Checks a runner's hub URL: `wss://`, or `ws://` to a loopback host ([`is_loopback_host`];
+/// any host when `allow_insecure`, `--allow-insecure`).
+pub fn check_hub_url(url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("ws://") {
+        let host = url_host(url)?;
+        if !allow_insecure && !is_loopback_host(&host) {
+            bail!(
+                "refusing plain ws:// to {host}: the box token and every event would cross the \
+                 network in clear text. Use wss:// (with --ca <pem> for a private CA), an SSH \
+                 tunnel to a loopback port (--hub ws://127.0.0.1:<port>), or --allow-insecure \
+                 on a network you trust"
+            );
+        }
+    } else if !lower.starts_with("wss://") {
+        bail!("the hub URL must start with ws:// or wss://");
+    }
+    Ok(())
+}
+
+/// Checks a hub URL that twr writes into commands and services for you (`twr runner
+/// install-token --hub`, `twr box add --dial-in --hub`): [`check_hub_url`] without
+/// `--allow-insecure`, and a URL that parses, has a host, and holds no space or control
+/// character.
+pub fn check_guided_hub_url(url: &str) -> anyhow::Result<()> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("the hub URL {url:?} holds a space or a control character");
+    }
+    check_hub_url(url, false)?;
+    url_host(url)?;
+    Ok(())
 }
 
 /// The lock file of box `box_name` of the hub at `hub_url` on this machine
@@ -830,9 +1034,16 @@ async fn connect_loop(
     }
 }
 
+/// How often a refused runner looks at its token file while it waits ([`wait_for_token`]).
+const TOKEN_POLL: Duration = Duration::from_secs(2);
+
 /// The runner's connection loop: dials the hub, serves it, and dials again with backoff (see
-/// the module docs).
+/// the module docs). After a refusal, a token from a file ([`RunnerOptions::token_file`]) is
+/// read again, and the file watched while the runner waits ([`wait_for_token`]): a new token
+/// there is used at once.
 async fn dial_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Receiver<bool>) {
+    // The options with the token in use, which a new token file replaces.
+    let mut live = opts.clone();
     let mut backoff = Backoff::new(opts.backoff_min, opts.backoff_max);
     let connector = match opts.ca_file.as_deref().map(tls_connector).transpose() {
         Ok(c) => c,
@@ -877,7 +1088,7 @@ async fn dial_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Recei
                 let out = serve(
                     ws,
                     lbox,
-                    opts,
+                    &live,
                     &epoch_hint,
                     stop.clone(),
                     std::future::pending(),
@@ -909,11 +1120,68 @@ async fn dial_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Recei
             backoff.next()
         };
         tracing::info!(retry_in_ms = delay.as_millis() as u64, "reconnecting");
+        let wait = async {
+            match opts.token_file.as_deref().filter(|_| refused) {
+                Some(path) => wait_for_token(path, &mut live.token, delay).await,
+                None => tokio::time::sleep(delay).await,
+            }
+        };
         tokio::select! {
-            () = tokio::time::sleep(delay) => {}
+            () = wait => {}
             () = stopped(&mut stop) => return,
             _ = fatal.wait_for(Option::is_some) => return,
         }
+    }
+}
+
+/// A refused runner's wait of `delay` before it connects again, cut short when its token file
+/// `path` holds a new token: the file is read at once (it may have changed while the runner
+/// was connected), then again whenever its [`FileStamp`] changes, looked at every
+/// [`TOKEN_POLL`]. A new token that passes [`read_token_file`]'s checks and is long enough
+/// replaces `token`, and the wait ends. A file that fails them is logged (once per change) and
+/// the old token kept. Neither token is ever logged.
+async fn wait_for_token(path: &std::path::Path, token: &mut Secret, delay: Duration) {
+    let until = tokio::time::Instant::now() + delay;
+    // The stamp of the file as last read (`None`: read it now).
+    let mut seen: Option<Option<FileStamp>> = None;
+    loop {
+        let now = FileStamp::at(path);
+        if seen != Some(now) {
+            seen = Some(now);
+            match read_token_file_stamped(path) {
+                Ok((new, stamp)) => {
+                    seen = Some(Some(stamp));
+                    if !new.ct_eq(token.expose()) {
+                        match twr_core::runner::check_token_len(new.expose(), "the runner token") {
+                            Err(e) => tracing::warn!(
+                                file = %path.display(),
+                                "the token file changed, but its token can't be used: {e}"
+                            ),
+                            Ok(warning) => {
+                                if let Some(w) = warning {
+                                    tracing::warn!("{w}");
+                                }
+                                tracing::info!(
+                                    file = %path.display(),
+                                    "the token file changed: connecting with the new token"
+                                );
+                                *token = new;
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "cannot read the token file again: keeping the token in use"
+                ),
+            }
+        }
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(TOKEN_POLL)).await;
     }
 }
 
@@ -1533,6 +1801,41 @@ mod tests {
         }
     }
 
+    /// The URL rule on its own (`twr runner install-token`, `twr box add --dial-in`), and its
+    /// stricter guided form: no `--allow-insecure`, nothing that doesn't parse, no space or
+    /// control character.
+    #[test]
+    fn guided_hub_urls_are_checked() {
+        check_hub_url("ws://127.0.0.1:7878", false).unwrap();
+        check_hub_url("ws://10.0.0.5:7878", true).unwrap();
+        let e = check_hub_url("ws://10.0.0.5:7878", false).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("refusing plain ws:// to 10.0.0.5: "),
+            "{e}"
+        );
+        assert!(check_hub_url("http://hub", true).is_err());
+        for url in [
+            "ws://127.0.0.1:7878",
+            "ws://[::1]:7878/x",
+            "wss://hub.tail1234.ts.net:7878",
+        ] {
+            check_guided_hub_url(url).unwrap_or_else(|e| panic!("{url}: {e:#}"));
+        }
+        for url in [
+            "ws://10.0.0.5:7878",
+            "ws://100.64.1.2:7878",
+            "wss://hub example:7878",
+            "wss://hub:7878\nExecStartPre=/bin/sh",
+            "wss://hub:7878/\u{1b}[2J",
+            "wss://",
+            "wss://:7878",
+            "https://hub:7878",
+        ] {
+            assert!(check_guided_hub_url(url).is_err(), "{url}");
+        }
+    }
+
     #[test]
     fn loopback_hosts_are_literal() {
         for h in [
@@ -1611,6 +1914,15 @@ mod tests {
             r.as_ref().unwrap_err().contains("is not a regular file"),
             "{r:?}"
         );
+        // A file of another user's is refused before anything else (root's here; a test run
+        // as root has no other user's file to try).
+        if twr_core::paths::effective_uid() != 0 {
+            let e = read_token_file(std::path::Path::new("/etc/passwd")).unwrap_err();
+            assert!(
+                e.to_string().contains("belongs to another user (uid 0;"),
+                "{e:#}"
+            );
+        }
         // The suggested command works pasted as shown, whatever the path holds.
         let odd = dir.path().join("my box's $HOME");
         std::fs::create_dir(&odd).unwrap();
@@ -1625,5 +1937,168 @@ mod tests {
             .unwrap();
         assert!(ran.success(), "{cmd}");
         assert_eq!(read_token_file(&p).unwrap().expose(), "s3cret");
+    }
+
+    /// `install-token`'s writes: private file and directory, the same token left alone,
+    /// another one replaced only when allowed, nothing left behind on an error, and never the
+    /// token in a message.
+    #[test]
+    fn token_files_are_written_privately_and_whole() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("cfg/runner-tokens");
+        let path = dir.join("gpu.token");
+        let a = Secret::new("token-a-0123456789abcdef0123456789");
+        let b = Secret::new("token-b-0123456789abcdef0123456789");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let leftovers = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect::<Vec<_>>()
+        };
+        let mut no = || Ok(false);
+        let mut yes = || Ok(true);
+        // Without `make_dir`, a missing directory is an error and nothing is made.
+        assert!(write_token_file(&path, &a, false, &mut no).is_err());
+        assert!(!dir.exists());
+        assert_eq!(
+            write_token_file(&path, &a, true, &mut no).unwrap(),
+            Stored::New
+        );
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", a.expose())
+        );
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        // The same token: the file is left as it is, nothing asked.
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let mut asked = || -> anyhow::Result<bool> { panic!("asked about the same token") };
+        assert_eq!(
+            write_token_file(&path, &a, true, &mut asked).unwrap(),
+            Stored::Same
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+        // Another token: kept when replacing is declined, the file untouched; an error from
+        // the question is the write's.
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Kept
+        );
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        let mut fails = || -> anyhow::Result<bool> { bail!("no terminal") };
+        let e = write_token_file(&path, &b, true, &mut fails).unwrap_err();
+        assert!(!format!("{e:#}").contains("token-"), "{e:#}");
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        // Agreed: a new file takes the old one's place (renamed over it: never half written).
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut yes).unwrap(),
+            Stored::Replaced
+        );
+        assert_eq!(read_token_file(&path).unwrap(), b);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), ino);
+        assert_eq!(mode(&path), 0o600);
+        // A file the runner can't use (readable by others) is not "the same token".
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Kept
+        );
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut yes).unwrap(),
+            Stored::Replaced
+        );
+        assert_eq!(mode(&path), 0o600);
+        // A directory there: the write fails, and no temporary file stays.
+        let taken = dir.join("taken.token");
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("x"), "x").unwrap();
+        assert!(write_token_file(&taken, &a, true, &mut yes).is_err());
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        // An existing directory loosened by someone is made private again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Same
+        );
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    /// Two installs at once never overwrite each other unasked: of two that find no file, one
+    /// stores its token and the other finds it there (and keeps it, replacing declined); one
+    /// that is asked about the file it found replaces that one, no other written meanwhile.
+    #[test]
+    fn concurrent_token_writes_do_not_overwrite_each_other_unasked() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("runner-tokens");
+        for round in 0..40 {
+            let path = dir.join(format!("gpu{round}.token"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writers: Vec<_> = ["token-a-0123456789abcdef", "token-b-0123456789abcdef"]
+                .into_iter()
+                .map(|t| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut no = || Ok(false);
+                        let stored = write_token_file(&path, &Secret::new(t), true, &mut no)
+                            .map_err(|e| format!("{e:#}"));
+                        (t, stored)
+                    })
+                })
+                .collect();
+            let done: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            let new: Vec<_> = done.iter().filter(|(_, s)| *s == Ok(Stored::New)).collect();
+            assert_eq!(new.len(), 1, "round {round}: {done:?}");
+            assert!(
+                done.iter()
+                    .any(|(_, s)| *s == Ok(Stored::Kept) || s.is_err()),
+                "round {round}: {done:?}"
+            );
+            assert_eq!(read_token_file(&path).unwrap().expose(), new[0].0);
+        }
+        // Asked about the token it found: while it asks, another write waits for it.
+        let path = dir.join("asked.token");
+        let mut no = || Ok(false);
+        write_token_file(
+            &path,
+            &Secret::new("token-a-0123456789abcdef"),
+            true,
+            &mut no,
+        )
+        .unwrap();
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let p = path.clone();
+        let first = std::thread::spawn(move || {
+            let mut ask = || {
+                asked_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(true)
+            };
+            write_token_file(&p, &Secret::new("token-b-0123456789abcdef"), true, &mut ask)
+        });
+        asked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let p = path.clone();
+        let second = std::thread::spawn(move || {
+            let mut no = || Ok(false);
+            write_token_file(&p, &Secret::new("token-c-0123456789abcdef"), true, &mut no)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !second.is_finished(),
+            "the second write ran while the first asked"
+        );
+        go_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), Stored::Replaced);
+        assert_eq!(second.join().unwrap().unwrap(), Stored::Kept);
+        assert_eq!(
+            read_token_file(&path).unwrap().expose(),
+            "token-b-0123456789abcdef"
+        );
     }
 }

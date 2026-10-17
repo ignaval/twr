@@ -236,6 +236,35 @@ pub fn check_token_len(token: &str, what: &str) -> Result<Option<String>, String
     }
 }
 
+/// Longest token [`check_token_text`] accepts, in characters.
+pub const TOKEN_MAX_LEN: usize = 1024;
+
+/// Checks a token typed or piped in (`twr runner install-token`), already trimmed:
+/// [`check_token_len`], and at most [`TOKEN_MAX_LEN`] printable ASCII characters without
+/// spaces, so a paste that took in something else is refused rather than stored. `what` names
+/// it in the messages, which never hold it.
+pub fn check_token_text(token: &str, what: &str) -> Result<Option<String>, String> {
+    if token.chars().count() > TOKEN_MAX_LEN {
+        return Err(format!(
+            "{what} is too long (more than {TOKEN_MAX_LEN} characters)"
+        ));
+    }
+    if let Some(bad) = token.chars().find(|c| !c.is_ascii_graphic()) {
+        let kind = if bad.is_whitespace() {
+            "a space"
+        } else if bad.is_control() {
+            "a control character"
+        } else {
+            "a character that is not ASCII"
+        };
+        return Err(format!(
+            "{what} holds {kind}: a box token is printable ASCII without spaces (`twr box \
+             token <box>` on the hub prints it)"
+        ));
+    }
+    check_token_len(token, what)
+}
+
 /// Checks a box name (`[boxes.<name>]`, `twr runner --box`): box names become file names
 /// (`runner-<box>.db`) and parts of paths on the box, so `[A-Za-z0-9._-]`, not starting with
 /// `.`, at most 64 bytes.
@@ -1885,6 +1914,28 @@ mod tests {
         assert_eq!(check_token_len(&"x".repeat(32), "t"), Ok(None));
         // Characters, not bytes.
         assert!(check_token_len(&"é".repeat(15), "t").is_err());
+    }
+
+    #[test]
+    fn typed_tokens_are_printable_ascii() {
+        let good = new_token().unwrap();
+        assert_eq!(check_token_text(&good, "the token"), Ok(None));
+        assert!(check_token_text(&"x".repeat(20), "t").unwrap().is_some());
+        assert!(check_token_text(&"x".repeat(15), "t").is_err());
+        assert_eq!(check_token_text(&"x".repeat(TOKEN_MAX_LEN), "t"), Ok(None));
+        let e = check_token_text(&"x".repeat(TOKEN_MAX_LEN + 1), "t").unwrap_err();
+        assert!(e.contains("too long"), "{e}");
+        for (bad, kind) in [
+            ("s3cret-token-with space-1234", "a space"),
+            ("s3cret-token-with\ttab-12345", "a space"),
+            ("s3cret-token-\u{1b}[31m-123456", "a control character"),
+            ("s3cret-token-\u{7f}-1234567890", "a control character"),
+            ("s3cret-token-é-12345678901234", "not ASCII"),
+        ] {
+            let e = check_token_text(bad, "the token").unwrap_err();
+            assert!(e.contains(kind), "{bad:?}: {e}");
+            assert!(!e.contains("s3cret"), "{e}");
+        }
     }
 
     #[test]

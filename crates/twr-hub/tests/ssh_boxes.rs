@@ -553,7 +553,9 @@ async fn listener_refuses(dialed: BoxConfig) {
 /// configured project used by `thread.new` once its daemon is connected); `config.show`
 /// lists both with their transports. Refused: a box the hub has (nothing replaced), one in
 /// neither file, files that do not parse, a short token, the orchestrator (agents cannot call
-/// it at all), a named workspace. `box.install` wakes an SSH box only.
+/// it at all), a named workspace. `box.install` wakes an SSH box only. `box.token` refuses an
+/// SSH box (it has no token), a box the hub does not have, the orchestrator and a named
+/// workspace; `hub.info` says whether the runner listener is up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn boxes_are_added_while_the_hub_runs() {
     let dir = tempfile::tempdir().unwrap();
@@ -712,7 +714,12 @@ async fn boxes_are_added_while_the_hub_runs() {
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::UNAUTHORIZED);
-    for m in ["box.add", "box.install"] {
+    let e = hub
+        .box_token("lab", &Caller::Orchestrator)
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED);
+    for m in ["box.add", "box.install", "box.token"] {
         assert!(twr_hub::server::METHODS.contains(&m));
         assert!(!twr_hub::server::AGENT_METHODS.contains(&m));
         assert!(!twr_hub::server::ORCHESTRATOR_METHODS.contains(&m));
@@ -749,6 +756,12 @@ async fn boxes_are_added_while_the_hub_runs() {
     assert_eq!(e.code, codes::BAD_REQUEST);
     let e = hub.box_install("nope", &user()).await.unwrap_err();
     assert_eq!(e.code, codes::NOT_FOUND);
+    // `box.token`: token boxes only (an SSH box has none), boxes the hub has.
+    let e = hub.box_token("far", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{}", e.message);
+    assert!(e.message.contains("has no token"), "{}", e.message);
+    let e = hub.box_token("nope", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::NOT_FOUND);
     hub.shutdown().await;
 
     // A named workspace's hub adds none.
@@ -763,6 +776,9 @@ async fn boxes_are_added_while_the_hub_runs() {
     let hub = Hub::open(opts).await.unwrap();
     let e = hub.box_add("w", &user()).await.unwrap_err();
     assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    let e = hub.box_token("w", &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::UNSUPPORTED, "{}", e.message);
+    assert_eq!(hub.info()["listening"], false);
     hub.shutdown().await;
 
     // A hub does not start with a box whose `ssh` would forward something.
@@ -881,7 +897,7 @@ async fn box_projects_are_read_again_while_the_hub_runs() {
     let e = hub.box_projects("far", &user()).await.unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{}", e.message);
     assert!(
-        e.message.contains("`twr hub stop`, then `twr`"),
+        e.message.contains("`twr hub stop`, then `twr`") && !e.message.contains("  "),
         "{}",
         e.message
     );
@@ -942,7 +958,7 @@ async fn box_projects_are_read_again_while_the_hub_runs() {
     let e = hub.box_projects("far", &user()).await.unwrap_err();
     assert_eq!(e.code, codes::NOT_FOUND, "{}", e.message);
     assert!(
-        e.message.contains("no longer have box far"),
+        e.message.contains("no longer have box far") && !e.message.contains("  "),
         "{}",
         e.message
     );

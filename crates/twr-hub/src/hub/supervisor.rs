@@ -528,9 +528,29 @@ pub(super) async fn supervise(
     }
 }
 
+/// What [`close_exited`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Closed {
+    /// The closing sequence (and the runner frame it came in, if any) was recorded.
+    Recorded,
+    /// The exit's connection proved a token the box no longer has (`box.token` changed it
+    /// before the commit, and put the runtime back as it was then): nothing was recorded.
+    Revoked,
+    /// The store failed for good (the hub fails).
+    Failed,
+}
+
 /// Records the closing sequence of an exited runtime (retrying the store), releases it, and
-/// dispatches the queue after a requested stop. Returns whether the closing sequence (and the
-/// runner frame it came in, if any) was recorded.
+/// dispatches the queue after a requested stop.
+///
+/// An exit a runner connection brought (its `exited` frame, or a runtime its reconciliation
+/// found lost) commits nothing once `box.token` changed or revoked the token the connection
+/// proved, checked under the core lock at each attempt ([`Closed::Revoked`]). The change
+/// itself put the runtime the exit took back, live and not exiting, in its own step under the
+/// core lock ([`Core::put_back_revoked_exits`]): a connection with the box's token that comes
+/// before this attempt finds the runtime as it was, and reports or finds the exit again. A
+/// connection fenced by a newer one of the box records the closing sequence without its
+/// frame's watermark (the frame comes again, and finds the runtime closed).
 ///
 /// The commit and the exit's bookkeeping ([`Core::finish_exit`]: the runtime no longer
 /// `exiting`) are one step under the core lock: a `thread.stop` never sees the runtime closed
@@ -539,9 +559,15 @@ pub(super) async fn supervise(
 /// with no runtime, and every later prompt stayed queued.) A stop that comes
 /// before the commit is the exit's own ([`Core::exit_plan`] closes it as stopped); one that
 /// comes after finds no runtime and closes the thread itself.
-pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut PendingExit) -> bool {
+pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut PendingExit) -> Closed {
     let mut dispatch = None;
+    let mut revoked = false;
     let closed = persist(hub, thread, "closing an exited runtime", |core| {
+        // Revoked: the runtime is back already, and may be another connection's exit by now.
+        if exit.fence.as_ref().is_some_and(|f| f.revoked()) {
+            revoked = true;
+            return Ok(());
+        }
         let plan = core.exit_plan(thread, exit);
         // A runner connection fenced meanwhile commits no watermark (its frame is replayed).
         let ack = match &exit.fence {
@@ -570,17 +596,29 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
     .await;
     #[cfg(test)]
     tests::after_close_commit();
+    if revoked {
+        tracing::info!(
+            thread,
+            "an exit a connection brought whose token the box no longer has: nothing recorded"
+        );
+        return Closed::Revoked;
+    }
     let dispatch = match dispatch {
         Some(d) => d,
-        // Never committed: released all the same (the hub fails below).
-        None => hub.core().finish_exit(hub, thread, exit, false),
+        // Never committed: released all the same (the hub fails below), unless a token change
+        // put the runtime back meanwhile (it keeps its slot).
+        None => {
+            let mut core = hub.core();
+            !exit.fence.as_ref().is_some_and(|f| f.revoked())
+                && core.finish_exit(hub, thread, exit, false)
+        }
     };
     if let Err(e) = closed {
         fail_hub(
             hub,
             format!("cannot record the closing sequence of thread {thread}: {e:#}"),
         );
-        return false;
+        return Closed::Failed;
     }
     if exit.crash {
         // A crash: classify it and retry once if it is due (`hub::retry`); nothing else is
@@ -610,7 +648,7 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
     if dispatch && exit.restart {
         hub.core().restart_after_settings_change(hub, thread);
     }
-    true
+    Closed::Recorded
 }
 
 /// Recording what runtime `generation` of `thread` did failed for good (`e`): stops the
@@ -950,7 +988,7 @@ mod tests {
                 *answer2.lock().unwrap() = Some(r);
             }))
         });
-        assert!(close_exited(&inner, &t, &mut exit).await);
+        assert_eq!(close_exited(&inner, &t, &mut exit).await, Closed::Recorded);
         let answer = answer.lock().unwrap().take().expect("the hook ran");
         assert_eq!(answer["stopping"], false, "{answer}");
         {
@@ -1058,8 +1096,11 @@ mod tests {
             let second = core.begin_exit(&t, gen, Some(1), "second".into()).unwrap();
             (first, second)
         };
-        assert!(close_exited(&inner, &t, &mut first).await);
-        assert!(close_exited(&inner, &t, &mut second).await);
+        assert_eq!(close_exited(&inner, &t, &mut first).await, Closed::Recorded);
+        assert_eq!(
+            close_exited(&inner, &t, &mut second).await,
+            Closed::Recorded
+        );
         let evs = hub.thread_events(&t, 0, 10_000).unwrap().1;
         let n = |k: &str| evs.iter().filter(|e| e.kind() == k).count();
         let kinds: Vec<&str> = evs.iter().map(|e| e.kind()).collect();

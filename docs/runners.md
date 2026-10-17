@@ -1,6 +1,6 @@
 # Runners: threads on other machines
 
-A box other than `local` is another machine, or a container, that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. There are three kinds. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A container box is the same, with `docker exec` (or podman, or `kubectl exec`) in place of ssh ([Container boxes](#container-boxes)). A box the hub can't reach either way runs `twr runner`, which connects out to the hub ([below](#boxes-the-hub-cant-reach-over-ssh)).
+A box other than `local` is another machine, or a container, that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. There are three kinds. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A container box is the same, with `docker exec` (or podman, or `kubectl exec`) in place of ssh ([Container boxes](#container-boxes)). A box the hub can't reach either way, a dial-in box, runs `twr runner`, which connects out to the hub ([Dial-in boxes](#dial-in-boxes)).
 
 ## SSH boxes
 
@@ -49,14 +49,16 @@ Threads on an SSH box get the branch names of threads on the hub's own box (`twr
 | `twr box status <name> [--json]` | everything the hub knows of one: state, version, the build it launched, a pending switch, OS/CPU, how its daemon was started, the last error, the latest notes (newest last), a connection the hub refused, and each agent CLI's path, version and login |
 | `twr box install <name> [--binary <path> \| --from-box <path>] [--yes]` | install twr on an SSH or container box and have the hub connect again ([below](#another-os-or-cpu)) |
 | `twr box restart <name> [--yes]` | have the hub restart the box daemon ([below](#restart-the-box-daemon)) |
-| `twr box remove <name>` | take the box out of `boxes.toml` |
+| `twr box add <name> --dial-in --hub <url> [--ca <pem>] [--yes]` | add a dial-in box: a new token in `boxes.toml`, the command to run on the box ([Dial-in boxes](#dial-in-boxes)) |
+| `twr box remove <name>` | take the box out of `boxes.toml` (a dial-in box: no longer accepted by the running hub) |
+| `twr box token <name> [--rotate [--yes] \| --reload]` | print a dial-in box's token, replace it, or have the running hub read it again ([Tokens, rotation and removal](#tokens-rotation-and-removal)) |
 | `twr box doctor <name> [--json]` | check the box and say how to fix what is wrong, with or without a hub ([Check a box](#check-a-box)) |
 | `twr box login <name> <agent>` | start an agent CLI's own login on the box, in your terminal ([Log an agent in on a box](#log-an-agent-in-on-a-box)) |
 | `twr box project <name> <project> [--path <path> \| --clone [--into <dir>] \| --remove] [--yes]` | find a project's repository on the box (or clone it there, in your terminal) and record where it is ([Projects on a box](#projects-on-a-box)) |
 
 States: `connecting` (probing, installing, opening the connection), `online`, `offline` (between attempts), `needs_install` (run `twr box install <name>`), `switching` (see below) and `error` (the hub's box key can't be loaded).
 
-`twr box remove` changes only `boxes.toml`. A box you configured in `config.toml` stays there: remove it yourself. The running hub keeps the box connected until it restarts (`twr hub stop`, then `twr`). The box daemon, its agents and the box's worktrees stay on the box; `twr box remove` prints the command that stops the daemon: the hub's own ssh, with its options and forwarding off, running `<build> runner --stdio --box=<name> --hub-key <key> --stop` on the box (for a container box, the box's command with `sh -c`; twr never removes the container). Run it once the hub no longer connects to the box, or the hub starts a daemon again.
+`twr box remove` changes only `boxes.toml`. A box you configured in `config.toml` stays there: remove it yourself. The running hub keeps the box connected until it restarts (`twr hub stop`, then `twr`); a dial-in box's runner is refused at once instead ([Tokens, rotation and removal](#tokens-rotation-and-removal)). The box daemon, its agents and the box's worktrees stay on the box; `twr box remove` prints the command that stops the daemon: the hub's own ssh, with its options and forwarding off, running `<build> runner --stdio --box=<name> --hub-key <key> --stop` on the box (for a container box, the box's command with `sh -c`; twr never removes the container). Run it once the hub no longer connects to the box, or the hub starts a daemon again.
 
 ### Another OS or CPU
 
@@ -194,13 +196,78 @@ twr doesn't check any of this. If keeping the host's services out matters, filte
 
 A network with IPv6 needs the same rules for IPv6 (`ip6tables`, or an `inet` table in nftables). These are starting points, not a complete firewall: try them from the container (`docker exec twr-sandbox curl <a host service>`) and make them persist across reboots your usual way. On Docker Desktop, use its settings, or give the container no network and the agents an egress proxy for their APIs.
 
-## Boxes the hub can't reach over SSH
+## Dial-in boxes
 
-A box the hub can't reach over SSH (behind NAT, or one you'd rather not give the hub an ssh key to) runs `twr runner`, which connects out to the hub over WebSocket and runs that box's threads. The hub needs no inbound access to the box.
+A box the hub can't reach over SSH (behind NAT, or one you'd rather not give the hub an ssh key to) is a dial-in box: it runs `twr runner`, which connects out to the hub's runner listener over WebSocket and runs that box's threads. The hub needs no inbound access to the box. Hub and runner share a token, which both prove they know without ever sending it.
 
-### Set it up
+```sh
+# on the hub machine (once: [hub] listen set and served to the box, below)
+twr box add gpu --dial-in --hub wss://hub.tail1234.ts.net:7878
 
-On the hub machine, turn on the listener and give the box a token:
+# on the box
+twr runner install-token gpu --hub wss://hub.tail1234.ts.net:7878
+```
+
+### The listener, once
+
+The box's runner connects to the hub's runner listener, which is off until you set it, in `~/.config/twr/config.toml`:
+
+```toml
+[hub]
+listen = "127.0.0.1:7878"
+```
+
+Restart the hub (`twr hub stop`, then `twr`), and make the listener reachable from the box. `twr box add --dial-in` refuses without `listen`, before it writes anything, and says this. Three ways, the first one recommended:
+
+- **Tailscale**, on both machines, with HTTPS certificates turned on for the tailnet: `tailscale serve --bg --tls-terminated-tcp=7878 tcp://127.0.0.1:7878` on the hub machine; the box then dials `wss://<hub machine>.<tailnet>.ts.net:7878` ([Over Tailscale](#over-tailscale)).
+- **TLS on the listener** (`[hub] tls`, [Transport and TLS](#transport-and-tls)): the box dials `wss://<a name in the certificate>:7878`, with `--ca` for a private CA.
+- **An ssh tunnel from the box** to the hub (`ssh -N -o ExitOnForwardFailure=yes -L 7878:127.0.0.1:7878 me@hub` on the box): the box dials `ws://127.0.0.1:7878`. The tunnel must stay up, as a service of its own.
+
+### Add the box
+
+`twr box add <name> --dial-in --hub <url>` on the hub machine:
+
+1. Checks `--hub` with the runner's own rule, without a way around it: `wss://`, or `ws://` to a loopback address (an ssh tunnel's end). A plain `ws://` to any other address is refused, and so is `ws://` when the listener serves TLS. Without `--hub` it says which URLs fit the config. `--ca <path>` (with `wss://`) names the CA certificate the runner trusts, by its absolute path on the box.
+2. Says what will happen and asks `Add box gpu? [y/N]` (`--yes` skips the question; without a terminal, `--yes` is required): where the runner connects, that a new token goes into `boxes.toml`, and which twr the box needs (the hub's version: `twr update --version v<version>` there; for a development hub, a build of its commit).
+3. Writes `[boxes.gpu]` with `transport = "token"` and a new token (32 random bytes, in hex) to `boxes.toml` (mode 0600), and adds the box to the running hub (`box.add`), starting the hub when none runs. A hub that started before `listen` was set says so: restart it.
+4. Prints the command to run on the box, `twr runner install-token gpu --hub <url>`, and, only when its output is a terminal, the token to paste there. Otherwise it says that `twr box token gpu` prints it.
+5. On a terminal, waits up to 10 minutes for the box's runner to connect, printing each state and each refusal with what to do: a refused proof is a bad paste (`twr box token gpu` prints the token again), a refused protocol means twr on the box needs updating. Ctrl-C stops the wait; the box stays added.
+
+### On the box
+
+`twr runner install-token <box> [--hub <url>] [--ca <pem>] [--token-file <path>] [--yes]` stores the box's token for its runner:
+
+- On a terminal it asks for the token at a prompt that does not show it (`/dev/tty`, echo off before the prompt appears, so nothing typed ahead is taken); paste it there. Ctrl-C cancels, and nothing is stored. Without a terminal it reads the token from stdin: on a box that can ssh to the hub, `ssh me@hub twr box token gpu | twr runner install-token gpu --yes`. The token must be 16 to 1024 printable ASCII characters without spaces. It is never shown, logged or put on a command line.
+- It writes the token to `~/.config/twr/runner-tokens/gpu.token` (`$TWR_HOME/runner-tokens/` with `TWR_HOME`), mode 0600 in a directory of mode 0700, atomically: a runner reading it sees the old token or the new one. `--token-file` writes it elsewhere (its directory must exist). The same token again is "unchanged". A file that holds another token is replaced only once you confirm, or with `--yes`: it is usually the same hub's box with a new token, but two hubs that both name a box `gpu` would collide on that machine (its token file, spool, service name), so give the second hub's box another name (`twr box add gpu-work --dial-in ...`).
+- With `--hub`, it prints the command that runs the runner, and a service to paste that keeps it running: a systemd user unit on Linux (when `systemctl` is there), a LaunchAgent on a Mac. Both name the token file and, when the data directory is not the standard one (`TWR_HOME`, `XDG_DATA_HOME`), `--data-dir`, by absolute paths. twr writes no service file and runs no `systemctl` or `launchctl` itself: what runs is what you pasted. When a path can't be written safely into the unit or the plist (a newline, a quote), it says to write the service yourself.
+
+`twr runner --hub <url> --box=gpu` reads the token from `--token-file`, else `TWR_RUNNER_TOKEN`, else the box's default file, `runner-tokens/<box>.token`. A token from a file is read again after the hub refuses the runner (or can't prove it knows the token): while the runner waits to try again (60 seconds), it looks at the file every 2 seconds, and connects at once with a new token there. So after a rotation, installing the new token on the box is enough; no restart. A file that fails the checks (another owner, group or other permission bits) is logged, and the old token kept.
+
+The systemd unit, as pasted, runs `systemctl --user enable --now twr-runner-gpu.service` and `loginctl enable-linger`, so the runner runs without a login session. `systemctl --user restart twr-runner-gpu.service` restarts it; `journalctl --user -u twr-runner-gpu.service` shows its log. On a Mac, the LaunchAgent (`tools.twr.runner.gpu`, its log in `~/Library/Logs/twr-runner-gpu.log`) runs in your GUI session, where Claude Code can read its keychain login, so it runs while someone is logged in at the Mac's screen, as [Mac boxes](#mac-boxes) need; `launchctl kickstart -k gui/$(id -u)/tools.twr.runner.gpu` restarts it. Pasting the snippet again replaces the service: the Mac snippet boots the old LaunchAgent out first (its agents stop with it). On Linux, a runner that is running already keeps its old settings (`--hub`, `--ca`, the token file) until it restarts, so the snippet doesn't restart it: it says so, with the `systemctl --user restart` command to run when the box's agents may stop.
+
+### Tokens, rotation and removal
+
+| Command | What it does |
+| --- | --- |
+| `twr box token <name>` | prints the box's token (from `boxes.toml`, or `config.toml` for a box configured there), and nothing else on stdout, to a pipe too |
+| `twr box token <name> --rotate [--yes]` | writes a new token to `boxes.toml` (only while the box there is the one it read, its token included) and has the running hub take it at once: the hub stops accepting the old token and drops the box's connection. The box stays offline until you install the new token there (`twr runner install-token gpu`); its agents keep running meanwhile. Prints the new token on a terminal only |
+| `twr box token <name> --reload` | has the running hub take the box's token from the files again, after you edited `config.toml` |
+| `twr box remove <name>` | takes the box out of `boxes.toml`, and the running hub stops accepting its runner at once and drops its connection (the hub goes by the box it runs, whatever the removed table's `transport` says). It prints how to stop the runner on the box (on a Mac, also removing its LaunchAgent's plist, which launchd would load again at the next login) and delete its token. When the box is in `config.toml` too, the hub keeps accepting it and the command says so |
+
+The hub's token for a box is always the one the files give it, or none: rotation and removal never need a hub restart, and a handshake that proved the old token is refused once the token changed. The hub keeps the box's threads until it restarts. A box in `config.toml` is yours to edit: `--rotate` refuses it and says to put a new token there (`twr runner token` prints one), then run `twr box token <name> --reload`.
+
+When the running hub doesn't take a rotation or a removal (it can't read the files, say, or is older than `box.token`), the command fails, its change to `boxes.toml` kept, and says what to run: `twr box token <name> --reload` once the files read, or a hub restart. A hub that is starting doesn't miss the change: it reads the files under `boxes.toml`'s lock and holds it until its socket is bound, so these commands wait for it and then ask it. Nor does a hub that is shutting down: it removes its socket first and accepts runners until it exits, so these commands, finding no socket, wait for its exit (at most 30 seconds, then they fail, the change kept).
+
+### Versions and updates
+
+The hub can't reach a dial-in box, so it can't install its build there. The runner must speak the hub's runner protocol; a runner of another protocol is refused, and the box shows the refusal (`twr box status`, `twr box doctor`). After a hub upgrade that changes it, update twr on the box (`twr update --version v<the hub's version>`, or for a development hub a build of its commit with `docs/tools/dev-install.sh`) and restart the runner. Threads whose agents were running get an error card, as after any runner restart. Another build of the same protocol works; `twr box doctor` warns about it, with the same fix.
+
+`twr box doctor <box>` on a dial-in box checks what the hub can see: its view of the box (state, version, a refusal, each with the fix on the box's side), whether the hub listens for runners, the box's token (there, and long enough; never shown), and the agent CLIs as the box's runner sees them, asked again through the hub while it is connected. The box's projects are not checked: twr can't look there. `twr box project <box> <project> --path <path>` records a repository's path on a dial-in box without checking it; a wrong one fails the thread at its start. `twr box login` says to log in on the box itself. `twr box install` and `twr box restart` say what to run on the box.
+
+### By hand
+
+A token box you set up yourself, in `config.toml`. On the hub machine, turn on the listener and give the box a token:
+
 
 ```toml
 [hub]
@@ -214,7 +281,7 @@ ssh = "me@gpu-box"             # used by `twr attach` for threads on that box
 repo = "/srv/code/api"         # where project api lives on the box
 ```
 
-`twr runner token` prints a new token: 32 random bytes, in hex. Put the same token in the hub's config and in a file on the box. A token shorter than 16 characters keeps the hub from starting (other commands, `twr hub stop` included, still work), and one shorter than 32 gets a warning in its log and in `twr info`; the runner refuses and warns the same way. If an upgrade finds a short token, replace it in both places with one from `twr runner token`, then restart the hub (`twr hub stop`, then `twr`) and the runner. The config file now holds a secret, so make it private with `chmod 600 ~/.config/twr/config.toml`. The hub warns at start when a config holding a box token or a `[notify]` command can be accessed by other users (any group or other permission bit).
+`twr runner token` prints a new token: 32 random bytes, in hex. Put the same token in the hub's config and on the box, with `twr runner install-token gpu` (which `twr runner` finds by default) or in a file of your own (`--token-file`). A token shorter than 16 characters keeps the hub from starting (other commands, `twr hub stop` included, still work), and one shorter than 32 gets a warning in its log and in `twr info`; the runner refuses and warns the same way. If an upgrade finds a short token, replace it in both places with one from `twr runner token`, then restart the hub (`twr hub stop`, then `twr`) and the runner. The config file now holds a secret, so make it private with `chmod 600 ~/.config/twr/config.toml`. The hub warns at start when a config holding a box token or a `[notify]` command can be accessed by other users (any group or other permission bit).
 
 Restart the hub, then connect the box. The simplest transport keeps the listener on loopback and tunnels it over SSH:
 
@@ -222,8 +289,10 @@ Restart the hub, then connect the box. The simplest transport keeps the listener
 # on the hub machine
 ssh -o ExitOnForwardFailure=yes -R 7878:127.0.0.1:7878 me@gpu-box
 
-# on the box: the token from a file only you can access, or from TWR_RUNNER_TOKEN
-twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file ~/.config/twr/gpu.token
+# on the box: the token at install-token's prompt, then the runner (which reads it from
+# ~/.config/twr/runner-tokens/gpu.token; or --token-file, or TWR_RUNNER_TOKEN)
+twr runner install-token gpu
+twr runner --hub ws://127.0.0.1:7878 --box=gpu
 
 # anywhere
 twr thread new /srv/code/model --box gpu
@@ -262,7 +331,7 @@ On the box, the runner:
 Description=twr runner for box gpu
 
 [Service]
-ExecStart=%h/.local/bin/twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file %h/.config/twr/gpu.token
+ExecStart=%h/.local/bin/twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file %h/.config/twr/runner-tokens/gpu.token
 # A service reads no shell startup file. The runner asks your login shell for its PATH
 # (when SHELL is set and is sh, bash, zsh, ksh or fish); otherwise put every agent CLI's
 # folder on PATH here, or set TWR_CLAUDE_BIN, TWR_CODEX_BIN or TWR_GROK_BIN to its full path.

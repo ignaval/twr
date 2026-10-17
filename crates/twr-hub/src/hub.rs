@@ -304,6 +304,12 @@ pub struct HubOptions {
     /// Period of the disk round (each box's free space, the worktrees due a measurement, the
     /// disk cards; `hub::disk`); `None` = [`DISK_TICK`] (5 minutes), zero = never.
     pub disk_tick: Option<Duration>,
+    /// The lock of `boxes.toml` ([`twr_core::config::BoxesFile::lock`]) taken before `config`
+    /// was read (`twr hub`), held by [`crate::run`] until the hub's socket is bound: a `twr box
+    /// remove` or `twr box token --rotate` that edits the file under that lock and then finds
+    /// no hub on the socket did so before this hub read the files, so the hub reads its edit.
+    /// `None`: nothing is held (tests, or a lock file `twr hub` could not open).
+    pub boxes_lock: Option<twr_core::config::BoxesLock>,
     /// The file `config` was read from: the hub warns when it holds secrets (a box token, a
     /// `[notify]` command) and other users can access it ([`Config::warnings`]). `None` (tests):
     /// only the config itself is checked.
@@ -376,11 +382,16 @@ pub struct HubOptions {
     /// no upload, no relay; [`crate::ssh_box::BoxDialer`]). Never set outside tests.
     #[doc(hidden)]
     pub box_dialer: Option<crate::ssh_box::BoxDialer>,
-    /// Test hook: awaited with the box's name by `box.projects` once it has read the config
-    /// files, before it compares and applies what it read (a slow read). Never set outside
-    /// tests.
+    /// Test hook: awaited with the box's name by `box.add` and `box.projects` once they have
+    /// read the config files, before they compare and apply what they read (a slow read).
+    /// Never set outside tests.
     #[doc(hidden)]
     pub box_files_read_hook: Option<BoxFilesReadHook>,
+    /// Test hook: awaited by [`crate::server::serve`] once the hub's socket is removed, before
+    /// it stops its runtimes (a slow shutdown, its runner listener still up). Never set
+    /// outside tests.
+    #[doc(hidden)]
+    pub socket_removed_hook: Option<SocketRemovedHook>,
     /// How the hub probes its own box's agent CLIs (`hub.info` `agents`, `box.agents local`;
     /// [`own_agent_probe`] for `twr hub`); `None` (the default, and tests): it probes none and
     /// reports none.
@@ -398,6 +409,10 @@ pub type MarkerReadHook = Arc<dyn Fn(u32) + Send + Sync>;
 #[doc(hidden)]
 pub type BoxFilesReadHook =
     Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// [`HubOptions::socket_removed_hook`].
+#[doc(hidden)]
+pub type SocketRemovedHook = Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
 /// [`HubOptions::reap_job_group_hook`]: given the group's id and its leader's start time.
 #[doc(hidden)]
@@ -426,6 +441,7 @@ impl HubOptions {
             trash_tick: None,
             disk_tick: None,
             job_slots_dir: None,
+            boxes_lock: None,
             config_file: None,
             test_user_token: None,
             hello_timeout: runners::HELLO_TIMEOUT,
@@ -445,6 +461,7 @@ impl HubOptions {
             job_members_hook: None,
             box_dialer: None,
             box_files_read_hook: None,
+            socket_removed_hook: None,
             agent_probe: None,
             agents_poll: AgentsPoll::default(),
         }
@@ -636,12 +653,15 @@ struct Inner {
     config_file: Option<PathBuf>,
     /// [`HubOptions::change_request_timeout`], for the remote boxes added later.
     change_request_timeout: Duration,
-    /// Serializes `box.install`s and `box.projects`: each reads the files, compares and
-    /// applies, so a slower one's older read can't be applied after a newer one's
-    /// (`hub::boxes`).
-    box_install_lock: tokio::sync::Mutex<()>,
+    /// Serializes `box.add`, `box.install`, `box.projects` and `box.token`: each reads the
+    /// files, compares and applies, so a slower one's older read can't be applied after a newer
+    /// one's (`hub::boxes`). Held across `.await`s and taken before any other lock (the boxes
+    /// lock, the core lock, a box's state lock), never while one of them is held.
+    box_files_lock: tokio::sync::Mutex<()>,
     /// [`HubOptions::box_files_read_hook`].
     box_files_read_hook: Option<BoxFilesReadHook>,
+    /// [`HubOptions::socket_removed_hook`].
+    socket_removed_hook: Option<SocketRemovedHook>,
     /// [`HubOptions::box_switch`].
     box_switch: crate::ssh_box::SwitchTiming,
     /// [`HubOptions::box_dialer`].
@@ -792,6 +812,10 @@ struct ThreadRt {
     /// A runtime exit whose closing sequence is not recorded yet ([`Core::begin_exit`] until
     /// [`Core::finish_exit`]): the thread takes no new turn, and nothing else closes it.
     exiting: bool,
+    /// The runtime that exit took, when a runner connection brought it
+    /// ([`Core::begin_exit_on`]): kept until [`Core::finish_exit`], to be put back as it was
+    /// when `box.token` changes the token that connection proved ([`TakenExit`]).
+    taken: Option<TakenExit>,
     /// A `thread.stop` asked the runtime to stop and its closing sequence is not recorded yet
     /// (mirrors the durable `stop_requests` row, see [`crate::store`]): its exit, whenever and
     /// however it comes (after a hub restart, through a runner that lost the process), closes
@@ -869,6 +893,17 @@ struct ThreadRt {
     /// the signs it showed (`hub::withdraw`): each kind of sign interrupts it again once.
     /// Memory only.
     reinterrupted: Option<(u64, u8)>,
+}
+
+/// A runtime an exit a runner connection brought took ([`ThreadRt::taken`]), and that
+/// connection's fence. A token change of the box (`box.token`) puts it back, live and not
+/// exiting, in the step under the core lock that changes the token
+/// ([`Core::put_back_revoked_exits`]): from then on the box's next connection finds the runtime
+/// as it was (its adoption, replay and reconciliation), and the exit records nothing
+/// (`supervisor::close_exited`).
+struct TakenExit {
+    live: Box<Live>,
+    fence: runners::Fence,
 }
 
 /// What a dispatch held back by a runtime kill in progress ([`ThreadRt::reaping`]) runs once
@@ -1154,6 +1189,11 @@ struct PendingExit {
     /// The runner frame (`exited`) this exit came in, committed with the closing sequence
     /// while its connection still holds `fence` (`hub::runners`).
     runner_ack: Option<store::RunnerAck>,
+    /// The runner connection the exit came from, by its frame or its reconciliation
+    /// ([`Core::begin_exit_on`]): the frame's watermark commits only while it holds, and
+    /// nothing commits once its token was revoked (the runtime the exit took is back then,
+    /// [`ThreadRt::taken`], and the box's next connection reports the exit again: the runner
+    /// sends its frame again, or the reconciliation finds the runtime lost again).
     fence: Option<runners::Fence>,
     /// When the runner recorded the exit ([`Batch::at`]).
     at: Option<DateTime<Utc>>,
@@ -2169,6 +2209,8 @@ impl Hub {
             "build": build,
             // The runner protocol its boxes' runners must speak (`twr box doctor` compares).
             "runner_protocol": twr_core::runner::PROTOCOL_VERSION,
+            // Its runner listener is up: a token box's runner can connect (`twr box doctor`).
+            "listening": self.inner.listening.load(std::sync::atomic::Ordering::Relaxed),
             "pid": std::process::id(),
             "db": self.inner.db_path,
             "instance": self.inner.instance_name,

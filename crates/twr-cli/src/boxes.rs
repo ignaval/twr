@@ -41,6 +41,7 @@ use super::{
 
 mod doctor;
 mod project;
+mod token;
 
 /// How long `twr box add` and `twr box install` wait for the box to come online.
 const ONLINE_WAIT: Duration = Duration::from_secs(90);
@@ -94,20 +95,41 @@ pub(super) enum BoxCmd {
     /// installs its own twr build on the box (same OS and CPU; else run `twr box install
     /// <name>`), connects and starts a twr box daemon there, which runs the box's threads.
     /// Waits up to 90 s for the box to come online. Boxes belong to the default workspace.
+    ///
+    /// With --dial-in --hub <url>: a box the hub can't reach, whose runner connects to the
+    /// hub's listener (`[hub] listen`, which must be set). Writes a token box with a new token
+    /// (32 random bytes) to boxes.toml, adds it to the running hub, and prints the command to
+    /// run on the box (`twr runner install-token`) and, on a terminal only, the token to paste
+    /// there; then, on a terminal, waits up to 10 minutes for its runner to connect.
     Add {
         /// The box's name: letters, digits, `.`, `_` or `-` (not starting with `.` or `-`; not `local`).
         name: String,
         /// The ssh destination (`me@host`, or a host from `~/.ssh/config`), with any ssh
         /// options before it (`-p 2222 me@host`): one argument or several words, joined with
         /// spaces. With --command, the command the hub runs to reach the box (`docker exec -i
-        /// <container>`), its words passed as they are, not through a shell.
+        /// <container>`), its words passed as they are, not through a shell. None with
+        /// --dial-in.
         #[arg(
-            required = true,
+            required_unless_present = "dial_in",
+            conflicts_with = "dial_in",
             value_name = "SSH",
             trailing_var_arg = true,
             allow_hyphen_values = true
         )]
         words: Vec<String>,
+        /// A dial-in box: its runner connects to the hub (`twr runner install-token` on the
+        /// box). Given before any other word, with --hub.
+        #[arg(long, conflicts_with = "command")]
+        dial_in: bool,
+        /// With --dial-in: the URL the box's runner dials to reach this hub's listener:
+        /// `wss://` (Tailscale serve, or `[hub] tls`), or `ws://` to a loopback address (an ssh
+        /// tunnel's end on the box).
+        #[arg(long, requires = "dial_in", value_name = "URL")]
+        hub: Option<String>,
+        /// With --dial-in and a wss:// URL: the CA certificate (PEM) the box's runner trusts,
+        /// by its absolute path on the box.
+        #[arg(long, requires = "dial_in", value_name = "PEM ON THE BOX")]
+        ca: Option<String>,
         /// The words are the command the hub runs to reach the box (`docker exec -i
         /// <container>`, `kubectl exec -i -n <ns> <pod> --`), with `sh -c <what ssh would run>`
         /// appended, instead of an ssh destination. Given before the words. For `docker`,
@@ -184,11 +206,32 @@ pub(super) enum BoxCmd {
     /// Remove a box from boxes.toml (a box of config.toml: remove it there). The running hub
     /// keeps the box until it restarts; the box daemon and the box's worktrees stay on the box
     /// (the command that stops the daemon is printed), and a command box's container stays
-    /// as it is (twr never stops or removes one).
+    /// as it is (twr never stops or removes one). A token box's runner is no longer accepted
+    /// from then on (the hub drops its connection), and how to stop it on the box is printed.
     #[command(alias = "rm")]
     Remove {
         /// The box's name.
         name: String,
+    },
+    /// Print a token box's token (from boxes.toml, or config.toml for a box configured there),
+    /// and nothing else on stdout, a pipe included: `ssh me@hub twr box token gpu | twr runner
+    /// install-token gpu --yes` on a box that can ssh to the hub. --rotate replaces it with a
+    /// new one (asks y/N first; without a terminal, only with --yes): the running hub stops
+    /// accepting the old one at once and drops the box's connection, until the new one is
+    /// installed on the box. --reload has the running hub take the box's token from the files
+    /// again (after an edit of config.toml).
+    Token {
+        /// The box's name.
+        name: String,
+        /// Replace the token with a new one (boxes.toml boxes only).
+        #[arg(long, conflicts_with = "reload")]
+        rotate: bool,
+        /// Have the running hub read the box's token from the files again.
+        #[arg(long)]
+        reload: bool,
+        /// Rotate without asking.
+        #[arg(long, short = 'y', requires = "rotate")]
+        yes: bool,
     },
     /// Check a box and say how to fix what is wrong: the hub's view of it (when a hub runs),
     /// ssh without prompting (as the hub runs it) and in this terminal (a command box: its
@@ -272,13 +315,44 @@ pub(super) async fn run(
             name,
             words,
             command,
+            dial_in,
+            hub,
+            ca,
             yes,
         } => {
             let (words, yes) = destination(&words, yes);
-            add(config, paths, socket, &name, command, words, yes).await?
+            if dial_in {
+                token::add(
+                    config,
+                    paths,
+                    socket,
+                    &name,
+                    hub.as_deref(),
+                    ca.as_deref(),
+                    yes,
+                )
+                .await?
+            } else {
+                // (clap takes them without --dial-in when ssh words follow.)
+                if hub.is_some() || ca.is_some() {
+                    bail!("--hub and --ca are for a dial-in box: give --dial-in too");
+                }
+                refuse_misplaced_dial_in(&words)?;
+                add(config, paths, socket, &name, command, words, yes).await?
+            }
         }
         BoxCmd::List { json } => list(socket, json).await?,
-        BoxCmd::Status { name, json } => status(socket, &name, json).await?,
+        BoxCmd::Status { name, json } => status(config, socket, &name, json).await?,
+        BoxCmd::Token {
+            name,
+            rotate,
+            reload,
+            yes,
+        } => match (rotate, reload) {
+            (true, _) => token::rotate(paths, socket, &name, yes).await?,
+            (_, true) => token::reload(paths, socket, &name).await?,
+            _ => token::show(paths, &name)?,
+        },
         BoxCmd::Install {
             name,
             binary,
@@ -332,6 +406,22 @@ fn destination(words: &[String], yes: bool) -> (Vec<String>, bool) {
     let given = words.iter().any(|w| w == "--yes");
     let kept = words.iter().filter(|w| *w != "--yes").cloned().collect();
     (kept, yes || given)
+}
+
+/// Refuses `twr box add`'s words when `--dial-in` or `--hub` is among them: given after a
+/// destination, they land among its words (which take everything that follows), and a dial-in
+/// box has no destination.
+fn refuse_misplaced_dial_in(words: &[String]) -> anyhow::Result<()> {
+    if words
+        .iter()
+        .any(|w| w == "--dial-in" || w == "--hub" || w.starts_with("--hub="))
+    {
+        bail!(
+            "--dial-in and --hub go before any other word, and a dial-in box takes no ssh \
+             destination or command: `twr box add <name> --dial-in --hub <url>`"
+        );
+    }
+    Ok(())
 }
 
 /// The ssh destination of `twr box add`'s words ([`destination`]): joined with spaces.
@@ -1427,8 +1517,8 @@ fn os_arch(b: &Value) -> Option<String> {
     ))
 }
 
-/// `twr box status`.
-async fn status(socket: &Path, name: &str, json: bool) -> anyhow::Result<()> {
+/// `twr box status`, `config` the loaded one (whether a token box is a dial-in one).
+async fn status(config: &Config, socket: &Path, name: &str, json: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let info = c.call("hub.info", Value::Null).await?;
     let Some(b) = find_box(&info, name) else {
@@ -1437,13 +1527,20 @@ async fn status(socket: &Path, name: &str, json: bool) -> anyhow::Result<()> {
     if json {
         outln!("{}", serde_json::to_string_pretty(b)?);
     } else {
-        out!("{}", status_text(b));
+        let dial_in = config.boxes.get(name).is_some_and(is_dial_in);
+        out!("{}", status_text(b, dial_in));
     }
     Ok(())
 }
 
-/// `twr box status`'s text for box entry `b`.
-fn status_text(b: &Value) -> String {
+/// Whether box `cfg` is a dial-in box: a token box without `ssh`, which twr can't reach (its
+/// runner connects to the hub; `ssh` would only be for `twr attach` and the checks).
+pub(super) fn is_dial_in(cfg: &BoxConfig) -> bool {
+    cfg.transport() == BoxTransport::Token && BoxLink::of(cfg).is_none()
+}
+
+/// `twr box status`'s text for box entry `b` (`dial_in`: a token box without `ssh`).
+fn status_text(b: &Value, dial_in: bool) -> String {
     let mut out = String::new();
     let mut line = |k: &str, v: &str| out.push_str(&format!("{k:<15} {v}\n"));
     line("box:", str_of(&b["name"]));
@@ -1452,6 +1549,7 @@ fn status_text(b: &Value) -> String {
         match str_of(&b["transport"]) {
             "ssh" => "ssh (the hub connects to the box over ssh)",
             "command" => "command (the hub reaches the box through its command, a container's)",
+            _ if dial_in => "token, dial-in (its runner connects to the hub's listener)",
             _ => "token (its runner connects to the hub's listener, [hub] listen)",
         },
     );
@@ -1556,9 +1654,12 @@ async fn install(
     let cfg = &cfg;
     let link = cfg.transport().dialed().then(|| BoxLink::of(cfg)).flatten();
     let Some(link) = link else {
+        let hub = HubBuild::of_running(socket).await;
         bail!(
-            "box {name} is a token box: its runner connects to the hub, and you install twr on \
-             it yourself (docs/runners.md)"
+            "box {name} is a token box: its runner connects to the hub, and twr can't reach it \
+             to install twr. On the box: {}; then restart its runner ({})",
+            token::update_hint(&hub.version),
+            token::restart_hint(name)
         );
     };
     let link = &link;
@@ -1780,7 +1881,8 @@ async fn restart(
     if !cfg.transport().dialed() {
         bail!(
             "box {name} is a token box: its runner connects to the hub; restart that `twr \
-             runner` on the box yourself"
+             runner` on the box yourself: {} (as `twr runner install-token` set it up)",
+            token::restart_hint(name)
         );
     }
     let mut ask = ask_on_stderr;
@@ -2324,6 +2426,25 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
     };
     outln!("removed box {name} from {}", file.display());
     outln!("The running hub keeps the box until it restarts (`twr hub stop`, then `twr`).");
+    // A token box: the running hub takes it out of what it accepts at once (`box.token`).
+    // Asked whatever the removed table says its transport is (edited since the hub read it,
+    // or misspelled, which the removal repairs): the hub decides from the box it runs.
+    let outcome = token::call_box_token(paths, socket, name)
+        .await
+        .unwrap_or_else(|e| token::Outcome::Refused(format!("{e:#}")));
+    let hub = HubBuild::of_running(socket).await;
+    let live = hub.box_entry(name).and_then(|b| b["transport"].as_str());
+    let transport = removed.get("transport").map(|t| t.as_str());
+    if token::removed_token_box(&outcome, live, transport) {
+        for l in token::removal_lines(name, &outcome, &paths.config_file) {
+            outln!("{l}");
+        }
+        let done = format!("box {name} is out of {}", file.display());
+        if let Some(why) = token::not_taken(name, &outcome, &done, "its runner") {
+            bail!("{why}");
+        }
+        return Ok(());
+    }
     let Ok(removed) = removed.try_into::<BoxConfig>() else {
         outln!("(Its settings were not valid, so twr cannot say how to stop its box daemon.)");
         return Ok(());
@@ -2344,7 +2465,6 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
         return Ok(());
     }
     let key = twr_core::sealed::HubKey::load_or_create(&key_file)?;
-    let hub = HubBuild::of_running(socket).await;
     // Only a build id: what the hub or the files say goes into a command to paste.
     let valid = |b: Option<String>| b.filter(|b| twr_core::valid_build_id(b));
     let build = valid(
@@ -2634,6 +2754,118 @@ mod tests {
         );
     }
 
+    /// `twr box add <name> --dial-in --hub <url>` parses next to add's trailing words: the
+    /// flags before any word (in any order, `--yes` and `--ca` too), no ssh words with
+    /// `--dial-in`, `--hub` and `--ca` only with it; given after a destination they land among
+    /// its words, which `run` refuses.
+    #[test]
+    fn dial_in_parses_next_to_the_trailing_words() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            crate::Cli::try_parse_from([&["twr", "box", "add"][..], args].concat()).map(|c| c.cmd)
+        };
+        let add = |args: &[&str]| match parse(args) {
+            Ok(Some(crate::Cmd::Boxes {
+                cmd:
+                    BoxCmd::Add {
+                        name,
+                        words,
+                        dial_in,
+                        hub,
+                        ca,
+                        yes,
+                        command,
+                    },
+            })) => (name, words, dial_in, hub, ca, yes, command),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        let (name, words, dial_in, hub, ca, yes, command) =
+            add(&["gpu", "--dial-in", "--hub", "wss://h:7878"]);
+        assert_eq!(
+            (
+                name.as_str(),
+                words.len(),
+                dial_in,
+                hub.as_deref(),
+                ca,
+                yes,
+                command
+            ),
+            ("gpu", 0, true, Some("wss://h:7878"), None, false, false)
+        );
+        let (_, words, dial_in, hub, ca, yes, _) = add(&[
+            "gpu",
+            "--hub=wss://h:7878",
+            "--yes",
+            "--ca",
+            "/etc/ca.pem",
+            "--dial-in",
+        ]);
+        assert!(words.is_empty() && dial_in && yes, "{words:?}");
+        assert_eq!(hub.as_deref(), Some("wss://h:7878"));
+        assert_eq!(ca.as_deref(), Some("/etc/ca.pem"));
+        // `--dial-in` without --hub parses: the command says which URLs fit.
+        assert!(add(&["gpu", "--dial-in"]).2);
+        // An ssh box as before, `--yes` among its words.
+        let (_, words, dial_in, hub, ..) = add(&["gpu", "-p", "2222", "me@host", "--yes"]);
+        assert_eq!(words, ["-p", "2222", "me@host", "--yes"]);
+        assert!(!dial_in && hub.is_none());
+        // Refused: no words and no --dial-in; words with it; --hub or --ca without it;
+        // --dial-in with --command.
+        for bad in [
+            &["gpu"][..],
+            &["gpu", "--dial-in", "--hub", "wss://h:1", "me@host"],
+            &["gpu", "--hub", "wss://h:1"],
+            &["gpu", "--dial-in", "--command", "docker", "exec", "-i", "c"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+        // With ssh words, clap takes --hub and --ca without --dial-in: `run` refuses them.
+        let (_, _, dial_in, hub, ..) = add(&["gpu", "--hub", "wss://h:1", "me@host"]);
+        assert!(!dial_in && hub.is_some());
+        // After a destination, they are its words: refused before anything runs.
+        let (_, words, dial_in, ..) = add(&["gpu", "me@host", "--dial-in", "--hub", "wss://h:1"]);
+        assert!(!dial_in);
+        let e = refuse_misplaced_dial_in(&words).unwrap_err();
+        assert!(e.to_string().contains("go before any other word"), "{e}");
+        let (_, words, ..) = add(&["gpu", "me@host", "--hub=wss://h:1"]);
+        assert!(refuse_misplaced_dial_in(&words).is_err());
+        assert!(refuse_misplaced_dial_in(&words[..1]).is_ok());
+    }
+
+    /// `twr box token <name>` with `--rotate` (`--yes` only with it) or `--reload`, not both.
+    #[test]
+    fn box_token_parses() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            crate::Cli::try_parse_from([&["twr", "box", "token"][..], args].concat()).map(|c| c.cmd)
+        };
+        let token = |args: &[&str]| match parse(args) {
+            Ok(Some(crate::Cmd::Boxes {
+                cmd:
+                    BoxCmd::Token {
+                        name,
+                        rotate,
+                        reload,
+                        yes,
+                    },
+            })) => (name, rotate, reload, yes),
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert_eq!(token(&["gpu"]), ("gpu".into(), false, false, false));
+        assert_eq!(
+            token(&["gpu", "--rotate", "--yes"]),
+            ("gpu".into(), true, false, true)
+        );
+        assert_eq!(
+            token(&["gpu", "--reload"]),
+            ("gpu".into(), false, true, false)
+        );
+        for bad in [&["gpu", "--rotate", "--reload"][..], &["gpu", "--yes"], &[]] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
     /// `twr box add`'s words: an ssh destination joined with spaces, a command's kept apart;
     /// `--yes` among them taken out of both.
     #[test]
@@ -2867,7 +3099,7 @@ mod tests {
              mac   token      offline  -        -             -\n\
              sb    command    online   0.2.0    linux/x86_64  -\n"
         );
-        let c = status_text(&command);
+        let c = status_text(&command, false);
         assert!(
             c.contains(
                 "transport:      command (the hub reaches the box through its command, a \
@@ -2879,7 +3111,7 @@ mod tests {
             c.contains("build:          0123456789abcdef (launched by the hub)\n"),
             "{c}"
         );
-        assert!(status_text(&ssh)
+        assert!(status_text(&ssh, false)
             .contains("transport:      ssh (the hub connects to the box over ssh)\n"));
         // A login twr does not know is `?`.
         let unknown = json!([{"runtime": "grok-build", "found": true, "login": "unknown"},
@@ -2888,7 +3120,7 @@ mod tests {
             agents_cell(&box_agents(&json!({ "agents": unknown }))),
             "grok ? other ?"
         );
-        let s = status_text(&ssh);
+        let s = status_text(&ssh, false);
         assert!(s.contains("state:          online\n"), "{s}");
         assert!(
             s.contains("build:          0123456789abcdef (launched by the hub)\n"),
@@ -2900,17 +3132,17 @@ mod tests {
         let mut systemd = ssh.clone();
         systemd["launch"] = json!("systemd twr-box-0123-abcd.service");
         assert!(
-            status_text(&systemd).contains(
+            status_text(&systemd, false).contains(
                 "launch:         the box daemon runs as the systemd user service \
                  twr-box-0123-abcd.service\n"
             ),
             "{}",
-            status_text(&systemd)
+            status_text(&systemd, false)
         );
         let mut mac = ssh.clone();
         mac["os"] = json!("Darwin");
         mac["launch"] = json!("detached");
-        let m = status_text(&mac);
+        let m = status_text(&mac, false);
         assert!(
             m.contains(
                 "launch:         the daemon runs from ssh, so Claude Code can't read its keychain \
@@ -2922,7 +3154,7 @@ mod tests {
         // Offline: what the last daemon said is no longer known to be so.
         let mut gone = mac.clone();
         gone["state"] = json!("offline");
-        let g = status_text(&gone);
+        let g = status_text(&gone, false);
         assert!(
             g.contains("launch:         not known: the box is not connected (it is offline)\n"),
             "{g}"
@@ -2941,10 +3173,20 @@ mod tests {
             s.ends_with("notes:          (newest last)\n  twr-box: started the box daemon 0123456789abcdef\n"),
             "{s}"
         );
-        let t = status_text(&token);
+        let t = status_text(&token, false);
         assert!(
-            t.contains("its runner connects to the hub's listener"),
+            t.contains(
+                "transport:      token (its runner connects to the hub's listener, [hub] listen)\n"
+            ),
             "{t}"
+        );
+        // A token box without ssh: a dial-in one.
+        let d = status_text(&token, true);
+        assert!(
+            d.contains(
+                "transport:      token, dial-in (its runner connects to the hub's listener)\n"
+            ),
+            "{d}"
         );
         assert!(
             t.contains("refused:        2026-10-16 09:30 UTC: a bad proof\n"),
