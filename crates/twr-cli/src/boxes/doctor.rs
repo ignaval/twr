@@ -7,23 +7,25 @@
 //! - the hub's view, when a hub runs (`hub.info`, asked within [`HUB_WAIT`]): the box's state,
 //!   last error, version and builds against the hub's, a pending switch, a refusal;
 //! - ssh without prompting, as the hub runs it ([`super::batch_check`]), and in this terminal
-//!   ([`super::ssh_here`], within [`PROBE_WAIT`]), which runs the hub's probe
-//!   ([`ssh_box::probe_script`]: OS, CPU, data directory, the builds tree's safety, the
+//!   ([`super::here`], within [`PROBE_WAIT`]), which runs the hub's probe
+//!   ([`ssh_box::probe_script_for`]: OS, CPU, data directory, the builds tree's safety, the
 //!   builds there) and [`inspect_script`]'s own lines (the builds newest first, logind, git,
-//!   free disk, the configured projects' repositories);
+//!   free disk, the configured projects' repositories); a command box's command instead
+//!   (`command`), run as the hub runs it, and its pipe check (`pipe`: it passes the hub's
+//!   input to the box, without a terminal);
 //! - on the box, with one twr build there ([`pick_build`]: the hub's when it is there, else
 //!   the box's configured one, else the newest; the output says which): the box daemon's
 //!   status line (`twr runner --stdio --status`, SSH boxes; on Linux with the daemon's active
 //!   systemd unit, if any, for the logind check) and the agent probe (`twr runner
 //!   --agents`: the login shell's `PATH`, each agent's path, version and login state), in a
-//!   second ssh in this terminal, within [`BOX_SIDE_WAIT`] ([`box_side_script`]);
+//!   second run on the box, within [`BOX_SIDE_WAIT`] ([`box_side_script`]);
 //! - on a Mac: whether someone is logged in at its screen (`launchctl print gui/<uid>`, exit
 //!   113 only meaning no one is), and, only while the box is connected (`online`: the hub
 //!   keeps what a daemon said after it is gone), how its daemon was started and Claude Code's
 //!   login as the daemon sees it, asked again through the hub first (`box.agents` with
 //!   `refresh`, within [`REFRESH_WAIT`]) ([`macos_checks`], [`daemon_view`]).
 //!
-//! What ssh prints is read as [`super::ssh_here`] reads it: stdout bounded
+//! What the box prints is read as [`super::here`] reads it: stdout bounded
 //! ([`ssh_box::SSH_OUTPUT_MAX`]), stderr shown cleaned and bounded; every value kept from it
 //! is cut short ([`ssh_box::NOTE_MAX_BYTES`]), and everything printed goes through
 //! `outln!` ([`crate::term::clean`]). The agent probe keeps no account detail, so none is
@@ -32,11 +34,12 @@
 //! **Login** checks that the caller is the user ([`super::refuse_agent_action`]) with a
 //! terminal on stdin and stdout, picks the build as doctor does, then runs `twr runner
 //! --login <agent>` with it over ssh with a terminal ([`ssh_box::terminal_ssh_args`]: the
-//! forced options and the refusals of the box's words stay), with ssh's stdin, stdout and
-//! stderr this terminal's. The box's twr resolves the agent as its runner would and `exec`s
-//! its login command. Afterwards the agent's login state comes from the hub (`box.agents`
-//! with `refresh`: the box daemon's own view) when one runs, else from the agent probe over
-//! ssh.
+//! forced options and the refusals of the box's words stay), or through a command box's
+//! terminal_command (refused without one, before anything runs: [`BoxLink::terminal`]), with
+//! its stdin, stdout and stderr this terminal's. The box's twr resolves the agent as its
+//! runner would and `exec`s its login command. Afterwards the agent's login state comes from
+//! the hub (`box.agents` with `refresh`: the box daemon's own view) when one runs, else from
+//! the agent probe on the box.
 
 use std::collections::BTreeSet;
 use std::io::IsTerminal;
@@ -50,11 +53,12 @@ use serde_json::{json, Value};
 use twr_core::config::{BoxTransport, Config};
 use twr_core::paths::{sh_word, Paths};
 use twr_core::runner::{AgentInfo, AgentLogin, AgentsReport, LoginPathReport};
-use twr_hub::ssh_box;
+use twr_hub::ssh_box::{self, BoxLink, Input};
 
 use super::{
-    agent_name, agent_said, batch_check, connect, default_workspace_only, refuse_agent_action,
-    same_target, ssh_here, ssh_program_name, target_label, HubBuild, PROBE_WAIT,
+    agent_name, agent_said, batch_check, caller_is_agent, connect, default_workspace_only,
+    failed_here, here, link_shown, reached, reached_by, refuse_agent_action, same_target,
+    target_label, terminal_refusal, unanswered, HubBuild, PROBE_WAIT,
 };
 
 /// How long the running hub may take to say what it knows (`hub.info`).
@@ -119,8 +123,8 @@ impl Mark {
 /// One check, as printed and in `--json`.
 #[derive(Debug, Clone, Serialize)]
 struct Check {
-    /// What was checked: `hub`, `ssh_batch`, `ssh`, `box`, `build`, `daemon`, `logind`,
-    /// `macos`, `login_shell`, `agent`, `git`, `disk`, `project`.
+    /// What was checked: `hub`, `ssh_batch`, `ssh` (a command box: `command`, `pipe`), `box`,
+    /// `build`, `daemon`, `logind`, `macos`, `login_shell`, `agent`, `git`, `disk`, `project`.
     check: &'static str,
     /// Which one (the agent's command, the project's name), for `agent` and `project`.
     item: Option<String>,
@@ -260,7 +264,8 @@ impl Report {
     }
 }
 
-/// Says `what` on stderr (in text mode only: `--json` keeps quiet but for ssh itself).
+/// Says `what` on stderr (in text mode only: `--json` keeps quiet but for what the box's
+/// ssh or command itself prints).
 fn progress(json: bool, what: &str) {
     if !json {
         errln!("{what}");
@@ -297,20 +302,21 @@ fn box_projects(config: &Config, name: &str) -> Vec<(String, String)> {
     out
 }
 
-/// The script of the first ssh: the hub's probe ([`ssh_box::probe_script`], in a subshell of
-/// its own: it may `exit`), then [`DOCTOR_MARK`], `home=<$HOME>` (when absolute and printable),
+/// The script of the first run on the box through `link`: the hub's probe
+/// ([`ssh_box::probe_script_for`], with a command box's pipe check, which reads the script's
+/// stdin; in a subshell of its own: it may `exit`), then [`DOCTOR_MARK`], `home=<$HOME>` (when absolute and printable),
 /// `order=<build>` for each directory of the builds tree, newest first, and on a Mac `gui=`
 /// with the exit status of `launchctl print gui/<uid>` (0: someone is logged in at the Mac's
 /// screen, so a GUI session exists, as the relay checks it). With `repos`
 /// (doctor), also: `linger=` / `kill=` (Linux: logind's `Linger` of this user and
-/// `KillUserProcesses`, as the relay reads them), `git=` (`git --version` on the PATH ssh
-/// gives, as the box daemon's), `df=` (`df -Pk` of the data directory, or the nearest
+/// `KillUserProcesses`, as the relay reads them), `git=` (`git --version` on the PATH ssh or
+/// the command gives, as the box daemon's), `df=` (`df -Pk` of the data directory, or the nearest
 /// directory above it that exists), and `project.<i>=` (`git`, `notgit` or `missing`) for each
 /// repository of `repos`, in order. Each of those commands is bounded
 /// by [`BOX_COMMAND_SECS`] ([`bounded_prelude`]): one that hangs on the box (a `df` of a dead
 /// network mount) ends with doctor, not after it.
-pub(super) fn inspect_script(repos: Option<&[String]>) -> String {
-    inspect_script_bounded(repos, BOX_COMMAND_SECS)
+pub(super) fn inspect_script(link: &BoxLink, repos: Option<&[String]>) -> String {
+    inspect_script_bounded(link, repos, BOX_COMMAND_SECS)
 }
 
 /// How long each command doctor runs on the box may take, in seconds ([`inspect_script`]).
@@ -350,14 +356,14 @@ fn bounded_prelude(secs: u32) -> String {
 }
 
 /// [`inspect_script`] with each box-side command bounded by `secs` seconds.
-fn inspect_script_bounded(repos: Option<&[String]>, secs: u32) -> String {
+fn inspect_script_bounded(link: &BoxLink, repos: Option<&[String]>, secs: u32) -> String {
     let mut s = format!(
         "(\n{probe})\n\
          echo '{DOCTOR_MARK}'\n\
          case ${{HOME:-}} in *[[:cntrl:]]*) ;; /*) printf 'home=%s\\n' \"$HOME\" ;; esac\n\
          case ${{XDG_DATA_HOME:-}} in /*) d=$XDG_DATA_HOME ;; *) d=${{HOME:-}}/.local/share ;; esac\n\
          ls -t \"$d/twr/runner/builds\" 2>/dev/null | sed 's/^/order=/'\n",
-        probe = ssh_box::probe_script()
+        probe = ssh_box::probe_script_for(link)
     );
     s.push_str(&bounded_prelude(secs));
     s.push_str(
@@ -390,7 +396,7 @@ fn inspect_script_bounded(repos: Option<&[String]>, secs: u32) -> String {
     s
 }
 
-/// What the first ssh found ([`inspect_script`]).
+/// What the first run on the box found ([`inspect_script`]).
 #[derive(Debug, Default)]
 pub(super) struct Inspected {
     pub(super) probe: ssh_box::Probe,
@@ -412,11 +418,16 @@ pub(super) struct Inspected {
     projects: Vec<Option<String>>,
 }
 
-/// Parses the first ssh's output `out` ([`inspect_script`]) with `projects` repositories
-/// asked: the probe ([`ssh_box::parse_probe`]: an error without its mark or an OS), then the
-/// lines after the last [`DOCTOR_MARK`] line, each value cut at [`ssh_box::NOTE_MAX_BYTES`].
-pub(super) fn parse_inspect(out: &str, projects: usize) -> anyhow::Result<Inspected> {
-    let probe = ssh_box::parse_probe(out)?;
+/// Parses the first run's output `out` ([`inspect_script`], through `link`) with `projects`
+/// repositories asked: the probe ([`ssh_box::parse_probe_for`]: an error without its mark or
+/// an OS; its pipe check's answer), then the lines after the last [`DOCTOR_MARK`] line, each
+/// value cut at [`ssh_box::NOTE_MAX_BYTES`].
+pub(super) fn parse_inspect(
+    out: &str,
+    link: &BoxLink,
+    projects: usize,
+) -> anyhow::Result<Inspected> {
+    let probe = ssh_box::parse_probe_for(out, link)?;
     let mut ins = Inspected {
         probe,
         projects: vec![None; projects],
@@ -483,7 +494,7 @@ pub(super) fn pick_build(
         .map(|b| (b.clone(), BuildSource::Newest))
 }
 
-/// The script of the second ssh: build `id` under `data` runs, each section between its mark
+/// The script of the second run on the box: build `id` under `data` runs, each section between its mark
 /// and an [`EXIT_MARK`] line with its exit status, stdin `/dev/null` and stderr dropped: with
 /// `status` (the box's name and the hub's public key), `twr runner --stdio --status` (the
 /// status line of the box daemon of that hub, or `no daemon`), then (a valid key, Linux) the
@@ -504,7 +515,7 @@ const BOX_STATUS_SECS: u32 = 20;
 /// login shell (5 s) and each agent's commands (10 s, at once), and some.
 const BOX_AGENTS_SECS: u32 = 40;
 
-// All of the second ssh's commands end before doctor stops waiting for it.
+// All of the second run's commands end before doctor stops waiting for it.
 const _: () = assert!(
     (BOX_STATUS_SECS + BOX_COMMAND_SECS + BOX_AGENTS_SECS) as u64 + 10 < BOX_SIDE_WAIT.as_secs()
 );
@@ -592,22 +603,22 @@ fn parse_agents(lines: &[&str]) -> Option<AgentsReport> {
     Some(report)
 }
 
-/// Runs [`box_side_script`] on box `name` over ssh in this terminal, within [`BOX_SIDE_WAIT`]:
-/// its output, or why there is none.
-async fn run_box_side(name: &str, ssh: &str, script: &str) -> Result<String, String> {
+/// Runs [`box_side_script`] on box `name` through `link` ([`here`]), within
+/// [`BOX_SIDE_WAIT`]: its output, or why there is none.
+async fn run_box_side(name: &str, link: &BoxLink, script: &str) -> Result<String, String> {
     let remote = ssh_box::sh_c(script);
-    let run = ssh_here(ssh, &remote, None);
+    let run = here(link, &remote, Input::None);
     match tokio::time::timeout(BOX_SIDE_WAIT, run).await {
         Err(_) => Err(format!(
             "it did not finish within {} s",
             BOX_SIDE_WAIT.as_secs()
         )),
         Ok(Err(e)) => Err(format!("{e:#}")),
-        Ok(Ok((Some(0), out))) => Ok(out),
-        Ok(Ok((code, _))) => Err(format!(
-            "ssh to box {name} failed ({}): see ssh's message above",
-            code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"))
-        )),
+        Ok(Ok(ran)) if ran.code == Some(0) => Ok(ran.out),
+        Ok(Ok(ran)) => {
+            let what = format!("{} to box {name}", link.via());
+            Err(failed_here(link, name, &what, ran.code, &ran.err))
+        }
     }
 }
 
@@ -621,7 +632,7 @@ pub(super) fn box_side_failure(id: &str, flag: &str, code: Option<i32>) -> Strin
     }
 }
 
-/// The hub's public box key, when the hub has made one (it has connected to an SSH box):
+/// The hub's public box key, when the hub has made one (it has connected to a box itself):
 /// box daemons are per hub key.
 fn hub_key(paths: &Paths) -> anyhow::Result<Option<String>> {
     let file = paths.data_dir.join(ssh_box::BOX_KEY_FILE);
@@ -649,23 +660,27 @@ pub(super) async fn doctor(
              destination>` adds one)"
         );
     };
-    let ssh_transport = cfg.transport() == BoxTransport::Ssh;
+    let dialed = cfg.transport().dialed();
+    let link = BoxLink::of(cfg);
+    // What it prints, an agent may read: never a command's words ([`link_shown`]).
+    let agent = caller_is_agent();
     let mut r = Report::new(name, json);
     if !json {
         outln!(
             "box {name}: {}",
-            if ssh_transport {
-                "ssh (the hub connects to it)"
-            } else {
-                "token (its runner connects to the hub)"
+            match &link {
+                Some(l @ BoxLink::Command { .. }) =>
+                    format!("command (the hub runs `{}`)", link_shown(l, agent)),
+                _ if dialed => "ssh (the hub connects to it)".to_string(),
+                _ => "token (its runner connects to the hub)".to_string(),
             }
         );
     }
 
     let hub = running_hub(socket).await;
-    hub_checks(&mut r, name, &hub, ssh_transport);
+    hub_checks(&mut r, name, &hub, dialed);
 
-    let Some(ssh) = cfg.ssh.as_deref().filter(|s| !s.trim().is_empty()) else {
+    let Some(link) = link else {
         r.add(
             "ssh",
             Mark::Warn,
@@ -676,78 +691,92 @@ pub(super) async fn doctor(
         );
         return r.finish();
     };
+    let link = &link;
+    // The check of the probe's run: ssh's, or a command box's command.
+    let reach = match link {
+        BoxLink::Ssh(_) => "ssh",
+        BoxLink::Command { .. } => "command",
+    };
 
-    progress(
-        json,
-        &format!("checking ssh to box {name} without prompting..."),
-    );
-    match batch_check(name, ssh).await {
-        None => r.add(
-            "ssh_batch",
-            Mark::Ok,
-            "works (the hub's ssh never prompts)".into(),
-            None,
-        ),
-        Some(why) => r.add(
-            "ssh_batch",
-            // Only the hub's ssh to an SSH box needs it.
-            if ssh_transport {
-                Mark::Fail
-            } else {
-                Mark::Warn
-            },
-            why,
-            Some(
-                "the hub runs ssh without prompting (BatchMode): accept the box's host key \
-                 with ssh once, and load your key into an ssh-agent the hub can reach \
-                 (SSH_AUTH_SOCK), or use a key without a passphrase"
-                    .into(),
+    // (A command runs as the hub runs it, without a terminal: one run says both.)
+    if let BoxLink::Ssh(ssh) = link {
+        progress(
+            json,
+            &format!("checking ssh to box {name} without prompting..."),
+        );
+        match batch_check(name, ssh).await {
+            None => r.add(
+                "ssh_batch",
+                Mark::Ok,
+                "works (the hub's ssh never prompts)".into(),
+                None,
             ),
-        ),
+            Some(why) => r.add(
+                "ssh_batch",
+                // Only the hub's ssh to an SSH box needs it.
+                if dialed { Mark::Fail } else { Mark::Warn },
+                why,
+                Some(
+                    "the hub runs ssh without prompting (BatchMode): accept the box's host key \
+                     with ssh once, and load your key into an ssh-agent the hub can reach \
+                     (SSH_AUTH_SOCK), or use a key without a passphrase"
+                        .into(),
+                ),
+            ),
+        }
     }
 
     let projects = box_projects(config, name);
     let repos: Vec<String> = projects.iter().map(|(_, r)| r.clone()).collect();
-    progress(
-        json,
-        &format!("probing box {name} over ssh in this terminal ({ssh})..."),
-    );
-    let remote = ssh_box::sh_c(&inspect_script(Some(&repos)));
-    let probing = ssh_here(ssh, &remote, None);
+    let here_said = match link {
+        BoxLink::Ssh(_) => format!("{} in this terminal", reached(link)),
+        BoxLink::Command { .. } => reached_by(link, agent),
+    };
+    progress(json, &format!("probing box {name} {here_said}..."));
+    let remote = ssh_box::sh_c(&inspect_script(link, Some(&repos)));
+    let probing = here(link, &remote, link.probe_input());
     let out = match tokio::time::timeout(PROBE_WAIT, probing).await {
         Err(_) => Err(format!(
-            "it did not finish within {} s (a question of ssh's left unanswered, or a box that \
-             does not answer)",
-            PROBE_WAIT.as_secs()
+            "it did not finish within {} s ({})",
+            PROBE_WAIT.as_secs(),
+            unanswered(link)
         )),
         Ok(Err(e)) => Err(format!("{e:#}")),
-        Ok(Ok((Some(0), out))) => Ok(out),
-        Ok(Ok((code, _))) => Err(format!(
-            "it failed ({}): see ssh's message above",
-            code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"))
-        )),
+        Ok(Ok(ran)) if ran.code == Some(0) => Ok(ran.out),
+        Ok(Ok(ran)) => Err(probe_failure(link, name, ran.code, &ran.err)),
     };
-    let ins = match out.map(|o| parse_inspect(&o, repos.len())) {
+    let ins = match out.map(|o| parse_inspect(&o, link, repos.len())) {
         Ok(Ok(ins)) => ins,
         Ok(Err(e)) => {
-            r.add("ssh", Mark::Fail, format!("probing the box: {e:#}"), None);
+            r.add(reach, Mark::Fail, format!("probing the box: {e:#}"), None);
             return r.finish();
         }
         Err(why) => {
+            let fix = match link {
+                BoxLink::Ssh(ssh) => {
+                    format!("check that `ssh {ssh}` reaches the box, and its [boxes.{name}] ssh")
+                }
+                BoxLink::Command { .. } if agent => format!(
+                    "check that [boxes.{name}] command ({}) runs here, with `true` after it",
+                    link_shown(link, agent)
+                ),
+                BoxLink::Command { .. } => format!(
+                    "check that `{} true` runs here, and [boxes.{name}] command",
+                    link.label()
+                ),
+            };
             r.add(
-                "ssh",
+                reach,
                 Mark::Fail,
                 format!("{why}; nothing on the box was checked"),
-                Some(format!(
-                    "check that `ssh {ssh}` reaches the box, and its [boxes.{name}] ssh"
-                )),
+                Some(fix),
             );
             return r.finish();
         }
     };
     let probe = &ins.probe;
     r.add(
-        "ssh",
+        reach,
         Mark::Ok,
         format!(
             "reaches the box: {} ({} {})",
@@ -757,7 +786,19 @@ pub(super) async fn doctor(
         ),
         None,
     );
-    let Some(data) = box_checks(&mut r, name, probe) else {
+    if link.pipe_checked() {
+        match probe.pipe_refusal(name, link) {
+            None => r.add(
+                "pipe",
+                Mark::Ok,
+                "the command passes the hub's input to the box, without a terminal".into(),
+                None,
+            ),
+            // The checks below still run: they need neither.
+            Some(why) => r.add("pipe", Mark::Fail, why, None),
+        }
+    }
+    let Some(data) = box_checks(&mut r, name, probe, link) else {
         return r.finish();
     };
 
@@ -770,31 +811,26 @@ pub(super) async fn doctor(
         hub.build.as_deref(),
         configured,
     );
-    build_check(
-        &mut r,
-        name,
-        &hub,
-        configured,
-        same,
-        ssh_transport,
-        pick.as_ref(),
-    );
+    build_check(&mut r, name, &hub, configured, same, dialed, pick.as_ref());
     r.build = pick.clone();
 
-    let key = if ssh_transport { hub_key(paths)? } else { None };
+    let key = if dialed { hub_key(paths)? } else { None };
     let side = match &pick {
         Some((id, _)) => {
             progress(
                 json,
-                &format!("running build {id}'s checks on box {name} over ssh..."),
+                &format!(
+                    "running build {id}'s checks on box {name} {}...",
+                    reached_by(link, agent)
+                ),
             );
             let status = key.as_deref().map(|k| (name, k));
-            Some(run_box_side(name, ssh, &box_side_script(&data, id, status, true)).await)
+            Some(run_box_side(name, link, &box_side_script(&data, id, status, true)).await)
         }
         None => None,
     };
 
-    if ssh_transport {
+    if dialed {
         daemon_check(
             &mut r,
             name,
@@ -806,8 +842,10 @@ pub(super) async fn doctor(
             side.as_ref(),
         );
         let prefix = key.as_deref().and_then(|k| unit_prefix(name, k));
-        let stop = match (&pick, key.as_deref()) {
-            (Some((id, _)), Some(k)) => super::stop_command(ssh, id, name, k).ok(),
+        // (Never to an agent through a command: the stop command holds its words.)
+        let stop = match (&pick, key.as_deref(), link) {
+            (_, _, BoxLink::Command { .. }) if agent => None,
+            (Some((id, _)), Some(k), _) => super::stop_command(link, id, name, k).ok(),
             _ => None,
         };
         logind_check(
@@ -820,7 +858,7 @@ pub(super) async fn doctor(
     }
     let mac = probe.os == "Darwin";
     if mac {
-        macos_checks(&mut r, name, &ins, &hub, ssh_transport);
+        macos_checks(&mut r, name, &ins, &hub, dialed);
     }
     let view = if mac {
         daemon_view(socket, &hub, name, json).await
@@ -834,14 +872,17 @@ pub(super) async fn doctor(
         &view,
         pick.as_ref(),
         side.as_ref(),
-        ssh_transport,
+        dialed,
     );
     match ins.git.as_deref().filter(|g| !g.is_empty()) {
         Some(g) => r.add("git", Mark::Ok, g.to_string(), None),
         None => r.add(
             "git",
             Mark::Fail,
-            "git is not on the PATH ssh gives on the box (the box daemon's)".into(),
+            format!(
+                "git is not on the PATH {} gives on the box (the box daemon's)",
+                link.via()
+            ),
             Some("install git on the box".into()),
         ),
     }
@@ -874,7 +915,7 @@ pub(super) async fn doctor(
 
 /// The hub's view of box `name` (`hub`): its state, last error, versions and builds against
 /// the hub's, a pending switch, a refusal.
-fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, ssh_transport: bool) {
+fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
     if let Some(why) = &hub.unknown {
         r.add(
             "hub",
@@ -933,7 +974,7 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, ssh_transport: bool) {
                          runner protocol)",
                         hub.version
                     ),
-                    ssh_transport.then(|| format!("`twr box install {name}` installs the hub's")),
+                    dialed.then(|| format!("`twr box install {name}` installs the hub's")),
                 );
             }
         }
@@ -965,7 +1006,7 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, ssh_transport: bool) {
             "hub",
             Mark::Fail,
             with_error(format!("box {name} is {other}")),
-            (!ssh_transport).then(|| {
+            (!dialed).then(|| {
                 "start the box's runner (`twr runner --hub ... --box ...`, docs/runners.md)"
                     .to_string()
             }),
@@ -998,15 +1039,44 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, ssh_transport: bool) {
     }
 }
 
+/// Why doctor's probe of box `name` through `link` failed with exit `code` and stderr `err`
+/// (shown above): ssh's messages say why; a command's known failure says it with its fix,
+/// else its last line does.
+fn probe_failure(link: &BoxLink, name: &str, code: Option<i32>, err: &[String]) -> String {
+    let said = match link {
+        BoxLink::Ssh(_) => None,
+        BoxLink::Command { .. } => ssh_box::command_failure(name, code, err).or_else(|| {
+            let last = err.iter().rev().find(|l| !l.trim().is_empty())?;
+            Some(format!(
+                "it failed ({}): {}",
+                code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}")),
+                last.trim()
+            ))
+        }),
+    };
+    said.unwrap_or_else(|| failed_here(link, name, "it", code, err))
+}
+
 /// The probe's findings: the data directory and the builds tree. The data directory, when the
 /// checks on the box can go on.
-fn box_checks(r: &mut Report, name: &str, probe: &ssh_box::Probe) -> Option<String> {
+fn box_checks(
+    r: &mut Report,
+    name: &str,
+    probe: &ssh_box::Probe,
+    link: &BoxLink,
+) -> Option<String> {
     let Some(data) = probe.data.clone() else {
+        let fix = match link {
+            BoxLink::Ssh(_) => "set HOME for ssh's commands".to_string(),
+            BoxLink::Command { .. } => {
+                format!("set HOME in the container, or `-e HOME=<home>` in [boxes.{name}] command")
+            }
+        };
         r.add(
             "box",
             Mark::Fail,
             "neither XDG_DATA_HOME nor HOME is an absolute path on the box".into(),
-            Some("twr keeps its builds and data under it: set HOME for ssh's commands".into()),
+            Some(format!("twr keeps its builds and data under it: {fix}")),
         );
         return None;
     };
@@ -1045,7 +1115,7 @@ fn build_check(
     hub: &HubBuild,
     configured: Option<&str>,
     same: bool,
-    ssh_transport: bool,
+    dialed: bool,
     pick: Option<&(String, BuildSource)>,
 ) {
     let hub_build = hub.build.as_deref().unwrap_or("-");
@@ -1081,7 +1151,7 @@ fn build_check(
             None,
         ),
         Some((id, source)) => {
-            let mark = if ssh_transport { Mark::Warn } else { Mark::Ok };
+            let mark = if dialed { Mark::Warn } else { Mark::Ok };
             let why = match (same, configured) {
                 (true, _) => format!(
                     "the hub's build {hub_build} is not on the box yet (the hub uploads it as \
@@ -1094,10 +1164,10 @@ fn build_check(
                 "build",
                 mark,
                 format!("{why}; the checks below run {} {id}", source.said()),
-                (ssh_transport && !same).then(|| install.clone()),
+                (dialed && !same).then(|| install.clone()),
             );
         }
-        None if !ssh_transport => r.add(
+        None if !dialed => r.add(
             "build",
             Mark::Warn,
             "no twr build in the box's builds directory (a token box runs the twr you \
@@ -1125,7 +1195,7 @@ fn build_check(
     }
 }
 
-/// The box daemon of this hub on box `name`: its status line from `side` (the second ssh's
+/// The box daemon of this hub on box `name`: its status line from `side` (the second run's
 /// output), against the build the hub launches and its protocol.
 #[allow(clippy::too_many_arguments)]
 fn daemon_check(
@@ -1145,7 +1215,8 @@ fn daemon_check(
         r.add(
             "daemon",
             Mark::Warn,
-            "not checked: the hub has no box key yet (it has never connected to an SSH box)".into(),
+            "not checked: the hub has no box key yet (it has never connected to a box itself)"
+                .into(),
             None,
         );
         return;
@@ -1336,7 +1407,8 @@ fn daemon_launch(side: Option<&Result<String, String>>, prefix: Option<&str>) ->
 /// (`KillUserProcesses` read as `b false`). Lingering alone is no proof: the relay starts the
 /// daemon in a new session when `systemd-run` fails. A query that is missing or failed is
 /// unknown, and warned about; a box without `loginctl` at all has no logind to end anything.
-/// `stop` is how to stop the daemon, when doctor can say.
+/// `stop` is how to stop the daemon, when doctor can say (and may: never a command's words
+/// to an agent); otherwise the fix names `twr box restart`.
 fn logind_check(
     r: &mut Report,
     probe: &ssh_box::Probe,
@@ -1361,7 +1433,7 @@ fn logind_check(
     };
     let restart = match stop {
         Some(stop) => format!("then stop the box daemon with `{stop}`"),
-        None => "then stop the box daemon (`twr box remove` prints how)".into(),
+        None => format!("then restart the box daemon (`twr box restart {}`)", r.name),
     };
     match (lingers, kills, launch) {
         (true, _, DaemonLaunch::Service(unit)) => r.add(
@@ -1541,8 +1613,8 @@ pub(super) fn launch_verdict(
 /// A Mac's own checks (box `name`): a GUI session (someone logged in at its screen, `ins`), and
 /// how the box daemon was started, as it told the hub (`hub.info` `launch`, while the box is
 /// connected; not known without a hub, or for a token box, whose runner you start yourself).
-fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, ssh_transport: bool) {
-    let restart = if ssh_transport {
+fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, dialed: bool) {
+    let restart = if dialed {
         format!("then `twr box restart {name}`")
     } else {
         "then restart the box's `twr runner` from there".into()
@@ -1552,7 +1624,7 @@ fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, ssh
             "macos",
             Some("GUI session"),
             Mark::Ok,
-            if ssh_transport {
+            if dialed {
                 "someone is logged in at the Mac's screen: the box daemon can run in that GUI \
                  session (a launchd job), where Claude Code can read its keychain login"
             } else {
@@ -1569,7 +1641,7 @@ fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, ssh
             format!(
                 "no one is logged in at the Mac's screen (`launchctl print gui/<uid>` found no \
                  GUI session): {}",
-                if ssh_transport {
+                if dialed {
                     "the box daemon then runs from ssh, where Claude Code can't read its \
                      keychain login"
                 } else {
@@ -1595,7 +1667,7 @@ fn macos_checks(r: &mut Report, name: &str, ins: &Inspected, hub: &HubBuild, ssh
             None,
         ),
     }
-    if !ssh_transport {
+    if !dialed {
         return;
     }
     let Some(b) = hub.box_entry(name) else {
@@ -1674,7 +1746,7 @@ async fn daemon_view(socket: &Path, hub: &HubBuild, name: &str, json: bool) -> D
 
 /// The login shell's `PATH` and each agent CLI, from the agent probe in `side` (the second
 /// ssh's output); without one, the agents as the box last reported them to the hub, when it
-/// did. On a Mac (`view` asked), Claude Code as the box daemon (`ssh_transport`; else the
+/// did. On a Mac (`view` asked), Claude Code as the box daemon (`dialed`; else the
 /// box's runner) sees it, when that is known ([`DaemonView`]).
 fn agents_checks(
     r: &mut Report,
@@ -1683,7 +1755,7 @@ fn agents_checks(
     view: &DaemonView,
     pick: Option<&(String, BuildSource)>,
     side: Option<&Result<String, String>>,
-    ssh_transport: bool,
+    dialed: bool,
 ) {
     let probed = match (pick, side) {
         (Some((id, _)), Some(Ok(out))) => match section(out, AGENTS_MARK) {
@@ -1728,7 +1800,7 @@ fn agents_checks(
     // On a Mac, Claude Code as the box daemon sees it (through the hub, while the box is
     // connected) over the probe's over ssh, found or not: the keychain can answer each
     // differently, and the daemon looks the CLI up on the PATH it started with.
-    let who = if ssh_transport {
+    let who = if dialed {
         "the box daemon"
     } else {
         "the box's runner"
@@ -1785,7 +1857,7 @@ fn agents_checks(
                     agent_said(d),
                     agent_said(a)
                 ),
-                Some(if ssh_transport {
+                Some(if dialed {
                     format!("`twr box restart {name}` starts a daemon that finds it")
                 } else {
                     "restart the box's `twr runner` (from a shell whose PATH finds it)".into()
@@ -1805,7 +1877,7 @@ fn agents_checks(
                      unlocked; {who}'s view is the one its threads get",
                     login_word(a.login),
                     login_word(d.login),
-                    if ssh_transport {
+                    if dialed {
                         "a box daemon running (a launchd job)"
                     } else {
                         "a runner started"
@@ -1957,15 +2029,25 @@ fn require_terminal(stdin: bool, stdout: bool, name: &str, agent: &str) -> anyho
     )
 }
 
-/// The ssh arguments of `twr box login`: with a terminal ([`ssh_box::terminal_ssh_args`]),
-/// build `id` under `data` runs `twr runner --login <agent>`.
-fn login_ssh_args(ssh: &str, data: &str, id: &str, agent: &str) -> anyhow::Result<Vec<String>> {
+/// The program and arguments of `twr box login` on box `name` through `link`, with a terminal
+/// there ([`BoxLink::terminal`]: ssh's [`ssh_box::terminal_ssh_args`], or a command box's
+/// terminal_command): build `id` under `data` runs `twr runner --login <agent>`.
+fn login_command(
+    link: &BoxLink,
+    name: &str,
+    data: &str,
+    id: &str,
+    agent: &str,
+) -> anyhow::Result<(std::ffi::OsString, Vec<String>)> {
     let remote = ssh_box::sh_c(&format!(
         "exec {} runner --login {}",
         sh_word(&ssh_box::build_path(data, id)),
         sh_word(agent)
     ));
-    ssh_box::terminal_ssh_args(ssh, &remote).map_err(|why| anyhow!("ssh {ssh:?}: {why}"))
+    link.terminal(&remote).map_err(|why| match link {
+        BoxLink::Ssh(ssh) => anyhow!("ssh {ssh:?}: {why}"),
+        BoxLink::Command { .. } => anyhow!("box {name}: {why}"),
+    })
 }
 
 /// What `twr box login` says on a Mac box about Claude Code's login over ssh.
@@ -1977,7 +2059,7 @@ const KEYCHAIN_NOTE: &str = "On a Mac, Claude Code keeps its login in the login 
 /// that no one is logged in at: the box daemon's Claude Code can't read it yet.
 fn no_gui_login_note(name: &str, transport: BoxTransport) -> String {
     let restart = match transport {
-        BoxTransport::Ssh => format!("`twr box restart {name}`"),
+        BoxTransport::Ssh | BoxTransport::Command => format!("`twr box restart {name}`"),
         BoxTransport::Token => "restart the box's `twr runner` there".to_string(),
     };
     format!(
@@ -2014,31 +2096,39 @@ pub(super) async fn login(
     let login_args = twr_adapters::agents::login_args(runtime)
         .unwrap_or_default()
         .join(" ");
-    let Some(ssh) = cfg.ssh.as_deref().filter(|s| !s.trim().is_empty()) else {
+    let Some(link) = BoxLink::of(cfg) else {
         bail!(
             "box {name} has no ssh destination ([boxes.{name}] ssh): log in on the box itself \
              with `{command} {login_args}`"
         );
     };
+    let link = &link;
+    let instead = format!("log in inside the container with `{command} {login_args}`");
+    if let Some(why) = terminal_refusal(name, link, &instead) {
+        bail!("{why}");
+    }
     let hub = running_hub(socket).await;
 
-    outln!("probing box {name} over ssh ({ssh})...");
-    let remote = ssh_box::sh_c(&inspect_script(None));
-    let probing = ssh_here(ssh, &remote, None);
-    let (code, out) = tokio::time::timeout(PROBE_WAIT, probing)
+    outln!("probing box {name} {}...", reached(link));
+    let remote = ssh_box::sh_c(&inspect_script(link, None));
+    let probing = here(link, &remote, link.probe_input());
+    let ran = tokio::time::timeout(PROBE_WAIT, probing)
         .await
         .map_err(|_| {
             anyhow!(
-                "probing box {name} did not finish within {} s (a question of ssh's left \
-                 unanswered, or a box that does not answer)",
-                PROBE_WAIT.as_secs()
+                "probing box {name} did not finish within {} s ({})",
+                PROBE_WAIT.as_secs(),
+                unanswered(link)
             )
         })??;
-    if code != Some(0) {
-        let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-        bail!("ssh to box {name} failed ({code}): see ssh's message above");
+    if ran.code != Some(0) {
+        let what = format!("{} to box {name}", link.via());
+        bail!("{}", failed_here(link, name, &what, ran.code, &ran.err));
     }
-    let ins = parse_inspect(&out, 0)?;
+    let ins = parse_inspect(&ran.out, link, 0)?;
+    if let Some(why) = ins.probe.pipe_refusal(name, link) {
+        bail!("{why}");
+    }
     if let Some(why) = ins.probe.tree_refusal(name) {
         bail!("{why}");
     }
@@ -2058,7 +2148,7 @@ pub(super) async fn login(
         );
     };
     let mac = ins.probe.os == "Darwin";
-    let args = login_ssh_args(ssh, &data, &id, &command)?;
+    let (program, args) = login_command(link, name, &data, &id, &command)?;
     match &hub.unknown {
         Some(why) => outln!(
             "box {name} runs the login with {} {id} (the running hub did not say which build \
@@ -2077,11 +2167,12 @@ pub(super) async fn login(
         }
         outln!("{KEYCHAIN_NOTE}.");
     }
-    let status = tokio::process::Command::new(ssh_box::ssh_program())
+    // In this terminal, in its process group: the login's questions are the user's.
+    let status = tokio::process::Command::new(&program)
         .args(&args)
         .status()
         .await
-        .map_err(|e| anyhow!("running {}: {e}", ssh_program_name()))?;
+        .map_err(|e| anyhow!("running {}: {e}", Path::new(&program).display()))?;
     let ended = match status.code() {
         Some(0) => "ended".to_string(),
         Some(c) => format!("ended with exit {c}"),
@@ -2089,7 +2180,7 @@ pub(super) async fn login(
     };
     outln!("{command}'s login on box {name} {ended}; asking whether {command} is logged in...");
 
-    let (from, seen) = state_after_login(socket, &hub, name, ssh, &data, &id, runtime).await;
+    let (from, seen) = state_after_login(socket, &hub, name, link, &data, &id, runtime).await;
     let Some((a, daemon)) = seen else {
         outln!("{from} did not say whether {command} is logged in on box {name}");
         return Ok(ExitCode::from(1));
@@ -2137,7 +2228,7 @@ pub(super) async fn login(
 /// so restarting it reads the PATH again (`twr box restart` for an SSH box).
 fn daemon_missing_note(transport: BoxTransport, name: &str, command: &str) -> String {
     let restart = match transport {
-        BoxTransport::Ssh => format!(
+        BoxTransport::Ssh | BoxTransport::Command => format!(
             "run `twr box restart {name}` (it stops the daemon and its agents and starts a new \
              one; their next prompts resume them)"
         ),
@@ -2190,13 +2281,13 @@ fn login_verdict(a: &AgentInfo) -> LoginVerdict {
 
 /// Agent `runtime` on box `name` after a login, and who said so: the box daemon through the
 /// hub (`box.agents` with `refresh`) when the hub has the box, else (or when that fails) the
-/// agent probe over ssh, with build `id` under `data`. With the agent, whether the box
-/// daemon said it (`true`) or the probe over ssh.
+/// agent probe on the box through `link`, with build `id` under `data`. With the agent,
+/// whether the box daemon said it (`true`) or the probe on the box.
 async fn state_after_login(
     socket: &Path,
     hub: &HubBuild,
     name: &str,
-    ssh: &str,
+    link: &BoxLink,
     data: &str,
     id: &str,
     runtime: &str,
@@ -2215,15 +2306,23 @@ async fn state_after_login(
                     find(agents_of(&v)).map(|a| (a, true)),
                 )
             }
-            Ok(Err(e)) => errln!("twr: the hub could not have box {name} probe its agents ({e:#}): asking the box over ssh"),
+            Ok(Err(e)) => errln!(
+                "twr: the hub could not have box {name} probe its agents ({e:#}): asking the box \
+                 {}",
+                reached(link)
+            ),
             Err(_) => errln!(
-                "twr: the hub did not answer within {} s: asking the box over ssh",
-                REFRESH_WAIT.as_secs()
+                "twr: the hub did not answer within {} s: asking the box {}",
+                REFRESH_WAIT.as_secs(),
+                reached(link)
             ),
         }
     }
-    let from = "the box, over ssh".to_string();
-    match run_box_side(name, ssh, &box_side_script(data, id, None, true)).await {
+    let from = match link {
+        BoxLink::Ssh(_) => "the box, over ssh".to_string(),
+        BoxLink::Command { .. } => "the box, through its command".to_string(),
+    };
+    match run_box_side(name, link, &box_side_script(data, id, None, true)).await {
         Ok(out) => match section(&out, AGENTS_MARK) {
             Some((Some(0), lines)) => (
                 from,
@@ -2256,6 +2355,11 @@ fn agents_of(v: &Value) -> Vec<AgentInfo> {
 mod tests {
     use super::*;
     use crate::test_support::install;
+
+    /// An SSH box's link (its probe has no pipe check).
+    fn ssh_link() -> BoxLink {
+        BoxLink::Ssh("me@box".into())
+    }
 
     fn set(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
@@ -2446,6 +2550,20 @@ mod tests {
             "{fix}"
         );
         assert!(fix.contains("`ssh box stop`"), "{fix}");
+        // Without a stop command doctor may show (none known, or an agent asking about a
+        // command box): `twr box restart`.
+        let mut r = Report::new("b", true);
+        let ins = Inspected {
+            linger: Some("Linger=yes".into()),
+            kill: Some("b true".into()),
+            ..Default::default()
+        };
+        logind_check(&mut r, &probe, &ins, &Session, None);
+        let fix = r.checks.pop().unwrap().fix.unwrap();
+        assert!(
+            fix.contains("then restart the box daemon (`twr box restart b`)"),
+            "{fix}"
+        );
         // Unknown: busctl missing (no `kill=`), its query failed (empty), or an answer that
         // is neither; loginctl's own answer failed too.
         for (linger, kill) in [
@@ -2597,13 +2715,18 @@ mod tests {
         ];
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(inspect_script(Some(&repos)))
+            .arg(inspect_script(&ssh_link(), Some(&repos)))
             .env("HOME", home)
             .env_remove("XDG_DATA_HOME")
             .output()
             .unwrap();
         assert!(out.status.success());
-        let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), repos.len()).unwrap();
+        let ins = parse_inspect(
+            &String::from_utf8_lossy(&out.stdout),
+            &ssh_link(),
+            repos.len(),
+        )
+        .unwrap();
         // (The temp dir's ancestors may not be safe on every machine: only checked when so.)
         if !ins.probe.tree_unsafe {
             assert_eq!(
@@ -2628,15 +2751,87 @@ mod tests {
         // Without repositories (`twr box login`): the probe and the builds only.
         let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(inspect_script(None))
+            .arg(inspect_script(&ssh_link(), None))
             .env("HOME", home)
             .env_remove("XDG_DATA_HOME")
             .output()
             .unwrap();
-        let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), 0).unwrap();
+        let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), &ssh_link(), 0).unwrap();
         assert_eq!(ins.newest_first.len(), 2);
         assert!(ins.git.is_none());
         assert_eq!(ins.home.as_deref(), home.to_str());
+    }
+
+    /// Doctor's first run through a command link, from the script to the parser, run here
+    /// with the pipe check's token on its stdin ([`here`]): with its bounded prelude (the
+    /// watcher of a box without `timeout` included) the check still reads the script's own
+    /// stdin, so a command that passes it on has it back and no refusal; one that gives the box
+    /// no input (`docker exec` without `-i`) and one that gives it a terminal (`-t`) are
+    /// refused. An SSH link's script has no pipe check.
+    #[tokio::test]
+    async fn doctor_s_probe_has_the_pipe_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = format!("HOME={}", dir.path().display());
+        let no_timeout = dir.path().join("no-timeout");
+        install(&no_timeout.join("timeout"), "#!/bin/sh\nexit 1\n");
+        let path = format!(
+            "PATH={}:{}",
+            no_timeout.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run = |wrap: &[&str]| {
+            let command: Vec<String> = ["env", home.as_str(), "XDG_DATA_HOME=", &path]
+                .iter()
+                .chain(wrap)
+                .map(|w| w.to_string())
+                .collect();
+            async move {
+                let link = BoxLink::Command {
+                    command,
+                    terminal: None,
+                };
+                let script = ssh_box::sh_c(&inspect_script_bounded(&link, Some(&[]), 1));
+                let ran = here(&link, &script, link.probe_input()).await.unwrap();
+                assert_eq!(ran.code, Some(0), "{} {:?}", ran.out, ran.err);
+                let ins = parse_inspect(&ran.out, &link, 0).unwrap();
+                assert!(
+                    ins.git
+                        .as_deref()
+                        .is_some_and(|g| g.contains("git version")),
+                    "{ins:?}"
+                );
+                let why = ins.probe.pipe_refusal("sb", &link);
+                (ins.probe.pipe, why)
+            }
+        };
+        assert_eq!(run(&[]).await, (Some("twr-pipe-ok".to_string()), None));
+        let (pipe, why) = run(&["sh", "-c", "exec \"$@\" </dev/null", "x"]).await;
+        assert_eq!(pipe.as_deref(), Some(""));
+        assert!(why
+            .unwrap()
+            .ends_with("`docker exec` and `kubectl exec` need `-i`"));
+        let script_here = std::process::Command::new("script")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if script_here {
+            let (pipe, why) = run(&["sh", "-c", "exec script -qec \"$3\" /dev/null", "x"]).await;
+            assert_eq!(pipe.as_deref(), Some("terminal"));
+            assert!(
+                why.unwrap()
+                    .starts_with("box sb's command gives the box a terminal"),
+                "a terminal refused"
+            );
+        } else {
+            eprintln!("no `script` here: the terminal case is skipped");
+        }
+        // An SSH link: no check in doctor's script.
+        assert!(!inspect_script(&ssh_link(), None).contains("pipe="));
+        let link = BoxLink::Command {
+            command: vec!["env".into()],
+            terminal: None,
+        };
+        assert!(inspect_script(&link, None).contains("pipe="));
     }
 
     /// A box-side command that hangs (a `df` of a dead mount) is ended at the bound, with
@@ -2658,7 +2853,7 @@ mod tests {
             let started = std::time::Instant::now();
             let out = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(inspect_script_bounded(Some(&[]), 1))
+                .arg(inspect_script_bounded(&ssh_link(), Some(&[]), 1))
                 .env("HOME", &home)
                 .env("PATH", dirs.join(":"))
                 .env_remove("XDG_DATA_HOME")
@@ -2668,7 +2863,7 @@ mod tests {
             let took = started.elapsed();
             assert!(out.status.success(), "{extra:?}");
             assert!(took < Duration::from_secs(10), "{extra:?} took {took:?}");
-            let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), 0).unwrap();
+            let ins = parse_inspect(&String::from_utf8_lossy(&out.stdout), &ssh_link(), 0).unwrap();
             assert_eq!(ins.df.as_deref(), Some(""), "{extra:?}: {ins:?}");
             assert!(
                 ins.git
@@ -2799,11 +2994,12 @@ mod tests {
              project.7=git\ndf=/dev/sda1 100 50 2048 3% /\n",
             "v".repeat(5000)
         );
-        let ins = parse_inspect(&out, 1).unwrap();
+        let ins = parse_inspect(&out, &ssh_link(), 1).unwrap();
         assert_eq!(ins.newest_first, ["00000000000000aa"]);
         assert_eq!(ins.home, None);
         let ins = parse_inspect(
             &format!("{out}home=relative\nhome=/h/me\nhome=/h/other\n"),
+            &ssh_link(),
             1,
         )
         .unwrap();
@@ -2813,7 +3009,7 @@ mod tests {
         assert_eq!(df_free(ins.df.as_deref().unwrap()), Some(2048 * 1024));
         assert_eq!(df_free("/dev/x y 10 5 7 50% /mnt/a b"), Some(7 * 1024));
         assert_eq!(df_free("garbage"), None);
-        assert!(parse_inspect("nothing", 0).is_err());
+        assert!(parse_inspect("nothing", &ssh_link(), 0).is_err());
     }
 
     /// The second ssh's script, run here with a fake build: its sections and exit statuses,
@@ -2987,16 +3183,20 @@ mod tests {
         assert!(agents_of(&json!({})).is_empty());
     }
 
-    /// `twr box login`'s ssh: a terminal, the forced options, the build's `--login`.
+    /// `twr box login`'s ssh: a terminal, the forced options, the build's `--login`. A command
+    /// box's: its terminal_command, `sh -c` and the same line; refused without one.
     #[test]
-    fn the_login_runs_the_builds_login_over_ssh_with_a_terminal() {
-        let args = login_ssh_args(
-            "-p 2222 me@mac",
+    fn the_login_runs_the_builds_login_with_a_terminal() {
+        let ssh = BoxLink::Ssh("-p 2222 me@mac".into());
+        let (program, args) = login_command(
+            &ssh,
+            "mac",
             "/Users/me/.local/share",
             "00000000000000aa",
             "claude",
         )
         .unwrap();
+        assert_eq!(program, ssh_box::ssh_program());
         let remote = ssh_box::sh_c(
             "exec /Users/me/.local/share/twr/runner/builds/00000000000000aa/twr runner --login \
              claude",
@@ -3023,8 +3223,45 @@ mod tests {
         assert_eq!(args[at + 1..at + 5], ["-a", "-x", "-k", "--"]);
         assert_eq!(args.last().unwrap(), &remote);
         // The box's words that would forward something are refused here too.
-        assert!(login_ssh_args("-A me@mac", "/d", "00000000000000aa", "claude").is_err());
-        assert!(login_ssh_args("me@mac -t", "/d", "00000000000000aa", "claude").is_err());
+        for words in ["-A me@mac", "me@mac -t"] {
+            let link = BoxLink::Ssh(words.into());
+            assert!(login_command(&link, "mac", "/d", "00000000000000aa", "claude").is_err());
+        }
+        // A command box: its terminal_command, then `sh -c` and the same line.
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sb = BoxLink::Command {
+            command: words(&["docker", "exec", "-i", "c"]),
+            terminal: Some(words(&["docker", "exec", "-i", "-t", "c"])),
+        };
+        let (program, args) = login_command(
+            &sb,
+            "sb",
+            "/home/box/.local/share",
+            "00000000000000aa",
+            "codex",
+        )
+        .unwrap();
+        assert_eq!(program, "docker");
+        let remote = ssh_box::sh_c(
+            "exec /home/box/.local/share/twr/runner/builds/00000000000000aa/twr runner --login \
+             codex",
+        );
+        assert_eq!(args, words(&["exec", "-i", "-t", "c", "sh", "-c", &remote]));
+        // Without one: refused before anything runs, naming the box and the key.
+        let bare = BoxLink::Command {
+            command: words(&["docker", "exec", "-i", "c"]),
+            terminal: None,
+        };
+        let why = terminal_refusal("sb", &bare, "log in inside the container").unwrap();
+        assert_eq!(
+            why,
+            "box sb has no terminal_command: set one in [boxes.sb] (its command with `-t`: \
+             `docker exec -i -t <container>`), or log in inside the container"
+        );
+        assert_eq!(terminal_refusal("sb", &sb, "x"), None);
+        assert_eq!(terminal_refusal("mac", &ssh, "x"), None);
+        let e = login_command(&bare, "sb", "/d", "00000000000000aa", "codex").unwrap_err();
+        assert!(format!("{e}").starts_with("box sb: "), "{e}");
     }
 
     #[test]
@@ -3135,13 +3372,13 @@ mod tests {
         let run = |path: &str| {
             let out = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(inspect_script(None))
+                .arg(inspect_script(&ssh_link(), None))
                 .env("HOME", dir.path())
                 .env("PATH", path)
                 .env_remove("XDG_DATA_HOME")
                 .output()
                 .unwrap();
-            parse_inspect(&String::from_utf8_lossy(&out.stdout), 0).unwrap()
+            parse_inspect(&String::from_utf8_lossy(&out.stdout), &ssh_link(), 0).unwrap()
         };
         let path = std::env::var("PATH").unwrap();
         let mac = run(&format!("{}:{path}", bin.display()));

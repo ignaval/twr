@@ -1,6 +1,7 @@
-//! The hub's ssh supervisor of an SSH box (`[boxes.<name>] transport = "ssh"`): one task per
-//! box, in the default workspace's hub only (a named workspace's hub never dials boxes, as it
-//! never listens), started with the hub or by a live add (`box.add`) and ended by the hub's
+//! The hub's supervisor of a box it connects to: an SSH box (`[boxes.<name>] transport =
+//! "ssh"`), or a command box (`transport = "command"`, below). One task per box, in the
+//! default workspace's hub only (a named workspace's hub never dials boxes, as it never
+//! listens), started with the hub or by a live add (`box.add`) and ended by the hub's
 //! shutdown, which kills its ssh children. It keeps the box connected:
 //!
 //! 1. **Probe** ([`PROBE_TIMEOUT`]): `ssh <box> -- sh -c <probe>` ([`probe_script`]) prints the
@@ -124,6 +125,18 @@
 //! key, an unknown host key, a name that does not resolve) become a plain `last_error`
 //! ([`ssh_failure`]).
 //!
+//! **Command boxes** (`transport = "command"`, a container): the same supervisor, through
+//! [`BoxLink::Command`] instead of ssh. The hub runs `[boxes.<name>] command` itself (`docker
+//! exec -i <container>`, its argv as written, no shell on the hub's side) with `sh -c <line>`
+//! appended, `<line>` what ssh would run on the box; so the box needs `sh` and the probe's
+//! tools. No ssh options and no `TWR_SSH` apply. Its probe first checks that the command passes
+//! the hub's input on and gives the box no terminal ([`PIPE_CHECK`], [`Probe::pipe_refusal`]:
+//! a missing `-i` would otherwise show only as a channel that never opens), and the command's
+//! own failures (no such container, a stopped one, an engine the hub cannot reach) become a
+//! plain `last_error` ([`command_failure`]). Its process gets the same session, process group,
+//! bounds and kill as ssh's; killing the engine's client ends the relay in the container
+//! through the end of its input.
+//!
 //! **State** ([`Status`], `hub.info` `boxes[]`): `connecting` (probing, installing, opening,
 //! or connected and not ready yet), `online` (the box is ready) and `switching` (its gate is
 //! set): the hub's, not this module's, to say; `offline` (between attempts), `needs_install`,
@@ -148,7 +161,7 @@ use tokio::io::{
 };
 use tokio::process::{Child, Command};
 use tokio::sync::{oneshot, watch, Notify};
-use twr_core::config::BoxConfig;
+use twr_core::config::{BoxConfig, BoxTransport};
 use twr_core::sealed::{DaemonHello, HubKey};
 
 use crate::hub::{HubState, SealedEnd, WeakHub};
@@ -412,12 +425,252 @@ pub fn sh_c(script: &str) -> String {
     format!("sh -c {}", sh_quote(script))
 }
 
-/// A spawned ssh ([`ssh_command`]: the leader of a process group of its own) whose whole
-/// process group, the child with it, is killed when it is dropped unreaped, and when it ends
-/// ([`Ssh::finish`]). Not once something else reaped the child
-/// ([`twr_adapters::process::ownership_lost`]): its id may name another process or group by
-/// then, so nothing signals it again (the `Child`'s own `kill_on_drop`, which would, is
-/// turned off: the group's kill covers the child).
+/// How the hub (and the CLI) reach a box the hub connects to: the one place that builds a
+/// process to it. Every operation builds the same line for the box (`sh -c '<probe>'`, the
+/// relay's `exec '<build>' runner --stdio ...`), which an ssh link hands to ssh after `--`, and
+/// a command link appends to its argv as `sh -c <line>` (no shell on the hub's side; one `sh`
+/// on the box, whatever its login shell).
+#[derive(Clone, PartialEq, Eq)]
+pub enum BoxLink {
+    /// `[boxes.<name>] ssh`: the words before the destination, and the destination.
+    Ssh(String),
+    /// `[boxes.<name>] command` (never empty) and `terminal_command`.
+    Command {
+        /// What the hub runs, `sh -c <line>` appended.
+        command: Vec<String>,
+        /// What the CLI runs in the user's terminal for what needs one there.
+        terminal: Option<Vec<String>>,
+    },
+}
+
+impl std::fmt::Debug for BoxLink {
+    // Never the words of a command (one may hold a secret): its program and length.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoxLink::Ssh(ssh) => f.debug_tuple("Ssh").field(ssh).finish(),
+            BoxLink::Command { command, terminal } => write!(
+                f,
+                "Command({} ({} words), terminal: {})",
+                command.first().map(String::as_str).unwrap_or_default(),
+                command.len(),
+                terminal.is_some()
+            ),
+        }
+    }
+}
+
+impl BoxLink {
+    /// The link of box `cfg`: its command for a command box, else its `ssh` words when it has
+    /// some (an SSH box; a token box's are for attach). `None` without either.
+    pub fn of(cfg: &BoxConfig) -> Option<BoxLink> {
+        match cfg.transport() {
+            BoxTransport::Command => cfg
+                .command
+                .clone()
+                .filter(|c| !c.is_empty())
+                .map(|command| BoxLink::Command {
+                    command,
+                    terminal: cfg.terminal_command.clone(),
+                }),
+            BoxTransport::Ssh | BoxTransport::Token => cfg
+                .ssh
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .map(BoxLink::Ssh),
+        }
+    }
+
+    /// The program run: [`ssh_program`], or the command's first word.
+    pub fn program(&self) -> OsString {
+        match self {
+            BoxLink::Ssh(_) => ssh_program(),
+            BoxLink::Command { command, .. } => {
+                command.first().map(OsString::from).unwrap_or_default()
+            }
+        }
+    }
+
+    /// The program as messages name it: `ssh` (whatever `TWR_SSH` names), or the file name of
+    /// the command's program (`docker`).
+    pub fn via(&self) -> String {
+        match self {
+            BoxLink::Ssh(_) => "ssh".to_string(),
+            BoxLink::Command { .. } => std::path::Path::new(&self.program())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// `argv` (the box's `command` or `terminal_command`, checked again:
+    /// [`twr_core::config::check_command_words`]) but its program, then `sh -c <line>`.
+    fn command_args(argv: &[String], line: &str) -> Result<Vec<String>, String> {
+        twr_core::config::check_command_words(argv)?;
+        Ok(argv[1..]
+            .iter()
+            .cloned()
+            .chain(["sh".to_string(), "-c".to_string(), line.to_string()])
+            .collect())
+    }
+
+    /// A process that runs `line` on the box in the background (the hub's, and the CLI's
+    /// probes of a command box): [`ssh_command`], or the command with `sh -c <line>` appended,
+    /// set up the same way: no stdin (set one before spawning, [`Input::prepare`]), stdout and
+    /// stderr piped, its own session and process group
+    /// ([`twr_adapters::process::new_session`]: no controlling terminal), the child killed
+    /// when dropped. Spawn it through [`Ssh::spawn`] and end it with [`Ssh::finish`], which
+    /// kill what is left of its group. An error when the words are refused.
+    pub fn background(&self, line: &str) -> Result<Command, String> {
+        match self {
+            BoxLink::Ssh(ssh) => ssh_command(ssh, line),
+            BoxLink::Command { command, .. } => {
+                let args = Self::command_args(command, line)?;
+                let mut c = Command::new(&command[0]);
+                c.args(args)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                twr_adapters::process::new_session(&mut c);
+                Ok(c)
+            }
+        }
+    }
+
+    /// The arguments ([`BoxLink::program`]'s) of a process that runs `line` on the box from
+    /// the CLI: [`interactive_ssh_args`] (ssh may prompt), or the command's with `sh -c
+    /// <line>` appended.
+    pub fn here_args(&self, line: &str) -> Result<Vec<String>, String> {
+        match self {
+            BoxLink::Ssh(ssh) => interactive_ssh_args(ssh, line),
+            BoxLink::Command { command, .. } => Self::command_args(command, line),
+        }
+    }
+
+    /// The program and arguments of a process that runs `line` on the box with a terminal
+    /// there, in the user's (`twr box login`, `twr box project --clone`):
+    /// [`terminal_ssh_args`], or `terminal_command` with `sh -c <line>` appended. An error
+    /// for a command box without `terminal_command`.
+    pub fn terminal(&self, line: &str) -> Result<(OsString, Vec<String>), String> {
+        match self {
+            BoxLink::Ssh(ssh) => Ok((ssh_program(), terminal_ssh_args(ssh, line)?)),
+            BoxLink::Command {
+                terminal: Some(t), ..
+            } => Ok((OsString::from(&t[0]), Self::command_args(t, line)?)),
+            BoxLink::Command { terminal: None, .. } => Err(
+                "it has no terminal_command (its command with `-t`: `docker exec -i -t \
+                 <container>`)"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Whether the CLI runs this link's background work in a session of its own, as the hub
+    /// does: a command's (nothing should prompt there), not ssh's (it may ask about a host key
+    /// or a passphrase in the user's terminal).
+    pub fn own_session_here(&self) -> bool {
+        matches!(self, BoxLink::Command { .. })
+    }
+
+    /// Whether the probe checks that this link passes the hub's input and gives the box no
+    /// terminal ([`probe_script_for`]): a command's (`docker exec` without `-i`, or with
+    /// `-t`); ssh's always does (`-T`).
+    pub fn pipe_checked(&self) -> bool {
+        matches!(self, BoxLink::Command { .. })
+    }
+
+    /// What a probe through this link gets on its stdin: [`PIPE_TOKEN`] when it is
+    /// [`BoxLink::pipe_checked`], else nothing.
+    pub fn probe_input(&self) -> Input {
+        if self.pipe_checked() {
+            Input::Bytes(PIPE_TOKEN.to_vec())
+        } else {
+            Input::None
+        }
+    }
+
+    /// What the link's own failure means for box `name`, from the process's exit `code` and
+    /// stderr `lines`: [`ssh_failure`] of ssh's exit 255, [`command_failure`] of a command's;
+    /// `None` when nothing known matches.
+    pub fn failure(&self, name: &str, code: Option<i32>, lines: &[String]) -> Option<String> {
+        match self {
+            BoxLink::Ssh(_) => (code == Some(255))
+                .then(|| ssh_failure(name, lines))
+                .flatten(),
+            BoxLink::Command { .. } => command_failure(name, code, lines),
+        }
+    }
+
+    /// The link as the user reads it (never sent to the orchestrator or logged): `ssh <words>`,
+    /// or the command's words, each shell-quoted when it needs it.
+    pub fn label(&self) -> String {
+        match self {
+            BoxLink::Ssh(ssh) => format!("ssh {}", ssh.trim()),
+            BoxLink::Command { command, .. } => command
+                .iter()
+                .map(|w| twr_core::paths::sh_word(w))
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// What the hub writes on the stdin of a pipe-checked probe ([`BoxLink::probe_input`]); the
+/// box's pipe check echoes its first line back (`pipe=twr-pipe-ok`, [`Probe::pipe`]).
+pub const PIPE_TOKEN: &[u8] = b"twr-pipe-ok\n";
+
+/// [`PIPE_TOKEN`]'s line, as the probe reports it.
+const PIPE_OK: &str = "twr-pipe-ok";
+
+/// What a process to the box gets on its stdin.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Input {
+    /// Nothing (`/dev/null`).
+    #[default]
+    None,
+    /// A file's bytes (an upload).
+    File(PathBuf),
+    /// These bytes ([`PIPE_TOKEN`]).
+    Bytes(Vec<u8>),
+}
+
+impl Input {
+    /// Gives `c` a piped stdin unless there is nothing to write. Before it is spawned.
+    pub fn prepare(&self, c: &mut Command) {
+        if *self != Input::None {
+            c.stdin(std::process::Stdio::piped());
+        }
+    }
+
+    /// Writes this to `stdin` (the spawned child's, [`Input::prepare`]) and closes it. An
+    /// error only when the file cannot be read: a box that stops reading shows in its answer.
+    pub async fn feed(self, stdin: Option<tokio::process::ChildStdin>) -> Result<(), String> {
+        let Some(mut stdin) = stdin else {
+            return Ok(());
+        };
+        match self {
+            Input::None => {}
+            Input::File(path) => {
+                let mut f = tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| format!("reading {}: {e}", path.display()))?;
+                let _ = tokio::io::copy(&mut f, &mut stdin).await;
+            }
+            Input::Bytes(b) => {
+                let _ = stdin.write_all(&b).await;
+            }
+        }
+        let _ = stdin.shutdown().await;
+        Ok(())
+    }
+}
+
+/// A spawned ssh or command ([`ssh_command`], [`BoxLink::background`]: the leader of a
+/// process group of its own) whose whole process group, the child with it, is killed when it
+/// is dropped unreaped, and when it ends ([`Ssh::finish`]). Not once something else reaped
+/// the child ([`twr_adapters::process::ownership_lost`]): its id may name another process or
+/// group by then, so nothing signals it again (the `Child`'s own `kill_on_drop`, which would,
+/// is turned off: the group's kill covers the child).
 pub struct Ssh {
     /// The ssh process.
     pub child: Child,
@@ -426,8 +679,8 @@ pub struct Ssh {
 }
 
 impl Ssh {
-    /// Spawns `c`, which makes its child a process group's leader ([`ssh_command`]'s
-    /// session).
+    /// Spawns `c`, which makes its child a process group's leader ([`ssh_command`]'s and
+    /// [`BoxLink::background`]'s session).
     pub fn spawn(mut c: Command) -> std::io::Result<Ssh> {
         c.kill_on_drop(false);
         Ok(Ssh {
@@ -549,8 +802,28 @@ tree() {
 /// each path it does not trust as an `unsafe=<path>: <why>` line, and `tree=unsafe` (and
 /// nothing more) when that is the builds tree itself.
 pub fn probe_script() -> String {
+    probe_script_with("")
+}
+
+/// The pipe check of a command box's probe, right after its mark: `pipe=terminal` when the box
+/// got a terminal (a `-t` in the command), else `pipe=` and the first line of its stdin, cut
+/// to 64 bytes: [`PIPE_TOKEN`]'s when the command passes the hub's input on (`docker exec`
+/// without `-i` gives the box none).
+pub const PIPE_CHECK: &str = "if [ -t 0 ] || [ -t 1 ]; then echo 'pipe=terminal'; else \
+     IFS= read -r _l || _l=; _l=$(printf '%s' \"$_l\" | head -c 64); \
+     printf 'pipe=%s\\n' \"$_l\"; fi\n";
+
+/// [`probe_script`] for a box reached through `link`: with the pipe check ([`PIPE_CHECK`])
+/// right after the mark when the link is [`BoxLink::pipe_checked`] (its stdin is then
+/// [`PIPE_TOKEN`], [`BoxLink::probe_input`]).
+pub fn probe_script_for(link: &BoxLink) -> String {
+    probe_script_with(if link.pipe_checked() { PIPE_CHECK } else { "" })
+}
+
+fn probe_script_with(pipe_check: &str) -> String {
     format!(
         "echo '{PROBE_MARK}'\n\
+         {pipe_check}\
          echo \"os=$(uname -s 2>/dev/null)\"\n\
          echo \"arch=$(uname -m 2>/dev/null)\"\n\
          case ${{XDG_DATA_HOME:-}} in /*) data=$XDG_DATA_HOME ;; *) case ${{HOME:-}} in /*) data=$HOME/.local/share ;; *) exit 0 ;; esac ;; esac\n\
@@ -588,6 +861,9 @@ pub struct Probe {
     /// What the probe did not trust, and why (`<path>: <why>`): the builds tree (when
     /// `tree_unsafe`), or builds left out of `has`. At most [`PROBE_UNSAFE_KEPT`].
     pub unsafe_paths: Vec<String>,
+    /// The pipe check's answer ([`PIPE_CHECK`]: `terminal`, or the first line the box read on
+    /// its stdin), `None` when the probe printed none (a probe without the check).
+    pub pipe: Option<String>,
 }
 
 /// The probe's `unsafe=` lines kept ([`Probe::unsafe_paths`]).
@@ -610,15 +886,54 @@ impl Probe {
             )
         })
     }
+
+    /// Why box `name`, reached through `link`, cannot carry the hub's connection, when the
+    /// pipe check says so (links that are [`BoxLink::pipe_checked`] only): the box got a
+    /// terminal, or not the hub's input ([`PIPE_TOKEN`]; no answer at all counts as that).
+    pub fn pipe_refusal(&self, name: &str, link: &BoxLink) -> Option<String> {
+        if !link.pipe_checked() {
+            return None;
+        }
+        match self.pipe.as_deref() {
+            Some(PIPE_OK) => None,
+            Some("terminal") => Some(format!(
+                "box {name}'s command gives the box a terminal (a `-t` in it?): the hub's \
+                 connection is binary. Remove `-t` from [boxes.{name}] command \
+                 (terminal_command is for that)"
+            )),
+            _ => Some(format!(
+                "box {name}'s command does not pass the hub's input to the box: `docker exec` \
+                 and `kubectl exec` need `-i`"
+            )),
+        }
+    }
 }
 
 /// Parses the probe's output: the lines after its first `twr-probe 1` line; unknown lines,
 /// a `data` that is not absolute and a `has` that is not a build id are ignored (a login
 /// script may print anything). An error without the mark or an `os`.
 pub fn parse_probe(out: &str) -> anyhow::Result<Probe> {
+    parse_probe_with(out, "is the login shell POSIX?")
+}
+
+/// [`parse_probe`] of a probe run through `link`: the error without the mark asks what fits
+/// it (a command box's command must run its arguments as they are; ssh hands them to the
+/// login shell).
+pub fn parse_probe_for(out: &str, link: &BoxLink) -> anyhow::Result<Probe> {
+    match link {
+        BoxLink::Ssh(_) => parse_probe(out),
+        BoxLink::Command { .. } => parse_probe_with(
+            out,
+            "does the command run its arguments without a shell in between, as `docker exec` \
+             does?",
+        ),
+    }
+}
+
+fn parse_probe_with(out: &str, hint: &str) -> anyhow::Result<Probe> {
     let mut lines = out.lines().map(|l| l.trim_end_matches('\r'));
     if !lines.by_ref().any(|l| l == PROBE_MARK) {
-        anyhow::bail!("the probe printed nothing twr understands (is the login shell POSIX?)");
+        anyhow::bail!("the probe printed nothing twr understands ({hint})");
     }
     let mut p = Probe::default();
     for line in lines {
@@ -636,6 +951,7 @@ pub fn parse_probe(out: &str) -> anyhow::Result<Probe> {
                 .unsafe_paths
                 .push(v.chars().take(NOTE_MAX_BYTES).collect()),
             "tree" if v == "unsafe" => p.tree_unsafe = true,
+            "pipe" if p.pipe.is_none() => p.pipe = Some(v.chars().take(NOTE_MAX_BYTES).collect()),
             _ => {}
         }
     }
@@ -1127,6 +1443,114 @@ pub fn ssh_failure(name: &str, lines: &[String]) -> Option<String> {
     })
 }
 
+/// What a command box's command failing means, from its exit `code` and stderr `lines`, for
+/// box `name`: a plain sentence with the fix for the failures of a container engine's client
+/// (docker's, podman's) a user can fix, else `None`. The relay's own lines (`twr-box: ...`) are
+/// not looked at.
+pub fn command_failure(name: &str, code: Option<i32>, lines: &[String]) -> Option<String> {
+    if code == Some(0) {
+        return None;
+    }
+    lines
+        .iter()
+        .rev()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("twr-box:"))
+        .find_map(|line| {
+            let l = cut(line, NOTE_MAX_BYTES / 2);
+            let low = l.to_ascii_lowercase();
+            let has = |words: &[&str]| words.iter().any(|w| low.contains(w));
+            if has(&["no such container", "no container with name or id"]) {
+                Some(format!(
+                    "box {name}'s container does not exist ({l}): create and start it \
+                     (docs/runners.md#container-boxes)"
+                ))
+            } else if has(&["is not running", "container state improper"]) {
+                Some(format!("box {name}'s container is stopped ({l}): start it"))
+            } else if has(&[
+                "cannot connect to the docker daemon",
+                "failed to connect to the docker api",
+                "permission denied while trying to connect",
+            ]) {
+                Some(format!(
+                    "the hub can't reach the container engine ({l}): is it running, and can the \
+                     hub's user use it (the docker group, `DOCKER_HOST` or `DOCKER_CONTEXT` in \
+                     the hub's environment)?"
+                ))
+            } else if has(&["executable file not found"]) {
+                Some(format!(
+                    "box {name} has no `sh` ({l}): twr needs a POSIX shell and the usual tools \
+                     in the container"
+                ))
+            } else if has(&["stdin is not a terminal", "the input device is not a tty"]) {
+                Some(format!(
+                    "box {name}'s command asks for a terminal ({l}): the hub's connection is \
+                     binary. Remove `-t` from [boxes.{name}] command (terminal_command is for \
+                     that)"
+                ))
+            } else {
+                None
+            }
+        })
+}
+
+/// `s`, at most `max` bytes (cut at a character boundary).
+fn cut(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// The version of the C library this hub runs with (glibc's), on a glibc build only.
+fn hub_glibc() -> Option<String> {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: gnu_get_libc_version(3) returns a pointer to a static NUL-terminated
+        // string.
+        let v = unsafe { std::ffi::CStr::from_ptr(libc::gnu_get_libc_version()) };
+        v.to_str().ok().map(str::to_string)
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        None
+    }
+}
+
+/// The hint for an upload whose answer `answer` says the hub's build does not run on the box
+/// for want of its C library (`GLIBC_2.39' not found`, or `not found` from a box without
+/// glibc, where the program's loader is missing): a development build is linked against this
+/// machine's glibc, a release build is static. `None` for another answer, or a hub that is no
+/// glibc build (a release build runs anywhere).
+pub fn glibc_hint(answer: &str) -> Option<String> {
+    let glibc_build = cfg!(all(target_os = "linux", target_env = "gnu"));
+    (glibc_build && (answer.contains("GLIBC_") || answer.contains("not found"))).then(|| {
+        format!(
+            "a development build of twr needs a box or container with this machine's C library \
+             or newer{}: use a newer image or system there, or a release build of twr",
+            hub_glibc().map_or_else(String::new, |v| format!(" (glibc {v} here)"))
+        )
+    })
+}
+
+/// The hint for an upload to box `name` refused for permission under its data directory
+/// `data` on a command box: `docker exec -u <user>` keeps the container's `HOME` (root's, say),
+/// which that user cannot write to.
+pub fn home_hint(name: &str, data: &str) -> String {
+    let what = match data.strip_suffix("/.local/share") {
+        Some(home) if !home.is_empty() => format!("HOME is {home}"),
+        _ => format!("data directory is {data}"),
+    };
+    format!(
+        "box {name}'s {what}, which its user can't write to: with `docker exec -u`, also pass \
+         `-e HOME=<that user's home>` and `-w` (exec keeps the container's HOME)"
+    )
+}
+
 /// Whether a line the relay printed reads like an error or a warning (it becomes the box's
 /// `last_error`).
 fn error_like(line: &str) -> bool {
@@ -1263,8 +1687,8 @@ pub struct Status {
 /// An SSH box the hub dials: its settings, its state, and its supervisor.
 pub struct SshBox {
     name: String,
-    /// `[boxes.<name>] ssh`.
-    ssh: String,
+    /// How the hub reaches it: `[boxes.<name>] ssh`, or its command.
+    link: BoxLink,
     /// `[boxes.<name>] build`, as the files said when the box was added or `box.install` last
     /// read them (a session on the configured build watches it: see the module docs).
     build: watch::Sender<Option<String>>,
@@ -1292,11 +1716,12 @@ impl std::fmt::Debug for SshBox {
 }
 
 impl SshBox {
-    /// The state of SSH box `name` configured as `cfg`, before its supervisor starts.
+    /// The state of box `name` configured as `cfg` (an SSH or a command box: [`BoxLink::of`]),
+    /// before its supervisor starts.
     pub fn new(name: &str, cfg: &BoxConfig) -> SshBox {
         SshBox {
             name: name.to_string(),
-            ssh: cfg.ssh.clone().unwrap_or_default(),
+            link: BoxLink::of(cfg).unwrap_or_else(|| BoxLink::Ssh(String::new())),
             build: watch::Sender::new(cfg.build.clone()),
             status: Mutex::default(),
             wake: Notify::new(),
@@ -1311,6 +1736,11 @@ impl SshBox {
     /// The box's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// How the hub reaches it.
+    pub fn link(&self) -> &BoxLink {
+        &self.link
     }
 
     fn st(&self) -> MutexGuard<'_, Status> {
@@ -1595,6 +2025,11 @@ async fn attempt(hub: &Hub, rbox: &RemoteBox, sbox: &SshBox, replace: bool) -> A
         Ok(p) => p,
         Err(why) => return Attempt::Failed(State::Offline, why),
     };
+    // A command that does not pass the hub's input on, or gives the box a terminal, cannot
+    // carry the channel.
+    if let Some(why) = probe.pipe_refusal(name, &sbox.link) {
+        return Attempt::Failed(State::Offline, why);
+    }
     {
         let mut st = sbox.st();
         st.os = Some(probe.os.clone());
@@ -1653,66 +2088,58 @@ async fn attempt(hub: &Hub, rbox: &RemoteBox, sbox: &SshBox, replace: bool) -> A
     connect(hub, rbox, sbox, &key, &data, &id, follows_config, replace).await
 }
 
-/// Runs `remote` on the box with `input` (when given) as its stdin, within `timeout`: its exit
-/// status (`None`: killed by a signal), stdout and stderr lines. An error when ssh cannot be
-/// started or the time is up.
+/// Runs `remote` on the box (through its link, [`BoxLink::background`]) with `input` as its
+/// stdin, within `timeout`: its exit status (`None`: killed by a signal), stdout and stderr
+/// lines. An error when the link's program cannot be started or the time is up.
 async fn run_ssh(
     sbox: &SshBox,
     remote: &str,
-    input: Option<PathBuf>,
+    input: Input,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, Vec<String>), String> {
-    let cmd = ssh_command(&sbox.ssh, remote).map_err(|why| refused_words(sbox, &why))?;
-    run_ssh_command(cmd, &sbox.name, input, timeout).await
+    let cmd = sbox
+        .link
+        .background(remote)
+        .map_err(|why| refused_words(sbox, &why))?;
+    run_ssh_command(cmd, &sbox.link.via(), &sbox.name, input, timeout).await
 }
 
-/// [`run_ssh`] of ssh command `cmd` ([`ssh_command`]) to box `name`.
+/// [`run_ssh`] of command `cmd` ([`BoxLink::background`]) to box `name`, its program named
+/// `via` in messages (`ssh`, `docker`).
 async fn run_ssh_command(
     mut cmd: Command,
+    via: &str,
     name: &str,
-    input: Option<PathBuf>,
+    input: Input,
     timeout: Duration,
 ) -> Result<(Option<i32>, String, Vec<String>), String> {
-    if input.is_some() {
-        cmd.stdin(std::process::Stdio::piped());
-    }
-    let mut ssh = Ssh::spawn(cmd).map_err(|e| {
-        format!(
-            "cannot run {}: {e}",
-            std::path::Path::new(&ssh_program()).display()
-        )
-    })?;
+    input.prepare(&mut cmd);
+    let program = std::path::PathBuf::from(cmd.as_std().get_program());
+    let mut ssh = Ssh::spawn(cmd).map_err(|e| format!("cannot run {}: {e}", program.display()))?;
     let stdin = ssh.child.stdin.take();
     let mut stdout = ssh.child.stdout.take().expect("piped");
     let mut stderr = ssh.child.stderr.take().expect("piped");
     let run = async {
-        let feed = async {
-            if let (Some(mut stdin), Some(path)) = (stdin, input) {
-                let mut f = tokio::fs::File::open(&path)
-                    .await
-                    .map_err(|e| format!("reading {}: {e}", path.display()))?;
-                // A box that stops reading shows in its answer: not an error here.
-                let _ = tokio::io::copy(&mut f, &mut stdin).await;
-                let _ = stdin.shutdown().await;
-            }
-            Ok::<(), String>(())
-        };
+        let feed = input.feed(stdin);
         // The first to fail (more output than allowed) ends the others; `ssh` is killed then.
+        // The wait for its end runs alongside the reads: a helper that kept its stdout or
+        // stderr open (a wrapper's, a `ProxyCommand`'s) is killed with the group once the
+        // leader exits, which ends the reads.
         let (out_what, err_what) = (
-            format!("ssh to box {name} (stdout)"),
-            format!("ssh to box {name} (stderr)"),
+            format!("{via} to box {name} (stdout)"),
+            format!("{via} to box {name} (stderr)"),
         );
-        let (_, out, err) = tokio::try_join!(
+        let (_, out, err, status) = tokio::try_join!(
             feed,
             read_capped(&mut stdout, SSH_OUTPUT_MAX, &out_what),
             read_capped(&mut stderr, SSH_OUTPUT_MAX, &err_what),
+            async { ssh.finish().await.map_err(|e| e.to_string()) },
         )?;
-        let status = ssh.finish().await.map_err(|e| e.to_string())?;
         Ok::<_, String>((status.code(), out, err))
     };
     let (code, out, err) = tokio::time::timeout(timeout, run)
         .await
-        .map_err(|_| format!("ssh to box {name} took over {} s", timeout.as_secs()))??;
+        .map_err(|_| format!("{via} to box {name} took over {} s", timeout.as_secs()))??;
     let err = String::from_utf8_lossy(&err)
         .lines()
         .map(str::to_string)
@@ -1786,18 +2213,21 @@ pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
-/// Why the hub does not run ssh with box `sbox`'s `ssh` words (`why`, from [`ssh_words`]):
-/// they were admitted, so this is a defence only.
+/// Why the hub does not run box `sbox`'s `ssh` words or command (`why`, from [`ssh_words`] or
+/// [`twr_core::config::check_command_words`]): they were admitted, so this is a defence only.
+/// (A command's words are not shown: one may hold a secret.)
 fn refused_words(sbox: &SshBox, why: &str) -> String {
-    format!("[boxes.{}] ssh = {:?}: {why}", sbox.name, sbox.ssh)
+    match &sbox.link {
+        BoxLink::Ssh(ssh) => format!("[boxes.{}] ssh = {ssh:?}: {why}", sbox.name),
+        BoxLink::Command { .. } => format!("[boxes.{}] command: {why}", sbox.name),
+    }
 }
 
-/// Why an ssh that exited `code` with stderr `err` failed, in one line.
+/// Why the link's process (ssh, a command) that exited `code` with stderr `err` failed, in
+/// one line.
 fn failure(sbox: &SshBox, what: &str, code: Option<i32>, err: &[String]) -> String {
-    if code == Some(255) {
-        if let Some(why) = ssh_failure(&sbox.name, err) {
-            return why;
-        }
+    if let Some(why) = sbox.link.failure(&sbox.name, code, err) {
+        return why;
     }
     let last = err
         .iter()
@@ -1810,11 +2240,13 @@ fn failure(sbox: &SshBox, what: &str, code: Option<i32>, err: &[String]) -> Stri
 
 /// Probes the box (see the module docs).
 async fn probe(sbox: &SshBox) -> Result<Probe, String> {
-    let (code, out, err) = run_ssh(sbox, &sh_c(&probe_script()), None, PROBE_TIMEOUT).await?;
+    let link = &sbox.link;
+    let script = sh_c(&probe_script_for(link));
+    let (code, out, err) = run_ssh(sbox, &script, link.probe_input(), PROBE_TIMEOUT).await?;
     if code != Some(0) {
         return Err(failure(sbox, "probing", code, &err));
     }
-    parse_probe(&out).map_err(|e| format!("probing box {}: {e:#}", sbox.name))
+    parse_probe_for(&out, link).map_err(|e| format!("probing box {}: {e:#}", sbox.name))
 }
 
 /// Uploads the hub's own executable as build `id` under `data` (see the module docs). On
@@ -1844,7 +2276,7 @@ async fn upload(sbox: &SshBox, data: &str, id: &str) -> Result<(), (State, Strin
         .map_err(|e| (State::Offline, format!("{e:#}")))?;
     tracing::info!(box_name = %sbox.name, build = id, size, "installing the hub's build on the box");
     let script = upload_script(data, id, size, twr_core::version(), &tag);
-    let (code, out, err) = run_ssh(sbox, &sh_c(&script), Some(exe), UPLOAD_TIMEOUT)
+    let (code, out, err) = run_ssh(sbox, &sh_c(&script), Input::File(exe), UPLOAD_TIMEOUT)
         .await
         .map_err(|e| (State::Offline, e))?;
     let answer = out
@@ -1860,11 +2292,26 @@ async fn upload(sbox: &SshBox, data: &str, id: &str) -> Result<(), (State, Strin
         (Some(UPLOAD_MISMATCH), Some(why)) => Err((
             State::NeedsInstall,
             format!(
-                "the twr the hub uploaded to box {} was refused: {why}; run `twr box install {}`",
-                sbox.name, sbox.name
+                "the twr the hub uploaded to box {} was refused: {why}; run `twr box install \
+                 {}`{}",
+                sbox.name,
+                sbox.name,
+                glibc_hint(why).map_or_else(String::new, |h| format!(". {h}"))
             ),
         )),
-        _ => Err((State::Offline, failure(sbox, "installing twr", code, &err))),
+        _ => {
+            let mut why = failure(sbox, "installing twr", code, &err);
+            // A command box exec'd as another user than the container's, whose HOME is not
+            // its own (`docker exec -u` keeps the container's).
+            if sbox.link.pipe_checked()
+                && err
+                    .iter()
+                    .any(|l| l.to_ascii_lowercase().contains("permission denied"))
+            {
+                why = format!("{why}. {}", home_hint(&sbox.name, data));
+            }
+            Err((State::Offline, why))
+        }
     }
 }
 
@@ -1891,7 +2338,7 @@ async fn connect(
     // (The relay adds its build to this hub's builds reference as it starts, and this hub's
     // prune after the welcome sets the whole reference: [`prune_script`].)
     let remote = connect_command(data, id, name, &key.public_hex(), dial);
-    let mut cmd = match ssh_command(&sbox.ssh, &remote) {
+    let mut cmd = match sbox.link.background(&remote) {
         Ok(c) => c,
         Err(why) => return Attempt::Failed(State::Offline, refused_words(sbox, &why)),
     };
@@ -1903,7 +2350,7 @@ async fn connect(
                 State::Offline,
                 format!(
                     "cannot run {}: {e}",
-                    std::path::Path::new(&ssh_program()).display()
+                    std::path::Path::new(&sbox.link.program()).display()
                 ),
             )
         }
@@ -1929,6 +2376,7 @@ async fn connect(
     );
     tokio::pin!(session, reader);
     let mut read_all = false;
+    let mut ended = None;
     let result = tokio::select! {
         r = &mut session => r,
         // ssh closed its stderr (it is ending): the session sees the end of its stdout too.
@@ -1936,13 +2384,22 @@ async fn connect(
             read_all = true;
             session.await
         }
+        // ssh exited, and what was left of its group is killed: a helper that kept its stdout
+        // open (a wrapper's) is gone, so the session sees its end.
+        s = ssh.finish() => {
+            ended = Some(s);
+            session.await
+        }
     };
     // ssh's exit when it has exited (what is left of its group killed before it is reaped),
     // and what it said last; else it is killed with its group (dropped unreaped).
-    let code = match tokio::time::timeout(Duration::from_millis(500), ssh.finish()).await {
-        Ok(Ok(s)) => s.code(),
-        _ => None,
+    let finished = match ended {
+        Some(s) => s,
+        None => tokio::time::timeout(Duration::from_millis(500), ssh.finish())
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
     };
+    let code = finished.ok().and_then(|s| s.code());
     drop(ssh);
     if !read_all {
         let _ = tokio::time::timeout(Duration::from_millis(500), &mut reader).await;
@@ -1955,17 +2412,15 @@ async fn connect(
         .collect();
     match result {
         Ok((end, hello, switched)) => {
-            if code == Some(255) {
-                if let Some(why) = ssh_failure(name, &lines) {
-                    sbox.st().last_error = Some(why);
-                }
+            if let Some(why) = sbox.link.failure(name, code, &lines) {
+                sbox.st().last_error = Some(why);
             }
             session_ended(name, id, end, &hello, switched)
         }
         Err(why) => {
-            let why = match code {
-                Some(255) => ssh_failure(name, &lines).unwrap_or(why),
-                _ => match lines.iter().rev().find(|l| error_like(l)) {
+            let why = match sbox.link.failure(name, code, &lines) {
+                Some(known) => known,
+                None => match lines.iter().rev().find(|l| error_like(l)) {
                     Some(l) => format!("{why} ({})", l.trim()),
                     None => why,
                 },
@@ -2288,7 +2743,7 @@ async fn prune(sbox: &SshBox, data: &str, reference: &str, id: &str, running: Op
         }
     }
     let script = prune_script(data, reference, &keep);
-    match run_ssh(sbox, &sh_c(&script), None, PROBE_TIMEOUT).await {
+    match run_ssh(sbox, &sh_c(&script), Input::None, PROBE_TIMEOUT).await {
         Ok((Some(0), _, _)) => {}
         Ok((code, _, err)) => {
             tracing::debug!(box_name = %sbox.name, ?code, ?err, "removing old builds failed")
@@ -3505,6 +3960,453 @@ mod tests {
         assert!(!lock.exists());
     }
 
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn command_link(command: &[&str], terminal: Option<&[&str]>) -> BoxLink {
+        BoxLink::Command {
+            command: words(command),
+            terminal: terminal.map(words),
+        }
+    }
+
+    /// The link of each kind of box, and what each builds: ssh's arguments as before, a
+    /// command's argv with `sh -c <line>` appended (the line one word, as it is), its terminal
+    /// argv the same, refused without one; Debug never shows a command's words.
+    #[test]
+    fn box_links_build_ssh_or_the_command() {
+        let cfg =
+            |toml: &str| twr_core::config::Config::from_toml_str(toml).unwrap().boxes["b"].clone();
+        let ssh = cfg("[boxes.b]\ntransport = \"ssh\"\nssh = \"-p 2222 me@b\"\n");
+        assert_eq!(BoxLink::of(&ssh), Some(BoxLink::Ssh("-p 2222 me@b".into())));
+        let token = cfg("[boxes.b]\ntoken = \"0123456789abcdef0123\"\nssh = \"me@b\"\n");
+        assert_eq!(BoxLink::of(&token), Some(BoxLink::Ssh("me@b".into())));
+        let bare = cfg("[boxes.b]\ntoken = \"0123456789abcdef0123\"\n");
+        assert_eq!(BoxLink::of(&bare), None);
+        let sb = cfg(
+            "[boxes.b]\ntransport = \"command\"\ncommand = [\"docker\", \"exec\", \"-i\", \"-e\", \
+             \"K=s3cret\", \"c\"]\nterminal_command = [\"docker\", \"exec\", \"-i\", \"-t\", \
+             \"c\"]\n",
+        );
+        let link = BoxLink::of(&sb).unwrap();
+        assert_eq!(
+            link,
+            command_link(
+                &["docker", "exec", "-i", "-e", "K=s3cret", "c"],
+                Some(&["docker", "exec", "-i", "-t", "c"])
+            )
+        );
+        let dbg = format!("{link:?}");
+        assert!(
+            !dbg.contains("s3cret") && dbg.contains("docker (6 words)"),
+            "{dbg}"
+        );
+        assert!(link.pipe_checked() && link.own_session_here());
+        let ssh = BoxLink::of(&ssh).unwrap();
+        assert!(!ssh.pipe_checked() && !ssh.own_session_here());
+        assert_eq!(
+            (ssh.via(), link.via()),
+            ("ssh".to_string(), "docker".to_string())
+        );
+        assert_eq!(link.program(), OsString::from("docker"));
+        assert_eq!(ssh.label(), "ssh -p 2222 me@b");
+        assert_eq!(
+            command_link(&["docker", "exec", "-i", "my box"], None).label(),
+            "docker exec -i 'my box'"
+        );
+
+        let line = "exec 'x y' --a";
+        // ssh: today's arguments.
+        assert_eq!(
+            ssh.here_args(line).unwrap(),
+            interactive_ssh_args("-p 2222 me@b", line).unwrap()
+        );
+        let (p, a) = ssh.terminal(line).unwrap();
+        assert_eq!(
+            (p, a),
+            (
+                ssh_program(),
+                terminal_ssh_args("-p 2222 me@b", line).unwrap()
+            )
+        );
+        let bg = ssh.background(line).unwrap();
+        let args: Vec<String> = bg
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ssh_args("-p 2222 me@b", line).unwrap());
+        // A command: its words, then `sh -c <line>`.
+        let want = words(&["exec", "-i", "-e", "K=s3cret", "c", "sh", "-c", line]);
+        assert_eq!(link.here_args(line).unwrap(), want);
+        let bg = link.background(line).unwrap();
+        assert_eq!(bg.as_std().get_program(), "docker");
+        let args: Vec<String> = bg
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, want);
+        let (p, a) = link.terminal(line).unwrap();
+        assert_eq!(p, OsString::from("docker"));
+        assert_eq!(a, words(&["exec", "-i", "-t", "c", "sh", "-c", line]));
+        let e = command_link(&["docker", "exec", "-i", "c"], None)
+            .terminal(line)
+            .unwrap_err();
+        assert!(e.contains("terminal_command"), "{e}");
+        // Refused words, checked again: an empty word, an ssh-like command.
+        assert!(command_link(&["docker", ""], None)
+            .background(line)
+            .is_err());
+        assert!(command_link(&["tailscale", "ssh", "me@b"], None)
+            .background(line)
+            .is_err());
+        assert!(command_link(&["docker"], Some(&["x", ""]))
+            .terminal(line)
+            .is_err());
+    }
+
+    /// Runs `line` on the box through `link` (here, on this machine) with `input`, as the hub
+    /// runs a script: its exit, stdout and stderr lines.
+    async fn run_link(
+        link: &BoxLink,
+        line: &str,
+        input: Input,
+    ) -> (Option<i32>, String, Vec<String>) {
+        run_ssh_command(
+            link.background(line).unwrap(),
+            &link.via(),
+            "sb",
+            input,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A command link runs the line as it is: `sh -c` gets it as one argument, with no shell
+    /// on the hub's side, whatever it holds (quotes, `$`, a backslash, a newline, a leading
+    /// `-`).
+    #[tokio::test]
+    async fn a_command_link_passes_the_line_as_it_is() {
+        let link = command_link(&["env", "-i", "PATH=/usr/bin:/bin"], None);
+        let odd = "-x it's \"q\" $HOME \\n\nnext";
+        let line = format!("printf '%s|' {}; echo \"[$PATH]\"", sh_quote(odd));
+        let (code, out, _) = run_link(&link, &line, Input::None).await;
+        assert_eq!(code, Some(0));
+        assert_eq!(out, format!("{odd}|[/usr/bin:/bin]\n"));
+        // With the probe's two `sh` layers too.
+        let (code, out, _) = run_link(
+            &link,
+            &sh_c(&format!("printf '%s' {}", sh_quote(odd))),
+            Input::None,
+        )
+        .await;
+        assert_eq!((code, out.as_str()), (Some(0), odd));
+    }
+
+    /// A script run through a link whose wrapper leaves a helper holding the command's stdout
+    /// and stderr ends with the leader, not with the helper (or the timeout): the leader's exit
+    /// kills its group, which closes them. Its answer and exit are kept.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_helper_holding_the_output_does_not_hold_up_a_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("helper.pid");
+        let link = command_link(
+            &[
+                "sh",
+                "-c",
+                "sleep 300 </dev/null & echo $! > \"$0\"; exec \"$@\"",
+                pid_file.to_str().unwrap(),
+                "env",
+            ],
+            None,
+        );
+        let start = std::time::Instant::now();
+        let (code, out, _) = run_ssh_command(
+            link.background("echo said; exit 3").unwrap(),
+            &link.via(),
+            "sb",
+            Input::None,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!((code, out.as_str()), (Some(3), "said\n"));
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "it waited for the helper"
+        );
+        let helper: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // (A zombie, not reaped yet, is gone.)
+        let alive = |pid: i32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| {
+                    s.rsplit_once(')')
+                        .map(|(_, r)| !r.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false)
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while alive(helper) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper still runs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A command link's terminal argv runs the line as it is too (run here, as the CLI runs it
+    /// for `twr box login`, with no terminal): `sh -c` gets it as one argument. An ssh-like
+    /// terminal command, whose remote shell would split the line, is refused.
+    #[test]
+    fn a_terminal_command_passes_the_line_as_it_is() {
+        let link = command_link(&["false"], Some(&["env", "-i", "PATH=/usr/bin:/bin"]));
+        let odd = "-x it's \"q\" $HOME \\n\nnext";
+        let line = format!("printf '%s|' {}; echo \"[$PATH]\"", sh_quote(odd));
+        let (program, args) = link.terminal(&line).unwrap();
+        let out = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{odd}|[/usr/bin:/bin]\n")
+        );
+        for like in [
+            &["ssh", "-t", "me@b"][..],
+            &["tailscale", "ssh", "me@b"],
+            &["gcloud", "compute", "ssh", "vm"],
+        ] {
+            let e = command_link(&["docker", "exec", "-i", "c"], Some(like))
+                .terminal(&line)
+                .unwrap_err();
+            assert!(
+                e.contains("passes its arguments to a shell on the box"),
+                "{e}"
+            );
+        }
+    }
+
+    /// The probe through a command link, run here, from the script to the parser: a command
+    /// that passes the hub's input on has the token back and no refusal; one that gives the
+    /// box no input (`docker exec` without `-i`) and one that gives it a terminal (`-t`) are
+    /// refused, each with its fix. An SSH link's probe has no pipe check.
+    #[tokio::test]
+    async fn the_pipe_check_runs_in_the_probe() {
+        let home = tempfile::tempdir().unwrap();
+        let env_home = format!("HOME={}", home.path().display());
+        let probe = |link: BoxLink| async move {
+            let (code, out, err) =
+                run_link(&link, &sh_c(&probe_script_for(&link)), link.probe_input()).await;
+            assert_eq!(code, Some(0), "{out} {err:?}");
+            let p = parse_probe_for(&out, &link).unwrap();
+            (p.pipe.clone(), p.pipe_refusal("sb", &link))
+        };
+        let ok = command_link(&["env", &env_home, "XDG_DATA_HOME="], None);
+        assert_eq!(probe(ok).await, (Some("twr-pipe-ok".to_string()), None));
+        let no_input = command_link(
+            &[
+                "env",
+                &env_home,
+                "XDG_DATA_HOME=",
+                "sh",
+                "-c",
+                "exec \"$@\" </dev/null",
+                "x",
+            ],
+            None,
+        );
+        let (pipe, why) = probe(no_input).await;
+        assert_eq!(pipe.as_deref(), Some(""));
+        assert_eq!(
+            why.unwrap(),
+            "box sb's command does not pass the hub's input to the box: `docker exec` and \
+             `kubectl exec` need `-i`"
+        );
+        if std::process::Command::new("script")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            let tty = command_link(
+                &[
+                    "env",
+                    &env_home,
+                    "XDG_DATA_HOME=",
+                    "sh",
+                    "-c",
+                    "exec script -qec \"$3\" /dev/null",
+                    "x",
+                ],
+                None,
+            );
+            let (pipe, why) = probe(tty).await;
+            assert_eq!(pipe.as_deref(), Some("terminal"));
+            assert!(why.unwrap().starts_with(
+                "box sb's command gives the box a terminal (a `-t` in it?): the hub's \
+                     connection is binary. Remove `-t` from [boxes.sb] command"
+            ));
+        } else {
+            eprintln!("no `script` here: the terminal case is skipped");
+        }
+        // An SSH link: no check in its probe, no refusal whatever it says.
+        let ssh = BoxLink::Ssh("me@sb".into());
+        assert!(!probe_script_for(&ssh).contains("pipe="));
+        assert_eq!(probe_script_for(&ssh), probe_script());
+        assert!(probe_script_for(&command_link(&["env"], None)).contains("pipe="));
+        let p = parse_probe("twr-probe 1\nos=Linux\n").unwrap();
+        assert_eq!(
+            (p.pipe.as_deref(), p.pipe_refusal("sb", &ssh)),
+            (None, None)
+        );
+    }
+
+    /// The probe's `pipe=` line is read after the mark only, once; without it a command
+    /// link's probe is refused (no input reached the box), an SSH link's is not. The hint
+    /// without the mark fits the link.
+    #[test]
+    fn the_pipe_line_is_parsed_after_the_mark() {
+        let link = command_link(&["docker", "exec", "-i", "c"], None);
+        let p = parse_probe("pipe=twr-pipe-ok\ntwr-probe 1\npipe=\nos=Linux\npipe=twr-pipe-ok\n")
+            .unwrap();
+        assert_eq!(p.pipe.as_deref(), Some(""));
+        assert!(p.pipe_refusal("sb", &link).unwrap().contains("need `-i`"));
+        let p = parse_probe("twr-probe 1\nos=Linux\n").unwrap();
+        assert_eq!(p.pipe, None);
+        assert!(p.pipe_refusal("sb", &link).unwrap().contains("need `-i`"));
+        let p = parse_probe("twr-probe 1\npipe=twr-pipe-ok\nos=Linux\n").unwrap();
+        assert_eq!(p.pipe_refusal("sb", &link), None);
+        let e = parse_probe_for("hello\n", &link).unwrap_err().to_string();
+        assert!(e.contains("as `docker exec` does?"), "{e}");
+        let e = parse_probe_for("hello\n", &BoxLink::Ssh("me@b".into()))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("is the login shell POSIX?"), "{e}");
+    }
+
+    /// What docker's and podman's clients say when they fail, made plain with the fix; the
+    /// relay's own lines and an exit 0 are not looked at, and an unknown message is left to
+    /// the caller.
+    #[test]
+    fn command_failures_say_what_to_do() {
+        let fail = |l: &str| {
+            command_failure(
+                "sb",
+                Some(1),
+                &["twr-box: is not running".to_string(), l.to_string()],
+            )
+        };
+        let why = fail("Error response from daemon: No such container: twr-plan-nosuch").unwrap();
+        assert_eq!(
+            why,
+            "box sb's container does not exist (Error response from daemon: No such container: \
+             twr-plan-nosuch): create and start it (docs/runners.md#container-boxes)"
+        );
+        let why =
+            fail("Error: no container with name or ID \"x\" found: no such container").unwrap();
+        assert!(
+            why.starts_with("box sb's container does not exist"),
+            "{why}"
+        );
+        let why = fail("Error response from daemon: container 4f2a is not running").unwrap();
+        assert_eq!(
+            why,
+            "box sb's container is stopped (Error response from daemon: container 4f2a is not \
+             running): start it"
+        );
+        let why = fail(
+            "Error: can only create exec sessions on running containers: container state improper",
+        )
+        .unwrap();
+        assert!(why.starts_with("box sb's container is stopped"), "{why}");
+        for l in [
+            "failed to connect to the docker API at unix:///x.sock; check if the path is correct \
+             and if the daemon is running: dial unix /x.sock: connect: no such file or directory",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker \
+             daemon running?",
+            "permission denied while trying to connect to the Docker daemon socket at \
+             unix:///var/run/docker.sock",
+        ] {
+            let why = fail(l).unwrap();
+            assert!(
+                why.starts_with("the hub can't reach the container engine (")
+                    && why.contains("`DOCKER_HOST` or `DOCKER_CONTEXT`"),
+                "{why}"
+            );
+        }
+        let why = fail(
+            "OCI runtime exec failed: exec failed: unable to start container process: exec: \
+             \"sh\": executable file not found in $PATH: unknown",
+        )
+        .unwrap();
+        assert!(why.starts_with("box sb has no `sh` ("), "{why}");
+        let why =
+            fail("cannot attach stdin to a TTY-enabled container because stdin is not a terminal")
+                .unwrap();
+        assert!(why.contains("Remove `-t` from [boxes.sb] command"), "{why}");
+        assert_eq!(fail("something else"), None);
+        assert_eq!(
+            command_failure("sb", Some(0), &["No such container: x".to_string()]),
+            None
+        );
+        // A command link's failure is this; an ssh link's is ssh's, on exit 255 only.
+        let link = command_link(&["docker"], None);
+        assert!(link
+            .failure("sb", Some(1), &["No such container: x".into()])
+            .is_some());
+        let ssh = BoxLink::Ssh("me@sb".into());
+        let denied = ["me@sb: Permission denied (publickey).".to_string()];
+        assert!(ssh.failure("sb", Some(255), &denied).is_some());
+        assert_eq!(ssh.failure("sb", Some(1), &denied), None);
+        // A very long line is cut.
+        let long = format!("No such container: {}", "x".repeat(10 * NOTE_MAX_BYTES));
+        assert!(fail(&long).unwrap().len() < NOTE_MAX_BYTES);
+    }
+
+    /// An upload refused because the hub's build does not run on the box for its C library
+    /// gets the hint (on a glibc build of the hub); an unwritable HOME on a command box gets
+    /// its own.
+    #[test]
+    fn upload_hints_name_the_c_library_and_home() {
+        let glibc = "it says /home/box/.local/share/twr/runner/builds/0123456789abcdef/.twr.up: \
+                     /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found when run, \
+                     not 'twr 0.2.0'";
+        let musl = "it says sh: /home/box/x/twr: not found when run, not 'twr 0.2.0'";
+        if cfg!(all(target_os = "linux", target_env = "gnu")) {
+            for answer in [glibc, musl] {
+                let h = glibc_hint(answer).unwrap();
+                assert!(
+                    h.starts_with(
+                        "a development build of twr needs a box or container with this \
+                                   machine's C library or newer (glibc "
+                    ) && h
+                        .ends_with("use a newer image or system there, or a release build of twr"),
+                    "{h}"
+                );
+            }
+        } else {
+            assert_eq!(glibc_hint(glibc), None);
+        }
+        assert_eq!(glibc_hint("it arrived with 3 bytes, not 4"), None);
+        assert_eq!(
+            home_hint("sb", "/root/.local/share"),
+            "box sb's HOME is /root, which its user can't write to: with `docker exec -u`, also \
+             pass `-e HOME=<that user's home>` and `-w` (exec keeps the container's HOME)"
+        );
+        assert!(home_hint("sb", "/data").starts_with("box sb's data directory is /data, which"));
+    }
+
     #[test]
     fn ssh_failures_say_what_to_do() {
         let lines = |l: &str| vec!["debug1: x".to_string(), l.to_string()];
@@ -3745,10 +4647,15 @@ mod tests {
         };
         // A script's ssh: its exit status kept, the helper gone.
         let pid_file = dir.path().join("script.pid");
-        let (code, out, _) =
-            run_ssh_command(cmd(&pid_file, false), "gpu", None, Duration::from_secs(20))
-                .await
-                .unwrap();
+        let (code, out, _) = run_ssh_command(
+            cmd(&pid_file, false),
+            "ssh",
+            "gpu",
+            Input::None,
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
         assert_eq!((code, out.as_str()), (Some(3), "said\n"));
         gone(&pid_file);
         // A session's ssh that ended.

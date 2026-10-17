@@ -1499,7 +1499,8 @@ impl TwrMcp {
                        default_runtime, project_roots, [orchestrator], [threads], [trash], \
                        the configured projects with their repositories, runtime presets, boxes \
                        and [hub]. Tokens, env values (only their names, env_names), preset \
-                       command lines, ssh destinations and TLS files are never shown. JSON.",
+                       command lines, ssh destinations, box commands and TLS files are never \
+                       shown. JSON.",
         annotations(read_only_hint = true)
     )]
     async fn show_config(&self) -> Result<String, String> {

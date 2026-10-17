@@ -2185,6 +2185,14 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "{}", shown());
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        // Ctrl-C only once the child's shell has become `sleep`: typed while it still runs
+        // `mv`, the shell ends with a status instead of the signal.
+        let pid = std::fs::read_to_string(&stat).unwrap();
+        let comm = format!("/proc/{}/comm", pid.split_whitespace().next().unwrap());
+        while std::fs::read_to_string(&comm).unwrap_or_default().trim() != "sleep" {
+            assert!(std::time::Instant::now() < deadline, "{}", shown());
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         typed.write_all(b"\x03").unwrap();
         let status = loop {
             if let Some(s) = script.try_wait().unwrap() {

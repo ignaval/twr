@@ -638,11 +638,11 @@ where
         refuse_unauthenticated(ws, permit, Some(m)).await;
         return Err(Refused::Other);
     }
-    // A listener's connection naming an SSH box is one naming a box the hub does not know;
-    // a sealed one is its box's.
+    // A listener's connection naming a box the hub dials (ssh or command) is one naming a box
+    // the hub does not know; a sealed one is its box's.
     let rbox = hub.remote(&hello.box_name).filter(|b| match &bound {
         None => b.transport() == BoxTransport::Token,
-        Some(_) => b.transport() == BoxTransport::Ssh,
+        Some(_) => b.transport().dialed(),
     });
     let hub_nonce = new_nonce();
     let proof = match (&hub_nonce, &rbox, &bound) {

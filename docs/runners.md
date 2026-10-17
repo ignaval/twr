@@ -1,6 +1,6 @@
 # Runners: threads on other machines
 
-A box other than `local` is another machine that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A box the hub can't reach over SSH runs `twr runner`, which connects out to the hub ([below](#boxes-the-hub-cant-reach-over-ssh)).
+A box other than `local` is another machine, or a container, that runs threads for the hub. Adapters, git worktrees and snapshots all happen on the box. There are three kinds. A box the hub can reach over SSH needs one command and nothing else on your side: no token, listener, tunnel or service. A container box is the same, with `docker exec` (or podman, or `kubectl exec`) in place of ssh ([Container boxes](#container-boxes)). A box the hub can't reach either way runs `twr runner`, which connects out to the hub ([below](#boxes-the-hub-cant-reach-over-ssh)).
 
 ## SSH boxes
 
@@ -27,7 +27,7 @@ For each SSH box, the hub runs ssh itself, from its own environment:
 - **Install.** On a box of the hub's OS and CPU, the hub runs its own build there. When that build is missing, the hub streams its own executable through ssh into `~/.local/share/twr/runner/builds/<build id>/twr` (mode 0700), and checks its size, its SHA-256 (with `sha256sum` or `shasum`, when the box has one; one that fails refuses the upload) and its `--version` before it moves it into place. A build id is the first 16 hex digits of the executable's SHA-256. twr uses the builds directory only when it and the directories above it are yours and no other user can write to them ([security-model.md](security-model.md#ssh-boxes)). The builds directory is shared by every twr instance that reaches the box as that user, so each hub records the builds it uses there, per box, in `builds/.refs/<hub id>-<box>`, and `twr box install` records the build it installs in a file of its own next to it (`<hub id>-<box>.install.<build id>`), which the hub removes once it runs that build. Writers take `builds/.refs.lock` (a directory, removed when they are done, or by the next writer two minutes later). After connecting, a hub keeps every build any of those records names, plus one more, any build an upload is writing and any build changed in the last 30 minutes, and removes the rest. A record no hub has rewritten for 90 days stops counting: a hub you no longer run doesn't keep its builds forever. A box of another OS or CPU needs `twr box install` ([below](#another-os-or-cpu)).
 - **Connect.** It runs `ssh <box> -- <build> runner --stdio --box=<name> --hub-key <key>`. That relay finds the box daemon of this hub and box, or starts one, and passes bytes between ssh and the daemon. The daemon owns the box's runtimes, its spool and its worktrees, and keeps them running when the connection ends. It keeps its data in `~/.local/share/twr/box-daemons/<hub id>-<box>/` (its log is `daemon.log` there) and listens on a socket in `~/.local/state/twr/box-daemons/`. The hub id is the first 16 hex digits of the SHA-256 of the hub's public key, so two twr instances (`TWR_HOME`) that share a box get separate daemons.
 - **Sealed channel.** The hub and the daemon talk through a channel only the hub's key can open, end to end: the relay and the socket only see encrypted records. See [security-model.md](security-model.md#ssh-boxes).
-- **Reconnect.** When the connection drops (the network, laptop sleep, a killed ssh), the hub tries again 1 second later, then at most 5 seconds apart during the first minute and 30 seconds after that. The daemon and its agents run on meanwhile, and the next connection picks up where the last one left off, as a token runner's does ([When the connection drops](#when-the-connection-drops)). After a hub restart, the new hub connects to the same daemon.
+- **Reconnect.** When the connection drops (the network, laptop sleep, a killed ssh), the hub tries again 1 second later, then at most 5 seconds apart during the first minute and 30 seconds after that. The daemon and its agents run on meanwhile, and the next connection picks up where the last one left off, as a token runner's does ([When the connection drops](#when-the-connection-drops)). After a hub restart, the new hub connects to the same daemon. A relay whose connection ends before it relays (the hub gave up on the attempt and killed its ssh) starts or stops nothing more, though a daemon start already under way finishes.
 - **A box reboot** ends the daemon and its agents. The hub's next connection starts a new daemon. Threads whose agents were running get an error card, as a token runner's do after a restart.
 
 ssh runs with `BatchMode=yes`, so it never prompts, and with every kind of forwarding and local commands turned off, whatever your `~/.ssh/config` says. It reads your ssh config and keys otherwise. `TWR_SSH` names another ssh program. The options in `[boxes.<name>] ssh` can't turn forwarding back on or change how ssh runs: see [configuration.md](configuration.md#notes-on-some-keys) for what they may hold.
@@ -45,9 +45,9 @@ Threads on an SSH box get the branch names of threads on the hub's own box (`twr
 
 | Command | What it does |
 | --- | --- |
-| `twr box list [--json]` | the hub's boxes: name, transport (`ssh` or `token`), state, the twr version its runner reported, OS/CPU, and its agent CLIs as the box last reported them (`claude ✓ codex ✗ grok ?`: logged in, logged out, not known; `-` not installed) |
+| `twr box list [--json]` | the hub's boxes: name, transport (`ssh`, `command` or `token`), state, the twr version its runner reported, OS/CPU, and its agent CLIs as the box last reported them (`claude ✓ codex ✗ grok ?`: logged in, logged out, not known; `-` not installed) |
 | `twr box status <name> [--json]` | everything the hub knows of one: state, version, the build it launched, a pending switch, OS/CPU, how its daemon was started, the last error, the latest notes (newest last), a connection the hub refused, and each agent CLI's path, version and login |
-| `twr box install <name> [--binary <path> \| --from-box <path>] [--yes]` | install twr on an SSH box and have the hub connect again ([below](#another-os-or-cpu)) |
+| `twr box install <name> [--binary <path> \| --from-box <path>] [--yes]` | install twr on an SSH or container box and have the hub connect again ([below](#another-os-or-cpu)) |
 | `twr box restart <name> [--yes]` | have the hub restart the box daemon ([below](#restart-the-box-daemon)) |
 | `twr box remove <name>` | take the box out of `boxes.toml` |
 | `twr box doctor <name> [--json]` | check the box and say how to fix what is wrong, with or without a hub ([Check a box](#check-a-box)) |
@@ -56,7 +56,7 @@ Threads on an SSH box get the branch names of threads on the hub's own box (`twr
 
 States: `connecting` (probing, installing, opening the connection), `online`, `offline` (between attempts), `needs_install` (run `twr box install <name>`), `switching` (see below) and `error` (the hub's box key can't be loaded).
 
-`twr box remove` changes only `boxes.toml`. A box you configured in `config.toml` stays there: remove it yourself. The running hub keeps the box connected until it restarts (`twr hub stop`, then `twr`). The box daemon, its agents and the box's worktrees stay on the box; `twr box remove` prints the command that stops the daemon: the hub's own ssh, with its options and forwarding off, running `<build> runner --stdio --box=<name> --hub-key <key> --stop` on the box. Run it once the hub no longer connects to the box, or the hub starts a daemon again.
+`twr box remove` changes only `boxes.toml`. A box you configured in `config.toml` stays there: remove it yourself. The running hub keeps the box connected until it restarts (`twr hub stop`, then `twr`). The box daemon, its agents and the box's worktrees stay on the box; `twr box remove` prints the command that stops the daemon: the hub's own ssh, with its options and forwarding off, running `<build> runner --stdio --box=<name> --hub-key <key> --stop` on the box (for a container box, the box's command with `sh -c`; twr never removes the container). Run it once the hub no longer connects to the box, or the hub starts a daemon again.
 
 ### Another OS or CPU
 
@@ -100,6 +100,99 @@ What a Mac needs:
 - **The agents logged in at the Mac itself.** On a Mac, agents use their keychain or file logins. The launchd job gets only part of the ssh session's environment, by name: `PATH`, `HOME`, `SHELL`, `USER`, `LOGNAME`, `LANG`, `LC_*`, `TMPDIR`, `TZ`, `XDG_*`, `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN`, `TWR_BOX_PROBE` and `TWR_AGENT_PROBE`. An API key set in the environment ssh commands get on the Mac (`ANTHROPIC_API_KEY`, say) doesn't reach a daemon launchd starts. A value a launchd job can't hold (not UTF-8, or a character XML forbids) is left out with a note. With `PATH` or `HOME` left out, the relay doesn't start the daemon with launchd, and starts it from ssh instead.
 
 `twr box doctor <box>` checks a Mac's own needs in its **macOS** group ([Check a box](#check-a-box)). `twr box login <box> claude` on a Mac with no one logged in at its screen says first that the box daemon's Claude Code can't read a login made now until someone logs in there and the daemon is restarted. A login over ssh reaches the keychain only while it is unlocked, so if the login doesn't stick, log in at the Mac once. `twr attach` of a Claude Code thread on a Mac runs Claude over ssh, where it may not read its keychain login: if it asks you to log in, end the attach and continue the thread from the TUI, where the box daemon's Claude Code keeps its login ([Attach on a remote box](#attach-on-a-remote-box)).
+
+## Container boxes
+
+A container box is a container the hub reaches through a command from the config instead of ssh: `docker exec -i <container>`, `podman exec -i` or `kubectl exec -i`. The hub speaks the same box protocol over that command's stdin and stdout: the same probe, upload, box daemon and sealed channel. Use one to run agents on a repository you don't trust where they can't reach your files, your ssh-agent or the hub's socket ([security-model.md](security-model.md#container-boxes) says what a container does and doesn't keep out).
+
+### Set one up
+
+```sh
+docker build -t twr-box docs/tools/container-box
+docker volume create twr-sandbox-home
+docker network create twr-sandbox
+docker run -d --name twr-sandbox --init --restart unless-stopped \
+  --network twr-sandbox -v twr-sandbox-home:/home/box \
+  --env-file ~/.config/twr/sandbox.env twr-box
+twr box add sandbox --command docker exec -i twr-sandbox
+```
+
+- `docs/tools/container-box/Dockerfile` is an Ubuntu 24.04 image with git, the tools twr needs and a plain user, `box`, whose home is the working directory. Build on it to add the agents' CLIs.
+- `--init` runs a small init as PID 1, which reaps processes left behind (a box daemon that ends after its relay left). Without it they stay zombies.
+- `--restart unless-stopped` brings the container back after a reboot or an engine restart.
+- The named volume keeps the user's home: twr's builds, the box daemon's spool and worktrees, the repositories and the agents' logins. Recreating a container without one loses all of that.
+- `--env-file` gives the container its secrets, such as the agents' API keys. Don't put them in `command` (`-e KEY=value`): `ps` on the hub's machine shows the command. `-e NAME` without a value copies the hub's own `NAME`.
+- The network of its own gives firewall rules one place to attach ([Network](#network)).
+- No bind mount of your home or of a repository, no `/var/run/docker.sock`, no `--privileged`, `--network host` or `--pid host`: each of them undoes the isolation.
+
+`twr box add <name> --command <program> <args>...` takes the words after `--command` as the command, as they are (not through a shell), and works as for an SSH box: it runs the hub's probe through the command, says what it found and what will happen, asks (`--yes` skips the question), writes `[boxes.<name>]` with `transport = "command"` and `command = [...]` to `boxes.toml`, and waits for the box to come online. It runs the probe as the hub does, in a session of its own without a terminal, so a command that would prompt (`sudo` without `NOPASSWD`) fails here too. When the command is `docker`, `podman` or `nerdctl exec`, or `kubectl exec`, with `-i` (`--interactive`, `--stdin`), it also writes `terminal_command`: the same words with `-t` after the `-i`.
+
+### How the hub runs the command
+
+The hub runs `<command...> sh -c <line>`, where `<line>` is what it hands ssh for an SSH box: the probe, the upload, `exec <build> runner --stdio ...`. The words from your config never go through a shell on the hub's side, and one `sh` runs on the box, whatever the container user's login shell. So:
+
+- The command must pass its input to the box and give the box no terminal: `-i`, and no `-t`. The probe checks both (the pipe check) on every attempt, and in `twr box add`, `twr box install` and `twr box doctor`, and says which one is wrong.
+- It must not prompt. The hub runs it in a session of its own, without a terminal, from the hub's own environment: the hub's `DOCKER_HOST`, `DOCKER_CONTEXT` and groups, not your shell's, if they differ. When the hub can't reach the engine, the box's last error says so.
+- The container needs `sh` and the usual tools (`uname`, `id`, `ls`, `readlink`, `wc`, `tr`, `head`, `cut`, `cat`, `mkdir`, `chmod`, `mv`, `rm`; `sha256sum` or `shasum` for the hash check), and git. Debian, Ubuntu and Busybox images have them; a distroless image doesn't.
+- ssh-like programs are refused as `command` and as `terminal_command`: `ssh`, `tailscale ssh`, `az ssh`, `gcloud compute ssh`. They pass their arguments to a shell on the far end, which would split twr's scripts. Make those hosts SSH boxes: a Tailscale SSH host and a `gcloud compute config-ssh` host work with plain ssh.
+- `TWR_SSH` and the ssh options don't apply.
+
+Other engines:
+
+```toml
+command = ["podman", "exec", "-i", "twr-sandbox"]
+command = ["kubectl", "exec", "-i", "-n", "sandbox", "twr-box-0", "--"]   # kubectl needs the `--`
+```
+
+For a container that runs as root, run the box as a plain user with `-u`. When the container's environment sets `HOME` (an image's `ENV HOME`, or `docker run -e HOME`), `docker exec -u` keeps that `HOME`, so pass the user's own, and its working directory:
+
+```toml
+command = ["docker", "exec", "-i", "-u", "box", "-e", "HOME=/home/box", "-w", "/home/box", "twr-sandbox"]
+```
+
+Add `-e XDG_DATA_HOME=...`, `-e XDG_STATE_HOME=...` and `-e XDG_CONFIG_HOME=...` when the image sets those for root. Without them, the hub's upload fails, and the box's last error says that its `HOME` isn't writable for its user.
+
+A development build of twr is linked against the C library (glibc) of the machine that built it, so the hub's own build runs only in a container with that glibc or newer: ubuntu:24.04 has 2.39, Debian bookworm's 2.36 is older, and Alpine has none. The box's last error says so. A release build is static and runs in any Linux container. A container of another CPU (an arm64 image under emulation) needs `twr box install`, as an SSH box does ([Another OS or CPU](#another-os-or-cpu)): every upload goes through the command too.
+
+### What twr does with the container
+
+twr never creates, starts, stops or removes a container. Those are yours to do.
+
+- **Stopped** (`docker stop`, a reboot, the engine restarting): the box daemon, its agents and the relay end with the container. The box goes offline, and its last error says the container is stopped. The hub tries again on its usual schedule ([What the hub does](#what-the-hub-does)). Once the container runs again, the next attempt starts a new daemon, and threads whose agents were running get a crash card, as after a box reboot. Their next prompt resumes the session.
+- **Recreated** (`docker rm`, then `docker run`): what wasn't in a volume is gone. The hub uploads its build again and the daemon starts empty.
+- **Gone:** the box's last error says the container doesn't exist. `twr box remove` takes the box out of `boxes.toml` and prints the command that stops the daemon (`docker exec -i twr-sandbox sh -c '...'`). It leaves the container as it is.
+- **The hub ends a connection** by killing the command's process group. The `docker exec` client ends, the relay in the container reads the end of its input and ends, and the daemon runs on. There are no ssh keepalives, but the runner protocol's pings end a connection that hangs.
+
+`twr box status` doesn't show the command. `twr box doctor` shows it to you, and to an agent only the program and how many words the command has.
+
+### Agents in the container
+
+The agents' CLIs and their logins live in the container. Install them in the image (or as the box's user in the running container), then log them in there: `twr box login sandbox claude` runs the login through `terminal_command` in your terminal, and `docker exec -it twr-sandbox claude auth login` does it directly. API keys go in the container's environment (`--env-file`). An agent working on the repository can read whatever logins and keys the container has, so use keys you can revoke and cap.
+
+### What needs a terminal
+
+`terminal_command` is used by `twr box login` and `twr box project --clone`. Without one, both are refused, saying how to set it. A `docker exec -t` client can go away while what it ran goes on: Docker's detach keys (Ctrl-P Ctrl-Q) end the client, and so does killing it.
+
+- Detaching from `twr box login` leaves the login running in the container. It holds no twr state. Run `twr box login` again, or end it with `docker exec twr-sandbox pkill -f 'claude.*login'`.
+- A clone whose client went away runs to its end in the container. If it fails, it removes its folder, as always. If it succeeds, the folder stays, unrecorded, and `twr box project <box> <project>` finds it (or record it with `--path`). Ctrl-C in your terminal still stops the clone and removes the folder.
+
+`twr attach` to a thread on a container box is refused for now: twr can't tell when an attach through `docker exec -t` ends, since the client can go away while the agent's CLI runs on in the container. Continue the thread from the TUI or with `twr send`.
+
+### Network
+
+Without mounts, the box daemon and its agents can't reach the hub's socket, your files, your ssh-agent or the hub's box key. What they reach on the network depends on the engine and its settings:
+
+- Docker Desktop (macOS, Windows, and Docker Desktop on Linux): `host.docker.internal` reaches services on the host's loopback, the hub's runner listener included (which still needs a box token).
+- Docker Engine on Linux: the bridge's gateway (`172.17.0.1` on the default bridge) reaches host services that listen on all interfaces or on that address. `--add-host host.docker.internal:host-gateway` gives it a name.
+- Podman: `host.containers.internal`; with pasta or slirp4netns, whether the host's loopback is reachable depends on their options.
+- `--network host`: everything the host reaches.
+
+twr doesn't check any of this. If keeping the host's services out matters, filter the traffic yourself. On Linux (Docker Engine) that takes two sets of rules, since the container's traffic takes two paths:
+
+- **To the host itself** (the gateway address, or any other address of the host): this traffic goes through the host's input path, which Docker's `DOCKER-USER` chain never sees. Filter it on the network's bridge interface. Name the interface when you create the network (`docker network create -o com.docker.network.bridge.name=twr-sb0 twr-sandbox`), or find it (`br-` and the start of the network's ID). Then drop new connections from it: `iptables -I INPUT -i twr-sb0 -m conntrack --ctstate NEW -j DROP`, or the same in an nftables chain on the `input` hook. For anything the container needs from the host, insert an accept rule after that one (`-I` puts each new rule first).
+- **Through the host to other machines** (your LAN, the private ranges): this traffic is forwarded. Add rules to Docker's `DOCKER-USER` chain, or an nftables chain on the `forward` hook, that drop traffic from the network's subnet to the private ranges and allow what the agents need (their APIs, a package mirror).
+
+A network with IPv6 needs the same rules for IPv6 (`ip6tables`, or an `inet` table in nftables). These are starting points, not a complete firewall: try them from the container (`docker exec twr-sandbox curl <a host service>`) and make them persist across reboots your usual way. On Docker Desktop, use its settings, or give the container no network and the agents an egress proxy for their APIs.
 
 ## Boxes the hub can't reach over SSH
 
@@ -242,7 +335,8 @@ The hub's own box (`local`) asks no login shell: its runtimes get the hub's envi
 - **ssh without prompting.** ssh to the box as the hub runs it (`BatchMode`).
 - **ssh in this terminal.** The hub's probe, run with ssh in your terminal, so ssh may ask about the host key or for a passphrase. It finds the box's OS and CPU, its data directory, whether the builds folder is safe to use, and the builds there.
 - **build.** The twr build on the box that runs the checks below: the hub's when it's there, else the box's configured `build`, else the newest one there. Doctor says which. When something answers on the hub's socket but does not say which build it runs, the hub's build is unknown: the configured or newest build runs the checks, and doctor says why.
-- **daemon** (SSH boxes). Whether this hub's box daemon runs (`twr runner --stdio --status`), with its build and runner protocol.
+- **command** and **pipe** (container boxes, instead of the two ssh checks). The same probe, run through the box's command as the hub runs it: on a failure, the command's last line and its fix (a container that doesn't exist or is stopped, an engine the command can't reach, no `sh`). Then whether the command passes its input to the box without a terminal (`-i`, no `-t`).
+- **daemon** (SSH and container boxes). Whether this hub's box daemon runs (`twr runner --stdio --status`), with its build and runner protocol.
 - **logind** (Linux). Whether you linger, whether logind ends your processes with your last session, and whether the running daemon is in its systemd user service (an active `twr-box-<hash>-*` unit). Lingering alone is not enough: when `systemd-run` failed, the daemon runs in a session, and if logind ends your processes it ends with the hub's ssh.
 - **macOS** (a Mac). Whether someone is logged in at the Mac's screen (`launchctl print gui/<uid>` over ssh): if not (it exits 113), it fails, with the fix to log in there or turn on automatic login, then `twr box restart <box>`; a `launchctl` that fails otherwise, or isn't there, is a warning that it couldn't tell. Then how the running daemon was started, as it told the hub (`hub.info` `launch`), only while the box is connected (not known without a hub, or while the box is offline: the hub keeps what the last daemon said): a launchd job is fine, a daemon started from ssh is worth a look, since Claude Code can't read its keychain login there (`twr box restart <box>`). For Claude Code on a Mac, the agent check below takes its login from the box daemon over the probe's over ssh, while the box is connected: the hub has the box probe its agents again first (as `twr box login` does, at most 45 seconds; when that fails, as the daemon last reported them, said so), and the check says when the two differ: the keychain answers a daemon in the GUI session, and ssh only while it is unlocked. A box that isn't connected gets the probe's over ssh, saying the daemon's own view isn't known. A daemon that doesn't find Claude Code while ssh does (installed since the daemon started) is a warning too, with `twr box restart <box>` as the fix. For a token box these speak of the runner you start on the Mac, not of a box daemon.
 - **login shell** and each agent. `twr runner --agents` on the box says whether the login shell gave its `PATH`, and each CLI's path, version and login. The fix says how to install it or log it in.
@@ -311,6 +405,8 @@ A runner the hub refuses, or whose hub can't prove it knows the token, waits at 
 ## Attach on a remote box
 
 `twr attach <thread>` on a remote thread pauses the runtime through its runner and runs the agent's CLI over `ssh -t <ssh> -- <command>`, in the thread's directory on the box. That ssh forwards nothing either, whatever your `~/.ssh/config` says: no agent, X11, Kerberos credentials, ports or tunnel (`-o ClearAllForwardings=yes -o ForwardAgent=no -o ForwardX11=no -o PermitLocalCommand=no -o Tunnel=no` before the `ssh` words, `-a -x -k` after them). The CLI you attach to is an agent's, and must not reach your ssh agent any more than the box's runtimes can: a `git push` from the attached session uses the box's own keys. It needs `[boxes.<name>] ssh`, and a POSIX login shell for that user on the box (`sh`, `bash`, `zsh`): the hub quotes the command for one, and a `fish` or `csh` login shell would read it differently. The `ssh` value may start with extra options, as in `-p 2222 me@host`. The hub builds that command with the thread's mode, model and effort as they are. It never trims them to what the hub's own `claude` supports, since the box may run another version. A `claude` on the box that lacks an option (an old one without `--effort`) refuses the command line in your terminal: run `claude update` there.
+
+On a container box `twr attach` is refused for now ([Container boxes](#what-needs-a-terminal)).
 
 On a Mac, `twr attach` of a Claude Code thread says, before it pauses the runtime, that Claude then runs over ssh, where it may not read its keychain login: if it asks you to log in, end the attach (exit it) and continue the thread from the TUI. The box daemon's Claude Code keeps its login. twr knows a box is a Mac from the hub's probe of an SSH box; for a token box it doesn't know, and says nothing.
 

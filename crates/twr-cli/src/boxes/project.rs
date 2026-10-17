@@ -4,8 +4,8 @@
 //! only once the user named it (`--path`) or confirmed it (or passed `--yes`).
 //!
 //! **Guards first.** An agent ([`refuse_agent_action`]) and a named workspace are refused
-//! before any ssh or write; `--clone` needs a terminal on stdin and stdout (`--yes` only skips
-//! its question).
+//! before anything runs on the box or is written; `--clone` needs a terminal on stdin and
+//! stdout (`--yes` only skips its question), and on a command box its terminal_command.
 //!
 //! **The project, on the hub.** A configured project (`[projects.<p>] repo`), else a folder
 //! name under the hub's `project_roots`, as `thread.new` looks it up on the hub's own box
@@ -15,8 +15,9 @@
 //! without them ([`RemoteUrl::parse_lenient`]), and they are never sent: the box gets the
 //! URL without them.
 //!
-//! **On the box.** A first ssh in this terminal probes the box (the doctor's
-//! [`inspect_script`]: its home, data directory and twr builds) and picks the build to run as
+//! **On the box.** A first run on the box ([`here`]: ssh in this terminal, or a command box's
+//! command, its pipe check with it) probes the box (the doctor's [`inspect_script`]: its home,
+//! data directory and twr builds) and picks the build to run as
 //! doctor picks it ([`pick_build`]). That build then runs `twr runner --find-repo` (every
 //! operand quoted, [`sh_word`] inside [`ssh_box::sh_c`]) with the home-mapped hint: the hub
 //! repository's path relative to the hub's home (`$HOME`), under the box's home. A candidate
@@ -29,8 +30,9 @@
 //!
 //! **`--clone`** refuses an origin twr does not clone ([`RemoteUrl::parse`]: credentials,
 //! `file://`, a local path, another scheme), says why and what to do, and otherwise runs `twr
-//! runner --clone-repo` on the box over ssh with a terminal ([`ssh_box::terminal_ssh_args`]:
-//! forwarding off, so git uses the box's own credentials), in this terminal, into `--into`
+//! runner --clone-repo` on the box with a terminal ([`BoxLink::terminal`]: ssh's
+//! [`ssh_box::terminal_ssh_args`], forwarding off, so git uses the box's own credentials; or a
+//! command box's terminal_command), in this terminal, into `--into`
 //! (the clone's own new directory, as `git clone <url> <dir>` takes it: its parent and its
 //! name are passed, [`split_into`]), else the home-mapped path (else `<box home>/code/<the
 //! folder>`). The box prints the clone's path last (`twr-clone-path <path>`,
@@ -60,7 +62,7 @@ use twr_core::gitremote::RemoteUrl;
 use twr_core::paths::{sh_word, Paths};
 use twr_core::project_lookup::{self, is_plain_name};
 use twr_core::proto::{codes, RpcError};
-use twr_hub::ssh_box;
+use twr_hub::ssh_box::{self, BoxLink, Input};
 use twr_runner::local::LocalGit;
 use twr_runner::repos::{shown_origin, Candidate, FindReport, Reason, CLONE_PATH_MARK};
 
@@ -70,8 +72,8 @@ use super::doctor::{
     box_side_failure, inspect_script, parse_inspect, pick_build, running_hub, BuildSource,
 };
 use super::{
-    ask_on_stderr, check_merged, confirm, consent, default_workspace_only, no_hub,
-    refuse_agent_action, ssh_here, ssh_program_name, PROBE_WAIT,
+    ask_on_stderr, check_merged, confirm, consent, default_workspace_only, failed_here, here,
+    no_hub, reached, refuse_agent_action, terminal_refusal, unanswered, PROBE_WAIT,
 };
 
 /// How long the search on the box may take, ssh's questions included.
@@ -122,8 +124,8 @@ pub(super) async fn project(
         );
     };
     let file = paths.boxes_file();
-    // One snapshot of the box, read from its file now, drives both the ssh below and the
-    // write's comparison.
+    // One snapshot of the box, read from its file now, drives both what runs on it below and
+    // the write's comparison.
     let entry = Entry::new(&paths.config_file, &file, name, project, loaded)?;
     let cfg = &entry.start;
     if req.remove {
@@ -135,18 +137,31 @@ pub(super) async fn project(
              folder name (letters, digits, `-`, `_` and `.`)"
         );
     }
-    let Some(ssh) = cfg.ssh.as_deref().filter(|s| !s.trim().is_empty()) else {
+    let Some(link) = BoxLink::of(cfg) else {
         bail!(
             "box {name} has no ssh destination ([boxes.{name}] ssh), so twr cannot look on it: \
              add [boxes.{name}.projects.{}] repo = \"<path on the box>\" yourself",
             toml_key(project)
         );
     };
+    let link = &link;
+    if req.clone {
+        let instead = format!(
+            "clone the repository in the container yourself and record it with `twr box \
+             project {} {} --path <path>`",
+            sh_word(name),
+            sh_word(project)
+        );
+        if let Some(why) = terminal_refusal(name, link, &instead) {
+            bail!("{why}");
+        }
+    }
     let hub_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|h| h.is_absolute());
     let hub_project = resolve(config, project, hub_home.as_deref()).await?;
-    // Checked before any ssh: an origin twr does not clone is refused at once.
+    // Checked before anything runs on the box: an origin twr does not clone is refused at
+    // once.
     let clone_url = if req.clone {
         Some(clone_url(&hub_project, name, project)?)
     } else {
@@ -157,7 +172,7 @@ pub(super) async fn project(
     }
     let into = req.into.as_deref().map(split_into).transpose()?;
     let hub = running_hub(socket).await;
-    let side = probe(name, ssh, cfg, &hub).await?;
+    let side = probe(name, link, cfg, &hub).await?;
     let mapped = side
         .home
         .as_deref()
@@ -166,7 +181,7 @@ pub(super) async fn project(
         return clone(
             &entry,
             socket,
-            ssh,
+            link,
             &side,
             &hub_project,
             &url,
@@ -177,12 +192,12 @@ pub(super) async fn project(
         .await;
     }
     if let Some(path) = &req.path {
-        return by_path(&entry, socket, ssh, &side, &hub_project, path).await;
+        return by_path(&entry, socket, link, &side, &hub_project, path).await;
     }
     search(
         &entry,
         socket,
-        ssh,
+        link,
         &side,
         &hub_project,
         mapped.as_deref(),
@@ -452,7 +467,7 @@ fn home_mapped(repo: &Path, home: Option<&Path>, box_home: &str) -> Option<Strin
     Some(format!("{}/{rel}", box_home.trim_end_matches('/')))
 }
 
-/// What the first ssh found on the box ([`probe`]).
+/// What the first run on the box found ([`probe`]).
 struct BoxSide {
     /// The box's name.
     name: String,
@@ -479,30 +494,35 @@ impl BoxSide {
     }
 }
 
-/// Probes box `name` (`cfg`, ssh `ssh`) in this terminal and picks the twr build that runs
-/// there, as `twr box doctor` picks it (the running hub's `hub` first).
+/// Probes box `name` (`cfg`, reached through `link`) and picks the twr build that runs there,
+/// as `twr box doctor` picks it (the running hub's `hub` first). A command box whose command
+/// does not carry the hub's connection (its pipe check) is refused here, as the hub refuses
+/// it.
 async fn probe(
     name: &str,
-    ssh: &str,
+    link: &BoxLink,
     cfg: &BoxConfig,
     hub: &super::HubBuild,
 ) -> anyhow::Result<BoxSide> {
-    outln!("probing box {name} over ssh ({ssh})...");
-    let remote = ssh_box::sh_c(&inspect_script(None));
-    let (code, out) = tokio::time::timeout(PROBE_WAIT, ssh_here(ssh, &remote, None))
+    outln!("probing box {name} {}...", reached(link));
+    let remote = ssh_box::sh_c(&inspect_script(link, None));
+    let ran = tokio::time::timeout(PROBE_WAIT, here(link, &remote, link.probe_input()))
         .await
         .map_err(|_| {
             anyhow!(
-                "probing box {name} did not finish within {} s (a question of ssh's left \
-                 unanswered, or a box that does not answer); nothing was changed",
-                PROBE_WAIT.as_secs()
+                "probing box {name} did not finish within {} s ({}); nothing was changed",
+                PROBE_WAIT.as_secs(),
+                unanswered(link)
             )
         })??;
-    if code != Some(0) {
-        let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-        bail!("ssh to box {name} failed ({code}): see ssh's message above");
+    if ran.code != Some(0) {
+        let what = format!("{} to box {name}", link.via());
+        bail!("{}", failed_here(link, name, &what, ran.code, &ran.err));
     }
-    let ins = parse_inspect(&out, 0)?;
+    let ins = parse_inspect(&ran.out, link, 0)?;
+    if let Some(why) = ins.probe.pipe_refusal(name, link) {
+        bail!("{why}");
+    }
     if let Some(why) = ins.probe.tree_refusal(name) {
         bail!("{why}");
     }
@@ -538,7 +558,7 @@ async fn probe(
 /// `twr runner --find-repo` on the box (see the module docs): its report, the candidates
 /// whose path is not absolute and printable left out (it is not complete then).
 async fn find_on_box(
-    ssh: &str,
+    link: &BoxLink,
     side: &BoxSide,
     folder: &str,
     origin: Option<&RemoteUrl>,
@@ -553,21 +573,22 @@ async fn find_on_box(
         args.push(format!("--hint={h}"));
     }
     let script = format!("{} </dev/null\n", side.runner(&args));
-    let (code, out) = tokio::time::timeout(FIND_WAIT, ssh_here(ssh, &ssh_box::sh_c(&script), None))
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "the search on box {name} did not finish within {} s; nothing was changed",
-                FIND_WAIT.as_secs()
-            )
-        })??;
-    if code != Some(0) {
+    let remote = ssh_box::sh_c(&script);
+    let find = here(link, &remote, Input::None);
+    let ran = tokio::time::timeout(FIND_WAIT, find).await.map_err(|_| {
+        anyhow!(
+            "the search on box {name} did not finish within {} s; nothing was changed",
+            FIND_WAIT.as_secs()
+        )
+    })??;
+    if ran.code != Some(0) {
         bail!(
             "{} on box {name}: see its message above; nothing was changed",
-            box_side_failure(&side.id, "--find-repo", code)
+            box_side_failure(&side.id, "--find-repo", ran.code)
         );
     }
-    let Some(mut report) = out
+    let Some(mut report) = ran
+        .out
         .lines()
         .rev()
         .find_map(|l| serde_json::from_str::<FindReport>(l.trim()).ok())
@@ -591,7 +612,7 @@ async fn find_on_box(
 fn refuse_without_git(name: &str, report: &FindReport) -> anyhow::Result<()> {
     if report.git_missing {
         bail!(
-            "git is not installed on box {name} (twr found no `git` on the PATH ssh gives it \
+            "git is not installed on box {name} (twr found no `git` on the PATH it has \
              there), so no folder there could be checked: install git on the box, then run \
              this again; nothing was recorded"
         );
@@ -649,7 +670,7 @@ fn box_origin(o: &str) -> String {
 async fn search(
     entry: &Entry<'_>,
     socket: &Path,
-    ssh: &str,
+    link: &BoxLink,
     side: &BoxSide,
     p: &HubProject,
     hint: Option<&str>,
@@ -672,7 +693,7 @@ async fn search(
             p.folder
         ),
     }
-    let report = find_on_box(ssh, side, &p.folder, p.origin.as_ref(), hint).await?;
+    let report = find_on_box(link, side, &p.folder, p.origin.as_ref(), hint).await?;
     let again = |opt: &str| {
         format!(
             "`twr box project {} {} {opt}`",
@@ -760,14 +781,14 @@ async fn search(
 async fn by_path(
     entry: &Entry<'_>,
     socket: &Path,
-    ssh: &str,
+    link: &BoxLink,
     side: &BoxSide,
     p: &HubProject,
     path: &str,
 ) -> anyhow::Result<ExitCode> {
     let name = entry.box_name;
     outln!("checking {path} on box {name}...");
-    let report = find_on_box(ssh, side, &p.folder, p.origin.as_ref(), Some(path)).await?;
+    let report = find_on_box(link, side, &p.folder, p.origin.as_ref(), Some(path)).await?;
     let Some(c) = report.candidates.iter().find(|c| c.reason == Reason::Hint) else {
         bail!(
             "{path} on box {name} is not in a git repository (or is not there): nothing was \
@@ -811,7 +832,7 @@ async fn by_path(
 async fn clone(
     entry: &Entry<'_>,
     socket: &Path,
-    ssh: &str,
+    link: &BoxLink,
     side: &BoxSide,
     p: &HubProject,
     url: &RemoteUrl,
@@ -854,14 +875,23 @@ async fn clone(
         outln!("nothing was cloned");
         return Ok(ExitCode::SUCCESS);
     }
-    let args = clone_args(ssh, side, url, &parent, &folder)?;
-    let (status, tail) = run_in_terminal(&args).await?;
+    let (program, args) = clone_args(link, side, url, &parent, &folder)?;
+    let (status, tail) = run_in_terminal(&program, &args).await?;
     let path = clone_path(&tail, &folder);
     let path = match (status.code(), path) {
         (Some(0), Some(path)) => path,
         (Some(0), None) => bail!(
             "the clone on box {name} ended without saying where it is: nothing was recorded; \
              once it is there, `twr box project {} {} --path <path>` records it",
+            sh_word(name),
+            sh_word(project)
+        ),
+        // ssh, or a command box's client, killed (`docker exec`'s may be lost while the
+        // clone runs on in the container: it removes what it made if it fails, and leaves a
+        // complete clone nobody recorded if it does not).
+        (None, _) => bail!(
+            "the connection to box {name} ended before the clone said how it went: nothing was \
+             recorded; if the clone is there, `twr box project {} {} --path <path>` records it",
             sh_word(name),
             sh_word(project)
         ),
@@ -905,38 +935,46 @@ fn clone_parent(mapped: Option<&str>, home: Option<&str>) -> Option<String> {
         .map(|h| format!("{}/code", h.trim_end_matches('/')))
 }
 
-/// The ssh arguments of a clone: with a terminal ([`ssh_box::terminal_ssh_args`]), the
-/// build picked runs `twr runner --clone-repo --url=<url> --parent=<parent> --name=<folder>`
-/// (`<folder>` the clone's own directory's name).
+/// The program and arguments of a clone through `link`, with a terminal on the box
+/// ([`BoxLink::terminal`]: ssh's [`ssh_box::terminal_ssh_args`], or a command box's
+/// terminal_command): the build picked runs `twr runner --clone-repo --url=<url>
+/// --parent=<parent> --name=<folder>` (`<folder>` the clone's own directory's name).
 fn clone_args(
-    ssh: &str,
+    link: &BoxLink,
     side: &BoxSide,
     url: &RemoteUrl,
     parent: &str,
     folder: &str,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(std::ffi::OsString, Vec<String>)> {
     let remote = ssh_box::sh_c(&side.runner(&[
         "--clone-repo".to_string(),
         format!("--url={}", url.redacted()),
         format!("--parent={parent}"),
         format!("--name={folder}"),
     ]));
-    ssh_box::terminal_ssh_args(ssh, &remote).map_err(|why| anyhow!("ssh {ssh:?}: {why}"))
+    link.terminal(&remote).map_err(|why| match link {
+        BoxLink::Ssh(ssh) => anyhow!("ssh {ssh:?}: {why}"),
+        BoxLink::Command { .. } => anyhow!("box {}: {why}", side.name),
+    })
 }
 
-/// Runs ssh with `args` (a terminal on the box) with this terminal as its stdin and stderr,
-/// its stdout (the box's terminal) copied here as it comes, as it is: its exit status and the
-/// last [`CLONE_TAIL_MAX`] bytes of that output.
-async fn run_in_terminal(args: &[String]) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>)> {
+/// Runs `program` with `args` (a terminal on the box) with this terminal as its stdin and
+/// stderr, its stdout (the box's terminal) copied here as it comes, as it is: its exit status
+/// and the last [`CLONE_TAIL_MAX`] bytes of that output.
+async fn run_in_terminal(
+    program: &std::ffi::OsStr,
+    args: &[String],
+) -> anyhow::Result<(std::process::ExitStatus, Vec<u8>)> {
     use tokio::io::AsyncReadExt;
-    let mut child = tokio::process::Command::new(ssh_box::ssh_program())
+    let shown = Path::new(program).display().to_string();
+    let mut child = tokio::process::Command::new(program)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
-        .with_context(|| format!("running {}", ssh_program_name()))?;
+        .with_context(|| format!("running {shown}"))?;
     let mut from = child.stdout.take().expect("piped");
     let mut out = std::io::stdout();
     let mut tail: Vec<u8> = Vec::new();
@@ -956,7 +994,7 @@ async fn run_in_terminal(args: &[String]) -> anyhow::Result<(std::process::ExitS
     let status = child
         .wait()
         .await
-        .with_context(|| format!("running {}", ssh_program_name()))?;
+        .with_context(|| format!("running {shown}"))?;
     Ok((status, tail))
 }
 
@@ -1045,8 +1083,8 @@ fn write_entry(entry: &Entry<'_>, repo: Option<&str>) -> anyhow::Result<()> {
     };
     if b.connection() != entry.start.connection() {
         bail!(
-            "box {name} changed in {} meanwhile (its ssh destination or settings): nothing was \
-             recorded; run the command again",
+            "box {name} changed in {} meanwhile (its ssh destination, command or settings): \
+             nothing was recorded; run the command again",
             file.display()
         );
     }
@@ -1463,7 +1501,9 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0, "ran");
         // The clone's, with a terminal: the same words after `--`.
         let url = RemoteUrl::parse("https://h/o/api.git").unwrap();
-        let a = clone_args("me@gpu", &side, &url, "/h/a b; $(x)", "api").unwrap();
+        let ssh = BoxLink::Ssh("me@gpu".into());
+        let (program, a) = clone_args(&ssh, &side, &url, "/h/a b; $(x)", "api").unwrap();
+        assert_eq!(program, ssh_box::ssh_program());
         assert!(a.iter().any(|w| w == "-t"), "{a:?}");
         let words = [
             "--clone-repo".to_string(),
@@ -1472,6 +1512,23 @@ mod tests {
             "--name=api".to_string(),
         ];
         assert_eq!(a.last().unwrap(), &ssh_box::sh_c(&side.runner(&words)));
+        // A command box's: its terminal_command, then `sh -c` and the same line; refused
+        // without one.
+        let argv = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let sb = BoxLink::Command {
+            command: argv(&["docker", "exec", "-i", "c"]),
+            terminal: Some(argv(&["docker", "exec", "-i", "-t", "c"])),
+        };
+        let (program, a) = clone_args(&sb, &side, &url, "/h/a b; $(x)", "api").unwrap();
+        assert_eq!(program, "docker");
+        let mut want = argv(&["exec", "-i", "-t", "c", "sh", "-c"]);
+        want.push(ssh_box::sh_c(&side.runner(&words)));
+        assert_eq!(a, want);
+        let bare = BoxLink::Command {
+            command: argv(&["docker", "exec", "-i", "c"]),
+            terminal: None,
+        };
+        assert!(clone_args(&bare, &side, &url, "/h", "api").is_err());
         let script = side.runner(&words).replacen("exec ", "printf '%s\\n' ", 1);
         let out = std::process::Command::new("sh")
             .arg("-c")

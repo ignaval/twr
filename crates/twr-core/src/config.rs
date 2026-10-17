@@ -34,6 +34,14 @@
 //! [boxes.gpu.projects.api]      # where project `api` lives on that box
 //! repo = "/srv/src/api"
 //!
+//! # A box the hub reaches through a command instead of ssh (a container): it runs
+//! # `<command> sh -c <what ssh would run>` itself, never through a shell on this side.
+//! [boxes.sandbox]
+//! transport = "command"
+//! command = ["docker", "exec", "-i", "twr-sandbox"]
+//! # Optional: what `twr box login` and `twr box project --clone` run in your terminal.
+//! terminal_command = ["docker", "exec", "-i", "-t", "twr-sandbox"]
+//!
 //! # A box whose runner connects to the hub's listener (`[hub] listen`) with a token.
 //! [boxes.lab]
 //! token = "..."                 # the runner's token (`--token-file` / TWR_RUNNER_TOKEN); never logged
@@ -388,8 +396,8 @@ pub struct TlsConfig {
     pub key: PathBuf,
 }
 
-/// `[boxes.<name>]`: a remote box, which the hub reaches over ssh or whose runner connects to
-/// the hub ([`BoxConfig::transport`]).
+/// `[boxes.<name>]`: a remote box, which the hub reaches over ssh or through a command, or
+/// whose runner connects to the hub ([`BoxConfig::transport`]).
 #[derive(Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BoxConfig {
@@ -408,10 +416,23 @@ pub struct BoxConfig {
     /// (required there).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh: Option<String>,
-    /// The build id ([`crate::build_id`], 16 lowercase hex digits) of the twr installed on an
-    /// SSH box whose OS or CPU is not the hub's, which the hub cannot upload its own
-    /// executable to: `twr box install` uploads a build for that target and writes its id
-    /// here, and the hub runs that build. `None`: the hub's own build. SSH boxes only.
+    /// The program and arguments the hub runs to reach a command box (`["docker", "exec",
+    /// "-i", "<container>"]`): it appends `sh -c <what ssh would run>` and speaks the box
+    /// protocol over the command's stdin and stdout. Never run through a shell on the hub's
+    /// side. Required on a command box, refused elsewhere ([`check_command_words`]). It may
+    /// hold a secret (`-e KEY=value`): Debug output shows only its program and length.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// A command box's argv for what needs a terminal on the box (`twr box login`, `twr box
+    /// project --clone`): `command` with `-t`, run the same way in the user's terminal.
+    /// Optional; command boxes only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_command: Option<Vec<String>>,
+    /// The build id ([`crate::build_id`], 16 lowercase hex digits) of the twr installed on a
+    /// box the hub connects to whose OS or CPU is not the hub's, which the hub cannot upload
+    /// its own executable to: `twr box install` uploads a build for that target and writes
+    /// its id here, and the hub runs that build. `None`: the hub's own build. SSH and command
+    /// boxes only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
     /// Projects on this box: where each repository lives there.
@@ -438,12 +459,54 @@ impl BoxConfig {
     }
 
     /// [`Config::validate`]'s checks of box `name`: an SSH box has an `ssh` destination that
-    /// [`check_ssh_words`] accepts and no token; `build`, on SSH boxes only, is a build id. (A
-    /// token box's `ssh`, which only `twr attach` uses, is the hub's to check: every twr
-    /// command loads the config, and one written before the check must not keep `twr hub
-    /// stop` from working.)
+    /// [`check_ssh_words`] accepts and no token; a command box has a `command` that
+    /// [`check_command_words`] accepts, and neither a token nor `ssh`; `command` and
+    /// `terminal_command` are a command box's only; `build`, on the boxes the hub connects to
+    /// only, is a build id. (A token box's `ssh`, which only `twr attach` uses, is the hub's to
+    /// check: every twr command loads the config, and one written before the check must not
+    /// keep `twr hub stop` from working.)
     fn check(&self, name: &str) -> anyhow::Result<()> {
-        match self.transport() {
+        let transport = self.transport();
+        if transport != BoxTransport::Command {
+            for (key, set) in [
+                ("command", self.command.is_some()),
+                ("terminal_command", self.terminal_command.is_some()),
+            ] {
+                if set {
+                    anyhow::bail!(
+                        "boxes.{name}.{key}: only a command box (transport = \"command\") has one"
+                    );
+                }
+            }
+        }
+        match transport {
+            BoxTransport::Command => {
+                let Some(argv) = &self.command else {
+                    anyhow::bail!(
+                        "boxes.{name}: a command box (transport = \"command\") needs `command`, \
+                         the program and arguments the hub runs to reach it ([\"docker\", \
+                         \"exec\", \"-i\", \"<container>\"])"
+                    );
+                };
+                check_command_words(argv)
+                    .map_err(|why| anyhow::anyhow!("boxes.{name}.command: {why}"))?;
+                if let Some(argv) = &self.terminal_command {
+                    check_command_words(argv)
+                        .map_err(|why| anyhow::anyhow!("boxes.{name}.terminal_command: {why}"))?;
+                }
+                if self.token.is_some() {
+                    anyhow::bail!(
+                        "boxes.{name}.token: a command box has no token, the hub runs its \
+                         command itself (remove the token)"
+                    );
+                }
+                if self.ssh.is_some() {
+                    anyhow::bail!(
+                        "boxes.{name}.ssh: a command box has no ssh destination, the hub runs \
+                         its command instead (remove ssh, or use transport = \"ssh\")"
+                    );
+                }
+            }
             BoxTransport::Ssh => {
                 if self.ssh.as_deref().is_none_or(|s| s.trim().is_empty()) {
                     anyhow::bail!(
@@ -463,7 +526,8 @@ impl BoxConfig {
             BoxTransport::Token => {
                 if self.build.is_some() {
                     anyhow::bail!(
-                        "boxes.{name}.build: only an SSH box (transport = \"ssh\") has a build"
+                        "boxes.{name}.build: only a box the hub connects to (transport ssh or \
+                         command) has a build"
                     );
                 }
             }
@@ -633,12 +697,72 @@ pub fn check_ssh_words(ssh: &str) -> Result<(), String> {
     }
 }
 
+/// Checks a command box's argv (`[boxes.<name>] command` or `terminal_command`): at least one
+/// word, none empty and none with a NUL byte, and not an ssh-like program, which hands its
+/// arguments to a shell on the far end (that shell would split and expand twr's scripts, the
+/// terminal's as much as the hub's): a program named `ssh`, one whose first argument is `ssh`
+/// (`tailscale ssh`, `az ssh`), or the words `compute ssh` (`gcloud compute ssh`). A refusal
+/// never quotes the words, which may hold a secret (`-e KEY=value`); only the program's file
+/// name. Why not, else `Ok`.
+pub fn check_command_words(argv: &[String]) -> Result<(), String> {
+    let Some(program) = argv.first() else {
+        return Err(
+            "it is empty: give the program and its arguments ([\"docker\", \"exec\", \"-i\", \
+             \"<container>\"])"
+                .to_string(),
+        );
+    };
+    for (i, word) in argv.iter().enumerate() {
+        if word.is_empty() {
+            return Err(format!("word {} is empty", i + 1));
+        }
+        if word.contains('\0') {
+            return Err(format!("word {} contains a NUL byte", i + 1));
+        }
+    }
+    let base = Path::new(program)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| program.clone());
+    let like = if base == "ssh" {
+        Some("ssh".to_string())
+    } else if argv.get(1).is_some_and(|a| a == "ssh") {
+        Some(format!("{base} ssh"))
+    } else if argv.windows(2).any(|w| w[0] == "compute" && w[1] == "ssh") {
+        Some(format!("{base} compute ssh"))
+    } else {
+        None
+    };
+    match like {
+        Some(like) => Err(format!(
+            "`{like}` passes its arguments to a shell on the box{}: use transport = \"ssh\" (a \
+             Tailscale SSH host and a `gcloud compute config-ssh` host work with plain ssh)",
+            if like == "ssh" { "" } else { ", as ssh does" }
+        )),
+        None => Ok(()),
+    }
+}
+
+/// How Debug shows a command box's argv: its program and how many words it has, never the
+/// words (one may hold a secret, and Debug output can reach logs).
+fn argv_shown(argv: &Option<Vec<String>>) -> Option<String> {
+    argv.as_ref().map(|a| {
+        format!(
+            "{} ({} words)",
+            a.first().map(String::as_str).unwrap_or_default(),
+            a.len()
+        )
+    })
+}
+
 impl fmt::Debug for BoxConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BoxConfig")
             .field("transport", &self.transport)
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("ssh", &self.ssh)
+            .field("command", &argv_shown(&self.command))
+            .field("terminal_command", &argv_shown(&self.terminal_command))
             .field("build", &self.build)
             .field("projects", &self.projects)
             .finish()
@@ -658,6 +782,19 @@ pub enum BoxTransport {
     /// and speaks the runner protocol over that connection, inside a channel only the hub's
     /// key can open ([`crate::sealed`]): no token, listener or tunnel.
     Ssh,
+    /// The hub runs the box's `command` itself (`docker exec -i <container>`, say) with `sh
+    /// -c <what ssh would run>` appended, and speaks to the box over that command's stdin and
+    /// stdout as it does over ssh's: the same probe, install, relay, daemon and sealed
+    /// channel. For a container on the hub's machine.
+    Command,
+}
+
+impl BoxTransport {
+    /// Whether the hub connects to the box itself (ssh or a command), rather than the box's
+    /// runner connecting to the hub.
+    pub fn dialed(self) -> bool {
+        matches!(self, BoxTransport::Ssh | BoxTransport::Command)
+    }
 }
 
 /// `[boxes.<name>.projects.<project>]`
@@ -1002,8 +1139,9 @@ impl Config {
     /// Checks values the types allow but twr does not: runtime presets
     /// ([`RuntimePreset::validate`]), `project_roots` that are neither absolute nor under `~`,
     /// an SSH box without `ssh` or with a `token` (which it would never use: refused, so a
-    /// token is never silently ignored), and a box `build` that is not a build id or not on an
-    /// SSH box.
+    /// token is never silently ignored), a command box without a valid `command` or with a
+    /// `token` or `ssh`, a `command` or `terminal_command` off a command box, and a box `build`
+    /// that is not a build id or not on a box the hub connects to.
     /// Box tokens that are too short are the hub's to refuse ([`Config::check_box_tokens`]):
     /// every twr command loads the config, and one that is too short must not keep `twr hub
     /// stop` from stopping a hub started before the minimum.
@@ -1972,7 +2110,7 @@ mod tests {
             ),
             (
                 "[boxes.gpu]\ntoken = \"0123456789abcdef0123\"\nbuild = \"0123456789abcdef\"\n",
-                "boxes.gpu.build: only an SSH box",
+                "boxes.gpu.build: only a box the hub connects to (transport ssh or command)",
             ),
             (
                 &format!("{ssh}ssh = \"me@gpu\"\nbuild = \"0123456789ABCDEF\"\n"),
@@ -1986,6 +2124,139 @@ mod tests {
             let e = format!("{:#}", Config::from_toml_str(bad).unwrap_err());
             assert!(e.contains(says), "{bad}: {e}");
         }
+    }
+
+    /// A command box: its `command` (and optional `terminal_command`) an argv of non-empty
+    /// words without NULs, no ssh-like program as `command`, no token or `ssh`; neither key
+    /// anywhere else; a `build` like an SSH box's. Both argvs are part of how the hub reaches
+    /// it, Debug shows neither, and boxes.toml keeps them as arrays.
+    #[test]
+    fn command_boxes_are_checked() {
+        let cmd = "[boxes.sb]\ntransport = \"command\"\n";
+        let c = Config::from_toml_str(&format!(
+            "{cmd}command = [\"docker\", \"exec\", \"-i\", \"-e\", \"KEY=s3cret\", \"ctr\"]\n\
+             terminal_command = [\"docker\", \"exec\", \"-i\", \"-t\", \"ctr\"]\n\
+             build = \"0123456789abcdef\"\n"
+        ))
+        .unwrap();
+        let b = &c.boxes["sb"];
+        assert_eq!(b.transport(), BoxTransport::Command);
+        assert!(BoxTransport::Command.dialed() && BoxTransport::Ssh.dialed());
+        assert!(!BoxTransport::Token.dialed());
+        assert_eq!(b.command.as_ref().unwrap()[4], "KEY=s3cret");
+        // How the hub reaches it: both argvs, not the build.
+        let conn = b.connection();
+        assert_eq!(conn.command, b.command);
+        assert_eq!(conn.terminal_command, b.terminal_command);
+        assert_eq!(conn.build, None);
+        let dbg = format!("{b:?}");
+        assert!(!dbg.contains("s3cret") && !dbg.contains("ctr"), "{dbg}");
+        assert!(
+            dbg.contains("docker (6 words)") && dbg.contains("docker (5 words)"),
+            "{dbg}"
+        );
+
+        for (bad, says) in [
+            (
+                cmd.to_string(),
+                "boxes.sb: a command box (transport = \"command\") needs `command`",
+            ),
+            (
+                format!("{cmd}command = []\n"),
+                "boxes.sb.command: it is empty",
+            ),
+            (
+                format!("{cmd}command = [\"docker\", \"\"]\n"),
+                "boxes.sb.command: word 2 is empty",
+            ),
+            (
+                format!("{cmd}command = [\"docker\", \"a\\u0000b\"]\n"),
+                "boxes.sb.command: word 2 contains a NUL byte",
+            ),
+            (
+                format!("{cmd}command = [\"docker\"]\nterminal_command = [\"\"]\n"),
+                "boxes.sb.terminal_command: word 1 is empty",
+            ),
+            (
+                format!("{cmd}command = [\"docker\"]\ntoken = \"0123456789abcdef0123\"\n"),
+                "boxes.sb.token: a command box has no token",
+            ),
+            (
+                format!("{cmd}command = [\"docker\"]\nssh = \"me@sb\"\n"),
+                "boxes.sb.ssh: a command box has no ssh destination",
+            ),
+            (
+                "[boxes.sb]\ntransport = \"ssh\"\nssh = \"me@sb\"\nterminal_command = [\"x\"]\n"
+                    .to_string(),
+                "boxes.sb.terminal_command: only a command box (transport = \"command\") has one",
+            ),
+            (
+                "[boxes.sb]\ntoken = \"0123456789abcdef0123\"\nterminal_command = [\"x\"]\n"
+                    .to_string(),
+                "boxes.sb.terminal_command: only a command box",
+            ),
+            (
+                "[boxes.sb]\ntransport = \"ssh\"\nssh = \"me@sb\"\ncommand = [\"x\"]\n".to_string(),
+                "boxes.sb.command: only a command box",
+            ),
+            (
+                format!("{cmd}command = [\"/usr/bin/ssh\", \"me@sb\"]\n"),
+                "boxes.sb.command: `ssh` passes its arguments to a shell on the box: use \
+                 transport = \"ssh\"",
+            ),
+            (
+                format!("{cmd}command = [\"tailscale\", \"ssh\", \"me@sb\"]\n"),
+                "boxes.sb.command: `tailscale ssh` passes its arguments to a shell on the box, \
+                 as ssh does: use transport = \"ssh\" (a Tailscale SSH host and a `gcloud \
+                 compute config-ssh` host work with plain ssh)",
+            ),
+            (
+                format!("{cmd}command = [\"gcloud\", \"--quiet\", \"compute\", \"ssh\", \"vm\"]\n"),
+                "boxes.sb.command: `gcloud compute ssh` passes its arguments",
+            ),
+            (
+                "[boxes.sb]\ntoken = \"0123456789abcdef0123\"\nbuild = \"0123456789abcdef\"\n"
+                    .to_string(),
+                "boxes.sb.build: only a box the hub connects to",
+            ),
+        ] {
+            let e = format!("{:#}", Config::from_toml_str(&bad).unwrap_err());
+            assert!(e.contains(says), "{bad}: {e}");
+            assert!(!e.contains("s3cret"), "{e}");
+        }
+        // An ssh-like terminal command is refused too: its remote shell would split the line.
+        let e = format!(
+            "{:#}",
+            Config::from_toml_str(&format!(
+                "{cmd}command = [\"docker\", \"exec\", \"-i\", \"c\"]\n\
+                 terminal_command = [\"tailscale\", \"ssh\", \"me@sb\"]\n"
+            ))
+            .unwrap_err()
+        );
+        assert!(
+            e.contains(
+                "boxes.sb.terminal_command: `tailscale ssh` passes its arguments to a shell"
+            ),
+            "{e}"
+        );
+        assert!(check_command_words(&["ssh".into(), "-t".into()]).is_err());
+
+        // boxes.toml keeps both argvs as arrays, word for word.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("boxes.toml");
+        let mut file = BoxesFile::default();
+        file.boxes.insert("sb".into(), b.clone());
+        file.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains(
+                "command = [\"docker\", \"exec\", \"-i\", \"-e\", \"KEY=s3cret\", \"ctr\"]"
+            ),
+            "{text}"
+        );
+        assert_eq!(BoxesFile::load(&path).unwrap(), file);
+        let c = Config::load_with_boxes(&path.with_file_name("config.toml")).unwrap();
+        assert_eq!(c.boxes, file.boxes);
     }
 
     /// A box's `ssh` words: options ssh parses as ssh does (letters together, values in the

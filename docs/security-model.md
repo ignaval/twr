@@ -8,7 +8,7 @@ twr starts coding agents (Claude Code, Codex, Grok Build, ACP agents) as your ow
 
 What twr adds is a guard on its own controls. Answering a permission prompt or a question, changing a thread's permission mode, deleting threads, emptying or restoring the trash, sending prompts and stopping the hub are yours. The hub refuses all of them to the agents it runs. The orchestrator may send prompts, and may pass on your answers, mode changes and deletions only under the rules below. The guard holds against an agent that uses twr's own channels, the socket and the orchestrator's tools. It can't hold against a process that is indistinguishable from you, and an agent running as your user can start one (see [What twr does not protect against](#what-twr-does-not-protect-against)).
 
-For a repository you don't trust, use the runtime's own sandbox, or run the agents as a separate OS user or in a container. A [runner box](runners.md) can be a container: its agents can't reach the hub's socket at all.
+For a repository you don't trust, use the runtime's own sandbox, or run the agents as a separate OS user or in a container. A [container box](runners.md#container-boxes) is one: the hub reaches it through `docker exec`, and its agents can't reach your files, your ssh-agent or the hub's socket ([Container boxes](#container-boxes)).
 
 ## Who is the user on the hub's socket
 
@@ -170,11 +170,45 @@ What a process of your user on the box can do: kill the daemon or its agents; as
 
 Residuals: a hub started without access to your ssh-agent can't connect, and a hub that has it can use every key in it for the box's host; the build the hub launches is checked by hash only when the box has `sha256sum` or `shasum` (size and version otherwise); and two hubs on different machines that share a repository on a box can collide on branch names.
 
+## Container boxes
+
+A container box ([runners.md](runners.md#container-boxes)) is an SSH box with a command from the config in place of ssh: the hub runs `docker exec -i <container>` (or `podman exec -i`, `kubectl exec -i`) and speaks the same runner protocol over it, through the same relay, box daemon and sealed channel. Everything in [SSH boxes](#ssh-boxes) about the hub key, the sealed channel, the daemon's socket, the builds tree and uploads holds unchanged inside the container.
+
+### Who chooses the command
+
+The command comes only from `config.toml` and `boxes.toml`, which the hub reads when it starts and on `box.add`. `twr box add` is refused to agents, and the orchestrator can't call `box.add`, `box.install` or `box.restart`. No socket method, MCP tool or runner message carries a command, and what a box prints is bounded and only shown. An agent on the hub's machine runs as you and can write `boxes.toml`, so it could add a command box: that is the existing "whoever can write your config controls twr" case, as for a `[notify]` command or a runtime preset. Such an entry takes effect only when the hub restarts, or when you run `twr box add` of that name.
+
+The command may hold a secret (`docker exec -e KEY=value`). twr never shows it to the orchestrator (`config.show`, `hub.info`), its Debug output and logs show only the program and how many words it has, and `twr box doctor` shows an agent only that (never the stop command it suggests to you, which holds the words). `ps` on the hub's machine shows it, though: give secrets to the container (`docker run --env-file`), not to the command.
+
+### How it runs
+
+- The hub runs `command[0]` with `command[1..]`, then `sh`, `-c` and one of twr's fixed scripts, the line it would hand ssh. Nothing runs through a shell on the hub's side. The script's variable parts are a validated box name, validated build ids, the hub key's hex and the data directory the probe reported (absolute, no control character), each shell-quoted.
+- Each command runs as ssh does: in a session and process group of its own, without a controlling terminal, from the hub's environment, with the same limits on what it prints. When it ends, what is left of its group is killed. Nothing of the hub's environment enters the container unless the command says so (`-e NAME` copies the hub's `NAME`).
+- ssh-like programs (`ssh`, `tailscale ssh`, `az ssh`, `gcloud compute ssh`) are refused as `command` and `terminal_command`: they hand their arguments to a shell on the far end, which would split the scripts.
+- The probe checks that the command passes the hub's input and gives the box no terminal (the pipe check), so a missing `-i` or a `-t` is said plainly instead of showing as a channel that never opens.
+- `twr box login` and `twr box project --clone` run `terminal_command` the same way, in your terminal: the container's process gets your terminal, as with `ssh -t`. `twr attach` is refused on a container box: a `docker exec -t` client can be detached or killed while the agent's CLI runs on in the container, and twr couldn't tell when the attach ended.
+- `docker inspect` shows each exec's command line: the box name and the hub's public key, nothing secret. `docker logs` shows only PID 1's output, not the exec streams.
+
+### What the container isolates
+
+Without mounts, the box daemon and its agents run as the container's user and see the container's filesystem. They can't reach your home, your ssh-agent, the hub's socket, `twr.db`, the hub's box key or your git credentials. The SSH box model holds inside the container: a process there can kill the daemon or its agents, ask it to stop, and pose as the box's runner while no daemon runs, but it can't read or change the sealed traffic or pose as the hub.
+
+What still reaches the container's agents:
+
+- **The network.** What the container reaches depends on the engine and its settings. On Docker Desktop, `host.docker.internal` reaches services on the host's loopback, the hub's runner listener included (it still needs a box token). On Docker Engine on Linux, the bridge's gateway (`172.17.0.1` by default) reaches every host service that listens on all interfaces or on that address, and a `host-gateway` mapping gives it a name. Podman offers `host.containers.internal`, and with pasta or slirp4netns host loopback access depends on their options. `--network host` gives the container the host's network. twr doesn't check any of this. Keeping host services out is yours to do. On Linux that takes two sets of rules: traffic to the host itself goes through the host's input path (iptables `INPUT`, an nftables `input` hook), filtered on the network's bridge interface, and traffic routed elsewhere goes through forwarding (Docker's `DOCKER-USER` chain, an nftables `forward` hook). `DOCKER-USER` alone leaves the host's own services reachable. Elsewhere: Docker Desktop's settings, or no network and an egress proxy. See [runners.md](runners.md#network).
+- **Their own credentials:** the agents' logins and API keys in the container. An agent working on an untrusted repository can read them. Use keys you can revoke and cap.
+- **What you mount or allow:** a bind mount of your home or of a repository, `/var/run/docker.sock` (root on the host), `--privileged`, `--pid host` and `--network host` each undo the isolation. The recipe uses none of them.
+- **Root in the container:** the recipe's image runs as a plain user. A container that runs as root needs `docker exec -u <user>`, with `-e HOME` when the container's environment sets one.
+
+### What it doesn't do
+
+A container box doesn't sandbox the hub's own threads. Agents on the hub's machine run as you, and if you can use docker, so can they: they can `docker exec` into the container, or start a privileged one. Use container boxes for the threads that work on what you don't trust, and keep the hub's own box for what you do.
+
 ## The socket and the config file
 
 The hub's socket is mode 0600; twr creates a missing parent directory at 0700, and an existing one you named (`--socket`, `hub.socket`) keeps its permissions. The hub sets the socket up by path (it binds it in a private directory there, then links it into place), so it refuses a parent directory another user owns (root aside) or one every user may write to without the sticky bit (`/tmp` has it), where another user could swap those entries; one its group may write to (a umask of `002` makes such directories, usually with a group of your own) is used and logged as a warning. The data directory, with `twr.db`, `hub.log`, job logs, the trash and the orchestrator's MCP configuration (which names the command its runtime starts), is kept at 0700: twr refuses to start with a data directory another user owns, or one it can't make 0700, since that user could replace what twr keeps there. For the data directory and the socket's directory, every directory their paths go through as the system resolves them, including the directory of each symbolic link on the way, must be yours or root's and not writable by every user unless it has the sticky bit, and each symbolic link must be yours or root's, as OpenSSH requires of its files' paths; a directory its group may write to is logged. Every client checks that the process listening on the socket runs as its own user (`SO_PEERCRED` on Linux, `getpeereid` on macOS) and refuses it otherwise, so a socket another user put at a path in a shared directory (`--socket`, `hub.socket`, `TWR_HOME`) is never used. The hub has no TCP listener for clients; the runner listener speaks only the runner protocol.
 
-`config.toml` can hold secrets: box tokens, a `[notify]` command with a webhook URL, `env` values. When a config holding a box token or a `[notify]` command has any group or other permission bit, the hub warns at start, in its log and in `twr info`, with the `chmod 600` to run. It doesn't refuse to start. The orchestrator's `show_config` never shows a token, an `env` value, a preset's command line, a box's `ssh` destination or the TLS files. An agent can't call it, but can read `config.toml` directly.
+`config.toml` can hold secrets: box tokens, a `[notify]` command with a webhook URL, `env` values. When a config holding a box token or a `[notify]` command has any group or other permission bit, the hub warns at start, in its log and in `twr info`, with the `chmod 600` to run. It doesn't refuse to start. The orchestrator's `show_config` never shows a token, an `env` value, a preset's command line, a box's `ssh` destination or `command`, or the TLS files. An agent can't call it, but can read `config.toml` directly.
 
 ## Releases and updates
 

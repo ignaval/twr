@@ -1,4 +1,5 @@
-//! The relay of an SSH box (`twr runner --stdio`): what the hub's `ssh` runs on the box. It
+//! The relay of an SSH box (`twr runner --stdio`): what the hub's `ssh` runs on the box, or a
+//! command box's command (`docker exec -i <container> sh -c ...`). It
 //! finds the box daemon of this hub key and box ([`crate::daemon`]), starts it when none
 //! runs (or replaces one of another build when asked to), and then copies bytes between its
 //! stdin/stdout (the hub, through ssh) and the daemon's socket until either side ends. The
@@ -82,8 +83,19 @@
 //! request to the daemon's socket); the hub's deadline to open the channel of each attempt
 //! covers the one it may meet. While it waits, the relay says so every [`PROGRESS_EVERY`],
 //! with how long it has: the hub shows these lines as the box's notes, and `twr box restart`
-//! prints them. A relay whose hub went away while it waited for another's start (its ssh
-//! gone: the end of its input) ends there, and starts or stops nothing.
+//! prints them.
+//!
+//! # A hub that goes away
+//!
+//! The hub sends nothing before the daemon's hello, so the relay reads its input from its start
+//! until it relays ([`HubWatch`]) to see it end: the hub gave up on the attempt (its ssh or
+//! command killed after a timeout, say). Once it has, the relay starts or stops nothing more.
+//! The status requests, the wait for another relay's start, for a daemon to settle, the
+//! request that the daemon stop and the wait for it to end, and the request for the daemon's
+//! connection are left where they are, and the relay ends with an error. A start already under way is not cut short (a launchd job or a
+//! systemd unit half made, a daemon without its reaper): it runs to its end, and the relay then
+//! ends instead of relaying; the daemon it started serves the next connection. What the hub
+//! sent meanwhile goes to the daemon first ([`pump`]), at most [`EARLY_MAX`] bytes of it.
 //!
 //! # Stopping the daemon, and its status
 //!
@@ -100,7 +112,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::client::{machine_lock_path_in, validate_box_name};
 use crate::daemon::{request, Request, Status};
@@ -190,6 +202,10 @@ pub const PLAIN_START_WORST: Duration = relay_worst(STOP_TIMEOUT, START_TIMEOUT,
 
 /// Lines of the daemon's log shown when it does not start.
 const LOG_TAIL_LINES: usize = 20;
+
+/// The most a relay keeps of what the hub sends before the daemon's hello ([`HubWatch`]): the
+/// hub sends nothing then, so more ends the relay.
+pub const EARLY_MAX: usize = 64 << 10;
 
 /// Where the box daemon of one hub key and box keeps everything on the box.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +507,8 @@ pub async fn relay(opts: RelayOptions) -> anyhow::Result<()> {
 /// restarts the daemon ([`decide`]; anything but using it under its start lock, [`StartLock`],
 /// and decided again there), connects to it and copies bytes both ways until the daemon's
 /// side ends (or both have). The hub's end of input is passed on (the socket's write side
-/// shut), and the daemon then closes its side.
+/// shut), and the daemon then closes its side. Until it relays, the hub's side ending ends it
+/// with an error, starting or stopping nothing more ([`HubWatch`], see the module docs).
 pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
     opts: RelayOptions,
     mut io: IO,
@@ -513,14 +530,21 @@ pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
             opts.restart,
         )
     };
-    let mut running = daemon_status(socket).await?;
-    // What the hub sent before the daemon's hello (nothing, as it speaks second), passed on.
-    let mut early = Vec::new();
+    // The hub's side, read until the relay relays: its end ends the startup (see the module
+    // docs).
+    let mut watch = HubWatch::new(&mut io);
+    const STATUS: &str = "asked the box daemon for its status";
+    let mut running = watch.during(daemon_status(socket), STATUS).await?;
     if decision(running.as_ref())? != Decision::Use {
         // Held until the daemon answers (or the start failed); decided again under it: another
         // relay may have started or replaced the daemon meanwhile.
-        let _start = take_start_lock(&opts, &mut io, &mut early, note).await?;
-        running = daemon_status(socket).await?;
+        let _start = watch
+            .during(
+                StartLock::take(&opts, note),
+                "waited for another relay's start of the box daemon",
+            )
+            .await?;
+        running = watch.during(daemon_status(socket), STATUS).await?;
         loop {
             match decision(running.as_ref())? {
                 Decision::Use => {}
@@ -530,14 +554,18 @@ pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
                     // down ends first; the one starting is decided about once it answers.
                     if !lock_free(&opts.paths.lock) {
                         note(&settling_note(&opts));
-                        if let Settled::Answers(st) =
-                            wait_settled(&opts, "is still shutting down or starting", note).await?
-                        {
+                        let settled = watch
+                            .during(
+                                wait_settled(&opts, "is still shutting down or starting", note),
+                                "waited for the box daemon to finish shutting down or starting",
+                            )
+                            .await?;
+                        if let Settled::Answers(st) = settled {
                             running = Some(st);
                             continue;
                         }
                     }
-                    let started = start_daemon(&opts, note).await?;
+                    let started = watch.start(&opts, note).await?;
                     note(&format!(
                         "twr-box: started the box daemon {}",
                         started.build_label()
@@ -545,9 +573,21 @@ pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
                 }
                 d @ (Decision::Replace | Decision::Restart) => {
                     let old = running.take().expect("a daemon to replace answered");
+                    watch.check("was about to stop the box daemon", "stopping nothing")?;
                     note(&stopping_note(&opts, &old));
-                    stop_daemon(&opts, note).await?;
-                    let started = start_daemon(&opts, note).await?;
+                    // (Left where it is, before or after the daemon took the request, the
+                    // daemon runs on or finishes its own shutdown, which the next relay waits
+                    // for.)
+                    watch
+                        .during(ask_stop(&opts), "asked the box daemon to stop")
+                        .await?;
+                    watch
+                        .during(
+                            wait_gone(&opts, "did not stop within that of being asked to", note),
+                            "waited for the box daemon to stop",
+                        )
+                        .await?;
+                    let started = watch.start(&opts, note).await?;
                     let (did, how) = match d {
                         Decision::Replace => ("replaced", "with"),
                         _ => ("restarted", "as"),
@@ -562,42 +602,150 @@ pub async fn relay_with<IO: AsyncRead + AsyncWrite + Unpin>(
             break;
         }
     }
-    let (stream, _) = request(socket, Request::Connect)
-        .await
-        .with_context(|| format!("connecting to the box daemon on {}", socket.display()))?;
+    // (A connection left before the daemon's answer is one the daemon sees end.)
+    let (stream, _) = watch
+        .during(
+            async {
+                request(socket, Request::Connect).await.with_context(|| {
+                    format!("connecting to the box daemon on {}", socket.display())
+                })
+            },
+            "asked the box daemon for a connection",
+        )
+        .await?;
+    // What the hub sent before the daemon's hello (nothing, as it speaks second), passed on.
+    let early = watch.into_early();
     pump(io, stream, early).await;
     Ok(())
 }
 
-/// [`StartLock::take`], unless the hub's side of `io` ends first: the hub gave up on this
-/// attempt (its ssh, and so this relay's input, is gone), and a relay no one waits for does not
-/// go on to start or stop the daemon once it has the lock (an error). The hub sends nothing
-/// before the daemon's hello, so whatever `io` gives meanwhile is kept in `early` (for the
-/// daemon, first) and the watch ends there.
-async fn take_start_lock<IO: AsyncRead + Unpin>(
-    opts: &RelayOptions,
-    io: &mut IO,
-    early: &mut Vec<u8>,
-    note: &mut (dyn FnMut(&str) + Send),
-) -> anyhow::Result<StartLock> {
-    use tokio::io::AsyncReadExt;
-    let take = StartLock::take(opts, note);
-    tokio::pin!(take);
-    let mut buf = [0u8; 4096];
-    loop {
-        tokio::select! {
-            biased;
-            lock = &mut take => return lock,
-            // (A read cut short here keeps what it read for the next one: `Stdin`'s, a
-            // duplex's.)
-            read = io.read(&mut buf), if early.is_empty() => match read {
-                Ok(0) | Err(_) => bail!(
-                    "the hub's side of this relay ended (its ssh is gone) while it waited for \
-                     another relay's start of the box daemon: starting nothing"
-                ),
-                Ok(n) => early.extend_from_slice(&buf[..n]),
-            },
+/// The relay's reads of the hub's side from its start until it relays (see the module docs):
+/// each read's bytes are kept for the daemon (at most [`EARLY_MAX`]: more is an error), and its
+/// end (or a read error) marks the hub gone, which ends the startup.
+struct HubWatch<'a, IO> {
+    io: &'a mut IO,
+    buf: Box<[u8]>,
+    /// What the hub sent (passed on to the daemon first).
+    early: Vec<u8>,
+    /// The hub's side ended.
+    gone: bool,
+}
+
+impl<'a, IO: AsyncRead + Unpin> HubWatch<'a, IO> {
+    fn new(io: &'a mut IO) -> HubWatch<'a, IO> {
+        HubWatch {
+            io,
+            buf: vec![0; 4096].into_boxed_slice(),
+            early: Vec::new(),
+            gone: false,
         }
+    }
+
+    /// The error of a relay whose hub's side ended while it `what`, which then does `then`.
+    fn ended(what: &str, then: &str) -> anyhow::Error {
+        anyhow!(
+            "the hub's side of this relay ended (its connection is gone) while it {what}: {then}"
+        )
+    }
+
+    /// One read's outcome: its bytes kept (an error past [`EARLY_MAX`]), or the end noted.
+    fn took(&mut self, read: std::io::Result<usize>) -> anyhow::Result<()> {
+        match read {
+            Ok(0) | Err(_) => self.gone = true,
+            Ok(n) => {
+                self.early.extend_from_slice(&self.buf[..n]);
+                if self.early.len() > EARLY_MAX {
+                    bail!(
+                        "the hub sent {} bytes before the box daemon's hello (it sends nothing \
+                         then): starting nothing",
+                        self.early.len()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `fut`, unless the hub's side ends first: then `fut` is dropped where it is (only for
+    /// what may be left so: a request to the daemon, a wait) and the error says the relay ended while
+    /// it `what`. Reads go on after bytes came (the hub's next ones, or its end).
+    async fn during<T>(
+        &mut self,
+        fut: impl std::future::Future<Output = anyhow::Result<T>>,
+        what: &str,
+    ) -> anyhow::Result<T> {
+        if self.gone {
+            return Err(Self::ended(what, "starting nothing"));
+        }
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                biased;
+                r = &mut fut => return r,
+                // (A read cut short here keeps what it read for the next one: `Stdin`'s, a
+                // duplex's.)
+                read = self.io.read(&mut self.buf) => {
+                    self.took(read)?;
+                    if self.gone {
+                        return Err(Self::ended(what, "starting nothing"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// An error when the hub's side has ended, by now or in what a read gives at once (without
+    /// waiting): the relay `what`, and does `then`.
+    fn check(&mut self, what: &str, then: &str) -> anyhow::Result<()> {
+        while !self.gone {
+            // (Polled once: a read not ready yet is dropped, keeping what it read for the next.)
+            let Some(read) = futures::FutureExt::now_or_never(self.io.read(&mut self.buf)) else {
+                return Ok(());
+            };
+            self.took(read)?;
+        }
+        Err(Self::ended(what, then))
+    }
+
+    /// Starts the daemon ([`start_daemon`]), unless the hub's side has ended: a start is never
+    /// cut short (see the module docs), so it runs to its end while the reads go on, and when
+    /// the hub's side ended meanwhile the relay ends instead of relaying (an error).
+    async fn start(
+        &mut self,
+        opts: &RelayOptions,
+        note: &mut (dyn FnMut(&str) + Send),
+    ) -> anyhow::Result<Status> {
+        self.check("was about to start the box daemon", "starting nothing")?;
+        let start = start_daemon(opts, note);
+        tokio::pin!(start);
+        let mut overflow = None;
+        let started = loop {
+            tokio::select! {
+                biased;
+                r = &mut start => break r,
+                read = self.io.read(&mut self.buf), if !self.gone && overflow.is_none() => {
+                    if let Err(e) = self.took(read) {
+                        overflow = Some(e);
+                    }
+                }
+            }
+        };
+        let started = started?;
+        if let Some(e) = overflow {
+            return Err(e);
+        }
+        if self.gone {
+            return Err(Self::ended(
+                "started the box daemon",
+                "not relaying (that daemon serves the next connection)",
+            ));
+        }
+        Ok(started)
+    }
+
+    /// What the hub sent meanwhile, for the daemon.
+    fn into_early(self) -> Vec<u8> {
+        self.early
     }
 }
 
@@ -931,6 +1079,12 @@ async fn stop_daemon(
     opts: &RelayOptions,
     note: &mut (dyn FnMut(&str) + Send),
 ) -> anyhow::Result<()> {
+    ask_stop(opts).await?;
+    wait_gone(opts, "did not stop within that of being asked to", note).await
+}
+
+/// Asks the daemon to stop (none listening is no error).
+async fn ask_stop(opts: &RelayOptions) -> anyhow::Result<()> {
     match request(&opts.paths.socket, Request::Stop).await {
         Ok(_) => {}
         Err(e) if gone(&e) => {}
@@ -943,7 +1097,7 @@ async fn stop_daemon(
             })
         }
     }
-    wait_gone(opts, "did not stop within that of being asked to", note).await
+    Ok(())
 }
 
 /// Waits (at most [`RelayOptions::stop_timeout`]) until nothing listens on the daemon's socket
@@ -1765,6 +1919,380 @@ mod tests {
         relay_with(opts, io, &mut |_: &str| {}).await.unwrap();
         release.join().unwrap();
         assert_eq!(seen.lock().unwrap().last(), Some(&Request::Connect));
+
+        // More than a relay keeps before the daemon's hello: it ends, starting nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let held = std::fs::File::create(opts.paths.start_lock()).unwrap();
+        held.lock().unwrap();
+        let (io, mut hub) = tokio::io::duplex(1 << 20);
+        hub.write_all(&vec![b'x'; EARLY_MAX + 1]).await.unwrap();
+        let e = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_with(opts, io, &mut |_: &str| {}),
+        )
+        .await
+        .expect("the relay ends")
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains("before the box daemon's hello"),
+            "{e:#}"
+        );
+        drop(held);
+    }
+
+    /// A relay whose hub went away while it waited for a daemon to settle (its machine lock
+    /// held, no socket: shutting down or starting) ends there at once, and starts nothing
+    /// once the lock is free.
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_while_a_daemon_settles_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let paths = opts.paths.clone();
+        let held = std::fs::File::create(&paths.lock).unwrap();
+        held.lock().unwrap();
+        let (io, hub) = tokio::io::duplex(1024);
+        // The hub goes away as the relay starts waiting.
+        let mut hub = Some(hub);
+        let mut notes = Vec::new();
+        let e = tokio::time::timeout(
+            Duration::from_secs(1),
+            relay_with(opts, io, &mut |l: &str| {
+                if l.contains("shutting down or starting") {
+                    hub.take();
+                }
+                notes.push(l.to_string());
+            }),
+        )
+        .await
+        .expect("the relay ends within 1 s")
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains(
+                "the hub's side of this relay ended (its connection is gone) while it waited \
+                 for the box daemon to finish shutting down or starting: starting nothing"
+            ),
+            "{e:#}"
+        );
+        assert!(hub.is_none(), "{notes:?}");
+        // Its start lock is free, and once the daemon's lock is, nothing starts.
+        assert!(std::fs::File::open(paths.start_lock())
+            .unwrap()
+            .try_lock()
+            .is_ok());
+        drop(held);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!paths.socket.exists());
+        assert!(!notes.iter().any(|n| n.contains("started")), "{notes:?}");
+    }
+
+    /// A restart whose hub went away while the old daemon was stopping (the stop asked for, its
+    /// shutdown held back as a repository change holds it) ends at once: the old daemon
+    /// finishes stopping by itself, no new one is started, and the start lock is free.
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_while_a_daemon_stops_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = RelayOptions {
+            restart: true,
+            ..quick_opts(dir.path())
+        };
+        let paths = opts.paths.clone();
+        let drain = Duration::from_millis(1500);
+        let seen = draining_daemon(&paths, Duration::ZERO, drain);
+        while daemon_status(&paths.socket).await.unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (io, hub) = tokio::io::duplex(1024);
+        // Gone once the daemon took the stop request and answered it (a moment for the relay
+        // to read the answer): the relay then waits for the daemon to end.
+        {
+            let seen = std::sync::Arc::clone(&seen);
+            tokio::spawn(async move {
+                while !seen.lock().unwrap().contains(&Request::Stop) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                drop(hub);
+            });
+        }
+        let mut notes = Vec::new();
+        let start = std::time::Instant::now();
+        let e = tokio::time::timeout(
+            Duration::from_secs(5),
+            relay_with(opts, io, &mut |l: &str| notes.push(l.to_string())),
+        )
+        .await
+        .expect("the relay ends")
+        .unwrap_err();
+        assert!(start.elapsed() < drain, "it waited for the stop");
+        assert!(
+            format!("{e:#}").contains(
+                "the hub's side of this relay ended (its connection is gone) while it waited \
+                 for the box daemon to stop: starting nothing"
+            ),
+            "{e:#}"
+        );
+        assert!(seen.lock().unwrap().contains(&Request::Stop));
+        assert!(std::fs::File::open(paths.start_lock())
+            .unwrap()
+            .try_lock()
+            .is_ok());
+        // The old daemon finishes stopping by itself.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !lock_free(&paths.lock) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the old daemon still runs"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !notes
+                .iter()
+                .any(|n| n.contains("started") || n.contains("restarted")),
+            "{notes:?}"
+        );
+        assert!(!paths.socket.exists());
+    }
+
+    /// A relay whose hub went away while it started the daemon lets the start finish (never
+    /// cut short), then ends instead of relaying: it never connects. The daemon it started is
+    /// the one the next relay uses (one daemon, not two).
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_while_it_starts_the_daemon_does_not_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let marks = dir.path().join("starts");
+        let program = dir.path().join("fake-twr");
+        // Stands for the daemon's process: the test serves its socket once it ran.
+        crate::test_support::install(
+            &program,
+            format!(
+                "#!/bin/sh\necho started >> '{}'\nexec sleep 5\n",
+                marks.display()
+            ),
+        );
+        let opts = RelayOptions {
+            program,
+            start_timeout: Duration::from_secs(10),
+            ..quick_opts(dir.path())
+        };
+        let paths = opts.paths.clone();
+        let (io, hub) = tokio::io::duplex(1024);
+        // Once the start is under way: the hub goes away, and the daemon answers a little
+        // later.
+        let daemon = {
+            let (marks, paths) = (marks.clone(), paths.clone());
+            tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while !marks.exists() {
+                    assert!(tokio::time::Instant::now() < deadline, "no start");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                drop(hub);
+                starting_daemon(&paths, Duration::from_millis(300))
+            })
+        };
+        let mut notes = Vec::new();
+        let e = tokio::time::timeout(
+            Duration::from_secs(10),
+            relay_with(opts.clone(), io, &mut |l: &str| notes.push(l.to_string())),
+        )
+        .await
+        .expect("the relay ends")
+        .unwrap_err();
+        assert!(
+            format!("{e:#}").contains(
+                "the hub's side of this relay ended (its connection is gone) while it started \
+                 the box daemon: not relaying"
+            ),
+            "{e:#}"
+        );
+        let seen = daemon.await.unwrap();
+        assert!(
+            !seen.lock().unwrap().contains(&Request::Connect),
+            "{:?}",
+            seen.lock().unwrap()
+        );
+        // The next relay uses that daemon.
+        let (io, _hub) = tokio::io::duplex(1024);
+        let mut notes = Vec::new();
+        relay_with(opts, io, &mut |l: &str| notes.push(l.to_string()))
+            .await
+            .unwrap();
+        assert!(!notes.iter().any(|n| n.contains("started")), "{notes:?}");
+        assert_eq!(seen.lock().unwrap().last(), Some(&Request::Connect));
+        assert_eq!(std::fs::read_to_string(&marks).unwrap(), "started\n");
+    }
+
+    /// A daemon that answers status requests at once and a `connect` only once `answer` is
+    /// notified, then reads what comes on that connection into the returned buffer. `asked`
+    /// is notified when the `connect` came.
+    fn slow_to_connect_daemon(
+        paths: &DaemonPaths,
+        asked: std::sync::Arc<tokio::sync::Notify>,
+        answer: std::sync::Arc<tokio::sync::Notify>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        slow_to_answer_daemon(paths, Request::Connect, asked, answer)
+    }
+
+    /// [`slow_to_connect_daemon`], slow to answer `slow` (a `stop` is then not acted on).
+    fn slow_to_answer_daemon(
+        paths: &DaemonPaths,
+        slow: Request,
+        asked: std::sync::Arc<tokio::sync::Notify>,
+        answer: std::sync::Arc<tokio::sync::Notify>,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        let got = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::UnixListener::bind(&paths.socket).unwrap();
+        let into = std::sync::Arc::clone(&got);
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let line = crate::daemon::read_line(&mut s, 256).await.unwrap();
+                let req = line.as_deref().and_then(Request::parse).unwrap();
+                if req == slow {
+                    asked.notify_one();
+                    answer.notified().await;
+                }
+                // (The relay may have left: a write to a closed connection is no failure.)
+                if s.write_all(Status::of(&KEY).line().as_bytes())
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                if req == Request::Connect {
+                    let mut buf = [0u8; 256];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        into.lock().unwrap().extend_from_slice(&buf[..n]);
+                    }
+                }
+            }
+        });
+        got
+    }
+
+    /// A relay whose hub went away while the daemon was slow to answer its `connect` ends
+    /// there, at once (not after the request's own timeout), and relays nothing. What the hub
+    /// sent while it waited (it sends nothing then) is still the daemon's first input.
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_while_it_connects_ends_there() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let (asked, answer) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let got = slow_to_connect_daemon(&opts.paths, Arc::clone(&asked), Arc::clone(&answer));
+        let (io, hub) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { relay_with(opts, io, &mut |_: &str| {}).await });
+        tokio::time::timeout(Duration::from_secs(5), asked.notified())
+            .await
+            .expect("the relay asks for a connection");
+        drop(hub);
+        let e = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("the relay ends within 1 s")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains(
+                "the hub's side of this relay ended (its connection is gone) while it asked the \
+                 box daemon for a connection"
+            ),
+            "{e:#}"
+        );
+        answer.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(got.lock().unwrap().is_empty());
+
+        // Bytes from the hub while the daemon is slow to answer: the daemon gets them first.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = quick_opts(dir.path());
+        let (asked, answer) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let got = slow_to_connect_daemon(&opts.paths, Arc::clone(&asked), Arc::clone(&answer));
+        let (io, mut hub) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(async move { relay_with(opts, io, &mut |_: &str| {}).await });
+        tokio::time::timeout(Duration::from_secs(5), asked.notified())
+            .await
+            .expect("the relay asks for a connection");
+        hub.write_all(b"early").await.unwrap();
+        // (The relay reads them while it waits.)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        answer.notify_one();
+        // (Its end only once it relays: an end before then ends the relay, as above.)
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while got.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "nothing relayed");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        hub.write_all(b" then").await.unwrap();
+        hub.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("the relay ends")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.lock().unwrap().as_slice(), b"early then");
+    }
+
+    /// A relay whose hub went away while the daemon was slow to answer its `stop` (a restart)
+    /// ends there, at once (not after the request's own timeout): its start lock free, and
+    /// nothing started.
+    #[tokio::test]
+    async fn a_relay_whose_hub_went_away_while_it_asks_for_a_stop_ends_there() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        let dir = tempfile::tempdir().unwrap();
+        let opts = RelayOptions {
+            restart: true,
+            ..quick_opts(dir.path())
+        };
+        let paths = opts.paths.clone();
+        let (asked, answer) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        slow_to_answer_daemon(
+            &paths,
+            Request::Stop,
+            Arc::clone(&asked),
+            Arc::clone(&answer),
+        );
+        let (io, hub) = tokio::io::duplex(1024);
+        let notes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay = {
+            let notes = Arc::clone(&notes);
+            tokio::spawn(async move {
+                relay_with(opts, io, &mut |l: &str| {
+                    notes.lock().unwrap().push(l.to_string())
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), asked.notified())
+            .await
+            .expect("the relay asks the daemon to stop");
+        drop(hub);
+        let e = tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("the relay ends within 1 s")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            format!("{e:#}").contains(
+                "the hub's side of this relay ended (its connection is gone) while it asked the \
+                 box daemon to stop: starting nothing"
+            ),
+            "{e:#}"
+        );
+        assert!(std::fs::File::open(paths.start_lock())
+            .unwrap()
+            .try_lock()
+            .is_ok());
+        answer.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let notes = notes.lock().unwrap();
+        assert!(!notes.iter().any(|n| n.contains("started")), "{notes:?}");
     }
 
     /// `TWR_BOX_LAUNCHER=launchd` off macOS: an error, never a start in a new session.

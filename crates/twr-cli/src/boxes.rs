@@ -1,18 +1,24 @@
 //! `twr box`: the remote boxes, from the command line. `add` sets up a box the hub reaches over
-//! SSH (`[boxes.<name>] transport = "ssh"`, in `boxes.toml`) and adds it to the running hub
-//! (`box.add`); `list` and `status` show `hub.info`'s boxes; `install` puts a twr build on an
-//! SSH box (the hub's own, a release's for another OS or CPU, or a file) and has the hub
-//! connect again (`box.install`); `restart` has the hub restart an SSH box's daemon
-//! (`box.restart`); `remove` takes a box out of `boxes.toml`; `doctor` checks a box and `login`
-//! starts an agent CLI's login on it ([`doctor`]); `project` finds (or clones) a project's
-//! repository on a box and records where it is ([`project`]).
+//! SSH (`[boxes.<name>] transport = "ssh"`, in `boxes.toml`) or through a command (`transport
+//! = "command"`, a container: `--command docker exec -i <container>`) and adds it to the
+//! running hub (`box.add`); `list` and `status` show `hub.info`'s boxes; `install` puts a twr
+//! build on a box the hub connects to (the hub's own, a release's for another OS or CPU, or a
+//! file) and has the hub connect again (`box.install`); `restart` has the hub restart such a
+//! box's daemon (`box.restart`); `remove` takes a box out of `boxes.toml`; `doctor` checks a
+//! box and `login` starts an agent CLI's login on it ([`doctor`]); `project` finds (or clones)
+//! a project's repository on a box and records where it is ([`project`]).
 //!
-//! The probes run ssh in the user's terminal, with the hub's ssh options but without
-//! `BatchMode` ([`twr_hub::ssh_box::interactive_ssh_args`]), so ssh can ask about an unknown
-//! host key or for a passphrase; the probe script and its parser are the hub's
-//! ([`twr_hub::ssh_box::probe_script`], [`twr_hub::ssh_box::parse_probe`]). `boxes.toml` is
-//! changed only under its lock ([`BoxesFile::lock`]): read, changed, checked with
-//! `config.toml` and saved in one hold.
+//! Everything run on a box goes through its link ([`BoxLink`], [`here`]). The probes run ssh
+//! in the user's terminal, with the hub's ssh options but without `BatchMode`
+//! ([`twr_hub::ssh_box::interactive_ssh_args`]), so ssh can ask about an unknown host key or
+//! for a passphrase. A command box's command runs as the hub runs it: in a session and process
+//! group of its own, without a terminal (nothing there may prompt), its whole group killed
+//! when it ends, and its probe checks that it passes this side's input on and gives the box no
+//! terminal (the pipe check). The probe script and its parser are the hub's
+//! ([`twr_hub::ssh_box::probe_script_for`], [`twr_hub::ssh_box::parse_probe_for`]). What needs a
+//! terminal on the box (`login`, `project --clone`) runs ssh with one, or a command box's
+//! `terminal_command`, in the user's terminal. `boxes.toml` is changed only under its lock
+//! ([`BoxesFile::lock`]): read, changed, checked with `config.toml` and saved in one hold.
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -26,11 +32,11 @@ use twr_core::config::{BoxConfig, BoxTransport, BoxesFile, Config};
 use twr_core::git::human_bytes;
 use twr_core::paths::Paths;
 use twr_core::proto::{codes, RpcError};
-use twr_hub::ssh_box;
+use twr_hub::ssh_box::{self, BoxLink, Input};
 
 use super::{
-    ask_on_stderr, connect, consent, fetch_release_archive, is_release_tag, refuse_agent_action,
-    str_of, table, wait_for_hub, workspace_hint, Consent, PrivateDir,
+    ask_on_stderr, caller_is_agent, connect, consent, fetch_release_archive, is_release_tag,
+    refuse_agent_action, str_of, table, wait_for_hub, workspace_hint, Consent, PrivateDir,
 };
 
 mod doctor;
@@ -77,36 +83,47 @@ const BATCH_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Subcommand)]
 pub(super) enum BoxCmd {
-    /// Add a box the hub reaches over SSH: no token, listener or tunnel. Probes the box with
-    /// ssh in this terminal (ssh may ask about its host key or for a passphrase), checks that
-    /// ssh also works without prompting (the hub's never prompts), says what will happen and
-    /// asks y/N (without a terminal, only with --yes). Then writes `[boxes.<name>]` to
-    /// boxes.toml, next to config.toml, and adds the box to the running hub (starting one when
-    /// none runs). The hub installs its own twr build on the box (same OS and CPU; else run
-    /// `twr box install <name>`), connects over ssh and starts a twr box daemon there, which
-    /// runs the box's threads. Waits up to 90 s for the box to come online. Boxes belong to
-    /// the default workspace.
+    /// Add a box the hub reaches over SSH, or through a command (--command: a container):
+    /// no token, listener or tunnel. Probes the box with ssh in this terminal (ssh may ask
+    /// about its host key or for a passphrase), checks that ssh also works without prompting
+    /// (the hub's never prompts), says what will happen and asks y/N (without a terminal, only
+    /// with --yes). A command is probed as the hub runs it: without a terminal, so nothing it
+    /// runs may prompt, and checked to pass the hub's input to the box (`-i`) without giving
+    /// it a terminal (no `-t`). Then writes `[boxes.<name>]` to boxes.toml, next to
+    /// config.toml, and adds the box to the running hub (starting one when none runs). The hub
+    /// installs its own twr build on the box (same OS and CPU; else run `twr box install
+    /// <name>`), connects and starts a twr box daemon there, which runs the box's threads.
+    /// Waits up to 90 s for the box to come online. Boxes belong to the default workspace.
     Add {
         /// The box's name: letters, digits, `.`, `_` or `-` (not starting with `.` or `-`; not `local`).
         name: String,
         /// The ssh destination (`me@host`, or a host from `~/.ssh/config`), with any ssh
         /// options before it (`-p 2222 me@host`): one argument or several words, joined with
-        /// spaces.
+        /// spaces. With --command, the command the hub runs to reach the box (`docker exec -i
+        /// <container>`), its words passed as they are, not through a shell.
         #[arg(
             required = true,
             value_name = "SSH",
             trailing_var_arg = true,
             allow_hyphen_values = true
         )]
-        ssh: Vec<String>,
+        words: Vec<String>,
+        /// The words are the command the hub runs to reach the box (`docker exec -i
+        /// <container>`, `kubectl exec -i -n <ns> <pod> --`), with `sh -c <what ssh would run>`
+        /// appended, instead of an ssh destination. Given before the words. For `docker`,
+        /// `podman` and `nerdctl exec -i` and `kubectl exec -i`, the same command with `-t`
+        /// becomes its terminal_command (for `twr box login` and `twr box project --clone`).
+        #[arg(long)]
+        command: bool,
         /// Add the box without asking.
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// List the hub's remote boxes: name, transport (`ssh`: the hub connects to it; `token`:
-    /// its runner connects to the hub), state, the twr version its runner reported, its OS
-    /// and CPU (SSH boxes), and its agent CLIs as it last reported them (`claude ✓`: logged
-    /// in, `✗`: logged out, `?`: not known, `-`: not installed).
+    /// List the hub's remote boxes: name, transport (`ssh` or `command`: the hub connects to
+    /// it; `token`: its runner connects to the hub), state, the twr version its runner
+    /// reported, its OS and CPU (boxes the hub connects to), and its agent CLIs as it last
+    /// reported them (`claude ✓`: logged in, `✗`: logged out, `?`: not known, `-`: not
+    /// installed).
     #[command(alias = "ls")]
     List {
         /// Print the boxes of `hub.info` as JSON.
@@ -123,10 +140,10 @@ pub(super) enum BoxCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Install twr on an SSH box and have the hub connect to it again. On a box of the hub's OS
-    /// and CPU the hub installs its own build. On another one: with --binary, that file;
-    /// with --from-box, a twr already on the box (built there with
-    /// docs/tools/dev-install.sh, say); otherwise, when the hub runs a release, the release's
+    /// Install twr on a box the hub connects to (ssh or command) and have the hub connect to
+    /// it again. On a box of the hub's OS and CPU the hub installs its own build. On another
+    /// one: with --binary, that file; with --from-box, a twr already on the box (built there
+    /// with docs/tools/dev-install.sh, say); otherwise, when the hub runs a release, the release's
     /// archive for the box (its signed checksums verified as `twr update` verifies them),
     /// unpacked on the box. The build is recorded as the box's `build` in boxes.toml (a box of
     /// config.toml: the line to add is printed). Asks y/N before installing (without a
@@ -148,8 +165,9 @@ pub(super) enum BoxCmd {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Restart an SSH box's daemon: the hub ends its connection to the box and connects again,
-    /// having the box stop its daemon (and the agents it runs) and start a new one. On a Mac,
+    /// Restart the daemon of a box the hub connects to (ssh or command): the hub ends its
+    /// connection to the box and connects again, having the box stop its daemon (and the
+    /// agents it runs) and start a new one. On a Mac,
     /// after someone logged in at its screen, the new daemon runs in that GUI session, where
     /// Claude Code can read its keychain login. Asks y/N first (without a terminal, only with
     /// --yes), then waits for the box to come back online (as long as the hub's attempts may
@@ -165,14 +183,16 @@ pub(super) enum BoxCmd {
     },
     /// Remove a box from boxes.toml (a box of config.toml: remove it there). The running hub
     /// keeps the box until it restarts; the box daemon and the box's worktrees stay on the box
-    /// (the command that stops the daemon is printed).
+    /// (the command that stops the daemon is printed), and a command box's container stays
+    /// as it is (twr never stops or removes one).
     #[command(alias = "rm")]
     Remove {
         /// The box's name.
         name: String,
     },
     /// Check a box and say how to fix what is wrong: the hub's view of it (when a hub runs),
-    /// ssh without prompting (as the hub runs it) and in this terminal, the box's OS, CPU,
+    /// ssh without prompting (as the hub runs it) and in this terminal (a command box: its
+    /// command, and that it passes the hub's input without a terminal), the box's OS, CPU,
     /// data directory and twr builds, its box daemon, logind (Linux), its agent CLIs (path,
     /// version, login), git, free disk, and the projects configured for it. Works without a
     /// hub and with the box offline. The checks on the box run the hub's twr build when it is
@@ -186,11 +206,11 @@ pub(super) enum BoxCmd {
         json: bool,
     },
     /// Start an agent CLI's own login on a box, in this terminal: `claude auth login`, `codex
-    /// login --device-auth` or `grok login --device-auth`, over ssh with a terminal, run by the
-    /// box's twr build (as `twr box doctor` picks it) on the program the box's runner would
-    /// start. twr never sees what you type. Then says whether the agent is logged in (the
-    /// box daemon's view through the hub when one runs, else the box's over ssh). Needs a
-    /// terminal.
+    /// login --device-auth` or `grok login --device-auth`, over ssh with a terminal (a
+    /// command box: its terminal_command), run by the box's twr build (as `twr box doctor`
+    /// picks it) on the program the box's runner would start. twr never sees what you type.
+    /// Then says whether the agent is logged in (the box daemon's view through the hub when
+    /// one runs, else the box's). Needs a terminal.
     Login {
         /// The box's name.
         name: String,
@@ -209,8 +229,9 @@ pub(super) enum BoxCmd {
     /// it doesn't) and records it; otherwise it lists them, and --path picks one. --path
     /// records the repository there once the box says it is one (its top level). --clone runs
     /// `git clone` of the project's origin on the box, in this terminal, with the box's own git
-    /// credentials (no agent forwarding), then records the clone; it needs a terminal. twr
-    /// never fetches. A running hub takes the change at once.
+    /// credentials (no agent forwarding), then records the clone; it needs a terminal (and on
+    /// a command box, its terminal_command). twr never fetches. A running hub takes the change
+    /// at once.
     Project {
         /// The box's name.
         name: String,
@@ -247,9 +268,14 @@ pub(super) async fn run(
     socket: &Path,
 ) -> anyhow::Result<ExitCode> {
     match cmd {
-        BoxCmd::Add { name, ssh, yes } => {
-            let (ssh, yes) = destination(&ssh, yes);
-            add(config, paths, socket, &name, &ssh, yes).await?
+        BoxCmd::Add {
+            name,
+            words,
+            command,
+            yes,
+        } => {
+            let (words, yes) = destination(&words, yes);
+            add(config, paths, socket, &name, command, words, yes).await?
         }
         BoxCmd::List { json } => list(socket, json).await?,
         BoxCmd::Status { name, json } => status(socket, &name, json).await?,
@@ -298,17 +324,96 @@ pub(super) async fn run(
     Ok(ExitCode::SUCCESS)
 }
 
-/// The ssh destination of `twr box add`'s words, joined with spaces, and whether `--yes` was
-/// given: a `--yes` after the destination lands among its words (they take everything that
-/// follows) and is taken out (ssh has no long options).
-fn destination(words: &[String], yes: bool) -> (String, bool) {
+/// `twr box add`'s words (an ssh destination, or with `--command` a command's argv, each word
+/// kept apart), and whether `--yes` was given: a `--yes` after the destination lands among its
+/// words (they take everything that follows) and is taken out (ssh has no long options, and a
+/// command that needs that word can be written in boxes.toml).
+fn destination(words: &[String], yes: bool) -> (Vec<String>, bool) {
     let given = words.iter().any(|w| w == "--yes");
-    let ssh: Vec<&str> = words
-        .iter()
-        .map(String::as_str)
-        .filter(|w| *w != "--yes")
-        .collect();
-    (ssh.join(" ").trim().to_string(), yes || given)
+    let kept = words.iter().filter(|w| *w != "--yes").cloned().collect();
+    (kept, yes || given)
+}
+
+/// The ssh destination of `twr box add`'s words ([`destination`]): joined with spaces.
+fn ssh_destination(words: &[String]) -> String {
+    words.join(" ").trim().to_string()
+}
+
+/// The terminal_command `twr box add` writes for command box `argv`: for `docker`, `podman`
+/// or `nerdctl exec` and `kubectl exec` with a word `-i` (`--interactive`, `--stdin`) before
+/// any `--`, the same argv with `-t` right after that word, every other one kept (`-u`, `-e
+/// HOME=...`, `-w`). `None` for any other command: guessing at its flags would hide a guess in
+/// every login and clone (`nsenter -t` is a pid).
+fn default_terminal(argv: &[String]) -> Option<Vec<String>> {
+    let program = Path::new(argv.first()?).file_name()?.to_str()?;
+    if !matches!(program, "docker" | "podman" | "nerdctl" | "kubectl") {
+        return None;
+    }
+    let end = argv.iter().position(|w| w == "--").unwrap_or(argv.len());
+    let exec = argv[..end].iter().position(|w| w == "exec")?;
+    let at = (exec + 1..end)
+        .find(|&i| matches!(argv[i].as_str(), "-i" | "--interactive" | "--stdin"))?;
+    let mut terminal = argv.to_vec();
+    terminal.insert(at + 1, "-t".to_string());
+    Some(terminal)
+}
+
+/// `argv` as the user reads it: each word shell-quoted when it needs it.
+fn argv_label(argv: &[String]) -> String {
+    argv.iter()
+        .map(|w| twr_core::paths::sh_word(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// How twr reaches a box through `link`, as said to the user (the commands that refuse
+/// agents): `over ssh (<destination>)`, or `through `<command>``.
+fn reached(link: &BoxLink) -> String {
+    reached_by(link, false)
+}
+
+/// [`reached`], said to an agent when `agent` ([`link_shown`]).
+fn reached_by(link: &BoxLink, agent: bool) -> String {
+    match link {
+        BoxLink::Ssh(ssh) => format!("over ssh ({})", ssh.trim()),
+        BoxLink::Command { .. } => format!("through `{}`", link_shown(link, agent)),
+    }
+}
+
+/// `link` as a command that agents may run (`twr box doctor`) shows it: its label
+/// ([`BoxLink::label`]), but to an agent (`agent`) a command box's program and how many words
+/// its command has, never the words, as the config's Debug output shows it (one may hold a
+/// secret, `-e KEY=value`).
+fn link_shown(link: &BoxLink, agent: bool) -> String {
+    match link {
+        BoxLink::Command { command, .. } if agent => format!(
+            "{} ({} words)",
+            command.first().map(String::as_str).unwrap_or_default(),
+            command.len()
+        ),
+        _ => link.label(),
+    }
+}
+
+/// Why a probe through `link` may not finish: a question of ssh's (a host key, a passphrase);
+/// a command has none (it runs without a terminal).
+fn unanswered(link: &BoxLink) -> &'static str {
+    match link {
+        BoxLink::Ssh(_) => "a question of ssh's left unanswered, or a box that does not answer",
+        BoxLink::Command { .. } => "a command or a box that does not answer",
+    }
+}
+
+/// Why box `name` (through `link`) cannot run what needs a terminal there (`twr box login`,
+/// `twr box project --clone`): a command box without terminal_command, refused before
+/// anything runs; `instead`, what to do without one. `None` when it can.
+pub(super) fn terminal_refusal(name: &str, link: &BoxLink, instead: &str) -> Option<String> {
+    matches!(link, BoxLink::Command { terminal: None, .. }).then(|| {
+        format!(
+            "box {name} has no terminal_command: set one in [boxes.{name}] (its command with \
+             `-t`: `docker exec -i -t <container>`), or {instead}"
+        )
+    })
 }
 
 /// Refuses a named workspace: boxes belong to the default workspace's hub.
@@ -463,107 +568,216 @@ fn release_target(os: &str, arch: &str) -> Option<&'static str> {
     }
 }
 
-/// The ssh program the hub runs too (`TWR_SSH`, else `ssh`).
-fn ssh_program_name() -> String {
-    Path::new(&ssh_box::ssh_program()).display().to_string()
+/// What [`here`] got from the box: the exit code (`None`: a signal), stdout, and the last lines
+/// of stderr (shown already, cleaned and cut: [`show_stderr`]).
+pub(super) struct Here {
+    pub(super) code: Option<i32>,
+    pub(super) out: String,
+    pub(super) err: Vec<String>,
 }
 
-/// Runs `remote` on the box `ssh` names, with ssh in this terminal: its prompts and messages
-/// on stderr, `input` (when given) as its stdin, stdout captured (at most
-/// [`ssh_box::SSH_OUTPUT_MAX`]: more is an error, and ssh is killed). The exit code (`None`:
-/// a signal) and stdout.
-async fn ssh_here(
-    ssh: &str,
-    remote: &str,
-    input: Option<&Path>,
-) -> anyhow::Result<(Option<i32>, String)> {
-    let mut cmd = tokio::process::Command::new(ssh_box::ssh_program());
-    cmd.args(
-        ssh_box::interactive_ssh_args(ssh, remote).map_err(|why| anyhow!("ssh {ssh:?}: {why}"))?,
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .kill_on_drop(true);
-    match input {
-        Some(path) => {
-            let f =
-                std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
-            cmd.stdin(Stdio::from(f));
-        }
-        None => {
-            cmd.stdin(Stdio::null());
+/// A process [`here`] runs: ssh in this terminal's process group, or a command in a process
+/// group of its own ([`ssh_box::Ssh`]).
+enum HereProc {
+    Terminal(tokio::process::Child),
+    Group(ssh_box::Ssh),
+}
+
+impl HereProc {
+    fn child(&mut self) -> &mut tokio::process::Child {
+        match self {
+            HereProc::Terminal(c) => c,
+            HereProc::Group(s) => &mut s.child,
         }
     }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("running {}", ssh_program_name()))?;
-    let stdout = child.stdout.take().expect("piped");
-    let stderr = child.stderr.take().expect("piped");
-    // (An error drops `child`, which kills ssh.)
-    let (out, ()) = tokio::join!(
-        ssh_box::read_capped(stdout, ssh_box::SSH_OUTPUT_MAX, "ssh (stdout)"),
-        show_stderr(stderr),
-    );
-    let out = out.map_err(|e| anyhow!("{e}"))?;
-    let status = child
-        .wait()
-        .await
-        .with_context(|| format!("running {}", ssh_program_name()))?;
-    Ok((status.code(), String::from_utf8_lossy(&out).into_owned()))
+
+    /// Waits for it to end; a group's leftovers are killed then ([`ssh_box::Ssh::finish`]).
+    async fn finish(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self {
+            HereProc::Terminal(c) => c.wait().await,
+            HereProc::Group(s) => s.finish().await,
+        }
+    }
 }
 
-/// The most lines of ssh's stderr (its messages and the box's) [`ssh_here`] shows; the rest
-/// is read and dropped.
+/// Runs `line` on the box through `link` from here, `input` its stdin, stdout captured (at most
+/// [`ssh_box::SSH_OUTPUT_MAX`]: more is an error, and the process is killed), stderr shown on
+/// this one ([`show_stderr`]). ssh runs in this terminal, in its process group, so it can ask
+/// about a host key or for a passphrase (killing that group would kill twr); only ssh itself
+/// is killed on an error or when this is dropped (a caller's timeout). A command runs as the
+/// hub runs it ([`BoxLink::background`], [`ssh_box::Ssh`]): in a session and process group of
+/// its own, without a terminal (nothing there may prompt), and its whole group is killed when
+/// it ends, on an error and when this is dropped, so no helper of a wrapper outlives it.
+pub(super) async fn here(link: &BoxLink, line: &str, input: Input) -> anyhow::Result<Here> {
+    let program = Path::new(&link.program()).display().to_string();
+    let refused = |why: String| match link {
+        BoxLink::Ssh(ssh) => anyhow!("ssh {ssh:?}: {why}"),
+        BoxLink::Command { .. } => anyhow!("the box's command ({program}): {why}"),
+    };
+    let mut cmd = if link.own_session_here() {
+        link.background(line).map_err(refused)?
+    } else {
+        let mut c = tokio::process::Command::new(link.program());
+        c.args(link.here_args(line).map_err(refused)?)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        c
+    };
+    let bytes = match input {
+        Input::None => {
+            cmd.stdin(Stdio::null());
+            None
+        }
+        Input::File(path) => {
+            let f = std::fs::File::open(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            cmd.stdin(Stdio::from(f));
+            None
+        }
+        Input::Bytes(b) => {
+            cmd.stdin(Stdio::piped());
+            Some(b)
+        }
+    };
+    let mut proc = if link.own_session_here() {
+        HereProc::Group(ssh_box::Ssh::spawn(cmd).with_context(|| format!("running {program}"))?)
+    } else {
+        HereProc::Terminal(cmd.spawn().with_context(|| format!("running {program}"))?)
+    };
+    let child = proc.child();
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let via = link.via();
+    let what = format!("{via} (stdout)");
+    // The first to fail (more output than allowed) ends the others; an error drops `proc`,
+    // which kills it (a command's whole group). The wait for its end runs alongside the
+    // reads: a helper that kept its stdout or stderr open (a wrapper's) is killed with the
+    // group once the leader exits, which ends the reads.
+    let (out, err, (), status) = tokio::try_join!(
+        async {
+            ssh_box::read_capped(stdout, ssh_box::SSH_OUTPUT_MAX, &what)
+                .await
+                .map_err(|e| anyhow!("{e}"))
+        },
+        async { Ok(show_stderr(stderr, &via).await) },
+        async {
+            // A box that does not read it shows in its answer: not an error here. (Closed
+            // when dropped.)
+            if let (Some(mut stdin), Some(b)) = (stdin, bytes) {
+                use tokio::io::AsyncWriteExt;
+                let _ = stdin.write_all(&b).await;
+            }
+            Ok(())
+        },
+        async {
+            proc.finish()
+                .await
+                .with_context(|| format!("running {program}"))
+        },
+    )?;
+    Ok(Here {
+        code: status.code(),
+        out: String::from_utf8_lossy(&out).into_owned(),
+        err,
+    })
+}
+
+/// Why `what` (`ssh to box gpu`, `installing twr on box gpu`) through `link` to box `name`
+/// failed with exit `code` and stderr `err` (shown above): a command's own failure when it is
+/// one twr knows (no such container, a stopped one, an engine it cannot reach:
+/// [`ssh_box::command_failure`], with its fix), else where to look. (ssh's own messages, above,
+/// say what went wrong: [`ssh_box::ssh_failure`] speaks of the hub's ssh, which never prompts.)
+pub(super) fn failed_here(
+    link: &BoxLink,
+    name: &str,
+    what: &str,
+    code: Option<i32>,
+    err: &[String],
+) -> String {
+    if let BoxLink::Command { .. } = link {
+        if let Some(why) = ssh_box::command_failure(name, code, err) {
+            return why;
+        }
+    }
+    let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
+    let via = link.via();
+    format!("{what} failed ({code}): see {via}'s message above")
+}
+
+/// The most lines of the box's stderr [`here`] shows; the rest is read and dropped.
 const STDERR_LINES_SHOWN: usize = 200;
 
-/// Shows ssh's stderr `stderr` (ssh's messages, and what the box prints there) on this one, a
-/// line at a time: each line cut at [`ssh_box::NOTE_MAX_BYTES`] and its control characters
-/// escaped ([`crate::term::clean`], through `errln!`), at most [`STDERR_LINES_SHOWN`] lines.
-/// ssh asks its questions (a host key, a passphrase) on the terminal itself (`/dev/tty`), not
-/// here, so they keep working.
-async fn show_stderr(stderr: tokio::process::ChildStderr) {
-    show_lines(stderr, &mut |line: &str| errln!("{line}")).await;
+/// The most of those lines [`here`] keeps, the last ones (to say what failed).
+const STDERR_LINES_KEPT: usize = 20;
+
+/// Shows stderr `stderr` of the program `via` names (ssh's messages, a command's, and what the
+/// box prints there) on this one, a line at a time: each line cut at
+/// [`ssh_box::NOTE_MAX_BYTES`] and its control characters escaped ([`crate::term::clean`],
+/// through `errln!`), at most [`STDERR_LINES_SHOWN`] lines. The last [`STDERR_LINES_KEPT`]
+/// lines shown, cleaned. ssh asks its questions (a host key, a passphrase) on the terminal
+/// itself (`/dev/tty`), not here, so they keep working.
+async fn show_stderr(stderr: tokio::process::ChildStderr, via: &str) -> Vec<String> {
+    show_lines(stderr, via, &mut |line: &str| errln!("{line}")).await
 }
 
 /// [`show_stderr`]'s work: the lines of `r` to `show`, each cut and cleaned, at most
-/// [`STDERR_LINES_SHOWN`] (then one saying the rest is not shown).
-async fn show_lines<R: tokio::io::AsyncRead + Unpin>(r: R, show: &mut dyn FnMut(&str)) {
+/// [`STDERR_LINES_SHOWN`] (then one saying the rest is not shown); the last ones shown.
+async fn show_lines<R: tokio::io::AsyncRead + Unpin>(
+    r: R,
+    via: &str,
+    show: &mut dyn FnMut(&str),
+) -> Vec<String> {
     let mut r = tokio::io::BufReader::new(r);
     let mut shown = 0;
+    let mut kept = std::collections::VecDeque::new();
     while let Ok(Some(line)) = ssh_box::read_line_capped(&mut r, ssh_box::NOTE_MAX_BYTES).await {
         shown += 1;
         if shown <= STDERR_LINES_SHOWN {
-            show(&crate::term::clean(&line));
+            let line = crate::term::clean(&line).into_owned();
+            show(&line);
+            if kept.len() == STDERR_LINES_KEPT {
+                kept.pop_front();
+            }
+            kept.push_back(line);
         } else if shown == STDERR_LINES_SHOWN + 1 {
-            show("(ssh printed more: not shown)");
+            show(&format!("({via} printed more: not shown)"));
         }
     }
+    kept.into()
 }
 
 /// How long the probe of `twr box add` and `twr box install` may take, ssh's questions
 /// included.
 const PROBE_WAIT: Duration = Duration::from_secs(120);
 
-/// Probes box `name` over ssh in this terminal ([`ssh_here`], within [`PROBE_WAIT`]) and says
-/// what it found. Its data directory too (an error without one).
-async fn probe(name: &str, ssh: &str) -> anyhow::Result<(ssh_box::Probe, String)> {
-    outln!("probing box {name} over ssh ({ssh})...");
-    let remote = ssh_box::sh_c(&ssh_box::probe_script());
-    let probing = ssh_here(ssh, &remote, None);
-    let (code, out) = tokio::time::timeout(PROBE_WAIT, probing)
+/// Probes box `name` through `link` ([`here`], within [`PROBE_WAIT`]; a command box's pipe
+/// check with it) and says what it found. Its data directory too (an error without one).
+async fn probe(name: &str, link: &BoxLink) -> anyhow::Result<(ssh_box::Probe, String)> {
+    outln!("probing box {name} {}...", reached(link));
+    let remote = ssh_box::sh_c(&ssh_box::probe_script_for(link));
+    let probing = here(link, &remote, link.probe_input());
+    let ran = tokio::time::timeout(PROBE_WAIT, probing)
         .await
         .map_err(|_| {
             anyhow!(
-                "probing box {name} did not finish within {} s (a question of ssh's left \
-                 unanswered, or a box that does not answer); nothing was changed",
-                PROBE_WAIT.as_secs()
+                "probing box {name} did not finish within {} s ({}); nothing was changed",
+                PROBE_WAIT.as_secs(),
+                unanswered(link)
             )
         })??;
-    if code != Some(0) {
-        let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-        bail!("ssh to box {name} failed ({code}): see ssh's message above");
+    if ran.code != Some(0) {
+        let what = format!("{} to box {name}", link.via());
+        bail!("{}", failed_here(link, name, &what, ran.code, &ran.err));
     }
-    let probe = ssh_box::parse_probe(&out).with_context(|| format!("probing box {name}"))?;
+    let probe =
+        ssh_box::parse_probe_for(&ran.out, link).with_context(|| format!("probing box {name}"))?;
+    // A command that does not pass the hub's input on, or gives the box a terminal, cannot
+    // carry the hub's connection.
+    if let Some(why) = probe.pipe_refusal(name, link) {
+        bail!("{why}");
+    }
     // Nothing is installed into a builds tree another user could write to.
     if let Some(why) = probe.tree_refusal(name) {
         bail!("{why}");
@@ -605,13 +819,14 @@ async fn batch_check(name: &str, ssh: &str) -> Option<String> {
             ssh.child.stdout.take().expect("piped"),
             ssh.child.stderr.take().expect("piped"),
         );
-        // Bounded: more than allowed ends the check (and drops `ssh`, which kills it).
+        // Bounded: more than allowed ends the check (and drops `ssh`, which kills it). Its end
+        // is waited for alongside the reads (a helper holding its output dies with the group).
         let max = ssh_box::SSH_OUTPUT_MAX;
-        let (_, err) = tokio::try_join!(
+        let (_, err, status) = tokio::try_join!(
             ssh_box::read_capped(stdout, max, "ssh (stdout)"),
             ssh_box::read_capped(stderr, max, "ssh (stderr)"),
+            async { ssh.finish().await.map_err(|e| e.to_string()) },
         )?;
-        let status = ssh.finish().await.map_err(|e| e.to_string())?;
         let lines: Vec<String> = String::from_utf8_lossy(&err)
             .lines()
             .map(str::to_string)
@@ -709,7 +924,8 @@ async fn add(
     paths: &Paths,
     socket: &Path,
     name: &str,
-    ssh: &str,
+    command: bool,
+    words: Vec<String>,
     yes: bool,
 ) -> anyhow::Result<()> {
     refuse_agent_action("add boxes")?;
@@ -718,20 +934,39 @@ async fn add(
     if name == twr_hub::hub::LOCAL_BOX {
         bail!("box name local is the hub's own box: name the remote box otherwise");
     }
-    if ssh.is_empty() {
-        bail!("give the box's ssh destination: `twr box add {name} me@host`");
-    }
+    let cfg = if command {
+        if words.is_empty() {
+            bail!(
+                "give the command that reaches the box: `twr box add {name} --command docker \
+                 exec -i <container>`"
+            );
+        }
+        BoxConfig {
+            transport: Some(BoxTransport::Command),
+            terminal_command: default_terminal(&words),
+            command: Some(words),
+            ..BoxConfig::default()
+        }
+    } else {
+        let ssh = ssh_destination(&words);
+        if ssh.is_empty() {
+            bail!("give the box's ssh destination: `twr box add {name} me@host`");
+        }
+        BoxConfig {
+            transport: Some(BoxTransport::Ssh),
+            ssh: Some(ssh),
+            ..BoxConfig::default()
+        }
+    };
     let file = paths.boxes_file();
     if config.boxes.contains_key(name) {
         bail!("there is a box {name} already (`twr box status {name}` shows it)");
     }
-    let cfg = BoxConfig {
-        transport: Some(BoxTransport::Ssh),
-        ssh: Some(ssh.to_string()),
-        ..BoxConfig::default()
-    };
-    // Checked now so a bad destination fails before any ssh.
+    // Checked now so a bad destination or command fails before anything runs.
     with_added_box(&paths.config_file, &file, name, cfg.clone())?;
+    let Some(link) = BoxLink::of(&cfg) else {
+        bail!("box {name} has no ssh destination or command");
+    };
     // Nobody to confirm with: refused before anything runs.
     let mut ask = ask_on_stderr;
     let consent = consent(yes, &mut ask);
@@ -752,19 +987,25 @@ async fn add(
         errln!("twr: warning: the running hub did not say which boxes it has ({why})");
     }
 
-    let (probe, data) = probe(name, ssh).await?;
-    if let Some(why) = batch_check(name, ssh).await {
-        errln!(
-            "twr: warning: ssh to box {name} does not work without prompting: {why}\n\
-             The hub runs ssh without prompting (BatchMode), so it cannot connect until it \
-             can: load the key into an ssh-agent the hub can use (or start the hub from a \
-             shell that has one), or use a key without a passphrase. The box can still be \
-             added."
-        );
+    let (probe, data) = probe(name, &link).await?;
+    // (A command ran as the hub runs it, without a terminal: it needs no other check.)
+    if let BoxLink::Ssh(ssh) = &link {
+        if let Some(why) = batch_check(name, ssh).await {
+            errln!(
+                "twr: warning: ssh to box {name} does not work without prompting: {why}\n\
+                 The hub runs ssh without prompting (BatchMode), so it cannot connect until it \
+                 can: load the key into an ssh-agent the hub can use (or start the hub from a \
+                 shell that has one), or use a key without a passphrase. The box can still be \
+                 added."
+            );
+        }
     }
     let same = same_target(&probe);
     outln!();
-    outln!("Adding box {name} (ssh {ssh}):");
+    match &link {
+        BoxLink::Ssh(_) => outln!("Adding box {name} ({}):", link.label()),
+        BoxLink::Command { .. } => outln!("Adding box {name} (command: {}):", link.label()),
+    }
     match (&hub.build, same) {
         (Some(id), true) => {
             let path = ssh_box::build_path(&data, id);
@@ -798,10 +1039,9 @@ async fn add(
             outln!("{l}");
         }
     }
-    outln!(
-        "- The hub connects to the box over ssh and starts a twr box daemon there, which runs \
-         the box's threads and keeps them running while the hub is away."
-    );
+    for l in reach_lines(name, &link) {
+        outln!("{l}");
+    }
     outln!("- [boxes.{name}] goes into {}.", file.display());
     if !confirm(
         consent,
@@ -853,6 +1093,35 @@ async fn add(
         }
     }
     Ok(())
+}
+
+/// What `twr box add` says of how the hub reaches box `name` through `link`, and for a command
+/// box, what runs in the user's terminal (its terminal_command) or that nothing does.
+fn reach_lines(name: &str, link: &BoxLink) -> Vec<String> {
+    let daemon = "starts a twr box daemon there, which runs the box's threads and keeps them \
+                  running while the hub is away.";
+    match link {
+        BoxLink::Ssh(_) => vec![format!(
+            "- The hub connects to the box over ssh and {daemon}"
+        )],
+        BoxLink::Command { terminal, .. } => vec![
+            format!(
+                "- The hub runs `{} sh -c ...` itself, from its own environment, and {daemon}",
+                link.label()
+            ),
+            match terminal {
+                Some(t) => format!(
+                    "- For `twr box login` and `twr box project --clone`, twr runs `{}` in your \
+                     terminal (terminal_command).",
+                    argv_label(t)
+                ),
+                None => format!(
+                    "- `twr box login` and `twr box project --clone` need a terminal_command in \
+                     [boxes.{name}] (the command with `-t`); without one they are refused."
+                ),
+            },
+        ],
+    }
 }
 
 /// What `twr box add` says a Mac (box `name`) needs, the hub running twr `version`: someone
@@ -1177,14 +1446,13 @@ async fn status(socket: &Path, name: &str, json: bool) -> anyhow::Result<()> {
 fn status_text(b: &Value) -> String {
     let mut out = String::new();
     let mut line = |k: &str, v: &str| out.push_str(&format!("{k:<15} {v}\n"));
-    let ssh = b["transport"] == "ssh";
     line("box:", str_of(&b["name"]));
     line(
         "transport:",
-        if ssh {
-            "ssh (the hub connects to the box over ssh)"
-        } else {
-            "token (its runner connects to the hub's listener, [hub] listen)"
+        match str_of(&b["transport"]) {
+            "ssh" => "ssh (the hub connects to the box over ssh)",
+            "command" => "command (the hub reaches the box through its command, a container's)",
+            _ => "token (its runner connects to the hub's listener, [hub] listen)",
         },
     );
     line("state:", str_of(&b["state"]));
@@ -1282,26 +1550,27 @@ async fn install(
         );
     };
     let file = paths.boxes_file();
-    // One snapshot of the box, read from its file now, drives both the ssh below and the
+    // One snapshot of the box, read from its file now, drives both the probe below and the
     // record's comparison.
     let (cfg, in_boxes_file) = box_snapshot(&paths.config_file, &file, name, loaded)?;
     let cfg = &cfg;
-    if cfg.transport() != BoxTransport::Ssh {
+    let link = cfg.transport().dialed().then(|| BoxLink::of(cfg)).flatten();
+    let Some(link) = link else {
         bail!(
             "box {name} is a token box: its runner connects to the hub, and you install twr on \
              it yourself (docs/runners.md)"
         );
-    }
-    let ssh = cfg.ssh.clone().unwrap_or_default();
+    };
+    let link = &link;
     match &from {
-        // Read now: a path that is wrong fails before any ssh.
+        // Read now: a path that is wrong fails before anything runs on the box.
         Some(InstallFrom::Binary(b)) => {
             std::fs::metadata(b).with_context(|| format!("reading {}", b.display()))?;
         }
         Some(InstallFrom::Box(p)) => check_box_path(name, p)?,
         None => {}
     }
-    let (probe, data) = probe(name, &ssh).await?;
+    let (probe, data) = probe(name, link).await?;
     if same_target(&probe) {
         if let Some(f) = &from {
             bail!(
@@ -1347,18 +1616,18 @@ async fn install(
     let reference = hub_reference(paths, name)?;
     let id = match &from {
         Some(InstallFrom::Binary(path)) => {
-            install_binary(name, &ssh, &data, path, &hub, consent, reference.as_deref()).await?
+            install_binary(name, link, &data, path, &hub, consent, reference.as_deref()).await?
         }
         Some(InstallFrom::Box(path)) => {
             if let Some(why) = home_here(path, &data) {
                 errln!("twr: warning: {why}");
             }
-            install_from_box(name, &ssh, &data, path, &hub, consent, reference.as_deref()).await?
+            install_from_box(name, link, &data, path, &hub, consent, reference.as_deref()).await?
         }
         None => {
             install_release(
                 name,
-                &ssh,
+                link,
                 &data,
                 target,
                 &hub,
@@ -1391,8 +1660,8 @@ async fn install(
 }
 
 /// Box `name` as its file has it now (boxes.toml, else config.toml): the one snapshot a
-/// command that changes it (`twr box install`, `twr box project`) works from, its ssh to the
-/// box and its write both, and whether it is in boxes.toml (else in config.toml, which twr
+/// command that changes it (`twr box install`, `twr box project`) works from, what it runs on
+/// the box and its write both, and whether it is in boxes.toml (else in config.toml, which twr
 /// does not edit). Refused when the box's connection settings there
 /// ([`BoxConfig::connection`]) are not those of `loaded` (the box as the command's config was
 /// loaded, earlier), or the box is in neither file now.
@@ -1414,15 +1683,15 @@ pub(super) fn box_snapshot(
     };
     if start.connection() != loaded.connection() {
         bail!(
-            "box {name} changed in {} while twr read its config (its ssh destination or \
-             settings): nothing was changed; run the command again",
+            "box {name} changed in {} while twr read its config (its ssh destination, command \
+             or settings): nothing was changed; run the command again",
             if in_file { file } else { config_file }.display()
         );
     }
     Ok((start, in_file))
 }
 
-/// Records build `id`, just installed over ssh to box `name` as configured by `used`, as the
+/// Records build `id`, just installed on box `name` as configured by `used`, as the
 /// box's `build` in boxes.toml (`file`, next to `config_file`), under the file's lock: only
 /// while the box there is still the one installed to (its connection settings,
 /// [`BoxConfig::connection`], as in `used`: a box removed and added again meanwhile, with
@@ -1446,9 +1715,9 @@ fn record_installed_build(
     };
     if b.connection() != used.connection() {
         bail!(
-            "box {name} changed in {} while twr was installing on it (its ssh destination or \
-             settings): build {id} was not recorded and stays on the box it went to; run `twr \
-             box install {name}` again",
+            "box {name} changed in {} while twr was installing on it (its ssh destination, \
+             command or settings): build {id} was not recorded and stays on the box it went to; \
+             run `twr box install {name}` again",
             file.display()
         );
     }
@@ -1508,7 +1777,7 @@ async fn restart(
     let Some(cfg) = config.boxes.get(name) else {
         bail!("there is no box {name} in config.toml or boxes.toml (`twr box list` lists them)");
     };
-    if cfg.transport() != BoxTransport::Ssh {
+    if !cfg.transport().dialed() {
         bail!(
             "box {name} is a token box: its runner connects to the hub; restart that `twr \
              runner` on the box yourself"
@@ -1720,7 +1989,7 @@ fn hub_reference(paths: &Paths, name: &str) -> anyhow::Result<Option<String>> {
 #[allow(clippy::too_many_arguments)]
 async fn install_binary(
     name: &str,
-    ssh: &str,
+    link: &BoxLink,
     data: &str,
     path: &Path,
     hub: &HubBuild,
@@ -1750,9 +2019,14 @@ async fn install_binary(
         // (Run only once the script got to its end: installed.)
         script.push_str(&ssh_box::install_ref_script(data, r, &id));
     }
-    let (code, out) = ssh_here(ssh, &ssh_box::sh_c(&script), Some(path)).await?;
-    let (answer, version) = ssh_box::upload_answer(&out);
-    upload_result(name, code, answer.as_deref())?;
+    let ran = here(
+        link,
+        &ssh_box::sh_c(&script),
+        Input::File(path.to_path_buf()),
+    )
+    .await?;
+    let (answer, version) = ssh_box::upload_answer(&ran.out);
+    upload_result(link, name, data, &ran, answer.as_deref())?;
     version_note(name, version.as_deref(), hub);
     Ok(Some(id))
 }
@@ -1796,7 +2070,7 @@ fn home_here(path: &str, data: &str) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 async fn install_from_box(
     name: &str,
-    ssh: &str,
+    link: &BoxLink,
     data: &str,
     path: &str,
     hub: &HubBuild,
@@ -1820,16 +2094,21 @@ async fn install_from_box(
         // (Run only once the script got to its end: `$id` is what it installed.)
         script.push_str(&ssh_box::install_ref_script(data, r, "\"$id\""));
     }
-    let (code, out) = ssh_here(ssh, &ssh_box::sh_c(&script), None).await?;
-    let (answer, version) = ssh_box::upload_answer(&out);
-    match (code, answer.as_deref()) {
+    let ran = here(link, &ssh_box::sh_c(&script), Input::None).await?;
+    let (answer, version) = ssh_box::upload_answer(&ran.out);
+    match (ran.code, answer.as_deref()) {
         (Some(0), Some(a)) if a.starts_with("ok ") => {}
-        (Some(ssh_box::UPLOAD_MISMATCH), Some(why)) => {
-            bail!("box {name} refused to install {path}: {why}; nothing was installed")
-        }
+        (Some(ssh_box::UPLOAD_MISMATCH), Some(why)) => bail!(
+            "box {name} refused to install {path}: {why}; nothing was installed{}",
+            upload_hints(link, name, data, Some(why), &ran.err)
+        ),
         (code, _) => {
-            let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-            bail!("installing {path} on box {name} failed ({code}): see ssh's message above")
+            let what = format!("installing {path} on box {name}");
+            bail!(
+                "{}{}",
+                failed_here(link, name, &what, code, &ran.err),
+                upload_hints(link, name, data, None, &ran.err)
+            )
         }
     }
     let id = answer
@@ -1872,7 +2151,7 @@ fn version_note(name: &str, version: Option<&str>, hub: &HubBuild) {
 #[allow(clippy::too_many_arguments)]
 async fn install_release(
     name: &str,
-    ssh: &str,
+    link: &BoxLink,
     data: &str,
     target: &str,
     hub: &HubBuild,
@@ -1920,10 +2199,10 @@ async fn install_release(
         // (Run only once the script got to its end: `$id` is what it installed.)
         script.push_str(&ssh_box::install_ref_script(data, r, "\"$id\""));
     }
-    let (code, out) = ssh_here(ssh, &ssh_box::sh_c(&script), Some(&file)).await?;
+    let ran = here(link, &ssh_box::sh_c(&script), Input::File(file)).await?;
     drop(tmp);
-    let (answer, _) = ssh_box::upload_answer(&out);
-    upload_result(name, code, answer.as_deref())?;
+    let (answer, _) = ssh_box::upload_answer(&ran.out);
+    upload_result(link, name, data, &ran, answer.as_deref())?;
     let id = answer
         .as_deref()
         .and_then(|a| a.strip_prefix("ok "))
@@ -1943,19 +2222,52 @@ fn upload_tag() -> anyhow::Result<String> {
     Ok(twr_core::runner::new_nonce()?[..16].to_string())
 }
 
-/// Whether an upload to box `name` that exited `code` with answer `answer` succeeded (an
-/// error saying why not).
-fn upload_result(name: &str, code: Option<i32>, answer: Option<&str>) -> anyhow::Result<()> {
-    match (code, answer) {
+/// Whether an upload to box `name` through `link`, under data directory `data`, that ended
+/// as `ran` with answer `answer` succeeded (an error saying why not, with [`upload_hints`]).
+fn upload_result(
+    link: &BoxLink,
+    name: &str,
+    data: &str,
+    ran: &Here,
+    answer: Option<&str>,
+) -> anyhow::Result<()> {
+    match (ran.code, answer) {
         (Some(0), Some(a)) if a == "ok" || a.starts_with("ok ") => Ok(()),
-        (Some(ssh_box::UPLOAD_MISMATCH), Some(why)) => {
-            bail!("box {name} refused the upload: {why}; nothing was installed")
-        }
+        (Some(ssh_box::UPLOAD_MISMATCH), Some(why)) => bail!(
+            "box {name} refused the upload: {why}; nothing was installed{}",
+            upload_hints(link, name, data, Some(why), &ran.err)
+        ),
         (code, _) => {
-            let code = code.map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-            bail!("installing twr on box {name} failed ({code}): see ssh's message above")
+            let what = format!("installing twr on box {name}");
+            bail!(
+                "{}{}",
+                failed_here(link, name, &what, code, &ran.err),
+                upload_hints(link, name, data, None, &ran.err)
+            )
         }
     }
+}
+
+/// What an upload's error adds (`. <hint>`, or nothing), as the hub's own upload does: when
+/// the box refused the build with `refusal` and that reads like a C library the build lacks,
+/// [`ssh_box::glibc_hint`]; when a command box's stderr `err` says permission was denied (an
+/// exec as another user, who kept the container's HOME), [`ssh_box::home_hint`] for `data`.
+fn upload_hints(
+    link: &BoxLink,
+    name: &str,
+    data: &str,
+    refusal: Option<&str>,
+    err: &[String],
+) -> String {
+    let hint = match refusal {
+        Some(why) => ssh_box::glibc_hint(why),
+        None => (link.pipe_checked()
+            && err
+                .iter()
+                .any(|l| l.to_ascii_lowercase().contains("permission denied")))
+        .then(|| ssh_box::home_hint(name, data)),
+    };
+    hint.map_or_else(String::new, |h| format!(". {h}"))
 }
 
 /// The commit part of a development version (`0.2.0+dev.<commit>`).
@@ -2016,8 +2328,16 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
         outln!("(Its settings were not valid, so twr cannot say how to stop its box daemon.)");
         return Ok(());
     };
-    if removed.transport() != BoxTransport::Ssh {
+    let link = removed
+        .transport()
+        .dialed()
+        .then(|| BoxLink::of(&removed))
+        .flatten();
+    let Some(link) = link else {
         return Ok(());
+    };
+    if let BoxLink::Command { .. } = link {
+        outln!("twr never stops or removes box {name}'s container: it stays as it is.");
     }
     let key_file = paths.data_dir.join(ssh_box::BOX_KEY_FILE);
     if !key_file.exists() {
@@ -2040,26 +2360,26 @@ pub(super) async fn remove(paths: &Paths, socket: &Path, name: &str) -> anyhow::
         "The box daemon and the box's worktrees stay on the box. This stops the daemon (and the \
          agents it runs), once the hub no longer connects to the box:"
     );
-    let stop = stop_command(
-        removed.ssh.as_deref().unwrap_or_default(),
-        &build,
-        name,
-        &key.public_hex(),
-    )?;
+    let stop = stop_command(&link, &build, name, &key.public_hex())?;
     outln!("  {stop}");
     Ok(())
 }
 
 /// The command that stops box `name`'s daemon of build `build` for the hub key `key`
-/// ([`ssh_box::stop_script`]), over ssh to `ssh` as `twr box add` runs it: the program the hub
-/// runs, every option it forces and its refusal of words that forward anything
-/// ([`ssh_box::interactive_ssh_args`]), each word shell-quoted, so it can be pasted as shown.
-fn stop_command(ssh: &str, build: &str, name: &str, key: &str) -> anyhow::Result<String> {
+/// ([`ssh_box::stop_script`]), through `link` as `twr box add` runs it: over ssh, the program
+/// the hub runs, every option it forces and its refusal of words that forward anything
+/// ([`ssh_box::interactive_ssh_args`]); through a command, its words then `sh -c <line>`, as
+/// the hub runs it ([`BoxLink::here_args`]). Each word shell-quoted, so it can be pasted as
+/// shown.
+fn stop_command(link: &BoxLink, build: &str, name: &str, key: &str) -> anyhow::Result<String> {
     let remote =
         ssh_box::sh_c(&ssh_box::stop_script(build, name, key).map_err(|e| anyhow!("{e}"))?);
-    let args = ssh_box::interactive_ssh_args(ssh, &remote)
-        .map_err(|why| anyhow!("[boxes.{name}] ssh = {ssh:?}: {why}"))?;
-    Ok(std::iter::once(ssh_program_name())
+    let args = link.here_args(&remote).map_err(|why| match link {
+        BoxLink::Ssh(ssh) => anyhow!("[boxes.{name}] ssh = {ssh:?}: {why}"),
+        BoxLink::Command { .. } => anyhow!("[boxes.{name}] command: {why}"),
+    })?;
+    let program = Path::new(&link.program()).display().to_string();
+    Ok(std::iter::once(program)
         .chain(args)
         .map(|w| twr_core::paths::sh_word(&w))
         .collect::<Vec<_>>()
@@ -2069,6 +2389,54 @@ fn stop_command(ssh: &str, build: &str, name: &str, key: &str) -> anyhow::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An upload's error says what the hub's own would: the C library hint when the box
+    /// refused the build for its glibc, the HOME hint when a command box's user may not write
+    /// under its data directory (not on an SSH box, where that is no `docker exec -u`).
+    #[test]
+    fn upload_errors_carry_the_hubs_hints() {
+        let cmd = BoxLink::Command {
+            command: vec!["docker".into(), "exec".into(), "-i".into(), "c".into()],
+            terminal: None,
+        };
+        let ssh = BoxLink::Ssh("me@b".into());
+        let denied = Here {
+            code: Some(1),
+            out: String::new(),
+            err: vec!["mkdir: cannot create directory '/root/.local': Permission denied".into()],
+        };
+        let e = format!(
+            "{:#}",
+            upload_result(&cmd, "sb", "/root/.local/share", &denied, None).unwrap_err()
+        );
+        assert!(
+            e.contains("installing twr on box sb failed (exit 1)")
+                && e.contains(". box sb's HOME is /root, which its user can't write to"),
+            "{e}"
+        );
+        let e = format!(
+            "{:#}",
+            upload_result(&ssh, "sb", "/root/.local/share", &denied, None).unwrap_err()
+        );
+        assert!(!e.contains("HOME"), "{e}");
+        let why = "it does not run: twr: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' \
+                   not found";
+        let refused = Here {
+            code: Some(ssh_box::UPLOAD_MISMATCH),
+            out: String::new(),
+            err: Vec::new(),
+        };
+        let e = format!(
+            "{:#}",
+            upload_result(&cmd, "sb", "/home/box/.local/share", &refused, Some(why)).unwrap_err()
+        );
+        assert!(e.contains("nothing was installed"), "{e}");
+        assert_eq!(
+            e.contains("a development build of twr needs a box or container"),
+            cfg!(all(target_os = "linux", target_env = "gnu")),
+            "{e}"
+        );
+    }
 
     /// No socket is no hub; a socket that answers but says nothing is a hub whose boxes and
     /// build are unknown, not no hub.
@@ -2105,28 +2473,315 @@ mod tests {
             input.push_str(&format!("line {i}\n"));
         }
         let mut shown = Vec::new();
-        show_lines(input.as_bytes(), &mut |l: &str| shown.push(l.to_string())).await;
+        let kept = show_lines(input.as_bytes(), "ssh", &mut |l: &str| {
+            shown.push(l.to_string())
+        })
+        .await;
         assert_eq!(shown[0], "\\u001b]0;owned\\u0007hello \\u001b[2J");
         assert!(shown.iter().all(|l| !l.contains('\x1b')));
         assert_eq!(shown[1].len(), ssh_box::NOTE_MAX_BYTES);
         assert_eq!(shown.len(), STDERR_LINES_SHOWN + 1);
         assert_eq!(shown.last().unwrap(), "(ssh printed more: not shown)");
+        // The last lines shown are kept, as shown, to say what failed.
+        assert_eq!(kept.len(), STDERR_LINES_KEPT);
+        assert_eq!(
+            kept[..],
+            shown[STDERR_LINES_SHOWN - STDERR_LINES_KEPT..STDERR_LINES_SHOWN]
+        );
+        let kept = show_lines(&b"a\nb\n"[..], "docker", &mut |_: &str| {}).await;
+        assert_eq!(kept, ["a", "b"]);
     }
 
+    fn words(w: &[&str]) -> Vec<String> {
+        w.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Whether process `pid` runs (exists and is no zombie).
+    fn alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit_once(')')
+                    .map(|(_, r)| !r.trim_start().starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Waits (at most 10 s) for every pid in `pid_file` to be gone.
+    fn all_gone(pid_file: &Path) {
+        let pids: Vec<i32> = std::fs::read_to_string(pid_file)
+            .unwrap()
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        assert_eq!(pids.len(), 2, "{pids:?}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for pid in pids {
+            while alive(pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "process {pid} is still running"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// A command link's run from here ([`here`]) leaves nothing of its process group behind,
+    /// as the hub's does: a helper its wrapper started (`sleep 300 &`) is gone after a run to
+    /// its end, after a caller's timeout with the command hanging (the wrapper's own process
+    /// too), after more output than twr reads, and when the helper holds the command's stdout
+    /// and stderr (the run still ends with the leader). (Only the group's kill reaches the
+    /// helper.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_command_run_here_leaves_nothing_of_its_group_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // `$0`: where the helper's pid and the wrapper's go; then `env`, and `sh -c <line>`.
+        let wrapper = "sleep 300 </dev/null >/dev/null 2>&1 & echo \"$! $$\" > \"$0\"; exec \"$@\"";
+        let link = |pid_file: &Path| BoxLink::Command {
+            command: words(&["sh", "-c", wrapper, pid_file.to_str().unwrap(), "env"]),
+            terminal: None,
+        };
+        // To its end: its answer, the helper gone.
+        let pids = dir.path().join("end.pids");
+        let ran = here(&link(&pids), "echo said; exit 3", Input::None)
+            .await
+            .unwrap();
+        assert_eq!((ran.code, ran.out.as_str()), (Some(3), "said\n"));
+        all_gone(&pids);
+        // A caller's timeout: the wrapper's process and the helper gone.
+        let pids = dir.path().join("timeout.pids");
+        let l = link(&pids);
+        let hung = tokio::time::timeout(Duration::from_secs(1), here(&l, "sleep 300", Input::None));
+        assert!(hung.await.is_err(), "it did not hang");
+        all_gone(&pids);
+        // More output than twr reads: the error, and nothing left.
+        let pids = dir.path().join("output.pids");
+        let l = link(&pids);
+        let line = format!(
+            "head -c {} /dev/zero; sleep 300",
+            2 * ssh_box::SSH_OUTPUT_MAX
+        );
+        let e = tokio::time::timeout(Duration::from_secs(20), here(&l, &line, Input::None))
+            .await
+            .expect("an output past the limit ends the run")
+            .err()
+            .unwrap();
+        assert!(format!("{e:#}").contains("more than twr reads"), "{e:#}");
+        all_gone(&pids);
+        // A helper that keeps the command's stdout and stderr open: the run ends with the
+        // leader (its group killed then, which closes them), not with the helper.
+        let pids = dir.path().join("inherit.pids");
+        let inherits = "sleep 300 </dev/null & echo \"$! $$\" > \"$0\"; exec \"$@\"";
+        let l = BoxLink::Command {
+            command: words(&["sh", "-c", inherits, pids.to_str().unwrap(), "env"]),
+            terminal: None,
+        };
+        let ran = tokio::time::timeout(
+            Duration::from_secs(10),
+            here(&l, "echo said; exit 3", Input::None),
+        )
+        .await
+        .expect("the run ends with its leader")
+        .unwrap();
+        assert_eq!((ran.code, ran.out.as_str()), (Some(3), "said\n"));
+        all_gone(&pids);
+    }
+
+    /// A command link's run from here gets what it is given on stdin (the pipe check's token,
+    /// or a file), and its stderr's last lines are kept to say what failed: a command's known
+    /// failure with its fix.
+    #[tokio::test]
+    async fn a_command_run_here_gets_its_input_and_says_its_failure() {
+        let link = BoxLink::Command {
+            command: words(&["env"]),
+            terminal: None,
+        };
+        let ran = here(&link, "cat", link.probe_input()).await.unwrap();
+        assert_eq!((ran.code, ran.out.as_str()), (Some(0), "twr-pipe-ok\n"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("in");
+        std::fs::write(&file, "from a file").unwrap();
+        let ran = here(&link, "cat", Input::File(file)).await.unwrap();
+        assert_eq!(ran.out, "from a file");
+        let ran = here(
+            &link,
+            "echo 'Error response from daemon: No such container: nosuch' >&2; exit 1",
+            Input::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran.code, Some(1));
+        assert_eq!(
+            failed_here(&link, "sb", "env to box sb", ran.code, &ran.err),
+            "box sb's container does not exist (Error response from daemon: No such container: \
+             nosuch): create and start it (docs/runners.md#container-boxes)"
+        );
+        let ran = here(&link, "echo other >&2; exit 2", Input::None)
+            .await
+            .unwrap();
+        assert_eq!(
+            failed_here(&link, "sb", "env to box sb", ran.code, &ran.err),
+            "env to box sb failed (exit 2): see env's message above"
+        );
+        // ssh's own messages say why: never the hub's reading of them.
+        let ssh = BoxLink::Ssh("me@gpu".into());
+        let err = words(&["me@gpu: Permission denied (publickey)."]);
+        assert_eq!(
+            failed_here(&ssh, "gpu", "ssh to box gpu", Some(255), &err),
+            "ssh to box gpu failed (exit 255): see ssh's message above"
+        );
+    }
+
+    /// `twr box add`'s words: an ssh destination joined with spaces, a command's kept apart;
+    /// `--yes` among them taken out of both.
     #[test]
     fn the_destination_takes_its_words_and_leaves_yes() {
-        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let ssh = |w: &[&str], yes: bool| {
+            let (w, yes) = destination(&words(w), yes);
+            (ssh_destination(&w), yes)
+        };
+        assert_eq!(ssh(&["me@host"], false), ("me@host".into(), false));
         assert_eq!(
-            destination(&words(&["me@host"]), false),
-            ("me@host".into(), false)
-        );
-        assert_eq!(
-            destination(&words(&["-p", "2222", "me@host", "--yes"]), false),
+            ssh(&["-p", "2222", "me@host", "--yes"], false),
             ("-p 2222 me@host".into(), true)
         );
         assert_eq!(
-            destination(&words(&["-p 2222 me@host"]), true),
+            ssh(&["-p 2222 me@host"], true),
             ("-p 2222 me@host".into(), true)
+        );
+        // A command's words, as given: one with a space stays one.
+        assert_eq!(
+            destination(&words(&["docker", "exec", "-i", "--yes", "my box"]), false),
+            (words(&["docker", "exec", "-i", "my box"]), true)
+        );
+        assert_eq!(
+            destination(&words(&["docker", "exec", "-i", "c"]), false),
+            (words(&["docker", "exec", "-i", "c"]), false)
+        );
+    }
+
+    /// The terminal_command `twr box add` derives: `-t` right after the `-i` (`--interactive`,
+    /// `--stdin`) of `docker`, `podman` and `nerdctl exec` and `kubectl exec`, every other word
+    /// kept (`-u`, `-e HOME=...`, `-w`); none for another program, or without such a word
+    /// before `--`.
+    #[test]
+    fn a_container_engine_s_exec_gets_its_terminal_command() {
+        let t = |argv: &[&str]| default_terminal(&words(argv));
+        assert_eq!(
+            t(&["docker", "exec", "-i", "twr-sandbox"]),
+            Some(words(&["docker", "exec", "-i", "-t", "twr-sandbox"]))
+        );
+        assert_eq!(
+            t(&["/usr/bin/podman", "exec", "--interactive", "c"]),
+            Some(words(&[
+                "/usr/bin/podman",
+                "exec",
+                "--interactive",
+                "-t",
+                "c"
+            ]))
+        );
+        assert_eq!(
+            t(&["nerdctl", "--namespace", "k8s.io", "exec", "-i", "c"]),
+            Some(words(&[
+                "nerdctl",
+                "--namespace",
+                "k8s.io",
+                "exec",
+                "-i",
+                "-t",
+                "c"
+            ]))
+        );
+        assert_eq!(
+            t(&["kubectl", "exec", "-i", "-n", "ns", "pod", "--"]),
+            Some(words(&[
+                "kubectl", "exec", "-i", "-t", "-n", "ns", "pod", "--"
+            ]))
+        );
+        assert_eq!(
+            t(&["kubectl", "exec", "--stdin", "pod", "--"]),
+            Some(words(&["kubectl", "exec", "--stdin", "-t", "pod", "--"]))
+        );
+        // A container that runs as root, exec'd as its user (R6): every other word kept.
+        assert_eq!(
+            t(&[
+                "docker",
+                "exec",
+                "-i",
+                "-u",
+                "box",
+                "-e",
+                "HOME=/home/box",
+                "-w",
+                "/home/box",
+                "c"
+            ]),
+            Some(words(&[
+                "docker",
+                "exec",
+                "-i",
+                "-t",
+                "-u",
+                "box",
+                "-e",
+                "HOME=/home/box",
+                "-w",
+                "/home/box",
+                "c"
+            ]))
+        );
+        for none in [
+            &["docker", "exec", "c"][..],
+            &["docker", "-i", "exec", "c"],
+            &["kubectl", "exec", "pod", "--", "-i"],
+            &["lxc", "exec", "-i", "c"],
+            &["nsenter", "-t", "1", "-i"],
+            &["env"],
+        ] {
+            assert_eq!(t(none), None, "{none:?}");
+        }
+    }
+
+    /// What `twr box add` says of how the hub reaches the box, and of what runs in your
+    /// terminal on a command box.
+    #[test]
+    fn box_add_says_how_the_hub_reaches_the_box() {
+        let ssh = reach_lines("gpu", &BoxLink::Ssh("me@gpu".into())).join("\n");
+        assert_eq!(
+            ssh,
+            "- The hub connects to the box over ssh and starts a twr box daemon there, which \
+             runs the box's threads and keeps them running while the hub is away."
+        );
+        let sb = BoxLink::Command {
+            command: words(&["docker", "exec", "-i", "twr-sandbox"]),
+            terminal: Some(words(&["docker", "exec", "-i", "-t", "twr-sandbox"])),
+        };
+        assert_eq!(
+            reach_lines("sb", &sb),
+            [
+                "- The hub runs `docker exec -i twr-sandbox sh -c ...` itself, from its own \
+                 environment, and starts a twr box daemon there, which runs the box's threads \
+                 and keeps them running while the hub is away.",
+                "- For `twr box login` and `twr box project --clone`, twr runs `docker exec -i \
+                 -t twr-sandbox` in your terminal (terminal_command)."
+            ]
+        );
+        let bare = BoxLink::Command {
+            command: words(&["my-exec", "c"]),
+            terminal: None,
+        };
+        assert_eq!(
+            reach_lines("sb", &bare)[1],
+            "- `twr box login` and `twr box project --clone` need a terminal_command in \
+             [boxes.sb] (the command with `-t`); without one they are refused."
+        );
+        assert_eq!(reached(&sb), "through `docker exec -i twr-sandbox`");
+        assert_eq!(
+            reached(&BoxLink::Ssh(" me@gpu ".into())),
+            "over ssh (me@gpu)"
         );
     }
 
@@ -2201,12 +2856,31 @@ mod tests {
             "notes": null, "switch_pending": null,
             "refused": {"at": "2026-10-16T09:30:12.345Z", "reason": "a bad proof"},
             "agents": []});
+        let mut command = ssh.clone();
+        command["name"] = json!("sb");
+        command["transport"] = json!("command");
+        command["agents"] = json!([]);
         assert_eq!(
-            list_text(&[ssh.clone(), token.clone()]),
+            list_text(&[ssh.clone(), token.clone(), command.clone()]),
             "NAME  TRANSPORT  STATE    VERSION  OS/ARCH       AGENTS\n\
              gpu   ssh        online   0.2.0    linux/x86_64  claude ✓ codex ✗ grok -\n\
-             mac   token      offline  -        -             -\n"
+             mac   token      offline  -        -             -\n\
+             sb    command    online   0.2.0    linux/x86_64  -\n"
         );
+        let c = status_text(&command);
+        assert!(
+            c.contains(
+                "transport:      command (the hub reaches the box through its command, a \
+                 container's)\n"
+            ),
+            "{c}"
+        );
+        assert!(
+            c.contains("build:          0123456789abcdef (launched by the hub)\n"),
+            "{c}"
+        );
+        assert!(status_text(&ssh)
+            .contains("transport:      ssh (the hub connects to the box over ssh)\n"));
         // A login twr does not know is `?`.
         let unknown = json!([{"runtime": "grok-build", "found": true, "login": "unknown"},
             {"runtime": "other", "found": true, "login": "something-new"}]);
@@ -2282,9 +2956,11 @@ mod tests {
 
     #[test]
     fn the_stop_command_runs_the_relay_with_stop() {
-        let stop = stop_command("-p 2222 me@host", "0123456789abcdef", "gpu", "ab").unwrap();
+        let ssh = |w: &str| BoxLink::Ssh(w.into());
+        let stop = stop_command(&ssh("-p 2222 me@host"), "0123456789abcdef", "gpu", "ab").unwrap();
         // Every word as the builder makes it, the forced options among them.
-        let want: Vec<String> = std::iter::once(ssh_program_name())
+        let program = Path::new(&ssh_box::ssh_program()).display().to_string();
+        let want: Vec<String> = std::iter::once(program)
             .chain(
                 ssh_box::interactive_ssh_args(
                     "-p 2222 me@host",
@@ -2323,9 +2999,53 @@ mod tests {
         );
         // Words that would forward something are refused here too, and a build that is no
         // build id (what the hub or the files said) or a name that is no box name.
-        assert!(stop_command("-A me@host", "0123456789abcdef", "gpu", "ab").is_err());
-        assert!(stop_command("me@host", "x; rm -rf ~", "gpu", "ab").is_err());
-        assert!(stop_command("me@host", "0123456789abcdef", "-gpu", "ab").is_err());
+        assert!(stop_command(&ssh("-A me@host"), "0123456789abcdef", "gpu", "ab").is_err());
+        assert!(stop_command(&ssh("me@host"), "x; rm -rf ~", "gpu", "ab").is_err());
+        assert!(stop_command(&ssh("me@host"), "0123456789abcdef", "-gpu", "ab").is_err());
+    }
+
+    /// A command box's stop command is its command, then `sh -c` and the same line ssh would
+    /// run, each word shell-quoted (a word with a space stays one); it runs the relay's
+    /// `--stop` as pasted.
+    #[test]
+    fn a_command_box_s_stop_command_runs_its_command() {
+        let link = BoxLink::Command {
+            command: words(&["docker", "exec", "-i", "-e", "A=b c", "twr-sandbox"]),
+            terminal: None,
+        };
+        let stop = stop_command(&link, "0123456789abcdef", "sb", "ab").unwrap();
+        let line = ssh_box::sh_c(&ssh_box::stop_script("0123456789abcdef", "sb", "ab").unwrap());
+        assert_eq!(
+            stop,
+            format!(
+                "docker exec -i -e 'A=b c' twr-sandbox sh -c {}",
+                twr_core::paths::sh_word(&line)
+            )
+        );
+        assert!(!stop.contains('\n'), "one line to paste: {stop}");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("printf '%s\\n' {stop}"))
+            .output()
+            .unwrap();
+        let got: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let mut want = words(&[
+            "docker",
+            "exec",
+            "-i",
+            "-e",
+            "A=b c",
+            "twr-sandbox",
+            "sh",
+            "-c",
+        ]);
+        want.extend(line.lines().map(str::to_string));
+        assert_eq!(got, want);
+        assert!(stop_command(&link, "x; rm -rf ~", "sb", "ab").is_err());
     }
 
     /// An install's build is recorded only for the box it went to: one whose destination (or
