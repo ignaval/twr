@@ -849,6 +849,7 @@ pub(super) async fn doctor(
             &hub,
             configured,
             same,
+            &probe.has,
             pick.as_ref(),
             key.is_some(),
             side.as_ref(),
@@ -998,12 +999,17 @@ fn hub_checks(r: &mut Report, name: &str, hub: &HubBuild, dialed: bool) {
                 );
             }
         }
-        "switching" => r.add(
-            "hub",
-            Mark::Warn,
-            format!("box {name} is switching to the build the hub launches"),
-            None,
-        ),
+        "switching" => {
+            match super::drain_text(name, b, hub.info.as_ref().unwrap_or(&Value::Null)) {
+                Some((what, fix)) => r.add("hub", Mark::Warn, format!("box {name}: {what}"), fix),
+                None => r.add(
+                    "hub",
+                    Mark::Warn,
+                    format!("box {name} is switching to the build the hub launches"),
+                    None,
+                ),
+            }
+        }
         "connecting" => r.add(
             "hub",
             Mark::Warn,
@@ -1360,7 +1366,7 @@ fn build_check(
 }
 
 /// The box daemon of this hub on box `name`: its status line from `side` (the second run's
-/// output), against the build the hub launches and its protocol.
+/// output), against the build the hub launches and its protocol. `has`: the builds on the box.
 #[allow(clippy::too_many_arguments)]
 fn daemon_check(
     r: &mut Report,
@@ -1368,6 +1374,7 @@ fn daemon_check(
     hub: &HubBuild,
     configured: Option<&str>,
     same: bool,
+    has: &BTreeSet<String>,
     pick: Option<&(String, BuildSource)>,
     has_key: bool,
     side: Option<&Result<String, String>>,
@@ -1459,8 +1466,55 @@ fn daemon_check(
         );
         return;
     };
+    // On another OS or CPU the hub replaces a daemon of an older protocol only with the box's
+    // configured build, when that one is on the box and is not the daemon's own (else the box
+    // needs an install).
+    let replacement = launches
+        .filter(|_| !same)
+        .filter(|l| has.contains(*l) && st.build.as_deref() != Some(*l));
+    let replaced = same || replacement.is_some();
+    let drains = hub
+        .drainable
+        .as_ref()
+        .is_some_and(|d| d.contains(&st.protocol));
+    if st.protocol != protocol && drains {
+        // (The hub lets its running turns finish, then replaces it: `twr box status` says how
+        // far that is.)
+        let (mark, then, fix) = if replaced {
+            (
+                Mark::Warn,
+                match replacement {
+                    Some(l) => format!("replaces it with build {l}, the box's configured one"),
+                    None => "replaces it with its own build".to_string(),
+                },
+                format!(
+                    "`twr box status {name}` shows how far the drain is; `twr box restart {name}` \
+                     stops its agents now"
+                ),
+            )
+        } else {
+            (
+                Mark::Fail,
+                "has no newer build to start there".to_string(),
+                format!("`twr box install {name}` installs this hub's build there"),
+            )
+        };
+        r.add(
+            "daemon",
+            mark,
+            format!(
+                "the box daemon (build {}) speaks runner protocol {}, {whose} {protocol}; the hub \
+                 drains it: its running turns finish first (up to 30 minutes), then its agents \
+                 stop, and the hub {then}",
+                st.build_label(),
+                st.protocol
+            ),
+            Some(fix),
+        );
+        return;
+    }
     if st.protocol != protocol {
-        let fix = if same {
+        let fix = if replaced {
             "the hub replaces it as it connects: start the hub (`twr`), or `twr box install \
              <box>` has a running one try now"
                 .replace("<box>", name)
@@ -1469,7 +1523,7 @@ fn daemon_check(
         };
         r.add(
             "daemon",
-            if same { Mark::Warn } else { Mark::Fail },
+            if replaced { Mark::Warn } else { Mark::Fail },
             format!(
                 "the box daemon (build {}) speaks runner protocol {}, {whose} {protocol}",
                 st.build_label(),
@@ -2587,6 +2641,7 @@ mod tests {
                 hub,
                 None,
                 true,
+                &set(&[id]),
                 Some(&pick),
                 true,
                 Some(&side(protocol)),
@@ -2623,6 +2678,118 @@ mod tests {
         // Whether a hub runs is unknown: so is its protocol.
         let (_, msg) = check(&HubBuild::own(Some("no answer".into())), mine);
         assert!(msg.contains("whether they match is unknown"), "{msg}");
+    }
+
+    /// A daemon of an older protocol the hub drains (`drainable_protocols`, this twr's when
+    /// no hub runs) is a warning that says the drain, then the replace, for a box the hub
+    /// installs its own build on, or one of another OS or CPU whose configured build is on the
+    /// box and is another than the daemon's; a failure with the install for one of another OS
+    /// or CPU without that; a hub that does not say what it drains (older than the drain) gets
+    /// today's verdict.
+    #[test]
+    fn a_daemon_the_hub_drains_says_so() {
+        let id = "0123456789abcdef";
+        let newer = "1111111111111111";
+        let mine = twr_core::runner::PROTOCOL_VERSION;
+        let side = Ok(format!(
+            "{STATUS_MARK}\ntwr-box 1 {id} {} fedcba9876543210\n{EXIT_MARK}0\n",
+            mine - 1
+        ));
+        let pick = (id.to_string(), BuildSource::Hub);
+        let check_on = |hub: &HubBuild, same: bool, configured: Option<&str>, has: &[&str]| {
+            let mut r = Report::new("gpu", true);
+            daemon_check(
+                &mut r,
+                "gpu",
+                hub,
+                configured,
+                same,
+                &set(has),
+                Some(&pick),
+                true,
+                Some(&side),
+            );
+            let c = r.checks.pop().unwrap();
+            (c.result, c.message, c.fix)
+        };
+        let check = |hub: &HubBuild, same: bool| check_on(hub, same, None, &[id]);
+        let running = |drainable: Option<Value>| {
+            let mut info = json!({"version": "0.2.0", "build": id, "runner_protocol": mine});
+            if let Some(d) = drainable {
+                info["drainable_protocols"] = d;
+            }
+            HubBuild::of_info(info)
+        };
+        let drains = running(Some(json!([mine - 1])));
+        let (mark, msg, fix) = check(&drains, true);
+        assert_eq!(mark, Mark::Warn);
+        assert_eq!(
+            msg,
+            format!(
+                "the box daemon (build {id}) speaks runner protocol {}, the hub {mine}; the hub \
+                 drains it: its running turns finish first (up to 30 minutes), then its agents \
+                 stop, and the hub replaces it with its own build",
+                mine - 1
+            )
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some(
+                "`twr box status gpu` shows how far the drain is; `twr box restart gpu` stops \
+                 its agents now"
+            )
+        );
+        let (mark, msg, fix) = check(&drains, false);
+        assert_eq!(mark, Mark::Fail);
+        assert!(msg.ends_with("has no newer build to start there"), "{msg}");
+        assert_eq!(
+            fix.as_deref(),
+            Some("`twr box install gpu` installs this hub's build there")
+        );
+        // Another OS or CPU whose configured build, another than the daemon's, is on the box:
+        // the hub replaces the daemon with it once drained.
+        let (mark, msg, fix) = check_on(&drains, false, Some(newer), &[id, newer]);
+        assert_eq!(mark, Mark::Warn, "{msg}");
+        assert!(
+            msg.ends_with(&format!(
+                "and the hub replaces it with build {newer}, the box's configured one"
+            )),
+            "{msg}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some(
+                "`twr box status gpu` shows how far the drain is; `twr box restart gpu` stops \
+                 its agents now"
+            )
+        );
+        // That build not on the box, or the daemon's own: nothing newer to start.
+        for (configured, has) in [(newer, &[id][..]), (id, &[id, newer][..])] {
+            let (mark, msg, _) = check_on(&drains, false, Some(configured), has);
+            assert_eq!(mark, Mark::Fail, "{configured}: {msg}");
+            assert!(msg.ends_with("has no newer build to start there"), "{msg}");
+        }
+        // The same for a protocol the hub does not drain: replaced as it connects.
+        let (mark, msg, _) = check_on(&running(None), false, Some(newer), &[id, newer]);
+        assert_eq!(mark, Mark::Warn, "{msg}");
+        let (mark, _, _) = check_on(&running(None), false, Some(id), &[id, newer]);
+        assert_eq!(mark, Mark::Fail);
+        // A hub that drains nothing, or does not say.
+        for hub in [running(Some(json!([]))), running(None)] {
+            let (mark, msg, _) = check(&hub, true);
+            assert_eq!(mark, Mark::Warn);
+            assert!(!msg.contains("drains"), "{msg}");
+            assert!(msg.ends_with(&format!("the hub {mine}")), "{msg}");
+        }
+        // No hub runs: this twr's list.
+        let mut none = HubBuild::own(None);
+        none.build = Some(id.into());
+        let (_, msg, _) = check(&none, true);
+        assert_eq!(
+            msg.contains("drains it"),
+            twr_core::runner::drainable(mine - 1),
+            "{msg}"
+        );
     }
 
     /// A dial-in box's report: the listener (the running hub's word, else the config's), its

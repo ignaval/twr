@@ -52,10 +52,17 @@ const ONLINE_WAIT: Duration = Duration::from_secs(90);
 /// the attempt that carries the restart out, each at most [`ssh_box::ATTEMPT_WORST`] (the
 /// probe, an upload of the hub's build, the channel of a dial that replaces or restarts the
 /// daemon: [`ssh_box::REPLACE_OPEN_TIMEOUT`], the relay's whole stop and start, and the
-/// WebSocket's handshake), and [`ONLINE_WAIT`] for the rest (the welcome). About an hour and
-/// twenty minutes at most; the box's notes, printed as they come, say what it waits for.
-const RESTART_WAIT: Duration =
-    Duration::from_secs(2 * ssh_box::ATTEMPT_WORST.as_secs() + ONLINE_WAIT.as_secs());
+/// WebSocket's handshake), and [`ONLINE_WAIT`] for the rest (the welcome); during a drain
+/// (the box's daemon speaks an older runner protocol: `twr_hub::hub` drain), its runtimes'
+/// stop first: the next look at the drain ([`ssh_box::LEGACY_CHECK`]) and the wait for their
+/// exits ([`ssh_box::SWITCH_DRAIN`]). About an hour and twenty minutes at most; the box's
+/// notes, printed as they come, say what it waits for.
+const RESTART_WAIT: Duration = Duration::from_secs(
+    2 * ssh_box::ATTEMPT_WORST.as_secs()
+        + ONLINE_WAIT.as_secs()
+        + ssh_box::LEGACY_CHECK.as_secs()
+        + ssh_box::SWITCH_DRAIN.as_secs(),
+);
 
 /// How long `twr box install` waits for a box that is online on another build to run the one
 /// it installed: an attempt under way when it asks, the box quiet for 2 minutes
@@ -69,6 +76,18 @@ const SWITCH_WAIT: Duration = Duration::from_secs(
         + ssh_box::SWITCH_CHECK.as_secs()
         + ssh_box::SWITCH_DRAIN.as_secs()
         + ONLINE_WAIT.as_secs(),
+);
+
+/// [`SWITCH_WAIT`] for a box being drained (its daemon speaks an older runner protocol that
+/// the hub drains before it replaces it: `twr_hub::hub` drain): before the switch, the running
+/// turns may go on for up to [`ssh_box::LEGACY_WAIT`] (looked at every
+/// [`ssh_box::LEGACY_CHECK`]), and a connection that does not sync is given
+/// [`ssh_box::LEGACY_SYNC`]. About two hours at most.
+const LEGACY_INSTALL_WAIT: Duration = Duration::from_secs(
+    SWITCH_WAIT.as_secs()
+        + ssh_box::LEGACY_WAIT.as_secs()
+        + ssh_box::LEGACY_CHECK.as_secs()
+        + ssh_box::LEGACY_SYNC.as_secs(),
 );
 
 /// How often they look.
@@ -152,9 +171,10 @@ pub(super) enum BoxCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Show what the hub knows of a box: its state, the twr version and build it runs, its
-    /// OS and CPU, the last error, its latest notes, a connection the hub refused, and its
-    /// agent CLIs (path, version, login).
+    /// Show what the hub knows of a box: its state, a drain (its runner speaks an older
+    /// runner protocol: how far it is, until when, and what to do), the twr version and build
+    /// it runs, its OS and CPU, the last error, its latest notes, a connection the hub
+    /// refused, and its agent CLIs (path, version, login).
     Status {
         /// The box's name.
         name: String,
@@ -171,7 +191,9 @@ pub(super) enum BoxCmd {
     /// config.toml: the line to add is printed). Asks y/N before installing (without a
     /// terminal, only with --yes). Waits up to 90 s for the box to come online; a box online
     /// on another build is switched once it has been quiet for 2 minutes, and that is waited
-    /// for too (at most about an hour and a half, printing the box's notes meanwhile).
+    /// for too (at most about an hour and a half, printing the box's notes meanwhile; about
+    /// two hours when its daemon speaks an older runner protocol that the hub drains first,
+    /// letting its running turns finish).
     Install {
         /// The box's name.
         name: String,
@@ -195,7 +217,8 @@ pub(super) enum BoxCmd {
     /// --yes), then waits for the box to come back online (as long as the hub's attempts may
     /// take: an hour and twenty minutes at most, when the old daemon has a repository change
     /// to finish and a build to upload, printing the box's notes meanwhile) and says how its
-    /// daemon was started.
+    /// daemon was started. While the hub drains the box (its daemon speaks an older runner
+    /// protocol), the restart stops its agents cleanly first, as the drain would: no crash.
     Restart {
         /// The box's name.
         name: String,
@@ -530,6 +553,9 @@ struct HubBuild {
     /// (no hub runs: a hub started now speaks it); `None` too when whether a hub runs is
     /// unknown.
     protocol: Option<u32>,
+    /// The older runner protocols it drains (`drainable_protocols`; this twr's when no hub
+    /// runs); `None` when unknown (or a hub older than the drain, which drains none).
+    drainable: Option<Vec<u32>>,
     /// `hub.info` of the running hub, when one answered.
     info: Option<Value>,
     /// Why whether a hub runs, or what it says, is unknown: something answers on the socket
@@ -577,6 +603,9 @@ impl HubBuild {
             protocol: unknown
                 .is_none()
                 .then_some(twr_core::runner::PROTOCOL_VERSION),
+            drainable: unknown
+                .is_none()
+                .then(|| twr_core::runner::DRAINABLE_PROTOCOLS.to_vec()),
             info: None,
             unknown,
         }
@@ -590,6 +619,11 @@ impl HubBuild {
             protocol: info["runner_protocol"]
                 .as_u64()
                 .and_then(|p| u32::try_from(p).ok()),
+            drainable: info["drainable_protocols"].as_array().map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.as_u64().and_then(|p| u32::try_from(p).ok()))
+                    .collect()
+            }),
             info: Some(info),
             unknown: None,
         }
@@ -1286,8 +1320,10 @@ enum Online {
 /// (`running_build`) to count as online; while it runs another one (`switch_pending`, then
 /// `switching`, as the hub switches it once quiet) the wait goes on, at most [`SWITCH_WAIT`],
 /// printing the box's notes that come meanwhile (the relay's, as it stops and starts the
-/// daemon). An error on timeout or when the hub's box key is unusable (state `error`), after
-/// printing the state, the last error and the notes.
+/// daemon). A box the hub drains (its daemon speaks an older runner protocol) is waited for
+/// up to [`LEGACY_INSTALL_WAIT`], its drain said once ([`drain_text`]). An error on timeout or
+/// when the hub's box key is unusable (state `error`), after printing the state, the last
+/// error and the notes.
 async fn wait_online(
     c: &mut Client,
     name: &str,
@@ -1295,11 +1331,12 @@ async fn wait_online(
     want: Option<&str>,
 ) -> anyhow::Result<Online> {
     let start = tokio::time::Instant::now();
-    let limit = if want.is_some() {
+    let mut limit = if want.is_some() {
         SWITCH_WAIT
     } else {
         ONLINE_WAIT
     };
+    let mut shown_drain: Option<Value> = None;
     let mut shown_state = String::new();
     let mut shown_error: Option<String> = None;
     let mut shown_running: Option<String> = None;
@@ -1324,6 +1361,17 @@ async fn wait_online(
         if state != shown_state {
             outln!("box {name}: {state}");
             shown_state = state.clone();
+        }
+        // A drain comes before the switch: it may take up to half an hour more.
+        if let Some((what, fix)) = drain_text(name, &b, &info) {
+            limit = limit.max(LEGACY_INSTALL_WAIT);
+            if shown_drain.as_ref() != Some(&b["drain"]["stage"]) {
+                outln!("  {what}");
+                if let Some(fix) = fix {
+                    outln!("  {fix}");
+                }
+                shown_drain = Some(b["drain"]["stage"].clone());
+            }
         }
         let error = b["last_error"].as_str().map(str::to_string);
         if error.is_some() && error != shown_error {
@@ -1528,7 +1576,7 @@ async fn status(config: &Config, socket: &Path, name: &str, json: bool) -> anyho
         outln!("{}", serde_json::to_string_pretty(b)?);
     } else {
         let dial_in = config.boxes.get(name).is_some_and(is_dial_in);
-        out!("{}", status_text(b, dial_in));
+        out!("{}", status_text(b, dial_in, &info));
     }
     Ok(())
 }
@@ -1539,8 +1587,98 @@ pub(super) fn is_dial_in(cfg: &BoxConfig) -> bool {
     cfg.transport() == BoxTransport::Token && BoxLink::of(cfg).is_none()
 }
 
-/// `twr box status`'s text for box entry `b` (`dial_in`: a token box without `ssh`).
-fn status_text(b: &Value, dial_in: bool) -> String {
+/// What `hub.info` `hub` says of box entry `b`'s drain (its runner speaks an older runner
+/// protocol, which the hub drains before it replaces the daemon or waits for the runner to be
+/// updated): how far it is, and what to do about it, if anything. `None` when it is not
+/// drained.
+pub(super) fn drain_text(name: &str, b: &Value, hub: &Value) -> Option<(String, Option<String>)> {
+    let d = b["drain"].as_object()?;
+    let dialed = matches!(str_of(&b["transport"]), "ssh" | "command");
+    let speaks = format!(
+        "{} speaks runner protocol {}{}",
+        if dialed {
+            "the box's daemon"
+        } else {
+            "its runner"
+        },
+        d.get("protocol")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        match hub["runner_protocol"].as_u64() {
+            Some(p) => format!(", the hub {p}"),
+            None => String::new(),
+        }
+    );
+    let at = |k: &str| super::trash_time(d.get(k).unwrap_or(&Value::Null));
+    let update = match hub["version"].as_str() {
+        Some(v) => format!(
+            "on the box: {}, then restart its runner ({})",
+            token::update_hint(v),
+            token::restart_hint(name)
+        ),
+        None => format!(
+            "on the box: update twr to the hub's version, then restart its runner ({})",
+            token::restart_hint(name)
+        ),
+    };
+    let stage = d.get("stage").map(str_of).unwrap_or_default();
+    Some(match (stage, dialed) {
+        ("draining", true) => (
+            format!(
+                "draining since {}: {speaks}; its running turns may finish until {}, then the \
+                 hub stops its agents and replaces the daemon; new prompts wait",
+                at("since"),
+                at("until")
+            ),
+            Some(format!(
+                "`twr box restart {name}` stops its agents now (running turns cut, no crash)"
+            )),
+        ),
+        ("draining", false) => (
+            format!(
+                "draining since {}: {speaks}; its running turns may finish until {}, then the \
+                 hub stops its agents; new prompts wait",
+                at("since"),
+                at("until")
+            ),
+            Some(format!(
+                "once it is drained, {update} (restarted before, its agents end as crashes)"
+            )),
+        ),
+        ("stopping", true) => (
+            format!(
+                "stopping: {speaks}; its agents were stopped for the upgrade, and the hub \
+                 replaces the daemon once they have ended"
+            ),
+            None,
+        ),
+        ("stopping", false) => (
+            format!(
+                "stopping: {speaks}; its agents were stopped for the upgrade, and it is drained \
+                 once they have ended"
+            ),
+            None,
+        ),
+        ("needs_install", _) => (
+            format!(
+                "drained: {speaks}, and runs the build the hub launches there; new prompts wait"
+            ),
+            Some(format!("`twr box install {name}` installs the hub's build")),
+        ),
+        (_, false) => (
+            format!(
+                "drained: {speaks}; its agents are stopped, and new prompts wait for its runner \
+                 to be updated"
+            ),
+            Some(update),
+        ),
+        (stage, true) => (format!("{stage}: {speaks}"), None),
+    })
+}
+
+/// `twr box status`'s text for box entry `b` (`dial_in`: a token box without `ssh`) of
+/// `hub.info` `hub`.
+fn status_text(b: &Value, dial_in: bool, hub: &Value) -> String {
     let mut out = String::new();
     let mut line = |k: &str, v: &str| out.push_str(&format!("{k:<15} {v}\n"));
     line("box:", str_of(&b["name"]));
@@ -1554,6 +1692,12 @@ fn status_text(b: &Value, dial_in: bool) -> String {
         },
     );
     line("state:", str_of(&b["state"]));
+    if let Some((what, fix)) = drain_text(str_of(&b["name"]), b, hub) {
+        line("drain:", &what);
+        if let Some(fix) = fix {
+            line("", &fix);
+        }
+    }
     line("online:", if b["online"] == true { "yes" } else { "no" });
     line(
         "version:",
@@ -1893,11 +2037,12 @@ async fn restart(
              pass --yes"
         );
     }
-    outln!(
-        "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
-         threads' runtimes end as when a box's runner restarts: each such thread shows a crash, \
-         a turn running then is cut short, and the thread's next prompt resumes its session."
-    );
+    // (During a drain, the restart stops the agents cleanly first.)
+    let drained = HubBuild::of_running(socket)
+        .await
+        .box_entry(name)
+        .is_some_and(|b| b["drain"].is_object());
+    outln!("{}", restart_says(name, drained));
     if !confirm(
         consent,
         &format!("Restart box {name}'s daemon? [y/N] "),
@@ -1945,6 +2090,27 @@ async fn restart(
         None => outln!("{said}"),
     }
     Ok(())
+}
+
+/// What `twr box restart` says it does to box `name`, `drained` by the hub or not (its daemon
+/// speaks an older runner protocol: the restart cuts the drain short, its agents stopped
+/// cleanly first).
+fn restart_says(name: &str, drained: bool) -> String {
+    if drained {
+        format!(
+            "Box {name}'s daemon speaks an older runner protocol, and the hub is draining it: \
+             this stops its agents now, as the drain would (a turn running then is cut short; no \
+             crash), then replaces the daemon with a new one of the hub's build; each thread's \
+             next prompt resumes its session."
+        )
+    } else {
+        format!(
+            "This stops box {name}'s daemon and the agents it runs, and starts a new one. Its \
+             threads' runtimes end as when a box's runner restarts: each such thread shows a \
+             crash, a turn running then is cut short, and the thread's next prompt resumes its \
+             session."
+        )
+    }
 }
 
 /// Whether box entry `b` of `hub.info` is online on a connection made after a restart asked
@@ -3099,7 +3265,7 @@ mod tests {
              mac   token      offline  -        -             -\n\
              sb    command    online   0.2.0    linux/x86_64  -\n"
         );
-        let c = status_text(&command, false);
+        let c = status_text(&command, false, &Value::Null);
         assert!(
             c.contains(
                 "transport:      command (the hub reaches the box through its command, a \
@@ -3111,7 +3277,7 @@ mod tests {
             c.contains("build:          0123456789abcdef (launched by the hub)\n"),
             "{c}"
         );
-        assert!(status_text(&ssh, false)
+        assert!(status_text(&ssh, false, &Value::Null)
             .contains("transport:      ssh (the hub connects to the box over ssh)\n"));
         // A login twr does not know is `?`.
         let unknown = json!([{"runtime": "grok-build", "found": true, "login": "unknown"},
@@ -3120,7 +3286,7 @@ mod tests {
             agents_cell(&box_agents(&json!({ "agents": unknown }))),
             "grok ? other ?"
         );
-        let s = status_text(&ssh, false);
+        let s = status_text(&ssh, false, &Value::Null);
         assert!(s.contains("state:          online\n"), "{s}");
         assert!(
             s.contains("build:          0123456789abcdef (launched by the hub)\n"),
@@ -3132,17 +3298,17 @@ mod tests {
         let mut systemd = ssh.clone();
         systemd["launch"] = json!("systemd twr-box-0123-abcd.service");
         assert!(
-            status_text(&systemd, false).contains(
+            status_text(&systemd, false, &Value::Null).contains(
                 "launch:         the box daemon runs as the systemd user service \
                  twr-box-0123-abcd.service\n"
             ),
             "{}",
-            status_text(&systemd, false)
+            status_text(&systemd, false, &Value::Null)
         );
         let mut mac = ssh.clone();
         mac["os"] = json!("Darwin");
         mac["launch"] = json!("detached");
-        let m = status_text(&mac, false);
+        let m = status_text(&mac, false, &Value::Null);
         assert!(
             m.contains(
                 "launch:         the daemon runs from ssh, so Claude Code can't read its keychain \
@@ -3154,7 +3320,7 @@ mod tests {
         // Offline: what the last daemon said is no longer known to be so.
         let mut gone = mac.clone();
         gone["state"] = json!("offline");
-        let g = status_text(&gone, false);
+        let g = status_text(&gone, false, &Value::Null);
         assert!(
             g.contains("launch:         not known: the box is not connected (it is offline)\n"),
             "{g}"
@@ -3173,7 +3339,7 @@ mod tests {
             s.ends_with("notes:          (newest last)\n  twr-box: started the box daemon 0123456789abcdef\n"),
             "{s}"
         );
-        let t = status_text(&token, false);
+        let t = status_text(&token, false, &Value::Null);
         assert!(
             t.contains(
                 "transport:      token (its runner connects to the hub's listener, [hub] listen)\n"
@@ -3181,7 +3347,7 @@ mod tests {
             "{t}"
         );
         // A token box without ssh: a dial-in one.
-        let d = status_text(&token, true);
+        let d = status_text(&token, true, &Value::Null);
         assert!(
             d.contains(
                 "transport:      token, dial-in (its runner connects to the hub's listener)\n"
@@ -3458,6 +3624,13 @@ mod tests {
         assert!(ssh_box::REPLACE_OPEN_TIMEOUT >= ssh_box::PLAIN_OPEN_TIMEOUT);
         assert!(RESTART_WAIT >= 2 * attempt);
         assert!(RESTART_WAIT > 4 * twr_runner::relay::STOP_TIMEOUT);
+        // A restart during a drain stops the box's runtimes first (`hub::drain`).
+        assert!(RESTART_WAIT >= 2 * attempt + ssh_box::LEGACY_CHECK + ssh_box::SWITCH_DRAIN);
+        let timing = ssh_box::SwitchTiming::default();
+        assert_eq!(
+            (timing.drain, timing.legacy_check),
+            (ssh_box::SWITCH_DRAIN, ssh_box::LEGACY_CHECK)
+        );
         assert!(
             SWITCH_WAIT
                 >= 2 * attempt
@@ -3465,10 +3638,90 @@ mod tests {
                     + ssh_box::SWITCH_CHECK
                     + ssh_box::SWITCH_DRAIN
         );
-        // What the help and the docs say: about an hour and twenty minutes, and an hour and a
-        // half at most.
-        assert_eq!(RESTART_WAIT.as_secs().div_ceil(60), 81);
+        // An install that waits on a drain: its running turns, the drain's looks, a
+        // connection's sync, then the switch.
+        assert_eq!(
+            (timing.legacy_wait, timing.legacy_sync),
+            (ssh_box::LEGACY_WAIT, ssh_box::LEGACY_SYNC)
+        );
+        assert!(
+            LEGACY_INSTALL_WAIT
+                >= SWITCH_WAIT
+                    + ssh_box::LEGACY_WAIT
+                    + ssh_box::LEGACY_CHECK
+                    + ssh_box::LEGACY_SYNC
+        );
+        // What the help and the docs say: about an hour and twenty minutes, an hour and a
+        // half, and two hours at most.
+        assert_eq!(RESTART_WAIT.as_secs().div_ceil(60), 83);
         assert_eq!(SWITCH_WAIT.as_secs().div_ceil(60), 86);
+        assert_eq!(LEGACY_INSTALL_WAIT.as_secs().div_ceil(60), 118);
+    }
+
+    /// `twr box status` says how far a drain is and what to do: for a box the hub dials, the
+    /// deadline and `twr box restart`; for a token box, to update its runner once drained (not
+    /// before); for a box of another OS or CPU, the install. Nothing without a drain.
+    #[test]
+    fn the_status_says_how_far_a_drain_is() {
+        let hub = json!({"version": "0.3.0", "runner_protocol": 8});
+        let entry = |transport: &str, stage: &str| {
+            json!({"name": "gpu", "transport": transport, "state": "switching", "online": true,
+                   "drain": {"protocol": 7, "since": "2026-10-18T01:02:03.456Z",
+                             "until": "2026-10-18T01:32:03.456Z", "stage": stage}})
+        };
+        let ssh = status_text(&entry("ssh", "draining"), false, &hub);
+        assert!(
+            ssh.contains(
+                "drain:          draining since 2026-10-18 01:02 UTC: the box's daemon speaks \
+                 runner protocol 7, the hub 8; its running turns may finish until 2026-10-18 \
+                 01:32 UTC, then the hub stops its agents and replaces the daemon; new prompts \
+                 wait\n                \
+                 `twr box restart gpu` stops its agents now (running turns cut, no crash)\n"
+            ),
+            "{ssh}"
+        );
+        let (what, fix) = drain_text("gpu", &entry("token", "draining"), &hub).unwrap();
+        assert!(what.starts_with("draining since 2026-10-18 01:02 UTC: its runner speaks"));
+        let fix = fix.unwrap();
+        assert!(
+            fix.starts_with("once it is drained, on the box: twr 0.3.0")
+                && fix.ends_with("(restarted before, its agents end as crashes)"),
+            "{fix}"
+        );
+        let (what, fix) = drain_text("gpu", &entry("token", "drained"), &hub).unwrap();
+        assert_eq!(
+            what,
+            "drained: its runner speaks runner protocol 7, the hub 8; its agents are stopped, \
+             and new prompts wait for its runner to be updated"
+        );
+        assert!(fix.unwrap().starts_with("on the box: twr 0.3.0"));
+        let (what, fix) = drain_text("gpu", &entry("ssh", "stopping"), &hub).unwrap();
+        assert!(
+            what.starts_with("stopping: the box's daemon speaks"),
+            "{what}"
+        );
+        assert_eq!(fix, None);
+        let (what, fix) = drain_text("gpu", &entry("command", "needs_install"), &hub).unwrap();
+        assert!(
+            what.contains("runs the build the hub launches there"),
+            "{what}"
+        );
+        assert_eq!(
+            fix.as_deref(),
+            Some("`twr box install gpu` installs the hub's build")
+        );
+        let mut none = entry("ssh", "draining");
+        none["drain"] = Value::Null;
+        assert_eq!(drain_text("gpu", &none, &hub), None);
+        assert!(!status_text(&none, false, &hub).contains("drain:"));
+    }
+
+    /// `twr box restart` says the restart is clean during a drain, and crashes the agents'
+    /// threads otherwise.
+    #[test]
+    fn a_restart_during_a_drain_says_it_stops_cleanly() {
+        assert!(restart_says("gpu", true).contains("no crash"));
+        assert!(restart_says("gpu", false).contains("shows a crash"));
     }
 
     /// A restart is over once the box is online on a newer connection with none pending.

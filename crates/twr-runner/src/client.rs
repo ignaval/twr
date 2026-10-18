@@ -47,8 +47,8 @@
 
 use std::future::Future;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -441,6 +441,12 @@ pub struct RunnerOptions {
     /// read again, and watched while the runner waits, so a new token installed there is used
     /// at once ([`dial_loop`]).
     pub token_file: Option<PathBuf>,
+    /// The runner protocol its hello names: [`PROTOCOL_VERSION`]. Tests only: a hub test
+    /// makes a running runner say it speaks an older protocol from its next connection on (a
+    /// hub then drains it, `twr_hub::hub`). A runner that names an older protocol only gets
+    /// less from the hub.
+    #[doc(hidden)]
+    pub hello_protocol: Arc<AtomicU32>,
 }
 
 impl RunnerOptions {
@@ -469,6 +475,7 @@ impl RunnerOptions {
             allow_insecure: false,
             daemon: None,
             token_file: None,
+            hello_protocol: Arc::new(AtomicU32::new(PROTOCOL_VERSION)),
         }
     }
 
@@ -1455,7 +1462,7 @@ async fn handshake<S: HubStream>(
     let nonce = new_nonce()?;
     let hello = RunnerMsg::Hello(Hello {
         box_name: opts.box_name.clone(),
-        protocol: PROTOCOL_VERSION,
+        protocol: opts.hello_protocol.load(SeqCst),
         nonce: nonce.clone(),
     });
     sink.send(text(&hello)?).await.context("sending hello")?;

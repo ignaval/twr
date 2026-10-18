@@ -53,7 +53,8 @@
 //! Every message type is listed in [`RunnerMsg`] (runner to hub) and [`HubMsg`] (hub to
 //! runner). [`PROTOCOL_VERSION`] changes on any incompatible change; the hub rejects a hello
 //! with a different version (`error{code: "protocol"}`, before any authentication: the hello
-//! of another version need not have the same shape).
+//! of another version need not have the same shape), unless the version is one it can still
+//! drain ([`DRAINABLE_PROTOCOLS`]).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -109,7 +110,48 @@ pub fn valid_run_id(run: &str) -> bool {
 /// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
 /// the protocol they were written under): a bump that changes how spooled frames encode must
 /// migrate the spool, or the next runner refuses to open one that holds such frames.
+///
+/// Each version has fixtures captured from a real revision of it
+/// (`crates/twr-core/tests/fixtures/runner-protocol-<version>`, written by
+/// `docs/tools/capture-runner-fixtures.sh`; `tests/runner_protocol_fixtures.rs` checks them).
+/// When you bump this:
+/// 1. In the working tree that bumps it, capture the new version's fixtures
+///    (`docs/tools/capture-runner-fixtures.sh --worktree <new version>`): the fixture test
+///    needs them before the bump can pass and be committed.
+/// 2. Run the fixture test (`cargo test -p twr-core --test runner_protocol_fixtures`). The
+///    previous version's fixtures were captured while it was current; when an outbound value
+///    changed since, capture its `hub-accepts.json` again from the last commit that spoke it
+///    (`docs/tools/capture-runner-fixtures.sh <that commit> <previous version>`).
+/// 3. List the previous version in [`DRAINABLE_PROTOCOLS`] only if its fixtures pass and the
+///    bump changed nothing a drain uses (see there); else leave it out, and the hub replaces
+///    such a daemon at once.
 pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Older runner protocols this hub still serves drain-only: it accepts such a runner's hello
+/// (and then authenticates it as any other), sends it nothing but acks, pings and the commands
+/// of sessions already running ([`Op::drain_safe`]), lets its running turns finish, then
+/// stops its runtimes and replaces it (an SSH box's daemon) or waits for it to be updated (a
+/// token box's runner). Never [`PROTOCOL_VERSION`].
+///
+/// A version is listed only when its fixtures (see [`PROTOCOL_VERSION`]) show that:
+/// - every message its runner sends (hello, auth, inventory, each event kind its runtimes
+///   emit, exited, synced, cmd_result, ping, pong) decodes as this build's [`RunnerMsg`],
+///   events to the same kind they had (never [`EventBody::Unknown`]);
+/// - every message this hub sends a drained runner (challenge, authenticated, welcome, ack,
+///   error, ping, pong, and `cmd` with a drain-safe op) decodes as that version's
+///   [`HubMsg`] and encodes back to the same value;
+/// - this build's [`auth_proof`] gives the proofs that version gives, and the sealed
+///   channel and its runner proof ([`SEALED_AUTH_PROOF`]) are the same.
+///
+/// The box daemon's socket lines (`twr-box 1 ...`) must be the same too. Usually only the
+/// previous version is listed; it may leave the list at any time (the hub then replaces such
+/// a daemon at once, its runtimes recorded as stopped for the upgrade).
+pub const DRAINABLE_PROTOCOLS: &[u32] = &[6];
+
+/// Whether the hub serves a runner of protocol `p` drain-only ([`DRAINABLE_PROTOCOLS`]).
+pub fn drainable(p: u32) -> bool {
+    DRAINABLE_PROTOCOLS.contains(&p)
+}
 
 /// The proof a runner sends in [`RunnerMsg::Auth`] on a sealed connection (see the module
 /// docs): none. The hub does not check it there.
@@ -677,7 +719,8 @@ pub enum HubMsg {
 pub mod hub_errors {
     /// A bad proof (wrong token), or an unknown box.
     pub const UNAUTHORIZED: &str = "unauthorized";
-    /// [`super::Hello::protocol`] is not the hub's version.
+    /// [`super::Hello::protocol`] is neither the hub's version nor one it drains
+    /// ([`super::DRAINABLE_PROTOCOLS`]).
     pub const PROTOCOL: &str = "protocol";
     /// A newer connection of the same box replaced this one.
     pub const FENCED: &str = "fenced";
@@ -945,6 +988,14 @@ impl Op {
                 | Op::Respond { .. }
                 | Op::Stop { .. }
         )
+    }
+
+    /// Whether the hub may send this op to a runner it drains ([`DRAINABLE_PROTOCOLS`]):
+    /// `send`, `respond` and `stop`, the commands a session already running issues (a
+    /// recorded prompt sent again, an answer, a stop). Nothing that starts a session or reads
+    /// or changes the box.
+    pub fn drain_safe(&self) -> bool {
+        matches!(self, Op::Send { .. } | Op::Respond { .. } | Op::Stop { .. })
     }
 
     /// Whether this op runs git commands that change a repository or a work tree on the box
@@ -2042,6 +2093,77 @@ mod tests {
         let r: GitSnapshot = decode_result(json!({"branch": "x", "dirty_files": 1})).unwrap();
         assert_eq!(r.dirty_files, 1);
         assert!(decode_result::<bool>(json!("nope")).is_err());
+    }
+
+    /// The drain contract: only older versions are listed, and a drained runner gets only
+    /// the commands of sessions already running.
+    #[test]
+    fn drainable_protocols_and_drain_safe_ops() {
+        assert!(!drainable(PROTOCOL_VERSION));
+        assert!(!drainable(PROTOCOL_VERSION + 1));
+        // 5 -> 6 changed the handshake: never drainable.
+        assert!(!drainable(5));
+        for p in DRAINABLE_PROTOCOLS {
+            assert!(*p < PROTOCOL_VERSION && *p >= 6 && drainable(*p), "{p}");
+        }
+        let safe = [
+            Op::Send {
+                thread: "t1".into(),
+                turn: 2,
+                text: "more".into(),
+                run: None,
+            },
+            Op::Respond {
+                thread: "t1".into(),
+                attn_id: "a".into(),
+                answer: Answer::allow(),
+                run: Some("r1".into()),
+            },
+            Op::Stop {
+                thread: "t1".into(),
+                run: None,
+            },
+        ];
+        for op in &safe {
+            assert!(op.drain_safe() && op.is_session_op(), "{}", op.name());
+        }
+        let unsafe_ops = [
+            Op::Spawn {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                prompt: None,
+                run: None,
+            },
+            Op::Resume {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                session_id: "s".into(),
+                run: None,
+            },
+            Op::AttachInfo {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                session_id: "s".into(),
+            },
+            Op::RepoRoot { dir: "/r".into() },
+            Op::GitSnapshot {
+                path: "/w".into(),
+                base: None,
+            },
+            Op::WorktreePrune { repo: "/r".into() },
+            Op::TrashList {},
+            Op::DiskUsage {
+                worktree: None,
+                disposable: None,
+            },
+            Op::Agents { refresh: false },
+        ];
+        for op in &unsafe_ops {
+            assert!(!op.drain_safe(), "{}", op.name());
+        }
     }
 
     #[test]

@@ -381,3 +381,192 @@ pub mod git {
         }
     }
 }
+
+/// One of each value the hub sends a runner it drains ([`crate::runner::DRAINABLE_PROTOCOLS`]),
+/// named: the challenge, `authenticated`, welcomes, acks, each error code, ping, pong, and
+/// `cmd` with each drain-safe op ([`crate::runner::Op::drain_safe`]: `send`, `respond` with
+/// each shape of answer the hub forwards, `stop` with and without a run), with command ids
+/// as the hub makes them. `docs/tools/capture-runner-fixtures.sh` has an older revision's
+/// decoder read them (`runner-protocol-<version>/hub-accepts.json`), and
+/// `tests/runner_protocol_fixtures.rs` checks that they still are what it accepted.
+pub fn outbound_samples() -> Vec<(&'static str, crate::runner::HubMsg)> {
+    use crate::runner::{hub_errors, HubMsg, Op};
+    let nonce = "0f1e2d3c4b5a69788796a5b4c3d2e1f000112233445566778899aabbccddeeff".to_string();
+    let proof = "3c5da0337b61ca60ddf4feb6bb294479b16c2308094cf65466ddf9d5fc0fdbe0".to_string();
+    let cmd = |cmd_id: &str, op: Op| HubMsg::Cmd {
+        cmd_id: cmd_id.into(),
+        op,
+    };
+    let respond = |cmd_id: &str, answer: Answer, run: Option<&str>| {
+        cmd(
+            cmd_id,
+            Op::Respond {
+                thread: "t1".into(),
+                attn_id: "toolu_01".into(),
+                answer,
+                run: run.map(str::to_string),
+            },
+        )
+    };
+    let mut questions = JsonMap::new();
+    questions.insert(
+        "answers".into(),
+        json!({"Which database?": "Postgres", "Migrate now?": "Yes"}),
+    );
+    let error = |code: &str, message: &str| HubMsg::Error {
+        code: code.into(),
+        message: message.into(),
+    };
+    let ulid = "01JZ8Q7W5M3K2N1P0R9S8T7V6X";
+    vec![
+        ("challenge", HubMsg::Challenge { nonce, proof }),
+        ("authenticated", HubMsg::Authenticated),
+        (
+            "welcome",
+            HubMsg::Welcome {
+                epoch: 3,
+                watermarks: [("t1".to_string(), 5), ("t2".to_string(), 1)].into(),
+            },
+        ),
+        (
+            "welcome without watermarks",
+            HubMsg::Welcome {
+                epoch: 1,
+                watermarks: Default::default(),
+            },
+        ),
+        (
+            "ack",
+            HubMsg::Ack {
+                thread: "t1".into(),
+                rseq: 6,
+            },
+        ),
+        (
+            "error unauthorized",
+            error(hub_errors::UNAUTHORIZED, "the box's token was revoked"),
+        ),
+        (
+            "error protocol",
+            error(
+                hub_errors::PROTOCOL,
+                "the answer to the challenge must be auth",
+            ),
+        ),
+        (
+            "error fenced",
+            error(
+                hub_errors::FENCED,
+                "a newer connection of box gpu replaced this one",
+            ),
+        ),
+        (
+            "error exhausted",
+            error(hub_errors::EXHAUSTED, "no more connection epochs"),
+        ),
+        ("error without message", error(hub_errors::FENCED, "")),
+        ("ping", HubMsg::Ping),
+        ("pong", HubMsg::Pong),
+        (
+            "cmd send",
+            cmd(
+                "send:t1:3",
+                Op::Send {
+                    thread: "t1".into(),
+                    turn: 3,
+                    text: "Now run the tests.\nThen commit.".into(),
+                    run: Some(ulid.into()),
+                },
+            ),
+        ),
+        (
+            "cmd send without run",
+            cmd(
+                "send:t1:4",
+                Op::Send {
+                    thread: "t1".into(),
+                    turn: 4,
+                    text: "go on".into(),
+                    run: None,
+                },
+            ),
+        ),
+        (
+            "cmd respond allow",
+            respond(&format!("respond:2:{ulid}"), Answer::allow(), Some(ulid)),
+        ),
+        (
+            "cmd respond deny with message",
+            respond(
+                &format!("respond:2:{ulid}"),
+                Answer {
+                    message: Some("Not on main; use a branch.".into()),
+                    ..Answer::deny()
+                },
+                Some(ulid),
+            ),
+        ),
+        (
+            "cmd respond option",
+            respond(
+                &format!("respond:2:{ulid}"),
+                Answer::new("Yes, and don't ask again this session"),
+                Some(ulid),
+            ),
+        ),
+        (
+            "cmd respond cancel",
+            respond(
+                &format!("respond:2:{ulid}"),
+                Answer::new("Cancel"),
+                Some(ulid),
+            ),
+        ),
+        (
+            "cmd respond free text",
+            respond(
+                &format!("respond:2:{ulid}"),
+                Answer {
+                    message: Some("Use the staging database.".into()),
+                    ..Answer::new("")
+                },
+                Some(ulid),
+            ),
+        ),
+        (
+            "cmd respond answers",
+            respond(
+                &format!("respond:2:{ulid}"),
+                Answer {
+                    extra: questions,
+                    ..Answer::allow()
+                },
+                Some(ulid),
+            ),
+        ),
+        (
+            "cmd respond without run",
+            respond(&format!("respond:{ulid}"), Answer::allow(), None),
+        ),
+        (
+            "cmd stop",
+            cmd(
+                "stop:t1:2",
+                Op::Stop {
+                    thread: "t1".into(),
+                    run: Some(ulid.into()),
+                },
+            ),
+        ),
+        (
+            "cmd stop without run",
+            cmd(
+                ulid,
+                Op::Stop {
+                    thread: "t1".into(),
+                    run: None,
+                },
+            ),
+        ),
+    ]
+}

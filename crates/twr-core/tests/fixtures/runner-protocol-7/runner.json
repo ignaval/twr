@@ -1,0 +1,833 @@
+{
+  "emitted_kinds": [
+    "thread.started",
+    "thread.resumed",
+    "turn.started",
+    "turn.ended",
+    "task.updated",
+    "agent.text",
+    "agent.tool_call",
+    "agent.tool_result",
+    "agent.thinking",
+    "attention.raised",
+    "attention.resolved",
+    "runtime.limits"
+  ],
+  "protocol": 7,
+  "revision": "daa8f4226cb7dca9b90337236f31d1722761ced5",
+  "samples": [
+    {
+      "frame": {
+        "box": "gpu",
+        "nonce": "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899",
+        "protocol": 7,
+        "type": "hello"
+      },
+      "name": "hello"
+    },
+    {
+      "frame": {
+        "proof": "5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+        "type": "auth"
+      },
+      "name": "auth"
+    },
+    {
+      "frame": {
+        "proof": "",
+        "type": "auth"
+      },
+      "name": "auth sealed"
+    },
+    {
+      "frame": {
+        "acks_needed": {
+          "t1": 9,
+          "t2": 2
+        },
+        "build": "0123456789abcdef",
+        "epoch_hint": 2,
+        "in_flight": [
+          "send:t1:3"
+        ],
+        "running": [
+          {
+            "pid": 4242,
+            "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+            "runtime": "claude-code",
+            "session_id": "sess-1",
+            "thread": "t1"
+          },
+          {
+            "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6Y",
+            "runtime": "codex",
+            "thread": "t2"
+          }
+        ],
+        "runtimes": [
+          "acp",
+          "claude-code",
+          "codex",
+          "grok-build"
+        ],
+        "type": "inventory",
+        "version": "0.3.0+dev.0123abc",
+        "worktrees": "/home/u/.local/share/twr/worktrees"
+      },
+      "name": "inventory"
+    },
+    {
+      "frame": {
+        "acks_needed": {},
+        "in_flight": [],
+        "running": [],
+        "runtimes": [
+          "claude-code"
+        ],
+        "type": "inventory",
+        "version": "0.3.0",
+        "worktrees": "/srv/twr/worktrees"
+      },
+      "name": "inventory of a fresh runner"
+    },
+    {
+      "frame": {
+        "acks_needed": {
+          "t1": 1
+        },
+        "agents": [
+          {
+            "found": true,
+            "login": "logged_in",
+            "method": "claude.ai",
+            "path": "/home/u/.local/bin/claude",
+            "runtime": "claude-code",
+            "version": "2.1.302 (Claude Code)"
+          },
+          {
+            "found": false,
+            "login": "unknown",
+            "note": "not found on PATH",
+            "runtime": "codex"
+          }
+        ],
+        "build": "fedcba9876543210",
+        "in_flight": [],
+        "launch": "systemd twr-box-0123456789abcdef-0a1b2c3d.service",
+        "running": [],
+        "runtimes": [
+          "claude-code",
+          "codex"
+        ],
+        "type": "inventory",
+        "version": "0.3.0",
+        "worktrees": "/srv/twr/worktrees"
+      },
+      "name": "inventory with agents and launch"
+    },
+    {
+      "event_kind": "thread.started",
+      "frame": {
+        "at_ms": 1792000000001,
+        "body": {
+          "data": {
+            "ext": {
+              "twr": {
+                "pid": 4242
+              }
+            },
+            "session_id": "sess-1"
+          },
+          "kind": "thread.started"
+        },
+        "rseq": 1,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event thread.started"
+    },
+    {
+      "event_kind": "thread.started",
+      "frame": {
+        "at_ms": 1792000000001,
+        "body": {
+          "data": {
+            "ext": {
+              "twr": {
+                "acp_command": [
+                  "grok",
+                  "agent",
+                  "stdio"
+                ],
+                "pid": 4300
+              }
+            },
+            "session_id": "acp-1"
+          },
+          "kind": "thread.started"
+        },
+        "rseq": 1,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event thread.started of an acp agent"
+    },
+    {
+      "event_kind": "thread.resumed",
+      "frame": {
+        "at_ms": 1792000000001,
+        "body": {
+          "data": {
+            "ext": {
+              "twr": {
+                "pid": 4243
+              }
+            },
+            "session_id": "sess-1"
+          },
+          "kind": "thread.resumed"
+        },
+        "rseq": 1,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event thread.resumed"
+    },
+    {
+      "event_kind": "turn.started",
+      "frame": {
+        "at_ms": 1792000000002,
+        "body": {
+          "data": {
+            "ext": {
+              "twr": {
+                "runtime_turn": "rt-1"
+              }
+            },
+            "from": "runtime",
+            "prompt": "",
+            "routed_by": null
+          },
+          "kind": "turn.started"
+        },
+        "rseq": 2,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event turn.started by the runtime"
+    },
+    {
+      "event_kind": "agent.thinking",
+      "frame": {
+        "at_ms": 1792000000003,
+        "body": {
+          "data": {
+            "text": "The tests live in crates/twr-core/tests."
+          },
+          "kind": "agent.thinking"
+        },
+        "rseq": 3,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.thinking"
+    },
+    {
+      "event_kind": "agent.text",
+      "frame": {
+        "at_ms": 1792000000004,
+        "body": {
+          "data": {
+            "delta": true,
+            "final": false,
+            "text": "Running"
+          },
+          "kind": "agent.text"
+        },
+        "rseq": 4,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.text delta"
+    },
+    {
+      "event_kind": "agent.text",
+      "frame": {
+        "at_ms": 1792000000005,
+        "body": {
+          "data": {
+            "delta": false,
+            "final": true,
+            "text": "Running the tests now."
+          },
+          "kind": "agent.text"
+        },
+        "rseq": 5,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.text final"
+    },
+    {
+      "event_kind": "agent.tool_call",
+      "frame": {
+        "at_ms": 1792000000006,
+        "body": {
+          "data": {
+            "call_id": "toolu_01",
+            "ext": {
+              "twr": {
+                "purpose": "Run the tests",
+                "step": "Testing"
+              }
+            },
+            "input_ref": null,
+            "input_summary": "cargo test",
+            "risky": true,
+            "tool": "Bash"
+          },
+          "kind": "agent.tool_call"
+        },
+        "rseq": 6,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.tool_call"
+    },
+    {
+      "event_kind": "attention.raised",
+      "frame": {
+        "at_ms": 1792000000007,
+        "body": {
+          "data": {
+            "attn_id": "toolu_01",
+            "call_id": "toolu_01",
+            "options": [
+              "allow",
+              "deny"
+            ],
+            "reason": "permission",
+            "summary": "Bash: cargo test"
+          },
+          "kind": "attention.raised"
+        },
+        "rseq": 7,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event attention.raised permission"
+    },
+    {
+      "event_kind": "attention.raised",
+      "frame": {
+        "at_ms": 1792000000008,
+        "body": {
+          "data": {
+            "attn_id": "q-1",
+            "call_id": "toolu_02",
+            "ext": {
+              "input": {
+                "questions": [
+                  {
+                    "question": "Which database?"
+                  }
+                ]
+              }
+            },
+            "options": [
+              "Postgres",
+              "SQLite"
+            ],
+            "reason": "question",
+            "summary": "Which database?"
+          },
+          "kind": "attention.raised"
+        },
+        "rseq": 8,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event attention.raised question"
+    },
+    {
+      "event_kind": "attention.raised",
+      "frame": {
+        "at_ms": 1792000000009,
+        "body": {
+          "data": {
+            "attn_id": "7:exec-1",
+            "call_id": null,
+            "ext": {
+              "twr": {
+                "session": true
+              }
+            },
+            "options": [
+              "allow",
+              "deny"
+            ],
+            "reason": "permission",
+            "summary": "Run `make` (child agent)"
+          },
+          "kind": "attention.raised"
+        },
+        "rseq": 9,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event attention.raised for the session"
+    },
+    {
+      "event_kind": "attention.resolved",
+      "frame": {
+        "at_ms": 1792000000010,
+        "body": {
+          "data": {
+            "answer": null,
+            "attn_id": "q-1",
+            "by": "timeout"
+          },
+          "kind": "attention.resolved"
+        },
+        "rseq": 10,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event attention.resolved by timeout"
+    },
+    {
+      "event_kind": "agent.tool_result",
+      "frame": {
+        "at_ms": 1792000000011,
+        "body": {
+          "data": {
+            "call_id": "toolu_01",
+            "ok": true,
+            "output_ref": null,
+            "output_summary": "test result: ok"
+          },
+          "kind": "agent.tool_result"
+        },
+        "rseq": 11,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.tool_result"
+    },
+    {
+      "event_kind": "agent.tool_result",
+      "frame": {
+        "at_ms": 1792000000012,
+        "body": {
+          "data": {
+            "_dropped": {
+              "bytes": 17000000,
+              "reason": "event too large for one runner frame; its content was dropped"
+            },
+            "call_id": "toolu_03",
+            "ext": {
+              "twr": {
+                "_dropped": {
+                  "bytes": 17000000,
+                  "reason": "event too large for one runner frame; its content was dropped"
+                }
+              }
+            },
+            "ok": false,
+            "output_ref": null,
+            "output_summary": ""
+          },
+          "kind": "agent.tool_result"
+        },
+        "rseq": 12,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.tool_result too large for a frame"
+    },
+    {
+      "event_kind": "task.updated",
+      "frame": {
+        "at_ms": 1792000000013,
+        "body": {
+          "data": {
+            "description": "cargo build",
+            "heartbeat": false,
+            "running": true,
+            "task_id": "bash-1"
+          },
+          "kind": "task.updated"
+        },
+        "rseq": 13,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event task.updated running"
+    },
+    {
+      "event_kind": "task.updated",
+      "frame": {
+        "at_ms": 1792000000014,
+        "body": {
+          "data": {
+            "description": "cargo build",
+            "heartbeat": true,
+            "running": true,
+            "task_id": "bash-1"
+          },
+          "kind": "task.updated"
+        },
+        "rseq": 14,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event task.updated heartbeat"
+    },
+    {
+      "event_kind": "task.updated",
+      "frame": {
+        "at_ms": 1792000000015,
+        "body": {
+          "data": {
+            "description": "cargo build",
+            "heartbeat": false,
+            "running": false,
+            "task_id": "bash-1"
+          },
+          "kind": "task.updated"
+        },
+        "rseq": 15,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event task.updated done"
+    },
+    {
+      "event_kind": "runtime.limits",
+      "frame": {
+        "at_ms": 1792000000016,
+        "body": {
+          "data": {
+            "plan": "max",
+            "source": "claude-code",
+            "windows": [
+              {
+                "minutes": 300,
+                "resets_at": "2026-10-17T18:00:00Z",
+                "used_pct": 42.5,
+                "window": "5h"
+              },
+              {
+                "used_pct": 3.0,
+                "window": "7d"
+              }
+            ]
+          },
+          "kind": "runtime.limits"
+        },
+        "rseq": 16,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event runtime.limits"
+    },
+    {
+      "event_kind": "turn.ended",
+      "frame": {
+        "at_ms": 1792000000017,
+        "body": {
+          "data": {
+            "duration_ms": 5300,
+            "result": "completed",
+            "session_id": "sess-1",
+            "usage": {
+              "cost": 0.0123,
+              "input": 1200,
+              "output": 340
+            }
+          },
+          "kind": "turn.ended"
+        },
+        "rseq": 17,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event turn.ended completed"
+    },
+    {
+      "event_kind": "turn.ended",
+      "frame": {
+        "at_ms": 1792000000018,
+        "body": {
+          "data": {
+            "duration_ms": 120,
+            "ext": {
+              "error": "overloaded"
+            },
+            "result": "error",
+            "session_id": "sess-1",
+            "usage": null
+          },
+          "kind": "turn.ended"
+        },
+        "rseq": 18,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 2,
+        "type": "event"
+      },
+      "name": "event turn.ended error"
+    },
+    {
+      "event_kind": "turn.ended",
+      "frame": {
+        "at_ms": 1792000000019,
+        "body": {
+          "data": {
+            "duration_ms": null,
+            "result": "interrupted",
+            "session_id": null,
+            "usage": null
+          },
+          "kind": "turn.ended"
+        },
+        "rseq": 19,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 3,
+        "type": "event"
+      },
+      "name": "event turn.ended interrupted"
+    },
+    {
+      "event_kind": "turn.ended",
+      "frame": {
+        "at_ms": 1792000000020,
+        "body": {
+          "data": {
+            "duration_ms": 900,
+            "ext": {
+              "twr": {
+                "runtime_turn": "rt-1"
+              }
+            },
+            "result": "completed",
+            "session_id": "sess-1",
+            "usage": null
+          },
+          "kind": "turn.ended"
+        },
+        "rseq": 20,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "type": "event"
+      },
+      "name": "event turn.ended of a runtime turn"
+    },
+    {
+      "event_kind": "turn.ended",
+      "frame": {
+        "at_ms": 1792000000021,
+        "body": {
+          "data": {
+            "duration_ms": null,
+            "ext": {
+              "twr": {
+                "_dropped": {
+                  "bytes": 17000000,
+                  "reason": "event too large for one runner frame; its content was dropped"
+                }
+              }
+            },
+            "result": "completed",
+            "session_id": "sess-1",
+            "usage": null
+          },
+          "kind": "turn.ended"
+        },
+        "rseq": 21,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 4,
+        "type": "event"
+      },
+      "name": "event turn.ended too large for a frame"
+    },
+    {
+      "event_kind": "agent.text",
+      "frame": {
+        "at_ms": 1792000000022,
+        "body": {
+          "data": {
+            "delta": false,
+            "final": true,
+            "text": "done"
+          },
+          "kind": "agent.text"
+        },
+        "raw": "{\"type\":\"assistant\",\"message\":{\"content\":\"done\"}}",
+        "rseq": 22,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event agent.text with its raw line"
+    },
+    {
+      "event_kind": "agent.thinking",
+      "frame": {
+        "body": {
+          "data": {
+            "text": "hm"
+          },
+          "kind": "agent.thinking"
+        },
+        "rseq": 23,
+        "thread": "t1",
+        "turn": 1,
+        "type": "event"
+      },
+      "name": "event without run or time"
+    },
+    {
+      "frame": {
+        "at_ms": 1792000000100,
+        "code": 0,
+        "rseq": 24,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "stderr_tail": "",
+        "thread": "t1",
+        "type": "exited"
+      },
+      "name": "exited"
+    },
+    {
+      "frame": {
+        "at_ms": 1792000000100,
+        "code": null,
+        "rseq": 24,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "stderr_tail": "twr runner: shut down before the runtime exited",
+        "thread": "t1",
+        "type": "exited"
+      },
+      "name": "exited at a shutdown"
+    },
+    {
+      "frame": {
+        "at_ms": 1792000000200,
+        "code": null,
+        "rseq": 3,
+        "stderr_tail": "twr runner: the runner that started this runtime died without recording its exit; it was stopped",
+        "thread": "t2",
+        "type": "exited"
+      },
+      "name": "exited of a runtime a previous runner left behind"
+    },
+    {
+      "frame": {
+        "code": null,
+        "rseq": 25,
+        "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "stderr_tail": "twr runner: spool full (268435456 bytes); runtime stopped, later events lost",
+        "thread": "t1",
+        "type": "exited"
+      },
+      "name": "exited with a full spool"
+    },
+    {
+      "frame": {
+        "type": "synced"
+      },
+      "name": "synced"
+    },
+    {
+      "frame": {
+        "cmd_id": "send:t1:3",
+        "ok": true,
+        "result": null,
+        "type": "cmd_result"
+      },
+      "name": "cmd_result ok"
+    },
+    {
+      "frame": {
+        "cmd_id": "01JZ8Q7W5M3K2N1P0R9S8T7V6Z",
+        "ok": true,
+        "result": {
+          "branch": "twr/x",
+          "dirty_files": 1
+        },
+        "type": "cmd_result"
+      },
+      "name": "cmd_result ok with a value"
+    },
+    {
+      "frame": {
+        "cmd_id": "stop:t1:2",
+        "error": {
+          "code": "not_running",
+          "message": "thread t1 has no live session"
+        },
+        "ok": false,
+        "type": "cmd_result"
+      },
+      "name": "cmd_result error"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "error": {
+          "code": "interrupted",
+          "message": "the runner stopped while the command ran; its effect is unknown"
+        },
+        "ok": false,
+        "type": "cmd_result"
+      },
+      "name": "cmd_result interrupted"
+    },
+    {
+      "frame": {
+        "type": "ping"
+      },
+      "name": "ping"
+    },
+    {
+      "frame": {
+        "type": "pong"
+      },
+      "name": "pong"
+    }
+  ],
+  "what": "frames a runner of this revision sends, as it encodes them"
+}

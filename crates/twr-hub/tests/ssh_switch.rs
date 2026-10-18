@@ -20,8 +20,20 @@
 //! the runtimes) is replaced at once, its runtimes recorded as stopped for the switch: their
 //! threads end `box_upgrade`, whether the new daemon replays their exits or has nothing of
 //! them, a user's stop stays plain, and that stop's reason does not outlive the runtime.
+//!
+//! Draining (`twr_hub::hub` drain): a daemon of an older protocol the hub drains (the
+//! in-process daemon made to say so, `RunnerOptions` test seam, or a stand-in that never gets
+//! ready) is served drain-only: its running turn finishes (its permission answered), the box is
+//! gated meanwhile, then its runtimes stop for the upgrade and it is replaced; past the
+//! deadline the running turn is cut; a restart cuts the drain short, before readiness too; a
+//! narrowed mode still takes effect; a user's stop stays plain; a daemon that does not get
+//! ready is replaced as one the hub cannot serve; a drained box of another OS or CPU needs an
+//! install, then is replaced by the build installed, and so does one whose daemon does not get
+//! ready. The drain tests' dialer replaces the daemon as the box's relay does: not when it
+//! already runs the build launched.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +48,7 @@ use twr_core::adapter::{Adapter, Answer};
 use twr_core::config::{BoxConfig, BoxTransport, Config};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
-use twr_core::runner::{new_nonce, Hello, RunnerMsg, PROTOCOL_VERSION};
+use twr_core::runner::{new_nonce, Hello, HubMsg, Inventory, RunnerMsg, PROTOCOL_VERSION};
 use twr_core::sealed::{hub_side, HubKey};
 use twr_hub::hub::SealedEnd;
 use twr_hub::listener::pre_auth_ws_config;
@@ -145,9 +157,14 @@ fn own_build() -> &'static str {
 /// A box daemon running in this process, as `twr runner --daemon` runs on a box.
 struct Daemon {
     socket: PathBuf,
+    /// The build it says it runs.
+    build: String,
     lbox: Option<LocalBox>,
     stop: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    /// The runner protocol its connections' hellos name from now on (`RunnerOptions` test
+    /// seam): an older one makes it a daemon the hub drains.
+    protocol: Arc<AtomicU32>,
 }
 
 impl Daemon {
@@ -175,6 +192,7 @@ impl Daemon {
                 launch: None,
             },
         );
+        let protocol = Arc::clone(&opts.hello_protocol);
         opts.ping_interval = Duration::from_millis(500);
         opts.idle_timeout = Duration::from_secs(10);
         opts.welcome_timeout = Duration::from_secs(10);
@@ -207,10 +225,17 @@ impl Daemon {
         }
         Daemon {
             socket: paths.socket,
+            build: build.to_string(),
             lbox: Some(lbox),
             stop: Some(tx),
             task: Some(task),
+            protocol,
         }
+    }
+
+    /// From its next connection on, the daemon says it speaks runner protocol `protocol`.
+    fn speak(&self, protocol: u32) {
+        self.protocol.store(protocol, Ordering::SeqCst);
     }
 
     fn live_count(&self) -> usize {
@@ -255,29 +280,56 @@ async fn connect(hub: &Hub, daemon: &Daemon, key: &HubKey) -> tokio::task::JoinH
 }
 
 /// The bytes between the hub and a daemon's connection: copied both ways, those the hub sends
-/// held back while `hold` is set (a slow link).
-fn pump(daemon: UnixStream, hold: watch::Receiver<bool>) -> tokio::io::DuplexStream {
+/// held back while `hold` is set (a slow link); cut, both ways at once, once `cut` (when given)
+/// is set (a lost link: what was held back is lost).
+fn pump(
+    daemon: UnixStream,
+    hold: watch::Receiver<bool>,
+    cut: Option<watch::Receiver<bool>>,
+) -> tokio::io::DuplexStream {
     let (hub_end, mine) = tokio::io::duplex(1 << 16);
     let (mut dr, mut dw) = daemon.into_split();
     let (mut mr, mut mw) = tokio::io::split(mine);
-    tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut dr, &mut mw).await;
-        let _ = mw.shutdown().await;
-    });
-    tokio::spawn(async move {
-        let mut hold = hold;
-        let mut buf = vec![0u8; 16 << 10];
-        loop {
-            let n = match mr.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            let _ = hold.wait_for(|h| !*h).await;
-            if dw.write_all(&buf[..n]).await.is_err() {
-                break;
-            }
+    // Until the link is cut (never without `cut`).
+    let cut_off = |cut: Option<watch::Receiver<bool>>| async move {
+        let cut_now = match cut {
+            Some(mut c) => c.wait_for(|c| *c).await.is_ok(),
+            None => false,
+        };
+        if !cut_now {
+            std::future::pending::<()>().await;
         }
-        let _ = dw.shutdown().await;
+    };
+    let up = cut_off(cut.clone());
+    tokio::spawn(async move {
+        tokio::select! {
+            () = up => {}
+            _ = async {
+                let _ = tokio::io::copy(&mut dr, &mut mw).await;
+                let _ = mw.shutdown().await;
+            } => {}
+        }
+    });
+    let down = cut_off(cut);
+    tokio::spawn(async move {
+        tokio::select! {
+            () = down => {}
+            () = async {
+                let mut hold = hold;
+                let mut buf = vec![0u8; 16 << 10];
+                loop {
+                    let n = match mr.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    let _ = hold.wait_for(|h| !*h).await;
+                    if dw.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = dw.shutdown().await;
+            } => {}
+        }
     });
     hub_end
 }
@@ -318,7 +370,7 @@ fn dialer(side: Arc<tokio::sync::Mutex<BoxSide>>, hold: watch::Receiver<bool>) -
             let (stream, _) = request(&socket, Request::Connect)
                 .await
                 .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
-            let io: Box<dyn BoxIo> = Box::new(pump(stream, hold));
+            let io: Box<dyn BoxIo> = Box::new(pump(stream, hold, None));
             Ok((io, launched.to_string()))
         }
         .boxed()
@@ -473,6 +525,20 @@ async fn first_hub_with(
     ask: bool,
     busy: bool,
 ) -> Vec<String> {
+    let busy = busy.then_some("!tool Bash ls\n!sleep 60000");
+    first_hub_busy(dir, daemon, key, names, ask, busy).await
+}
+
+/// [`first_hub`], and with `busy`, the last thread's next turn runs on when the hub shuts down
+/// (its prompt `busy`, which runs a tool first).
+async fn first_hub_busy(
+    dir: &Path,
+    daemon: &Daemon,
+    key: &HubKey,
+    names: &[&str],
+    ask: bool,
+    busy: Option<&str>,
+) -> Vec<String> {
     let hub = Hub::open(hub_opts(dir)).await.unwrap();
     let served = connect(&hub, daemon, key).await;
     let h = hub.clone();
@@ -501,10 +567,9 @@ async fn first_hub_with(
             .unwrap();
         until_turn_event(&hub, &ids[0], "attention.raised", 2).await;
     }
-    if busy {
+    if let Some(prompt) = busy {
         let last = ids.last().unwrap();
-        hub.send(last, "!tool Bash ls\n!sleep 60000", TurnFrom::User, user())
-            .unwrap();
+        hub.send(last, prompt, TurnFrom::User, user()).unwrap();
         until_turn_event(&hub, last, "agent.tool_result", 2).await;
     }
     hub.shutdown().await;
@@ -630,6 +695,7 @@ async fn a_quiet_box_switches_to_the_launched_build() {
         quiet: Duration::from_millis(1500),
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     let hub = second_hub(dir.path(), &side, hold, timing).await;
     let h = hub.clone();
@@ -763,6 +829,7 @@ async fn a_busy_box_is_switched_once_quiet() {
         quiet: Duration::from_millis(300),
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     let hub = second_hub(dir.path(), &side, hold, timing).await;
     let h = hub.clone();
@@ -884,6 +951,7 @@ async fn an_installed_build_replaces_the_running_one() {
         quiet: Duration::from_millis(300),
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     opts.box_dialer = Some(dialer);
     let hub = Hub::open(opts).await.unwrap();
@@ -959,6 +1027,7 @@ async fn a_thread_being_made_keeps_the_box_from_switching() {
         quiet,
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     let hub = second_hub(dir.path(), &side, hold, timing).await;
     let h = hub.clone();
@@ -1050,6 +1119,7 @@ async fn a_switch_that_does_not_take_is_not_tried_again() {
         quiet,
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     opts.box_dialer = Some(dialer);
     let hub = Hub::open(opts).await.unwrap();
@@ -1358,6 +1428,7 @@ async fn a_runtime_the_new_daemon_lost_ends_stopped_and_its_reason_with_it() {
         quiet: Duration::from_secs(5),
         check: Duration::from_millis(50),
         drain: Duration::from_secs(20),
+        ..Default::default()
     };
     let hub = Hub::open(opts).await.unwrap();
     let session = hub.get_thread(lost).unwrap()["session_id"].clone();
@@ -1401,5 +1472,988 @@ async fn a_runtime_the_new_daemon_lost_ends_stopped_and_its_reason_with_it() {
         &format!("switching to build {}", own_build())
     ));
     assert_eq!(count(&hub, lost, "thread.crashed"), 0);
+    hub.shutdown().await;
+}
+
+// ------------------------------------------------------------------------------------------
+// Draining an older daemon
+// ------------------------------------------------------------------------------------------
+
+/// The older runner protocol the hub drains.
+fn drained_protocol() -> u32 {
+    *twr_core::runner::DRAINABLE_PROTOCOLS
+        .iter()
+        .max()
+        .expect("a drainable protocol")
+}
+
+/// The build of a box daemon that speaks an older protocol the hub drains.
+const DRAINED: &str = "00000000000000d6";
+
+/// The prompt of a turn that runs a tool, then waits on a question until it is answered: it
+/// keeps the box from being drained for as long as a test needs ([`first_hub_busy`]), unless
+/// the drain cuts it.
+const HELD_TURN: &str = "!tool Bash ls\n!ask go on?|yes|no";
+
+/// How a stand-in for the box's older daemon goes on once it is welcomed ([`stand_in`]).
+#[derive(Debug, Clone, Copy)]
+enum StandIn {
+    /// It never syncs (until the hub closes it).
+    Unsynced,
+    /// It leaves at once.
+    Leaves,
+}
+
+/// A box whose daemon speaks an older protocol the hub drains, as [`drain_dialer`] sees it.
+struct DrainBox {
+    dir: PathBuf,
+    hub_key: [u8; 32],
+    /// The daemon that runs the box's runtimes.
+    daemon: Option<Daemon>,
+    /// The build the hub is told it launched: the one a dial that replaces or restarts the
+    /// daemon starts (of the hub's protocol).
+    launched: String,
+    /// While the daemon is not replaced, the dials reach a stand-in of the older daemon
+    /// ([`stand_in`], of the daemon's build) instead of it.
+    stand_in: Option<StandIn>,
+    replaced: bool,
+    dials: Vec<Dial>,
+    /// Cuts the link of the last dial that reached the daemon (set it).
+    cut: Option<watch::Sender<bool>>,
+}
+
+impl DrainBox {
+    fn new(dir: &Path, hub_key: [u8; 32], daemon: Daemon) -> DrainBox {
+        DrainBox {
+            dir: dir.to_path_buf(),
+            hub_key,
+            daemon: Some(daemon),
+            launched: own_build().into(),
+            stand_in: None,
+            replaced: false,
+            dials: Vec::new(),
+            cut: None,
+        }
+    }
+}
+
+/// The dialer of a [`DrainBox`], which replaces the daemon as the box's relay does
+/// (`twr_runner::relay::decide`): a dial that restarts it (`--restart`), or that replaces it
+/// (`--replace`) while it runs another build than [`DrainBox::launched`], stops it (its
+/// runtimes stop, their exits spooled) and starts one of the launched build on the same data
+/// directory, of the hub's protocol; the others reach the daemon as it is (or its stand-in).
+/// What the hub sends goes through a pump `hold` holds.
+fn drain_dialer(side: Arc<tokio::sync::Mutex<DrainBox>>, hold: watch::Receiver<bool>) -> BoxDialer {
+    Arc::new(move |name: String, dial: Dial| {
+        let side = Arc::clone(&side);
+        let hold = hold.clone();
+        async move {
+            assert_eq!(name, BOX);
+            let mut side = side.lock().await;
+            side.dials.push(dial);
+            let running = side.daemon.as_ref().map(|d| d.build.clone());
+            if dial.restart || (dial.replace && running.as_ref() != Some(&side.launched)) {
+                if let Some(old) = side.daemon.take() {
+                    old.stop().await;
+                }
+                let launched = side.launched.clone();
+                side.daemon = Some(Daemon::start_as(&side.dir, side.hub_key, &launched).await);
+                side.replaced = true;
+            }
+            let io: Box<dyn BoxIo> = match side.stand_in.filter(|_| !side.replaced) {
+                Some(how) => {
+                    let build = side.daemon.as_ref().expect("a daemon").build.clone();
+                    Box::new(stand_in(side.hub_key, how, build))
+                }
+                None => {
+                    let socket = side.daemon.as_ref().expect("a daemon").socket.clone();
+                    let (stream, _) = request(&socket, Request::Connect)
+                        .await
+                        .map_err(|e| std::io::Error::other(format!("{e:#}")))?;
+                    let (cut, link) = watch::channel(false);
+                    side.cut = Some(cut);
+                    Box::new(pump(stream, hold, Some(link)))
+                }
+            };
+            Ok((io, side.launched.clone()))
+        }
+        .boxed()
+    })
+}
+
+/// A connection to a stand-in for the box's older daemon, of build `build`: it opens the
+/// sealed channel, authenticates speaking [`drained_protocol`], reports an empty inventory
+/// and, once welcomed, goes on as `how` says.
+fn stand_in(hub_key: [u8; 32], how: StandIn, build: String) -> tokio::io::DuplexStream {
+    let (hub_end, box_end) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let Ok(sealed) =
+            twr_core::sealed::daemon_side(box_end, &hub_key, BOX, Some(build.as_str())).await
+        else {
+            return;
+        };
+        let Ok((mut ws, _)) = tokio_tungstenite::client_async("ws://twr-box/", sealed).await else {
+            return;
+        };
+        let say = |m: &RunnerMsg| Message::Text(serde_json::to_string(m).unwrap().into());
+        // The hub's next message (pings aside).
+        async fn heard<S>(ws: &mut tokio_tungstenite::WebSocketStream<S>) -> Option<HubMsg>
+        where
+            S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        {
+            while let Some(Ok(m)) = ws.next().await {
+                if let Message::Text(t) = m {
+                    match serde_json::from_str(t.as_str()).ok()? {
+                        HubMsg::Ping | HubMsg::Pong => continue,
+                        m => return Some(m),
+                    }
+                }
+            }
+            None
+        }
+        let hello = RunnerMsg::Hello(Hello {
+            box_name: BOX.into(),
+            protocol: drained_protocol(),
+            nonce: new_nonce().unwrap(),
+        });
+        if ws.send(say(&hello)).await.is_err() {
+            return;
+        }
+        let Some(HubMsg::Challenge { .. }) = heard(&mut ws).await else {
+            return;
+        };
+        let auth = RunnerMsg::Auth {
+            proof: twr_core::runner::SEALED_AUTH_PROOF.into(),
+        };
+        if ws.send(say(&auth)).await.is_err() {
+            return;
+        }
+        let Some(HubMsg::Authenticated) = heard(&mut ws).await else {
+            return;
+        };
+        let inv = RunnerMsg::Inventory(Inventory {
+            version: "0.6.0".into(),
+            runtimes: vec!["fake".into()],
+            worktrees: "/nonexistent/worktrees".into(),
+            build: Some(build.clone()),
+            ..Default::default()
+        });
+        if ws.send(say(&inv)).await.is_err() {
+            return;
+        }
+        let Some(HubMsg::Welcome { .. }) = heard(&mut ws).await else {
+            return;
+        };
+        match how {
+            StandIn::Leaves => {}
+            StandIn::Unsynced => while heard(&mut ws).await.is_some() {},
+        }
+    });
+    hub_end
+}
+
+/// A second hub dialing [`DrainBox`] `side` with the drain's timing `timing` (`opts` as
+/// [`hub_opts`] makes them, or another hub's).
+async fn drain_hub(
+    mut opts: HubOptions,
+    side: &Arc<tokio::sync::Mutex<DrainBox>>,
+    hold: watch::Receiver<bool>,
+    timing: SwitchTiming,
+) -> Hub {
+    opts.box_switch = timing;
+    opts.box_dialer = Some(drain_dialer(Arc::clone(side), hold));
+    Hub::open(opts).await.unwrap()
+}
+
+/// The drain's timing in these tests: looked at often, its stops' exits waited for long
+/// enough, its deadline `wait` and its sync bound `sync`.
+fn drain_timing(wait: Duration, sync: Duration) -> SwitchTiming {
+    SwitchTiming {
+        drain: Duration::from_secs(20),
+        legacy_check: Duration::from_millis(50),
+        legacy_wait: wait,
+        legacy_sync: sync,
+        ..Default::default()
+    }
+}
+
+/// Waits until the box is drained, `stage` (`hub.info` `drain.stage`).
+async fn until_stage(hub: &Hub, stage: &str) {
+    let (h, stage) = (hub.clone(), stage.to_string());
+    wait_for(&format!("the drain {stage}"), move || {
+        box_info(&h)["drain"]["stage"] == stage.as_str()
+    })
+    .await;
+}
+
+/// Waits until the box is online on a daemon of the hub's protocol, its drain over.
+async fn until_drain_over(hub: &Hub) {
+    let h = hub.clone();
+    wait_for("the box online, its drain over", move || {
+        let b = box_info(&h);
+        online(&h) && b["state"] == "online" && b["drain"].is_null()
+    })
+    .await;
+    let (h, n) = (hub.clone(), format!("now on build {}", own_build()));
+    wait_for("the drain's end note", move || has_note(&h, &n)).await;
+}
+
+/// The note that begins with `start`, if any.
+fn note_starting(hub: &Hub, start: &str) -> Option<String> {
+    box_info(hub)["notes"]
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|n| n.starts_with(start))
+        .map(str::to_string)
+}
+
+/// `thread`'s turn `turn`'s result.
+fn turn_result(hub: &Hub, thread: &str, turn: u64) -> Option<TurnResult> {
+    events(hub, thread).iter().find_map(|e| match &e.body {
+        EventBody::TurnEnded(t) if e.turn == Some(turn) => Some(t.result),
+        _ => None,
+    })
+}
+
+/// A new thread on the box, which the drain refuses (`box_offline`, saying why).
+async fn new_thread_refused(hub: &Hub, dir: &Path, why: &str) {
+    let req = NewThread {
+        project: dir.join("proj").to_string_lossy().into_owned(),
+        runtime: Some("fake".into()),
+        name: Some("late".into()),
+        box_name: Some(BOX.into()),
+        ..Default::default()
+    };
+    let e = hub.new_thread(req, "test").await.unwrap_err();
+    assert_eq!(e.code, codes::BOX_OFFLINE, "{}", e.message);
+    assert!(e.message.contains(why), "{}", e.message);
+}
+
+/// The box's daemon speaks an older protocol the hub drains (a hub upgrade across a protocol
+/// bump): its connection is served, the box shows `switching` with its drain (`draining`,
+/// not `switch_pending`), a prompt to the idle thread waits and a new thread or a park is
+/// refused saying why, while the turn waiting on a permission goes on: the answer reaches the
+/// daemon and the turn ends. Then the box is drained: both runtimes stop for the upgrade (no
+/// crash, no error item), the next dial replaces the daemon, the connection of the hub's
+/// protocol ends the drain, and the queued prompt runs on the resumed session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_finishes_its_turn_then_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub(dir.path(), &daemon, &key, &["asks", "idle"], true).await;
+    let (asks, idle) = (&ids[0], &ids[1]);
+    daemon.speak(drained_protocol());
+    let side = Arc::new(tokio::sync::Mutex::new(DrainBox::new(
+        &box_dir,
+        key.public(),
+        daemon,
+    )));
+    let (_hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_secs(60));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    let session = |t: &str| hub.get_thread(t).unwrap()["session_id"].clone();
+    let sessions: Vec<Value> = ids.iter().map(|t| session(t)).collect();
+
+    until_stage(&hub, "draining").await;
+    let h = hub.clone();
+    wait_for("the box ready", move || online(&h)).await;
+    let b = box_info(&hub);
+    assert_eq!(
+        (&b["state"], &b["switch_pending"], &b["drain"]["protocol"]),
+        (
+            &Value::from("switching"),
+            &Value::from(false),
+            &Value::from(drained_protocol())
+        ),
+        "{b}"
+    );
+    assert!(
+        b["drain"]["since"].is_string() && b["drain"]["until"].is_string(),
+        "{b}"
+    );
+    let note = note_starting(&hub, "draining: ").expect("the drain's note");
+    assert!(
+        note.contains(&format!(
+            "(runner protocol {}; the hub speaks {PROTOCOL_VERSION}): running turns may \
+             finish until ",
+            drained_protocol()
+        )) && note.ends_with(" UTC; new prompts wait"),
+        "{note}"
+    );
+    // A prompt waits; a new thread and a park are refused.
+    let sent = hub
+        .send(idle, "after the drain", TurnFrom::User, user())
+        .unwrap();
+    assert_eq!((sent.turn, sent.pending), (None, 1), "{sent:?}");
+    let why = format!(
+        "runs an older twr (runner protocol {}) that finishes its running turns before the \
+         hub's build replaces it",
+        drained_protocol()
+    );
+    new_thread_refused(&hub, dir.path(), &why).await;
+    match hub
+        .park_thread(idle, false, false, &Caller::user("test"))
+        .await
+    {
+        Err(e) => assert!(e.message.contains(&why), "{}", e.message),
+        Ok(_) => panic!("a park during the drain"),
+    }
+    // The permission is answered: the turn ends.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(stop_reasons(&hub, asks).is_empty());
+    let attn = hub
+        .attention_list(false)
+        .into_iter()
+        .find(|i| i["thread"] == asks.as_str())
+        .expect("the permission")["attn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.respond(&attn, Answer::allow(), "test").unwrap();
+    until_turn_event(&hub, asks, "turn.ended", 2).await;
+    assert_eq!(turn_result(&hub, asks, 2), Some(TurnResult::Completed));
+
+    until_drain_over(&hub).await;
+    assert!(has_note(&hub, "drained: stopping 2 idle agent(s)"));
+    assert!(has_note(
+        &hub,
+        &format!("switching to build {}", own_build())
+    ));
+    assert_eq!(
+        side.lock().await.dials,
+        [
+            Dial::default(),
+            Dial {
+                replace: true,
+                restart: false
+            }
+        ]
+    );
+    // The queued prompt runs on its resumed session.
+    until_turn_event(&hub, idle, "turn.ended", 2).await;
+    assert_eq!(session(idle), sessions[1]);
+    for t in &ids {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(hub.get_thread(t).unwrap()["stopped"], false, "{t}");
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+        assert_eq!(error_items(&hub, t), 0, "{t}");
+    }
+    hub.send(asks, "again", TurnFrom::User, user()).unwrap();
+    until_turn_event(&hub, asks, "turn.ended", 3).await;
+    assert_eq!(session(asks), sessions[0]);
+    hub.shutdown().await;
+}
+
+/// A turn that runs past the drain's deadline is cut: once it passes, the box's runtimes stop
+/// for the upgrade whatever they do (the turn ends `interrupted`, its thread stopped for the
+/// upgrade, not crashed), and the daemon is replaced. A stop the user asked for before, whose
+/// way to the box is slow, keeps its own: that thread ends plainly stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_drain_deadline_stops_a_long_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub_busy(
+        dir.path(),
+        &daemon,
+        &key,
+        &["idle", "stopped", "busy"],
+        false,
+        Some(HELD_TURN),
+    )
+    .await;
+    let (idle, stopped, busy) = (&ids[0], &ids[1], &ids[2]);
+    daemon.speak(drained_protocol());
+    let side = Arc::new(tokio::sync::Mutex::new(DrainBox::new(
+        &box_dir,
+        key.public(),
+        daemon,
+    )));
+    let (hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(3), Duration::from_secs(60));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    until_stage(&hub, "draining").await;
+    let h = hub.clone();
+    wait_for("the box ready", move || online(&h)).await;
+    // The user's stop waits on the link past the deadline.
+    hold_tx.send(true).unwrap();
+    let stop = hub.stop_thread(stopped, "test").unwrap();
+    assert_eq!(stop["stopping"], true, "{stop}");
+    let h = hub.clone();
+    wait_for("the deadline", move || {
+        has_note(
+            &h,
+            "drain time is up: stopping 2 agent(s), cutting 1 running turn(s)",
+        )
+    })
+    .await;
+    hold_tx.send(false).unwrap();
+
+    until_drain_over(&hub).await;
+    assert_eq!(turn_result(&hub, busy, 2), Some(TurnResult::Interrupted));
+    for t in [idle, busy] {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(hub.get_thread(t).unwrap()["stopped"], false, "{t}");
+    }
+    assert_eq!(stop_reasons(&hub, stopped), [None]);
+    assert_eq!(hub.get_thread(stopped).unwrap()["stopped"], true);
+    for t in &ids {
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+    }
+    assert_eq!(
+        side.lock()
+            .await
+            .dials
+            .iter()
+            .map(|d| d.replace)
+            .collect::<Vec<_>>(),
+        [false, true]
+    );
+    hub.shutdown().await;
+}
+
+/// `box.restart` during a drain cuts it short: the box's runtimes stop for the upgrade at once
+/// (the running turn cut, no crash, unlike a restart outside a drain), a stop the user asked
+/// for before keeps its own, and once they have exited the next dial restarts the daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_cuts_the_drain_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub_busy(
+        dir.path(),
+        &daemon,
+        &key,
+        &["stopped", "busy"],
+        false,
+        Some(HELD_TURN),
+    )
+    .await;
+    let (stopped, busy) = (&ids[0], &ids[1]);
+    daemon.speak(drained_protocol());
+    let side = Arc::new(tokio::sync::Mutex::new(DrainBox::new(
+        &box_dir,
+        key.public(),
+        daemon,
+    )));
+    let (hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_secs(60));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    until_stage(&hub, "draining").await;
+    let h = hub.clone();
+    wait_for("the box ready", move || online(&h)).await;
+    hold_tx.send(true).unwrap();
+    let stop = hub.stop_thread(stopped, "test").unwrap();
+    assert_eq!(stop["stopping"], true, "{stop}");
+    hub.box_restart(BOX, &Caller::user("test")).unwrap();
+    assert!(has_note(
+        &hub,
+        "a restart cuts the drain short: stopping 1 agent(s), cutting 1 running turn(s)"
+    ));
+    assert_eq!(box_info(&hub)["drain"]["stage"], "stopping");
+    hold_tx.send(false).unwrap();
+
+    until_drain_over(&hub).await;
+    let h = hub.clone();
+    wait_for("the restart carried out", move || {
+        box_info(&h)["restart_pending"] == false
+    })
+    .await;
+    assert_eq!(
+        side.lock().await.dials,
+        [
+            Dial::default(),
+            Dial {
+                replace: false,
+                restart: true
+            }
+        ]
+    );
+    assert_eq!(turn_result(&hub, busy, 2), Some(TurnResult::Interrupted));
+    assert_eq!(stop_reasons(&hub, busy), [upgrade()]);
+    assert_eq!(stop_reasons(&hub, stopped), [None]);
+    assert_eq!(hub.get_thread(stopped).unwrap()["stopped"], true);
+    for t in &ids {
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+    }
+    hub.shutdown().await;
+}
+
+/// A permission mode narrowed while the box is drained takes effect as anywhere: the runtime
+/// is restarted for it once its turn (held open by a question until the mode is changed)
+/// ends (`mode_change`, not stopped by the drain), and the next prompt, after the switch,
+/// runs in the new mode on the resumed session. Another thread's turn (held open by a
+/// permission) keeps the box draining until that restart is seen: else the drain could find
+/// the box idle first and stop the runtime for the upgrade (the new mode applies on resume
+/// either way).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mode_change_takes_effect_while_draining() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub_busy(
+        dir.path(),
+        &daemon,
+        &key,
+        &["held", "busy"],
+        true,
+        Some(HELD_TURN),
+    )
+    .await;
+    let (held, busy) = (&ids[0], &ids[1]);
+    daemon.speak(drained_protocol());
+    let side = Arc::new(tokio::sync::Mutex::new(DrainBox::new(
+        &box_dir,
+        key.public(),
+        daemon,
+    )));
+    let (_hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_secs(60));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    let session = hub.get_thread(busy).unwrap()["session_id"].clone();
+    until_stage(&hub, "draining").await;
+    let h = hub.clone();
+    wait_for("the box ready", move || online(&h)).await;
+    let r = hub.set_mode(busy, "manual", &Caller::user("test")).unwrap();
+    assert_eq!(r["applies"], "after_turn", "{r}");
+    let question = |h: &Hub| {
+        h.attention_list(false)
+            .into_iter()
+            .find(|i| i["thread"] == busy.as_str())
+            .and_then(|i| i["attn_id"].as_str().map(str::to_string))
+    };
+    let h = hub.clone();
+    wait_for("the question", move || question(&h).is_some()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        stop_reasons(&hub, busy).is_empty(),
+        "nothing stops meanwhile"
+    );
+    let attn = question(&hub).unwrap();
+    hub.respond(&attn, Answer::new("yes"), "test").unwrap();
+    until_turn_event(&hub, busy, "turn.ended", 2).await;
+    let h = hub.clone();
+    wait_for("the restart for the mode", move || {
+        !stop_reasons(&h, busy).is_empty()
+    })
+    .await;
+    assert_eq!(
+        stop_reasons(&hub, busy),
+        [Some(MODE_RESTART_REASON.to_string())]
+    );
+    // The other turn ends: the box is drained.
+    assert!(stop_reasons(&hub, held).is_empty());
+    let attn = hub
+        .attention_list(false)
+        .into_iter()
+        .find(|i| i["thread"] == held.as_str())
+        .expect("the permission")["attn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.respond(&attn, Answer::allow(), "test").unwrap();
+    until_turn_event(&hub, held, "turn.ended", 2).await;
+    until_drain_over(&hub).await;
+    assert_eq!(
+        stop_reasons(&hub, busy),
+        [Some(MODE_RESTART_REASON.to_string())]
+    );
+    assert_eq!(stop_reasons(&hub, held), [upgrade()]);
+    assert!(has_note(&hub, "drained: stopping 1 idle agent(s)"));
+    hub.send(busy, "gamma", TurnFrom::User, user()).unwrap();
+    until_turn_event(&hub, busy, "turn.ended", 3).await;
+    let t = hub.get_thread(busy).unwrap();
+    assert_eq!(
+        (&t["mode"], &t["session_id"]),
+        (&Value::from("manual"), &session),
+        "{t}"
+    );
+    for t in &ids {
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+    }
+    hub.shutdown().await;
+}
+
+/// The box's older daemon whose connections do not get ready (`how`: they never sync, closed
+/// at the bound; or they leave at once) is replaced after three of them, as one the hub
+/// cannot serve: its runtimes recorded as stopped for the upgrade first, so the replaced
+/// daemon's exits close their threads `box_upgrade` (the running turn cut), not crashed.
+async fn an_unready_older_daemon_is_replaced(how: StandIn) {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub_with(dir.path(), &daemon, &key, &["idle", "busy"], false, true).await;
+    let (idle, busy) = (&ids[0], &ids[1]);
+    let mut side = DrainBox::new(&box_dir, key.public(), daemon);
+    side.stand_in = Some(how);
+    let side = Arc::new(tokio::sync::Mutex::new(side));
+    let (_hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_millis(300));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    until_drain_over(&hub).await;
+    let note = format!(
+        "3 of its daemon's connections ended before they synced: replacing the box's daemon \
+         (runner protocol {}); its 2 agent(s) stop, and each thread's next prompt resumes its \
+         session (1 running turn(s) cut)",
+        drained_protocol()
+    );
+    assert!(has_note(&hub, &note), "{}", box_info(&hub));
+    assert_eq!(
+        side.lock()
+            .await
+            .dials
+            .iter()
+            .map(|d| d.replace)
+            .collect::<Vec<_>>(),
+        [false, false, false, true]
+    );
+    assert_eq!(turn_result(&hub, busy, 2), Some(TurnResult::Interrupted));
+    for t in [idle, busy] {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+        assert_eq!(error_items(&hub, t), 0, "{t}");
+    }
+    hub.send(idle, "gamma", TurnFrom::User, user()).unwrap();
+    until_turn_event(&hub, idle, "turn.ended", 2).await;
+    hub.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_that_does_not_sync_is_replaced() {
+    an_unready_older_daemon_is_replaced(StandIn::Unsynced).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_that_keeps_leaving_is_replaced() {
+    an_unready_older_daemon_is_replaced(StandIn::Leaves).await;
+}
+
+/// The box's older daemon loses its connection once the drain has stopped its runtimes (the
+/// stops lost on the way), and its connections then never sync: once the wait for the stops'
+/// exits is over, the daemon is replaced all the same, the stops not recorded again, and the
+/// replaced daemon's exits close the threads `box_upgrade` (the running turn cut), not crashed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_daemon_lost_while_stopping_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub_busy(
+        dir.path(),
+        &daemon,
+        &key,
+        &["idle", "busy"],
+        false,
+        Some(HELD_TURN),
+    )
+    .await;
+    let (idle, busy) = (&ids[0], &ids[1]);
+    daemon.speak(drained_protocol());
+    let side = Arc::new(tokio::sync::Mutex::new(DrainBox::new(
+        &box_dir,
+        key.public(),
+        daemon,
+    )));
+    let (hold_tx, hold) = watch::channel(false);
+    let timing = SwitchTiming {
+        drain: Duration::from_millis(1500),
+        ..drain_timing(Duration::from_secs(3), Duration::from_millis(300))
+    };
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    until_stage(&hub, "draining").await;
+    let h = hub.clone();
+    wait_for("the box ready", move || online(&h)).await;
+    // The deadline's stops wait on the link, which is then lost; the next connections reach
+    // a daemon that does not sync.
+    hold_tx.send(true).unwrap();
+    let h = hub.clone();
+    wait_for("the deadline", move || {
+        has_note(
+            &h,
+            "drain time is up: stopping 2 agent(s), cutting 1 running turn(s)",
+        )
+    })
+    .await;
+    {
+        let mut side = side.lock().await;
+        side.stand_in = Some(StandIn::Unsynced);
+        side.cut.take().expect("a link").send(true).unwrap();
+    }
+    hold_tx.send(false).unwrap();
+
+    until_drain_over(&hub).await;
+    assert!(
+        has_note(
+            &hub,
+            &format!(
+                "the box's daemon (runner protocol {}) is not ready to report its stopped \
+                 agents' ends: replacing it",
+                drained_protocol()
+            )
+        ),
+        "{}",
+        box_info(&hub)
+    );
+    let dials = side.lock().await.dials.clone();
+    assert_eq!(dials.iter().filter(|d| d.replace).count(), 1, "{dials:?}");
+    assert!(
+        dials.last().unwrap().replace && dials.len() >= 3,
+        "{dials:?}"
+    );
+    assert_eq!(turn_result(&hub, busy, 2), Some(TurnResult::Interrupted));
+    for t in [idle, busy] {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+        assert_eq!(error_items(&hub, t), 0, "{t}");
+    }
+    hub.shutdown().await;
+}
+
+/// `box.restart` before the older daemon's connection is ready cuts the drain short too: the
+/// box's runtimes are recorded as stopped for the upgrade at once and the next dial both
+/// replaces and restarts the daemon; its exits close the threads `box_upgrade`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_before_the_drained_box_is_ready_stops_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let daemon = Daemon::start_as(&box_dir, key.public(), DRAINED).await;
+    let ids = first_hub(dir.path(), &daemon, &key, &["idle"], false).await;
+    let mut side = DrainBox::new(&box_dir, key.public(), daemon);
+    side.stand_in = Some(StandIn::Unsynced);
+    let side = Arc::new(tokio::sync::Mutex::new(side));
+    let (_hold_tx, hold) = watch::channel(false);
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_secs(60));
+    let hub = drain_hub(hub_opts(dir.path()), &side, hold, timing).await;
+    until_stage(&hub, "draining").await;
+    assert!(!online(&hub));
+    hub.box_restart(BOX, &Caller::user("test")).unwrap();
+    let note = format!(
+        "a restart cuts the drain short: replacing the box's daemon (runner protocol {}); its 1 \
+         agent(s) stop, and each thread's next prompt resumes its session",
+        drained_protocol()
+    );
+    assert!(has_note(&hub, &note), "{}", box_info(&hub));
+    until_drain_over(&hub).await;
+    assert_eq!(
+        side.lock().await.dials,
+        [
+            Dial::default(),
+            Dial {
+                replace: true,
+                restart: true
+            }
+        ]
+    );
+    assert_eq!(stop_reasons(&hub, &ids[0]), [upgrade()]);
+    assert_eq!(count(&hub, &ids[0], "thread.crashed"), 0);
+    hub.shutdown().await;
+}
+
+/// The builds of a box of another OS or CPU: the one configured first, of an older protocol
+/// the hub drains, and the one `twr box install` records then.
+const CROSS: &str = "00000000000000c7";
+const NEW: &str = "00000000000000c8";
+
+/// Writes the hub's config file in `dir` (returned), and the boxes file next to it, where the
+/// box's configured build is `build`.
+fn configure_build(dir: &Path, build: &str) -> PathBuf {
+    let config_file = dir.join("config.toml");
+    std::fs::write(&config_file, "default_runtime = \"fake\"\n").unwrap();
+    std::fs::write(
+        dir.join("boxes.toml"),
+        format!(
+            "[boxes.{BOX}]\ntransport = \"ssh\"\nssh = \"me@gpu.invalid\"\nbuild = \"{build}\"\n"
+        ),
+    )
+    .unwrap();
+    config_file
+}
+
+/// Why a box whose launched build speaks the drained protocol needs an install.
+fn needs_install_why() -> String {
+    format!(
+        "box gpu runs a twr build that speaks protocol {}, the hub {PROTOCOL_VERSION}: install \
+         this hub's build there: `twr box install gpu`",
+        drained_protocol()
+    )
+}
+
+/// A box of another OS or CPU whose configured build speaks an older protocol the hub drains:
+/// it is drained (its runtime stopped for the upgrade), then, as there is nothing newer to
+/// start, it needs an install: `hub.info` says `needs_install` with the drain's stage, a
+/// prompt waits and a new thread is refused (the box is offline), and the build is not dialed
+/// again, not even when `box.install` finds the same build. Once `twr box install` records
+/// another, the daemon found then is drained at once and replaced by it, and the queued prompt
+/// runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drained_cross_target_box_needs_an_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let config_file = configure_build(dir.path(), CROSS);
+    let daemon = Daemon::start_as(&box_dir, key.public(), CROSS).await;
+    let ids = first_hub(dir.path(), &daemon, &key, &["idle"], false).await;
+    let idle = &ids[0];
+    daemon.speak(drained_protocol());
+    let mut side = DrainBox::new(&box_dir, key.public(), daemon);
+    side.launched = CROSS.into();
+    let side = Arc::new(tokio::sync::Mutex::new(side));
+    let (_hold_tx, hold) = watch::channel(false);
+    let mut opts = hub_opts(dir.path());
+    opts.config = Config::load_with_boxes(&config_file).unwrap();
+    opts.config_file = Some(config_file.clone());
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_secs(60));
+    let hub = drain_hub(opts, &side, hold, timing).await;
+
+    let (h, w) = (hub.clone(), needs_install_why());
+    wait_for("needs_install", move || {
+        let b = box_info(&h);
+        b["state"] == "needs_install"
+            && b["drain"]["stage"] == "needs_install"
+            && b["last_error"] == w.as_str()
+    })
+    .await;
+    assert_eq!(stop_reasons(&hub, idle), [upgrade()]);
+    assert_eq!(hub.get_thread(idle).unwrap()["stopped"], false);
+    let sent = hub
+        .send(idle, "after the install", TurnFrom::User, user())
+        .unwrap();
+    assert_eq!((sent.turn, sent.pending), (None, 1), "{sent:?}");
+    // (Offline meanwhile: `hub.info` says why.)
+    new_thread_refused(&hub, dir.path(), "is offline").await;
+    // Not dialed again, not even when `box.install` finds the same build.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    hub.box_install(BOX, &Caller::user("test")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(side.lock().await.dials, [Dial::default()]);
+    assert_eq!(box_info(&hub)["state"], "needs_install");
+
+    // `twr box install` records another build.
+    configure_build(dir.path(), NEW);
+    side.lock().await.launched = NEW.into();
+    hub.box_install(BOX, &Caller::user("test")).await.unwrap();
+    until_online_on(&hub, NEW).await;
+    assert_eq!(
+        side.lock().await.dials,
+        [
+            Dial::default(),
+            Dial::default(),
+            Dial {
+                replace: true,
+                restart: false
+            }
+        ]
+    );
+    until_turn_event(&hub, idle, "turn.ended", 2).await;
+    assert_eq!(count(&hub, idle, "thread.crashed"), 0);
+    hub.shutdown().await;
+}
+
+/// Waits until the box is online on a daemon of build `build`, its drain over.
+async fn until_online_on(hub: &Hub, build: &str) {
+    let (h, build) = (hub.clone(), build.to_string());
+    wait_for(
+        "the box online on the new build, its drain over",
+        move || {
+            let b = box_info(&h);
+            online(&h) && b["drain"].is_null() && b["running_build"] == build.as_str()
+        },
+    )
+    .await;
+}
+
+/// A box of another OS or CPU whose configured build speaks an older protocol the hub drains,
+/// and whose daemon does not get ready (its connections never sync): the drain falls back to
+/// replacing it, its runtimes recorded as stopped for the upgrade, but the box's relay keeps a
+/// daemon of its own build, so no replace takes. The box needs an install instead (not dialed
+/// again meanwhile, its drain kept), and the first dial once `twr box install` records another
+/// build replaces the old daemon: its exits close the threads `box_upgrade` (the running turn
+/// cut), not crashed, and the queued prompt runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unready_older_daemon_of_the_build_launched_needs_an_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = hub_key(dir.path());
+    let box_dir = dir.path().join("box");
+    let config_file = configure_build(dir.path(), CROSS);
+    let daemon = Daemon::start_as(&box_dir, key.public(), CROSS).await;
+    let ids = first_hub_with(dir.path(), &daemon, &key, &["idle", "busy"], false, true).await;
+    let (idle, busy) = (&ids[0], &ids[1]);
+    let mut side = DrainBox::new(&box_dir, key.public(), daemon);
+    side.launched = CROSS.into();
+    side.stand_in = Some(StandIn::Unsynced);
+    let side = Arc::new(tokio::sync::Mutex::new(side));
+    let (_hold_tx, hold) = watch::channel(false);
+    let mut opts = hub_opts(dir.path());
+    opts.config = Config::load_with_boxes(&config_file).unwrap();
+    opts.config_file = Some(config_file.clone());
+    let timing = drain_timing(Duration::from_secs(600), Duration::from_millis(300));
+    let hub = drain_hub(opts, &side, hold, timing).await;
+
+    let (h, w) = (hub.clone(), needs_install_why());
+    wait_for("needs_install", move || {
+        let b = box_info(&h);
+        b["state"] == "needs_install"
+            && b["drain"]["stage"] == "needs_install"
+            && b["last_error"] == w.as_str()
+    })
+    .await;
+    let note = format!(
+        "3 of its daemon's connections ended before they synced: replacing the box's daemon \
+         (runner protocol {}); its 2 agent(s) stop, and each thread's next prompt resumes its \
+         session (1 running turn(s) cut)",
+        drained_protocol()
+    );
+    assert!(has_note(&hub, &note), "{}", box_info(&hub));
+    let sent = hub
+        .send(idle, "after the install", TurnFrom::User, user())
+        .unwrap();
+    assert_eq!((sent.turn, sent.pending), (None, 1), "{sent:?}");
+    // Not dialed again, not even when `box.install` finds the same build. (The session that
+    // ends `needs_install` is the third or the replace's after it, whichever ends after the
+    // fallback asked for the replace.)
+    let dials = side.lock().await.dials.clone();
+    assert!(
+        dials.len() <= 4 && dials.iter().take(3).all(|d| *d == Dial::default()),
+        "{dials:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    hub.box_install(BOX, &Caller::user("test")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(side.lock().await.dials, dials);
+    let b = box_info(&hub);
+    assert_eq!(
+        (&b["state"], &b["drain"]["stage"]),
+        (&Value::from("needs_install"), &Value::from("needs_install")),
+        "{b}"
+    );
+
+    // `twr box install` records another build: the first dial replaces the old daemon.
+    configure_build(dir.path(), NEW);
+    side.lock().await.launched = NEW.into();
+    hub.box_install(BOX, &Caller::user("test")).await.unwrap();
+    until_online_on(&hub, NEW).await;
+    let after = side.lock().await.dials[dials.len()..].to_vec();
+    assert_eq!(
+        after,
+        [Dial {
+            replace: true,
+            restart: false
+        }]
+    );
+    assert_eq!(turn_result(&hub, busy, 2), Some(TurnResult::Interrupted));
+    for t in [idle, busy] {
+        assert_eq!(stop_reasons(&hub, t), [upgrade()], "{t}");
+        assert_eq!(count(&hub, t, "thread.crashed"), 0, "{t}");
+        assert_eq!(error_items(&hub, t), 0, "{t}");
+    }
+    until_turn_event(&hub, idle, "turn.ended", 2).await;
     hub.shutdown().await;
 }

@@ -2,8 +2,9 @@
 //! runners (`twr_runner::run_with`, fake adapter) — spawn/send/permission/respond through a
 //! runner, connections killed mid-stream (a counting WebSocket proxy between runner and hub),
 //! a hub crash between commit and ack, command resends, fencing, authentication, the bind
-//! check, TLS, worktrees and snapshots on the box, remote attach, and reconciliation after
-//! a runner restart.
+//! check, TLS, worktrees and snapshots on the box, remote attach, reconciliation after a
+//! runner restart, and a runner of an older protocol the hub drains (its captured frames
+//! recorded with their effects, its drain across reconnections, a revocation meanwhile).
 //!
 //! The TLS fixtures in `tests/fixtures/tls` were made once with the `openssl` CLI: a test CA
 //! (`ca.pem`, its key discarded) and a leaf for `localhost` / `127.0.0.1` signed by it
@@ -24,8 +25,9 @@ use twr_core::config::{BoxConfig, Config, HubConfig, TlsConfig};
 use twr_core::event::*;
 use twr_core::proto::codes;
 use twr_core::runner::{
-    auth_proof, check_auth_proof, cmd_errors, hub_errors, new_nonce, CmdError, CmdResult, HubMsg,
-    Inventory, Op, Prover, RunnerMsg, RunningSession, Secret, PROTOCOL_VERSION,
+    auth_proof, check_auth_proof, cmd_errors, drainable, hub_errors, new_nonce, CmdError,
+    CmdResult, HubMsg, Inventory, Op, Prover, RunnerMsg, RunningSession, Secret,
+    DRAINABLE_PROTOCOLS, PROTOCOL_VERSION,
 };
 use twr_hub::hub::ThreadSubscription;
 use twr_hub::listener::{RunnerListener, RunnerServer};
@@ -566,12 +568,29 @@ async fn raw_expect(ws: &mut RawWs) -> Option<HubMsg> {
     }
 }
 
-/// What a raw runner says in its handshake: its box and token ([`raw_hello`]) and its
-/// inventory.
+/// The newest older runner protocol the hub drains ([`DRAINABLE_PROTOCOLS`]).
+fn drainable_older() -> u32 {
+    *DRAINABLE_PROTOCOLS
+        .iter()
+        .max()
+        .expect("a drainable protocol")
+}
+
+/// An older runner protocol the hub does not drain.
+fn undrainable_older() -> u32 {
+    (1..PROTOCOL_VERSION)
+        .rev()
+        .find(|p| !drainable(*p))
+        .expect("an older protocol the hub does not drain")
+}
+
+/// What a raw runner says in its handshake: its box and token ([`raw_hello`]), its protocol
+/// (`None`: the hub's) and its inventory.
 #[derive(Debug, Clone, Default)]
 struct Hello {
     box_name: String,
     token: String,
+    protocol: Option<u32>,
     version: String,
     epoch_hint: Option<u64>,
     running: Vec<RunningSession>,
@@ -600,7 +619,7 @@ async fn raw_hello(ws: &mut RawWs, h: Hello) {
     let nonce = new_nonce().unwrap();
     let hello = twr_core::runner::Hello {
         box_name: h.box_name.clone(),
-        protocol: PROTOCOL_VERSION,
+        protocol: h.protocol.unwrap_or(PROTOCOL_VERSION),
         nonce: nonce.clone(),
     };
     raw_send(ws, &RunnerMsg::Hello(hello)).await;
@@ -1105,10 +1124,11 @@ async fn raw_hello_only(ws: &mut RawWs, box_name: &str, protocol: u32) -> (Strin
 
 /// The handshake's refusals: a wrong token and an unknown box get a challenge whose proof the
 /// runner's token does not check (an unknown box's is random, so a peer cannot tell which
-/// boxes exist), and `unauthorized` for their own proof; another protocol (an older runner's
-/// hello with its token included), a malformed hello or nonce, and anything but `hello`
-/// first or `auth` second are refused as `protocol`. Neither token is ever logged, and no
-/// refused connection gets the box online.
+/// boxes exist), and `unauthorized` for their own proof, whether the runner speaks the hub's
+/// protocol or an older one the hub drains; another protocol (a newer one, an older one the
+/// hub does not drain, an older runner's hello with its token included), a malformed hello
+/// or nonce, and anything but `hello` first or `auth` second are refused as `protocol`.
+/// Neither token is ever logged, and no refused connection gets the box online.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1121,10 +1141,14 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
         }
         other => panic!("expected error {code}, got {other:?}"),
     };
-    // A wrong token, an unknown box.
-    for (box_name, token) in [(BOX, "wrong-token-8d1e"), ("nope", TOKEN)] {
+    // A wrong token, an unknown box; of the hub's protocol or an older one it drains.
+    let tries = [(BOX, "wrong-token-8d1e"), ("nope", TOKEN)];
+    for (protocol, (box_name, token)) in [PROTOCOL_VERSION, drainable_older()]
+        .into_iter()
+        .flat_map(|p| tries.map(|t| (p, t)))
+    {
         let mut ws = raw(&h.url).await;
-        let (nonce, m) = raw_hello_only(&mut ws, box_name, PROTOCOL_VERSION).await;
+        let (nonce, m) = raw_hello_only(&mut ws, box_name, protocol).await;
         let Some(HubMsg::Challenge { nonce: hub, proof }) = m else {
             panic!("no challenge: {m:?}")
         };
@@ -1171,7 +1195,7 @@ async fn bad_tokens_unknown_boxes_and_other_protocols_are_refused() {
     // Other protocols are told which side to update, before any authentication.
     for (protocol, update) in [
         (PROTOCOL_VERSION + 1, "update twr on the hub"),
-        (PROTOCOL_VERSION - 1, "update twr on box `gpu`"),
+        (undrainable_older(), "update twr on box `gpu`"),
     ] {
         let mut ws = raw(&h.url).await;
         let (_, m) = raw_hello_only(&mut ws, BOX, protocol).await;
@@ -2216,6 +2240,536 @@ async fn a_remote_attach_keeps_its_directory_from_a_park_of_the_worktrees_thread
         .unwrap()
         .unwrap();
     assert!(out.worktree_removed, "{out:?}");
+    runner.shutdown().await;
+    h.shutdown().await;
+}
+
+/// The frames a runner of protocol `protocol` encodes, as captured from its revision
+/// (`twr-core/tests/fixtures/runner-protocol-<protocol>/runner.json`), by sample name.
+fn captured_frames(protocol: u32) -> std::collections::HashMap<String, Value> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../twr-core/tests/fixtures")
+        .join(format!("runner-protocol-{protocol}"))
+        .join("runner.json");
+    let v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    v["samples"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap().to_string(), s["frame"].clone()))
+        .collect()
+}
+
+/// A runner of an older protocol the hub drains (its hello names that protocol, with the
+/// box's token) is served drain-only: the box shows `switching` with its drain, a new thread
+/// there is refused saying why and a prompt waits, while the frames that runner's revision
+/// encodes (captured from it, every kind its runtimes emit) are recorded with their effects:
+/// the session's start, a turn's text, thinking and tool call, a permission raised and
+/// answered (the answer goes out to it), a question raised and timed out, a background task
+/// listed then done, a usage report folded, the turn's end with its usage, a turn of the
+/// runtime's own, a resume's start. The hub sends it nothing but acks, pings and the
+/// commands of the running session. A runner of the hub's protocol then ends the drain: the
+/// queued prompt goes out. Another thread's turn, which no runner ends, keeps the box from
+/// being drained meanwhile (else the drain could find it idle after the replayed turns and
+/// stop its runtimes before the runner of the hub's protocol comes).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_runners_frames_are_recorded_with_their_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let old = drainable_older();
+    let frames = captured_frames(old);
+    // The hub spawns the threads' sessions on a runner of its own protocol, which goes away
+    // before it says anything. `held`'s turn stays open to the end (no runner ends it): the
+    // box is never idle, so the drain stops nothing.
+    let mut ws = raw_online(&h, Vec::new()).await;
+    let t = h.new_thread_raw_named(&mut ws, dir.path(), "old").await;
+    let held = h.new_thread_raw_named(&mut ws, dir.path(), "held").await;
+    for (thread, prompt) in [(&t, "hi"), (&held, "hold on")] {
+        h.send(thread, prompt);
+        let (cmd_id, op) = raw_cmd(&mut ws).await;
+        assert!(matches!(op, Op::Spawn { .. }), "{op:?}");
+        raw_ok(&mut ws, cmd_id).await;
+    }
+    drop(ws);
+    let hub = h.hub().clone();
+    wait_for("the box offline", move || {
+        hub.boxes().iter().any(|(n, on, _)| n == BOX && !*on)
+    })
+    .await;
+
+    // The older runner, which runs them.
+    let run = run_id(&t, "r1");
+    let running = || {
+        [(&t, run.clone()), (&held, run_id(&held, "r1"))]
+            .map(|(thread, run)| RunningSession {
+                thread: thread.clone(),
+                run: Some(run),
+                runtime: "fake".into(),
+                ..Default::default()
+            })
+            .to_vec()
+    };
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.protocol = Some(old);
+    hi.running = running();
+    raw_hello(&mut ws, hi).await;
+    let Some(HubMsg::Welcome { .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    h.online().await;
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(b["state"], "switching", "{b}");
+    assert_eq!(
+        (&b["drain"]["protocol"], &b["drain"]["stage"]),
+        (&json!(old), &json!("draining")),
+        "{b}"
+    );
+    assert_eq!(
+        h.hub().info()["drainable_protocols"],
+        json!(DRAINABLE_PROTOCOLS)
+    );
+    // The orchestrator and agents see the state, not the drain.
+    let limited = h.hub().info_for(twr_hub::hub::BoxView::Limited)["boxes"][0].clone();
+    assert_eq!(limited["state"], "switching", "{limited}");
+    assert!(limited.get("drain").is_none(), "{limited}");
+    // Nothing new on the box meanwhile; a prompt waits.
+    let req = NewThread {
+        project: dir.path().join("rawproj").to_string_lossy().into_owned(),
+        runtime: Some("fake".into()),
+        name: Some("late".into()),
+        box_name: Some(BOX.into()),
+        ..Default::default()
+    };
+    let e = h
+        .run(|hub| async move { hub.new_thread(req, "test").await })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BOX_OFFLINE, "{}", e.message);
+    assert!(
+        e.message.contains(&format!(
+            "runs an older twr (runner protocol {old}; the hub speaks {PROTOCOL_VERSION}): its \
+             running turns finish"
+        )),
+        "{}",
+        e.message
+    );
+    h.send(&t, "after the update");
+
+    // Its frames, as its revision encodes them, for the thread's session.
+    let mut rseq = 0;
+    let mut cmds = Vec::new();
+    let mut frame = |name: &str, turn: Option<u64>, f: &dyn Fn(&mut Value)| {
+        let mut v = frames
+            .get(name)
+            .unwrap_or_else(|| panic!("no captured frame {name:?}"))
+            .clone();
+        rseq += 1;
+        v["thread"] = json!(t);
+        v["rseq"] = json!(rseq);
+        v["run"] = json!(run);
+        match turn {
+            Some(n) => v["turn"] = json!(n),
+            None => {
+                v.as_object_mut().unwrap().remove("turn");
+            }
+        }
+        f(&mut v);
+        serde_json::from_value::<RunnerMsg>(v).unwrap()
+    };
+    let same = |_: &mut Value| {};
+    let thread = |h: &TestHub| h.hub().get_thread(&t).unwrap();
+    for (name, turn) in [
+        ("event thread.started", None),
+        ("event agent.thinking", Some(1)),
+        ("event agent.text delta", Some(1)),
+        ("event agent.text final", Some(1)),
+        ("event agent.tool_call", Some(1)),
+        ("event attention.raised permission", Some(1)),
+        ("event attention.raised question", Some(1)),
+        ("event attention.resolved by timeout", Some(1)),
+        ("event task.updated running", None),
+    ] {
+        cmds.extend(raw_frame(&mut ws, frame(name, turn, &same)).await);
+    }
+    assert_eq!(thread(&h)["session_id"], "sess-1");
+    assert_eq!(thread(&h)["background_task_count"], 1);
+    // The permission is open, the question timed out; the answer goes out to the runner.
+    let open: Vec<Value> = h
+        .hub()
+        .attention_list(false)
+        .into_iter()
+        .filter(|i| i["thread"] == t.as_str())
+        .collect();
+    assert_eq!(open.len(), 1, "{open:?}");
+    assert_eq!(open[0]["reason"], "permission", "{open:?}");
+    let attn = open[0]["attn_id"].as_str().unwrap().to_string();
+    h.sync(|hub| hub.respond(&attn, Answer::allow(), "test").unwrap());
+    let (cmd_id, op) = raw_cmd(&mut ws).await;
+    let Op::Respond {
+        attn_id, run: r, ..
+    } = &op
+    else {
+        panic!("not the answer: {op:?}")
+    };
+    assert_eq!(
+        (attn_id.as_str(), r.as_deref()),
+        ("toolu_01", Some(run.as_str()))
+    );
+    cmds.push((cmd_id.clone(), op.clone()));
+    raw_ok(&mut ws, cmd_id).await;
+    for (name, turn) in [
+        ("event task.updated heartbeat", None),
+        ("event task.updated done", None),
+        ("event agent.tool_result", Some(1)),
+    ] {
+        cmds.extend(raw_frame(&mut ws, frame(name, turn, &same)).await);
+    }
+    // (Observed now: a report as old as the capture would be stale.)
+    let now = |v: &mut Value| v["at_ms"] = json!(chrono::Utc::now().timestamp_millis());
+    cmds.extend(raw_frame(&mut ws, frame("event runtime.limits", None, &now)).await);
+    cmds.extend(raw_frame(&mut ws, frame("event turn.ended completed", Some(1), &same)).await);
+    assert_eq!(thread(&h)["background_task_count"], 0);
+    // A turn of the runtime's own, and a resume's start (replayed).
+    for (name, turn) in [
+        ("event turn.started by the runtime", None),
+        ("event turn.ended of a runtime turn", None),
+    ] {
+        cmds.extend(raw_frame(&mut ws, frame(name, turn, &same)).await);
+    }
+    let resumed = |v: &mut Value| v["body"]["data"]["session_id"] = json!("sess-2");
+    cmds.extend(raw_frame(&mut ws, frame("event thread.resumed", None, &resumed)).await);
+    assert_eq!(thread(&h)["session_id"], "sess-2");
+
+    let evs = log(h.hub(), &t);
+    let of_turn = |n: u64| -> Vec<String> {
+        evs.iter()
+            .filter(|e| e.turn == Some(n))
+            .map(|e| e.kind().to_string())
+            .collect()
+    };
+    assert_eq!(
+        of_turn(1),
+        [
+            "turn.started",
+            "agent.thinking",
+            "agent.text",
+            "agent.text",
+            "agent.tool_call",
+            "attention.raised",
+            "attention.raised",
+            "attention.resolved",
+            "attention.resolved",
+            "agent.tool_result",
+            "turn.ended",
+            // The hub's reactions to the turn's end.
+            "decision.made",
+            "report.ready",
+        ],
+        "{:?}",
+        kinds(&evs)
+    );
+    let ended = evs
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::TurnEnded(p) if e.turn == Some(1) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(ended.result, TurnResult::Completed);
+    let usage = ended.usage.expect("the turn's usage");
+    assert_eq!((usage.input, usage.output), (1200, 340));
+    assert_eq!(
+        of_turn(2),
+        [
+            "turn.started",
+            "turn.ended",
+            "decision.made",
+            "report.ready"
+        ],
+        "{:?}",
+        kinds(&evs)
+    );
+    assert_eq!(count(&evs, "task.updated"), 3);
+    assert_eq!(count(&evs, "thread.resumed"), 1);
+    // The usage report went to the account's usage, not the thread (its 5-hour window, whose
+    // reset time is the capture's, is over).
+    let usage = h.hub().usage();
+    let fake = &usage["runtimes"][0];
+    assert_eq!(
+        (
+            &fake["runtime"],
+            &fake["plan"],
+            &fake["windows"][0]["window"]
+        ),
+        (&json!("fake"), &json!("max"), &json!("7d")),
+        "{usage}"
+    );
+    assert_eq!(fake["windows"][0]["used_pct"], 3.0, "{usage}");
+    // Nothing but the session's own commands went out; the prompt still waits.
+    assert!(cmds.iter().all(|(_, op)| op.drain_safe()), "{cmds:?}");
+    assert_eq!(thread(&h)["pending"], 1, "{}", thread(&h));
+    assert_eq!(count(&evs, "thread.crashed"), 0);
+    assert!(stop_reasons(h.hub(), &t).is_empty());
+
+    // The runner of the hub's protocol ends the drain: the prompt goes out.
+    drop(ws);
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.running = running();
+    hi.acks_needed = [(t.clone(), rseq)].into();
+    raw_hello(&mut ws, hi).await;
+    let Some(HubMsg::Welcome { .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    let (_, op) = raw_cmd(&mut ws).await;
+    assert!(
+        matches!(&op, Op::Send { text, .. } if text.contains("after the update")),
+        "{op:?}"
+    );
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(
+        (&b["state"], &b["drain"]),
+        (&json!("online"), &Value::Null),
+        "{b}"
+    );
+    h.shutdown().await;
+}
+
+/// A raw runner of older protocol `protocol` online (synced, nothing running), its connection.
+async fn raw_online_as(h: &TestHub, protocol: u32) -> RawWs {
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.protocol = Some(protocol);
+    raw_hello(&mut ws, hi).await;
+    let Some(HubMsg::Welcome { .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    ws
+}
+
+/// A runner of an older protocol that connects again, fencing the previous one, finds the
+/// box's drain as it was (since, deadline and stage: the token box's runner, which ran
+/// nothing, is `drained`, waiting to be updated); a runner of the hub's protocol that
+/// replaces it ends the drain once reconciled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_drain_outlives_its_runners_connections_until_a_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = hub_opts(dir.path(), config(None));
+    opts.box_switch.legacy_check = Duration::from_millis(50);
+    let h = TestHub::start_opts(opts).await;
+    let drain = |h: &TestHub| h.hub().info()["boxes"][0]["drain"].clone();
+    let _first = raw_online_as(&h, drainable_older()).await;
+    h.online().await;
+    wait_for("the box drained", || drain(&h)["stage"] == "drained").await;
+    let before = drain(&h);
+    let epoch = h.hub().info()["boxes"][0]["epoch"].as_u64().unwrap();
+    let _second = raw_online_as(&h, drainable_older()).await;
+    wait_for("the second connection online", || {
+        h.hub().info()["boxes"][0]["epoch"].as_u64() > Some(epoch) && h.hub().boxes()[0].1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(drain(&h), before);
+    assert_eq!(h.hub().info()["boxes"][0]["state"], "switching");
+    let _current = raw_online(&h, Vec::new()).await;
+    wait_for("the drain over", || {
+        let b = h.hub().info()["boxes"][0].clone();
+        b["drain"].is_null() && b["state"] == "online"
+    })
+    .await;
+    h.shutdown().await;
+}
+
+/// The reasons (`ext.twr.reason`, `None` for none) of `thread`'s `thread.stopped` events.
+fn stop_reasons(hub: &Hub, thread: &str) -> Vec<Option<String>> {
+    log(hub, thread)
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::ThreadStopped(p) => Some(
+                p.ext
+                    .as_ref()
+                    .and_then(|x| x.get("twr")?.get("reason")?.as_str())
+                    .map(str::to_string),
+            ),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `thread.new` on the box, refused `box_offline`: its message.
+async fn new_thread_refused(h: &TestHub, dir: &Path) -> String {
+    let req = NewThread {
+        project: project(dir).to_string_lossy().into_owned(),
+        runtime: Some("fake".into()),
+        name: Some("late".into()),
+        box_name: Some(BOX.into()),
+        ..Default::default()
+    };
+    let e = h
+        .run(|hub| async move { hub.new_thread(req, "test").await })
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BOX_OFFLINE, "{}", e.message);
+    e.message
+}
+
+/// A token box's real runner across a hub upgrade over a protocol bump: the new hub drains
+/// the runner of the older protocol (it keeps running both threads' runtimes). The box shows
+/// `switching` with its drain while online; a prompt to the idle thread waits, a new thread
+/// is refused saying to wait for `drained`, and the turn waiting on a permission goes on: the
+/// answer reaches the runtime and the turn ends. Then both runtimes stop for the upgrade (no
+/// crash, no error item) and the runner stays connected, `drained`, gated, a new thread
+/// refused saying to update it. Restarted at the hub's protocol (updated), it ends the drain:
+/// the queued prompt runs on the thread's resumed session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_runner_of_an_older_protocol_is_drained_until_it_is_updated() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let proxy = Proxy::start(&h.url).await;
+    let rdir = dir.path().join("r");
+    let opts = runner_opts(&proxy.url, &rdir);
+    let speaks = Arc::clone(&opts.hello_protocol);
+    let runner = Runner::start(opts, open_box(&rdir));
+    h.online().await;
+    let asks = h.new_thread(&project(dir.path()), "asks").await;
+    let idle = h.new_thread(&project(dir.path()), "idle").await;
+    let mut sub = h.hub().subscribe_thread(&idle, 0).unwrap();
+    h.send(&idle, "hello");
+    until(&mut sub, |e| e.kind() == "report.ready").await;
+    drop(sub);
+    let mut sub = h.hub().subscribe_thread(&asks, 0).unwrap();
+    h.send(&asks, "!perm Bash rm -rf build");
+    until(&mut sub, |e| e.kind() == "attention.raised").await;
+    drop(sub);
+    h.shutdown().await;
+
+    // The upgraded hub: the runner (the same process, its runtimes alive) speaks the older
+    // protocol from its next connection on.
+    let old = drainable_older();
+    speaks.store(old, SeqCst);
+    let mut opts = hub_opts(dir.path(), config(None));
+    opts.box_switch.legacy_check = Duration::from_millis(50);
+    let h = TestHub::start_opts(opts).await;
+    proxy.st().upstream = h.url.clone();
+    h.online().await;
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(
+        (&b["state"], &b["online"], &b["drain"]["protocol"]),
+        (&json!("switching"), &json!(true), &json!(old)),
+        "{b}"
+    );
+    assert_eq!(b["drain"]["stage"], "draining", "{b}");
+    let session = |t: &str| h.hub().get_thread(t).unwrap()["session_id"].clone();
+    let idle_session = session(&idle);
+    let s = h.sync(|hub| {
+        hub.send(
+            &idle,
+            "after the update",
+            TurnFrom::User,
+            Source::User("test".into()),
+        )
+        .unwrap()
+    });
+    assert_eq!((s.turn, s.pending), (None, 1), "{s:?}");
+    let why = new_thread_refused(&h, dir.path()).await;
+    assert!(
+        why.contains(&format!(
+            "runs an older twr (runner protocol {old}; the hub speaks {PROTOCOL_VERSION}): its \
+             running turns finish, then its agents stop; once `twr box status {BOX}` says \
+             drained, update twr on the box and restart its runner"
+        )),
+        "{why}"
+    );
+    // The permission is answered: the turn ends.
+    let attn = h
+        .hub()
+        .attention_list(false)
+        .into_iter()
+        .find(|i| i["thread"] == asks.as_str())
+        .expect("the permission")["attn_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    h.sync(|hub| hub.respond(&attn, Answer::allow(), "test").unwrap());
+    let mut sub = h.hub().subscribe_thread(&asks, 0).unwrap();
+    until(&mut sub, |e| {
+        e.kind() == "report.ready" && e.turn == Some(1)
+    })
+    .await;
+    drop(sub);
+
+    // Drained: both runtimes stopped for the upgrade, the runner still connected and gated.
+    wait_for("the box drained", || {
+        h.hub().info()["boxes"][0]["drain"]["stage"] == "drained"
+    })
+    .await;
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(
+        (&b["state"], &b["online"]),
+        (&json!("switching"), &json!(true)),
+        "{b}"
+    );
+    for t in [&asks, &idle] {
+        let all = log(h.hub(), t);
+        assert_eq!(
+            stop_reasons(h.hub(), t),
+            [Some(BOX_UPGRADE_REASON.to_string())],
+            "{t}: {:?}",
+            kinds(&all)
+        );
+        assert_eq!(count(&all, "thread.crashed"), 0, "{t}");
+        assert_eq!(h.hub().get_thread(t).unwrap()["stopped"], false, "{t}");
+    }
+    assert!(log(h.hub(), &asks).iter().all(|e| !matches!(
+        &e.body,
+        EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error
+    )));
+    let why = new_thread_refused(&h, dir.path()).await;
+    assert!(
+        why.contains(&format!(
+            "runs an older twr (runner protocol {old}; the hub speaks {PROTOCOL_VERSION}): its \
+             agents were stopped; update twr on the box and restart its runner"
+        )),
+        "{why}"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.hub().get_thread(&idle).unwrap()["pending"], 1);
+    assert_eq!(h.hub().info()["boxes"][0]["drain"]["stage"], "drained");
+
+    // The runner, updated, is restarted: the drain is over and the queued prompt runs on the
+    // resumed session.
+    runner.shutdown().await;
+    let opts = runner_opts(&proxy.url, &rdir);
+    let runner = Runner::start(opts, open_box(&rdir));
+    let mut sub = h.hub().subscribe_thread(&idle, 0).unwrap();
+    until(&mut sub, |e| {
+        e.kind() == "report.ready" && e.turn == Some(2)
+    })
+    .await;
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(
+        (&b["state"], &b["drain"]),
+        (&json!("online"), &Value::Null),
+        "{b}"
+    );
+    assert_eq!(session(&idle), idle_session);
+    let all = log(h.hub(), &idle);
+    let resumed: Vec<bool> = all
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::ThreadStarted(p) => {
+                Some(p.ext.as_ref().is_some_and(|x| x["fake"]["resumed"] == true))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(resumed, [false, true], "{:?}", kinds(&all));
+    assert_eq!(count(&all, "thread.crashed"), 0, "{:?}", kinds(&all));
     runner.shutdown().await;
     h.shutdown().await;
 }
@@ -5711,6 +6265,49 @@ async fn raw_online_with(h: &TestHub, token: &str) -> RawWs {
 async fn box_token(h: &TestHub, caller: Caller) -> Result<Value, twr_core::proto::RpcError> {
     h.run(|hub| async move { hub.box_token(BOX, &caller).await })
         .await
+}
+
+/// A revocation while the box's runner of an older protocol is drained still revokes: its
+/// connection is dropped at once (the box offline, still gated), and a runner with that token,
+/// of either protocol, is refused from then on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revocation_during_a_drain_revokes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (h, boxes_file) = hub_with_boxes_file(dir.path(), TOKEN).await;
+    let mut ws = raw_online_as(&h, drainable_older()).await;
+    h.online().await;
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(b["state"], "switching", "{b}");
+    assert!(b["drain"].is_object(), "{b}");
+    std::fs::write(&boxes_file, "").unwrap();
+    let v = box_token(&h, Caller::user("test")).await.unwrap();
+    assert_eq!(v, json!({"box": BOX, "changed": true, "accepting": false}));
+    assert!(!h.hub().boxes()[0].1, "offline at once");
+    // (Its connection closes.)
+    while raw_next(&mut ws).await.is_some() {}
+    let b = h.hub().info()["boxes"][0].clone();
+    assert_eq!(b["state"], "offline", "{b}");
+    assert!(b["drain"].is_object(), "{b}");
+    for protocol in [drainable_older(), PROTOCOL_VERSION] {
+        let mut ws = raw(&h.url).await;
+        let (nonce, m) = raw_hello_only(&mut ws, BOX, protocol).await;
+        let Some(HubMsg::Challenge {
+            nonce: hub,
+            proof: _,
+        }) = m
+        else {
+            panic!("no challenge: {m:?}")
+        };
+        let mine = auth_proof(&Secret::new(TOKEN), Prover::Runner, BOX, &nonce, &hub);
+        raw_send(&mut ws, &RunnerMsg::Auth { proof: mine }).await;
+        let m = raw_expect(&mut ws).await;
+        assert!(
+            matches!(&m, Some(HubMsg::Error { code, .. }) if code == hub_errors::UNAUTHORIZED),
+            "{m:?}"
+        );
+    }
+    assert!(!h.hub().boxes()[0].1);
+    h.shutdown().await;
 }
 
 /// A rotated token is taken live: `box.token` after the files changed drops the box's runner

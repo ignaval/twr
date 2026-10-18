@@ -500,6 +500,7 @@ impl Core {
             items_restored: HashMap::new(),
             online_boxes: HashSet::new(),
             switching_boxes: HashSet::new(),
+            draining_boxes: HashMap::new(),
             defer_ack_sync: false,
         };
         // Reducers fold hydrated payloads: control kinds, agent text whose end the thread's

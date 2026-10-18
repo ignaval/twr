@@ -1,0 +1,267 @@
+{
+  "accepted": [
+    {
+      "frame": {
+        "nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f000112233445566778899aabbccddeeff",
+        "proof": "3c5da0337b61ca60ddf4feb6bb294479b16c2308094cf65466ddf9d5fc0fdbe0",
+        "type": "challenge"
+      },
+      "name": "challenge"
+    },
+    {
+      "frame": {
+        "type": "authenticated"
+      },
+      "name": "authenticated"
+    },
+    {
+      "frame": {
+        "epoch": 3,
+        "type": "welcome",
+        "watermarks": {
+          "t1": 5,
+          "t2": 1
+        }
+      },
+      "name": "welcome"
+    },
+    {
+      "frame": {
+        "epoch": 1,
+        "type": "welcome",
+        "watermarks": {}
+      },
+      "name": "welcome without watermarks"
+    },
+    {
+      "frame": {
+        "rseq": 6,
+        "thread": "t1",
+        "type": "ack"
+      },
+      "name": "ack"
+    },
+    {
+      "frame": {
+        "code": "unauthorized",
+        "message": "the box's token was revoked",
+        "type": "error"
+      },
+      "name": "error unauthorized"
+    },
+    {
+      "frame": {
+        "code": "protocol",
+        "message": "the answer to the challenge must be auth",
+        "type": "error"
+      },
+      "name": "error protocol"
+    },
+    {
+      "frame": {
+        "code": "fenced",
+        "message": "a newer connection of box gpu replaced this one",
+        "type": "error"
+      },
+      "name": "error fenced"
+    },
+    {
+      "frame": {
+        "code": "exhausted",
+        "message": "no more connection epochs",
+        "type": "error"
+      },
+      "name": "error exhausted"
+    },
+    {
+      "frame": {
+        "code": "fenced",
+        "message": "",
+        "type": "error"
+      },
+      "name": "error without message"
+    },
+    {
+      "frame": {
+        "type": "ping"
+      },
+      "name": "ping"
+    },
+    {
+      "frame": {
+        "type": "pong"
+      },
+      "name": "pong"
+    },
+    {
+      "frame": {
+        "cmd_id": "send:t1:3",
+        "op": {
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "text": "Now run the tests.\nThen commit.",
+          "thread": "t1",
+          "turn": 3,
+          "type": "send"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd send"
+    },
+    {
+      "frame": {
+        "cmd_id": "send:t1:4",
+        "op": {
+          "text": "go on",
+          "thread": "t1",
+          "turn": 4,
+          "type": "send"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd send without run"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "allow"
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond allow"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "deny",
+            "message": "Not on main; use a branch."
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond deny with message"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "Yes, and don't ask again this session"
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond option"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "Cancel"
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond cancel"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "",
+            "message": "Use the staging database."
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond free text"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:2:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "answers": {
+              "Migrate now?": "Yes",
+              "Which database?": "Postgres"
+            },
+            "decision": "allow"
+          },
+          "attn_id": "toolu_01",
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond answers"
+    },
+    {
+      "frame": {
+        "cmd_id": "respond:01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "answer": {
+            "decision": "allow"
+          },
+          "attn_id": "toolu_01",
+          "thread": "t1",
+          "type": "respond"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd respond without run"
+    },
+    {
+      "frame": {
+        "cmd_id": "stop:t1:2",
+        "op": {
+          "run": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+          "thread": "t1",
+          "type": "stop"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd stop"
+    },
+    {
+      "frame": {
+        "cmd_id": "01JZ8Q7W5M3K2N1P0R9S8T7V6X",
+        "op": {
+          "thread": "t1",
+          "type": "stop"
+        },
+        "type": "cmd"
+      },
+      "name": "cmd stop without run"
+    }
+  ],
+  "protocol": 7,
+  "revision": "daa8f4226cb7dca9b90337236f31d1722761ced5",
+  "what": "values the hub sends a drained runner, each decoded and encoded back unchanged by this revision"
+}

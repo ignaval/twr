@@ -124,6 +124,7 @@ mod context;
 pub use context::OPEN_FLAGS as OPEN_NOFOLLOW_NONBLOCK;
 mod delete;
 mod disk;
+mod drain;
 mod find_project;
 mod git;
 mod handoff;
@@ -1306,6 +1307,10 @@ struct Core {
     /// threads take no turn and start no runtime until the box's next connection is
     /// reconciled. Memory only.
     switching_boxes: HashSet<String>,
+    /// Boxes whose runner speaks an older runner protocol that the hub drains (`hub::drain`),
+    /// with how far the drain is: their threads take no turn and start no runtime until a
+    /// connection of the hub's protocol is reconciled. Memory only.
+    draining_boxes: HashMap<String, drain::Drain>,
     /// Runner frames are being committed without a sync each: their connection syncs the
     /// batch before acking it (`hub::runners`, [`store::AppendBatch::defer_sync`]).
     defer_ack_sync: bool,
@@ -1611,10 +1616,16 @@ impl Core {
     }
 
     /// `box_offline` unless the thread's box is online ([`Core::box_online`]) and not being
-    /// switched to another build ([`Core::refuse_switching_box`]).
+    /// switched to another build or drained ([`Core::refuse_switching_box`]).
     fn require_box(&self, view: &ThreadView) -> Result<(), RpcError> {
+        self.require_online(view)?;
+        self.refuse_switching_box(&view.box_name)
+    }
+
+    /// `box_offline` unless the thread's box is online ([`Core::box_online`]).
+    fn require_online(&self, view: &ThreadView) -> Result<(), RpcError> {
         if self.box_online(&view.box_name) {
-            self.refuse_switching_box(&view.box_name)
+            Ok(())
         } else {
             Err(rpc(
                 codes::BOX_OFFLINE,
@@ -1623,6 +1634,19 @@ impl Core {
                     view.box_name, view.name
                 ),
             ))
+        }
+    }
+
+    /// [`Core::require_box`] for an answer to a runtime on the thread's box: a box being
+    /// drained takes it while its running turns may still finish (`hub::drain`), so a turn
+    /// that waits on a permission can end.
+    fn require_box_for_answer(&self, view: &ThreadView) -> Result<(), RpcError> {
+        self.require_online(view)?;
+        match self.draining_boxes.get(&view.box_name) {
+            Some(d) if d.takes_answers() && !self.switching_boxes.contains(&view.box_name) => {
+                Ok(())
+            }
+            _ => self.refuse_switching_box(&view.box_name),
         }
     }
 
@@ -1644,9 +1668,12 @@ impl Core {
     /// a park, resume, deletion or restore) would fail when the box's session closes. An
     /// operation that awaits the box after this check holds [`Core::reserve_box`]'s guard
     /// instead (one that records its own state in the same step, such as a park, resume,
-    /// deletion or attach lease, is counted by that).
+    /// deletion or attach lease, is counted by that). The same while box `name` is drained
+    /// (`hub::drain`): its runner speaks an older protocol, and gets nothing new.
     fn refuse_switching_box(&self, name: &str) -> Result<(), RpcError> {
-        if self.switching_boxes.contains(name) {
+        if let Some(d) = self.draining_boxes.get(name) {
+            Err(rpc(codes::BOX_OFFLINE, d.refusal(name)))
+        } else if self.switching_boxes.contains(name) {
             Err(rpc(
                 codes::BOX_OFFLINE,
                 format!("box {name:?} is switching to the hub's twr build: try again in a minute"),
@@ -1671,9 +1698,20 @@ impl Core {
 
     /// Whether `thread` can take a new turn now: the hub is not shutting down, no turn is
     /// open, it is not attached (or being attached), parked or resumed, its box is online and
-    /// not being switched to another build, its runtime is not exiting or being stopped, and
-    /// no answer to its remote runtime awaits the box's acknowledgement.
+    /// neither being switched to another build nor drained, its runtime is not exiting or being
+    /// stopped, and no answer to its remote runtime awaits the box's acknowledgement.
     fn thread_free(&self, thread: &str) -> bool {
+        self.thread_free_but_drain(thread)
+            && self
+                .registry
+                .get(thread)
+                .is_some_and(|v| !self.draining_boxes.contains_key(&v.box_name))
+    }
+
+    /// [`Core::thread_free`] but for the gate of a box being drained (`hub::drain`): what a
+    /// settings restart waits for ([`Core::dispatch_next`]), so that a narrowed permission
+    /// mode stops the runtime of a drained box as anywhere else.
+    fn thread_free_but_drain(&self, thread: &str) -> bool {
         if self.shutting_down {
             return false;
         }
@@ -1692,8 +1730,8 @@ impl Core {
             return false;
         }
         // A remote box's threads wait (prompts stay queued) while it is offline, or while it
-        // is being switched to another build (`hub::box_switch`); its reconnection dispatches
-        // them (`hub::runners`).
+        // is being switched to another build (`hub::box_switch`) or drained (`hub::drain`,
+        // in `Core::thread_free`); its reconnection dispatches them (`hub::runners`).
         if !self.box_online(&view.box_name) || self.switching_boxes.contains(&view.box_name) {
             return false;
         }
@@ -1782,7 +1820,7 @@ impl Core {
         hub: &Arc<Inner>,
         thread: &str,
     ) -> anyhow::Result<Option<(u64, Option<i64>)>> {
-        if !self.thread_free(thread) {
+        if !self.thread_free_but_drain(thread) {
             self.hold_for_reap(thread, AfterReap::Dispatch);
             return Ok(None);
         }
@@ -1794,8 +1832,13 @@ impl Core {
         // A live runtime started in another permission mode, model or effort than the
         // thread's now: it is restarted on its session before anything else runs
         // (`hub::restart`); its exit dispatches again. While an item it raised between turns
-        // defers that, nothing runs in the old settings.
+        // defers that, nothing runs in the old settings. On a box being drained too (its
+        // `stop` is drain-safe), so a narrowed mode takes effect there as anywhere.
         if self.restart_for_settings(hub, thread)? {
+            return Ok(None);
+        }
+        // Nothing else runs on a box being drained (`hub::drain`).
+        if !self.thread_free(thread) {
             return Ok(None);
         }
         if let Some(turn) = self.start_retry(hub, thread)? {
@@ -2220,6 +2263,9 @@ impl Hub {
             "build": build,
             // The runner protocol its boxes' runners must speak (`twr box doctor` compares).
             "runner_protocol": twr_core::runner::PROTOCOL_VERSION,
+            // The older runner protocols it drains (`hub::drain`): such a box is replaced once
+            // its running turns are over.
+            "drainable_protocols": twr_core::runner::DRAINABLE_PROTOCOLS,
             // Its runner listener is up: a token box's runner can connect (`twr box doctor`).
             "listening": self.inner.listening.load(std::sync::atomic::Ordering::Relaxed),
             "pid": std::process::id(),

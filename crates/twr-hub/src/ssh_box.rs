@@ -43,10 +43,12 @@
 //! 5. When the session ends: the ssh child is killed (its whole process group), and the next
 //!    attempt follows a backoff ([`backoff_delay`]: 1 s doubling, at most 5 s apart during the
 //!    first minute of an outage, then at most 30 s; reset by a welcomed session, as a token
-//!    runner's). A daemon that speaks another runner protocol was refused at its hello: the
-//!    next attempt passes `--replace` at once, so the relay replaces it with the build the hub
-//!    launches. Its runtimes end with it, and the hub cannot tell what they were doing, so it
-//!    first records every runtime the log shows on the box as stopped for the switch and sets
+//!    runner's). A daemon that speaks a runner protocol the hub can still drain is served
+//!    drain-only and replaced once drained (below, "Draining an older daemon"). One that speaks
+//!    another runner protocol was refused at its hello: the next attempt passes `--replace` at
+//!    once, so the relay replaces it with the build the hub launches. Its runtimes end with
+//!    it, and the hub cannot tell what they were doing, so it first records every runtime the
+//!    log shows on the box as stopped for the switch and sets
 //!    the box's `switching` gate (`Hub::begin_blind_box_switch`, `hub::box_switch`; the notes
 //!    say so): the exits the new daemon replays, and the reconciliation for a runtime it has
 //!    nothing of, close their threads as `thread.stopped` with `ext.twr.reason` =
@@ -104,6 +106,29 @@
 //! runtimes' exits close their threads as plainly stopped (no crash card; their queues are
 //! kept and dispatched), and the new hub's supervisor finds the box `switch_pending` again.
 //!
+//! **Draining an older daemon** (its runner protocol is one the hub still drains,
+//! [`twr_core::runner::DRAINABLE_PROTOCOLS`]; the hub's part is `hub::drain`): the session is
+//! served drain-only. The box is gated as for a switch while its running turns finish and
+//! stream, and answers to them go through; it is not `switch_pending` and no switch runs (old
+//! builds are still pruned). Once the box is idle, or after [`SwitchTiming::legacy_wait`] (30
+//! minutes), the hub stops its runtimes for the upgrade (`box_upgrade`, as a switch does), waits
+//! for their exits (at most [`SwitchTiming::drain`]), tells the supervisor
+//! ([`SshBox::drained`]) and ends the session; the next attempt replaces the daemon at once
+//! (`--replace`), and the next connection's reconciliation ends the drain. When the drained
+//! daemon runs the build launched (a box of another OS or CPU whose configured build is old),
+//! there is nothing newer to start: the box is `needs_install`, and that build is not launched
+//! again until `twr box install` records another one or the hub restarts; the daemon found
+//! then is drained in one check (it runs nothing) and replaced. A replace that does not take
+//! (the next session reaches the same older daemon) is not asked for again: the box stays
+//! gated, its last error says to run `twr box restart`. A daemon that does not get ready (its
+//! connection does not sync within [`SwitchTiming::legacy_sync`], three times, or the deadline
+//! passes first) is replaced as one the hub cannot serve, its runtimes recorded as stopped for
+//! the upgrade first ([`SshBox::force_replace`]; each attempt asks for the replace until a
+//! daemon of the hub's protocol answers). When it runs the build launched, no replace takes
+//! (the relay keeps a daemon of its own build): the next session that reaches it ends
+//! `needs_install`, as above, and the first attempt after `twr box install` replaces it. The
+//! notes say each step.
+//!
 //! **Restarting the daemon** (`box.restart`, `twr box restart`: after someone logged in at a
 //! Mac's screen, say, so that a new daemon starts in the GUI session): the hub asks for a
 //! restart ([`SshBox::request_restart`], counted) and wakes the supervisor. A welcomed session
@@ -115,7 +140,11 @@
 //! asked for during it is carried out by the next. Nothing races the supervisor: the restart
 //! is its own next connection. The daemon's runtimes end with it, as with any runner restart:
 //! the reconciliation of the next connection closes the threads whose runtime is gone as
-//! crashed (`hub::runners`), and each one's next prompt resumes its session. `hub.info` shows the box's `restart_pending` until then, and its
+//! crashed (`hub::runners`), and each one's next prompt resumes its session. During a drain
+//! (above) a restart cuts it short instead: the hub stops the box's runtimes for the upgrade at
+//! once (running turns cut), and the drain ends the session once they have exited (or at once,
+//! the stops only recorded, when the box is not ready); the next attempt restarts the daemon,
+//! and no thread crashes. `hub.info` shows the box's `restart_pending` until then, and its
 //! connection's `epoch`, which the next connection makes larger.
 //!
 //! **ssh** ([`ssh_args`]): `TWR_SSH`, else `ssh` on `PATH`, with the hub's environment (its
@@ -147,7 +176,8 @@
 //!
 //! **State** ([`Status`], `hub.info` `boxes[]`): `connecting` (probing, installing, opening,
 //! or connected and not ready yet), `online` (the box is ready) and `switching` (its gate is
-//! set): the hub's, not this module's, to say; `offline` (between attempts), `needs_install`,
+//! set, by a switch or a drain, unless the box is offline `needs_install` or `error`): the
+//! hub's, not this module's, to say; `offline` (between attempts), `needs_install`,
 //! `error` (the hub's box key cannot be loaded: every SSH box shows it); with the last error,
 //! the notes, the box's OS and CPU, the build launched and `switch_pending`.
 //!
@@ -277,8 +307,21 @@ pub const SWITCH_DRAIN: Duration = Duration::from_secs(120);
 /// How often the exits of the runtimes a switch stopped are looked for.
 const DRAIN_POLL: Duration = Duration::from_millis(250);
 
-/// When a box whose daemon runs another build than the one launched is switched to it (see
-/// the module docs; [`crate::HubOptions::box_switch`]).
+/// How often a box whose runner speaks an older protocol is checked for whether its running
+/// turns are over (`hub::drain`).
+pub const LEGACY_CHECK: Duration = Duration::from_secs(5);
+
+/// How long the running turns of a box whose runner speaks an older protocol may go on
+/// before they are cut (`hub::drain`).
+pub const LEGACY_WAIT: Duration = Duration::from_secs(30 * 60);
+
+/// How long a connection of a runner of an older protocol may take to sync before it is
+/// closed (`hub::drain`).
+pub const LEGACY_SYNC: Duration = Duration::from_secs(120);
+
+/// When a box whose daemon runs another build than the one launched is switched to it, and
+/// how a box whose runner speaks an older protocol is drained (see the module docs;
+/// [`crate::HubOptions::box_switch`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SwitchTiming {
     /// How long the box must have been quiet ([`SWITCH_QUIET`]).
@@ -287,6 +330,12 @@ pub struct SwitchTiming {
     pub check: Duration,
     /// Longest wait for the stopped runtimes' exits ([`SWITCH_DRAIN`]).
     pub drain: Duration,
+    /// How often a drained box is looked at ([`LEGACY_CHECK`]).
+    pub legacy_check: Duration,
+    /// How long a drained box's running turns may go on ([`LEGACY_WAIT`]).
+    pub legacy_wait: Duration,
+    /// How long a connection of an older protocol may take to sync ([`LEGACY_SYNC`]).
+    pub legacy_sync: Duration,
 }
 
 impl Default for SwitchTiming {
@@ -295,6 +344,9 @@ impl Default for SwitchTiming {
             quiet: SWITCH_QUIET,
             check: SWITCH_CHECK,
             drain: SWITCH_DRAIN,
+            legacy_check: LEGACY_CHECK,
+            legacy_wait: LEGACY_WAIT,
+            legacy_sync: LEGACY_SYNC,
         }
     }
 }
@@ -1715,6 +1767,21 @@ pub struct SshBox {
     /// them a connection has carried out (see the module docs).
     restarts: watch::Sender<u64>,
     restarted: Mutex<u64>,
+    /// A drain stopped the box's runtimes on the daemon of this build (none: its inventory
+    /// named none), which speaks this protocol: the session's end replaces it
+    /// ([`SshBox::drained`]; see the module docs, "Draining an older daemon").
+    drain_switch: Mutex<Option<(Option<String>, u32)>>,
+    /// The hub asks for the daemon to be replaced ([`SshBox::force_replace`]): each attempt
+    /// does, until a session of the hub's protocol is welcomed.
+    replace_asked: AtomicBool,
+    /// The build of a drained daemon that is the one launched (a box of another OS or CPU),
+    /// and its protocol: not dialed again while it stays the one launched (until the hub
+    /// restarts).
+    drained_build: Mutex<Option<(String, u32)>>,
+    /// The daemon build a drain asked to replace, until the next welcomed session says whether
+    /// that took; and one whose replace did not take (not asked again while it runs).
+    drain_replaced: Mutex<Option<String>>,
+    drain_failed: Mutex<Option<String>>,
 }
 
 impl std::fmt::Debug for SshBox {
@@ -1738,6 +1805,11 @@ impl SshBox {
             failed_switch: Mutex::default(),
             restarts: watch::Sender::new(0),
             restarted: Mutex::default(),
+            drain_switch: Mutex::default(),
+            replace_asked: AtomicBool::new(false),
+            drained_build: Mutex::default(),
+            drain_replaced: Mutex::default(),
+            drain_failed: Mutex::default(),
         }
     }
 
@@ -1771,7 +1843,7 @@ impl SshBox {
     }
 
     /// The restarts asked for so far, when a connection has not carried them all out.
-    fn restart_wanted(&self) -> Option<u64> {
+    pub(crate) fn restart_wanted(&self) -> Option<u64> {
         let asked = *self.restarts.borrow();
         (asked > self.restarts_done()).then_some(asked)
     }
@@ -1869,6 +1941,99 @@ impl SshBox {
         self.st().last_error = Some(why);
     }
 
+    /// A drain stopped the box's runtimes on its daemon, of build `build` and runner protocol
+    /// `protocol`, and they have exited (`hub::drain`): the end of the session, which the hub
+    /// asks for next, replaces that daemon (see the module docs, "Draining an older daemon").
+    /// False, and nothing asked for, when a drain's replace of that build did not take before
+    /// ([`SshBox::check_drain_replace`]).
+    pub(crate) fn drained(&self, build: Option<String>, protocol: u32) -> bool {
+        let failed = self.drain_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if build.is_some() && *failed == build {
+            return false;
+        }
+        drop(failed);
+        *self
+            .drain_replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = build.clone();
+        *self.drain_switch.lock().unwrap_or_else(|e| e.into_inner()) = Some((build, protocol));
+        true
+    }
+
+    /// The hub asks for the box's daemon to be replaced (`hub::drain`: one of an older protocol
+    /// that does not get ready), and wakes the supervisor. Each attempt replaces it until a
+    /// daemon of the hub's protocol answers; a session that reaches an older daemon of the build
+    /// launched ends `needs_install` instead (see the module docs, "Draining an older daemon").
+    pub(crate) fn force_replace(&self) {
+        self.replace_asked.store(true, Ordering::Relaxed);
+        self.wake();
+    }
+
+    /// What [`SshBox::drained`] asked for, taken.
+    pub(crate) fn take_drain_switch(&self) -> Option<(Option<String>, u32)> {
+        self.drain_switch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// Whether [`SshBox::force_replace`] asked for a replace (still wanted).
+    fn replace_wanted(&self) -> bool {
+        self.replace_asked.load(Ordering::Relaxed)
+    }
+
+    /// Whether [`SshBox::force_replace`] asked for a replace, taken.
+    pub(crate) fn take_replace_asked(&self) -> bool {
+        self.replace_asked.swap(false, Ordering::Relaxed)
+    }
+
+    /// A session was welcomed with the daemon running `running`, of an older protocol
+    /// (`legacy`) or not: when a drain asked to replace the daemon before it, whether that
+    /// took. One that did not (the box still runs that older daemon) is made the box's last
+    /// error, and not asked for again for that build ([`SshBox::drained`]).
+    fn check_drain_replace(&self, running: Option<&str>, legacy: bool) {
+        let asked = self
+            .drain_replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(b) = asked.filter(|b| legacy && running == Some(b.as_str())) else {
+            return;
+        };
+        let why = format!(
+            "could not replace the box's older daemon (build {b}): run `twr box restart {}`",
+            self.name
+        );
+        tracing::warn!(box_name = %self.name, "{why}");
+        *self.drain_failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(b);
+        self.remark(why.clone());
+        self.st().last_error = Some(why);
+    }
+
+    /// The box needs this hub's build installed (see the module docs, "Draining an older
+    /// daemon"): its drained daemon of runner protocol `protocol` runs build `id`, the one
+    /// launched. Not dialed again while `id` is launched. Why, for the box's last error.
+    fn drained_needs_install(&self, id: &str, protocol: u32) -> String {
+        *self.drained_build.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((id.to_string(), protocol));
+        // (Nothing was replaced: the next session on that daemon is no replace that failed.)
+        *self
+            .drain_replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        needs_install_why(&self.name, protocol)
+    }
+
+    /// Why the box is not dialed when the build to launch is `id`: a drained daemon of it
+    /// needs this hub's build installed ([`SshBox::drained_needs_install`]).
+    fn drained_launch(&self, id: &str) -> Option<String> {
+        let drained = self.drained_build.lock().unwrap_or_else(|e| e.into_inner());
+        drained
+            .as_ref()
+            .filter(|(b, _)| b == id)
+            .map(|(_, p)| needs_install_why(&self.name, *p))
+    }
+
     /// Whether a switch from build `running` to build `to` did not take before
     /// ([`SshBox::check_switch`]).
     fn switch_failed(&self, running: Option<&str>, to: &str) -> bool {
@@ -1949,6 +2114,9 @@ async fn supervise(weak: WeakHub, rbox: RemoteBox, sbox: Arc<SshBox>) {
             let _ = state.wait_for(|s| *s == HubState::Stopped).await;
             return;
         }
+        // (A drain that falls back asks for a replace between attempts too, until a daemon of
+        // the hub's protocol answers.)
+        replace |= sbox.replace_wanted();
         let outcome = tokio::select! {
             o = attempt(&hub, &rbox, &sbox, replace) => o,
             _ = state.wait_for(|s| *s == HubState::Stopped) => return,
@@ -2027,6 +2195,15 @@ async fn attempt(hub: &Hub, rbox: &RemoteBox, sbox: &SshBox, replace: bool) -> A
         }
     };
     if let Some(dial) = hub.box_dialer() {
+        // (The configured build stands for the one the dialer launches; a restart asked for
+        // still goes.)
+        let drained = sbox
+            .configured_build()
+            .filter(|_| sbox.restart_wanted().is_none())
+            .and_then(|c| sbox.drained_launch(&c));
+        if let Some(why) = drained {
+            return Attempt::Failed(State::NeedsInstall, why);
+        }
         return dialed(hub, rbox, sbox, &key, dial, replace).await;
     }
     let probe = match probe(sbox).await {
@@ -2081,6 +2258,14 @@ async fn attempt(hub: &Hub, rbox: &RemoteBox, sbox: &SshBox, replace: bool) -> A
                      box install {name}`"
                 ),
             )
+        }
+        // A drained daemon of the build that would be launched: nothing newer to start (a
+        // restart asked for still goes).
+        BuildChoice::Configured(id) if sbox.restart_wanted().is_none() => {
+            if let Some(why) = sbox.drained_launch(&id) {
+                return Attempt::Failed(State::NeedsInstall, why);
+            }
+            (id, true)
         }
         BuildChoice::Configured(id) => (id, true),
         BuildChoice::Own(id) => {
@@ -2527,7 +2712,30 @@ fn after_session(
 ) -> Attempt {
     let name = sbox.name();
     let refused = end.protocol_refused;
-    let attempt = session_ended(name, id, end, hello, switched);
+    // A drain stopped the runtimes of this older daemon: it is replaced, unless it is the
+    // build launched (nothing newer to start: the box needs an install, and that build is not
+    // launched again meanwhile). (Only a legacy session's end: the drain asked it of that
+    // session, `hub::drain`.)
+    let drained = sbox.take_drain_switch().filter(|_| end.legacy.is_some());
+    // The same for an older daemon a drain asked to replace as one not ready
+    // (`SshBox::force_replace`): no replace takes on the build launched (the relay keeps a
+    // daemon of its own build). The request stays: the first attempt after an install
+    // replaces that daemon, whose runtimes' stops are recorded.
+    let forced = end.legacy.filter(|_| sbox.replace_wanted());
+    if let Some(protocol) = drained
+        .as_ref()
+        .map(|(_, p)| *p)
+        .or(forced)
+        .filter(|_| hello.build.as_deref() == Some(id))
+    {
+        let why = sbox.drained_needs_install(id, protocol);
+        hub.drain_needs_install(name);
+        return Attempt::Failed(State::NeedsInstall, why);
+    }
+    if drained.is_some() {
+        sbox.remark(format!("switching to build {id}"));
+    }
+    let attempt = session_ended(name, id, end, hello, switched || drained.is_some());
     if let (Some(p), Attempt::Session { replace: true, .. }) = (refused, &attempt) {
         let mut note = format!(
             "the box's daemon speaks runner protocol {p}, which this hub (protocol {}) cannot \
@@ -2574,19 +2782,22 @@ fn session_ended(
     } = end;
     if let Some(p) = protocol_refused {
         if hello.build.as_deref() == Some(id) {
-            return Attempt::Failed(
-                State::NeedsInstall,
-                format!(
-                    "box {name} runs a twr build that speaks protocol {p}, the hub {}: install \
-                     this hub's build there: `twr box install {name}`",
-                    twr_core::runner::PROTOCOL_VERSION
-                ),
-            );
+            return Attempt::Failed(State::NeedsInstall, needs_install_why(name, p));
         }
         tracing::warn!(box_name = %name, protocol = p, daemon = ?hello.build, launched = id, "the box's daemon speaks another runner protocol: replacing it");
     }
     let replace = switched || (protocol_refused.is_some() && hello.build.as_deref() != Some(id));
     Attempt::Session { welcomed, replace }
+}
+
+/// Why box `name` needs this hub's build installed: the build launched there speaks runner
+/// protocol `protocol`, not the hub's.
+fn needs_install_why(name: &str, protocol: u32) -> String {
+    format!(
+        "box {name} runs a twr build that speaks protocol {protocol}, the hub {}: install this \
+         hub's build there: `twr box install {name}`",
+        twr_core::runner::PROTOCOL_VERSION
+    )
 }
 
 /// Opens the sealed channel over `io` with box `name`'s daemon (through its relay), giving up
@@ -2662,12 +2873,14 @@ where
     // Ends only once a switch or a restart asked the session to end; else the session's end
     // ends it.
     let after_welcome = async {
-        let Ok(build) = welcomed_rx.await else {
+        let Ok((build, legacy)) = welcomed_rx.await else {
             return std::future::pending().await;
         };
         // (Subscribed before it is read: a `box.install` from now on is seen.)
         let mut configured = sbox.build.subscribe();
-        let pending = build.as_deref() != Some(id);
+        // A daemon of an older protocol is drained, then replaced (`hub::drain`), not
+        // switched.
+        let pending = legacy.is_none() && build.as_deref() != Some(id);
         {
             let mut st = sbox.st();
             st.last_error = None;
@@ -2678,14 +2891,27 @@ where
             tracing::info!(box_name = %name, launched = id, running = ?build, "the box runs another build than the hub launched (switch pending)");
         }
         sbox.check_switch(build.as_deref());
+        sbox.check_drain_replace(build.as_deref(), legacy.is_some());
+        if legacy.is_none() {
+            // (A daemon of the hub's protocol: a replace a drain asked for is moot.)
+            sbox.take_replace_asked();
+        }
         // A restart asked for (now, or before this attempt carried out the ones it knew of).
+        // During a drain it is cut short: the drain stops the runtimes cleanly first, then
+        // ends the session.
         let restart = async {
             sbox.restart_asked().await;
+            if legacy.is_some() && hub.cut_drain_short(name) {
+                return std::future::pending().await;
+            }
             hub.end_box_session(name, "restarting the box's daemon (`twr box restart`)");
         };
         let switch = async {
             if let Some(data) = data {
                 prune(sbox, data, &ref_name(&key.id(), name), id, build.as_deref()).await;
+            }
+            if legacy.is_some() {
+                return std::future::pending().await;
             }
             // (A switch that did not take is not tried again for the same builds.)
             let worth = |to: &str| !sbox.switch_failed(build.as_deref(), to);
@@ -4508,7 +4734,7 @@ mod tests {
             build: Some(build.into()),
         };
         let refused = || SealedEnd {
-            protocol_refused: Some(6),
+            protocol_refused: Some(5),
             ..Default::default()
         };
         let launched = "00000000000000c6";
@@ -4516,7 +4742,7 @@ mod tests {
             Attempt::Failed(State::NeedsInstall, why) => assert_eq!(
                 why,
                 format!(
-                    "box gpu runs a twr build that speaks protocol 6, the hub {}: install this \
+                    "box gpu runs a twr build that speaks protocol 5, the hub {}: install this \
                      hub's build there: `twr box install gpu`",
                     twr_core::runner::PROTOCOL_VERSION
                 )
@@ -4549,6 +4775,89 @@ mod tests {
                 replace: false
             }
         ));
+    }
+
+    /// An older daemon a drain asked to replace as one not ready (`SshBox::force_replace`)
+    /// cannot be replaced when it runs the build launched (the relay keeps a daemon of its own
+    /// build): the session that reaches it ends `needs_install`, that build is not launched
+    /// again, and the replace stays asked for (the first attempt after an install does it).
+    /// On another build, or without the request, or for a session of the hub's protocol,
+    /// the session's end is as before.
+    #[tokio::test]
+    async fn a_forced_replace_of_the_build_launched_needs_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = crate::HubOptions::new(dir.path().join("twr.db"), Default::default());
+        let hub = Hub::open(opts).await.unwrap();
+        let sbox = SshBox::new("gpu", &BoxConfig::default());
+        let launched = "00000000000000c6";
+        let hello = |build: &str| DaemonHello {
+            v: 1,
+            box_name: "gpu".into(),
+            nonce: String::new(),
+            eph: String::new(),
+            build: Some(build.into()),
+        };
+        let end = |legacy: Option<u32>, build: &str| SealedEnd {
+            welcomed: true,
+            build: Some(build.into()),
+            legacy,
+            ..Default::default()
+        };
+        let p = *twr_core::runner::DRAINABLE_PROTOCOLS.first().unwrap();
+        // Not asked: a legacy session's end changes nothing.
+        let a = after_session(
+            &hub,
+            &sbox,
+            launched,
+            end(Some(p), launched),
+            &hello(launched),
+            false,
+        );
+        assert!(matches!(a, Attempt::Session { replace: false, .. }));
+        sbox.force_replace();
+        // Another build: a session as any, the request kept (the next attempt replaces it).
+        let other = "00000000000000b6";
+        let a = after_session(
+            &hub,
+            &sbox,
+            launched,
+            end(Some(p), other),
+            &hello(other),
+            false,
+        );
+        assert!(matches!(a, Attempt::Session { replace: false, .. }));
+        assert!(sbox.replace_wanted());
+        // A session of the hub's protocol on the build launched: not this case.
+        let a = after_session(
+            &hub,
+            &sbox,
+            launched,
+            end(None, launched),
+            &hello(launched),
+            false,
+        );
+        assert!(matches!(a, Attempt::Session { .. }));
+        // The build launched: needs an install, not launched again, the request kept.
+        match after_session(
+            &hub,
+            &sbox,
+            launched,
+            end(Some(p), launched),
+            &hello(launched),
+            false,
+        ) {
+            Attempt::Failed(State::NeedsInstall, why) => {
+                assert_eq!(why, needs_install_why("gpu", p))
+            }
+            _ => panic!("not needs_install"),
+        }
+        assert_eq!(
+            sbox.drained_launch(launched),
+            Some(needs_install_why("gpu", p))
+        );
+        assert_eq!(sbox.drained_launch(other), None);
+        assert!(sbox.replace_wanted());
+        hub.shutdown().await;
     }
 
     #[test]
