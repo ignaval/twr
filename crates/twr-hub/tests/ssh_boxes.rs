@@ -489,6 +489,7 @@ async fn a_sealed_handshake_is_bound_to_its_box() {
             welcomed: true,
             protocol_refused: None,
             build: Some("0123456789abcdef".into()),
+            legacy: None,
         }
     );
     hub.shutdown().await;
@@ -1456,9 +1457,10 @@ async fn a_boxs_agents_reach_the_hub_and_warn_its_threads() {
 }
 
 /// A box of another OS or CPU runs its configured build; after a twr upgrade that build speaks
-/// an older protocol, so the hub refuses its daemon. The hub does not launch that build again
-/// and again: the box needs an install (`twr box install`), said in its `last_error`, and is
-/// looked at again only when `box.install` wakes it (or after 5 minutes).
+/// an older protocol the hub does not drain, so the hub refuses its daemon. The hub does not
+/// launch that build again and again: the box needs an install (`twr box install`), said in
+/// its `last_error`, and is looked at again only when `box.install` wakes it (or after 5
+/// minutes). (One the hub drains: `ssh_switch.rs`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     use futures::FutureExt;
@@ -1472,7 +1474,11 @@ async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     let public = key.public();
     let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counted = Arc::clone(&dials);
-    // A daemon of the configured build, speaking the protocol before the hub's.
+    // A daemon of the configured build, speaking an older protocol the hub does not drain.
+    let old = (1..PROTOCOL_VERSION)
+        .rev()
+        .find(|p| !twr_core::runner::drainable(*p))
+        .unwrap();
     let dialer: BoxDialer = Arc::new(move |name: String, _dial: Dial| {
         counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         async move {
@@ -1488,7 +1494,7 @@ async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
                 else {
                     return;
                 };
-                send(&mut ws, &hello(&name, PROTOCOL_VERSION - 1)).await;
+                send(&mut ws, &hello(&name, old)).await;
                 let _ = next(&mut ws).await;
             });
             let io: Box<dyn BoxIo> = Box::new(hub_end);
@@ -1504,7 +1510,7 @@ async fn a_cross_target_build_of_an_older_protocol_needs_an_install() {
     let want = format!(
         "box gpu runs a twr build that speaks protocol {}, the hub {PROTOCOL_VERSION}: install \
          this hub's build there: `twr box install gpu`",
-        PROTOCOL_VERSION - 1
+        old
     );
     let h = hub.clone();
     let w = want.clone();

@@ -667,9 +667,10 @@ impl Core {
                 ),
             ));
         }
-        // The answer goes to a runtime on the item's box: it must be reachable now.
+        // The answer goes to a runtime on the item's box: it must be reachable now (a box
+        // being drained takes it while its turns may still finish, `hub::drain`).
         if let Some(view) = self.registry.get(&item.thread).cloned() {
-            self.require_box(&view)?;
+            self.require_box_for_answer(&view)?;
         }
         let alive = self
             .rt

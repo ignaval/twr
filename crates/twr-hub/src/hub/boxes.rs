@@ -500,6 +500,9 @@ impl Hub {
         };
         let epoch = rbox.epoch();
         tracing::info!(box_name = %name, ?epoch, "restarting the box's daemon");
+        // A drain is cut short: the box's runtimes stop for the upgrade before the restart
+        // replaces the daemon (`hub::drain`).
+        self.cut_drain_short(name);
         sbox.request_restart();
         Ok(json!({ "box": name, "epoch": epoch }))
     }
@@ -733,13 +736,14 @@ impl Hub {
         self.inner.box_switch
     }
 
-    /// [`Hub::serve_sealed_runner`], telling `welcomed` the inventory's build once the welcome
-    /// went out (the ssh supervisor).
+    /// [`Hub::serve_sealed_runner`], telling `welcomed` the inventory's build, and the older
+    /// runner protocol of a daemon the hub drains (`hub::drain`), once the welcome went out (the
+    /// ssh supervisor).
     pub(crate) async fn serve_sealed_session<S>(
         &self,
         ws: tokio_tungstenite::WebSocketStream<S>,
         box_name: &str,
-        welcomed: tokio::sync::oneshot::Sender<Option<String>>,
+        welcomed: tokio::sync::oneshot::Sender<(Option<String>, Option<u32>)>,
     ) -> runners::SealedEnd
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -771,7 +775,7 @@ impl Hub {
             .into_iter()
             .map(|s| (s.name().to_string(), s))
             .collect();
-        let online: Vec<(bool, bool)> = {
+        let online: Vec<(bool, bool, Option<Value>)> = {
             let core = self.inner.core();
             remotes
                 .iter()
@@ -779,6 +783,7 @@ impl Hub {
                     (
                         core.online_boxes.contains(b.name()),
                         core.switching_boxes.contains(b.name()),
+                        core.draining_boxes.get(b.name()).map(|d| d.json()),
                     )
                 })
                 .collect()
@@ -786,7 +791,7 @@ impl Hub {
         let mut out: Vec<(String, Value)> = remotes
             .iter()
             .zip(online)
-            .map(|(b, (online, switching))| {
+            .map(|(b, (online, switching, drain))| {
                 let name = b.name().to_string();
                 // Refusals only matter while no runner of the box is connected.
                 let refused = (!online)
@@ -795,11 +800,23 @@ impl Hub {
                     .map(|r| json!({"at": r.at, "reason": r.reason}));
                 let st = ssh.get(&name).map(|s| s.status());
                 let state = match (&st, online) {
-                    // Being switched to the build launched there (`hub::box_switch`).
-                    _ if switching => "switching",
+                    // What the supervisor waits for while the box is offline comes first (a
+                    // drained box that needs an install shows it).
+                    (Some(st), false)
+                        if matches!(
+                            st.state,
+                            ssh_box::State::NeedsInstall | ssh_box::State::Error
+                        ) =>
+                    {
+                        st.state.as_str()
+                    }
+                    // A token box whose runner is not connected, gated or not.
+                    (None, false) => "offline",
+                    // Being switched to the build launched there (`hub::box_switch`), or
+                    // drained (`hub::drain`).
+                    _ if switching || drain.is_some() => "switching",
                     (_, true) => "online",
                     (Some(st), false) => st.state.as_str(),
-                    (None, false) => "offline",
                 };
                 let st = st.unwrap_or_default();
                 // The fields of a box the hub dials (ssh or command).
@@ -821,6 +838,7 @@ impl Hub {
                     "restart_pending": ssh_box.then_some(st.restart_pending),
                     "epoch": b.epoch(),
                     "launch": b.info().and_then(|i| i.launch),
+                    "drain": drain,
                     "agents": b.agents(),
                 });
                 (name, v)

@@ -125,6 +125,20 @@ cargo test -p twr-cli --test ssh_box container_box -- --ignored
 
 They build `docs/tools/container-box/Dockerfile` once as `twr-test-box:<the Dockerfile's hash>` (its base pulled the first time, which needs the network), and run each case in a container of its own, removed at the end: a box from `twr box add --command` to the container's removal (a thread's turns, doctor, `docker restart`, `docker stop` and `start`, the hub's client killed during a daemon restart, `twr hub stop`), the terminal paths (a clone whose client is killed, Ctrl-C during a clone, the detach keys during `twr box login`), and a container that runs as root. The image stays for the next run; `docker image rm twr-test-box:<hash>` removes it. `TWR_TEST_BOX_IMAGE` names another base image (default `ubuntu:24.04`): the debug build the tests upload needs this machine's glibc or newer there.
 
+## A runner protocol bump
+
+Each runner protocol version has fixtures captured from a real revision of it, in `crates/twr-core/tests/fixtures/runner-protocol-<version>`: what its runner sends, what the hub sends a drained runner as that revision decodes it, and its handshake proofs. `crates/twr-core/tests/runner_protocol_fixtures.rs` checks the tree against them, and `DRAINABLE_PROTOCOLS` lists the older versions the hub drains instead of refusing ([runners.md](runners.md#a-new-twr-build)). When you bump `PROTOCOL_VERSION`:
+
+1. In the working tree that bumps it, capture the new version's fixtures. The fixture test needs them before the bump can pass, so they come from the tree, not from a commit:
+
+   ```sh
+   docs/tools/capture-runner-fixtures.sh --worktree <new version>
+   ```
+
+   It takes the tree's tracked files, changes included (`git add` a new file first), builds the capture there in a temporary worktree under `target/`, and writes the three files. They name `HEAD` as their revision, with `"uncommitted": true` when the tree had changes.
+2. Run `cargo test -p twr-core --test runner_protocol_fixtures`. When an outbound value changed since the previous version's fixtures were captured, capture its `hub-accepts.json` again from the last commit that spoke it: `docs/tools/capture-runner-fixtures.sh <that commit> <previous version>`.
+3. Keep the previous version in `DRAINABLE_PROTOCOLS` only if its fixtures pass and the bump changed nothing a drain uses (the `PROTOCOL_VERSION` and `DRAINABLE_PROTOCOLS` docs in `twr_core::runner` say what that is). Otherwise leave it out: the hub then replaces such a daemon at once, its agents recorded as stopped for the upgrade.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push to `dev` and `main` and on every pull request. It uses `pull_request`, never `pull_request_target`, so code from a fork runs without the repository's secrets and with a read-only token, and GitHub asks a maintainer to approve the workflows of a first-time contributor before they run. A new push to a pull request cancels the run still going for its previous one. On `dev` and `main` a new run waits for the one in progress instead, and GitHub keeps one waiting run per branch: a newer push replaces the run still waiting, so of quick pushes only the first and the last get a CI result. The jobs:

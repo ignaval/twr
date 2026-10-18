@@ -51,6 +51,19 @@ impl Core {
         if self.switching_boxes.contains(name) {
             return Err("the box is being switched already".into());
         }
+        if self.draining_boxes.contains_key(name) {
+            return Err("the box is being drained".into());
+        }
+        self.box_idle(hub, name, true)
+    }
+
+    /// The checks of [`Core::box_quiet`] on box `name` and its threads after its gates: no
+    /// repository change or operation of the box under way, and of each thread no running
+    /// turn, background task of its runtime, attach, park, resume, deletion or trim, runtime
+    /// being stopped, restarted, exiting or given up on, open item its runtime raised, or
+    /// answer on its way to the box; with `queue`, no queued prompt (but behind a held queue)
+    /// and no due retry either. `Ok` with the mark of what the log holds of the box's threads.
+    pub(super) fn box_idle(&self, hub: &Inner, name: &str, queue: bool) -> Result<u64, String> {
         let rbox = hub.remote(name).ok_or("the hub has no such box")?;
         let changes = rbox.repository_changes();
         if changes > 0 {
@@ -100,17 +113,19 @@ impl Core {
             {
                 return Err(format!("{n} waits on an answer"));
             }
-            let held = rt.is_some_and(|r| r.queue_held);
-            match self.store.pending_count(&v.id) {
-                Ok(0) => {}
-                Ok(_) if held => {}
-                Ok(k) => return Err(format!("{n} has {k} prompt(s) queued")),
-                Err(e) => return Err(format!("{n}'s queue cannot be read: {e:#}")),
-            }
-            match self.due_retry(&v.id) {
-                Ok(None) => {}
-                Ok(Some(turn)) => return Err(format!("{n} has a retry of turn {turn} due")),
-                Err(e) => return Err(format!("{n}'s retry cannot be read: {e:#}")),
+            if queue {
+                let held = rt.is_some_and(|r| r.queue_held);
+                match self.store.pending_count(&v.id) {
+                    Ok(0) => {}
+                    Ok(_) if held => {}
+                    Ok(k) => return Err(format!("{n} has {k} prompt(s) queued")),
+                    Err(e) => return Err(format!("{n}'s queue cannot be read: {e:#}")),
+                }
+                match self.due_retry(&v.id) {
+                    Ok(None) => {}
+                    Ok(Some(turn)) => return Err(format!("{n} has a retry of turn {turn} due")),
+                    Err(e) => return Err(format!("{n}'s retry cannot be read: {e:#}")),
+                }
             }
             match self.store.unanswered_respond(&v.id) {
                 Ok(false) => {}
@@ -141,7 +156,9 @@ impl Core {
             .filter(|v| self.rt.get(&v.id).is_some_and(|r| r.live.is_some()))
             .map(|v| v.id.clone())
             .collect();
-        self.stop_box_runtimes(hub, name, threads)
+        let stopped = self.stop_box_runtimes(hub, name, threads)?;
+        self.switching_boxes.insert(name.to_string());
+        Ok(stopped)
     }
 
     /// Sets box `name`'s `switching` gate as the hub replaces its daemon, which it refused for
@@ -153,6 +170,20 @@ impl Core {
     /// their threads as stopped for the switch, not crashed. The threads stopped and how many
     /// of them have a turn running (the replace cuts it), or why nothing was done.
     fn begin_blind_box_switch(
+        &mut self,
+        hub: &Inner,
+        name: &str,
+    ) -> Result<(Vec<String>, usize), String> {
+        let stopped = self.stop_log_runtimes(hub, name)?;
+        self.switching_boxes.insert(name.to_string());
+        Ok(stopped)
+    }
+
+    /// The stops of [`Core::begin_blind_box_switch`] without its gate: every runtime of box
+    /// `name`'s threads the log shows, live here or not taken over
+    /// ([`Core::stop_box_runtimes`]). The threads stopped and how many of them have a turn
+    /// running.
+    pub(super) fn stop_log_runtimes(
         &mut self,
         hub: &Inner,
         name: &str,
@@ -172,25 +203,30 @@ impl Core {
             .map(|v| v.id.clone())
             .collect();
         let stopped = self.stop_box_runtimes(hub, name, threads)?;
-        let running = stopped
+        let running = self.running_turns(&stopped);
+        Ok((stopped, running))
+    }
+
+    /// How many of `threads` have a turn running.
+    pub(super) fn running_turns(&self, threads: &[String]) -> usize {
+        threads
             .iter()
             .filter(|t| {
                 self.registry
                     .get(t)
                     .is_some_and(|v| v.current_turn.is_some())
             })
-            .count();
-        Ok((stopped, running))
+            .count()
     }
 
     /// Stops the runtimes of box `name`'s threads `threads` for a switch of the box (see the
-    /// module docs) and sets its `switching` gate. A durable stop request for each thread, and
-    /// the box's `stop` command for each whose runtime is live here (the hub's session issues
-    /// it), are recorded in one batch before the gate is set: when that fails nothing changed.
-    /// A thread whose runtime is being stopped or restarted already, for whatever reason, is
-    /// left out: its stop keeps its own reason (a `thread.stop` stays a plain stop and stops
-    /// the thread, a settings restart keeps its own). The threads stopped.
-    fn stop_box_runtimes(
+    /// module docs). A durable stop request for each thread, and the box's `stop` command for
+    /// each whose runtime is live here (the hub's session issues it), are recorded in one
+    /// batch first: when that fails nothing changed (and the caller sets no gate). A thread
+    /// whose runtime is being stopped or restarted already, for whatever reason, is left out:
+    /// its stop keeps its own reason (a `thread.stop` stays a plain stop and stops the thread,
+    /// a settings restart keeps its own). The threads stopped.
+    pub(super) fn stop_box_runtimes(
         &mut self,
         hub: &Inner,
         name: &str,
@@ -214,7 +250,6 @@ impl Core {
             self.append_batch(hub, batch)
                 .map_err(|e| format!("the stops cannot be recorded: {e:#}"))?;
         }
-        self.switching_boxes.insert(name.to_string());
         if let Some(rbox) = hub.remote(name) {
             for c in &stops {
                 rbox.expect_stop(&c.thread, &c.cmd_id);
@@ -234,7 +269,7 @@ impl Core {
 
     /// Whether no thread of box `name` has a runtime live or exiting (its exit not recorded
     /// yet).
-    fn box_drained(&self, name: &str) -> bool {
+    pub(super) fn box_drained(&self, name: &str) -> bool {
         !self
             .registry
             .list()
@@ -369,11 +404,18 @@ mod tests {
         let stopped = EventBody::ThreadStopped(SessionPayload::default());
         core.append(&inner, "idle", None, Source::Hub, stopped)
             .unwrap();
+        make_live(&inner, &mut core, "live");
+        drop(core);
+        hub
+    }
+
+    /// Gives thread `t` a live runtime here (its handle's other end dropped).
+    fn make_live(inner: &Inner, core: &mut Core, t: &str) {
         let (handle, _end) = AdapterHandle::pair();
         core.generation += 1;
         let generation = core.generation;
-        let log_runtime = core.runtime_gen("live");
-        core.rt("live").live = Some(Live {
+        let log_runtime = core.runtime_gen(t);
+        core.rt(t).live = Some(Live {
             handle,
             generation,
             stop_requested: false,
@@ -387,8 +429,6 @@ mod tests {
             log_runtime,
         });
         inner.live_count.send_modify(|n| *n += 1);
-        drop(core);
-        hub
     }
 
     /// The switch of a box whose daemon is replaced for its protocol stops every runtime the
@@ -490,5 +530,200 @@ mod tests {
         // Again (another refused attempt): nothing more is stopped.
         let (stopped, _) = core.begin_blind_box_switch(&inner, "gpu").unwrap();
         assert!(stopped.is_empty(), "{stopped:?}");
+    }
+
+    /// A box being drained (its runner speaks an older protocol, `hub::drain`) is switched
+    /// once nothing of it runs (`Core::box_drainable`): a queued prompt does not count (it
+    /// waits for the new runner anyway), but a running turn, a background task of a runtime,
+    /// an open item a runtime raised and an operation on the box under way do. Without
+    /// `force` the switch waits for that; with it, it stops every live runtime at once and cuts
+    /// the running turn, leaving a stop under way as it is (a user's stays plain). When the
+    /// stops cannot be recorded, nothing changes: the drain stays `draining`.
+    #[tokio::test]
+    async fn a_drained_box_is_switched_once_idle_or_when_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with_threads(dir.path()).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let adapter = || Source::Adapter("fake".into());
+        let stage = |core: &Core| core.draining_boxes["gpu"].json()["stage"].clone();
+        let mut core = inner.core();
+        assert!(core.enter_drain(&inner, &rbox, 6, "0.1.0").is_some());
+        assert!(core.enter_drain(&inner, &rbox, 6, "0.1.0").is_none());
+        core.online_boxes.insert("gpu".into());
+        make_live(&inner, &mut core, "user");
+        // Not quiet (it is being drained), but drainable with a prompt queued.
+        core.store
+            .enqueue_prompt("live", "later", TurnFrom::User, None, &Source::Hub, 0)
+            .unwrap();
+        assert_eq!(core.store.pending_count("live").unwrap(), 1);
+        assert_eq!(
+            core.box_quiet(&inner, "gpu").unwrap_err(),
+            "the box is being drained"
+        );
+        core.box_drainable(&inner, "gpu").unwrap();
+
+        // A running turn.
+        let turn = EventBody::TurnStarted(TurnStarted {
+            prompt: "go".into(),
+            ..Default::default()
+        });
+        core.append(&inner, "user", Some(1), Source::Hub, turn)
+            .unwrap();
+        let e = core.box_drainable(&inner, "gpu").unwrap_err();
+        assert!(e.contains("turn 1 of user is running"), "{e}");
+        let e = core.begin_legacy_switch(&inner, "gpu", false).unwrap_err();
+        assert!(e.contains("turn 1 of user is running"), "{e}");
+        assert_eq!(stage(&core), "draining");
+        // A background task of a runtime.
+        let task = |running| {
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "bash-1".into(),
+                running,
+                description: "cargo build".into(),
+                ..Default::default()
+            })
+        };
+        core.append(&inner, "live", None, adapter(), task(true))
+            .unwrap();
+        let busy = |core: &Core| core.box_idle(&inner, "gpu", false).unwrap_err();
+        // (The turn comes first.)
+        assert!(busy(&core).contains("running"), "{}", busy(&core));
+        // An open item a runtime raised.
+        let raised = EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "live:q-1".into(),
+            reason: AttentionReason::Question,
+            summary: "which one?".into(),
+            ..Default::default()
+        });
+        core.append(&inner, "live", None, adapter(), raised)
+            .unwrap();
+        let ended = EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Completed,
+            ..Default::default()
+        });
+        core.append(&inner, "user", Some(1), Source::Hub, ended)
+            .unwrap();
+        let e = core.box_drainable(&inner, "gpu").unwrap_err();
+        assert!(
+            e.contains("live's runtime has background tasks running"),
+            "{e}"
+        );
+        core.append(&inner, "live", None, adapter(), task(false))
+            .unwrap();
+        let e = core.box_drainable(&inner, "gpu").unwrap_err();
+        assert!(e.contains("live waits on an answer"), "{e}");
+        let resolved = EventBody::AttentionResolved(AttentionResolved {
+            attn_id: "live:q-1".into(),
+            by: ResolvedBy::Timeout,
+            ..Default::default()
+        });
+        core.append(&inner, "live", None, adapter(), resolved)
+            .unwrap();
+        core.box_drainable(&inner, "gpu").unwrap();
+        // An operation on the box under way.
+        let op = rbox.begin_op();
+        let e = core.box_drainable(&inner, "gpu").unwrap_err();
+        assert!(e.contains("operation(s) on the box under way"), "{e}");
+        drop(op);
+        core.box_drainable(&inner, "gpu").unwrap();
+
+        // Forced, with a turn running again and the user's stop of `live` under way.
+        let turn = EventBody::TurnStarted(TurnStarted {
+            prompt: "again".into(),
+            ..Default::default()
+        });
+        core.append(&inner, "user", Some(2), Source::Hub, turn)
+            .unwrap();
+        let r = core
+            .stop_thread(&inner, "live", &Caller::user("test"))
+            .unwrap();
+        assert_eq!(r["stopping"], true, "{r}");
+        // The stops cannot be recorded: nothing changes.
+        let db = rusqlite::Connection::open(dir.path().join("twr.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER inject BEFORE INSERT ON stop_requests \
+             BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+        let e = core.begin_legacy_switch(&inner, "gpu", true).unwrap_err();
+        assert!(e.contains("the stops cannot be recorded"), "{e}");
+        assert_eq!(stage(&core), "draining");
+        assert!(!core.rt["user"].stop_requested);
+        db.execute_batch("DROP TRIGGER inject").unwrap();
+        assert_eq!(core.begin_legacy_switch(&inner, "gpu", true), Ok((1, 1)));
+        assert_eq!(stage(&core), "stopping");
+        let up = Some(BOX_UPGRADE_REASON);
+        assert_eq!(
+            (
+                core.rt["user"].stop_requested,
+                core.rt["user"].restart_reason
+            ),
+            (true, up)
+        );
+        // The user's stop keeps no reason; nothing else is touched; no switching gate.
+        assert_eq!(
+            (
+                core.rt["live"].stop_requested,
+                core.rt["live"].restart_reason
+            ),
+            (true, None)
+        );
+        assert!(!core.switching_boxes.contains("gpu"));
+        // The drain gates the box's threads (a settings restart aside).
+        assert!(core.thread_free_but_drain("idle") && !core.thread_free("idle"));
+    }
+
+    /// A permission mode narrowed on a box being drained still restarts the runtime (its
+    /// `stop` is drain-safe): with a background task of the runtime running and an item it
+    /// raised between turns open, as anywhere (`stops_background_tasks`); nothing else is
+    /// dispatched there.
+    #[tokio::test]
+    async fn a_narrowed_mode_restarts_a_runtime_of_a_drained_box() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with_threads(dir.path()).await;
+        let inner = Arc::clone(&hub.inner);
+        let rbox = inner.remote("gpu").unwrap();
+        let adapter = || Source::Adapter("fake".into());
+        let mut core = inner.core();
+        core.enter_drain(&inner, &rbox, 6, "0.1.0");
+        core.online_boxes.insert("gpu".into());
+        let settings = super::super::restart::RunSettings::of(core.registry.get("live").unwrap());
+        core.rt("live").runtime_settings = Some(settings);
+        let task = EventBody::TaskUpdated(TaskUpdated {
+            task_id: "bash-1".into(),
+            running: true,
+            description: "cargo build".into(),
+            ..Default::default()
+        });
+        core.append(&inner, "live", None, adapter(), task).unwrap();
+        let raised = EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "live:p-1".into(),
+            reason: AttentionReason::Permission,
+            summary: "Bash: make".into(),
+            ..Default::default()
+        });
+        core.append(&inner, "live", None, adapter(), raised)
+            .unwrap();
+        core.store
+            .enqueue_prompt("live", "later", TurnFrom::User, None, &Source::Hub, 0)
+            .unwrap();
+        let r = core
+            .set_mode_locked(&inner, "live", "manual", &Caller::user("test"), None)
+            .unwrap();
+        assert_eq!(
+            (&r["applies"], &r["stops_background_tasks"]),
+            (&serde_json::json!("now"), &serde_json::json!(true)),
+            "{r}"
+        );
+        let rt = &core.rt["live"];
+        assert_eq!(
+            (rt.stop_requested, rt.restart_reason),
+            (true, Some(MODE_RESTART_REASON))
+        );
+        assert!(rt.live.as_ref().unwrap().stop_requested);
+        // The queued prompt waits.
+        assert_eq!(core.store.pending_count("live").unwrap(), 1);
+        assert_eq!(core.registry.get("live").unwrap().turns, 0);
     }
 }

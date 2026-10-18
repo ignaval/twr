@@ -3,8 +3,13 @@
 //! are [`RemoteBox`]es; the listener that accepts connections is [`crate::listener`].
 //!
 //! **Handshake** ([`twr_core::runner`]). The first message must be `hello`, with
-//! [`PROTOCOL_VERSION`] (else `error{protocol}`, before any authentication) and a well-formed
-//! nonce. The hub answers `challenge{nonce, proof}` with a fresh nonce and its proof over
+//! [`PROTOCOL_VERSION`] or an older protocol the hub drains
+//! ([`twr_core::runner::DRAINABLE_PROTOCOLS`]; else `error{protocol}`, before any
+//! authentication) and a well-formed nonce. A runner of such an older protocol goes through
+//! the same handshake; its connection is then served drain-only (`hub::drain`: only
+//! drain-safe commands go out, its box is gated until a runner of the hub's protocol is
+//! reconciled, and it is not asked for its agents). The hub answers `challenge{nonce, proof}`
+//! with a fresh nonce and its proof over
 //! the box's token ([`RemoteBox::hub_proof`]; a random one for a box it does not know or that
 //! has no token, so a peer cannot tell which boxes exist), then expects `auth{proof}`: the
 //! runner's proof ([`RemoteBox::checks_runner_proof`], constant time), else
@@ -105,14 +110,16 @@
 //!   run). A `send` names the run of the hub's session too, so no prompt reaches another run.
 //!
 //! Then the box is *online*: first the stops of those strays go out, then the session commands
-//! that wait for the box (same ids), including the recorded commands (`remote_outbox`) a
-//! previous hub may not have delivered — a `send` of a live session whose turn is still the one
+//! that wait for the box (same ids; on a drained connection only the drain-safe ones),
+//! including the recorded commands (`remote_outbox`) a previous hub may not have delivered —
+//! a `send` of a live session whose turn is still the one
 //! it was issued in, a `respond` of the live runtime generation it answers (whatever its turn:
 //! a thread takes no new turn while an answer to it is unacknowledged, [`Core::thread_free`]);
 //! the others no longer apply and are forgotten. Then `runner.connected
-//! {box, version}` is appended on the `hub` thread, a switch of the box to another build that
-//! was under way is over (`hub::box_switch`), and the box's threads get their queued
-//! prompts. Until then (and while it is offline) their prompts wait and box commands answer
+//! {box, version}` is appended on the `hub` thread, a switch of the box to another build or a
+//! drain that was under way is over (`hub::box_switch`, `hub::drain`; not on a drained
+//! connection, which keeps them), and the box's threads get their queued prompts (gated while
+//! it is drained). Until then (and while it is offline) their prompts wait and box commands answer
 //! `box_offline`. When the current connection ends the box is offline again and
 //! `runner.disconnected{box, version}` is appended (the connection's end is checked and
 //! recorded in one step under the core lock, so the end of a replaced connection never takes
@@ -156,8 +163,8 @@ use twr_core::adapter::AdapterCmd;
 use twr_core::config::BoxTransport;
 use twr_core::event::*;
 use twr_core::runner::{
-    cmd_errors, hub_errors, new_nonce, valid_nonce, CmdError, Hello, HubMsg, Inventory, Op,
-    RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
+    cmd_errors, drainable, hub_errors, new_nonce, valid_nonce, CmdError, Hello, HubMsg, Inventory,
+    Op, RunnerMsg, Secret, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
 use super::supervisor::{close_exited, give_up_runtime, persist, supervise, Closed};
@@ -275,6 +282,8 @@ struct Conn {
     rbox: RemoteBox,
     epoch: u64,
     tx: ConnTx,
+    /// Its runner speaks this older protocol, which the hub only drains (`hub::drain`).
+    legacy: Option<u32>,
     version: String,
     /// The build the inventory reported ([`Inventory::build`]).
     build: Option<String>,
@@ -569,13 +578,27 @@ pub struct SealedEnd {
     pub protocol_refused: Option<u32>,
     /// The build its inventory reported ([`Inventory::build`]), once welcomed.
     pub build: Option<String>,
+    /// Welcomed, and its runner speaks this older protocol, which the hub only drains
+    /// (`hub::drain`).
+    pub legacy: Option<u32>,
+}
+
+/// What a connection's handshake ([`handshake`]) gives once it authenticated.
+struct Authenticated<S> {
+    rbox: RemoteBox,
+    /// The generation of the token its proofs were over (a listener's connection).
+    token_gen: Option<u64>,
+    inv: Inventory,
+    /// The runner protocol its hello named: the hub's, or one it drains.
+    protocol: u32,
+    ws: WebSocketStream<S>,
 }
 
 /// The handshake of one connection (see the module docs): the box, the generation of the token
-/// its proofs were over (a listener's connection; `None` for a sealed one) and the runner's
-/// inventory once the connection is authenticated, with the connection (raised to the full
-/// message size when it came with the small pre-authentication limits); why not once it was
-/// refused or ended.
+/// its proofs were over (a listener's connection; `None` for a sealed one), the runner's
+/// inventory and its protocol (the hub's, or an older one it drains) once the connection is
+/// authenticated, with the connection (raised to the full message size when it came with the
+/// small pre-authentication limits); why not once it was refused or ended.
 ///
 /// A listener's connection names any box: a token box proves its token both ways, while an
 /// SSH box (which has none) is treated as one the hub does not know. A sealed one
@@ -587,7 +610,7 @@ async fn handshake<S>(
     mut ws: WebSocketStream<S>,
     peer: &str,
     admission: Admission,
-) -> Result<(RemoteBox, Option<u64>, Inventory, WebSocketStream<S>), Refused>
+) -> Result<Authenticated<S>, Refused>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -628,8 +651,9 @@ where
             return Err(Refused::Other);
         }
     };
-    // Before anything else: a runner of another version need not speak this handshake.
-    if hello.protocol != PROTOCOL_VERSION {
+    // Before anything else: a runner of another version need not speak this handshake. One of
+    // an older protocol the hub drains does (`DRAINABLE_PROTOCOLS`), and goes on.
+    if hello.protocol != PROTOCOL_VERSION && !drainable(hello.protocol) {
         tracing::warn!(peer, box_name = %hello.box_name, protocol = hello.protocol, "runner refused: protocol mismatch");
         let update = if hello.protocol < PROTOCOL_VERSION {
             format!("update twr on box `{}`", hello.box_name)
@@ -797,7 +821,13 @@ where
                 }
             }
             let token_gen = token.as_ref().map(BoxToken::gen);
-            return Ok((rbox, token_gen, inv, ws));
+            return Ok(Authenticated {
+                rbox,
+                token_gen,
+                inv,
+                protocol: hello.protocol,
+                ws,
+            });
         }
         Next::Msg(_) => Some(refuse(
             hub_errors::PROTOCOL,
@@ -848,13 +878,14 @@ pub(super) fn checked_inventory(mut inv: Inventory) -> (Inventory, Vec<String>) 
 }
 
 /// Serves one runner connection from its handshake to its end (see the module docs).
-/// `welcomed` is told the inventory's build once the welcome went out.
+/// `welcomed` is told the inventory's build and, when the runner speaks an older protocol the
+/// hub drains, that protocol, once the welcome went out.
 pub(super) async fn serve<S>(
     hub: Arc<Inner>,
     ws: WebSocketStream<S>,
     peer: String,
     admission: Admission,
-    welcomed: Option<oneshot::Sender<Option<String>>>,
+    welcomed: Option<oneshot::Sender<(Option<String>, Option<u32>)>>,
 ) -> SealedEnd
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -863,7 +894,13 @@ where
         code: code.to_string(),
         message,
     };
-    let (rbox, token_gen, inv, ws) = match handshake(&hub, ws, &peer, admission).await {
+    let Authenticated {
+        rbox,
+        token_gen,
+        inv,
+        protocol,
+        ws,
+    } = match handshake(&hub, ws, &peer, admission).await {
         Ok(h) => h,
         Err(Refused::Protocol(p)) => {
             return SealedEnd {
@@ -879,9 +916,12 @@ where
     let (close_tx, mut close_rx) = watch::channel::<Option<String>>(None);
     let tx = ConnTx::new(tx, close_tx);
     let box_name = rbox.name().to_string();
+    // A runner of an older protocol is drained (`hub::drain`).
+    let legacy = (protocol != PROTOCOL_VERSION).then_some(protocol);
+    let mut drain_note = None;
     let connected = {
         let mut core = hub.core();
-        let c = rbox.connect(&inv, tx.clone(), token_gen);
+        let c = rbox.connect(&inv, tx.clone(), token_gen, legacy);
         let connected = c.epoch().map(|epoch| {
             // Not ready until synced and reconciled.
             core.online_boxes.remove(&box_name);
@@ -898,6 +938,9 @@ where
             if watermarks.is_err() {
                 // Under the same lock: nothing else saw this connection.
                 rbox.disconnect(epoch);
+            } else if let Some(p) = legacy {
+                // Gated from now on, before anything is dispatched to it.
+                drain_note = core.enter_drain(&hub, &rbox, p, &inv.version);
             }
             (epoch, watermarks)
         });
@@ -945,23 +988,34 @@ where
         epoch,
         peer,
         version = %inv.version,
+        protocol,
         running = inv.running.len(),
         "runner connected"
     );
+    if let Some(note) = drain_note {
+        match hub.ssh_box(&box_name) {
+            Some(s) => s.remark(note),
+            None => tracing::info!(box_name = %box_name, "{note}"),
+        }
+    }
     tx.send(HubMsg::Welcome { epoch, watermarks });
-    // The box's agent CLIs, asked on this connection while it lasts (`hub::box_agents`).
-    let _agents = super::box_agents::AbortOnDrop(tokio::spawn(super::box_agents::poll(
-        rbox.clone(),
-        epoch,
-        hub.agents_poll,
-    )));
+    // The box's agent CLIs, asked on this connection while it lasts (`hub::box_agents`); not
+    // of a runner the hub only drains.
+    let _agents = legacy.is_none().then(|| {
+        super::box_agents::AbortOnDrop(tokio::spawn(super::box_agents::poll(
+            rbox.clone(),
+            epoch,
+            hub.agents_poll,
+        )))
+    });
     let end = SealedEnd {
         welcomed: true,
         protocol_refused: None,
         build: inv.build.clone(),
+        legacy,
     };
     if let Some(w) = welcomed {
-        let _ = w.send(inv.build.clone());
+        let _ = w.send((inv.build.clone(), legacy));
     }
     // Its end (a write failed or timed out, or every sender is gone) ends the connection.
     let (writer_done, mut writer_ended) = oneshot::channel::<()>();
@@ -988,6 +1042,7 @@ where
         rbox: rbox.clone(),
         epoch,
         tx,
+        legacy,
         version: inv.version.clone(),
         build: inv.build.clone(),
         running: inv
@@ -1008,6 +1063,9 @@ where
     // WebSocket layer) do not move it.
     let idle = hub.runner_idle_timeout;
     let mut idle_at = tokio::time::Instant::now() + idle;
+    // A runner of an older protocol must sync within its bound (`hub::drain`).
+    let sync_within = hub.box_switch.legacy_sync;
+    let sync_by = tokio::time::Instant::now() + sync_within;
     let why = loop {
         let flush_at = conn.flush_at();
         let next = tokio::select! {
@@ -1017,6 +1075,10 @@ where
             }
             _ = &mut writer_ended => break "its writer stopped (a write failed or timed out)".to_string(),
             _ = state.wait_for(|s| *s == HubState::Stopped) => break "the hub stopped".to_string(),
+            () = tokio::time::sleep_until(sync_by), if legacy.is_some() && !conn.synced => {
+                let secs = sync_within.as_secs();
+                break format!("its runner of an older protocol did not sync within {secs}s")
+            }
             // Before reading more: a batch whose time is up is synced and acked even while
             // frames keep coming.
             () = tokio::time::sleep_until(flush_at.unwrap_or_else(tokio::time::Instant::now)), if flush_at.is_some() => None,
@@ -1069,7 +1131,8 @@ where
         }
     };
     tracing::info!(box_name = %box_name, epoch, reason = %why, "runner connection ended");
-    connection_ended(&hub, &rbox, epoch, conn.announced, &conn.version);
+    let unsynced = legacy.is_some() && !conn.synced;
+    connection_ended(&hub, &rbox, epoch, conn.announced, &conn.version, unsynced);
     drop(conn.tx);
     // The writer ends once every sender is gone (the box dropped its copy above).
     let mut writer = writer;
@@ -1083,16 +1146,19 @@ where
 }
 
 /// Connection `epoch` of `rbox` ended: when it was still the box's current one, the box is
-/// offline (and `runner.disconnected` is recorded once `runner.connected` was). The whole of
-/// it happens under the core lock, where a newer connection replaces the current one
-/// ([`serve`]): the epoch is checked and the box taken offline in one step, so the end of a
-/// connection a replacement already fenced never takes that replacement offline.
+/// offline (and `runner.disconnected` is recorded once `runner.connected` was), and, when it
+/// was a runner of an older protocol that never synced (`unsynced`), the box's drain counts it
+/// (`hub::drain`). The whole of it happens under the core lock, where a newer connection
+/// replaces the current one ([`serve`]): the epoch is checked and the box taken offline in one
+/// step, so the end of a connection a replacement already fenced never takes that replacement
+/// offline.
 fn connection_ended(
     hub: &Arc<Inner>,
     rbox: &RemoteBox,
     epoch: u64,
     announced: bool,
     version: &str,
+    unsynced: bool,
 ) {
     let mut core = hub.core();
     if !rbox.disconnect(epoch) {
@@ -1102,6 +1168,9 @@ fn connection_ended(
     tests::after_disconnect();
     let box_name = rbox.name().to_string();
     core.online_boxes.remove(&box_name);
+    if unsynced {
+        core.drain_unsynced(&box_name);
+    }
     if announced && !core.shutting_down {
         let body = EventBody::RunnerDisconnected(RunnerPayload {
             box_name: box_name.clone(),
@@ -1576,9 +1645,16 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     }
     conn.stopped.extend(strays);
     core.online_boxes.insert(box_name.clone());
-    // A switch to another build is over once a connection after it is reconciled
-    // (`hub::box_switch`): its threads are dispatched below.
-    let switched = core.switching_boxes.remove(&box_name);
+    // A switch to another build, or a drain, is over once a connection of the hub's protocol
+    // after it is reconciled (`hub::box_switch`, `hub::drain`): its threads are dispatched
+    // below. A runner the hub drains keeps both gates; its drain looks at it now.
+    let switched = if conn.legacy.is_none() {
+        let switched = core.switching_boxes.remove(&box_name);
+        core.end_drain(&box_name) || switched
+    } else {
+        core.drain_ready(&box_name);
+        false
+    };
     let body = EventBody::RunnerConnected(RunnerPayload {
         box_name: box_name.clone(),
         version: Some(conn.version.clone()),
@@ -1610,6 +1686,10 @@ async fn reconcile(hub: &Arc<Inner>, conn: &mut Conn) {
     tracing::info!(box_name = %box_name, epoch = conn.epoch, "runner synced; box online");
     if switched {
         box_switch::ended(hub, &box_name, conn.build.as_deref());
+    }
+    // (A runner the hub drains is asked nothing more.)
+    if conn.legacy.is_some() {
+        return;
     }
     // What a crash left the log and this box's trash disagreeing on.
     let hub = super::Hub {
@@ -2461,7 +2541,7 @@ mod tests {
         let (tx, _) = mpsc::channel(8);
         let (close, _) = watch::channel(None);
         let epoch = rbox
-            .connect(&Inventory::default(), ConnTx::new(tx, close), None)
+            .connect(&Inventory::default(), ConnTx::new(tx, close), None, None)
             .epoch()
             .unwrap();
         assert!(rbox.set_ready(epoch, &[], Vec::new()));
@@ -2503,7 +2583,7 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(300));
             }))
         });
-        connection_ended(&inner, &rbox, first, true, "v1");
+        connection_ended(&inner, &rbox, first, true, "v1", false);
         let second = rx.recv_timeout(Duration::from_secs(10)).unwrap();
         assert!(rbox.is_current(second));
         assert!(
@@ -2511,7 +2591,7 @@ mod tests {
             "the live replacement was taken offline"
         );
         // The first connection's end was recorded once; ending it again changes nothing.
-        connection_ended(&inner, &rbox, first, true, "v1");
+        connection_ended(&inner, &rbox, first, true, "v1", false);
         assert!(inner.core().online_boxes.contains("gpu"));
         let (items, _) = hub.control_read(0, 1000).unwrap();
         let ends = items
@@ -2581,6 +2661,7 @@ mod tests {
             rbox: rbox.clone(),
             epoch,
             tx: ConnTx::new(tx, close),
+            legacy: None,
             version: "v1".into(),
             build: None,
             running: HashMap::new(),
@@ -2886,7 +2967,7 @@ mod tests {
             .unwrap_err();
         assert!(format!("{e:#}").contains("offline"), "{e:#}");
 
-        connection_ended(&inner, &rbox, first, true, "v1");
+        connection_ended(&inner, &rbox, first, true, "v1", false);
         let (items, _) = hub.control_read(0, 1000).unwrap();
         let ends = items
             .iter()

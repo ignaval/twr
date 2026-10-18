@@ -100,6 +100,11 @@
 //! replacement). Should the counter ever run out, the connection is refused before anything
 //! changes. The box is *ready* once the
 //! hub has replayed the runner's spool and reconciled sessions; only then are commands sent.
+//! A connection whose runner speaks an older runner protocol that the hub only drains
+//! (`hub::drain`, [`twr_core::runner::DRAINABLE_PROTOCOLS`]) gets drain-safe commands only
+//! ([`Op::drain_safe`]: the `send`, `respond` and `stop` of sessions already running): any
+//! other op, request or session command, fails at once `box_offline` saying why, and one
+//! waiting from before is never written on it (it waits for the next connection).
 //!
 //! **Attach.** [`RemoteBox::attach_command`] runs, under the user's own ssh identity, the
 //! interactive command the hub's own adapter for the runtime builds for another box
@@ -393,6 +398,9 @@ impl Connect {
 struct Conn {
     epoch: u64,
     tx: ConnTx,
+    /// The older runner protocol it speaks, which the hub only drains (`hub::drain`): only
+    /// drain-safe commands go out on it ([`Op::drain_safe`]).
+    legacy: Option<u32>,
 }
 
 #[derive(Default)]
@@ -476,6 +484,19 @@ fn offline(name: &str) -> CmdError {
     )
 }
 
+/// Why `op` does not go to box `name`, whose runner speaks older runner protocol `protocol`
+/// (see the module docs, "Connections").
+fn not_drain_safe(name: &str, protocol: u32, op: &Op) -> CmdError {
+    CmdError::new(
+        codes::BOX_OFFLINE,
+        format!(
+            "box {name:?} runs an older twr (runner protocol {protocol}) that the hub only \
+             drains: no {} goes to it",
+            op.name()
+        ),
+    )
+}
+
 impl State {
     /// The id (and run) of the oldest recorded `respond` of `thread` to `attn_id` not issued
     /// yet ([`RemoteBox::expect_respond`]).
@@ -548,12 +569,18 @@ impl State {
         rx
     }
 
-    /// Sends pending command `order` on the current connection, if the box is ready.
+    /// Sends pending command `order` on the current connection, if the box is ready. Never on
+    /// a connection of an older protocol unless it is drain-safe ([`Op::drain_safe`]): it
+    /// stays pending for the next connection.
     fn send_pending(&mut self, order: u64) {
         let (Some(conn), true) = (self.conn.as_ref(), self.ready) else {
             return;
         };
-        if let Some(p) = self.pending.get_mut(&order) {
+        if let Some(p) = self
+            .pending
+            .get_mut(&order)
+            .filter(|p| conn.legacy.is_none() || p.op.drain_safe())
+        {
             p.sent = conn.tx.send(HubMsg::Cmd {
                 cmd_id: p.cmd_id.clone(),
                 op: p.op.clone(),
@@ -679,6 +706,13 @@ impl RemoteBox {
     /// connection does (the box goes offline, and its runner keeps everything for the next).
     pub fn close_connection(&self, why: &str) {
         if let Some(c) = &self.state().conn {
+            c.tx.close(why);
+        }
+    }
+
+    /// [`RemoteBox::close_connection`], only while connection `epoch` is the current one.
+    pub fn close_connection_of(&self, epoch: u64, why: &str) {
+        if let Some(c) = self.state().conn.as_ref().filter(|c| c.epoch == epoch) {
             c.tx.close(why);
         }
     }
@@ -853,6 +887,12 @@ impl RemoteBox {
         epoch <= self.state().revoked_through
     }
 
+    /// The older runner protocol the box's current connection speaks, which the hub only
+    /// drains (`hub::drain`); `None` without a connection or for one of the hub's protocol.
+    pub fn legacy(&self) -> Option<u32> {
+        self.state().conn.as_ref().and_then(|c| c.legacy)
+    }
+
     /// Whether `epoch` is the current connection.
     pub fn is_current(&self, epoch: u64) -> bool {
         self.state().conn.as_ref().is_some_and(|c| c.epoch == epoch)
@@ -1023,8 +1063,15 @@ impl RemoteBox {
     /// `u64::MAX` connections of this box ([`Connect::Exhausted`]), or when `token_gen` (the
     /// generation of the token its handshake proved, [`RemoteBox::token_snapshot`]; `None` for
     /// a sealed connection, which proves no token) is no longer the box's
-    /// ([`Connect::TokenChanged`]: [`RemoteBox::set_token`] ran meanwhile).
-    pub fn connect(&self, inv: &Inventory, tx: ConnTx, token_gen: Option<u64>) -> Connect {
+    /// ([`Connect::TokenChanged`]: [`RemoteBox::set_token`] ran meanwhile). `legacy`: the
+    /// connection's runner speaks that older protocol, which the hub only drains.
+    pub fn connect(
+        &self,
+        inv: &Inventory,
+        tx: ConnTx,
+        token_gen: Option<u64>,
+        legacy: Option<u32>,
+    ) -> Connect {
         let mut st = self.state();
         if token_gen.is_some_and(|g| g != st.token_gen) {
             return Connect::TokenChanged;
@@ -1054,7 +1101,7 @@ impl RemoteBox {
             st.unsettled.clear();
         }
         st.last_epoch = epoch;
-        st.conn = Some(Conn { epoch, tx });
+        st.conn = Some(Conn { epoch, tx, legacy });
         st.ready = false;
         st.info = Some(BoxInfo {
             version: inv.version.clone(),
@@ -1271,6 +1318,13 @@ impl RemoteBox {
         let mut st = self.state();
         if kind == Kind::Request && !st.ready {
             return Err(offline(&self.inner.name));
+        }
+        // A runner of an older protocol gets drain-safe commands only, requests and session
+        // commands alike (see the module docs, "Connections").
+        if let Some(p) = st.conn.as_ref().and_then(|c| c.legacy) {
+            if !op.drain_safe() {
+                return Err(not_drain_safe(&self.inner.name, p, &op));
+            }
         }
         if on.is_some_and(|e| !st.conn.as_ref().is_some_and(|c| c.epoch == e)) {
             return Err(CmdError::new(
@@ -2338,9 +2392,9 @@ mod tests {
             ..Default::default()
         };
         let (first, first_closed) = conn();
-        assert_eq!(b.connect(&hello, first, None), Connect::Connected(1));
+        assert_eq!(b.connect(&hello, first, None, None), Connect::Connected(1));
         let (second, _) = conn();
-        assert_eq!(b.connect(&hello, second, None), Connect::Connected(2));
+        assert_eq!(b.connect(&hello, second, None, None), Connect::Connected(2));
         assert!(first_closed.borrow().is_some(), "the first is fenced");
         assert!(!b.is_current(1) && b.is_current(2));
         // The first connection's end leaves its replacement alone.
@@ -2350,11 +2404,11 @@ mod tests {
         b.state().last_epoch = u64::MAX - 1;
         let (last, last_closed) = conn();
         assert_eq!(
-            b.connect(&Inventory::default(), last, None),
+            b.connect(&Inventory::default(), last, None, None),
             Connect::Connected(u64::MAX)
         );
         let (extra, extra_closed) = conn();
-        assert_eq!(b.connect(&hello, extra, None), Connect::Exhausted);
+        assert_eq!(b.connect(&hello, extra, None, None), Connect::Exhausted);
         assert!(b.is_current(u64::MAX), "the current connection stays");
         assert!(last_closed.borrow().is_none(), "and is not fenced");
         assert!(extra_closed.borrow().is_none());
@@ -2376,6 +2430,7 @@ mod tests {
                 &Inventory::default(),
                 ConnTx::new(tx, close),
                 Some(before.gen()),
+                None,
             )
             .epoch()
             .unwrap();
@@ -2420,7 +2475,7 @@ mod tests {
         b.note_refusal("earlier");
         let (late, late_closed) = conn();
         assert_eq!(
-            b.connect(&Inventory::default(), late, Some(before.gen())),
+            b.connect(&Inventory::default(), late, Some(before.gen()), None),
             Connect::TokenChanged
         );
         assert_eq!(b.epoch(), None);
@@ -2428,7 +2483,7 @@ mod tests {
         assert!(b.refusal().is_some(), "the refusal shown stays");
         // One that proved the new one connects.
         let (good, _) = conn();
-        let next = b.connect(&Inventory::default(), good, Some(after.gen()));
+        let next = b.connect(&Inventory::default(), good, Some(after.gen()), None);
         assert_eq!(next, Connect::Connected(epoch + 1));
         assert!(b.refusal().is_none());
 
@@ -2492,6 +2547,139 @@ mod tests {
         assert_eq!(attach_dir(None, Path::new(""), wt, repo), None);
     }
 
+    /// The commands that went out on a connection, as their ops (pings and the like left out).
+    fn sent_ops(rx: &mut mpsc::Receiver<HubMsg>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let HubMsg::Cmd { op, .. } = m {
+                ops.push(op);
+            }
+        }
+        ops
+    }
+
+    /// On a connection of an older protocol, which the hub only drains, only the drain-safe
+    /// commands of sessions already running go out (`send`, `respond`, `stop`, as issued or
+    /// sent again); a request (git) and a session's `spawn` fail at once saying why, and a
+    /// `spawn` that waited from before is not written on it (it waits for the next connection,
+    /// where it goes).
+    #[tokio::test]
+    async fn a_drained_connection_gets_only_drain_safe_commands() {
+        let b = RemoteBox::new_ssh("gpu", "me@gpu".into());
+        let connect = |legacy: Option<u32>| {
+            let (tx, rx) = mpsc::channel(64);
+            let (close, closed) = watch::channel(None);
+            let epoch = b
+                .connect(&Inventory::default(), ConnTx::new(tx, close), None, legacy)
+                .epoch()
+                .unwrap();
+            (epoch, rx, closed)
+        };
+        let spawn = |thread: &str| Op::Spawn {
+            thread: thread.into(),
+            runtime: "fake".into(),
+            cfg: WireSpawnConfig::default(),
+            prompt: Some("hi".into()),
+            run: None,
+        };
+        // A spawn issued while a connection of the hub's protocol is not ready yet waits.
+        let (_, mut rx, _c0) = connect(None);
+        let _waiting = b.start_session("early", Some(spawn("early")));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(sent_ops(&mut rx).is_empty());
+
+        let (epoch, mut rx, _c1) = connect(Some(6));
+        assert_eq!(b.legacy(), Some(6));
+        let resend = vec![
+            (
+                "send:t:1".to_string(),
+                Op::Send {
+                    thread: "t".into(),
+                    turn: 1,
+                    text: "again".into(),
+                    run: None,
+                },
+            ),
+            (
+                "respond:1:x".to_string(),
+                Op::Respond {
+                    attn_id: "a".into(),
+                    thread: "t".into(),
+                    answer: twr_core::event::Answer::allow(),
+                    run: None,
+                },
+            ),
+            (
+                "stop:t:1".to_string(),
+                Op::Stop {
+                    thread: "t".into(),
+                    run: None,
+                },
+            ),
+        ];
+        let safe: Vec<Op> = resend.iter().map(|(_, op)| op.clone()).collect();
+        assert!(b.set_ready(epoch, &[], resend));
+        // The resends go out; the waiting spawn does not.
+        assert_eq!(sent_ops(&mut rx), safe);
+
+        // A request fails at once, saying why.
+        let e = b.git().repo_root(PathBuf::from("/r")).await.unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("runs an older twr (runner protocol 6) that the hub only drains"),
+            "{e}"
+        );
+        // A new session's spawn too: the session ends at once.
+        let mut refused = b.start_session("late", Some(spawn("late")));
+        let mut events = refused.take_events().unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(AdapterEvent::Exited { stderr_tail, .. })) => assert!(
+                stderr_tail.contains("that the hub only drains: no spawn goes to it"),
+                "{stderr_tail}"
+            ),
+            other => panic!("no exit: {other:?}"),
+        }
+        // A session taken over sends, answers and stops (each once the one before it is
+        // answered).
+        let h = b.start_session("t", None);
+        let c = h.commander();
+        let cmds = [
+            AdapterCmd::Send {
+                text: "go".into(),
+                turn: 2,
+            },
+            AdapterCmd::Respond {
+                attn_id: "b".into(),
+                answer: twr_core::event::Answer::allow(),
+            },
+            AdapterCmd::Stop,
+        ];
+        let mut ops = Vec::new();
+        for cmd in cmds {
+            c.send(cmd).unwrap();
+            let m = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            let Ok(Some(HubMsg::Cmd { cmd_id, op })) = m else {
+                panic!("no command: {m:?}")
+            };
+            b.on_result(epoch, CmdResult::new(&cmd_id, Ok(Value::Null)));
+            ops.push(op);
+        }
+        assert!(matches!(ops[0], Op::Send { turn: 2, .. }), "{ops:?}");
+        assert!(matches!(ops[1], Op::Respond { .. }), "{ops:?}");
+        assert!(matches!(ops[2], Op::Stop { .. }), "{ops:?}");
+
+        // The next connection, of the hub's protocol, gets the spawn that waited.
+        let (epoch, mut rx, _c2) = connect(None);
+        assert_eq!(b.legacy(), None);
+        assert!(b.set_ready(epoch, &[], Vec::new()));
+        let ops = sent_ops(&mut rx);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Spawn { thread, .. } if thread == "early")),
+            "{ops:?}"
+        );
+    }
+
     /// Agent requests to one box go one at a time, each answer kept before the next is sent:
     /// a poll's slow answer (the runner's cached list, older) cannot land after a refresh
     /// asked later and replace its fresher one.
@@ -2501,7 +2689,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(4);
         let (close, _closed) = watch::channel(None);
         let epoch = b
-            .connect(&Inventory::default(), ConnTx::new(tx, close), None)
+            .connect(&Inventory::default(), ConnTx::new(tx, close), None, None)
             .epoch()
             .unwrap();
         assert!(b.set_ready(epoch, &[], Vec::new()));
@@ -2718,7 +2906,7 @@ mod tests {
                 ..Default::default()
             };
             let epoch = b
-                .connect(&inv, ConnTx::new(tx, close), None)
+                .connect(&inv, ConnTx::new(tx, close), None, None)
                 .epoch()
                 .unwrap();
             assert!(b.set_ready(epoch, &[], Vec::new()));
@@ -2794,7 +2982,7 @@ mod tests {
                 ..Default::default()
             };
             let epoch = b
-                .connect(&inv, ConnTx::new(tx, close), None)
+                .connect(&inv, ConnTx::new(tx, close), None, None)
                 .epoch()
                 .unwrap();
             assert!(b.set_ready(epoch, &[], Vec::new()));
