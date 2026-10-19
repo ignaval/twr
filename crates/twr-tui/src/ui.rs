@@ -1718,10 +1718,16 @@ fn card_bottom(
         if room(&left, &right) < token.min_width() {
             left = None;
         }
-        let mut spans = vec![Span::raw(" ")];
-        spans.extend(token.fit(room(&left, &right)));
-        spans.push(Span::raw(" "));
-        Line::from(spans).left_aligned()
+        // Its padding goes before its state would be cut.
+        let room = room(&left, &right);
+        if room >= token.min_width() {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(token.fit(room));
+            spans.push(Span::raw(" "));
+            Line::from(spans).left_aligned()
+        } else {
+            Line::from(token.fit(room + 2)).left_aligned()
+        }
     });
     let mut block = block;
     if let Some(l) = left {
@@ -1826,9 +1832,8 @@ fn note_icon(panes: &mut Panes, state: &AppState, thread: &str, inner: Rect, cel
 struct CardBody {
     /// The state and what it does or came to.
     section: Vec<Line<'static>>,
-    /// How many of `section`'s first rows hold its head, the state and the first word after
-    /// it ([`section_lines`]).
-    head: usize,
+    /// The section on one row, cut with `…`: shown in place of its rows when it has but one.
+    one: Option<Line<'static>>,
     /// The top attention item's rows ([`attention_rows`]).
     attn: Option<Arc<AttnRows>>,
     /// The git line ([`git_line`]; a tile's with its turns), when there is one.
@@ -1847,7 +1852,7 @@ fn card_body(
     tile: Option<(&str, &str)>,
 ) -> CardBody {
     let attn = attention_rows(state, &t.id, width, tile.is_some());
-    let (section, head) = section_lines(state, t, width, attn.is_some());
+    let (section, one) = section_lines(state, t, width, attn.is_some());
     let git = match (tile, &t.git) {
         // The turn count (and what the turns spent) after the git state, which gives way; what
         // the turns spent goes first when the git state would be cut at its end.
@@ -1886,7 +1891,7 @@ fn card_body(
     };
     CardBody {
         section,
-        head,
+        one: Some(one),
         attn,
         git,
     }
@@ -1914,15 +1919,15 @@ fn at_work(t: &ThreadView) -> bool {
 /// background work shows the report its turn yielded under that: an interim one. With an item
 /// open (`item`), a thread at work but not waiting on the user (running, on background tasks,
 /// attached: a stalled notice, a review) still says what it does; one waiting on the user, or
-/// not at work, shows the state alone: the item says the rest. Also returns how many of its
-/// rows its head takes, the state and the first word of what follows it: the rows a card
-/// keeps before all else ([`card_rows`]).
+/// not at work, shows the state alone: the item says the rest. Also returns the section on
+/// one row, cut to the width with `…`: what a card shows when it has a row for it alone
+/// ([`card_rows`]), the state and the start of what follows it.
 fn section_lines(
     state: &AppState,
     t: &ThreadView,
     width: usize,
     item: bool,
-) -> (Vec<Line<'static>>, usize) {
+) -> (Vec<Line<'static>>, Line<'static>) {
     let dim = Style::default().fg(Color::DarkGray);
     let doing = Style::default()
         .fg(Color::Gray)
@@ -1941,31 +1946,46 @@ fn section_lines(
     ));
     let width = width.max(1);
     let wrapped = |spans: Vec<Span<'static>>| wrap_line(Line::from(spans), width);
-    // The rows the state and the first word after it take: the head kept on any card.
-    let head = |spans: &[Span<'static>], base: usize| {
-        let mut head = spans[..base].to_vec();
-        let word =
-            |s: &Span<'static>| Span::styled(through_first_word(&s.content).to_string(), s.style);
-        match &spans[base..] {
-            [] => {}
-            // What goes on from the state's word (`: rate limited`).
-            [joined] => head.push(word(joined)),
-            [sep, what, ..] => head.extend([sep.clone(), word(what)]),
+    // On one row: its line breaks as spaces, cut at the width.
+    let one = |spans: &[Span<'static>]| {
+        let flat: Vec<Span<'static>> = spans
+            .iter()
+            .map(|s| Span::styled(one_row(&s.content), s.style))
+            .collect();
+        // (`one_row` drops the spaces at the ends of a span: put back those between spans.)
+        let mut out: Vec<Span<'static>> = Vec::new();
+        for (s, f) in spans.iter().zip(flat) {
+            if f.content.is_empty() {
+                // All whitespace (the space after the icon): one space.
+                if !s.content.is_empty() {
+                    out.push(Span::styled(" ", s.style));
+                }
+                continue;
+            }
+            let lead = if s.content.starts_with(char::is_whitespace) && !out.is_empty() {
+                " "
+            } else {
+                ""
+            };
+            let tail = if s.content.ends_with(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            out.push(Span::styled(format!("{lead}{}{tail}", f.content), f.style));
         }
-        wrapped(head).len()
+        Line::from(cut_spans(out, width))
     };
-    let base = spans.len();
     if item && (!at_work(t) || status == ThreadStatus::Waiting) {
-        let rows = wrapped(spans);
-        let n = rows.len();
-        return (rows, n);
+        let line = one(&spans);
+        return (wrapped(spans), line);
     }
     let report = |r: &twr_core::event::ReportReady| Span::styled(r.summary.clone(), dim);
     if !at_work(t) && status != ThreadStatus::Error {
         if let Some(r) = &t.last_report {
             spans.extend([Span::styled(" · ", dim), report(r)]);
-            let n = head(&spans, base);
-            return (wrapped(spans), n);
+            let line = one(&spans);
+            return (wrapped(spans), line);
         }
     }
     let activity = state
@@ -1979,7 +1999,7 @@ fn section_lines(
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
         After::Apart(text) => spans.extend([Span::styled(" · ", dim), Span::styled(text, doing)]),
     }
-    let n = head(&spans, base);
+    let line = one(&spans);
     let mut lines = wrapped(spans);
     let selected = highlighted(state) == Some(t.id.as_str());
     if selected && status == ThreadStatus::Background && t.reported {
@@ -1987,19 +2007,7 @@ fn section_lines(
             lines.extend(wrapped(vec![report(r)]));
         }
     }
-    (lines, n)
-}
-
-/// `s` up to the end of its first word, past what leads it (spaces, a `:`): `: rate` of `:
-/// rate limited`, `implementing` of `implementing scroll anchoring`.
-fn through_first_word(s: &str) -> &str {
-    let start = s
-        .find(|c: char| !c.is_whitespace() && c != ':')
-        .unwrap_or(s.len());
-    let end = s[start..]
-        .find(char::is_whitespace)
-        .map_or(s.len(), |i| start + i);
-    &s[..end]
+    (lines, line)
 }
 
 /// What a status section says after the state ([`section_lines`]).
@@ -2090,11 +2098,12 @@ fn card_status(t: &ThreadView) -> String {
 /// The rows a card or tile `height` rows tall and `width` wide shows of `body`, in its order
 /// (the section, the item, the git line at the bottom), and the item it shows in full (id and
 /// revision), if any. When they do not all fit, they are kept in this order: the section's
-/// head (the state and the first word of what it does: a row, two when the state leaves the
-/// first no room for that word), the item's core (its badge, summary and options), the git
-/// line, the section's next row, the item's note and how many more wait, then the rest of the
-/// section, which gives way from its end and then ends in `…`. An item whose core does not fit
-/// beside the head is cut, and not drawn in full. Only the
+/// first row, the item's core (its badge, summary and options), the git line, the section's
+/// second row, the item's note and how many more wait, then the rest of the section, which
+/// gives way from its end, its last row shown ending in `…`. A section left one row shows
+/// itself on one row cut to the width (`one`): the state and the start of what the thread
+/// does, though they wrapped over two rows. An item whose core does not fit beside the
+/// section's row is cut, and not drawn in full. Only the
 /// rows drawn are copied: an item's rows are kept between frames ([`WrapCache`]) and may be
 /// many.
 fn card_rows(
@@ -2105,7 +2114,7 @@ fn card_rows(
     let height = usize::from(height);
     let CardBody {
         mut section,
-        head,
+        one,
         attn,
         git,
     } = body;
@@ -2113,11 +2122,17 @@ fn card_rows(
         Some(a) => (&a.core, &a.extra),
         None => (&[], &[]),
     };
-    let first = head.max(1).min(section.len()).min(height);
+    let first = section.len().min(1).min(height);
     let mut room = height - first;
     let cut_to = |section: &mut Vec<Line<'static>>, n: usize| {
         let cut = n < section.len();
         section.truncate(n);
+        if n == 1 && cut {
+            if let Some(one) = &one {
+                section[0] = one.clone();
+                return;
+            }
+        }
         if let Some(last) = section.last_mut().filter(|_| cut) {
             *last = ellipsized(std::mem::take(last), usize::from(width));
         }
@@ -3214,7 +3229,7 @@ fn render_hub_card(
     let (head, attn) = hub_card_parts(state, usize::from(inner.width));
     let body = CardBody {
         section: Vec::new(),
-        head: 0,
+        one: None,
         attn,
         git: None,
     };
@@ -5349,7 +5364,7 @@ fn render_orch_banner(
     let attn = attention_rows(state, orch, usize::from(inner.width), false);
     let body = CardBody {
         section: Vec::new(),
-        head: 0,
+        one: None,
         attn,
         git: None,
     };
@@ -13264,7 +13279,7 @@ mod tests {
         };
         let body = || CardBody {
             section: vec![l("running · one"), l("two"), l("three")],
-            head: 1,
+            one: None,
             attn: attn(&["Q", "1 a"], &["note"]),
             git: Some(l("twr/q")),
         };
@@ -13314,7 +13329,7 @@ mod tests {
                 l("four"),
                 l("five"),
             ],
-            head: 1,
+            one: None,
             attn: None,
             git: Some(l("twr/q")),
         };
@@ -15271,9 +15286,10 @@ mod tests {
     }
 
     /// On a card too narrow for the state and the first word of what the thread does on one
-    /// row (`▃ running (1 bg) ·`, then `implementing`), both rows are kept before an item that
-    /// fills the card: in the row of 30-column cards above a narrow conversation, the column
-    /// at 34, and 40-column tiles, with other threads beside it.
+    /// row (`▃ running (1 bg) ·`, then `implementing`), an item that fills the card leaves the
+    /// section its one row, which shows the section on one row, cut (`▃ running (1 bg) ·
+    /// implemen…`): in the row of 30-column cards above a narrow conversation, the column at 34,
+    /// and 40-column tiles, with other threads beside it.
     #[test]
     fn a_narrow_card_keeps_what_its_thread_does_beside_a_long_item() {
         use crate::app::tests::control;
@@ -15313,8 +15329,8 @@ mod tests {
             let text = pane_text(&st, &lines, &card("t-run"));
             let rows: Vec<&str> = text.lines().collect();
             let head = card_words(&rows[1..3].join("\n"));
-            assert!(head.contains("running (1 bg) ·"), "{w}:\n{text}");
-            assert!(head.contains("implementing"), "{w}:\n{text}");
+            // (On its one row, cut: `running (1 bg) · implemen…`.)
+            assert!(head.contains("running (1 bg) · imp"), "{w}:\n{text}");
             assert!(text.contains(" STALLED "), "{w}:\n{text}");
         }
     }
@@ -15376,6 +15392,112 @@ mod tests {
                     assert!(text.contains(long), "the name whole: {what}");
                 }
             }
+        }
+    }
+
+    /// A report starting with a word longer than the card (an unbroken URL) wraps inside the
+    /// word and is cut like any report: the git line keeps its row, and the state shows.
+    #[test]
+    fn a_long_first_word_leaves_the_git_line_its_row() {
+        use crate::app::tests::control;
+        use twr_core::event::Grade;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-url");
+        let mut report = s.report(Some(1), Grade::Success);
+        if let EventBody::ReportReady(p) = &mut report.body {
+            p.summary = format!("https://example.com/{} is up.", "a".repeat(150));
+        }
+        let git = s.event(EventBody::GitSnapshot(GitSnapshot {
+            branch: Some("twr/url".into()),
+            ..Default::default()
+        }));
+        let evs = [
+            s.created("url"),
+            s.turn_started("go"),
+            s.turn_ended(TurnResult::Completed),
+            report,
+            git,
+        ];
+        control(&mut st, &evs);
+        for (w, grid, compact) in [(100u16, false, false), (90, true, false), (40, false, true)] {
+            let mut st = st.clone();
+            if grid {
+                st.view.screen = Screen::Grid;
+            }
+            if compact {
+                st.view.compact = Some(true);
+                st.view.compact_pane = crate::app::CompactPane::Threads;
+            }
+            let lines = draw_panes(&mut st, w, 20);
+            let text = pane_text(&st, &lines, &card("t-url"));
+            let rows: Vec<&str> = text.lines().collect();
+            assert!(rows[1].contains("done ✓ ·"), "{w}:\n{text}");
+            assert!(
+                card_words(&text).contains("https://example.com/aaa"),
+                "{w}:\n{text}"
+            );
+            assert!(rows[rows.len() - 2].contains("twr/url"), "{w}:\n{text}");
+        }
+    }
+
+    /// A card the column cuts to one row inside (on a screen a few rows tall) still says the
+    /// state and the start of what its thread does on it, though they wrap over two rows on a
+    /// card of full height.
+    #[test]
+    fn a_card_cut_to_one_row_keeps_the_state_and_what_it_does() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-run");
+        let evs = [
+            s.at(10).created("run"),
+            s.turn_started("go"),
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "t1".into(),
+                running: true,
+                ..Default::default()
+            })),
+        ];
+        control(&mut st, &evs);
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-run": {"activity": "reimplementing scroll anchoring"}}),
+        );
+        st.settle_order(std::time::Instant::now());
+        let mut seen = false;
+        for h in 3..12u16 {
+            let lines = draw_panes(&mut st, 100, h);
+            let Some(pane) = st.view.panes.get(&card("t-run")).cloned() else {
+                continue;
+            };
+            if pane.area.height != 1 {
+                continue;
+            }
+            seen = true;
+            let text = pane_text(&st, &lines, &card("t-run"));
+            let row = text.lines().nth(1).unwrap();
+            assert!(row.contains("running (1 bg) · reimpl"), "{h}:\n{text}");
+        }
+        assert!(seen, "no height cuts the card to one row");
+    }
+
+    /// The bottom border of a narrow compact card says a box's state the title has no room for
+    /// whole: its padding gives way first (`┗@… not configured┛` at 20 columns).
+    #[test]
+    fn a_narrow_bottom_border_drops_its_padding_before_the_box_state() {
+        let st = on_box("review-last", "gpu", removed_box("gpu"), |s| {
+            vec![s.turn_started("go")]
+        });
+        let mut st = st;
+        st.view.compact = Some(true);
+        st.view.compact_pane = crate::app::CompactPane::Threads;
+        for w in [20u16, 22, 30] {
+            let lines = draw_panes(&mut st, w, 20);
+            let text = pane_text(&st, &lines, &card("t-job"));
+            assert!(
+                text.lines().any(|r| has_token(r, "gpu", " not configured")),
+                "{w}:\n{text}"
+            );
         }
     }
 
