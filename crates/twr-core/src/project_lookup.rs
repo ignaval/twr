@@ -355,6 +355,10 @@ mod tests {
     /// not read it (a repository of the name may be in it, as an organization folder); a
     /// hidden one, or a file, is not that.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "APFS refuses file names that are not UTF-8"
+    )]
     fn a_folder_whose_name_is_not_utf8_says_so() {
         use std::os::unix::ffi::OsStrExt;
         let d = tempfile::tempdir().unwrap();
