@@ -30,8 +30,8 @@ use crate::select::{
 
 /// Height of a card with an attention item (and of the card row), borders included.
 pub const CARD_HEIGHT: u16 = 11;
-/// Height of a card without an attention item in the side column, borders included: its
-/// status, activity and git rows and two of its report.
+/// Height of a card without an attention item in the side column, borders included (its
+/// title is its top border): 4 rows of its status section and its git row.
 pub const COMPACT_CARD_HEIGHT: u16 = 7;
 /// Narrowest a card may get before cards start scrolling horizontally.
 pub const CARD_MIN_WIDTH: u16 = 30;
@@ -419,14 +419,16 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
 /// What a card says, listed by the help overlay.
 pub const HELP_CARDS: &[(&str, &str)] = &[
     (
-        "status",
-        "the state (done ✓ with its report's grade), then what the thread is doing, why it \
-         failed or its last report; with an item open, the item and its options",
+        "title",
+        "the project and the name; at the right the runtime, its box when remote (@gpu \
+         offline when the box is not simply online) and the model, then the permission mode. \
+         Narrow, the project goes first, then the runtime, then the model; never the name",
     ),
     (
-        "who",
-        "the runtime, its box when remote (@gpu offline when the box is not simply online) \
-         and the model",
+        "status",
+        "up to 4 rows: the state (done ✓ with its report's grade), then what the thread is \
+         doing, why it failed or its last report; with an item open, the item and its \
+         options, under what a working thread does",
     ),
     (
         "git",
@@ -1612,34 +1614,130 @@ fn card_border(block: Block<'static>, look: Look, plain: Style) -> Block<'static
     }
 }
 
-/// The title of a card or tile `width` columns wide: its project, dim, then its name (`twr ·
-/// scroll-follow`), `[pin]`, and the permission mode on the right when both fit. The project
-/// gives way first: cut with `…` to the room the rest leaves ([`title_project`]), then left
-/// out.
-fn card_block(t: &ThreadView, pinned: bool, width: u16) -> Block<'static> {
+/// The title of a card or tile `width` columns wide: at its left its project, dim, then its
+/// name (`twr · scroll-follow`) and `[pin]`; at its right who runs it ([`who_fit`]:
+/// `claude-code · sonnet-4-5`, with the box token of a remote box) and its permission mode,
+/// apart (`─ auto`). Where they do not all fit, the project gives way first: cut with `…` to
+/// the room the rest leaves ([`title_project`]), then left out; then who runs it shortens
+/// (the runtime goes, the model is cut, then left out, then the box's name is cut); then the
+/// mode goes, before the state of a box not simply online would. The name is never cut (only the border can clip it). Also
+/// returns whether a box not simply online has its state left out for want of room (the
+/// bottom border then says it, [`card_bottom`]).
+fn card_block(
+    state: &AppState,
+    t: &ThreadView,
+    pinned: bool,
+    width: u16,
+) -> (Block<'static>, bool) {
+    let cells = crate::edit::width;
     let dim = Style::default().fg(Color::DarkGray);
     let width = usize::from(width);
-    let mut title = vec![Span::styled(
+    let mut name = vec![Span::styled(
         format!(" {} ", t.name),
         Style::default().add_modifier(Modifier::BOLD),
     )];
     if pinned {
-        title.push(Span::styled("[pin] ", Style::default().fg(Color::Cyan)));
+        name.push(Span::styled("[pin] ", Style::default().fg(Color::Cyan)));
     }
-    let used = Line::from(title.clone()).width();
-    let mode = format!(" {} ", t.mode);
-    let mode_width = mode.chars().count();
-    let show_mode = !t.mode.is_empty() && used + mode_width + 4 <= width;
-    let room = width.saturating_sub(used + 4 + if show_mode { mode_width } else { 0 });
-    if let Some(project) = title_project(t.project.as_deref(), room) {
+    let name_w = Line::from(name.clone()).width();
+    let mode = (!t.mode.is_empty()).then(|| format!(" {} ", t.mode));
+    let mode_w = mode.as_deref().map_or(0, cells);
+    // The corners and a cell of border at least between the left and the right.
+    let free = width.saturating_sub(name_w + 3);
+    // What the right side takes: who (padded) and the mode, a cell of border between them.
+    let right = |who: Option<usize>, mode: bool| {
+        let who = who.map_or(0, |w| w + 2);
+        let mode = if mode { mode_w } else { 0 };
+        who + mode + usize::from(who > 0 && mode > 0)
+    };
+    let with_mode = mode.is_some();
+    let full = who_fit(state, t, usize::MAX);
+    let full_w = full.as_ref().map(|w| Line::from(w.clone()).width());
+    // The room for who beside the name and, when `mode`, the mode.
+    let who_room = |mode: bool| {
+        let rest = if mode { mode_w + 1 } else { 0 };
+        free.saturating_sub(rest + 2)
+    };
+    let (project, who, show_mode) = if right(full_w, with_mode) <= free {
+        let room = free - right(full_w, with_mode);
+        (title_project(t.project.as_deref(), room), full, with_mode)
+    } else if let Some(who) = who_fit(state, t, who_room(with_mode)) {
+        (None, Some(who), with_mode)
+    } else if state.box_word(t).is_some() {
+        // A box not simply online keeps its state over the mode.
+        match who_fit(state, t, who_room(false)) {
+            Some(who) => (None, Some(who), false),
+            None => (None, None, with_mode && mode_w <= free),
+        }
+    } else {
+        (None, None, with_mode && mode_w <= free)
+    };
+    let unsaid = state.box_word(t).is_some() && who.is_none();
+    let mut title = name;
+    if let Some(project) = project {
         title[0].content = format!("{} ", t.name).into();
         title.insert(0, Span::styled(format!(" {project} · "), dim));
     }
     let mut block = Block::default()
         .borders(Borders::ALL)
         .title(Line::from(title));
-    if show_mode {
+    if let Some(who) = who {
+        let mut spans = vec![Span::raw(" ")];
+        spans.extend(who);
+        spans.push(Span::raw(" "));
+        block = block.title(Line::from(spans).right_aligned());
+    }
+    if let (Some(mode), true) = (mode, show_mode) {
         block = block.title(Line::from(Span::styled(mode, dim)).right_aligned());
+    }
+    (block, unsaid)
+}
+
+/// `block`, a card or tile `width` columns wide, with its bottom border's labels: the `more`
+/// labels (left, right: `↑ 2 more`, `↓ 3 more`), and after the left one the box `token` when
+/// the title had no room for the state of its box ([`card_block`]), so that state is always on
+/// the card. The token is cut to the room the labels leave, its box's name first
+/// ([`BoxToken::fit`]); where its state would not fit, the right label gives way, then the left.
+fn card_bottom(
+    block: Block<'static>,
+    width: u16,
+    (mut left, mut right): (Option<String>, Option<String>),
+    token: Option<BoxToken>,
+) -> Block<'static> {
+    let cells = crate::edit::width;
+    let avail = usize::from(width).saturating_sub(2);
+    let label = |l: &Option<String>| l.as_deref().map_or(0, |l| cells(l) + 1);
+    // The token padded, after a cell of border.
+    let room = |left: &Option<String>, right: &Option<String>| {
+        avail.saturating_sub(label(left) + label(right) + 2)
+    };
+    let token = token.map(|token| {
+        if room(&left, &right) < token.min_width() {
+            right = None;
+        }
+        if room(&left, &right) < token.min_width() {
+            left = None;
+        }
+        // Its padding goes before its state would be cut.
+        let room = room(&left, &right);
+        if room >= token.min_width() {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(token.fit(room));
+            spans.push(Span::raw(" "));
+            Line::from(spans).left_aligned()
+        } else {
+            Line::from(token.fit(room + 2)).left_aligned()
+        }
+    });
+    let mut block = block;
+    if let Some(l) = left {
+        block = block.title_bottom(Line::from(l).left_aligned());
+    }
+    if let Some(token) = token {
+        block = block.title_bottom(token);
+    }
+    if let Some(r) = right {
+        block = block.title_bottom(Line::from(r).right_aligned());
     }
     block
 }
@@ -1668,14 +1766,10 @@ fn render_card(
     panes: &mut Panes,
 ) -> Option<(String, u64)> {
     let pinned = state.view.pins.contains(&t.id);
-    let block = card_block(t, pinned, area.width);
-    let mut block = card_border(block, look, Style::default().fg(Color::DarkGray));
-    if let Some(l) = more_left {
-        block = block.title_bottom(Line::from(l).left_aligned());
-    }
-    if let Some(r) = more_right {
-        block = block.title_bottom(Line::from(r).right_aligned());
-    }
+    let (block, unsaid) = card_block(state, t, pinned, area.width);
+    let block = card_border(block, look, Style::default().fg(Color::DarkGray));
+    let token = box_token(state, t).filter(|_| unsaid);
+    let block = card_bottom(block, area.width, (more_left, more_right), token);
 
     let inner = block.inner(area);
     let body = card_body(state, t, usize::from(inner.width), None);
@@ -1734,25 +1828,23 @@ fn note_icon(panes: &mut Panes, state: &AppState, thread: &str, inner: Rect, cel
 
 /// A card's or tile's text before it is fitted to its height ([`card_rows`]), in the order it
 /// is drawn: its status section ([`section_lines`]), its top attention item when one is open,
-/// then its footer: who runs it ([`who_line`]) and its git state, last.
+/// then its git state, last. (Who runs it is in its title, [`card_block`].)
 struct CardBody {
-    /// The state and what it does or came to; with an item open, the state alone.
+    /// The state and what it does or came to.
     section: Vec<Line<'static>>,
+    /// The section on one row, cut with `…`: shown in place of its rows when it has but one.
+    one: Option<Line<'static>>,
     /// The top attention item's rows ([`attention_rows`]).
     attn: Option<Arc<AttnRows>>,
-    /// Who runs it, and whether its box token says the box is not simply online: that row is
-    /// then kept before the item's note and the rest of the section.
-    who: Option<(Line<'static>, bool)>,
     /// The git line ([`git_line`]; a tile's with its turns), when there is one.
     git: Option<Line<'static>>,
 }
 
 /// The text of `t`'s card (or, `tile`, its grid tile with its turns and what they spent after
-/// its git state)
-/// `width` cells wide inside ([`CardBody`]): one section on its status (the state with its
-/// report's grade, then what it does or what came of it, [`section_lines`]), the top attention
-/// item when one is open ([`attention_rows`]), then who runs it and the git state. (Its project
-/// is in its title, [`card_block`].)
+/// its git state) `width` cells wide inside ([`CardBody`]): one section on its status (the
+/// state with its report's grade, then what it does or what came of it, [`section_lines`]),
+/// the top attention item when one is open ([`attention_rows`]), then the git state. (Its
+/// project, name, runtime, model and mode are in its title, [`card_block`].)
 fn card_body(
     state: &AppState,
     t: &ThreadView,
@@ -1760,8 +1852,7 @@ fn card_body(
     tile: Option<(&str, &str)>,
 ) -> CardBody {
     let attn = attention_rows(state, &t.id, width, tile.is_some());
-    let section = section_lines(state, t, width, attn.is_some());
-    let who = Some(who_line(state, t, width));
+    let (section, one) = section_lines(state, t, width, attn.is_some());
     let git = match (tile, &t.git) {
         // The turn count (and what the turns spent) after the git state, which gives way; what
         // the turns spent goes first when the git state would be cut at its end.
@@ -1800,8 +1891,8 @@ fn card_body(
     };
     CardBody {
         section,
+        one: Some(one),
         attn,
-        who,
         git,
     }
 }
@@ -1826,8 +1917,17 @@ fn at_work(t: &ThreadView) -> bool {
 /// said, what its status says, [`twr_core::activity::fallback`]); else its last report (dim), or
 /// the activity line when it has none (`idle · not started`). A selected card waiting on
 /// background work shows the report its turn yielded under that: an interim one. With an item
-/// open (`item`), the state alone: the item says the rest.
-fn section_lines(state: &AppState, t: &ThreadView, width: usize, item: bool) -> Vec<Line<'static>> {
+/// open (`item`), a thread at work but not waiting on the user (running, on background tasks,
+/// attached: a stalled notice, a review) still says what it does; one waiting on the user, or
+/// not at work, shows the state alone: the item says the rest. Also returns the section on
+/// one row, cut to the width with `…`: what a card shows when it has a row for it alone
+/// ([`card_rows`]), the state and the start of what follows it.
+fn section_lines(
+    state: &AppState,
+    t: &ThreadView,
+    width: usize,
+    item: bool,
+) -> (Vec<Line<'static>>, Line<'static>) {
     let dim = Style::default().fg(Color::DarkGray);
     let doing = Style::default()
         .fg(Color::Gray)
@@ -1846,14 +1946,46 @@ fn section_lines(state: &AppState, t: &ThreadView, width: usize, item: bool) -> 
     ));
     let width = width.max(1);
     let wrapped = |spans: Vec<Span<'static>>| wrap_line(Line::from(spans), width);
-    if item {
-        return wrapped(spans);
+    // On one row: its line breaks as spaces, cut at the width.
+    let one = |spans: &[Span<'static>]| {
+        let flat: Vec<Span<'static>> = spans
+            .iter()
+            .map(|s| Span::styled(one_row(&s.content), s.style))
+            .collect();
+        // (`one_row` drops the spaces at the ends of a span: put back those between spans.)
+        let mut out: Vec<Span<'static>> = Vec::new();
+        for (s, f) in spans.iter().zip(flat) {
+            if f.content.is_empty() {
+                // All whitespace (the space after the icon): one space.
+                if !s.content.is_empty() {
+                    out.push(Span::styled(" ", s.style));
+                }
+                continue;
+            }
+            let lead = if s.content.starts_with(char::is_whitespace) && !out.is_empty() {
+                " "
+            } else {
+                ""
+            };
+            let tail = if s.content.ends_with(char::is_whitespace) {
+                " "
+            } else {
+                ""
+            };
+            out.push(Span::styled(format!("{lead}{}{tail}", f.content), f.style));
+        }
+        Line::from(cut_spans(out, width))
+    };
+    if item && (!at_work(t) || status == ThreadStatus::Waiting) {
+        let line = one(&spans);
+        return (wrapped(spans), line);
     }
     let report = |r: &twr_core::event::ReportReady| Span::styled(r.summary.clone(), dim);
     if !at_work(t) && status != ThreadStatus::Error {
         if let Some(r) = &t.last_report {
             spans.extend([Span::styled(" · ", dim), report(r)]);
-            return wrapped(spans);
+            let line = one(&spans);
+            return (wrapped(spans), line);
         }
     }
     let activity = state
@@ -1867,6 +1999,7 @@ fn section_lines(state: &AppState, t: &ThreadView, width: usize, item: bool) -> 
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
         After::Apart(text) => spans.extend([Span::styled(" · ", dim), Span::styled(text, doing)]),
     }
+    let line = one(&spans);
     let mut lines = wrapped(spans);
     let selected = highlighted(state) == Some(t.id.as_str());
     if selected && status == ThreadStatus::Background && t.reported {
@@ -1874,7 +2007,7 @@ fn section_lines(state: &AppState, t: &ThreadView, width: usize, item: bool) -> 
             lines.extend(wrapped(vec![report(r)]));
         }
     }
-    lines
+    (lines, line)
 }
 
 /// What a status section says after the state ([`section_lines`]).
@@ -1931,23 +2064,6 @@ fn after_state(activity: &str, shown: &str, status: ThreadStatus) -> After {
     }
 }
 
-/// Who runs `t`, the footer row of its card or tile over its git line: `runtime@box[ state] ·
-/// model` within `width` cells, the box token giving way last ([`runtime_model_spans`]: the
-/// model is cut first, then the runtime, then the box's name, never the box's state); with
-/// whether that token says its box is not simply online (the row is then kept before an
-/// item's note, [`card_rows`]).
-fn who_line(state: &AppState, t: &ThreadView, width: usize) -> (Line<'static>, bool) {
-    let dim = Style::default().fg(Color::DarkGray);
-    let spans = runtime_model_spans(
-        runtime_name(t),
-        box_token(state, t).as_ref(),
-        model_label(t),
-        dim,
-        width,
-    );
-    (Line::from(spans), state.box_word(t).is_some())
-}
-
 /// The status a card or tile shows: the thread's (`failed` or `crashed` for an error,
 /// `stopped` for a stopped one), with the grade of the report on its last turn once it is
 /// done (`done ✓`: success, `~` partial, `✗` gave up, `?` needs verification), and its
@@ -1980,13 +2096,16 @@ fn card_status(t: &ThreadView) -> String {
 }
 
 /// The rows a card or tile `height` rows tall and `width` wide shows of `body`, in its order
-/// (the section, the item, who runs it, the git line), and the item it shows in full (id and
-/// revision), if any. When they do not all fit, they are kept in this order: the item's core
-/// (its badge, summary and options) whole, the row of who runs it when its box is not simply
-/// online, the item's note and how many more wait, the section's first row (the state), the git
-/// line, who runs it, then the rest of the section, which gives way from its end and then ends
-/// in `…`. Only the rows drawn are copied: an item's rows are kept between frames
-/// ([`WrapCache`]) and may be many.
+/// (the section, the item, the git line at the bottom), and the item it shows in full (id and
+/// revision), if any. When they do not all fit, they are kept in this order: the section's
+/// first row, the item's core (its badge, summary and options), the git line, the section's
+/// second row, the item's note and how many more wait, then the rest of the section, which
+/// gives way from its end, its last row shown ending in `…`. A section left one row shows
+/// itself on one row cut to the width (`one`): the state and the start of what the thread
+/// does, though they wrapped over two rows. An item whose core does not fit beside the
+/// section's row is cut, and not drawn in full. Only the
+/// rows drawn are copied: an item's rows are kept between frames ([`WrapCache`]) and may be
+/// many.
 fn card_rows(
     body: CardBody,
     height: u16,
@@ -1995,52 +2114,54 @@ fn card_rows(
     let height = usize::from(height);
     let CardBody {
         mut section,
+        one,
         attn,
-        who,
         git,
     } = body;
     let (core, extra): (&[Line<'static>], &[Line<'static>]) = match &attn {
         Some(a) => (&a.core, &a.extra),
         None => (&[], &[]),
     };
-    if core.len() > height {
-        return (core[..height].to_vec(), None);
+    let first = section.len().min(1).min(height);
+    let mut room = height - first;
+    let cut_to = |section: &mut Vec<Line<'static>>, n: usize| {
+        let cut = n < section.len();
+        section.truncate(n);
+        if n == 1 && cut {
+            if let Some(one) = &one {
+                section[0] = one.clone();
+                return;
+            }
+        }
+        if let Some(last) = section.last_mut().filter(|_| cut) {
+            *last = ellipsized(std::mem::take(last), usize::from(width));
+        }
+    };
+    if core.len() > room {
+        cut_to(&mut section, first);
+        section.extend_from_slice(&core[..room]);
+        return (section, None);
     }
-    let mut room = height - core.len();
+    room -= core.len();
     let mut grab = |want: usize| {
         let n = want.min(room);
         room -= n;
         n
     };
-    let kept = who.as_ref().is_some_and(|(_, k)| *k);
-    let mut who_on = kept && grab(1) == 1;
-    let extra_n = grab(extra.len());
-    let mut section_n = grab(section.len().min(1));
     let git_on = git.is_some() && grab(1) == 1;
-    if who.is_some() && !kept {
-        who_on = grab(1) == 1;
-    }
-    section_n += grab(section.len() - section_n);
-    let cut = section_n < section.len();
-    section.truncate(section_n);
-    if let Some(last) = section.last_mut().filter(|_| cut) {
-        *last = ellipsized(std::mem::take(last), usize::from(width));
-    }
+    let second = grab(section.len().saturating_sub(first).min(1));
+    let extra_n = grab(extra.len());
+    let rest = grab(section.len() - first - second);
+    cut_to(&mut section, first + second + rest);
     let mut rows = section;
     rows.extend_from_slice(core);
     rows.extend_from_slice(&extra[..extra_n]);
-    // The footer at the bottom of the card, the rows it leaves blank above it.
-    let footer: Vec<Line<'static>> = who
-        .filter(|_| who_on)
-        .map(|(line, _)| line)
-        .into_iter()
-        .chain(git.filter(|_| git_on))
-        .collect();
-    if !footer.is_empty() {
-        let blank = height.saturating_sub(rows.len() + footer.len());
+    // The git line at the bottom of the card, the rows it leaves blank above it.
+    if let Some(git) = git.filter(|_| git_on) {
+        let blank = height.saturating_sub(rows.len() + 1);
         rows.extend(std::iter::repeat_n(Line::default(), blank));
+        rows.push(git);
     }
-    rows.extend(footer);
     let drawn = attn
         .as_ref()
         .filter(|a| a.exact && a.complete)
@@ -2415,11 +2536,6 @@ struct BoxToken {
 }
 
 impl BoxToken {
-    /// Its width whole, in cells: `@gpu offline` takes 12.
-    fn width(&self) -> usize {
-        1 + crate::edit::width(&self.name) + self.word_width()
-    }
-
     /// The cells its word takes with the space before it (` offline`): none when online.
     fn word_width(&self) -> usize {
         self.word.map_or(0, |w| 1 + crate::edit::width(w.text()))
@@ -2465,39 +2581,75 @@ fn box_token(state: &AppState, t: &ThreadView) -> Option<BoxToken> {
     })
 }
 
-/// `runtime@box[ state] · model` ([`who_line`]) within `width` cells, `sep` the style of
-/// its ` · `. Without a box token, cut at its end. With one, the token gives way last: the
-/// model is cut (`codex@gpu offline · gpt…`) or dropped, then the runtime is cut (`co…@gpu
-/// offline`) or dropped, then the box's name is cut ([`BoxToken::fit`]: `@gp… offline`).
-fn runtime_model_spans(
-    runtime: &str,
-    token: Option<&BoxToken>,
-    model: String,
-    sep: Style,
-    width: usize,
-) -> Vec<Span<'static>> {
-    let mut spans = vec![Span::raw(runtime.to_string())];
-    let Some(token) = token else {
-        spans.extend([Span::styled(" · ", sep), Span::raw(model)]);
-        return cut_spans(spans, width);
+/// Who runs `t`, as its card's or tile's title says it at its right ([`card_block`]), in the
+/// first of these that fits `room` cells: `runtime@box[ state] · model`; the runtime left out
+/// (`@box[ state] · model`, a local thread's model alone); the model cut with `…` (to 3 of its
+/// cells at least); then left out (`@box state`; nothing for a local thread); then the box's
+/// name cut (`@g… offline`, [`BoxToken::fit`]). The box's state is never cut. Dim, but for the
+/// state's own color ([`box_word_style`]). None when not even that fits.
+fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'static>>> {
+    let cells = crate::edit::width;
+    let dim = Style::default().fg(Color::DarkGray);
+    let token = box_token(state, t);
+    let model = model_label(t);
+    let whole: Vec<Span<'static>> = token
+        .as_ref()
+        .map(|k| k.fit(usize::MAX))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| {
+            if s.style == Style::default() {
+                s.style(dim)
+            } else {
+                s
+            }
+        })
+        .collect();
+    let form = |runtime: bool, model: Option<String>| {
+        let mut spans = Vec::new();
+        if runtime {
+            spans.push(Span::styled(runtime_name(t).to_string(), dim));
+        }
+        spans.extend(whole.iter().cloned());
+        if let Some(m) = model {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", dim));
+            }
+            spans.push(Span::styled(m, dim));
+        }
+        spans
     };
-    let head = crate::edit::width(runtime) + token.width();
-    spans.extend(token.fit(usize::MAX));
-    // Cut at its end while that leaves the token whole and its `…` apart from the token.
-    if head + 2 <= width {
-        spans.extend([Span::styled(" · ", sep), Span::raw(model)]);
-        return cut_spans(spans, width);
+    let width = |spans: &[Span<'static>]| Line::from(spans.to_vec()).width();
+    let mut forms = vec![
+        form(true, Some(model.clone())),
+        form(false, Some(model.clone())),
+    ];
+    // The model cut to the room the token leaves it.
+    let used = width(&form(false, None)) + if whole.is_empty() { 0 } else { 3 };
+    if room >= used + 4 && cells(&model) > room - used {
+        forms.push(form(false, Some(truncate_cells(&model, room - used))));
     }
-    if head <= width {
-        return spans;
+    if let Some(token) = &token {
+        forms.push(form(false, None));
+        if room >= token.min_width() {
+            forms.push(
+                token
+                    .fit(room)
+                    .into_iter()
+                    .map(|s| {
+                        if s.style == Style::default() {
+                            s.style(dim)
+                        } else {
+                            s
+                        }
+                    })
+                    .collect(),
+            );
+        }
     }
-    let room = width.saturating_sub(token.width());
-    if room >= 1 {
-        let mut spans = vec![Span::raw(truncate_cells(runtime, room))];
-        spans.extend(token.fit(usize::MAX));
-        return spans;
-    }
-    token.fit(width)
+    forms
+        .into_iter()
+        .find(|f| !f.is_empty() && width(f) <= room)
 }
 
 /// The color of a box token's word ([`box_token`]).
@@ -3074,14 +3226,17 @@ fn render_hub_card(
         block = block.title_bottom(Line::from(r).right_aligned());
     }
     let inner = block.inner(area);
-    let (body, attn) = hub_card_parts(state, usize::from(inner.width));
+    let (head, attn) = hub_card_parts(state, usize::from(inner.width));
     let body = CardBody {
-        section: body,
+        section: Vec::new(),
+        one: None,
         attn,
-        who: None,
         git: None,
     };
-    let (rows, drawn) = card_rows(body, inner.height, inner.width);
+    let (mut rows, drawn) = card_rows(body, inner.height, inner.width);
+    // `routing` over its question where the question leaves it the room.
+    let room = usize::from(inner.height).saturating_sub(rows.len());
+    rows.splice(0..0, head.into_iter().take(room));
     frame.render_widget(Paragraph::new(rows).block(block), area);
     drawn
 }
@@ -3251,8 +3406,10 @@ fn render_tile(
     panes: &mut Panes,
 ) -> Option<(String, u64)> {
     let dim = Style::default().fg(Color::DarkGray);
-    let block = card_block(t, state.view.pins.contains(&t.id), area.width);
+    let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
     let block = card_border(block, look, dim);
+    let token = box_token(state, t).filter(|_| unsaid);
+    let block = card_bottom(block, area.width, (None, None), token);
     let inner = block.inner(area);
     let turns = match t.turns {
         1 => " · 1 turn".to_string(),
@@ -5207,8 +5364,8 @@ fn render_orch_banner(
     let attn = attention_rows(state, orch, usize::from(inner.width), false);
     let body = CardBody {
         section: Vec::new(),
+        one: None,
         attn,
-        who: None,
         git: None,
     };
     let (rows, drawn) = card_rows(body, inner.height, inner.width);
@@ -8654,14 +8811,15 @@ mod tests {
 
         let beta_card = pane_text(&st, &lines, &card("t-beta"));
         assert!(beta_card.contains("│waiting "), "{beta_card}");
-        assert!(beta_card.contains("│fake · default model "), "{beta_card}");
+        // The title: the name, the model (the side column at 120 has no room for the project
+        // and the runtime), the mode at the top right; none of it on a row of its own.
         assert!(
-            beta_card.contains("manual ┐"),
-            "the mode, top right: {beta_card}"
+            beta_card.starts_with("┌ beta ──── default model ─ manual ┐"),
+            "{beta_card}"
         );
-        // The project is in the title, not on a row of its own.
-        assert!(beta_card.contains("┌ proj · beta "), "{beta_card}");
-        assert_eq!(beta_card.matches("proj").count(), 1, "{beta_card}");
+        assert!(!beta_card.contains("proj"), "{beta_card}");
+        let body = beta_card.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert!(!card_words(&body).contains("default model"), "{beta_card}");
         assert!(beta_card.contains(" PERMISSION  Bash: rm -rf target"));
         assert!(beta_card.contains("1 allow  2 deny"));
         assert!(beta_card.contains("note: build dir only"));
@@ -8674,7 +8832,11 @@ mod tests {
         let gamma_card = pane_text(&st, &lines, &card("t-gamma"));
         assert!(gamma_card.contains("running "), "{gamma_card}");
         assert!(
-            gamma_card.contains("│fake · default model "),
+            gamma_card
+                .lines()
+                .next()
+                .unwrap()
+                .contains(" default model "),
             "{gamma_card}"
         );
         assert!(!gamma_card.contains("PERMISSION"));
@@ -8752,16 +8914,13 @@ mod tests {
             let text = pane_text(&st, &lines, &card("t-gamma"));
             let rows: Vec<&str> = text.lines().collect();
             assert_eq!(rows.len(), usize::from(height), "{w}:\n{text}");
-            assert!(rows[0].contains("┌ proj · gamma "), "{w}:\n{text}");
+            assert!(rows[0].contains("┌ gamma "), "{w}:\n{text}");
             assert!(
                 rows[1].starts_with("│_ running · implementing"),
                 "{w}:\n{text}"
             );
             assert!(rows[2].contains("anchoring"), "wrapped: {w}:\n{text}");
-            assert!(
-                rows[rows.len() - 2].contains("│fake · default model"),
-                "{w}:\n{text}"
-            );
+            assert!(rows[0].contains(" default mo"), "{w}:\n{text}");
         }
     }
 
@@ -9941,11 +10100,7 @@ mod tests {
         let top = &lines[r(0)];
         let at = |n: &str| col(top, &format!(" {n} ")).unwrap();
         assert!(at("beta") < at("alpha") && at("alpha") < at("gamma") && at("gamma") < at("eps"));
-        assert!(
-            lines[r(1)].starts_with("┌ proj · delta "),
-            "{}",
-            lines[r(1)]
-        );
+        assert!(lines[r(1)].starts_with("┌ delta "), "{}", lines[r(1)]);
         // No transcript in the grid; the input box and the status bar stay.
         let s = screen(&lines);
         assert!(!s.contains("transcript"));
@@ -9953,9 +10108,10 @@ mod tests {
         assert!(lines.last().unwrap().contains("Ctrl-G stack"), "{s}");
     }
 
-    /// A card's title leads with the thread's project, dim (`twr · scroll-follow`), where it
-    /// used to take a row of its own. Narrow, the permission mode keeps its place: the project
-    /// is cut with `…` to the room left, then left out, and the name stays whole.
+    /// A card's title leads with the thread's project, dim (`twr · scroll-follow`), then its
+    /// name; at its right who runs it, then the permission mode. Narrow, the project is cut
+    /// with `…` to the room left, then left out; then the runtime gives way, the model is cut,
+    /// then left out; then the mode. The name stays whole.
     #[test]
     fn the_project_leads_the_title_and_gives_way_first() {
         assert_eq!(title_project(Some("twr"), 20).as_deref(), Some("twr"));
@@ -9978,33 +10134,56 @@ mod tests {
         }
         crate::app::tests::control(&mut st, &[created]);
         st.set_focus(Some("t-long".into()));
-        let title = |st: &mut AppState, w: u16| {
-            let lines = draw_panes(st, w, 40);
-            let text = pane_text(st, &lines, &card("t-long"));
-            text.lines().next().unwrap().to_string()
+        // The title of a card `w` wide, as its block draws it.
+        let title = |st: &AppState, w: u16| {
+            let t = st.registry.get("t-long").unwrap();
+            let (block, _) = card_block(st, t, false, w);
+            let mut buf = Buffer::empty(Rect::new(0, 0, w, 3));
+            ratatui::widgets::Widget::render(block, Rect::new(0, 0, w, 3), &mut buf);
+            (0..w).map(|x| buf[(x, 0)].symbol()).collect::<String>()
         };
-        // Beside the conversation it fits whole; in the row above it, the narrower the card,
-        // the shorter, until the name and the mode leave it no room.
-        for (w, project) in [
-            (160, Some("orbit-webapp")),
-            (99, Some("or…")),
-            (36, Some("orbit…")),
-            (30, None),
+        // As the card narrows: the project is cut, then left out; then the runtime goes, the
+        // model is cut, then goes; then the mode. The name stays whole.
+        for (w, project, who, mode) in [
+            (70, Some("orbit-webapp"), Some("fake · default model"), true),
+            (64, Some("orbit-webapp"), Some("fake · default model"), true),
+            (58, Some("orbit…"), Some("fake · default model"), true),
+            (55, Some("or…"), Some("fake · default model"), true),
+            (54, None, Some("fake · default model"), true),
+            (49, None, Some("fake · default model"), true),
+            (48, None, Some("default model"), true),
+            (42, None, Some("default model"), true),
+            (36, None, Some("defaul…"), true),
+            (33, None, Some("def…"), true),
+            (32, None, None, true),
+            (26, None, None, true),
+            (25, None, None, false),
+            (17, None, None, false),
         ] {
-            let t = title(&mut st, w);
+            let t = title(&st, w);
+            let what = format!("{w}: {t:?}");
+            assert_eq!(crate::edit::width(&t), usize::from(w), "{what}");
             match project {
-                Some(p) => assert!(t.contains(&format!("┏ {p} · scroll-follow ")), "{w}: {t}"),
-                None => assert!(
-                    t.contains("┏ scroll-follow ") && !t.contains("orbit") && !t.contains("or…"),
-                    "{w}: {t}"
-                ),
+                Some(p) => assert!(t.starts_with(&format!("┌ {p} · scroll-follow ")), "{what}"),
+                None => assert!(t.starts_with("┌ scroll-follow "), "{what}"),
             }
-            assert!(t.contains(" manual "), "{w}: {t}");
+            match who {
+                Some(who) => {
+                    assert!(t.contains(&format!(" {who} ")), "{what}");
+                    assert_eq!(t.contains(" fake "), who.starts_with("fake"), "{what}");
+                }
+                None => assert!(!t.contains("fake") && !t.contains("def"), "{what}"),
+            }
+            assert_eq!(t.contains(" manual "), mode, "{what}");
         }
-        // The tile's title says it too; its turns go after its git state.
+        // A tile's title follows the same rules (a 45-column tile leaves the project out);
+        // its turns go after its git state.
         st.view.screen = Screen::Grid;
         let s = screen(&draw(&st, 180, 30));
-        assert!(s.contains(" orbit-webapp · scroll-follow "), "{s}");
+        assert!(
+            s.contains("┏ scroll-follow ━━━━ default model ━ manual ┓"),
+            "{s}"
+        );
         assert!(!s.contains("orbit-webapp · 0 turns"), "{s}");
         assert!(s.contains("no git snapshot · 0 turns"), "{s}");
     }
@@ -10116,7 +10295,7 @@ mod tests {
     /// work or why it failed (an activity line that starts with the state's word goes on from
     /// it), else its last report, cut to the rows the card has. Never the activity and the
     /// report both, never a report of an earlier turn while it works, never a `report:` label
-    /// or a `›`. Who runs it is its last row (these threads have no git state). In the column
+    /// or a `›`. Who runs it is in the title. In the column
     /// (34, 40 and 48 columns), the row above a narrow conversation, the grid, and the compact
     /// layout's Threads screen (40 columns).
     #[test]
@@ -10151,7 +10330,7 @@ mod tests {
             ("park", &["parked · An earlier turn's report."], &[]),
             ("stop", &["stopped · An earlier turn's report."], &[]),
         ];
-        let check = |what: &str, text: &str, name: &str, footer: bool| {
+        let check = |what: &str, text: &str, name: &str| {
             let (_, has, not) = expect.iter().find(|e| e.0 == name).unwrap();
             let body: Vec<String> = text
                 .lines()
@@ -10177,17 +10356,10 @@ mod tests {
             for n in ["report:", "›"] {
                 assert!(!text.contains(n), "{what} {name}: not {n}\n{text}");
             }
-            if footer {
-                let last = body
-                    .iter()
-                    .rev()
-                    .find(|l| !l.contains('─') && !l.contains('━'));
-                assert_eq!(
-                    last.map(String::as_str),
-                    Some("fake · default model"),
-                    "{what} {name}\n{text}"
-                );
-            }
+            // Who runs it is in the title (its model cut on a narrow card), not in the section.
+            let title = text.lines().next().unwrap_or_default();
+            assert!(title.contains("default m"), "{what} {name}\n{text}");
+            assert!(!words.contains("default model"), "{what} {name}\n{text}");
         };
         for w in [100, 134, 160] {
             let mut st = one_of_each_state();
@@ -10198,7 +10370,7 @@ mod tests {
             );
             for (name, ..) in &expect {
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-                check(&format!("column {w}"), &text, name, true);
+                check(&format!("column {w}"), &text, name);
             }
         }
         // The row of cards above a narrow conversation: each card, selected to show it.
@@ -10213,7 +10385,7 @@ mod tests {
                     assert!(text.contains("Tests run in the"), "row {w}:\n{text}");
                     continue;
                 }
-                check(&format!("row {w}"), &text, name, true);
+                check(&format!("row {w}"), &text, name);
             }
         }
         let mut st = one_of_each_state();
@@ -10221,7 +10393,7 @@ mod tests {
         let lines = draw_panes(&mut st, 160, 60);
         for (name, ..) in &expect {
             let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-            check("grid", &text, name, false);
+            check("grid", &text, name);
         }
         // The compact layout's Threads: each card, selected (so it is in view).
         for (name, ..) in &expect {
@@ -10236,7 +10408,7 @@ mod tests {
                 assert!(text.contains("Tests run in the"), "compact:\n{text}");
                 continue;
             }
-            check("compact", &text, name, true);
+            check("compact", &text, name);
         }
     }
 
@@ -10641,8 +10813,11 @@ mod tests {
         };
         let beta = tile(0);
         assert!(beta.contains("│waiting "), "{beta}");
-        assert!(beta.contains("│fake · default model "), "{beta}");
-        assert!(beta.contains(" proj · beta "), "{beta}");
+        // Its title: name, who runs it and the mode (no room for the project).
+        assert!(
+            beta.starts_with("┌ beta ────── fake · default model ─ manual ┐"),
+            "{beta}"
+        );
         assert!(beta.contains("no git snapshot · 1 turn"), "{beta}");
         assert!(beta.contains(" PERMISSION  Bash: rm -rf target"));
         // An open item shows its options (what an option key answers) instead of the report.
@@ -10684,12 +10859,13 @@ mod tests {
 
         // Stack view at 180: beta, alpha, delta, gamma, eps (36 columns each).
         let mut st = st;
-        // A row of cards at 90 columns: beta, alpha, delta (30 columns each).
+        // A row of cards at 90 columns: beta, alpha, delta (30 columns each, too narrow for
+        // the project: the name at x = 2).
         st.view.screen = Screen::Stack;
         let buf = draw_buf(&st, 90, 30);
-        assert_eq!(buf[(9 + 2 * 30, 0)].symbol(), "d");
-        assert!(buf[(9 + 2 * 30, 0)].modifier.contains(Modifier::DIM));
-        assert!(!buf[(9 + 30, 0)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(2 + 2 * 30, 0)].symbol(), "d");
+        assert!(buf[(2 + 2 * 30, 0)].modifier.contains(Modifier::DIM));
+        assert!(!buf[(2 + 30, 0)].modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -11504,8 +11680,8 @@ mod tests {
     #[test]
     fn cards_tiles_and_the_main_pane_say_runtime_and_model() {
         let mut st = model_threads();
-        // Wide: the cards in a column, who runs each on its last row (they have no git state);
-        // no orchestrator card.
+        // Wide: the cards in a column, who runs each in its title, before its mode; no
+        // orchestrator card.
         let lines = draw_panes(&mut st, 160, 40);
         for (id, want) in [
             ("t-ops", "claude-code · opus-4-1"),
@@ -11514,9 +11690,10 @@ mod tests {
             ("t-sh", "pty · default model"),
         ] {
             let c = pane_text(&st, &lines, &card(id));
-            let rows: Vec<&str> = c.lines().collect();
-            let last = rows[rows.len() - 2].trim_matches(['│', '┃', ' ']);
-            assert_eq!(last, want, "{c}");
+            let title = c.lines().next().unwrap();
+            assert!(title.contains(&format!(" {want} ")), "{c}");
+            let body = c.lines().skip(1).collect::<Vec<_>>().join("\n");
+            assert!(!card_words(&body).contains(want), "not in the body: {c}");
         }
         assert!(st.view.panes.get(&card("t-orch")).is_none());
         // The main pane is the orchestrator's: its full model id.
@@ -11548,24 +11725,18 @@ mod tests {
         st.back();
         st.set_focus(Some("t-ops".into()));
 
-        // Narrow: one 30-column card; the state first, who runs it last.
+        // Narrow: one 30-column card; its title drops the project and the runtime, keeps
+        // the model and the mode.
         let lines = draw(&st, 30, 24);
-        assert!(
-            lines[0].contains("┏ proj · ops ") && lines[0].contains(" manual "),
+        assert_eq!(
+            lines[0],
+            "┏ ops ━━━━ opus-4-1 ━ manual ┓",
             "{}",
-            lines[0]
+            screen(&lines)
         );
         assert_eq!(
             lines[1].trim_matches(['┃', ' ']),
             "idle · not started",
-            "{}",
-            screen(&lines)
-        );
-        // (A row of cards: the tall card's height.)
-        let who = usize::from(CARD_HEIGHT) - 2;
-        assert_eq!(
-            lines[who].trim_matches(['┃', ' ']),
-            "claude-code · opus-4-1",
             "{}",
             screen(&lines)
         );
@@ -11578,15 +11749,16 @@ mod tests {
         assert!(s.contains("pty · default model"), "{s}");
         assert!(s.contains("grid · 4 threads"), "no orchestrator tile: {s}");
         let lines = draw(&st, 28, 30);
-        let at = lines
-            .iter()
-            .position(|l| l.starts_with("┏ proj · ops "))
-            .unwrap();
-        let body = |i: usize| lines[at + i].trim_matches(['┃', ' ']).to_string();
-        let who = usize::from(TILE_HEIGHT) - 3;
+        let at = lines.iter().position(|l| l.starts_with("┏ ops ")).unwrap();
         assert_eq!(
-            [body(1), body(who)],
-            ["idle · not started", "claude-code · opus-4-1"],
+            lines[at],
+            "┏ ops ━━ opus-4-1 ━ manual ┓",
+            "{}",
+            screen(&lines)
+        );
+        assert_eq!(
+            lines[at + 1].trim_matches(['┃', ' ']),
+            "idle · not started",
             "{}",
             screen(&lines)
         );
@@ -11709,9 +11881,9 @@ mod tests {
         ]
     }
 
-    /// A thread on a remote box carries its box token on its card, its tile, its compact row
-    /// (only when the box is not simply online) and the dive header, in every state; a local
-    /// thread never names its box; the cards keep their heights.
+    /// A thread on a remote box carries its box token in the title of its card, its tile and
+    /// its compact card, and in the dive header, in every state; a local thread never names its
+    /// box; the cards keep their heights.
     #[test]
     fn a_remote_thread_shows_its_box_token() {
         use crate::app::CompactPane;
@@ -11727,14 +11899,15 @@ mod tests {
         let mut heights = None;
         for (gpu, word) in box_cases() {
             let mut st = box_threads(gpu);
-            // Stack cards, wide: who runs it on the row over the git line.
+            // Stack cards, wide: who runs it in the title.
+            let title = |text: &str| text.lines().next().unwrap_or_default().to_string();
             let lines = draw_panes(&mut st, 160, 40);
             let c = pane_text(&st, &lines, &card("t-job"));
-            let want = format!("codex@gpu{word} · gpt-5-codex");
-            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            assert!(has_token(&title(&c), "gpu", word), "{c}");
+            assert!(title(&c).contains("gpt"), "{c}");
             assert!(c.contains("idle · not started"), "{c}");
             let l = pane_text(&st, &lines, &card("t-loc"));
-            assert!(l.contains("claude-code · sonnet"), "{l}");
+            assert!(title(&l).contains("claude-code · sonnet"), "{l}");
             assert!(!l.contains('@'), "{l}");
             // Narrow: the same heights whatever the token says.
             let narrow = draw_panes(&mut st, 30, 40);
@@ -11749,33 +11922,27 @@ mod tests {
             }
             let at = narrow
                 .iter()
-                .position(|l| l.starts_with("┏ proj · job "))
+                .position(|l| l.starts_with("┏ job "))
                 .unwrap_or_else(|| panic!("{}", screen(&narrow)));
             let body = |i: usize| narrow[at + i].trim_matches(['┃', ' ']).to_string();
             assert_eq!(body(1), "idle · not started", "{}", screen(&narrow));
-            // The model gives way first, on the card's last row (it has no git state).
-            let bottom = narrow[at..]
-                .iter()
-                .position(|l| l.starts_with('┗'))
-                .unwrap();
-            let who = body(bottom - 1);
-            let second = format!("codex@gpu{word} · gpt-5-codex");
-            if second.chars().count() <= 28 {
-                assert_eq!(who, second, "{}", screen(&narrow));
-            } else {
-                assert!(
-                    who.starts_with(&format!("codex@gpu{word}")) && who.ends_with('…'),
-                    "{}",
-                    screen(&narrow)
-                );
-            }
+            // The project and the runtime give way, never the box's state.
+            assert!(has_token(&narrow[at], "gpu", word), "{}", screen(&narrow));
 
             // Grid tiles.
             st.view.screen = Screen::Grid;
-            let g = screen(&draw(&st, 180, 30));
-            assert!(g.contains(&second), "{second:?} missing:\n{g}");
-            assert!(g.contains("claude-code · sonnet"), "{g}");
-            assert!(!g.contains("@local"), "{g}");
+            let g = draw(&st, 180, 30);
+            assert!(
+                g.iter().any(|l| has_token(l, "gpu", word)),
+                "{}",
+                screen(&g)
+            );
+            assert!(
+                screen(&g).contains("claude-code · sonnet"),
+                "{}",
+                screen(&g)
+            );
+            assert!(!screen(&g).contains("@local"), "{}", screen(&g));
             st.view.screen = Screen::Stack;
 
             // Compact Threads cards: the same as in the column.
@@ -11784,7 +11951,7 @@ mod tests {
             st.set_focus(Some("t-job".into()));
             let lines = draw_panes(&mut st, 50, 20);
             let c = pane_text(&st, &lines, &card("t-job"));
-            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            assert!(has_token(&title(&c), "gpu", word), "{c}");
             st.view.compact = Some(false);
 
             // The dive header, wide and narrow: the token of a box not simply online stays.
@@ -11843,20 +12010,23 @@ mod tests {
     fn a_removed_box_is_not_configured_once_the_boxes_are_known() {
         use crate::app::CompactPane;
         let shows = |st: &mut AppState, word: &str| {
+            // In the title of its card, tile and compact card.
             let lines = draw_panes(st, 160, 40);
             let c = pane_text(st, &lines, &card("t-job"));
-            let want = format!("codex@gpu{word} · gpt-5-codex");
-            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            assert!(has_token(c.lines().next().unwrap(), "gpu", word), "{c}");
             st.view.screen = Screen::Grid;
-            let g = screen(&draw(st, 180, 30));
-            let want = format!("codex@gpu{word} · gpt-5-codex");
-            assert!(g.contains(&want), "{want:?} missing:\n{g}");
+            let g = draw(st, 180, 30);
+            assert!(
+                g.iter().any(|l| has_token(l, "gpu", word)),
+                "{}",
+                screen(&g)
+            );
             st.view.screen = Screen::Stack;
             st.view.compact = Some(true);
             st.view.compact_pane = CompactPane::Threads;
             let lines = draw_panes(st, 50, 20);
             let c = pane_text(st, &lines, &card("t-job"));
-            assert!(c.contains(&want), "{want:?} missing:\n{c}");
+            assert!(has_token(c.lines().next().unwrap(), "gpu", word), "{c}");
             st.view.compact = Some(false);
             st.dive("t-job");
             assert_eq!(
@@ -11889,13 +12059,13 @@ mod tests {
         // The hub's boxes, without `gpu`.
         st.apply_boxes(&box_snapshot(removed_box("gpu")));
         shows(&mut st, " not configured");
-        // In red, on the card.
+        // In red, in the card's title.
         let buf = draw_buf(&st, 160, 40);
         let (x, y) = (0..40u16)
             .find_map(|y| {
                 let row: String = (0..160u16).map(|x| buf[(x, y)].symbol()).collect();
-                row.find("codex@gpu not configured").map(|i| {
-                    let at = row[..i + "codex@gpu ".len()].chars().count();
+                row.find("@gpu not configured").map(|i| {
+                    let at = row[..i + "@gpu ".len()].chars().count();
                     (u16::try_from(at).unwrap(), y)
                 })
             })
@@ -11910,9 +12080,9 @@ mod tests {
         shows(&mut st, "");
     }
 
-    /// A thread's box token follows the box at once: a `runner.disconnected` makes it
-    /// `offline`, a `runner.connected` plain again, a working card's line cut at its end (the
-    /// model) to make room for the icon keeps the token.
+    /// A thread's box token follows the box at once, in its card's title: a
+    /// `runner.disconnected` makes it `offline`, a `runner.connected` plain again; cut to the
+    /// room it has, the runtime gives way, never the token.
     #[test]
     fn a_box_token_follows_its_runner_and_keeps_its_place() {
         use crate::app::tests::{control, info_box};
@@ -11925,28 +12095,32 @@ mod tests {
         };
         let down = hub.event(EventBody::RunnerDisconnected(runner.clone()));
         control(&mut st, &[down]);
-        let lines = draw_panes(&mut st, 160, 40);
-        let c = pane_text(&st, &lines, &card("t-job"));
-        assert!(c.contains("codex@gpu offline · gpt-5-codex"), "{c}");
+        let title = |st: &mut AppState| {
+            let lines = draw_panes(st, 160, 40);
+            pane_text(st, &lines, &card("t-job"))
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let c = title(&mut st);
+        assert!(c.contains("@gpu offline · gpt-5-codex"), "{c}");
         let up = hub.event(EventBody::RunnerConnected(runner));
         control(&mut st, &[up]);
-        let lines = draw_panes(&mut st, 160, 40);
-        let c = pane_text(&st, &lines, &card("t-job"));
+        let c = title(&mut st);
         assert!(c.contains("codex@gpu · gpt-5-codex"), "{c}");
-        // Exactly as wide as the row, and a cell narrower: the model gives way, never the
-        // token. A working thread's icon is on its status row, not this one.
+        // Exactly as wide as the room, and a cell narrower: the runtime gives way, never the
+        // token.
         let st = box_threads_working(info_box("gpu", "offline"), true);
         let job = st.registry.get("t-job").unwrap();
+        let who = |room: usize| {
+            who_fit(&st, job, room)
+                .map(|w| Line::from(w).to_string())
+                .unwrap_or_default()
+        };
         let whole = "codex@gpu offline · gpt-5-codex";
-        assert_eq!(
-            who_line(&st, job, whole.chars().count()).0.to_string(),
-            whole
-        );
-        let text = who_line(&st, job, whole.chars().count() - 1).0.to_string();
-        assert!(
-            text.starts_with("codex@gpu offline · gpt") && text.ends_with('…'),
-            "{text}"
-        );
+        assert_eq!(who(whole.chars().count()), whole);
+        assert_eq!(who(whole.chars().count() - 1), "@gpu offline · gpt-5-codex");
     }
 
     /// One thread `t-job` named `name` on box `box_name` (codex, reporting `gpt-5-codex`),
@@ -12005,14 +12179,15 @@ mod tests {
         })
     }
 
-    /// A card's or tile's header cut to its width cuts the model first, then the runtime,
-    /// then the box's name, never the box's state: at a card's narrowest (28 cells inside), a
-    /// 30-column tile, the side column's 32 and a tile's narrowest (38), idle or working, for
-    /// box names up to 64 characters and every state. Every row fits.
+    /// Who runs a thread, as a card's or tile's title says it, cut to the room it has: the
+    /// runtime goes first, then the model is cut, then left out, then the box's name is cut,
+    /// never the box's state; for box names up to 64 characters, every state, idle or working,
+    /// at rooms from a narrow card's to a wide tile's. It always fits.
     #[test]
-    fn a_card_header_cut_keeps_the_box_state() {
+    fn who_runs_it_gives_way_but_for_the_box_state() {
         use crate::app::tests::info_box;
         let cells = crate::edit::width;
+        let text = |w: Option<Vec<Span<'static>>>| w.map(|w| Line::from(w).to_string());
         for name in box_names() {
             for (entry, word) in box_cases() {
                 for working in [false, true] {
@@ -12024,51 +12199,64 @@ mod tests {
                         }
                     });
                     let job = st.registry.get("t-job").unwrap();
-                    for width in [28usize, 32, 38] {
-                        let rows = vec![who_line(&st, job, width).0.to_string()];
-                        let what = format!("{name:?}{word} {width} {working}: {rows:#?}");
-                        assert!(rows.iter().all(|r| cells(r) <= width), "{what}");
-                        let last = rows.last().unwrap();
-                        assert!(has_token(last, &name, word), "{what}");
-                        // The runtime stays while the whole token leaves it room.
-                        let head = format!("codex@{name}{word}");
-                        if cells(&head) <= width {
-                            assert!(last.starts_with(&head), "{what}");
-                        }
-                        // The box's name is cut only once the runtime is gone.
-                        if !last.contains(&format!("@{name}{word}")) {
-                            assert!(last.starts_with('@'), "{what}");
+                    for room in [14usize, 20, 26, 32, 38, 46] {
+                        let what = format!("{name:?}{word} {room} {working}");
+                        let Some(who) = text(who_fit(&st, job, room)) else {
+                            // Nothing fits only a room narrower than the token at its narrowest.
+                            assert!(room < 2 + cells(word), "{what}");
+                            continue;
+                        };
+                        let what = format!("{what}: {who:?}");
+                        assert!(cells(&who) <= room, "{what}");
+                        assert!(has_token(&who, &name, word), "{what}");
+                        // The runtime only with the whole model, the box's name cut only with
+                        // the model gone.
+                        let whole = format!("codex@{name}{word} · gpt-5-codex");
+                        assert_eq!(who.starts_with("codex"), cells(&whole) <= room, "{what}");
+                        if !who.contains(&format!("@{name}{word}")) {
+                            assert!(!who.contains("gpt"), "{what}");
                         }
                     }
                 }
             }
         }
-        // The bug cases: a token exactly as wide as the row, and one a cell narrower, are not
-        // cut at their end.
-        let at = |name: &str, state: &str, width: usize| {
-            let st = on_box("job", name, info_box(name, state), |_| Vec::new());
-            let job = st.registry.get("t-job").unwrap();
-            vec![who_line(&st, job, width).0.to_string()]
-        };
-        let upd = |name: &str, width| {
+        let upd = |name: &str, room| {
             let mut e = info_box(name, "online");
             e["switch_pending"] = true.into();
             let st = on_box("job", name, e, |_| Vec::new());
             let job = st.registry.get("t-job").unwrap();
-            vec![who_line(&st, job, width).0.to_string()]
+            text(who_fit(&st, job, room)).unwrap_or_default()
         };
-        assert_eq!(upd("gpubox7", 28), ["codex@gpubox7 update pending"]);
-        assert_eq!(upd("gpu-box-123", 32), ["codex@gpu-box-123 update pending"]);
-        assert_eq!(upd("gpu-box-12", 32), ["codex@gpu-box-12 update pending"]);
-        assert_eq!(upd("gpu-box-123", 28), ["…@gpu-box-123 update pending"]);
+        assert_eq!(upd("gpubox7", 28), "@gpubox7 update pending");
         assert_eq!(
-            at("gpu-workstation-01", "needs_install", 32),
-            ["@gpu-workstation-… needs install"]
+            upd("gpu-box-12", 40),
+            "@gpu-box-12 update pending · gpt-5-codex"
         );
-        // A local thread's header is cut at its end, as ever.
+        assert_eq!(
+            upd("gpu-box-123", 36),
+            "@gpu-box-123 update pending · gpt-5…"
+        );
+        let st = on_box(
+            "job",
+            "gpu-workstation-01",
+            info_box("gpu-workstation-01", "needs_install"),
+            |_| Vec::new(),
+        );
+        let job = st.registry.get("t-job").unwrap();
+        assert_eq!(
+            text(who_fit(&st, job, 32)).unwrap_or_default(),
+            "@gpu-workstation-… needs install"
+        );
+        // A local thread: its runtime, then its model alone, cut, then nothing.
         let st = box_threads(info_box("gpu", "online"));
         let loc = st.registry.get("t-loc").unwrap();
-        assert_eq!([who_line(&st, loc, 12).0.to_string()], ["claude-code…"]);
+        assert_eq!(
+            text(who_fit(&st, loc, 40)).as_deref(),
+            Some("claude-code · sonnet")
+        );
+        assert_eq!(text(who_fit(&st, loc, 12)).as_deref(), Some("sonnet"));
+        assert_eq!(text(who_fit(&st, loc, 4)).as_deref(), Some("son…"));
+        assert_eq!(text(who_fit(&st, loc, 3)), None);
     }
 
     /// The same, drawn: a card at its narrowest (30 columns), in the side column (34), a
@@ -12102,13 +12290,11 @@ mod tests {
     }
 
     /// A tall card with a request whose summary wraps to 5 rows, its options, why the agent
-    /// asks and how many more wait: the row of who runs it, with the box token of a box not
-    /// online, is kept before the why and the count, and before the state row (the request is
-    /// whole first; the request says the thread waits); a box online gives that row way first.
-    /// A tile (no why, no count: `(+1)` after the summary) keeps the request whole and its
-    /// state row.
+    /// asks and how many more wait: its state row first, then the request whole, then the note
+    /// and the count; the box token, in the title, says the box's state whatever it is. A tile
+    /// (no why, no count: `(+1)` after the summary) keeps its state row and the request whole.
     #[test]
-    fn a_tall_card_keeps_the_box_state_before_the_requests_note() {
+    fn a_tall_card_keeps_its_state_and_the_box_state_with_a_long_request() {
         use crate::app::tests::info_box;
         let raise = |s: &mut ThreadScript, id: &str| {
             let mut perm = s.raise(id, AttentionReason::Permission);
@@ -12121,11 +12307,7 @@ mod tests {
             }
             perm
         };
-        for (state, kept) in [
-            ("offline", true),
-            ("needs_install", true),
-            ("online", false),
-        ] {
+        for state in ["offline", "needs_install", "online"] {
             let mut st = on_box("job", "gpubox7", info_box("gpubox7", state), |s| {
                 vec![s.turn_started("go"), raise(s, "pm1"), raise(s, "pm2")]
             });
@@ -12145,34 +12327,22 @@ mod tests {
             } else {
                 ""
             };
-            assert_eq!(
-                pane.lines().any(|r| has_token(r, "gpubox7", word)),
-                kept,
-                "{state}: {pane}"
-            );
-            // The note and the count either way: the state row gives way to the box's.
+            assert!(has_token(rows[0], "gpubox7", word), "{state}: {pane}");
+            assert!(rows[1].contains("waiting"), "{pane}");
             assert!(
                 pane.contains("why: Git") && pane.contains("+1 more"),
                 "{pane}"
             );
-            if kept {
-                let last = rows[rows.len() - 2];
-                assert!(last.contains(&format!("codex@gpubox7{word}")), "{pane}");
-                assert!(!pane.contains("waiting"), "{pane}");
-            } else {
-                assert!(rows[1].contains("waiting"), "{pane}");
-            }
-            // The tile at 40 columns: the request whole, then the row of a box not online, else
-            // the state row.
+            // The tile at 40 columns: the state row, then the request whole.
             st.view.screen = Screen::Grid;
             let lines = draw_panes(&mut st, 40, 40);
             let tile = pane_text(&st, &lines, &card("t-job"));
             assert!(tile.contains("1 allow") && tile.contains("(+1)"), "{tile}");
-            if kept {
-                assert!(tile.contains(&format!("codex@gpubox7{word}")), "{tile}");
-            } else {
-                assert!(tile.lines().nth(1).unwrap().contains("waiting"), "{tile}");
-            }
+            assert!(tile.lines().nth(1).unwrap().contains("waiting"), "{tile}");
+            assert!(
+                has_token(tile.lines().next().unwrap(), "gpubox7", word),
+                "{tile}"
+            );
         }
     }
 
@@ -12473,7 +12643,7 @@ mod tests {
         assert!(c.contains("claude-code · sonnet · high"), "{c}");
         st.view.screen = Screen::Grid;
         let g = screen(&draw(&st, 180, 30));
-        assert!(g.contains("claude-code · sonnet · high"), "{g}");
+        assert!(g.contains(" sonnet · high "), "{g}");
         st.view.screen = Screen::Stack;
         st.dive("t-web");
         let d = screen(&draw(&st, 160, 30));
@@ -13095,7 +13265,8 @@ mod tests {
             text(&option_rows(&opts, 40)),
             ["1 yes", "2 no,", "not now", "3 later"]
         );
-        // A card keeps the item whole first; the section gives way, then its footer.
+        // The section's first row is kept first, then the item whole; then the git line, the
+        // section's second row, the note, and the rest of the section.
         let l = |s: &str| Line::from(s.to_string());
         let attn = |core: &[&str], extra: &[&str]| {
             Some(Arc::new(AttnRows {
@@ -13106,45 +13277,67 @@ mod tests {
                 complete: true,
             }))
         };
-        let body = |kept: bool| CardBody {
-            section: vec![l("waiting")],
+        let body = || CardBody {
+            section: vec![l("running · one"), l("two"), l("three")],
+            one: None,
             attn: attn(&["Q", "1 a"], &["note"]),
-            who: Some((l("codex@gpu offline"), kept)),
             git: Some(l("twr/q")),
         };
-        let (rows, drawn) = card_rows(body(false), 6, 40);
+        let (rows, drawn) = card_rows(body(), 8, 40);
         assert_eq!(drawn, Some(("a".to_string(), 1)));
         assert_eq!(
             text(&rows),
-            ["waiting", "Q", "1 a", "note", "codex@gpu offline", "twr/q"]
+            [
+                "running · one",
+                "two",
+                "three",
+                "Q",
+                "1 a",
+                "note",
+                "",
+                "twr/q"
+            ]
         );
-        // Who runs it gives way before the git line, the git line before the state.
-        let (rows, _) = card_rows(body(false), 5, 40);
-        assert_eq!(text(&rows), ["waiting", "Q", "1 a", "note", "twr/q"]);
-        let (rows, _) = card_rows(body(false), 4, 40);
-        assert_eq!(text(&rows), ["waiting", "Q", "1 a", "note"]);
-        let (rows, _) = card_rows(body(false), 3, 40);
-        assert_eq!(text(&rows), ["Q", "1 a", "note"]);
-        // The row of a box not online kept first: the note gives way to it.
-        let (rows, _) = card_rows(body(true), 3, 40);
-        assert_eq!(text(&rows), ["Q", "1 a", "codex@gpu offline"]);
-        let short = CardBody {
-            section: vec![],
-            attn: attn(&["Q", "1 a"], &[]),
-            who: None,
-            git: None,
-        };
-        let (_, drawn) = card_rows(short, 1, 40);
+        for (h, want) in [
+            (
+                7,
+                &["running · one", "two", "three", "Q", "1 a", "note", "twr/q"][..],
+            ),
+            (6, &["running · one", "two…", "Q", "1 a", "note", "twr/q"]),
+            (5, &["running · one", "two…", "Q", "1 a", "twr/q"]),
+            (4, &["running · one…", "Q", "1 a", "twr/q"]),
+            (3, &["running · one…", "Q", "1 a"]),
+        ] {
+            let (rows, drawn) = card_rows(body(), h, 40);
+            assert_eq!(text(&rows), want, "{h}");
+            assert!(drawn.is_some(), "{h}");
+        }
+        // Too short for the item beside the first row: that row stays, the item is cut and
+        // not drawn whole.
+        let (rows, drawn) = card_rows(body(), 2, 40);
+        assert_eq!(text(&rows), ["running · one…", "Q"]);
         assert_eq!(drawn, None, "the item is not drawn whole");
-        // No item: the section's later rows give way first, its last one shown ending in `…`.
+        let (rows, _) = card_rows(body(), 1, 40);
+        assert_eq!(text(&rows), ["running · one…"]);
+        // No item: the section's later rows give way to the git line, its last one shown
+        // ending in `…`.
         let plain = || CardBody {
-            section: vec![l("done ✓ · one"), l("two"), l("three")],
+            section: vec![
+                l("done ✓ · one"),
+                l("two"),
+                l("three"),
+                l("four"),
+                l("five"),
+            ],
+            one: None,
             attn: None,
-            who: Some((l("fake · m"), false)),
             git: Some(l("twr/q")),
         };
-        let (rows, _) = card_rows(plain(), 4, 40);
-        assert_eq!(text(&rows), ["done ✓ · one", "two…", "fake · m", "twr/q"]);
+        let (rows, _) = card_rows(plain(), 5, 40);
+        assert_eq!(
+            text(&rows),
+            ["done ✓ · one", "two", "three", "four…", "twr/q"]
+        );
         let (rows, _) = card_rows(plain(), 2, 40);
         assert_eq!(text(&rows), ["done ✓ · one…", "twr/q"]);
     }
@@ -13160,7 +13353,7 @@ mod tests {
         let mut st = three_threads();
         let long = format!(
             "implementing scroll anchoring · running tests {}",
-            "x".repeat(200)
+            "x".repeat(400)
         );
         st.apply_result(
             "thread.activity",
@@ -13179,8 +13372,7 @@ mod tests {
                 words.contains("running · implementing scroll anchoring · running tests"),
                 "{w}: {gamma}"
             );
-            // Wrapped over the rows the section has, the last one cut with `…`, the row of
-            // who runs it kept under it.
+            // Wrapped over the rows the section has, the last one cut with `…`.
             let rows: Vec<&str> = gamma.lines().collect();
             // (In the row of cards above a narrow conversation, the tall card's height.)
             let height = if w >= SIDE_MIN_WIDTH {
@@ -13189,17 +13381,17 @@ mod tests {
                 CARD_HEIGHT
             };
             assert_eq!(rows.len(), usize::from(height), "{w}: {gamma}");
-            assert!(rows[rows.len() - 3].contains("x…"), "cut with …: {gamma}");
+            assert!(rows[rows.len() - 2].contains("x…"), "cut with …: {gamma}");
             assert!(
-                rows[rows.len() - 2].contains("fake · default model"),
-                "{gamma}"
+                rows[0].contains("default mo"),
+                "who runs it, in the title: {gamma}"
             );
-            // alpha's review and beta's permission say it, not the activity too.
+            // alpha, running with a review open, still says what it does, above the review;
+            // beta's permission says it waits, not the activity too.
             let alpha = pane_text(&st2, &lines, &card("t-alpha"));
-            assert!(
-                alpha.contains(" REVIEW ") && !alpha.contains("thinking"),
-                "{w}: {alpha}"
-            );
+            let rows: Vec<&str> = alpha.lines().collect();
+            assert!(rows[1].contains("running · thinking"), "{w}: {alpha}");
+            assert!(rows[2].contains(" REVIEW "), "{w}: {alpha}");
             let beta = pane_text(&st2, &lines, &card("t-beta"));
             assert!(
                 beta.contains(" PERMISSION ") && !beta.contains("waiting for"),
@@ -13215,9 +13407,10 @@ mod tests {
         assert!(!gamma.contains("working"), "{gamma}");
         st.view.screen = Screen::Grid;
         let s = screen(&draw(&st, 160, 40));
+        // The tiles the same: alpha's review under what it does, beta's permission alone.
         assert!(
             s.contains("running · implementing scroll")
-                && !s.contains("thinking")
+                && s.contains("│_ running · thinking ")
                 && !s.contains("waiting for you"),
             "{s}"
         );
@@ -13234,11 +13427,20 @@ mod tests {
     /// drawn so; selected, the dive's card is drawn selected.
     #[test]
     fn the_selection_is_drawn_apart_from_where_the_line_goes() {
+        // A title drawn thick (`┏`) or thin (`┌`) for `name`, its project before it or not.
+        let titled = |s: &str, corner: char, name: &str| {
+            [
+                format!("{corner} {name} "),
+                format!("{corner} proj · {name} "),
+            ]
+            .iter()
+            .any(|t| s.contains(t.as_str()))
+        };
         let mut st = three_threads();
         st.set_focus(Some("t-gamma".into()));
         let buf = crate::app::tests::draw(&mut st, 160, 40);
         let s = screen(&buffer_lines(&buf));
-        assert!(s.contains("┏ proj · gamma "), "{s}");
+        assert!(titled(&s, '┏', "gamma"), "{s}");
         // Where the line goes: the header band's fill (the pane has no border).
         assert_eq!(buf[(0, 0)].bg, target_fill(false).bg.unwrap(), "{s}");
         st.set_focus(None);
@@ -13247,7 +13449,7 @@ mod tests {
         st.view.screen = Screen::Grid;
         st.set_focus(Some("t-gamma".into()));
         let s = screen(&draw(&st, 160, 40));
-        assert!(s.contains("┏ proj · gamma "), "a tile too: {s}");
+        assert!(titled(&s, '┏', "gamma"), "a tile too: {s}");
         st.view.screen = Screen::Stack;
         st.dive("t-beta");
         let mut st2 = st.clone();
@@ -13255,11 +13457,11 @@ mod tests {
         let lines = buffer_lines(&buf);
         let s = screen(&lines);
         assert!(!s.contains('┏'), "the dive selects nothing: {s}");
-        let row = lines
-            .iter()
-            .position(|l| l.contains("┌ proj · beta "))
-            .unwrap();
-        let x = col(&lines[row], "┌ proj · beta ").unwrap() as u16;
+        let row = lines.iter().position(|l| titled(l, '┌', "beta")).unwrap();
+        // (The corner of the card whose title names beta.)
+        let x = col(&lines[row], "┌ beta ")
+            .or_else(|| col(&lines[row], "┌ proj · beta "))
+            .unwrap() as u16;
         assert_eq!(buf[(x, row as u16)].fg, target_color(true), "{s}");
         assert_eq!(
             buf[(0, 0)].bg,
@@ -13268,10 +13470,7 @@ mod tests {
         );
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
-        assert!(
-            s.contains("┏ proj · beta "),
-            "selected, the dive's card: {s}"
-        );
+        assert!(titled(&s, '┏', "beta"), "selected, the dive's card: {s}");
     }
 
     /// A worker's request in the conversation shows what it was raised in: why the runtime
@@ -15018,6 +15217,367 @@ mod tests {
                     (row as isize, true),
                     "{width}, row {row} {t:?}: {a:?}"
                 );
+            }
+        }
+    }
+
+    /// A finished thread's report takes the rows its title (who runs it is there now) and its
+    /// fixed height leave: 4 on a card in the column (34 and 48 columns) and on the compact
+    /// Threads screen at 40x20, 8 in the row of cards above a narrow conversation (its cards are
+    /// all 11 rows tall), 6 on a grid tile; its last row ends in `…`, the git line under it.
+    #[test]
+    fn the_status_section_takes_up_to_four_rows() {
+        use crate::app::tests::control;
+        use twr_core::event::Grade;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-rep");
+        let mut report = s.report(Some(1), Grade::Success);
+        if let EventBody::ReportReady(p) = &mut report.body {
+            p.summary = "Rewrote the parser, the lexer and the error messages, ran every test \
+                         twice and pushed the branch after a rebase onto main. "
+                .repeat(4);
+        }
+        let git = s.event(EventBody::GitSnapshot(GitSnapshot {
+            branch: Some("twr/rep".into()),
+            base: Some("refs/heads/dev".into()),
+            base_ahead: Some(1),
+            base_behind: Some(0),
+            ..Default::default()
+        }));
+        let evs = [
+            s.created("rep"),
+            s.turn_started("go"),
+            s.turn_ended(TurnResult::Completed),
+            report,
+            git,
+        ];
+        control(&mut st, &evs);
+        st.set_focus(Some("t-rep".into()));
+        for (w, h, grid, compact, rows) in [
+            (100u16, 40u16, false, false, 4),
+            (160, 40, false, false, 4),
+            (60, 40, false, false, 8),
+            (40, 20, false, true, 4),
+            (90, 40, true, false, 6),
+        ] {
+            let mut st = st.clone();
+            if grid {
+                st.view.screen = Screen::Grid;
+            }
+            if compact {
+                st.view.compact = Some(true);
+                st.view.compact_pane = crate::app::CompactPane::Threads;
+            }
+            let lines = draw_panes(&mut st, w, h);
+            let text = pane_text(&st, &lines, &card("t-rep"));
+            let body: Vec<&str> = text.lines().skip(1).collect();
+            let body = &body[..body.len() - 1];
+            let what = format!("{w}x{h}:\n{text}");
+            assert_eq!(body.len(), rows + 1, "{what}");
+            assert!(body[0].contains("done ✓ · Rewrote the parser"), "{what}");
+            assert!(
+                body[rows - 1]
+                    .trim_end_matches(['│', '┃', ' '])
+                    .ends_with('…'),
+                "{what}"
+            );
+            assert!(body[rows].contains("twr/rep · 1 ahead of dev"), "{what}");
+        }
+    }
+
+    /// On a card too narrow for the state and the first word of what the thread does on one
+    /// row (`▃ running (1 bg) ·`, then `implementing`), an item that fills the card leaves the
+    /// section its one row, which shows the section on one row, cut (`▃ running (1 bg) ·
+    /// implemen…`): in the row of 30-column cards above a narrow conversation, the column at 34,
+    /// and 40-column tiles, with other threads beside it.
+    #[test]
+    fn a_narrow_card_keeps_what_its_thread_does_beside_a_long_item() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-run");
+        let mut stall = s.raise("a1", AttentionReason::Stalled);
+        if let EventBody::AttentionRaised(p) = &mut stall.body {
+            p.summary = "x ".repeat(120);
+        }
+        let evs = [
+            s.created("run"),
+            s.turn_started("go"),
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "t1".into(),
+                running: true,
+                ..Default::default()
+            })),
+            stall,
+        ];
+        control(&mut st, &evs);
+        for (i, name) in ["b", "c"].iter().enumerate() {
+            let mut o = ThreadScript::new(format!("t-{name}"));
+            control(&mut st, &[o.at(10 + i as i64).created(name)]);
+        }
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-run": {"activity": "implementing scroll anchoring"}}),
+        );
+        st.set_focus(Some("t-run".into()));
+        for (w, grid) in [(90u16, false), (100, false), (80, true)] {
+            let mut st = st.clone();
+            if grid {
+                st.view.screen = Screen::Grid;
+            }
+            let lines = draw_panes(&mut st, w, 40);
+            let text = pane_text(&st, &lines, &card("t-run"));
+            let rows: Vec<&str> = text.lines().collect();
+            let head = card_words(&rows[1..3].join("\n"));
+            // (On its one row, cut: `running (1 bg) · implemen…`.)
+            assert!(head.contains("running (1 bg) · imp"), "{w}:\n{text}");
+            assert!(text.contains(" STALLED "), "{w}:\n{text}");
+        }
+    }
+
+    /// A long-named thread on a box not simply online, its title left no room for the box's
+    /// state by the name: the card's bottom border says it, whole, however long a stalled
+    /// notice fills the card while the thread says what it does; in the column (34), the row (30), a tile (40) and
+    /// the compact Threads screen (40x20).
+    #[test]
+    fn a_box_state_the_title_has_no_room_for_is_on_the_bottom_border() {
+        use crate::app::tests::info_box;
+        let long = "review-last-3-remote-worker";
+        let raise = |s: &mut ThreadScript| {
+            // A stalled notice: the thread still works, and says what it does.
+            let mut stall = s.raise("s1", AttentionReason::Stalled);
+            if let EventBody::AttentionRaised(p) = &mut stall.body {
+                p.summary = format!("No output: {}", "x".repeat(200));
+            }
+            stall
+        };
+        for (box_name, state, word) in [
+            ("gpu-workstation-01", "offline", " offline"),
+            ("gpu", "needs_install", " needs install"),
+        ] {
+            for item in [false, true] {
+                let mut st = on_box(long, box_name, info_box(box_name, state), |s| {
+                    let mut evs = vec![s.turn_started("go")];
+                    if item {
+                        evs.push(raise(s));
+                    }
+                    evs
+                });
+                st.apply_result(
+                    "thread.activity",
+                    &serde_json::json!({"t-job": {"activity": "implementing scroll anchoring                                                              and running every test again"}}),
+                );
+                for (w, h, grid, compact) in [
+                    (100u16, 40u16, false, false),
+                    (90, 40, false, false),
+                    (80, 40, true, false),
+                    (40, 20, false, true),
+                ] {
+                    let mut st = st.clone();
+                    if grid {
+                        st.view.screen = Screen::Grid;
+                    }
+                    if compact {
+                        st.view.compact = Some(true);
+                        st.view.compact_pane = crate::app::CompactPane::Threads;
+                    }
+                    let lines = draw_panes(&mut st, w, h);
+                    let text = pane_text(&st, &lines, &card("t-job"));
+                    let what = format!("{box_name}{word} item={item} {w}x{h}:\n{text}");
+                    let shown: Vec<&str> = text
+                        .lines()
+                        .filter(|r| has_token(r, box_name, word))
+                        .collect();
+                    assert!(!shown.is_empty(), "{what}");
+                    assert!(text.contains(long), "the name whole: {what}");
+                }
+            }
+        }
+    }
+
+    /// A report starting with a word longer than the card (an unbroken URL) wraps inside the
+    /// word and is cut like any report: the git line keeps its row, and the state shows.
+    #[test]
+    fn a_long_first_word_leaves_the_git_line_its_row() {
+        use crate::app::tests::control;
+        use twr_core::event::Grade;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-url");
+        let mut report = s.report(Some(1), Grade::Success);
+        if let EventBody::ReportReady(p) = &mut report.body {
+            p.summary = format!("https://example.com/{} is up.", "a".repeat(150));
+        }
+        let git = s.event(EventBody::GitSnapshot(GitSnapshot {
+            branch: Some("twr/url".into()),
+            ..Default::default()
+        }));
+        let evs = [
+            s.created("url"),
+            s.turn_started("go"),
+            s.turn_ended(TurnResult::Completed),
+            report,
+            git,
+        ];
+        control(&mut st, &evs);
+        for (w, grid, compact) in [(100u16, false, false), (90, true, false), (40, false, true)] {
+            let mut st = st.clone();
+            if grid {
+                st.view.screen = Screen::Grid;
+            }
+            if compact {
+                st.view.compact = Some(true);
+                st.view.compact_pane = crate::app::CompactPane::Threads;
+            }
+            let lines = draw_panes(&mut st, w, 20);
+            let text = pane_text(&st, &lines, &card("t-url"));
+            let rows: Vec<&str> = text.lines().collect();
+            assert!(rows[1].contains("done ✓ ·"), "{w}:\n{text}");
+            assert!(
+                card_words(&text).contains("https://example.com/aaa"),
+                "{w}:\n{text}"
+            );
+            assert!(rows[rows.len() - 2].contains("twr/url"), "{w}:\n{text}");
+        }
+    }
+
+    /// A card the column cuts to one row inside (on a screen a few rows tall) still says the
+    /// state and the start of what its thread does on it, though they wrap over two rows on a
+    /// card of full height.
+    #[test]
+    fn a_card_cut_to_one_row_keeps_the_state_and_what_it_does() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-run");
+        let evs = [
+            s.at(10).created("run"),
+            s.turn_started("go"),
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "t1".into(),
+                running: true,
+                ..Default::default()
+            })),
+        ];
+        control(&mut st, &evs);
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-run": {"activity": "reimplementing scroll anchoring"}}),
+        );
+        st.settle_order(std::time::Instant::now());
+        let mut seen = false;
+        for h in 3..12u16 {
+            let lines = draw_panes(&mut st, 100, h);
+            let Some(pane) = st.view.panes.get(&card("t-run")).cloned() else {
+                continue;
+            };
+            if pane.area.height != 1 {
+                continue;
+            }
+            seen = true;
+            let text = pane_text(&st, &lines, &card("t-run"));
+            let row = text.lines().nth(1).unwrap();
+            assert!(row.contains("running (1 bg) · reimpl"), "{h}:\n{text}");
+        }
+        assert!(seen, "no height cuts the card to one row");
+    }
+
+    /// The bottom border of a narrow compact card says a box's state the title has no room for
+    /// whole: its padding gives way first (`┗@… not configured┛` at 20 columns).
+    #[test]
+    fn a_narrow_bottom_border_drops_its_padding_before_the_box_state() {
+        let st = on_box("review-last", "gpu", removed_box("gpu"), |s| {
+            vec![s.turn_started("go")]
+        });
+        let mut st = st;
+        st.view.compact = Some(true);
+        st.view.compact_pane = crate::app::CompactPane::Threads;
+        for w in [20u16, 22, 30] {
+            let lines = draw_panes(&mut st, w, 20);
+            let text = pane_text(&st, &lines, &card("t-job"));
+            assert!(
+                text.lines().any(|r| has_token(r, "gpu", " not configured")),
+                "{w}:\n{text}"
+            );
+        }
+    }
+
+    /// A working thread's card always says its state and what it does, first: with a stalled
+    /// notice or a review open, background tasks, a long activity line, an item whose summary
+    /// fills the card, a narrow card, a card the column cuts short, a tile, and the compact
+    /// Threads screen at 40x20 and 40x14. (The state used to give way to a long item, and an
+    /// item open hid what the thread does.) A thread waiting on the user says its state, the
+    /// item saying the rest.
+    #[test]
+    fn a_working_card_always_says_its_state_and_what_it_does() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let activity = "implementing scroll anchoring · running the whole workspace test suite";
+        let views = [
+            (100u16, 40u16, false, false),
+            (160, 40, false, false),
+            (100, 18, false, false),
+            (100, 15, false, false),
+            (90, 40, false, false),
+            (60, 30, false, false),
+            (80, 40, true, false),
+            (160, 30, true, false),
+            (40, 20, false, true),
+            (40, 14, false, true),
+        ];
+        let items = [
+            None,
+            Some(AttentionReason::Stalled),
+            Some(AttentionReason::Review),
+            Some(AttentionReason::Question),
+        ];
+        for item in items {
+            for bg in [false, true] {
+                for long in [false, true] {
+                    for (w, h, grid, compact) in views {
+                        let mut st = AppState::new();
+                        let mut s = ThreadScript::new("t-run");
+                        let mut evs = vec![s.created("run"), s.turn_started("go")];
+                        if bg {
+                            evs.push(s.event(EventBody::TaskUpdated(TaskUpdated {
+                                task_id: "t1".into(),
+                                running: true,
+                                ..Default::default()
+                            })));
+                        }
+                        if let Some(r) = item {
+                            let mut ev = s.raise("a1", r);
+                            if let EventBody::AttentionRaised(p) = &mut ev.body {
+                                if long {
+                                    p.summary = "x ".repeat(120);
+                                }
+                            }
+                            evs.push(ev);
+                        }
+                        control(&mut st, &evs);
+                        st.apply_result(
+                            "thread.activity",
+                            &serde_json::json!({"t-run": {"activity": activity}}),
+                        );
+                        if grid {
+                            st.view.screen = Screen::Grid;
+                        }
+                        if compact {
+                            st.view.compact = Some(true);
+                            st.view.compact_pane = crate::app::CompactPane::Threads;
+                        }
+                        st.set_focus(Some("t-run".into()));
+                        let lines = draw_panes(&mut st, w, h);
+                        let what = format!("{item:?} bg={bg} long={long} {w}x{h}");
+                        assert!(st.view.panes.get(&card("t-run")).is_some(), "{what}");
+                        let text = pane_text(&st, &lines, &card("t-run"));
+                        let t = st.registry.get("t-run").unwrap();
+                        let first = text.lines().nth(1).unwrap_or_default();
+                        assert!(first.contains(&card_status(t)), "{what}:\n{text}");
+                        if t.status() != ThreadStatus::Waiting {
+                            assert!(first.contains(" · implementing"), "{what}:\n{text}");
+                        }
+                    }
+                }
             }
         }
     }
