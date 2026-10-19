@@ -1802,8 +1802,16 @@ mod tests {
             "{e:#}"
         );
         assert!(seen.lock().unwrap().contains(&Request::Stop));
+        // Free within moments: a child another test forks shares the lock until it execs.
         let f = std::fs::File::open(&lock).unwrap();
-        assert!(f.try_lock().is_ok(), "the start lock was kept");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while f.try_lock().is_err() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the start lock was kept"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     /// A restart whose daemon takes long to stop (it finishes a repository change, holding its
