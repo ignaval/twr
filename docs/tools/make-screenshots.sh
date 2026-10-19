@@ -1,5 +1,6 @@
 #!/bin/sh
-# Regenerates docs/img/tui-stack.svg and docs/img/tui-grid.svg from the real TUI.
+# Regenerates docs/img/tui-stack.svg, docs/img/tui-grid.svg and docs/img/tui-compact.svg from
+# the real TUI.
 #
 #   docs/tools/make-screenshots.sh
 #
@@ -10,13 +11,14 @@
 # orchestrator through the TUI, and drives eight threads into different states: waiting on a
 # permission, asking a question, failed, running, done and parked. The orchestrator hears
 # about them from the hub, and then the TUI asks it what needs the user. Then it runs `twr` in
-# a private tmux server, captures the stack view (160x42) and the grid view (160x25) with
-# their colors, and turns the captures into SVG with docs/tools/ansi2svg.py. No real agent
+# a private tmux server, captures the stack view (160x42), the grid view (160x25) and the
+# compact layout's Threads screen (40x20, a phone) with their colors, and turns the captures
+# into SVG with docs/tools/ansi2svg.py. No real agent
 # runs: the hub and the TUI get a PATH without claude, codex or grok, and HOME is the
 # temporary directory. Everything the script started is stopped and removed on exit.
 #
 # Needs git, tmux and python3. Takes a minute or two (it waits for the hub's 30 s git tick).
-# TWR_SHOTS_KEEP=<dir> also copies the raw captures (stack.ans, grid.ans) there.
+# TWR_SHOTS_KEEP=<dir> also copies the raw captures (stack.ans, grid.ans, compact.ans) there.
 
 set -eu
 
@@ -263,8 +265,6 @@ commit() {
     printf '%s\n' "$4" >> "$wt/$3"
     git -C "$wt" add -A
     git -C "$wt" commit -q -m "$4"
-    # Track the main branch, so the card shows how far ahead the thread is.
-    git -C "$wt" branch -q --set-upstream-to=main
 }
 
 new() {
@@ -411,12 +411,12 @@ sleep 32
 wait_orchestrator
 tui_say "What needs me right now?"
 
-# capture NAME ROWS KEYS...: run the TUI at 160 x ROWS, press KEYS, capture the screen. The
-# TUI opens with nothing selected; Tab selects the first card (or tile).
+# capture NAME COLS ROWS KEYS...: run the TUI at COLS x ROWS, press KEYS, capture the screen.
+# The TUI opens with nothing selected; Tab selects the first card (or tile).
 capture() {
-    name=$1 rows=$2
-    shift 2
-    tmux -L "$tmux_name" -f /dev/null new-session -d -x 160 -y "$rows" \
+    name=$1 cols=$2 rows=$3
+    shift 3
+    tmux -L "$tmux_name" -f /dev/null new-session -d -x "$cols" -y "$rows" \
         "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
     first_frame
     # A pause after each key, as a person presses them.
@@ -456,14 +456,18 @@ capture() {
     sleep 0.3
 }
 
-capture stack 42 Tab
-capture grid 25 C-g Tab
+capture stack 160 42 Tab
+capture grid 160 25 C-g Tab
+# A phone: below 60 columns the TUI is compact. `/t` shows the Threads screen, the first card
+# selected; three Downs (past the permission, the question and the failure) select the running
+# one, the cards following it.
+capture compact 40 20 /t Enter Down Down Down
 
-[ -z "${TWR_SHOTS_KEEP:-}" ] || cp "$work/stack.ans" "$work/grid.ans" "$TWR_SHOTS_KEEP/"
+[ -z "${TWR_SHOTS_KEEP:-}" ] || cp "$work/stack.ans" "$work/grid.ans" "$work/compact.ans" "$TWR_SHOTS_KEEP/"
 
 # The fake runtime's directive lines must not show (the permission thread's transcript
 # scrolls its prompt out of view).
-if grep -q '!perm\|!tool\|!write' "$work/stack.ans" "$work/grid.ans"; then
+if grep -q '!perm\|!tool\|!write' "$work/stack.ans" "$work/grid.ans" "$work/compact.ans"; then
     echo "make-screenshots: a prompt's directive lines are on screen; lengthen the reply" >&2
     exit 1
 fi
@@ -473,4 +477,6 @@ python3 docs/tools/ansi2svg.py "$work/stack.ans" docs/img/tui-stack.svg \
     --title "twr stack view: the conversation with the orchestrator, and the worker thread cards with a permission and a question"
 python3 docs/tools/ansi2svg.py "$work/grid.ans" docs/img/tui-grid.svg \
     --title "twr grid view: one tile per worker thread"
-ls -l docs/img/tui-stack.svg docs/img/tui-grid.svg
+python3 docs/tools/ansi2svg.py "$work/compact.ans" docs/img/tui-compact.svg \
+    --title "twr on a phone: the compact layout's tab bar over the Threads screen's cards"
+ls -l docs/img/tui-stack.svg docs/img/tui-grid.svg docs/img/tui-compact.svg

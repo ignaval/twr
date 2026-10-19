@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="364" height="388" viewBox="0 0 364 388" role="img" aria-label="twr on a phone: the compact layout&#x27;s tab bar over the Threads screen&#x27;s cards">
+<title>twr on a phone: the compact layout&#x27;s tab bar over the Threads screen&#x27;s cards</title>
+<style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
+<rect width="100%" height="100%" rx="8" fill="#0d1117"/>
+<rect x="14" y="14" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="14" width="109.2" height="18" fill="#444444"/>
+<rect x="240.8" y="14" width="84" height="18" fill="#c9d1d9"/>
+<rect x="14" y="32" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="32" width="109.2" height="18" fill="#444444"/>
+<rect x="22.4" y="302" width="134.4" height="18" fill="#5fd7d7"/>
+<rect x="22.4" y="74.8" width="8.4" height="11.2" fill="#d7875f"/>
+<path d="M18.2 311H22.4M266 311H345.8M18.2 347H345.8M18.2 311V347M345.8 311V347" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M18.2 185H22.4M173.6 185H291.2M341.6 185H345.8M18.2 293H274.4M341.6 293H345.8M18.2 185V293M345.8 185V293" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M18.2 59H22.4M182 59H291.2M341.6 59H345.8M18.2 167H22.4M89.6 167H345.8M18.2 59V167M345.8 59V167" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<text x="47.6" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
+<text x="131.6" y="27.5" fill="#ffd700" class="b" textLength="92.4">Needs you 3</text>
+<text x="266" y="27.5" fill="#0d1117" class="b" textLength="58.8">Threads</text>
+<text x="30.8" y="63.5" fill="#6e7681" textLength="42">web ·</text>
+<text x="81.2" y="63.5" fill="#d29922" class="b" textLength="92.4">checkout-ui</text>
+<text x="299.6" y="63.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="39.2" y="81.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="106.4" y="81.5" fill="#6e7681">·</text>
+<text x="123.2" y="81.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="22.4" y="135.5" fill="#c9d1d9" textLength="33.6">fake</text>
+<text x="64.4" y="135.5" fill="#6e7681">·</text>
+<text x="81.2" y="135.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
+<text x="22.4" y="153.5" fill="#d29922" textLength="319.2">twr/ff… · changes made · +1/−1 vs main</text>
+<text x="22.4" y="171.5" fill="#d29922" textLength="67.2">↑ 3 more</text>
+<text x="30.8" y="189.5" fill="#6e7681" textLength="50.4">docs ·</text>
+<text x="89.6" y="189.5" fill="#6e7681" class="b" textLength="75.6">changelog</text>
+<text x="299.6" y="189.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="22.4" y="207.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
+<text x="81.2" y="207.5" fill="#6e7681" textLength="243.6">· Drafted the 0.5.0 changelog</text>
+<text x="22.4" y="225.5" fill="#6e7681" textLength="302.4">from 37 commits: features, fixes and</text>
+<text x="22.4" y="243.5" fill="#6e7681" textLength="310.8">one breaking change (the --json outpu</text>
+<text x="333.2" y="243.5" fill="#c9d1d9">…</text>
+<text x="22.4" y="261.5" fill="#c9d1d9" textLength="33.6">fake</text>
+<text x="64.4" y="261.5" fill="#6e7681">·</text>
+<text x="81.2" y="261.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
+<text x="22.4" y="279.5" fill="#39c5cf" textLength="319.2">twr/ffd9504a8da964aa/cha… · +1 vs main</text>
+<text x="274.4" y="297.5" fill="#6e7681" textLength="67.2">↓ 2 more</text>
+<text x="30.8" y="315.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="165.2" y="315.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="22.4" y="333.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
+<text x="14" y="369.5" fill="#6e7681" textLength="336">↑↓/tap select · Enter/tap again: actions</text>
+</svg>
