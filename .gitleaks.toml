@@ -1,4 +1,4 @@
-# gitleaks configuration: the default rules, minus four pieces of test data, each allowed
+# gitleaks configuration: the default rules, minus five pieces of test data, each allowed
 # only in its own file (and, where gitleaks matches inside a file, only as an exact match).
 [extend]
 useDefault = true
@@ -28,3 +28,12 @@ condition = "AND"
 paths = ['''^crates/twr-hub/src/hub/project_read\.rs$''']
 regexTarget = "match"
 regexes = ['''^-----BEGIN OPENSSH PRIVATE KEY-----\\nb3BlbnNzaA==\\n";''']
+
+# The fixed test token the runner-protocol fixtures' auth vectors are computed with
+# (docs/tools/capture-runner-fixtures.rs).
+[[allowlists]]
+description = "runner protocol fixture test token"
+condition = "AND"
+paths = ['''^crates/twr-core/tests/fixtures/runner-protocol-[0-9]+/auth-vectors\.json$''']
+regexTarget = "match"
+regexes = ['''^token": "0123456789abcdef0123456789abcdef"$''']
