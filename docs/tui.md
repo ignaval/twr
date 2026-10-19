@@ -63,44 +63,57 @@ The cards are ordered by what needs you: permissions first, then questions, erro
 
 Only a card that comes to need you moves at once: a new permission, question, error, review or stall brings it to the top right away. Every other move waits about three seconds: a thread finishing, failing, going idle, or leaving the top once you answered its item. It also waits while you're using the cards: while a card or tile is selected, while its action popup or a detail view is open, and while the mouse pointer is over the cards (for at most 30 seconds after it last moved, and not after the terminal loses focus). Once nothing holds them, the cards move to their new places all at once. A new thread's card shows right away, in its place, and a deleted or hidden one goes. The same order holds in the column, the row of cards above a narrow conversation, and the grid. A list you scrolled down keeps showing the same card first when a card above it comes or goes.
 
-Cards have a fixed height: 7 rows, or 11 with an item open, the size a card keeps until its move is applied. A card's text changing (what it's doing, its report, its git state) never shifts the cards below it. A report too long for its card ends in `…`; the full report is in the card's action popup, the dive and the conversation. Grid tiles and the row of cards were fixed-height already.
+Cards have a fixed height: 7 rows (a title, 4 rows of status and report, the git line and the border), or 11 with an item open, the size a card keeps until its move is applied. A card's text changing (what it's doing, its report, its git state) never shifts the cards below it. A report too long for its card ends in `…`; the full report is in the card's action popup, the dive and the conversation. Grid tiles and the row of cards were fixed-height already.
 
 `[tui] card_order = "attention"` brings back the old order: within a group, the most recently active thread first, every move at once ([configuration.md](configuration.md)).
 
 Parked threads are hidden by default, unless one is pinned, has an open item (so a failure on a parked thread stays in view) or is the thread you are in a dive into. A dim line under the cards says how many are hidden, such as `2 parked hidden · /parked shows them`; where the cards have no room for it (the narrow row above the conversation, even with no card in it, or a grid header too narrow for it), the status bar's hints start with it. `/parked` lists them among the cards, and so does a tap on the note; `/parked` again hides them (`/parked on` and `/parked off` set it). Hidden threads still work everywhere else: commands, Tab completion and `@` mentions name them. Cards have a fixed height (see above). When they don't all fit, the edge cards say `↑ N more` or `↓ N more` (`< N more` and `N more >` in the narrow row).
 
-A card's title is the thread's project, dimmed, then its name (`twr · scroll-follow`), with its permission mode at the top right when the title has room for it. On a narrow card the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out, while the name and the mode stay. Under the title, a card has one section about the thread's status, then, at its bottom, who runs it and its git state:
+A card's title says which thread it is and who runs it: at its left the thread's project, dimmed, then its name (`twr · scroll-follow`); at its right the runtime and model (`claude-code · sonnet-4-5`), with the box token of a thread on a remote box (see below), then its permission mode, apart (`─ auto`). Under the title, a card has one section about the thread's status, and its git state on its last row:
 
 ```
-┌ twr · scroll-follow ─────────────── auto ┐
-│▃ running · implementing scroll anchoring │
-│· running tests                           │
-│                                          │
-│claude-code · sonnet-4-5                  │
-│twr/scroll-fol… · changes made · +3 vs dev│
-└──────────────────────────────────────────┘
-┌ docs · quickstart ───────────────── auto ┐
-│done ✓ · Rewrote the quick start around   │
-│three commands and moved the config       │
-│reference to its own page. All 41 links…  │
-│claude-code · sonnet-4-5                  │
-│twr/quickstart · 2 ahead of main          │
-└──────────────────────────────────────────┘
+┌ quickstart ─ claude-code · sonnet-4-5 ─ auto ┐
+│done ✓ · Rewrote the quick start around three │
+│commands and moved the config reference to its│
+│own page. All 41 links resolve; the old       │
+│anchors redirect.                             │
+│twr/quickstart · 2 ahead of main              │
+└──────────────────────────────────────────────┘
+┌ scroll-follow ──────────── sonnet-4-5 ─ auto ┐
+│▃ running · implementing scroll anchoring ·   │
+│running tests                                 │
+│                                              │
+│                                              │
+│twr/scroll-follow · changes made · +3 vs dev  │
+└──────────────────────────────────────────────┘
+┌ api-tests ── claude-code · sonnet-4-5 ─ auto ┐
+│▃ running tests · cargo test --workspace      │
+│ STALLED  No output for 12 minutes            │
+│1 wait  2 interrupt                           │
+│                                              │
+│                                              │
+│                                              │
+│                                              │
+│                                              │
+│twr/api-tests · changes made · +1/−2 vs dev   │
+└──────────────────────────────────────────────┘
 ```
+
+Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out. Then the mode goes, and last the box's name is cut (`@gp… offline`). The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the status section says it after the state (`idle · @gpu offline`). The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
 
 The section starts with the state, then says what is going on, without saying anything twice:
 
-- an open item: the state alone (`waiting`), then its top attention item with numbered options;
+- an open item: its top attention item with numbered options, under the state. A thread waiting on you shows the state alone (`waiting`: the item says what it waits for), and so does one not at work (`done ?` over a review); a thread at work with an item open, such as a stalled notice or a review while it runs, still says what it does, above the item (`running tests · cargo test --workspace`);
 - else, while the thread works (running, waiting on background tasks, attached) or after it failed, what it is doing right now or why it failed (see [The activity line](#the-activity-line)): `running · implementing scroll anchoring`, `failed · turn 2 failed: rate limited`. When that line starts with the state's own word, it goes on from it (`waiting for permission: Bash: git push`, `failed: the state lock is held`), and waiting on background tasks it names the tasks (`background (1 bg) · cargo test --workspace`);
 - else its last report, dimmed and unlabeled, after the state (`done ✓ · Rewrote the quick start …`), in the rows the card has, cut with `…`. Without a report, the activity line, unless it is the state again (`idle · not started`, but `idle`, `parked` or `stopped` alone).
 
-It wraps over the rows the card has above its footer, and its last row ends in `…` when it is cut. So a card never shows a report of an earlier turn while its thread works, and never the activity line next to the report. The state says what the thread is: `failed` or `crashed` after an error, `stopped`, and, once a turn is done, the grade of its report: `done ✓` (success), `done ~` (partial), `done ✗` (gave up) or `done ?` (needs verification). Background tasks follow it (`background (1 bg)`). A selected card waiting on background tasks also shows, under the activity line, the report its turn ended with: an interim one, which the result comes after. The full report is in the card's [action popup](#the-action-popup), the dive and the conversation. Parked threads are dimmed.
+It wraps over the rows the card has above its git line, up to 4 on a card with nothing open in the column and on the compact Threads screen (8 in the row of cards above a narrow conversation, 6 on a grid tile), and its last row ends in `…` when it is cut. The section's first row, the state and the start of what the thread does, always shows: with a long item open, the item gives way before it, and an item cut so is answered from its [action popup](#the-action-popup). So a card never shows a report of an earlier turn while its thread works, and never the activity line next to the report. The state says what the thread is: `failed` or `crashed` after an error, `stopped`, and, once a turn is done, the grade of its report: `done ✓` (success), `done ~` (partial), `done ✗` (gave up) or `done ?` (needs verification). Background tasks follow it (`background (1 bg)`). A selected card waiting on background tasks also shows, under the activity line, the report its turn ended with: an interim one, which the result comes after. The full report is in the card's [action popup](#the-action-popup), the dive and the conversation. Parked threads are dimmed.
 
-Under the section, a row says who runs the thread: its runtime and model (`claude-code · sonnet-4-5`), and the last row is its git state ([The git line](#the-git-line)). A thread with no git state (a project that isn't a git repository) has the section down to the row of who runs it.
+The last row is the git state ([The git line](#the-git-line)). A thread with no git state (a project that isn't a git repository) has the section down to the card's bottom.
 
-The model is the one the runtime reports it runs, such as Claude Code's `claude-sonnet-4-5-20250929`, shortened on cards by dropping a trailing date and a leading `claude-`. Until the runtime reports one, the card shows the model you asked for, or `default model` when you asked for none. Some runtimes never report it: a `pty:` thread, or an ACP agent that doesn't say. A reasoning effort you set follows the model (`claude-code · fable-5-1 · high`, on cards, tiles and the dive header); a thread on the runtime's default effort shows none. Where the row is too narrow, the model is cut at its end with `…`.
+The model is the one the runtime reports it runs, such as Claude Code's `claude-sonnet-4-5-20250929`, shortened on cards by dropping a trailing date and a leading `claude-`. Until the runtime reports one, the card shows the model you asked for, or `default model` when you asked for none. Some runtimes never report it: a `pty:` thread, or an ACP agent that doesn't say. A reasoning effort you set follows the model (`claude-code · fable-5-1 · high`, in the titles of cards and tiles and in the dive header); a thread on the runtime's default effort shows none.
 
-A thread on a remote box has a box token after its runtime: `running · codex@gpu · gpt-5-codex`. A thread on the hub's own machine has none (`@local` is never shown). When the box isn't simply online, the token says why, in this order of precedence:
+A thread on a remote box has a box token after its runtime, in its card's title: `codex@gpu · gpt-5-codex`. A thread on the hub's own machine has none (`@local` is never shown). When the box isn't simply online, the token says why, in this order of precedence:
 
 | Token | Means |
 |---|---|
@@ -113,7 +126,7 @@ A thread on a remote box has a box token after its runtime: `running · codex@gp
 | `@gpu offline` (red) | no runner of the box is connected |
 | `@gpu reconnecting` (yellow) | the hub is connecting to the box |
 
-The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. A card keeps its height: when the row is too narrow, the model is cut first, then the runtime, then the box's name (`@gpu-wo… offline`); the box's state is never cut. With a request open on a card and too little room for everything, the request is kept whole first, then the row with the token of a box that isn't simply online, before the request's `why:` and `+N more` rows and the state. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
+The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. In a card's title the token gives way last, as above: the runtime first, then the model, then the box's name (`@gpu-wo… offline`); the box's state is never cut. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
 
 When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column.
 
@@ -198,7 +211,7 @@ The transcript records each change, from `twr model`, the orchestrator or `/mode
 
 ![The grid view](img/tui-grid.svg)
 
-`Ctrl-G`, or `/grid`, switches to the grid: one tile per worker thread, at least 40 columns wide, with parked threads at the end, hidden as in the stack view unless `/parked` lists them. The orchestrator has no tile; when it needs you, the grid's header says so. A tile shows what a card does, in the same order: the project before the name and the permission mode in its title, the status section (the state, led by the [working icon](#what-is-working) while the thread works, then the top attention item, what it is doing now ([the activity line](#the-activity-line)) or its last report in the rows left, cut with `…`), who runs it with a remote box's [box token](#stack-view) (`codex@gpu · gpt-5-codex`), and last [the git line](#the-git-line) followed by the turn count (`twr/api · changes made · 3 ahead of dev · 3 turns`). The header counts the threads and the parked ones, and how many of those are hidden: `· 2 parked (1 hidden, /parked shows)`. `Tab`, `Shift-Tab` and all four Shift-arrows move between tiles, and a click selects one. `Enter`, or a click on the selected tile, opens its action popup, the same as its card's; its `talk to` row dives into the thread in the stack view, and `Esc` from there returns to the orchestrator conversation. A double click on a tile dives in too. `Ctrl-G`, or a click on `‹ stack` at the start of the header, goes back without diving; a click on the header's `/parked shows` lists the parked threads.
+`Ctrl-G`, or `/grid`, switches to the grid: one tile per worker thread, at least 40 columns wide, with parked threads at the end, hidden as in the stack view unless `/parked` lists them. The orchestrator has no tile; when it needs you, the grid's header says so. A tile shows what a card does, in the same order: its title as on a card (the project and the name, then who runs it with a remote box's [box token](#stack-view), `codex@gpu · gpt-5-codex`, then the permission mode), the status section in up to 6 rows (the state, led by the [working icon](#what-is-working) while the thread works, then what it is doing now ([the activity line](#the-activity-line)), the top attention item, or its last report in the rows left, cut with `…`), and last [the git line](#the-git-line) followed by the turn count (`twr/api · changes made · 3 ahead of dev · 3 turns`). The header counts the threads and the parked ones, and how many of those are hidden: `· 2 parked (1 hidden, /parked shows)`. `Tab`, `Shift-Tab` and all four Shift-arrows move between tiles, and a click selects one. `Enter`, or a click on the selected tile, opens its action popup, the same as its card's; its `talk to` row dives into the thread in the stack view, and `Esc` from there returns to the orchestrator conversation. A double click on a tile dives in too. `Ctrl-G`, or a click on `‹ stack` at the start of the header, goes back without diving; a click on the header's `/parked shows` lists the parked threads.
 
 ## Decision audit view
 
@@ -437,7 +450,7 @@ Each tab is a filled block a third of the screen wide, the current one reversed,
 
 - **Chat** is the conversation alone, the orchestrator's or the thread you dived into, with the input box under it. On an empty line, Enter opens the item that has waited on you longest. A dive (Talk to it, `/open`) shows here, and so does an item too long for its popup.
 - **Needs you** lists every thread waiting on you, one line each, most urgent first, with its first item: `api · permission · Bash: git push`, and `(+2 more)` when it has more. ↑ and ↓ on an empty line pick one, and Enter opens its [action popup](#the-action-popup), where a digit answers it, as on a card; the next item comes up after.
-- **Threads** shows the threads' cards, the same cards as the stack view's ([Stack view](#stack-view)): the status section, then who runs the thread (with the box token of a remote box) and its git state, as wide as the screen, in the same order and with the same fixed heights. The selected card stays in view as ↑ and ↓ move on, the cards scroll with the wheel, and the edge cards say `↑ 2 more` or `↓ 3 more`. Enter opens a thread's popup, where Talk to it dives in.
+- **Threads** shows the threads' cards, the same cards as the stack view's ([Stack view](#stack-view)): the title with who runs the thread (and the box token of a remote box), the status section and the git state, as wide as the screen, in the same order and with the same fixed heights. The selected card stays in view as ↑ and ↓ move on, the cards scroll with the wheel, and the edge cards say `↑ 2 more` or `↓ 3 more`. Enter opens a thread's popup, where Talk to it dives in.
 
 `/c`, `/n` and `/t` switch between them, since Tab and the Shift-arrows are awkward on a phone keyboard, and so does a tap on a tab (the whole bar is tappable: each tab owns its third of the bar, every row of it and the gap after it). On the lists, a tap selects a row or card and a tap on the selected one opens its action popup, where `talk to` is already picked (one more tap dives in) and an option takes two taps once the item has been read (see [The action popup](#the-action-popup)). A swipe your terminal sends as the wheel scrolls a list, the cards or the conversation; one it sends as a drag selects and copies text. On the lists, Shift-↑ and Shift-↓ move like ↑ and ↓; in Chat they step through its long blocks and requests, as with the main pane selected. The compact layout has no grid: it shows the stack view's conversation. `/compact off` brings the full layout back on a narrow screen, for every workspace until you quit, and each workspace keeps the screen it was on. Answers go through the same checks as anywhere else, the guard against a key meant for something that just moved included.
 
