@@ -12066,7 +12066,8 @@ mod tests {
 
     /// Watches the reservations of `g` for `path` once `<dir>/started` exists: returns whether
     /// any pid in `<dir>/pids` was still alive at the moment a runtime could first start in
-    /// `path` again (the reservation of the change gone).
+    /// `path` again (the reservation of the change gone). A change that never starts (killed
+    /// before it got there) fails it after 30 s, rather than leaving it waiting.
     fn reservation_probe(
         g: &LocalGit,
         path: &Path,
@@ -12078,7 +12079,12 @@ mod tests {
             dir.to_path_buf(),
         );
         tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             loop {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the change never started, or its reservation never went"
+                );
                 if dir.join("started").exists() {
                     if let Ok(u) = workdirs.begin_use(&path, "probe") {
                         let alive = pids_in(&dir.join("pids"))
@@ -12146,18 +12152,30 @@ mod tests {
             .begin_change(&wt, ChangeKind::Remove, Duration::ZERO)
             .await
             .unwrap();
-        let gave_up = tokio::time::timeout(
-            Duration::from_millis(300),
-            g.run_holding(
-                dir.path(),
-                vec!["worktree".into(), "remove".into()],
-                Mode::Change(Duration::from_secs(300)),
-                None,
-                Some(hold),
-            ),
-        )
-        .await;
-        assert!(gave_up.is_err());
+        // Given up once the change has started (a fixed delay can end before it even starts,
+        // on a busy machine).
+        let run = g.run_holding(
+            dir.path(),
+            vec!["worktree".into(), "remove".into()],
+            Mode::Change(Duration::from_secs(300)),
+            None,
+            Some(hold),
+        );
+        let started = async {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            while !dir.path().join("started").exists() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the change never started"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        };
+        let gave_up = tokio::select! {
+            _ = run => false,
+            _ = started => true,
+        };
+        assert!(gave_up);
         assert_eq!(probe.await.unwrap(), Vec::<u32>::new());
         let pids = pids_in(&dir.path().join("pids"));
         assert_eq!(pids.len(), 2, "{pids:?}");
