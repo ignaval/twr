@@ -390,7 +390,8 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     (
         "click, tap",
         "a card, tile, list row or request selects it, and on the one selected opens its \
-         actions (a quick double click on a card or tile dives in); a folded line expands, a \
+         actions (a quick double click on a card or tile dives in, but in the compact layout, \
+         where a double tap selects and opens); a folded line expands, a \
          long block's footer expands or collapses it; the input box puts the cursor there",
     ),
     (
@@ -11009,15 +11010,27 @@ mod tests {
             let middle = usize::from((rows - 1) / 2);
             let words: Vec<&str> = lines[middle].split_whitespace().collect();
             assert_eq!(words.join(" "), names.join(" "), "{what}");
+            // Centered in its tab: its third of the width, but the column after it (the last
+            // tab has none), which is blank.
+            let shares =
+                Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(Rect::new(0, 0, w, 1));
             for (k, name) in names.iter().enumerate() {
-                // Centered in its third.
-                let third = w / 3;
+                let tab = if k < 2 {
+                    shares[k].width - 1
+                } else {
+                    shares[k].width
+                };
+                let len = name.chars().count() as u16;
                 let at = col(&lines[middle], name).unwrap() as u16;
-                let (from, to) = (third * k as u16, third * (k as u16 + 1));
-                assert!(
-                    from <= at && at + name.chars().count() as u16 <= to.max(w - 1),
-                    "{name} {what}"
-                );
+                // (The margins on either side differ by a cell at most.)
+                let (left, right) = (at - shares[k].x, (shares[k].x + tab) - (at + len));
+                assert!(left.abs_diff(right) <= 1, "{name} {left} {right} {what}");
+                if k < 2 {
+                    let gap = shares[k].right() - 1;
+                    for y in 0..rows {
+                        assert_eq!(buf[(gap, y)].bg, Color::Reset, "{name} gap {what}");
+                    }
+                }
             }
             // The bar's rows are filled (the current tab reversed); under it, the cards start.
             for y in 0..rows {
@@ -12558,6 +12571,14 @@ mod tests {
         ] {
             assert!(s.contains(part), "{part:?} missing:\n{s}");
         }
+        // A double click dives in, but not in the compact layout, where a double tap opens.
+        let words = flat(std::slice::from_ref(&s));
+        assert!(
+            words.contains(
+                "dives in, but in the compact layout, where a double tap selects and opens"
+            ),
+            "{words}"
+        );
     }
 
     fn decisions_state() -> AppState {
