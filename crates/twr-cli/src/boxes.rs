@@ -2783,6 +2783,7 @@ mod tests {
     }
 
     /// Whether process `pid` runs (exists and is no zombie).
+    #[cfg(target_os = "linux")]
     fn alive(pid: i32) -> bool {
         std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
@@ -2794,6 +2795,7 @@ mod tests {
     }
 
     /// Waits (at most 10 s) for every pid in `pid_file` to be gone.
+    #[cfg(target_os = "linux")]
     fn all_gone(pid_file: &Path) {
         let pids: Vec<i32> = std::fs::read_to_string(pid_file)
             .unwrap()

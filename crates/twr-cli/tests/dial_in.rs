@@ -503,6 +503,7 @@ fn poll<T>(what: &str, limit: Duration, mut f: impl FnMut() -> Option<T>) -> T {
 }
 
 /// `hub.info`'s entry of box `name`, from the hub of `home`.
+#[cfg(target_os = "linux")]
 fn box_status(home: &Path, name: &str) -> serde_json::Value {
     serde_json::from_str(&ok(home, &["box", "status", name, "--json"])).unwrap()
 }
@@ -524,6 +525,7 @@ fn file_token(home: &Path, name: &str) -> String {
 }
 
 /// The `report.ready` events of `thread` so far.
+#[cfg(target_os = "linux")]
 fn reports(home: &Path, thread: &str) -> usize {
     ok(home, &["events", thread])
         .lines()
