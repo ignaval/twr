@@ -1685,6 +1685,17 @@ mod tests {
         seen
     }
 
+    /// Asserts that `lock` (`what`) is free, or is within moments (5 s): a child another test
+    /// forks shares it until it execs.
+    async fn assert_lock_free(lock: &Path, what: &str) {
+        let f = std::fs::File::open(lock).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while f.try_lock().is_err() {
+            assert!(tokio::time::Instant::now() < deadline, "{what} was kept");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Options with short timeouts, the socket (and the start lock) in a private directory in
     /// `dir`, as the relay makes it.
     fn quick_opts(dir: &Path) -> RelayOptions {
@@ -1734,7 +1745,7 @@ mod tests {
             "{notes:?}"
         );
         assert_eq!(seen.lock().unwrap().last(), Some(&Request::Stop));
-        assert!(lock_free(&opts.paths.lock));
+        assert_lock_free(&opts.paths.lock, "the daemon's lock").await;
     }
 
     /// A relay that finds a daemon starting uses it once it answers (no second daemon).
@@ -1802,8 +1813,7 @@ mod tests {
             "{e:#}"
         );
         assert!(seen.lock().unwrap().contains(&Request::Stop));
-        let f = std::fs::File::open(&lock).unwrap();
-        assert!(f.try_lock().is_ok(), "the start lock was kept");
+        assert_lock_free(&lock, "the start lock").await;
     }
 
     /// A restart whose daemon takes long to stop (it finishes a repository change, holding its
@@ -1976,10 +1986,7 @@ mod tests {
         );
         assert!(hub.is_none(), "{notes:?}");
         // Its start lock is free, and once the daemon's lock is, nothing starts.
-        assert!(std::fs::File::open(paths.start_lock())
-            .unwrap()
-            .try_lock()
-            .is_ok());
+        assert_lock_free(&paths.start_lock(), "the start lock").await;
         drop(held);
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(!paths.socket.exists());
@@ -2033,10 +2040,7 @@ mod tests {
             "{e:#}"
         );
         assert!(seen.lock().unwrap().contains(&Request::Stop));
-        assert!(std::fs::File::open(paths.start_lock())
-            .unwrap()
-            .try_lock()
-            .is_ok());
+        assert_lock_free(&paths.start_lock(), "the start lock").await;
         // The old daemon finishes stopping by itself.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !lock_free(&paths.lock) {
@@ -2285,10 +2289,7 @@ mod tests {
             ),
             "{e:#}"
         );
-        assert!(std::fs::File::open(paths.start_lock())
-            .unwrap()
-            .try_lock()
-            .is_ok());
+        assert_lock_free(&paths.start_lock(), "the start lock").await;
         answer.notify_one();
         tokio::time::sleep(Duration::from_millis(200)).await;
         let notes = notes.lock().unwrap();
