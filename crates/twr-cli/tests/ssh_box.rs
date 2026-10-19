@@ -417,13 +417,27 @@ fn cmdline(pid: u32) -> Option<Vec<String>> {
     )
 }
 
-/// The box daemons running from the fake box (`twr runner --daemon` of a build under it).
+/// The box daemons running from the fake box (`twr runner --daemon` of a build under it). A
+/// child a daemon has forked but not yet exec'd shows the daemon's arguments (twr starts
+/// children with `pre_exec`, so through fork and exec): one whose parent is a daemon is not.
 fn daemons(box_home: &Path) -> Vec<u32> {
-    processes_mentioning(box_home.to_str().unwrap())
+    let all: Vec<u32> = processes_mentioning(box_home.to_str().unwrap())
         .into_iter()
         .filter(|(_, args)| args.iter().any(|a| a == "--daemon"))
         .map(|(pid, _)| pid)
+        .collect();
+    all.iter()
+        .copied()
+        .filter(|pid| !parent(*pid).is_some_and(|p| all.contains(&p)))
         .collect()
+}
+
+/// The parent of process `pid` (`/proc/<pid>/stat`), when it runs.
+fn parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the command's `(...)`, which may hold spaces: the state, then the parent's pid.
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
 }
 
 /// Kills, when dropped, every process whose arguments mention the fake box (its daemons and
