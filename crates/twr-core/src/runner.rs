@@ -1872,9 +1872,13 @@ mod tests {
             "gpu",
             &rn,
             &hn,
-            // Uppercase hex in place of the first digit: a case-only variant when that digit
-            // is `a`, another proof otherwise; refused either way, whatever the random proof.
-            &format!("A{}", &hub[1..])
+            // Another value for the first digit, whatever the random proof (a change of case
+            // alone is the same proof: hex decodes either case).
+            &format!(
+                "{}{}",
+                if hub.starts_with('0') { '1' } else { '0' },
+                &hub[1..]
+            )
         ));
         assert!(!ok(Prover::Hub, "gpu", &rn, &hn, ""));
         let other = Secret::new("0123456789abcdef0123456789abcdeX");
