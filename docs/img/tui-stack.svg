@@ -11,8 +11,7 @@
 <rect x="963.2" y="632.8" width="8.4" height="11.2" fill="#d7875f"/>
 <path d="M18.2 707H22.4M266 707H950.6M18.2 743H950.6M18.2 707V743M950.6 707V743" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
 <path d="M959 221H963.2M1198.4 221H1299.2M1349.6 221H1353.8M959 401H1353.8M959 419H963.2M1131.2 419H1299.2M1349.6 419H1353.8M959 599H1353.8M959 617H963.2M1122.8 617H1299.2M1349.6 617H1353.8M959 725H1282.4M1349.6 725H1353.8M959 221V401M959 419V599M959 617V725M1353.8 221V401M1353.8 419V599M1353.8 617V725" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M18.2 167H30.8M274.4 167H942.2M18.2 293H942.2M18.2 167V293M942.2 167V293" stroke="#87d787" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M18.2 329H30.8M232.4 329H942.2M18.2 473H942.2M18.2 329V473M942.2 329V473" stroke="#af87ff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M18.2 167H30.8M274.4 167H942.2M18.2 293H942.2M18.2 329H30.8M232.4 329H942.2M18.2 473H942.2M18.2 167V293M18.2 329V473M942.2 167V293M942.2 329V473" stroke="#af87af" stroke-width="1.2" fill="none" stroke-linecap="square"/>
 <path d="M959 23H963.2M1106 23H1299.2M1349.6 23H1353.8M959 203H1353.8M959 23V203M1353.8 23V203" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
 <text x="22.4" y="27.5" fill="#000000" class="b" textLength="151.2">[twr] ORCHESTRATOR</text>
 <text x="190.4" y="27.5" fill="#000000" textLength="134.4">acp · scripted-1</text>
@@ -20,11 +19,11 @@
 <text x="1022" y="27.5" fill="#d29922" class="b" textLength="75.6">ratelimit</text>
 <text x="1307.6" y="27.5" fill="#6e7681" textLength="33.6">auto</text>
 <text x="14" y="45.5" fill="#ff7b72">✗</text>
-<text x="30.8" y="45.5" fill="#87d787" textLength="84">deploy-fix</text>
+<text x="30.8" y="45.5" fill="#af87af" textLength="84">deploy-fix</text>
 <text x="123.2" y="45.5" fill="#ff7b72" textLength="58.8">failed:</text>
 <text x="190.4" y="45.5" fill="#c9d1d9" textLength="714">deploy-fix: turn 1 failed: terraform plan failed: the state lock is held by run 81719</text>
 <text x="963.2" y="45.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
-<text x="30.8" y="63.5" fill="#87d787" textLength="84">deploy-fix</text>
+<text x="30.8" y="63.5" fill="#af87af" textLength="84">deploy-fix</text>
 <text x="123.2" y="63.5" fill="#6e7681" textLength="260.4">· hub update (ctrl+o to expand)</text>
 <text x="971.6" y="63.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
 <text x="1072.4" y="63.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
@@ -37,12 +36,12 @@
 <text x="106.4" y="99.5" fill="#949494" textLength="33.6">tool</text>
 <text x="148.4" y="99.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
 <text x="14" y="135.5" fill="#c9d1d9" textLength="798">● deploy-fix failed: turn 1 failed: terraform plan failed: the state lock is held by run 81719.</text>
-<text x="39.2" y="171.5" fill="#87d787" class="b" textLength="226.8">invoice-rounding · question</text>
+<text x="39.2" y="171.5" fill="#af87af" class="b" textLength="226.8">invoice-rounding · question</text>
 <text x="963.2" y="171.5" fill="#c9d1d9" textLength="33.6">fake</text>
 <text x="1005.2" y="171.5" fill="#6e7681">·</text>
 <text x="1022" y="171.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="30.8" y="189.5" fill="#c9d1d9" textLength="403.2">Round tax per line or once on the invoice total?</text>
-<text x="963.2" y="189.5" fill="#d29922" textLength="386.4">twr/ffd9504a8da96… · changes made · +1 vs main</text>
+<text x="963.2" y="189.5" fill="#d29922" textLength="386.4">twr/68daf64d1fb03… · changes made · +1 vs main</text>
 <text x="30.8" y="225.5" fill="#6e7681" textLength="42">task:</text>
 <text x="81.2" y="225.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
 <text x="971.6" y="225.5" fill="#6e7681" textLength="75.6">billing ·</text>
@@ -62,14 +61,14 @@
 <text x="980" y="297.5" fill="#c9d1d9" textLength="67.2">per line</text>
 <text x="1064" y="297.5" fill="#d29922" class="b">2</text>
 <text x="1080.8" y="297.5" fill="#c9d1d9" textLength="100.8">on the total</text>
-<text x="39.2" y="333.5" fill="#af87ff" class="b" textLength="184.8">ratelimit · permission</text>
+<text x="39.2" y="333.5" fill="#af87af" class="b" textLength="184.8">ratelimit · permission</text>
 <text x="30.8" y="351.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
 <text x="963.2" y="369.5" fill="#c9d1d9" textLength="33.6">fake</text>
 <text x="1005.2" y="369.5" fill="#6e7681">·</text>
 <text x="1022" y="369.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="30.8" y="387.5" fill="#6e7681" textLength="42">task:</text>
 <text x="81.2" y="387.5" fill="#b1bac4" textLength="680.4">I'll add a per-IP limit to POST /login. First, how a request reaches the handler.</text>
-<text x="963.2" y="387.5" fill="#39c5cf" textLength="310.8">twr/ffd9504a8da964aa/invoice-rounding</text>
+<text x="963.2" y="387.5" fill="#39c5cf" textLength="310.8">twr/68daf64d1fb03cf3/invoice-rounding</text>
 <text x="30.8" y="405.5" fill="#6e7681" textLength="42">said:</text>
 <text x="81.2" y="405.5" fill="#b1bac4" textLength="823.2">Added a test: six logins from one IP inside a minute, and the sixth must get 429 with Retry-After:</text>
 <text x="30.8" y="423.5" fill="#b1bac4" textLength="898.8">60. It uses a paused clock, so it runs in milliseconds. Running the auth tests to check nothing else broke.</text>
@@ -97,7 +96,7 @@
 <text x="1005.2" y="567.5" fill="#6e7681">·</text>
 <text x="1022" y="567.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="14" y="585.5" fill="#c9d1d9" textLength="932.4">● Three things. ratelimit wants to run cargo test -p api auth:: to check its new login limiter: select its card</text>
-<text x="963.2" y="585.5" fill="#39c5cf" textLength="260.4">twr/ffd9504a8da964aa/deploy-fix</text>
+<text x="963.2" y="585.5" fill="#39c5cf" textLength="260.4">twr/68daf64d1fb03cf3/deploy-fix</text>
 <text x="30.8" y="603.5" fill="#c9d1d9" textLength="907.2">and press Enter, then 1 allows. invoice-rounding asks whether tax is rounded per line or once on the invoice</text>
 <text x="30.8" y="621.5" fill="#c9d1d9" textLength="890.4">total. deploy-fix stopped because run 81719 still holds the Terraform state lock; I can retry it once that</text>
 <text x="971.6" y="621.5" fill="#6e7681" textLength="42">web ·</text>
@@ -114,7 +113,7 @@
 <text x="1022" y="693.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="30.8" y="711.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
 <text x="165.2" y="711.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
-<text x="963.2" y="711.5" fill="#d29922" textLength="386.4">twr/ffd9504a8d… · changes made · +1/−1 vs main</text>
+<text x="963.2" y="711.5" fill="#d29922" textLength="386.4">twr/68daf64d1f… · changes made · +1/−1 vs main</text>
 <text x="22.4" y="729.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
 <text x="1282.4" y="729.5" fill="#6e7681" textLength="67.2">↓ 3 more</text>
 <text x="963.2" y="747.5" fill="#6e7681" textLength="302.4">1 parked hidden · /parked shows them</text>

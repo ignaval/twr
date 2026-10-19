@@ -65,13 +65,12 @@
 <text x="1089.2" y="153.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="22.4" y="171.5" fill="#d29922" textLength="210">changes made · +1 vs main</text>
 <text x="240.8" y="171.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="358.4" y="171.5" fill="#39c5cf" textLength="243.6">twr/ffd9504a8da964aa/invoice…</text>
+<text x="358.4" y="171.5" fill="#39c5cf" textLength="243.6">twr/68daf64d1fb03cf3/invoice…</text>
 <text x="610.4" y="171.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="694.4" y="171.5" fill="#39c5cf" textLength="117.6">twr/ffd9504a8…</text>
+<text x="694.4" y="171.5" fill="#39c5cf" textLength="117.6">twr/68daf64d1…</text>
 <text x="820.4" y="171.5" fill="#6e7681" textLength="193.2">· 1 turn · 22 tok $0.00</text>
-<text x="1030.4" y="171.5" fill="#d29922" textLength="100.8">twr/ffd9504a</text>
-<text x="1131.2" y="171.5" fill="#c9d1d9">…</text>
-<text x="1148" y="171.5" fill="#6e7681" textLength="201.6">· 2 turns · 46 tok $0.00</text>
+<text x="1030.4" y="171.5" fill="#d29922" textLength="235.2">changes made · +1/−1 vs main</text>
+<text x="1274" y="171.5" fill="#6e7681" textLength="75.6">· 2 turns</text>
 <text x="30.8" y="207.5" fill="#6e7681" textLength="50.4">docs ·</text>
 <text x="89.6" y="207.5" fill="#6e7681" class="b" textLength="75.6">changelog</text>
 <text x="299.6" y="207.5" fill="#6e7681" textLength="33.6">auto</text>
@@ -108,9 +107,8 @@
 <text x="753.2" y="315.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
 <text x="22.4" y="333.5" fill="#39c5cf" textLength="84">+1 vs main</text>
 <text x="114.8" y="333.5" fill="#6e7681" textLength="193.2">· 1 turn · 44 tok $0.00</text>
-<text x="358.4" y="333.5" fill="#d29922" textLength="109.2">twr/ffd9504a8</text>
-<text x="467.6" y="333.5" fill="#c9d1d9">…</text>
-<text x="484.4" y="333.5" fill="#6e7681" textLength="193.2">· 1 turn · 93 tok $0.00</text>
+<text x="358.4" y="333.5" fill="#d29922" textLength="210">changes made · −1 vs main</text>
+<text x="576.8" y="333.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
 <text x="694.4" y="333.5" fill="#39c5cf" textLength="84">+2 vs main</text>
 <text x="786.8" y="333.5" fill="#6e7681" textLength="193.2">· 1 turn · 49 tok $0.00</text>
 <text x="30.8" y="405.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
