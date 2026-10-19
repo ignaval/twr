@@ -21,7 +21,7 @@
 <text x="39.2" y="81.5" fill="#3fb950" class="b" textLength="58.8">running</text>
 <text x="106.4" y="81.5" fill="#6e7681">·</text>
 <text x="123.2" y="81.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
-<text x="22.4" y="153.5" fill="#d29922" textLength="319.2">twr/d3… · changes made · +1/−1 vs main</text>
+<text x="22.4" y="153.5" fill="#d29922" textLength="319.2">twr/2a… · changes made · +1/−1 vs main</text>
 <text x="22.4" y="171.5" fill="#d29922" textLength="67.2">↑ 3 more</text>
 <text x="30.8" y="189.5" fill="#6e7681" class="b" textLength="75.6">changelog</text>
 <text x="165.2" y="189.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
@@ -31,7 +31,7 @@
 <text x="22.4" y="225.5" fill="#6e7681" textLength="302.4">from 37 commits: features, fixes and</text>
 <text x="22.4" y="243.5" fill="#6e7681" textLength="319.2">one breaking change (the --json output</text>
 <text x="22.4" y="261.5" fill="#6e7681" textLength="134.4">of thread list).</text>
-<text x="22.4" y="279.5" fill="#39c5cf" textLength="319.2">twr/d3be9d68f84b44aa/cha… · +1 vs main</text>
+<text x="22.4" y="279.5" fill="#39c5cf" textLength="319.2">twr/2af45b85b248ddf0/cha… · +1 vs main</text>
 <text x="274.4" y="297.5" fill="#6e7681" textLength="67.2">↓ 2 more</text>
 <text x="30.8" y="315.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
 <text x="165.2" y="315.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
