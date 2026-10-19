@@ -99,7 +99,7 @@ A card's title says which thread it is and who runs it: at its left the thread's
 └──────────────────────────────────────────────┘
 ```
 
-Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out. Then the mode goes, and last the box's name is cut (`@gp… offline`). The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the status section says it after the state (`idle · @gpu offline`). The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
+Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out, then the box's name is cut (`@gp… offline`). Only then does the mode go. The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the card's bottom border says it (`└ @gpu offline ──┘`), where the `↓ 3 more` of an edge card gives way to it if it must. The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
 
 The section starts with the state, then says what is going on, without saying anything twice:
 
