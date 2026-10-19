@@ -16911,6 +16911,38 @@ pub(crate) mod tests {
         assert_eq!(st.focused(), Some("t-alpha"));
     }
 
+    /// A request selected with text after it is drawn whole above the row that says what is
+    /// below (the view scrolled up to it): its last row is not under that row, so it counts
+    /// as drawn in full, at any height that has room for it and that row; one drawn alone at
+    /// the bottom needs no such row. With the sidebar hidden, the conversation is the only
+    /// place it is drawn.
+    #[test]
+    fn a_selected_request_is_whole_above_the_row_saying_what_is_below() {
+        for after in [0, 1, 2, 30] {
+            for h in 16..40u16 {
+                let mut st = api_and_web_waiting();
+                st.view.sidebar_hidden = true;
+                let mut o = ThreadScript::new("t-orch");
+                o.at(50);
+                st.apply_event(&request_update(&mut o, "pa"));
+                for i in 0..after {
+                    st.apply_event(&thread_item(&o.text(&format!("reply {i}"))));
+                }
+                draw(&mut st, 100, h);
+                st.select_request("pa");
+                let screen = draw(&mut st, 100, h);
+                let text = screen_text(&screen);
+                // (Its card is 5 rows: room for it and the row under it.)
+                let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+                assert!(pane.area.height >= 7, "{h}");
+                assert!(
+                    drawn_ids(&st).contains(&"pa"),
+                    "{after} after, {h} rows:\n{text}"
+                );
+            }
+        }
+    }
+
     /// The first Ctrl-↑ from a request selected at the bottom of a working conversation
     /// releases it and puts a line of text below the view, past the working cursor's own rows
     /// (which go once it is scrolled), as with no request selected.

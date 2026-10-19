@@ -5690,6 +5690,9 @@ fn request_tail(state: &AppState, id: &str, width: u16) -> usize {
         .map_or(0, |end| rows.len() - end - 1)
 }
 
+/// How far up the main pane scrolls to show request `id`'s card at its bottom: the rows below
+/// the card but one, the pane's last row (which says what is below once it is scrolled up,
+/// [`render_below`]) taking that one's place, so the card's last row stays above it.
 pub(crate) fn request_scroll(state: &AppState, id: &str) -> usize {
     let width = state.view.panes.get(&PaneId::Transcript).map_or_else(
         || {
@@ -5702,7 +5705,7 @@ pub(crate) fn request_scroll(state: &AppState, id: &str) -> usize {
         },
         |p| p.area.width,
     );
-    request_tail(state, id, width)
+    request_tail(state, id, width).saturating_sub(1)
 }
 
 /// Conversation rows for block navigation, using the current pane's wrapping. No cursor
@@ -5961,7 +5964,9 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         None => state.view.scroll,
     };
     // New replies must not scroll a selected request away. Esc or an explicit transcript
-    // scroll releases the selection; until then its options stay in view.
+    // scroll releases the selection; until then its options stay in view, above the row that
+    // says what is below when the view is scrolled up (it takes the pane's last row).
+    let shown = |scroll: usize| height - usize::from(scroll > 0 && height > 1);
     let scroll = requests
         .iter()
         .find(|(item, _)| state.view.request.as_deref() == Some(item.attn_id.as_str()))
@@ -5971,8 +5976,9 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             if range.start < start {
                 // Move just far enough to show the request, leaving room for its reply.
                 max_scroll.saturating_sub(range.start)
-            } else if range.end > start + height {
-                rows.len().saturating_sub(range.end)
+            } else if range.end > start + shown(scroll) {
+                // Down to its last row: one row less below it than there is, for that row.
+                rows.len().saturating_sub(range.end).saturating_sub(1)
             } else {
                 scroll
             }
@@ -5982,7 +5988,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // Scrolled up, the pane's last row says how much is below ([`render_below`]): the rows it
     // shows end above it.
     let footer = scroll > 0 && height > 1;
-    let end = (start + height - usize::from(footer)).min(rows.len());
+    let end = (start + shown(scroll)).min(rows.len());
     for (item, range) in requests {
         if start <= range.start
             && range.end <= end
@@ -12219,6 +12225,18 @@ mod tests {
                             .unwrap_or_else(|| panic!("{what}"));
                         assert!(has_token(row, &name, word), "{what}");
                         assert!(card_words(&text).contains(status), "{what}");
+                        // The rows as made, before the terminal clips them: none wider than
+                        // the card; a box name too long for the row cut with `…`.
+                        let inner = st.view.panes.get(&card("t-job")).unwrap().area;
+                        let job = st.registry.get("t-job").unwrap();
+                        let body = card_body(&st, job, usize::from(inner.width), None);
+                        let (rows, _) = card_rows(body, inner.height, inner.width);
+                        for r in &rows {
+                            assert!(r.width() <= usize::from(inner.width), "{r:?} {what}");
+                        }
+                        if cells(&name) + 1 + cells(word) > usize::from(inner.width) {
+                            assert!(row.contains('…'), "{what}");
+                        }
                     }
                 }
             }
