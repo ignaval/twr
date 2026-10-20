@@ -4251,6 +4251,44 @@ mod tests {
         drop(hub);
     }
 
+    /// The hub's wake of a worker is recorded (`hub::wake`): its held idle line goes with that
+    /// record, live and on replay, whatever holds the woken turn up (its report fires the
+    /// watches).
+    #[tokio::test]
+    async fn a_recorded_wake_takes_the_idle_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let w1 = set_watch(&hub, "api", false);
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        hub.append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        assert_eq!(replayed_queue(&hub, &db).0.len(), 1);
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::ConversationUpdate(ConversationUpdate {
+                text: "api's background work finished: twr woke it".into(),
+                about_thread: Some("api".into()),
+                ext: twr_ext_map(json!({"auto_wake": {"turn": 1, "tasks": []}})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w1]));
+        drop(hub);
+    }
+
     /// The tasks of a turn that failed end: no idle line fires its worker's watches (its
     /// error card already notifies, and an automatic retry may follow).
     #[tokio::test]

@@ -349,6 +349,9 @@ impl Core {
                 ),
             ));
         }
+        // The interruption is recorded with the answer (one batch): `turn.interrupted` first
+        // makes the turn end `interrupted` whatever its runtime does, as `message.send_now`.
+        let already = view.current_turn_interrupted || view.current_turn_withdrawn;
         let mut batch = Batch::default();
         let answered = batch.push(
             &thread,
@@ -365,14 +368,35 @@ impl Core {
                 ..Default::default()
             }),
         );
+        let head = head.filter(|_| interrupting);
+        if let (Some(head), false) = (&head, already) {
+            batch.push(
+                &thread,
+                Some(turn),
+                caller.source(),
+                EventBody::TurnInterrupted(TurnInterrupted {
+                    msg_ref: head.id,
+                    turn,
+                    ..Default::default()
+                }),
+            );
+        }
         let done = self.append_batch(hub, batch).map_err(append_err)?;
         let ev = done
             .events
             .get(answered)
             .cloned()
             .ok_or_else(|| super::internal("the answer was not recorded"))?;
-        if let (true, Some(head)) = (interrupting, head) {
-            self.send_now_locked(hub, &thread, head.id, caller)?;
+        if let Some(head) = head {
+            self.release_for(&thread, head.id)?;
+            if !already {
+                if let Some(live) = self.rt.get(&thread).and_then(|r| r.live.as_ref()) {
+                    if live.handle.interrupt().is_err() {
+                        // The runtime is exiting: its closing sequence ends the turn.
+                        tracing::info!(thread = %thread, turn, "the runtime was gone before the interrupt");
+                    }
+                }
+            }
         }
         Ok(ev)
     }

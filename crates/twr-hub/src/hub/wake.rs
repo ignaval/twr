@@ -40,7 +40,8 @@
 //! (the Claude Code adapter stamps the runs in order); the prompt says to answer in one line
 //! when the work was handled already. An orchestrator's watch on the worker fires on the woken
 //! turn's report (a follow-up's: `follow_up=true`); the line about the worker going idle
-//! (`hub::watches`) is held until the wake was decided, and goes out only if none started.
+//! (`hub::watches`) is held until the wake was decided, goes with the wake's record, and goes
+//! out only if the hub did not wake it.
 //!
 //! [`HubOptions::wake_after`]: super::HubOptions::wake_after
 
@@ -262,6 +263,9 @@ impl Core {
                 self.wake.pending.remove(&ev.thread);
                 if woke.is_some() {
                     *self.wake.chain.entry(ev.thread.clone()).or_default() += 1;
+                    // Its prompt is queued: the turn it starts reports, and fires the watches,
+                    // whatever holds that turn up meanwhile.
+                    self.orch.drop_idle(&ev.thread);
                 }
             }
             // (A stop or park cancels nothing here: a stop that restarts the runtime for a

@@ -1075,7 +1075,7 @@ Behaviors worth knowing when you follow the stream:
   log time, it fires on the idle worker instead (`- thread=<name> idle: ...`); a task starting
   meanwhile cancels that line, and the worker going idle again holds a new one. While the hub
   is about to wake the worker (below), the line is held until that is decided, and the
-  woken turn's start drops it. A failed turn,
+  wake's record drops it. A failed turn,
   and a report the orchestrator or a user wrote, fire nothing (an idle worker fires only after
   a turn that completed; a rewrite of an interim report stays interim while the turn's tasks
   run). Firing adds ` watch=<id> note="<note>"` to the report's notice line (or queues one for

@@ -578,6 +578,13 @@ impl Translator {
     /// item of a request the runtime replaced since (see [`crate::attn`]) returns None, and
     /// the reply is built only from the content `attn_id` was raised with.
     pub fn respond(&mut self, attn_id: &str, answer: &Answer) -> Option<Translated> {
+        let out = self.answer(attn_id, answer);
+        self.requests_closed();
+        out
+    }
+
+    /// [`Translator::respond`] before the wait restarts.
+    fn answer(&mut self, attn_id: &str, answer: &Answer) -> Option<Translated> {
         if self.failed {
             return None;
         }
@@ -1734,6 +1741,25 @@ impl Translator {
         for attn_id in r.open_ids() {
             out.events
                 .push(self.withdrawal(attn_id, "runtime", Some(line)));
+        }
+        self.requests_closed();
+    }
+
+    /// The last request for the user was answered or withdrawn: what is awaited by a deadline
+    /// (a missing `result`, a notification's run) gets its whole wait again from now.
+    fn requests_closed(&mut self) {
+        if !self.pending.is_empty() {
+            return;
+        }
+        if let Some((watch, _)) = self.watch {
+            let after = match watch {
+                Watch::Result => self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER),
+                Watch::NoticeRun => self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER),
+            };
+            self.watch = Some((watch, (self.clock)() + chrono_of(after)));
         }
     }
 
@@ -3619,7 +3645,17 @@ mod tests {
         let again = t.deadline().unwrap();
         assert!(again > at && t.busy());
         t.respond("r1", &Answer::new("allow")).unwrap();
-        let events = t.expire(again).events;
+        // The whole wait again from the answer.
+        let fresh = t.deadline().unwrap();
+        assert!(
+            fresh >= Utc::now() + chrono::Duration::seconds(119),
+            "{fresh}"
+        );
+        assert!(t
+            .expire(fresh - chrono::Duration::seconds(1))
+            .events
+            .is_empty());
+        let events = t.expire(fresh).events;
         assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
     }
 
