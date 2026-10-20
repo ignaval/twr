@@ -548,10 +548,14 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 ///   and does not lie in the git dir or a checkout;
 /// - it is the runtime's user's (twr's effective uid: the sandbox runs as it, whoever owns
 ///   `cwd`), and no other user can replace it or a directory above it ([`held_by`]);
-/// - it does not lie in anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`, the shared
-///   memory folder or another root. Codex's sandbox finds its roots again for each command,
-///   so a root in a folder the agent can write could be swapped for a link to anywhere
-///   between two commands.
+/// - it neither lies in nor holds anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`
+///   (also before it exists), the shared memory folder; nor lies in another root. Codex's
+///   sandbox finds its roots again for each command, so a root in a folder the agent can
+///   write, or a scratch folder below a root, could be swapped for a link to anywhere between
+///   two commands. A relative `$TMPDIR` (Codex resolves it against the cwd) opens none;
+/// - the repository's checkouts can be found (from `repo`'s git dir, even when it lies in
+///   `cwd`), so that none of them is opened: otherwise neither these nor the shared memory
+///   folder are.
 ///
 /// The shared memory folder qualifies as root's, sticky and writable by all, with no other
 /// user able to replace it, and none of the repository's checkouts in it. (Codex lets every
@@ -586,7 +590,16 @@ fn writable_roots(
     };
     // The runtime's user, whom the sandbox runs as (not whoever owns `cwd`).
     let owner = twr_core::paths::effective_uid();
-    let common = repo.and_then(|r| common_dir_of(r, &canonical_cwd));
+    let common = repo.and_then(|r| common_dir_of(r, Some(&canonical_cwd)));
+    // What to keep out, found even where it grants nothing (a thread in the main checkout,
+    // whose git dir lies in its cwd). A repository whose checkouts can't be found gets no
+    // root but its git metadata.
+    let repo_git = repo.and_then(|r| common_dir_of(r, None));
+    let repo_known = repo.is_none() || repo_git.is_some();
+    // Codex lets commands write `$TMPDIR`, resolving a relative one against the cwd: twr
+    // takes an absolute one, and with a relative one opens no named root.
+    let tmpdir = env("TMPDIR").filter(|v| !v.is_empty()).map(PathBuf::from);
+    let tmpdir_known = tmpdir.as_ref().is_none_or(|t| t.is_absolute());
     let home = var("HOME");
     let canonical_home = home.as_ref().and_then(|h| h.canonicalize().ok());
     // Roots twr found itself (canonical), and those a variable named.
@@ -602,7 +615,7 @@ fn writable_roots(
         );
     }
     let mut named: Vec<PathBuf> = Vec::new();
-    if canonical_home.is_some() {
+    if canonical_home.is_some() && tmpdir_known && repo_known {
         if let Some(cargo) = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo"))) {
             named.extend(["registry", "git"].map(|d| cargo.join(d)));
         }
@@ -616,21 +629,22 @@ fn writable_roots(
     let shared = shared_memory.canonicalize().ok();
     // What no root may hold: the worktree, the repository's git dir and its other checkouts,
     // the home folder.
-    let mut repo_checkouts: Vec<PathBuf> = common.as_deref().map(checkouts).unwrap_or_default();
+    let mut repo_checkouts: Vec<PathBuf> = repo_git.as_deref().map(checkouts).unwrap_or_default();
     repo_checkouts.extend(repo.and_then(|r| r.canonicalize().ok()));
     let keep_out: Vec<PathBuf> = [
         Some(canonical_cwd.clone()),
-        common.clone(),
+        repo_git.clone(),
         canonical_home.clone(),
     ]
     .into_iter()
     .flatten()
     .chain(repo_checkouts.iter().cloned())
     .collect();
+    // What commands can write besides the roots (`$TMPDIR` also before it exists).
     let scratch: Vec<PathBuf> = [
         Some(canonical_cwd.clone()),
-        tmp.canonicalize().ok(),
-        var("TMPDIR").and_then(|t| t.canonicalize().ok()),
+        resolved(tmp),
+        tmpdir.as_deref().and_then(resolved),
         shared.clone(),
     ]
     .into_iter()
@@ -654,9 +668,12 @@ fn writable_roots(
         if r.canonicalize().ok().as_ref() != Some(&r) {
             continue;
         }
-        let lies_in_git = common.as_ref().is_some_and(|c| r.starts_with(c))
+        let lies_in_git = repo_git.as_ref().is_some_and(|c| r.starts_with(c))
             || repo_checkouts.iter().any(|c| r.starts_with(c));
-        let lies_in_scratch = scratch.iter().any(|s| r.starts_with(s));
+        // In it, or holding it: a folder between the two could be swapped for a link.
+        let lies_in_scratch = scratch
+            .iter()
+            .any(|s| r.starts_with(s) || s.starts_with(&r));
         if writable(&r)
             && !holds_kept_out(&r)
             && !lies_in_git
@@ -679,7 +696,9 @@ fn writable_roots(
         std::fs::metadata(r).is_ok_and(|m| m.is_dir() && m.mode() & 0o1002 == 0o1002)
             && held_by(r, owner)
     };
-    if let Some(shm) = shared.filter(|s| s.as_path() == shared_memory && shared_dir(s)) {
+    if let Some(shm) =
+        shared.filter(|s| repo_known && s.as_path() == shared_memory && shared_dir(s))
+    {
         if !holds_kept_out(&shm) && !out.contains(&shm) {
             out.push(shm);
         }
@@ -690,6 +709,19 @@ fn writable_roots(
 /// The shared memory folder an `auto` sandbox may write ([`auto_writable_roots`]), where it
 /// exists (Linux).
 pub const SHARED_MEMORY: &str = "/dev/shm";
+
+/// The absolute path `path` resolves to: its nearest existing ancestor canonical, with the
+/// rest of it after (a folder that does not exist yet). None for a relative path.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let (base, rest) = path.ancestors().find_map(|a| {
+        let canonical = a.canonicalize().ok()?;
+        Some((canonical, path.strip_prefix(a).ok()?.to_path_buf()))
+    })?;
+    Some(base.join(rest))
+}
 
 /// Whether no user but `owner` (and root) can replace `path` (canonical) or a directory above
 /// it: each is `owner`'s or root's, and one every user may write to has the sticky bit. A
@@ -744,7 +776,7 @@ fn checkouts(common: &Path) -> Vec<PathBuf> {
 /// disagrees, or no repository.
 fn linked_worktree_git_dirs(cwd: &Path, repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let cwd = cwd.canonicalize().ok()?;
-    let common = common_dir_of(repo, &cwd)?;
+    let common = common_dir_of(repo, Some(&cwd))?;
     let dot_git = cwd
         .ancestors()
         .map(|d| d.join(".git"))
@@ -798,10 +830,10 @@ fn worktree_record(common: &Path, dot_git: &Path) -> Option<PathBuf> {
 /// The git common dir of repository `repo` (canonical): `repo/.git` when it is a directory,
 /// the common dir its `.git` file leads to (a linked worktree's `commondir`, else the git dir
 /// itself), or `repo` when it is a bare repository. None when there is none, or when it, or
-/// a pointer read on the way, lies inside `cwd` (the agent's to write).
-fn common_dir_of(repo: &Path, cwd: &Path) -> Option<PathBuf> {
+/// a pointer read on the way, lies inside `cwd` (the agent's to write), when one is given.
+fn common_dir_of(repo: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let repo = repo.canonicalize().ok()?;
-    let inside = |p: &Path| p.starts_with(cwd);
+    let inside = |p: &Path| cwd.is_some_and(|c| p.starts_with(c));
     let dot_git = repo.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git);
     let common = match meta {
@@ -2163,6 +2195,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(roots_with(&d.join("none")), git);
+    }
+
+    /// The review's round 4 cases. A thread in the main checkout (whose git dir lies in its
+    /// cwd, so it gets no git roots) still keeps the repository's other worktrees out: one in
+    /// the shared memory folder leaves that out. A named root holding `$TMPDIR`, even one not
+    /// made yet, is left out (a folder between them could become a link), and with a relative
+    /// `$TMPDIR` no named root is opened at all.
+    #[test]
+    fn checkouts_and_tmpdir_are_kept_out_from_every_side() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let (_, common) = worktree(dir.path(), false);
+        let d = dir.path().canonicalize().unwrap();
+        let home = d.join("home");
+        for p in ["home", "shm", "cache/build", "nowt"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        let (shm, tmp) = (d.join("shm"), d.join("tmp"));
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let main = d.join("main");
+        let repo = Some(main.as_path());
+        let roots_with = |cwd: &Path, vars: Vec<(&'static str, String)>| {
+            let home = home.clone();
+            let env = move |k: &str| match k {
+                "HOME" => Some(home.clone().into_os_string()),
+                _ => vars
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.clone().into()),
+            };
+            writable_roots(cwd, repo, env, &shm, &tmp)
+        };
+        let target = d.join("cache/build");
+        let target_var = ("CARGO_TARGET_DIR", target.display().to_string());
+        // The main checkout: no git roots, the target and the shared memory folder.
+        assert_eq!(
+            roots_with(&main, vec![target_var.clone()]),
+            [target.clone(), shm.clone()]
+        );
+        // A worktree of the repository in the shared memory folder.
+        let other = shm.join("other");
+        std::fs::create_dir_all(common.join("worktrees/other")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            common.join("worktrees/other/gitdir"),
+            format!("{}\n", other.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            roots_with(&main, vec![target_var.clone()]),
+            [target.clone()]
+        );
+        std::fs::remove_dir_all(common.join("worktrees/other")).unwrap();
+        // `$TMPDIR` below the target, not made yet: the target is left out.
+        let tmpdir = ("TMPDIR", target.join("temp/session").display().to_string());
+        assert_eq!(
+            roots_with(&main, vec![target_var.clone(), tmpdir]),
+            [shm.clone()]
+        );
+        // A relative `$TMPDIR`: no named root at all.
+        let relative = ("TMPDIR", "../scratch".to_string());
+        assert_eq!(
+            roots_with(&main, vec![target_var.clone(), relative]),
+            [shm.clone()]
+        );
+        // A repository whose git dir can't be found: nothing but what twr found itself.
+        let gone = d.join("gone");
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        assert!(writable_roots(&d.join("nowt"), Some(&gone), env, &shm, &tmp).is_empty());
     }
 
     /// No root may hold the home folder, the worktree or the repository's git dir: a
