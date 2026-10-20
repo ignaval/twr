@@ -738,7 +738,8 @@ fn held_by(path: &Path, owner: u32) -> bool {
 /// worktree's `.git` file), as far as they resolve. Only where the main checkout is known:
 /// `repo` is it (its `.git` is `common`), or the repository is bare (`common` is `repo`).
 /// None otherwise (`repo` is a linked checkout, or the git dir lives apart from the main
-/// checkout, `git init --separate-git-dir`): git itself can't find that main checkout.
+/// checkout, `git init --separate-git-dir`: git itself can't find that main checkout), and
+/// when the records can't all be read (only a missing `worktrees` folder means none).
 fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
     let repo = repo.canonicalize().ok()?;
     let dot_git = repo.join(".git");
@@ -748,17 +749,26 @@ fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
         return None;
     }
     let mut out: Vec<PathBuf> = vec![repo];
-    let Ok(records) = std::fs::read_dir(common.join("worktrees")) else {
-        return Some(out);
+    let records = match std::fs::read_dir(common.join("worktrees")) {
+        Ok(r) => r,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(out),
+        Err(_) => return None,
     };
-    for record in records.flatten() {
-        let Ok(text) = std::fs::read_to_string(record.path().join("gitdir")) else {
+    for record in records {
+        let record = record.ok()?;
+        if !record.file_type().ok()?.is_dir() {
             continue;
-        };
-        let named = record.path().join(text.trim_end_matches(['\n', '\r']));
-        if let Some(worktree) = named.parent().and_then(|w| w.canonicalize().ok()) {
-            out.push(worktree);
         }
+        // A record whose `gitdir` can't be read hides where its worktree is.
+        let text = std::fs::read_to_string(record.path().join("gitdir")).ok()?;
+        let named = record.path().join(text.trim_end_matches(['\n', '\r']));
+        let worktree = named.parent()?;
+        // One that is gone is kept out by its path, should it come back.
+        out.push(
+            worktree
+                .canonicalize()
+                .unwrap_or_else(|_| worktree.to_path_buf()),
+        );
     }
     Some(out)
 }
@@ -2345,6 +2355,63 @@ mod tests {
             .map(|x| git.join(x))
             .collect();
         assert_eq!(roots, want);
+    }
+
+    /// The repository's worktree records must all be read to know its checkouts: a records
+    /// folder that can't be listed, or a record whose `gitdir` can't be read (not UTF-8,
+    /// unreadable), opens no named root and no shared memory folder. A record whose worktree
+    /// is gone still keeps its path out.
+    #[test]
+    fn unreadable_worktree_records_open_no_optional_root() {
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (_, common) = worktree(dir.path(), false);
+        let d = dir.path().canonicalize().unwrap();
+        for p in ["home", "shm"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        let (shm, tmp) = (d.join("shm"), d.join("tmp"));
+        mode(&shm, 0o1777);
+        let main = d.join("main");
+        let home = d.join("home");
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        let roots = || writable_roots(&main, Some(&main), env, &shm, &tmp);
+        assert_eq!(roots(), std::slice::from_ref(&shm));
+        // A record naming a worktree in the shared memory folder that is gone: kept out.
+        let gone = common.join("worktrees/gone");
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(
+            gone.join("gitdir"),
+            format!("{}\n", shm.join("x/.git").display()),
+        )
+        .unwrap();
+        assert!(roots().is_empty());
+        std::fs::remove_dir_all(&gone).unwrap();
+        // A `gitdir` that is not UTF-8.
+        let odd = common.join("worktrees/odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(
+            odd.join("gitdir"),
+            std::ffi::OsStr::from_bytes(b"/\xff/.git\n").as_bytes(),
+        )
+        .unwrap();
+        assert!(roots().is_empty());
+        std::fs::remove_dir_all(&odd).unwrap();
+        assert_eq!(roots(), std::slice::from_ref(&shm));
+        // A records folder that can't be listed (root reads it anyway).
+        if twr_core::paths::effective_uid() != 0 {
+            mode(&common.join("worktrees"), 0o300);
+            let r = roots();
+            mode(&common.join("worktrees"), 0o755);
+            assert!(r.is_empty(), "{r:?}");
+        }
     }
 
     /// No root may hold the home folder, the worktree or the repository's git dir: a
