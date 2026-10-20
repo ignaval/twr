@@ -26,6 +26,7 @@
 //! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
 //! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
 //! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
+//! | `suggest.next`      | `{thread, turn, model}` (users only)                | `{thread, turn, model, suggestion, reason?, cached, stats}`: a likely next message of the user's after turn `turn` ended, from `claude -p` with the user's login (`hub::suggest`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -670,6 +671,7 @@ pub const METHODS: &[&str] = &[
     "thread.queue",
     "shell.run",
     "shell.cd",
+    "suggest.next",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -1054,7 +1056,7 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
-            | "box.restart" | "box.projects" | "box.token" => {
+            | "box.restart" | "box.projects" | "box.token" | "suggest.next" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1842,6 +1844,17 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "thread.trim" => {
             let p: ThreadRef = params(p)?;
             hub.trim_thread(&p.thread, caller).await
+        }
+        "suggest.next" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct SuggestParams {
+                thread: String,
+                turn: u64,
+                model: String,
+            }
+            let p: SuggestParams = params(p)?;
+            hub.suggest_next(&p.thread, p.turn, &p.model, caller).await
         }
         "usage.threads" => {
             #[derive(Default, Deserialize)]

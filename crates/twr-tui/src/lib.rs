@@ -26,6 +26,7 @@ pub mod queue;
 pub mod select;
 pub mod shell;
 pub mod slash;
+pub mod suggest;
 pub mod ui;
 pub mod workspace;
 
@@ -1877,6 +1878,8 @@ struct Shared {
     keys: keys::Keys,
     /// `/compact on|off`, for every workspace shown ([`crate::app::ViewState::compact`]).
     compact: Option<bool>,
+    /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
+    suggest: Option<bool>,
 }
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
@@ -1950,6 +1953,7 @@ pub async fn run_with(
         waiting_seen: std::collections::HashMap::new(),
         keys,
         compact: None,
+        suggest: None,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2136,6 +2140,8 @@ async fn drive(
     state.view.card_order = ctx.tui.card_order;
     state.view.compact_width = ctx.tui.compact_width;
     state.view.compact = ctx.compact;
+    state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
+    state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.view.picker = Picker::from_show(&show);
     state.workspace = current;
     state.set_tabs(carried.tabs);
@@ -2205,6 +2211,9 @@ async fn drive(
     // off the input loop and tried again until they succeed (`AppState::hydration_due`).
     type Hydrated = (String, u64, Result<StreamItem, String>);
     let (hyd_tx, mut hyd_rx) = mpsc::unbounded_channel::<Hydrated>();
+    // Suggestion calls' answers: each call on a connection of its own, as it takes a second
+    // or more and nothing else waits for it.
+    let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
     // (`Transcript::visible`), so nothing on screen changed, and a draw per event would slow
@@ -2336,6 +2345,14 @@ async fn drive(
             }
             if state.shell_cwd_due() {
                 let _ = call_tx.send(("shell.cd", json!({})));
+            }
+            if let Some(ask) = state.take_suggest_due() {
+                let (socket, tx) = (socket.clone(), sug_tx.clone());
+                tokio::spawn(async move {
+                    let params = json!({"thread": ask.thread, "turn": ask.turn, "model": ask.model});
+                    let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
+                    let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
+                });
             }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
@@ -2531,6 +2548,7 @@ async fn drive(
                 _ = sleep_opt(state.unsend_deadline()) => {
                     state.expire_unsend(std::time::Instant::now());
                 }
+                Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
                 Some((attn, revision, r)) = hyd_rx.recv() => {
                     state.hydrated(&attn, revision, r, std::time::Instant::now());
                 }
@@ -2671,6 +2689,7 @@ async fn drive(
 
     // `/compact on|off` holds in the next workspace shown too.
     ctx.compact = state.view.compact;
+    ctx.suggest = Some(state.view.suggest);
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
     drop(call_tx);

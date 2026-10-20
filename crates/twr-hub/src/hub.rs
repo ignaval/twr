@@ -151,6 +151,7 @@ mod shell;
 mod spawn;
 mod stall;
 mod subscribe;
+mod suggest;
 mod supervisor;
 mod switch;
 mod threads;
@@ -294,6 +295,9 @@ pub struct HubOptions {
     /// (whose `main` runs the gate first thing). `None`: jobs are refused. Tests set this
     /// crate's `twr-job-gate`.
     pub job_gate_exe: Option<PathBuf>,
+    /// The Claude Code CLI that answers next-message suggestions (`hub::suggest`): `None`
+    /// uses `TWR_CLAUDE_BIN`, else `claude` on the hub's `PATH`. Tests give a script.
+    pub suggest_bin: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -442,6 +446,7 @@ impl HubOptions {
             socket: None,
             twr_exe: std::env::current_exe().ok(),
             job_gate_exe: std::env::current_exe().ok(),
+            suggest_bin: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
             git_tick: None,
@@ -716,6 +721,10 @@ struct Inner {
     twr_exe: Option<PathBuf>,
     /// [`HubOptions::job_gate_exe`].
     job_gate_exe: Option<PathBuf>,
+    /// [`HubOptions::suggest_bin`], resolved.
+    suggest_bin: PathBuf,
+    /// Next-message suggestions asked and answered (`hub::suggest`).
+    suggestions: Mutex<suggest::Suggestions>,
     /// [`HubOptions::claude_policy`].
     claude_policy: twr_adapters::claude_code::guard::PolicySources,
     /// Wakes the notifier task ([`orch::notifier`]).

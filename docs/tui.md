@@ -338,6 +338,21 @@ A line that starts with `!` is a shell command of yours, run without leaving the
 
 A pasted `!` line runs only when you press Enter, like any line. `↑` recalls `!` lines with the rest of the history.
 
+### Suggestions
+
+With `[tui] suggest = true` in the [configuration](configuration.md) (or `/suggest on` while the TUI runs), the TUI suggests your next message after a turn of the thread you see ends, as Claude Code does. The suggestion shows as dim ghost text in the empty input box, and its title says `Tab or → takes the suggestion`:
+
+```
+╭ → orchestrator  Tab or → takes the suggestion · Enter sends ──────────────────╮
+│now run the integration tests                                                   │
+```
+
+- `Tab` or `→` puts it in the box, to edit or send with `Enter` as anything you type. While a suggestion shows, `Tab` takes it instead of selecting a card.
+- Typing types over it; with the line empty again it shows again. `Enter` on the empty line does what it always does: a suggestion is never sent unless you take it and press `Enter`, and then it is your message, from what you have seen when you send it.
+- A new turn of the thread takes it away; it shows only for the thread on the main pane, with nothing typed.
+
+Where it comes from: when a turn ends while the TUI watches and nothing is typed, the TUI asks the hub (`suggest.next`), which runs the Claude Code CLI once, with your login (`claude -p --model haiku`, or `[tui] suggest_model`), with no tools, settings, hooks, MCP servers, CLAUDE.md or memory of yours, in an empty folder. The model reads the turn's prompt (its first 2 KB), the end of the agent's last reply (6 KB) and the thread's name, nothing else. That text goes to Anthropic whatever runtime the thread runs. Each call costs about 600 input tokens over the text (about $0.0001 with Haiku at list price) and counts toward your Claude plan's usage windows, which the status bar shows as the runtimes report them. The hub makes one call per turn, shared by every TUI that asks, at most one every 3 seconds and 60 an hour, and none for 10 minutes after a call fails (not signed in, a usage limit); the TUI says why once. A suggestion that reads as an answer (`yes`, `2`, `allow api`, `stop web`) is dropped: answers are yours to type. Nothing about suggestions is recorded in the event log. `/suggest` says how many calls the hub made.
+
 ### Queued messages
 
 A message you send while its thread is busy waits in the thread's queue, which the hub keeps, and runs when the turn before it ends, one turn per message, in order. The messages waiting for the thread on the main pane (the orchestrator, or the thread you dived into) are listed right above the input box, the next to run first:
@@ -405,7 +420,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Key | Action |
 |---|---|
 | Enter | send what you typed; on an empty line, about the selection: a long block expands or collapses, a card, tile or request opens its [action popup](#the-action-popup) (in a dive with nothing selected, the dived thread's) |
-| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first) |
+| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first, and takes a [suggestion](#suggestions) shown in the empty box) |
 | Shift-↑, Shift-↓ | select the previous, the next card; with the conversation selected, its previous, next long block or request |
 | Shift-←, Shift-→ | select the conversation (see [Selecting the conversation](#selecting-the-conversation)); the cards again, the one selected before. In the grid, the four Shift-arrows move between tiles |
 | Esc | close a popup or overlay, else release the selection, else leave the dive (see [above](#typing-and-the-selection)); never clears what you typed |
@@ -577,6 +592,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/grid` | the grid, or back to the stack view, as Ctrl-G does |
 | `/decisions` | the decision audit table, over the view you are in; `Esc` closes it |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal; no argument toggles |
+| `/suggest [on\|off]` | [suggest your next message](#suggestions) after a turn (`[tui] suggest`); no argument toggles |
 | `/ws [name]` | list the [workspaces](#workspaces), or switch to one; a new name asks `y` to create it; alias `/workspace` |
 | `/help` | commands and keys, as `?` on an empty line |
 | `/quit` | quit, as Ctrl-C does |

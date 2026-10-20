@@ -403,9 +403,7 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
             |l| l.contains("\\x1b\\r") || l.contains("\\e\\r"),
             "map shift+enter send_text all \\x1b\\r",
         ),
-        Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => {
-            return Ok(Outcome::Manual)
-        }
+        Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => return Ok(Outcome::Manual),
     };
     let new = match change {
         Change::Already => return Ok(Outcome::Already { file }),
@@ -829,10 +827,7 @@ mod tests {
 
     #[test]
     fn names_given_with_terminal_parse_loosely() {
-        assert_eq!(
-            Terminal::parse("Terminal.app"),
-            Some(Terminal::AppleApp)
-        );
+        assert_eq!(Terminal::parse("Terminal.app"), Some(Terminal::AppleApp));
         assert_eq!(Terminal::parse("iTerm2"), Some(Terminal::ITerm2));
         assert_eq!(
             Terminal::parse("VS Code"),

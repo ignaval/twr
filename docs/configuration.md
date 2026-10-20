@@ -123,6 +123,8 @@ mouse = true                      # the TUI selects and copies text; false = the
 animate = true                    # the working icon moves; false = a still _ marker
 card_order = "stable"             # "attention": the most recently active thread first, every move at once
 compact_width = 60                # narrower, one screen at a time (a phone); 0 = never
+suggest = false                   # true: a small model suggests your next message after a turn
+suggest_model = "haiku"           # the Claude Code model the suggestions come from
 
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
@@ -182,6 +184,8 @@ The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the
 `[notify]` has the hub run a command of yours when something needs you, with or without a TUI open: a push to your phone through ntfy, a Slack message, a desktop notification. It's off until `command` is set. The command gets the title and body as arguments (`{title}`, `{body}`, `{workspace}`) and the details as JSON on stdin. Every workspace's hub runs it, and nothing goes out while you use a TUI. See [notifications.md](notifications.md) for the rules and recipes.
 
 `compact_width` is the width, in columns, below which the TUI shows one screen at a time: the conversation, what needs you, or the threads, switched with `/c`, `/n` and `/t`. It's meant for a phone over SSH or mosh. 0 turns it off; `/compact on|off` overrides it while the TUI runs. See [tui.md](tui.md#on-a-phone).
+
+`suggest = true` has the TUI suggest your next message: after a turn of the thread you see ends, the hub asks a small model, through the Claude Code CLI with your login, for a likely next message, which shows as ghost text in the empty input box until Tab or → takes it. It's off by default because it sends that turn's prompt and the end of its reply to Anthropic, whatever runtime the thread runs, and counts toward your Claude plan's usage. `suggest_model` names the model (`haiku` by default; any name `claude --model` takes). `/suggest on|off` turns it on or off while the TUI runs. See [tui.md](tui.md#suggestions).
 
 `[tui.notify]` has the TUI alert its terminal, with a bell or a desktop notification, when something needs you and the terminal isn't focused. The TUI reads it from the config of the machine it runs on. See [tui.md](tui.md#notifications).
 

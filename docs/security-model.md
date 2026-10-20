@@ -136,6 +136,15 @@ A line you type in the TUI that starts with `!` runs as a shell command of yours
 - **What is recorded.** The command, where it ran, who asked (`user:<client>`), how it ended, and the last 4 KiB of what it printed, on the job's `task.updated` events in the thread's log; its whole output is in its job log. Like everything recorded, any agent can read them (`thread.events`, `job.log`). The orchestrator's own transcript reads leave jobs out. Don't print secrets you wouldn't show an agent; run such commands in your own terminal.
 - **What reaches an agent.** With `!`, nothing reaches any agent's turn. With `!!`, when the command ends, the thread gets a prompt quoting the command, where it ran, how it ended and the last 8 KiB of its output, framed as the command's output and not your instructions. That prompt is queued with the job's end in one transaction, so it arrives even if the TUI quits. It is a turn the runtime starts (`from: runtime`), never your message: it carries none of your authority. The orchestrator can't relay an answer, change a mode or move a runtime on the strength of it, and a short command in the output is never applied. Command output is untrusted text, like anything an agent reads.
 
+## Suggestions
+
+Next-message suggestions are off unless you turn them on (`[tui] suggest = true`, `/suggest on`). On, after a turn of the thread on a TUI's main pane ends, the hub runs the Claude Code CLI with your login to guess your next message ([tui.md](tui.md#suggestions)).
+
+- **What leaves the machine.** That turn's prompt (its first 2 KB), the end of the agent's last reply (6 KB) and the thread's name, sent to Anthropic by the CLI, whatever runtime the thread runs (a Codex thread's text goes to Anthropic too). Nothing else: no files, no other turns or threads. It counts toward your Claude plan's usage.
+- **What the CLI loads.** Nothing of yours: no tools, MCP servers, settings, hooks, plugins, CLAUDE.md or memory (`--tools ""`, `--strict-mcp-config`, `--setting-sources ""`), no session kept, a system prompt of twr's, in an empty private folder, without twr's tokens, with a `TWR_AGENT` marker.
+- **Who asks.** User clients only (`suggest.next`): the orchestrator and agents get `unauthorized`.
+- **What a suggestion can do.** Nothing by itself. It is ghost text in your input box; it becomes a message only when you take it (Tab or →) and press Enter, and then it is yours, with your authority. The agent's reply is untrusted text and can steer what the model suggests, so the hub drops any suggestion that reads as an answer or a short command (`yes`, `2`, `allow api`, `stop web`), and none is ever recorded in the event log.
+
 ## git in repositories agents control
 
 An agent can write the config of the repository it works in, and git's config can name programs for git to run. twr runs git itself (snapshots, worktrees, the trash, merge readiness, project reads), so none of those commands may run a program the repository names:

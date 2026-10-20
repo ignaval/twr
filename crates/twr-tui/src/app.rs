@@ -290,6 +290,10 @@ pub struct ViewState {
     /// `[tui] compact_width`: below it the compact layout is on ([`AppState::compact`]); 0:
     /// never by itself.
     pub compact_width: u16,
+    /// Next-message suggestions on (`[tui] suggest`, `/suggest`; [`crate::suggest`]).
+    pub suggest: bool,
+    /// The model they come from (`[tui] suggest_model`).
+    pub suggest_model: String,
     /// `/compact on|off`: the compact layout on or off whatever the width; `None`: by the
     /// width.
     pub compact: Option<bool>,
@@ -2217,6 +2221,14 @@ pub struct AppState {
     pub shell_jobs: Vec<crate::shell::Started>,
     /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
     pub shell_reads: HashMap<String, crate::shell::Reads>,
+    /// The suggested next message, while it may show ([`crate::suggest`]).
+    pub suggestion: Option<crate::suggest::Suggestion>,
+    /// A suggestion to ask for: the thread and the turn that ended.
+    pub suggest_due: Option<(String, u64)>,
+    /// A suggestion call failed already (the status bar said so once).
+    pub suggest_failed: bool,
+    /// The hub's suggestion counts, as its last answer gave them.
+    pub suggest_stats: Value,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
     /// came while a view kept for it is being restored: applied once it is
     /// ([`AppState::finish_restore`]), into the view as it was left.
@@ -2497,9 +2509,22 @@ impl AppState {
                     self.shell_ended(&job);
                 }
             }
+            // A turn ended while the TUI watched: a suggestion may be due; one started: the
+            // last one goes.
+            EventBody::TurnEnded(_) if self.catch_up.is_none() => {
+                self.queue_changed(&ev.thread);
+                if let Some(turn) = ev.turn {
+                    let thread = ev.thread.clone();
+                    self.suggest_after(&thread, turn);
+                }
+            }
+            EventBody::TurnStarted(_) => {
+                self.queue_changed(&ev.thread);
+                let thread = ev.thread.clone();
+                self.suggest_drop(&thread);
+            }
             // The thread's queue moved: read it again when it is the main pane's.
-            EventBody::TurnStarted(_)
-            | EventBody::TurnEnded(_)
+            EventBody::TurnEnded(_)
             | EventBody::PromptWithdrawn(_)
             | EventBody::TurnInterrupted(_)
             | EventBody::ThreadStopped(_)
@@ -2743,6 +2768,7 @@ impl AppState {
             "shell.run" => self.shell_started(result),
             "shell.cd" => self.shell_moved(result),
             "job.log" => self.shell_log(result, Instant::now()),
+            "suggest.next" => self.suggest_result(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
             "orchestrator.reset" => {
@@ -4284,6 +4310,10 @@ impl AppState {
                 }
             }
             Slash::Focus(on) => self.set_focus_mode(on.unwrap_or(!self.view.focus_mode)),
+            Slash::Suggest(on) => {
+                self.toggle_suggest(on);
+                return (Vec::new(), true);
+            }
             Slash::Mouse(on) => {
                 let on = on.unwrap_or(!self.view.mouse);
                 self.view.mouse = on;
@@ -4532,6 +4562,13 @@ impl AppState {
         }
         // A line break goes in before the popup could take the Enter.
         if self.newline(key) {
+            return Vec::new();
+        }
+        // Tab or → on the empty line takes the suggestion shown in it ([`crate::suggest`]).
+        if matches!(key.code, KeyCode::Tab | KeyCode::Right)
+            && key.modifiers.is_empty()
+            && self.accept_suggestion()
+        {
             return Vec::new();
         }
         // The slash command popup takes its keys first.
@@ -5842,7 +5879,7 @@ impl AppState {
 
     /// Columns of the input line's box (as last drawn; while it is not drawn, from the
     /// terminal width, [`crate::ui::input_box_width`]).
-    fn input_cols(&self) -> usize {
+    pub(crate) fn input_cols(&self) -> usize {
         usize::from(self.view.panes.get(&PaneId::Input).map_or_else(
             || crate::ui::input_box_width(self, self.view.width).saturating_sub(2),
             |p| p.area.width,
@@ -5850,7 +5887,7 @@ impl AppState {
     }
 
     /// Rows the input line's box may grow to at the terminal height of the last draw.
-    fn input_rows(&self) -> usize {
+    pub(crate) fn input_rows(&self) -> usize {
         crate::ui::input_cap(self.view.height)
     }
 
@@ -20955,6 +20992,142 @@ pub(crate) mod tests {
                 .shell_reads_due(later + Duration::from_secs(5))
                 .is_empty());
             assert_eq!(st.shell_deadline(later), None);
+        }
+    }
+
+    /// Next-message suggestions ([`crate::suggest`]).
+    mod suggestions {
+        use super::*;
+        use serde_json::json;
+
+        /// The orchestrator conversation after its turn 1 ended live.
+        fn ended(on: bool) -> (AppState, ThreadScript) {
+            let mut st = with_orch();
+            st.view.suggest = on;
+            st.view.suggest_model = "haiku".into();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(200);
+            let started = o.turn_started("fix it");
+            let ended = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended]);
+            (st, o)
+        }
+
+        fn answer(st: &mut AppState, text: &str) {
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "model": "haiku", "suggestion": text,
+                        "cached": false, "stats": {"calls": 1, "failures": 0, "cost_usd": 0.0001}}),
+            );
+        }
+
+        /// Off by default: nothing is asked. On: one ask after a turn ended live, with the
+        /// model configured; none while something is typed.
+        #[test]
+        fn a_suggestion_is_asked_after_a_turn_only_when_on() {
+            let (mut st, _) = ended(false);
+            assert_eq!(st.take_suggest_due(), None);
+            let (mut st, mut o) = ended(true);
+            assert_eq!(
+                st.take_suggest_due(),
+                Some(crate::suggest::Ask {
+                    thread: "t-orch".into(),
+                    turn: 1,
+                    model: "haiku".into()
+                })
+            );
+            assert_eq!(st.take_suggest_due(), None, "asked once");
+            typed(&mut st, "draft");
+            let started = o.turn_started("more");
+            let ended = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended]);
+            assert_eq!(st.take_suggest_due(), None, "typing: not asked");
+        }
+
+        /// The answer shows as ghost text in the empty box; Enter there sends nothing; Tab or →
+        /// puts it in the box to send; typing types over it.
+        #[test]
+        fn the_ghost_is_taken_with_tab_or_right_and_never_sent_by_itself() {
+            let (mut st, _) = ended(true);
+            st.take_suggest_due();
+            answer(&mut st, "now run the integration tests");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(screen.contains("now run the integration tests"), "{screen}");
+            assert!(
+                screen.contains("Tab or → takes the suggestion · Enter sends"),
+                "{screen}"
+            );
+            assert!(!screen.contains("message the orchestrator…"), "{screen}");
+            // Enter on the empty line: no message.
+            let out = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                out.iter().all(|a| !matches!(a, Action::Say { .. })),
+                "{out:?}"
+            );
+            assert!(st.view.input.is_empty());
+            // Typing types over it; with the line empty again it shows again.
+            typed(&mut st, "x");
+            assert_eq!(st.shown_suggestion(), None);
+            st.handle_key(key(KeyCode::Backspace));
+            assert!(st.shown_suggestion().is_some());
+            // → takes it; then Enter sends it, as typed.
+            assert!(st.handle_key(key(KeyCode::Right)).is_empty());
+            assert_eq!(st.view.input.as_str(), "now run the integration tests");
+            assert_eq!(st.shown_suggestion(), None);
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "now run the integration tests"),
+                "{sent:?}"
+            );
+            // Tab takes one too (and selects no card meanwhile).
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            assert!(st.handle_key(key(KeyCode::Tab)).is_empty());
+            assert_eq!(st.view.input.as_str(), "and the docs");
+            assert_eq!(st.view.focus, None);
+        }
+
+        /// A new turn takes the suggestion away, and an answer for a turn that is no longer the
+        /// last shows nothing; a failed call says so once; /suggest turns them off.
+        #[test]
+        fn suggestions_go_with_the_next_turn_and_can_be_turned_off() {
+            let (mut st, mut o) = ended(true);
+            answer(&mut st, "next step");
+            assert!(st.shown_suggestion().is_some());
+            control(&mut st, &[o.turn_started("go on")]);
+            assert_eq!(st.shown_suggestion(), None);
+            // Late answer for turn 1 while turn 2 runs: not shown.
+            answer(&mut st, "stale");
+            assert_eq!(st.shown_suggestion(), None);
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": null,
+                        "reason": "failed: Please run /login"}),
+            );
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Please run /login"));
+            st.view.status = None;
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": null,
+                        "reason": "failed: Please run /login"}),
+            );
+            assert_eq!(st.view.status, None, "said once");
+            type_line(&mut st, "/suggest off");
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status.as_deref(), Some("suggestions off"));
+            type_line(&mut st, "/suggest");
+            assert!(st.view.suggest);
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("go to Anthropic"));
         }
     }
 }

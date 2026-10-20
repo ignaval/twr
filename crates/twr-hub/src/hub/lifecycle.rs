@@ -123,6 +123,12 @@ impl Hub {
             socket: opts.socket,
             twr_exe: opts.twr_exe,
             job_gate_exe: opts.job_gate_exe,
+            suggest_bin: opts.suggest_bin.unwrap_or_else(|| {
+                std::env::var_os(twr_adapters::claude_code::BIN_ENV)
+                    .filter(|b| !b.is_empty())
+                    .map_or_else(|| PathBuf::from("claude"), PathBuf::from)
+            }),
+            suggestions: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,
             stall_after: opts.stall_after.unwrap_or(Duration::from_secs(stall_secs)),

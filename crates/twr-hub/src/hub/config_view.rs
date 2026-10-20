@@ -90,6 +90,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         card_order,
         compact_width,
         notify,
+        suggest,
+        suggest_model,
     } = tui;
     let TuiNotifyConfig {
         terminal,
@@ -225,6 +227,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "card_order": card_order,
             "compact_width": compact_width,
             "notify": { "terminal": terminal, "when": when, "events": events },
+            "suggest": suggest,
+            "suggest_model": suggest_model,
         },
     })
 }

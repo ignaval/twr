@@ -387,6 +387,10 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
 pub const HELP_EDIT_KEYS: &[(&str, &str)] = &[
     ("←→", "move the cursor"),
     (
+        "Tab, →",
+        "on an empty line showing a suggested message (/suggest), take it into the box",
+    ),
+    (
         "↑↓",
         "a row up or down in wrapped text; on an empty line with messages of yours queued, Up \
          takes the newest back to edit it; on the first row, Up recalls the lines you sent \
@@ -6874,6 +6878,9 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
             m.place, m.target
         ),
         Some(m) => format!(" in {} · Enter runs it · shown only{back} ", m.place),
+        None if state.shown_suggestion().is_some() => {
+            format!(" Tab or → takes the suggestion · Enter sends{back} ")
+        }
         None => format!(" Enter sends{back} "),
     });
     let title = match &shell {
@@ -6914,7 +6921,14 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     let line = &state.view.input;
     let view = line.view(usize::from(inner.width), usize::from(inner.height));
     let mut pane = Pane::new(PaneId::Input, inner);
-    let text = if line.is_empty() {
+    let text = if let (true, Some(ghost)) = (line.is_empty(), state.shown_suggestion()) {
+        // A suggested next message, as ghost text: Tab or → takes it, typing types over it.
+        let ghost = truncate_cells(&ghost.replace('\n', " "), usize::from(inner.width).max(1));
+        vec![Line::from(Span::styled(
+            ghost,
+            dim.add_modifier(Modifier::ITALIC),
+        ))]
+    } else if line.is_empty() {
         // Who a typed line goes to, until something is typed.
         let who = match dive {
             Some(t) => format!("message {} directly…", t.name),
