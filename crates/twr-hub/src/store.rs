@@ -989,11 +989,13 @@ impl Store {
     /// Records that the user asked for queued prompt `id` to run (`message.send_now` on a held
     /// queue), at control head `head`, as a send of theirs records it (`user_sent`): a hub
     /// started after a crash finds the hold released ([`Store::user_sent_since`]). The row's
-    /// sender and authority (`from_`, `source`, `said_after`) stay as they were. Whether a row
-    /// changed.
+    /// sender and authority (`from_`, `source`, `said_after`) stay as they were; a mark from
+    /// an earlier send of the user's (before the crash that holds the queue) moves to `head`.
+    /// Whether a row changed.
     pub fn mark_user_sent(&mut self, id: i64, head: u64) -> anyhow::Result<bool> {
         Ok(self.conn.execute(
-            "UPDATE pending_prompts SET user_sent = ?2 WHERE id = ?1 AND user_sent IS NULL",
+            "UPDATE pending_prompts SET user_sent = ?2
+             WHERE id = ?1 AND (user_sent IS NULL OR user_sent < ?2)",
             params![id, to_i64(head)?],
         )? > 0)
     }
@@ -2418,6 +2420,11 @@ mod tests {
         assert!(s.user_sent_since("t1", 3).unwrap());
         assert!(!s.user_sent_since("t1", 4).unwrap());
         assert!(!s.user_sent_since("t2", 0).unwrap());
+        // Sent now after another crash: the user's earlier mark moves up, never back.
+        assert!(s.mark_user_sent(sent.queued[0], 9).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
+        assert!(!s.mark_user_sent(sent.queued[0], 5).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
     }
 
     #[test]

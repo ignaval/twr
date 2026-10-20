@@ -6090,11 +6090,8 @@ impl AppState {
                 let typed = text.clone();
                 let text = message_text(&text);
                 // Only a dive sends to a thread; everything else goes to the orchestrator.
-                self.note_sent(
-                    self.view.dive.clone(),
-                    &typed,
-                    suggested && self.view.dive.is_none(),
-                );
+                // In a dive too: taken back, it is still a suggestion where it goes next.
+                self.note_sent(self.view.dive.clone(), &typed, suggested);
                 let action = match &self.view.dive {
                     Some(thread) => Action::Send {
                         thread: thread.clone(),
@@ -6712,7 +6709,9 @@ impl AppState {
                     // A click is about something else than the action popup's rows: it
                     // closes the popup, then does what it does.
                     self.view.action = None;
-                    // A running `!` command's `■ stop`.
+                    // A running `!` command's `■ stop`: the same one under the press as under
+                    // the release (output streaming in may have moved another one there).
+                    let pressed = sel.pane.link(sel.anchor.y);
                     let stop = (sel.pane.id == PaneId::Transcript)
                         .then(|| {
                             self.view
@@ -6720,6 +6719,7 @@ impl AppState {
                                 .get(&PaneId::Transcript)
                                 .filter(|p| p.area == sel.pane.area)
                                 .and_then(|p| p.link(y))
+                                .filter(|l| pressed == Some(*l))
                                 .and_then(|l| l.strip_prefix(crate::ui::SHELL_STOP))
                                 .map(str::to_string)
                         })
@@ -21448,6 +21448,26 @@ pub(crate) mod tests {
             let screen = draw(&mut st, 120, 30);
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
             assert_eq!(out, vec![Action::JobCancel { job: "J3".into() }]);
+            // Pressed on it, released once a redraw put another command's `■ stop` there
+            // (output streaming in moved the rows): nothing stops.
+            st.shell_jobs.clear();
+            let screen = draw(&mut st, 120, 30);
+            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            let screen = draw(&mut st, 120, 30);
+            let pane = st
+                .view
+                .panes
+                .panes
+                .iter_mut()
+                .find(|p| p.id == PaneId::Transcript)
+                .unwrap();
+            let row = usize::from(y - pane.area.y);
+            pane.links[row] = Some(format!("{}J9", crate::ui::SHELL_STOP));
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            assert!(
+                !out.iter().any(|a| matches!(a, Action::JobCancel { .. })),
+                "{out:?}"
+            );
         }
 
         /// A running command's output is read every so often, and once more after it ended;
@@ -21791,6 +21811,42 @@ pub(crate) mod tests {
                 .withdrawals
                 .iter()
                 .any(|w| w.msg_ref == 71 && w.suggested));
+        }
+
+        /// A suggestion sent in a dive and taken back is still one: out of the dive, sent to
+        /// the orchestrator as it is, it goes as a suggestion.
+        #[test]
+        fn a_suggestion_sent_in_a_dive_stays_one() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            st.dive("t-alpha");
+            st.view.input.set("set web to bypass");
+            st.taken_suggestion = Some("set web to bypass".into());
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(matches!(&sent[..], [Action::Send { .. }]), "{sent:?}");
+            st.apply_result(
+                "thread.send",
+                &json!({"thread": "t-alpha", "ref": 81, "turn": null, "pending": 1}),
+            );
+            assert_eq!(
+                st.unsend(),
+                vec![Action::Withdraw {
+                    thread: "t-alpha".into(),
+                    msg_ref: 81
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 81,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            st.leave_dive();
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { .. }]),
+                "{sent:?}"
+            );
         }
 
         /// An answer to an ask made before a send of the user's is about a conversation that
