@@ -152,6 +152,7 @@ mod spawn;
 mod stall;
 mod subscribe;
 mod suggest;
+pub use suggest::SuggestAsk;
 mod supervisor;
 mod switch;
 mod threads;
@@ -304,6 +305,9 @@ pub struct HubOptions {
     /// (`hub::suggest`): `None` uses `TWR_CODEX_BIN`, else `codex` on the hub's `PATH`. Tests
     /// give a script, or a path that doesn't exist.
     pub suggest_codex_bin: Option<PathBuf>,
+    /// The Codex home whose global instructions keep Codex from answering suggestions
+    /// (`hub::suggest`): `None` uses `$CODEX_HOME`, else `~/.codex`. Tests give a folder.
+    pub suggest_codex_home: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -458,6 +462,7 @@ impl HubOptions {
             job_gate_exe: std::env::current_exe().ok(),
             suggest_bin: None,
             suggest_codex_bin: None,
+            suggest_codex_home: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
             wake_after: None,
@@ -737,6 +742,8 @@ struct Inner {
     suggest_bin: PathBuf,
     /// [`HubOptions::suggest_codex_bin`], resolved.
     suggest_codex_bin: PathBuf,
+    /// [`HubOptions::suggest_codex_home`] (`None`: read from the environment when needed).
+    suggest_codex_home: Option<PathBuf>,
     /// Next-message suggestions asked and answered (`hub::suggest`).
     suggestions: Mutex<suggest::Suggestions>,
     /// [`HubOptions::claude_policy`].

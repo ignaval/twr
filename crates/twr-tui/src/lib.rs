@@ -2509,7 +2509,7 @@ async fn drive(
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
                 tokio::spawn(async move {
-                    let params = json!({"thread": ask.thread, "turn": ask.turn, "models": ask.models});
+                    let params = json!({"thread": ask.thread, "turn": ask.turn, "models": ask.models, "retry": ask.retry});
                     let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
                     let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
                 });

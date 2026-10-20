@@ -1377,6 +1377,41 @@ fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
 }
 
+/// `suggest.next`'s parameters: the thread, the turn, and what the client asks
+/// ([`crate::hub::SuggestAsk`]). `models` (each runtime's model) comes from a client that knows
+/// Codex answers too; `model` alone (Claude Code's), from one from before, whose user was told
+/// of Anthropic only, so only Claude Code answers it; neither, Claude Code with its default.
+fn suggest_params(p: Value) -> Result<(String, u64, crate::hub::SuggestAsk), RpcError> {
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SuggestParams {
+        thread: String,
+        turn: u64,
+        model: Option<String>,
+        models: Option<twr_core::config::SuggestModels>,
+        #[serde(default)]
+        retry: bool,
+    }
+    let p: SuggestParams = params(p)?;
+    let ask = match (p.models, p.model) {
+        (Some(models), _) => crate::hub::SuggestAsk {
+            models,
+            claude_only: false,
+            retry: p.retry,
+        },
+        (None, model) => crate::hub::SuggestAsk {
+            models: twr_core::config::SuggestModels {
+                claude_code: model
+                    .unwrap_or_else(|| twr_core::config::DEFAULT_SUGGEST_MODEL.to_string()),
+                ..Default::default()
+            },
+            claude_only: true,
+            retry: p.retry,
+        },
+    };
+    Ok((p.thread, p.turn, ask))
+}
+
 /// The thread of this hub whose agent `agent` is: jobs are for it alone. Only a process twr
 /// started for the thread, or one that descends from it (its runtime, an attach's CLI), proves
 /// which thread it is: a marker in its environment alone (a detached process, which anyone
@@ -1850,26 +1885,8 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             hub.trim_thread(&p.thread, caller).await
         }
         "suggest.next" => {
-            #[derive(Default, Deserialize)]
-            #[serde(deny_unknown_fields)]
-            struct SuggestParams {
-                thread: String,
-                turn: u64,
-                /// Claude Code's model (a client from before `models`).
-                model: Option<String>,
-                /// The model for each runtime (`twr_core::config::SuggestModels`).
-                models: Option<twr_core::config::SuggestModels>,
-            }
-            let p: SuggestParams = params(p)?;
-            let models = match (p.models, p.model) {
-                (Some(m), _) => m,
-                (None, Some(model)) => twr_core::config::SuggestModels {
-                    claude_code: model,
-                    ..Default::default()
-                },
-                (None, None) => hub.config().tui.suggest_model.clone(),
-            };
-            hub.suggest_next(&p.thread, p.turn, &models, caller).await
+            let (thread, turn, ask) = suggest_params(p)?;
+            hub.suggest_ask(&thread, turn, &ask, caller).await
         }
         "usage.threads" => {
             #[derive(Default, Deserialize)]
@@ -2647,6 +2664,42 @@ fn thread_subscribe(
     let sub = hub.subscribe_thread(&p.thread, p.since_seq)?;
     let ack = json!({ "thread": sub.thread(), "since_seq": p.since_seq, "head": sub.head() });
     Ok((ack, sub))
+}
+
+#[cfg(test)]
+mod suggest_params_tests {
+    use super::*;
+
+    /// A client from before `models` (`model` alone) gets Claude Code only; one that sends
+    /// `models`, either runtime; `retry` passes through; anything else is refused.
+    #[test]
+    fn old_clients_get_claude_code_only() {
+        let (thread, turn, ask) =
+            suggest_params(serde_json::json!({"thread": "api", "turn": 3, "model": "haiku"}))
+                .unwrap();
+        assert_eq!((thread.as_str(), turn), ("api", 3));
+        assert!(ask.claude_only && !ask.retry);
+        assert_eq!(ask.models.claude_code, "haiku");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3})).unwrap();
+        assert!(ask.claude_only);
+        assert_eq!(ask.models.claude_code, "claude-haiku-5-5");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3,
+            "models": {"claude-code": "claude-haiku-5-5", "codex": "gpt-6-luna"}, "retry": true}))
+        .unwrap();
+        assert!(!ask.claude_only && ask.retry);
+        assert_eq!(ask.models.codex, "gpt-6-luna");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3,
+            "models": {"codex": "gpt-5.6-luna"}}))
+        .unwrap();
+        assert_eq!(ask.models.claude_code, "claude-haiku-5-5");
+        assert_eq!(ask.models.codex, "gpt-5.6-luna");
+        for bad in [
+            serde_json::json!({"thread": "api", "turn": 3, "models": {"grok": "x"}}),
+            serde_json::json!({"thread": "api", "turn": 3, "runtime": "codex"}),
+        ] {
+            assert!(suggest_params(bad).is_err());
+        }
+    }
 }
 
 #[cfg(test)]

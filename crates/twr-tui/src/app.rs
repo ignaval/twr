@@ -2308,6 +2308,8 @@ pub struct AppState {
     /// The user turned suggestions on in this run (`/suggest on`): `hub.info` no longer
     /// turns them off, only a call's answer does.
     pub suggest_turned_on: bool,
+    /// The next ask says the user turned suggestions on ([`crate::suggest::Ask::retry`]).
+    pub suggest_retry: bool,
     /// The Shift-Enter offer on screen, until it is answered ([`Action::TerminalSetup`]).
     pub terminal_offer: Option<crate::firstrun::TerminalOffer>,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
@@ -22018,6 +22020,7 @@ pub(crate) mod tests {
                     thread: "t-orch".into(),
                     turn: 1,
                     models: twr_core::config::SuggestModels::default(),
+                    retry: false,
                 })
             );
             assert_eq!(st.take_suggest_due(), None, "asked once");
@@ -22130,10 +22133,16 @@ pub(crate) mod tests {
             st.view.status = None;
             st.apply_result("hub.info", &info);
             assert!(st.view.status.as_deref().unwrap().contains("not installed"));
-            // Turned on by the user: `hub.info` leaves them on.
+            // Turned on by the user: `hub.info` leaves them on, and the next ask says so, for
+            // the hub to try again what its calls found.
             st.toggle_suggest(Some(true));
             st.apply_result("hub.info", &info);
             assert!(st.view.suggest);
+            st.seen.suggest_notice = true;
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(st.take_suggest_due().unwrap().retry);
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(!st.take_suggest_due().unwrap().retry, "once");
             // Nothing in `hub.info`: nothing changes.
             let (mut st, _) = ended(true);
             st.apply_result("hub.info", &json!({"suggest": {"unavailable": null}}));

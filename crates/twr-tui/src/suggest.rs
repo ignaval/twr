@@ -46,6 +46,9 @@ pub struct Ask {
     /// The model for each runtime that may answer (`[tui] suggest_model`): the hub picks the
     /// runtime.
     pub models: twr_core::config::SuggestModels,
+    /// The user turned suggestions on since the last ask: the hub tries again what its calls
+    /// found unable to run.
+    pub retry: bool,
 }
 
 impl AppState {
@@ -108,6 +111,7 @@ impl AppState {
             thread,
             turn,
             models: self.view.suggest_model.clone(),
+            retry: std::mem::take(&mut self.suggest_retry),
         })
     }
 
@@ -276,6 +280,7 @@ impl AppState {
         let on = on.unwrap_or(!self.view.suggest);
         self.view.suggest = on;
         self.suggest_turned_on = on;
+        self.suggest_retry = on;
         self.suggest_off_why = None;
         // The notice is told only by itself, drawn whole: what `/suggest` says is not it.
         if self

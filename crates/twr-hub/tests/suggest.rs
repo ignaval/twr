@@ -95,6 +95,8 @@ async fn hub_probing(
     o.stop_timeout = Duration::from_secs(5);
     o.suggest_bin = Some(bin);
     o.suggest_codex_bin = Some(dir.join("codex-cli").join("codex"));
+    // Not the developer's own Codex home: its global instructions would keep Codex out.
+    o.suggest_codex_home = Some(dir.join("codex-home"));
     if let Some(probe) = probe {
         o.agent_probe = Some(Arc::new(move || {
             let probe = probe.clone();
@@ -508,19 +510,21 @@ async fn a_turn_the_user_did_not_start_gets_no_suggestion() {
 }
 
 /// No Claude Code to ask: a CLI that isn't there, or that says it has no login (as Claude
-/// Code 2.1.304 does without one, or with a refused key), and no Codex either: `unavailable:
-/// ...` with both reasons, for the TUI to stop asking; `hub.info` says so from then on.
+/// Code 2.1.304 does without one, or with a refused key). One call per ask: that ask gets
+/// nothing (`retry: ...`), Codex may answer the next; with no Codex either, `unavailable:
+/// ...` with both reasons, for the TUI to stop asking, and `hub.info` says so. Turned on
+/// again (`retry`), what the calls found is tried again.
 #[tokio::test]
 async fn a_missing_or_signed_out_cli_is_unavailable() {
     for (case, want) in [
-        ("missing", "unavailable: Claude Code's CLI ("),
+        ("missing", "Claude Code's CLI ("),
         (
             "Not logged in · Please run /login",
-            "unavailable: Claude Code is not signed in",
+            "Claude Code is not signed in",
         ),
         (
             "Invalid API key · Please run /login",
-            "unavailable: Claude Code is not signed in",
+            "Claude Code is not signed in",
         ),
     ] {
         let dir = tempfile::tempdir().unwrap();
@@ -535,24 +539,49 @@ async fn a_missing_or_signed_out_cli_is_unavailable() {
         };
         let hub = hub(dir.path(), bin).await;
         assert!(hub.info()["suggest"]["unavailable"].is_null());
-        turn_ended(&hub, dir.path(), "one").await;
+        let api = turn_ended(&hub, dir.path(), "one").await;
         let r = hub
             .suggest_next("api", 1, &m("haiku"), &tui())
             .await
             .unwrap();
         let reason = r["reason"].as_str().unwrap_or_default();
-        assert!(reason.starts_with(want), "{case}: {r}");
-        assert!(reason.contains("; Codex's CLI ("), "{case}: {r}");
+        assert!(reason.starts_with(&format!("retry: {want}")), "{case}: {r}");
         assert!(r["suggestion"].is_null(), "{r}");
-        assert_eq!(r["stats"]["failures"], 2, "{r}");
-        // What the calls found holds: `hub.info` says so, and no call is made again.
+        assert_eq!(r["stats"]["failures"], 1, "{r}");
+        assert!(hub.info()["suggest"]["unavailable"].is_null());
+        // The next: Codex, missing here too. Then none can, and `hub.info` says so.
+        let mut sub = hub.subscribe_control(0);
+        hub.send_by(&api, "two", &tui()).unwrap();
+        until_ended(&mut sub, &api, 2).await;
+        // Calls at least 3 seconds apart (`hub::suggest::MIN_GAP`).
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        let r = hub
+            .suggest_next("api", 2, &m("haiku"), &tui())
+            .await
+            .unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with(&format!("unavailable: {want}")),
+            "{case}: {r}"
+        );
+        assert!(reason.contains("; Codex's CLI ("), "{case}: {r}");
         let info = hub.info()["suggest"]["unavailable"]
             .as_str()
             .map(str::to_string);
-        assert!(
-            info.as_deref().is_some_and(|i| i.starts_with(want)),
-            "{info:?}"
-        );
+        assert_eq!(info.as_deref(), Some(reason), "{case}");
+        let claude_runs = usize::from(case != "missing");
+        assert_eq!(runs(&cli), claude_runs);
+        // Turned on again: tried again.
+        let ask = twr_hub::SuggestAsk {
+            models: m("haiku"),
+            claude_only: false,
+            retry: true,
+        };
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        let r = hub.suggest_ask("api", 2, &ask, &tui()).await.unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(reason.starts_with("retry: "), "{case}: {r}");
+        assert_eq!(runs(&cli), 2 * claude_runs);
         hub.shutdown().await;
     }
 }
@@ -686,6 +715,7 @@ async fn codex_answers_with_its_small_model_and_nothing_of_the_users() {
         "features.unified_exec=false",
         "features.multi_agent=false",
         "features.plugins=false",
+        "skills.include_instructions=false",
     ] {
         assert!(has(c), "{c} in {argv:?}");
     }
@@ -762,8 +792,9 @@ async fn a_codex_call_that_uses_a_tool_is_stopped() {
 }
 
 /// Claude Code first for a thread of another runtime; when its call says it has no login,
-/// Codex answers in the same ask, and Claude Code is left out from then on. Codex without a
-/// login (a 401) is `unavailable` too.
+/// that ask gets nothing (`retry: ...`), and Codex answers the next one: never in the same
+/// ask, which the user may have turned off meanwhile. Codex without a login (a 401) is
+/// `unavailable` too.
 #[tokio::test]
 async fn codex_stands_in_when_claude_code_cannot_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -779,6 +810,17 @@ async fn codex_stands_in_when_claude_code_cannot_run() {
         .suggest_next("api", 1, &m("haiku"), &tui())
         .await
         .unwrap();
+    assert_eq!(r["reason"], "retry: Claude Code is not signed in", "{r}");
+    assert_eq!((runs(&claude), runs(&cli)), (1, 0));
+    let mut sub = hub.subscribe_control(0);
+    hub.send_by(&api, "two", &tui()).unwrap();
+    until_ended(&mut sub, &api, 2).await;
+    // Calls at least 3 seconds apart (`hub::suggest::MIN_GAP`).
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let r = hub
+        .suggest_next("api", 2, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(r["suggestion"], "and the docs", "{r}");
     assert_eq!(r["runtime"], "codex");
     assert_eq!((runs(&claude), runs(&cli)), (1, 1));
@@ -789,13 +831,11 @@ async fn codex_stands_in_when_claude_code_cannot_run() {
             serde_json::json!({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}),
         ],
     );
-    let mut sub = hub.subscribe_control(0);
-    hub.send_by(&api, "two", &tui()).unwrap();
-    until_ended(&mut sub, &api, 2).await;
-    // Calls at least 3 seconds apart (`hub::suggest::MIN_GAP`).
+    hub.send_by(&api, "three", &tui()).unwrap();
+    until_ended(&mut sub, &api, 3).await;
     tokio::time::sleep(Duration::from_millis(3100)).await;
     let r = hub
-        .suggest_next("api", 2, &m("haiku"), &tui())
+        .suggest_next("api", 3, &m("haiku"), &tui())
         .await
         .unwrap();
     assert_eq!(runs(&claude), 1, "Claude Code left out");
@@ -807,8 +847,82 @@ async fn codex_stands_in_when_claude_code_cannot_run() {
     hub.shutdown().await;
 }
 
-/// Only small models answer: one that looks large is never asked, and another runtime with a
-/// small one answers instead; with none, the reason says why.
+/// A client from before Codex answered suggestions (`model` alone) told its user of
+/// Anthropic only: Claude Code alone answers it, and without it nothing goes to OpenAI.
+#[tokio::test]
+async fn a_claude_only_ask_never_reaches_codex() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let hub = hub(dir.path(), dir.path().join("no-claude")).await;
+    turn_ended(&hub, dir.path(), "one").await;
+    let ask = twr_hub::SuggestAsk {
+        models: m("haiku"),
+        claude_only: true,
+        retry: false,
+    };
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    let reason = r["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("unavailable: Claude Code's CLI ("),
+        "{r}"
+    );
+    assert!(!reason.contains("Codex"), "{r}");
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// Codex sends the user's global `AGENTS.md` with every request, and has no setting to leave
+/// it out: while there is one, Codex answers no suggestion.
+#[tokio::test]
+async fn codex_with_global_instructions_answers_none() {
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let home = dir.path().join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("AGENTS.md"), "my private rules").unwrap();
+    let hub = hub_probing(
+        dir.path(),
+        dir.path().join("no-claude"),
+        Some(vec![
+            probe("claude-code", false, AgentLogin::Unknown),
+            probe("codex", true, AgentLogin::LoggedIn),
+        ]),
+    )
+    .await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(
+        r["reason"].as_str(),
+        Some("unavailable: Claude Code's CLI is not installed; Codex would send your global AGENTS.md along"),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// Only small models answer: one that looks large is never asked, and no other runtime
+/// answers instead (no other provider stands in for a setting); the reason says why.
 #[tokio::test]
 async fn large_models_are_never_asked() {
     let dir = tempfile::tempdir().unwrap();
@@ -824,23 +938,16 @@ async fn large_models_are_never_asked() {
         claude_code: "claude-opus-5-5".into(),
         codex: "gpt-6.1-sol".into(),
     };
-    let r = hub.suggest_next("api", 1, &both, &tui()).await.unwrap();
-    let reason = r["reason"].as_str().unwrap();
-    assert!(
-        reason.starts_with("failed: ") && reason.contains("large model"),
-        "{r}"
-    );
-    assert_eq!((runs(&claude), runs(&cli)), (0, 0));
-    let r = hub
-        .suggest_next("api", 1, &m("sonnet"), &tui())
-        .await
-        .unwrap();
-    assert_eq!(
-        (r["runtime"].as_str(), r["suggestion"].as_str()),
-        (Some("codex"), Some("and the docs")),
-        "{r}"
-    );
-    assert_eq!(runs(&claude), 0);
+    for models in [both, m("sonnet")] {
+        let r = hub.suggest_next("api", 1, &models, &tui()).await.unwrap();
+        let reason = r["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("failed: ") && reason.contains("large model"),
+            "{r}"
+        );
+        assert!(reason.contains(&format!("{:?}", models.claude_code)), "{r}");
+        assert_eq!((runs(&claude), runs(&cli)), (0, 0));
+    }
     hub.shutdown().await;
 }
 

@@ -3,16 +3,21 @@
 //! input box. On unless the user turns it off (`[tui] suggest = false`); the TUI asks only for
 //! the thread its main pane shows, once per turn that ended while it watched.
 //!
-//! - **The runtime:** the thread's own when it runs Claude Code or Codex (the orchestrator's
-//!   for its conversation), else Claude Code, then Codex ([`order`]); the next one only when
-//!   one can't run at all: its CLI missing or not signed in, as the hub's own agent probe found
-//!   it (`hub::box_agents`) or its call said ([`Suggestions::down`], for [`DOWN_FOR`]). A
-//!   runtime that failed otherwise (a usage limit, a timeout) gets none for [`BACKOFF`], and no
-//!   other stands in for it ([`plan`]).
+//! - **The runtime:** one per ask: the thread's own when it runs Claude Code or Codex (the
+//!   orchestrator's for its conversation), else Claude Code, then Codex ([`order`]), the first
+//!   that can run at all ([`plan`]). One can't when its CLI is missing or not signed in (the
+//!   hub's own agent probe, `hub::box_agents`, or a call of its, [`Suggestions::down`], for
+//!   [`DOWN_FOR`] or until a later probe finds it signed in, or the user turns suggestions on
+//!   again: `retry`), or, for Codex, when the user has global instructions it would send along
+//!   ([`codex_global_instructions`]). A call that finds its runtime unable gets nothing
+//!   (`retry: ...`): the next runtime answers the next ask, never this one, which the user may
+//!   have turned off meanwhile. A runtime that failed otherwise (a usage limit, a timeout)
+//!   gets none for [`BACKOFF`], and no other stands in for it. A client from before Codex
+//!   answered suggestions gets Claude Code only ([`SuggestAsk::claude_only`]).
 //! - **The model:** the small one the TUI names for that runtime (`[tui] suggest_model`):
 //!   Claude Code's `claude-haiku-5-5` and Codex's `gpt-6-luna` by default. One that looks
-//!   large ([`twr_core::config::suggest_model_too_large`]) is never asked: suggestions run
-//!   after every turn.
+//!   large ([`twr_core::config::suggest_model_too_large`]) is never asked, and no other
+//!   runtime answers instead: suggestions run after every turn.
 //! - **Claude Code:** its CLI in print mode (`claude -p`), with the user's own login (no API
 //!   key: their subscription). It loads nothing of the user's: no tools (`--tools ""`), no MCP
 //!   servers (`--strict-mcp-config`), no settings, hooks, plugins, CLAUDE.md or memory
@@ -24,11 +29,14 @@
 //!   call), 20 output, $0.0002 at list price uncached and $0.00002 cached.
 //! - **Codex:** `codex exec` with the user's own login (`$CODEX_HOME`'s; no `OPENAI_*` or
 //!   `CODEX_*` from the hub's environment): no session saved (`--ephemeral`), none of the user's
-//!   config, rules or `AGENTS.md` (`--ignore-user-config`, `--ignore-rules`,
-//!   `project_doc_max_bytes=0`), twr's prompt as the model's instructions
-//!   (`model_instructions_file`), a read-only sandbox that asks nothing, low reasoning effort,
-//!   no web search and every tool feature off ([`CODEX_FEATURES_OFF`]); a call in which the
-//!   model starts any item but its message is stopped at once ([`codex_tool_item`]). Measured
+//!   config, rules, project `AGENTS.md` or skills (`--ignore-user-config`, `--ignore-rules`,
+//!   `project_doc_max_bytes=0`, `skills.include_instructions=false`), twr's prompt as the
+//!   model's instructions (`model_instructions_file`), a read-only sandbox that asks nothing,
+//!   low reasoning effort, no web search and every tool feature off
+//!   ([`CODEX_FEATURES_OFF`]). Codex 0.162.1 still lists a few tools of its own (code mode,
+//!   which fails closed with its host off; asking the user; sub-agents): a call in which the
+//!   model starts any item but its message is stopped at once ([`codex_tool_item`]). Its global
+//!   `AGENTS.md` it sends whatever twr asks, so Codex isn't asked while there is one. Measured
 //!   with Codex 0.162.1 and `gpt-6-luna`: about 5,100 input tokens (Codex's own context,
 //!   about 3,500 of them cached after the first call), 10 output, $0.0002 at list price
 //!   ($0.0005 uncached; [`codex_cost`]).
@@ -153,7 +161,7 @@ fn probed_out(agents: &[twr_core::runner::AgentInfo], runtime: &str) -> Option<S
 
 /// The reason for a failed call's `e`: [`UNAVAILABLE`] ones as they are, else `failed: `.
 fn failed_reason(e: &str) -> String {
-    if e.starts_with(UNAVAILABLE) {
+    if e.starts_with(UNAVAILABLE) || e.starts_with("retry: ") {
         e.to_string()
     } else {
         format!("failed: {e}")
@@ -199,26 +207,83 @@ pub(super) struct Suggestions {
     cost_usd: f64,
 }
 
+/// What the hub's own agent probe found, and when it ended (`hub::box_agents`); and the Codex
+/// home the hub's Codex uses ([`codex_home`]).
+pub(super) struct Probe<'a> {
+    pub agents: &'a [twr_core::runner::AgentInfo],
+    pub at: Option<Instant>,
+    pub codex_home: Option<PathBuf>,
+}
+
 impl Suggestions {
-    /// Why `runtime` can't run suggestions now, by a call of its ([`DOWN_FOR`]).
-    fn down(&self, runtime: &str, now: Instant) -> Option<&str> {
-        self.down
+    /// Why `runtime` can't run suggestions now, by a call of its ([`DOWN_FOR`]); not once a
+    /// probe that ended since found its CLI there and signed in.
+    fn down(&self, runtime: &str, now: Instant, probe: &Probe) -> Option<&str> {
+        let (why, at) = self
+            .down
             .get(runtime)
-            .filter(|(_, at)| now.saturating_duration_since(*at) < DOWN_FOR)
-            .map(|(why, _)| why.as_str())
+            .filter(|(_, at)| now.saturating_duration_since(*at) < DOWN_FOR)?;
+        let signed_in = probe.at.is_some_and(|p| p > *at)
+            && probe.agents.iter().any(|a| {
+                a.runtime == runtime && a.found && a.login == twr_core::runner::AgentLogin::LoggedIn
+            });
+        (!signed_in).then_some(why.as_str())
     }
 }
 
-/// Why no runtime can run suggestions here (`None`: one may), by the probe (`agents`) and by
-/// the calls that said so (`s`): `unavailable: ...`, every runtime's reason.
-pub(super) fn unavailable(
-    agents: &[twr_core::runner::AgentInfo],
-    s: &Suggestions,
-    now: Instant,
-) -> Option<String> {
+/// The global instructions Codex would send with every request, a suggestion's too, from
+/// the Codex home `dir` (`AGENTS.override.md`, else `AGENTS.md`, when not empty): Codex
+/// 0.162.1 adds them even with `--ignore-user-config`, and has no setting to leave them out.
+pub(super) fn codex_global_instructions(dir: &Path) -> Option<PathBuf> {
+    ["AGENTS.override.md", "AGENTS.md"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|f| std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() > 0))
+}
+
+/// The Codex home the hub's Codex would use: `given` ([`super::HubOptions::suggest_codex_home`]),
+/// else `$CODEX_HOME`, else `~/.codex`.
+fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
+    if let Some(dir) = given {
+        return Some(dir.to_path_buf());
+    }
+    std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+}
+
+/// Why `runtime` can't run suggestions at all now: its CLI missing or signed out (the
+/// `probe`, or a call of its, [`Suggestions::down`]), or, for Codex, global instructions of
+/// the user's that it would send along ([`codex_global_instructions`]).
+fn cant_run(runtime: &'static str, probe: &Probe, s: &Suggestions, now: Instant) -> Option<String> {
+    if let Some(why) = probed_out(probe.agents, runtime) {
+        return Some(why);
+    }
+    if let Some(why) = s.down(runtime, now, probe) {
+        return Some(why.to_string());
+    }
+    if runtime == "codex" {
+        if let Some(f) = probe
+            .codex_home
+            .as_deref()
+            .and_then(codex_global_instructions)
+        {
+            return Some(format!(
+                "Codex would send your global {} along",
+                f.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+    }
+    None
+}
+
+/// Why no runtime can run suggestions here (`None`: one may), by the `probe`, the calls that
+/// said so (`s`) and Codex's global instructions: `unavailable: ...`, every runtime's reason.
+pub(super) fn unavailable(probe: &Probe, s: &Suggestions, now: Instant) -> Option<String> {
     let mut why = Vec::new();
     for rt in RUNTIMES {
-        why.push(probed_out(agents, rt).or_else(|| s.down(rt, now).map(str::to_string))?);
+        why.push(cant_run(rt, probe, s, now)?);
     }
     Some(format!("{UNAVAILABLE}{}", why.join("; ")))
 }
@@ -634,6 +699,8 @@ async fn ask_codex(
         "include_permissions_instructions=false",
         "-c",
         "project_doc_max_bytes=0",
+        "-c",
+        "skills.include_instructions=false",
     ]);
     for f in CODEX_FEATURES_OFF {
         cmd.arg("-c").arg(format!("features.{f}=false"));
@@ -686,46 +753,48 @@ async fn ask_codex(
     Ok((text, codex_cost(model, &usage)))
 }
 
-/// The runtimes that may answer a suggestion for a thread running `runtime`, in order, each
-/// with its model of `models`; or, when none may, why (`failed: ...` for a model that looks
-/// large, else `unavailable: ...`). Left out: a runtime whose model looks large
-/// ([`twr_core::config::suggest_model_too_large`]), one the probe (`agents`) or a call of its
-/// ([`Suggestions::down`]) found unable to run.
+/// The runtime that answers a suggestion for a thread running `runtime`, of those `allowed`,
+/// with its model of `models`: the first in [`order`] that can run at all ([`cant_run`]);
+/// else why none can (`unavailable: ...`). Its model looking large
+/// ([`twr_core::config::suggest_model_too_large`]) is a `failed: ...`: no other runtime, and
+/// no other provider, stands in for a setting.
 fn plan(
     runtime: &str,
+    allowed: &[&str],
     models: &SuggestModels,
-    agents: &[twr_core::runner::AgentInfo],
+    probe: &Probe,
     s: &Suggestions,
     now: Instant,
-) -> Result<Vec<(&'static str, String)>, String> {
-    let (mut plan, mut large, mut out) = (Vec::new(), None, Vec::new());
-    for rt in order(runtime) {
+) -> Result<(&'static str, String), String> {
+    let mut out = Vec::new();
+    for rt in order(runtime).into_iter().filter(|r| allowed.contains(r)) {
+        if let Some(why) = cant_run(rt, probe, s, now) {
+            out.push(why);
+            continue;
+        }
         let model = models.of(rt).unwrap_or_default();
         if let Some(why) = twr_core::config::suggest_model_too_large(rt, model) {
-            large.get_or_insert(why);
-        } else if let Some(why) =
-            probed_out(agents, rt).or_else(|| s.down(rt, now).map(str::to_string))
-        {
-            out.push(why);
-        } else {
-            plan.push((rt, model.to_string()));
+            return Err(format!("failed: {why}"));
         }
+        return Ok((rt, model.to_string()));
     }
-    match (plan.is_empty(), large) {
-        (false, _) => Ok(plan),
-        (true, Some(why)) => Err(format!("failed: {why}")),
-        (true, None) => Err(format!("{UNAVAILABLE}{}", out.join("; "))),
-    }
+    Err(format!("{UNAVAILABLE}{}", out.join("; ")))
+}
+
+/// What a client may ask of `suggest.next` beyond the thread and turn.
+#[derive(Debug, Clone, Default)]
+pub struct SuggestAsk {
+    /// The model for each runtime.
+    pub models: SuggestModels,
+    /// Only Claude Code may answer: a client from before Codex answered suggestions, which
+    /// told its user nothing of OpenAI.
+    pub claude_only: bool,
+    /// The user turned suggestions on again: what calls found unable to run is tried again.
+    pub retry: bool,
 }
 
 impl Hub {
-    /// `suggest.next {thread, turn, models}` (users only): a likely next message of the
-    /// user's after turn `turn` of thread `query` ended (see the module docs), from the small
-    /// model `models` names for the runtime that answers ([`plan`]). `{thread, turn, runtime,
-    /// model, suggestion, reason?, cached, stats: {calls, failures, cost_usd}}` (`runtime` and
-    /// `model`: what answered, null when nothing did): `suggestion` null with a `reason` when
-    /// there is none (`none`, `answer_like`, `running`, `limit`, `backoff`, `failed: ...`,
-    /// `unavailable: ...`, `no_reply`, `notice`, `not_user`).
+    /// [`Hub::suggest_ask`] with `models`, any runtime, no retry.
     pub async fn suggest_next(
         &self,
         query: &str,
@@ -733,6 +802,34 @@ impl Hub {
         models: &SuggestModels,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
+        let ask = SuggestAsk {
+            models: models.clone(),
+            ..Default::default()
+        };
+        self.suggest_ask(query, turn, &ask, caller).await
+    }
+
+    /// `suggest.next {thread, turn, models, retry}` (users only): a likely next message of the
+    /// user's after turn `turn` of thread `query` ended (see the module docs), from the small
+    /// model `ask` names for the one runtime that answers ([`plan`]). `{thread, turn, runtime,
+    /// model, suggestion, reason?, cached, stats: {calls, failures, cost_usd}}` (`runtime` and
+    /// `model`: what answered, null when nothing did): `suggestion` null with a `reason` when
+    /// there is none (`none`, `answer_like`, `running`, `limit`, `backoff`, `failed: ...`,
+    /// `unavailable: ...`, `retry: ...` (this runtime can't run, another may for the next
+    /// ask), `no_reply`, `notice`, `not_user`).
+    pub async fn suggest_ask(
+        &self,
+        query: &str,
+        turn: u64,
+        ask: &SuggestAsk,
+        caller: &Caller,
+    ) -> Result<Value, RpcError> {
+        let models = &ask.models;
+        let allowed: &[&str] = if ask.claude_only {
+            &["claude-code"]
+        } else {
+            &RUNTIMES
+        };
         if caller.is_orchestrator() {
             return Err(rpc(codes::UNAUTHORIZED, "suggestions are the user's"));
         }
@@ -800,12 +897,26 @@ impl Hub {
         let key = (
             id.clone(),
             turn,
-            format!("claude-code={},codex={}", models.claude_code, models.codex),
+            format!(
+                "claude-code={},codex={},only={}",
+                models.claude_code,
+                models.codex,
+                allowed.join("+")
+            ),
         );
         let agents = hub.local_agents.known();
+        let probe = Probe {
+            agents: &agents,
+            at: hub.local_agents.probed_at(),
+            codex_home: codex_home(hub.suggest_codex_home.as_deref()),
+        };
         // Answered already, or being asked: that answer.
         let waiting = {
             let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
+            // Turned on again by the user: what the calls found is found again.
+            if ask.retry {
+                s.down.clear();
+            }
             if let Some((_, a)) = s.done.iter().find(|(k, _)| *k == key) {
                 let (a, rt, model) = a.clone();
                 drop(s);
@@ -818,17 +929,17 @@ impl Hub {
                 Some(rx) => Ok(rx.clone()),
                 None => {
                     let now = Instant::now();
-                    // No runtime that may run it: nothing goes anywhere. The first one failed
-                    // a moment ago (a usage limit, a timeout): none is asked, not even
+                    // No runtime that may run it: nothing goes anywhere. The one that would
+                    // failed a moment ago (a usage limit, a timeout): none is asked, not even
                     // another runtime, which only stands in for one that can't run at all.
-                    let ways = match plan(&runtime, models, &agents, &s, now) {
-                        Ok(ways) => ways,
+                    let way = match plan(&runtime, allowed, models, &probe, &s, now) {
+                        Ok(way) => way,
                         Err(why) => {
                             drop(s);
                             return Ok(none(&id, &why));
                         }
                     };
-                    if s.backoff_until.get(ways[0].0).is_some_and(|t| now < *t) {
+                    if s.backoff_until.get(way.0).is_some_and(|t| now < *t) {
                         drop(s);
                         return Ok(none(&id, "backoff"));
                     }
@@ -848,11 +959,11 @@ impl Hub {
                     s.starts.push_back(now);
                     let (tx, rx) = tokio::sync::watch::channel(None);
                     s.flight.insert(key.clone(), rx);
-                    Err((tx, ways))
+                    Err((tx, way))
                 }
             }
         };
-        let (tx, ways) = match waiting {
+        let (tx, (rt, model)) = match waiting {
             Err(call) => call,
             Ok(rx) => return Ok(wait_for(rx, &id, turn, &hub).await),
         };
@@ -868,21 +979,21 @@ impl Hub {
             .map_or_else(|| PathBuf::from("suggest"), |d| d.join("suggest"));
         let input = context(&name, orchestrator, &prompt, &reply);
         let marker = format!("{id}:suggest");
-        // The runtimes in order: the next only when one can't run at all (no CLI, no login).
-        let mut result: Answer = Err(format!("{UNAVAILABLE}nothing to ask"));
-        let mut out = Vec::new();
-        for (rt, model) in ways {
-            let r = match twr_core::paths::ensure_private_dir(&dir) {
-                Err(e) => Err(format!("cannot make {}: {e:#}", dir.display())),
-                Ok(()) if rt == "codex" => match system_file(&dir) {
-                    Err(e) => Err(e),
-                    Ok(system) => {
-                        let bin = &hub.suggest_codex_bin;
-                        ask_codex(bin, &model, &input, &dir, &system, &marker).await
-                    }
-                },
-                Ok(()) => ask_claude(&hub.suggest_bin, &model, &input, &dir, &marker).await,
-            };
+        // One runtime, one call. One that turns out unable to run is left out from now on
+        // ([`Suggestions::down`]): another may answer the next ask, never this one, which the
+        // user may have turned off meanwhile.
+        let r = match twr_core::paths::ensure_private_dir(&dir) {
+            Err(e) => Err(format!("cannot make {}: {e:#}", dir.display())),
+            Ok(()) if rt == "codex" => match system_file(&dir) {
+                Err(e) => Err(e),
+                Ok(system) => {
+                    let bin = &hub.suggest_codex_bin;
+                    ask_codex(bin, &model, &input, &dir, &system, &marker).await
+                }
+            },
+            Ok(()) => ask_claude(&hub.suggest_bin, &model, &input, &dir, &marker).await,
+        };
+        let mut result: Answer = {
             let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
             s.calls += 1;
             match r {
@@ -893,29 +1004,31 @@ impl Hub {
                     // Not what the hub would read as a command of the user's, with the threads
                     // as they are now.
                     let a = suggestion(&text).filter(|t| !hub.core().reads_as_command(t));
-                    result = Ok((a, rt, model));
-                    break;
+                    Ok((a, rt, model))
                 }
                 Err(e) => {
                     s.failures += 1;
                     tracing::info!(thread = %id, turn, runtime = rt, error = %e, "a suggestion call failed");
                     if let Some(why) = e.strip_prefix(UNAVAILABLE) {
                         s.down.insert(rt, (why.to_string(), Instant::now()));
-                        out.push(why.to_string());
-                        result = Err(format!("{UNAVAILABLE}{}", out.join("; ")));
-                        continue;
+                    } else {
+                        s.backoff_until.insert(rt, Instant::now() + BACKOFF);
                     }
-                    s.backoff_until.insert(rt, Instant::now() + BACKOFF);
-                    result = Err(e);
-                    break;
+                    Err(e)
                 }
             }
-        }
-        // None could run: why each one can't, those left out before the calls too.
-        if result.as_ref().is_err_and(|e| e.starts_with(UNAVAILABLE)) {
-            let s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(all) = unavailable(&agents, &s, Instant::now()) {
-                result = Err(all);
+        };
+        // Unable to run: whether another runtime may, for the next ask (`retry: ...`), or
+        // none (`unavailable: ...`, every runtime's reason).
+        if let Err(e) = &result {
+            if let Some(why) = e.strip_prefix(UNAVAILABLE) {
+                let s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
+                let now = Instant::now();
+                result = Err(match plan(&runtime, allowed, models, &probe, &s, now) {
+                    Ok(_) => format!("retry: {why}"),
+                    Err(all) if all.starts_with(UNAVAILABLE) => all,
+                    Err(_) => e.clone(),
+                });
             }
         }
         let reason = match &result {
@@ -943,12 +1056,17 @@ impl Hub {
     /// by its agent probe and the calls that said so ([`unavailable`]).
     pub(super) fn suggest_unavailable(&self) -> Option<String> {
         let agents = self.inner.local_agents.known();
+        let probe = Probe {
+            agents: &agents,
+            at: self.inner.local_agents.probed_at(),
+            codex_home: codex_home(self.inner.suggest_codex_home.as_deref()),
+        };
         let s = self
             .inner
             .suggestions
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        unavailable(&agents, &s, Instant::now())
+        unavailable(&probe, &s, Instant::now())
     }
 }
 
@@ -1038,6 +1156,70 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call that found a runtime unable to run leaves it out for [`DOWN_FOR`], unless a
+    /// probe that ended since found it there and signed in.
+    #[test]
+    fn a_runtime_down_comes_back_once_probed_signed_in() {
+        use twr_core::runner::{AgentInfo, AgentLogin};
+        let mut s = Suggestions::default();
+        let t0 = Instant::now();
+        s.down
+            .insert("codex", ("Codex is not signed in".into(), t0));
+        let codex = |login| AgentInfo {
+            runtime: "codex".into(),
+            found: true,
+            login,
+            ..Default::default()
+        };
+        let probe = |agents: &'static [AgentInfo], at| Probe {
+            agents,
+            at,
+            codex_home: None,
+        };
+        let now = t0 + Duration::from_secs(60);
+        assert!(s.down("codex", now, &probe(&[], None)).is_some());
+        let signed_in: &'static [AgentInfo] = Box::leak(Box::new([codex(AgentLogin::LoggedIn)]));
+        let signed_out: &'static [AgentInfo] = Box::leak(Box::new([codex(AgentLogin::LoggedOut)]));
+        let before = t0.checked_sub(Duration::from_secs(1));
+        let after = Some(t0 + Duration::from_secs(1));
+        assert!(
+            s.down("codex", now, &probe(signed_in, before)).is_some(),
+            "probed before"
+        );
+        assert!(
+            s.down("codex", now, &probe(signed_out, after)).is_some(),
+            "still out"
+        );
+        assert!(
+            s.down("codex", now, &probe(signed_in, after)).is_none(),
+            "signed in since"
+        );
+        assert!(
+            s.down("codex", t0 + DOWN_FOR, &probe(&[], None)).is_none(),
+            "an hour on"
+        );
+        assert!(s.down("claude-code", now, &probe(&[], None)).is_none());
+    }
+
+    /// Codex's global instructions: `AGENTS.override.md`, else `AGENTS.md`, when not empty.
+    #[test]
+    fn codex_global_instructions_are_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(codex_global_instructions(dir.path()), None);
+        std::fs::write(dir.path().join("AGENTS.md"), "").unwrap();
+        assert_eq!(codex_global_instructions(dir.path()), None, "empty");
+        std::fs::write(dir.path().join("AGENTS.md"), "rules").unwrap();
+        assert_eq!(
+            codex_global_instructions(dir.path()),
+            Some(dir.path().join("AGENTS.md"))
+        );
+        std::fs::write(dir.path().join("AGENTS.override.md"), "more").unwrap();
+        assert_eq!(
+            codex_global_instructions(dir.path()),
+            Some(dir.path().join("AGENTS.override.md"))
+        );
+    }
 
     /// The thread's own runtime first, when it runs suggestions; Claude Code, then Codex for
     /// any other.
