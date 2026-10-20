@@ -369,3 +369,28 @@ async fn asks_at_once_share_one_call() {
     assert_eq!(runs(&cli), 1);
     hub.shutdown().await;
 }
+
+/// A suggestion the hub would read as the user's command (an answer or a mode change, in any
+/// of its words and languages) is dropped: it would be one Tab and Enter from applying.
+#[tokio::test]
+async fn a_suggestion_that_reads_as_a_command_is_dropped() {
+    for (n, text) in ["set all to bypass", "dale a ambos", "approve both"]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let bin = fake_claude(&cli);
+        answer(&cli, text, false);
+        let hub = hub(dir.path(), bin).await;
+        turn_ended(&hub, dir.path(), "go").await;
+        let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+        assert_eq!(
+            (r["suggestion"].is_null(), r["reason"].as_str()),
+            (true, Some("none")),
+            "{n}: {text}: {r}"
+        );
+        hub.shutdown().await;
+    }
+}

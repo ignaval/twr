@@ -206,6 +206,25 @@ pub(super) fn answer_like(s: &str) -> bool {
     )
 }
 
+impl super::Core {
+    /// Whether `text`, sent as a message, reads as a command the hub may apply for the user
+    /// (`command::is_command` over the threads as they are now: an answer or a mode change,
+    /// in any of the grammar's words and languages) or as an answer to items by name or
+    /// quantity (`command::answer_attempt`).
+    pub(super) fn reads_as_command(&self, text: &str) -> bool {
+        let ctx = twr_decisions::context::RouteContext::from_registry(
+            &self.registry,
+            &self.attention,
+            &std::collections::HashSet::new(),
+            None,
+            text,
+            false,
+        );
+        twr_decisions::code::command::is_command(text, &ctx.threads)
+            || twr_decisions::code::command::answer_attempt(&ctx, text)
+    }
+}
+
 /// Kills process group `pgid` (SIGKILL), what is left of a suggestion call.
 fn kill_group(pgid: u32) {
     if let Ok(pgid) = i32::try_from(pgid) {
@@ -467,7 +486,9 @@ impl Hub {
                     let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
                     s.cost_usd += cost;
                     drop(s);
-                    suggestion(&text)
+                    // Not what the hub would read as a command of the user's, with the threads
+                    // as they are now.
+                    suggestion(&text).filter(|t| !hub.core().reads_as_command(t))
                 }),
         };
         let reason = match &result {

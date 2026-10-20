@@ -655,17 +655,20 @@ pub fn run(
         Some(format!(
             "This runs for {a}: an agent doesn't change your terminal's settings. To change them:"
         ))
+    } else if let Some(m) = place.multiplexer {
+        // A session of tmux or screen may be attached from another machine: its terminal's
+        // settings may not be here.
+        Some(format!(
+            "Inside {m} twr can't tell which machine your terminal runs on, so it changes \
+             nothing: run `twr terminal-setup` outside {m}, or change it by hand:"
+        ))
     } else if target.is_none() {
-        Some(match place.multiplexer {
-            Some(m) => format!(
-                "Inside {m} twr can't tell which terminal you use: name it with --terminal, or \
-                 change it by hand:"
-            ),
-            None => "twr can't tell which terminal this is: name it with --terminal \
-                     (terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode, cursor, \
-                     windsurf, vscodium, zed), or change it by hand:"
+        Some(
+            "twr can't tell which terminal this is: name it with --terminal \
+             (terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode, cursor, \
+             windsurf, vscodium, zed), or change it by hand:"
                 .to_string(),
-        })
+        )
     } else {
         None
     };
@@ -1059,6 +1062,18 @@ mod tests {
             .join("\n");
         assert!(text.contains("an agent doesn't change"), "{text}");
         assert!(!dir.path().join(".config/kitty/kitty.conf").exists());
+        // Inside tmux or screen, a terminal named or found: nothing edited either.
+        let mut tmux = place.clone();
+        tmux.multiplexer = Some("tmux");
+        tmux.terminal = Some(Terminal::Kitty);
+        let text = run(&tmux, None, false, None).0.join("\n");
+        assert!(text.contains("Inside tmux"), "{text}");
+        let text = run(&tmux, Some(Terminal::Ghostty), false, None)
+            .0
+            .join("\n");
+        assert!(text.contains("keybind = shift+enter"), "{text}");
+        assert!(!dir.path().join(".config/kitty/kitty.conf").exists());
+        assert!(!dir.path().join(".config/ghostty/config").exists());
         // iTerm2 and Terminal.app: the steps.
         let text = run(&place, Some(Terminal::ITerm2), false, None)
             .0
