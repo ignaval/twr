@@ -733,6 +733,22 @@ fn held_by(path: &Path, owner: u32) -> bool {
     })
 }
 
+/// The absolute path `path` names: its deepest existing ancestor resolved, with the rest
+/// after it, which holds no `..` (None otherwise, or for a relative path). The rest does
+/// not exist, so no link in it can lead elsewhere.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let (base, rest) = path
+        .ancestors()
+        .find_map(|a| Some((a.canonicalize().ok()?, path.strip_prefix(a).ok()?)))?;
+    let plain = rest
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)));
+    plain.then(|| base.join(rest))
+}
+
 /// The checkouts of repository `repo`, whose git common dir is `common` (canonical): its main
 /// checkout and each linked worktree its records name (a record's `gitdir` names the
 /// worktree's `.git` file), as far as they resolve. Only where the main checkout is known:
@@ -756,19 +772,15 @@ fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
     };
     for record in records {
         let record = record.ok()?;
-        if !record.file_type().ok()?.is_dir() {
+        // Through a link too, as git reads it.
+        if !std::fs::metadata(record.path()).ok()?.is_dir() {
             continue;
         }
         // A record whose `gitdir` can't be read hides where its worktree is.
         let text = std::fs::read_to_string(record.path().join("gitdir")).ok()?;
         let named = record.path().join(text.trim_end_matches(['\n', '\r']));
-        let worktree = named.parent()?;
         // One that is gone is kept out by its path, should it come back.
-        out.push(
-            worktree
-                .canonicalize()
-                .unwrap_or_else(|_| worktree.to_path_buf()),
-        );
+        out.push(resolved(named.parent()?)?);
     }
     Some(out)
 }
@@ -2394,6 +2406,21 @@ mod tests {
         .unwrap();
         assert!(roots().is_empty());
         std::fs::remove_dir_all(&gone).unwrap();
+        // A relative record of a worktree that is gone, and one reached through a link.
+        std::fs::create_dir_all(&gone).unwrap();
+        std::fs::write(gone.join("gitdir"), "../../../../shm/y/.git\n").unwrap();
+        assert!(roots().is_empty());
+        std::fs::remove_dir_all(&gone).unwrap();
+        let elsewhere = d.join("records/linked");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(
+            elsewhere.join("gitdir"),
+            format!("{}\n", shm.join("z/.git").display()),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, common.join("worktrees/linked")).unwrap();
+        assert!(roots().is_empty());
+        std::fs::remove_file(common.join("worktrees/linked")).unwrap();
         // A `gitdir` that is not UTF-8.
         let odd = common.join("worktrees/odd");
         std::fs::create_dir_all(&odd).unwrap();
