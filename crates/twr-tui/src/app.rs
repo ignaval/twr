@@ -22070,6 +22070,11 @@ pub(crate) mod tests {
             draw(&mut st, 60, 12);
             st.note_drawn(Instant::now());
             assert!(!st.seen.suggest_notice, "cut short");
+            // A terminal of one row has no room for the status bar at all.
+            draw(&mut st, 1000, 1);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "no status bar");
+            assert_eq!(st.take_suggest_due(), None);
             let screen = screen_text(&draw(&mut st, 400, 40));
             assert!(screen.contains("suggestions are on"), "{screen}");
             st.note_drawn(Instant::now());
