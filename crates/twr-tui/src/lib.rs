@@ -1998,6 +1998,32 @@ struct Shared {
     seen_file: Option<PathBuf>,
     /// The Shift-Enter offer, for the first workspace shown ([`firstrun::terminal_offer`]).
     offer: Option<firstrun::TerminalOffer>,
+    /// The suggestion asks on their way, of every workspace shown ([`Asks`]).
+    asking: Asks,
+}
+
+/// The suggestion asks on their way (`suggest.next`, each on a connection of its own), of
+/// every workspace shown: once suggestions are off, in whichever workspace, they are aborted,
+/// which closes their connections, and the hub drops them, before any model is asked or with
+/// the call it started.
+#[derive(Default)]
+struct Asks(Vec<tokio::task::AbortHandle>);
+
+impl Asks {
+    /// An ask on its way.
+    fn add(&mut self, ask: tokio::task::AbortHandle) {
+        self.0.push(ask);
+    }
+
+    /// Forgets the asks that ended; with suggestions off (`on` false), aborts the others.
+    fn settle(&mut self, on: bool) {
+        self.0.retain(|h| !h.is_finished());
+        if !on {
+            for h in self.0.drain(..) {
+                h.abort();
+            }
+        }
+    }
 }
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
@@ -2107,6 +2133,7 @@ pub async fn run_with(
         seen,
         seen_file,
         offer,
+        asking: Asks::default(),
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2373,9 +2400,7 @@ async fn drive(
     // Suggestion calls' answers: each call on a connection of its own, as it takes a second
     // or more and nothing else waits for it.
     let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
-    // The suggestion asks on their way: aborted once suggestions are off, which closes their
-    // connections, and the hub drops them, before any model is asked or with the call.
-    let mut asking: Vec<tokio::task::AbortHandle> = Vec::new();
+
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
     // (`Transcript::visible`), so nothing on screen changed, and a draw per event would slow
@@ -2509,12 +2534,7 @@ async fn drive(
             if state.shell_cwd_due() {
                 let _ = call_tx.send(("shell.cd", json!({})));
             }
-            asking.retain(|h| !h.is_finished());
-            if !state.view.suggest {
-                for h in asking.drain(..) {
-                    h.abort();
-                }
-            }
+            ctx.asking.settle(state.view.suggest);
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
                 let task = tokio::spawn(async move {
@@ -2522,7 +2542,7 @@ async fn drive(
                     let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
                     let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
                 });
-                asking.push(task.abort_handle());
+                ctx.asking.add(task.abort_handle());
             }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
@@ -2893,6 +2913,29 @@ async fn drive(
     // The writer ends once it wrote what it has.
     drop(history);
     (end, history_writer)
+}
+
+#[cfg(test)]
+mod asks_tests {
+    use super::*;
+
+    /// Asks on their way stay while suggestions are on, and all go, of every workspace, once
+    /// they are off.
+    #[tokio::test]
+    async fn asks_on_their_way_go_once_suggestions_are_off() {
+        let mut asks = Asks::default();
+        let one = tokio::spawn(std::future::pending::<()>());
+        let two = tokio::spawn(std::future::pending::<()>());
+        asks.add(one.abort_handle());
+        asks.add(two.abort_handle());
+        asks.settle(true);
+        tokio::task::yield_now().await;
+        assert!(!one.is_finished() && !two.is_finished());
+        asks.settle(false);
+        assert!(one.await.unwrap_err().is_cancelled());
+        assert!(two.await.unwrap_err().is_cancelled());
+        assert!(asks.0.is_empty());
+    }
 }
 
 #[cfg(test)]
