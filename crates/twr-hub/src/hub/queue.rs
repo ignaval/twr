@@ -159,7 +159,7 @@ impl Core {
         Ok(())
     }
 
-    fn send_now_locked(
+    pub(super) fn send_now_locked(
         &mut self,
         hub: &Arc<Inner>,
         id: &str,

@@ -4,6 +4,7 @@
 //! ```toml
 //! default_runtime = "claude-code"
 //! stall_after_secs = 600  # a running turn silent this long raises `stalled`; 0 = off
+//! wake_after_secs = 30    # wake a worker idle this long after its background work; 0 = off
 //! # Where `thread.new` looks for a project given by its folder name (`<root>/<name>` or
 //! # `<root>/*/<name>`, a git repository); unset = DEFAULT_PROJECT_ROOTS, [] = no lookup.
 //! project_roots = ["~/code", "~/src"]
@@ -136,6 +137,10 @@ pub struct Config {
     pub stall_after_secs: u64,
     /// Background-only work with no task liveness signal this long is stopped. Zero = off.
     pub background_timeout_secs: u64,
+    /// Seconds the hub waits, after a worker's background work ended with no turn after its
+    /// interim report, before it wakes the worker itself with a prompt saying what ended (once
+    /// per such report). Zero = never.
+    pub wake_after_secs: u64,
     /// Named runtimes (`[runtimes.<name>]`): ACP agent commands under a short name.
     pub runtimes: BTreeMap<String, RuntimePreset>,
     /// Codex settings (`[codex]`).
@@ -186,6 +191,7 @@ impl Default for Config {
             trash: TrashConfig::default(),
             stall_after_secs: 600,
             background_timeout_secs: 86400,
+            wake_after_secs: 30,
             runtimes: BTreeMap::new(),
             codex: CodexConfig::default(),
             notify: NotifyConfig::default(),

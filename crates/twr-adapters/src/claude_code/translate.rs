@@ -85,6 +85,26 @@
 //! carry its id (`ext.twr.runtime_turn`). A `system/init` alone opens none: Claude also sends
 //! one before a run that never reaches the model. A user message written after that `init`
 //! or meanwhile stays queued until the run's `result`.
+//!
+//! Claude's own runs (2.1.304): the end of a task the main agent put in the background
+//! (`task_started` with `is_backgrounded: true`, or a later `task_updated` patch saying so; not
+//! `owned_by_subagent`) makes Claude start a run of its own for its notification, with no
+//! `init`, and its first output may come a minute later (time to first token). So that end,
+//! with no turn running or queued, opens the runtime's turn at once ([`Translator::task`]):
+//! the hub sees the thread busy and writes no prompt into that run. A prompt written into a
+//! run Claude started itself is folded into it, and since 2.1.295 such a run ends with no
+//! `result` at all, which left the turn open for hours. A turn so opened that sees no line of
+//! a run (output, a request, a `result`) within [`TranslatorOptions::notice_run_after`] is
+//! ended `completed` with `ext.twr.no_run` (Claude ran nothing); one ended by a `result` that
+//! asked the model nothing (`num_turns: 0`) ends then.
+//!
+//! A missing `result`: once the main agent's message stops for good (`message_delta` with a
+//! `stop_reason` other than `tool_use` / `pause_turn`) in a running turn, the `result` is
+//! due. When nothing else comes within [`TranslatorOptions::missing_result_after`] (no new
+//! model message, request, `init` or `result`), [`Translator::expire`] ends the turn
+//! `completed` with `ext.twr.missing_result` (no usage), and a `result` that still comes
+//! before the next model output, with no prompt queued, is absorbed (its total read, charged
+//! to no turn; no turn ended or opened).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -139,6 +159,16 @@ pub const DEFAULT_DECLINE_MESSAGE: &str = "The user declined to answer via twr";
 /// `ext.twr.error` of a turn whose `result` line was too long to read.
 pub const OVERSIZED_ERROR: &str = "oversized runtime message";
 
+/// `turn.ended` `ext.twr` key: the turn was ended because its `result` never came.
+pub const MISSING_RESULT_KEY: &str = "missing_result";
+/// `turn.ended` `ext.twr` key: the turn opened for a notification saw no run.
+pub const NO_RUN_KEY: &str = "no_run";
+
+/// `d` as a chrono duration (the longest one when it does not fit).
+fn chrono_of(d: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+}
+
 /// Prefix of the `request_id` of twr's `get_usage` reads.
 pub const USAGE_REQUEST: &str = "twr_usage_";
 
@@ -159,6 +189,26 @@ pub struct TranslatorOptions {
     /// The `--permission-mode` the process was started with (empty: `default`): every
     /// `permissionMode` Claude reports is checked against it ([`Translator::translate`]).
     pub mode: String,
+    /// How long after the main agent's message stopped a missing `result` ends the turn
+    /// (`None`: [`MISSING_RESULT_AFTER`]).
+    pub missing_result_after: Option<std::time::Duration>,
+    /// How long a turn opened for a background task's notification waits for its run
+    /// (`None`: [`NOTICE_RUN_AFTER`]).
+    pub notice_run_after: Option<std::time::Duration>,
+}
+
+/// Default [`TranslatorOptions::missing_result_after`].
+pub const MISSING_RESULT_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+/// Default [`TranslatorOptions::notice_run_after`].
+pub const NOTICE_RUN_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// What the translator waits for, with a deadline ([`Translator::deadline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The running turn's `result`, after the main agent's message stopped.
+    Result,
+    /// The run of a notification the runtime's turn was opened for.
+    NoticeRun,
 }
 
 /// One normalized event produced from a stdout line.
@@ -318,6 +368,15 @@ pub struct Translator {
     failed: bool,
     /// When to read the plan's usage again (`get_usage`).
     usage: crate::usage::Reads,
+    /// Tasks the main agent put in the background: their end starts a run of Claude's own.
+    notifying: std::collections::HashSet<String>,
+    /// Tasks a subagent owns.
+    subagent_tasks: std::collections::HashSet<String>,
+    /// What is awaited, and until when.
+    watch: Option<(Watch, DateTime<Utc>)>,
+    /// A turn was ended for its missing `result`: a `result` before the next model output is
+    /// that run's, absorbed.
+    absorb_result: bool,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
 }
@@ -359,6 +418,10 @@ impl Translator {
             mode_changed: None,
             failed: false,
             usage: crate::usage::Reads::default(),
+            notifying: Default::default(),
+            subagent_tasks: Default::default(),
+            watch: None,
+            absorb_result: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
@@ -639,7 +702,19 @@ impl Translator {
                 return out;
             }
         };
-        match str_at(&v, "type") {
+        // A line of a run: the notification's run started (a task's or a rate limit's line
+        // is none, nor the answer to a request of twr's).
+        let kind = str_at(&v, "type");
+        let run_line = match kind {
+            "system" => !str_at(&v, "subtype").starts_with("task_"),
+            // (A `result` is [`Translator::on_result`]'s to judge.)
+            "rate_limit_event" | "control_response" | "result" => false,
+            _ => true,
+        };
+        if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
+            self.watch = None;
+        }
+        match kind {
             "system" => {
                 // Every system message carrying the mode (each turn's `init`, a status
                 // change) is checked: a session in a wider mode must not go on.
@@ -650,6 +725,9 @@ impl Translator {
                     }
                 }
                 if str_at(&v, "subtype") == "init" {
+                    if matches!(self.watch, Some((Watch::Result, _))) {
+                        self.watch = None;
+                    }
                     self.on_init(&v, line, &mut out);
                     self.read_usage(&mut out);
                 }
@@ -663,7 +741,13 @@ impl Translator {
             "stream_event" => self.on_stream_event(&v, line, &mut out),
             "assistant" => self.on_assistant(&v, line, &mut out),
             "user" => self.on_user(&v, line, &mut out),
-            "control_request" => self.on_control_request(&v, line, &mut out),
+            "control_request" => {
+                // Waiting on the user, not on a `result`.
+                if matches!(self.watch, Some((Watch::Result, _))) {
+                    self.watch = None;
+                }
+                self.on_control_request(&v, line, &mut out)
+            }
             "control_cancel_request" => self.on_cancel(&v, line, &mut out),
             "rate_limit_event" => {
                 let status = v
@@ -897,6 +981,9 @@ impl Translator {
         ) {
             // The model works for the parent session, in a turn of twr's or its own.
             self.model_ran |= !child;
+            if !child {
+                self.absorb_result = false;
+            }
             self.start_runtime_turn(out, raw);
         }
         let turn = match &body {
@@ -953,6 +1040,22 @@ impl Translator {
             .and_then(Value::as_str)
             .unwrap_or_else(|| str_at(v, "description"));
         let terminal = crate::background::terminal(status);
+        let id = str_at(v, "task_id");
+        // Whose task it is: one the main agent put in the background notifies it when it ends
+        // (a run of Claude's own); a subagent's, or one in the foreground of a turn, does not.
+        if subtype == "task_started" && !id.is_empty() {
+            if v.get("owned_by_subagent").and_then(Value::as_bool) == Some(true) {
+                self.subagent_tasks.insert(id.to_string());
+            } else if v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
+                self.notifying.insert(id.to_string());
+            }
+        }
+        if v.pointer("/patch/is_backgrounded").and_then(Value::as_bool) == Some(true)
+            && !self.subagent_tasks.contains(id)
+            && !id.is_empty()
+        {
+            self.notifying.insert(id.to_string());
+        }
         // A resumed subagent can reuse its task id. An explicit new launch overrides the
         // terminal tombstone; late progress alone never does.
         if subtype == "task_started"
@@ -975,6 +1078,86 @@ impl Translator {
             line,
             out,
         );
+        if terminal {
+            self.subagent_tasks.remove(id);
+            if self.notifying.remove(id) {
+                self.open_notice_turn(out, line);
+            }
+        }
+    }
+
+    /// A background task of the main agent's ended: Claude starts a run of its own for its
+    /// notification. With no turn running or queued, the runtime's turn opens now, not at the
+    /// run's first output (see the module docs).
+    fn open_notice_turn(&mut self, out: &mut Translated, line: &str) {
+        if !self.started || self.busy() || self.failed {
+            return;
+        }
+        self.start_runtime_turn(out, Some(line));
+        if self.runtime_turn.is_some() {
+            let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
+            self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
+        }
+    }
+
+    /// When [`Translator::expire`] has something to do (a turn's `result` or a notification's
+    /// run awaited), if anything is awaited.
+    pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.watch.map(|(_, at)| at)
+    }
+
+    /// What is awaited did not come by `now` (see the module docs): a turn whose `result` is
+    /// missing ends `completed` with `ext.twr.missing_result`; one opened for a notification
+    /// whose run never started ends with `ext.twr.no_run`. Nothing while the user is asked
+    /// something.
+    pub fn expire(&mut self, now: DateTime<Utc>) -> Translated {
+        let mut out = Translated::default();
+        let Some((watch, at)) = self.watch else {
+            return out;
+        };
+        if now < at {
+            return out;
+        }
+        self.watch = None;
+        if !self.active || !self.pending.is_empty() || self.failed {
+            return out;
+        }
+        match watch {
+            Watch::Result => {
+                tracing::warn!(turn = ?self.turn, runtime_turn = ?self.runtime_turn, "claude-code: no `result` came after the turn's last message; ending the turn");
+                self.end_without_result(MISSING_RESULT_KEY, &mut out);
+                self.absorb_result = true;
+            }
+            Watch::NoticeRun if self.turn.is_none() && self.runtime_turn.is_some() => {
+                tracing::info!(runtime_turn = ?self.runtime_turn, "claude-code: no run followed a background task's notification; ending the runtime's turn");
+                self.end_without_result(NO_RUN_KEY, &mut out);
+            }
+            Watch::NoticeRun => {}
+        }
+        out
+    }
+
+    /// Ends the running turn without a `result` of Claude's: `completed`, no usage, and
+    /// `ext.twr.<why> = true`.
+    fn end_without_result(&mut self, why: &str, out: &mut Translated) {
+        let model_ran = self.model_ran;
+        let synthetic = json!({"type": "result", "subtype": "success", "stop_reason": "end_turn"});
+        let mut ended = Translated::default();
+        self.end_turn_with(&synthetic, "", &mut ended);
+        self.model_ran = model_ran;
+        for mut e in ended.events {
+            e.raw = None;
+            if let EventBody::TurnEnded(t) = &mut e.body {
+                t.usage = None;
+                if let Some(claude) = t.ext.as_mut().and_then(|x| x.get_mut(EXT)) {
+                    if let Some(c) = claude.as_object_mut() {
+                        c.retain(|k, _| k == "mode_changed" || k == "mode_note");
+                    }
+                }
+                set_twr_ext(&mut t.ext, why, json!(true));
+            }
+            out.events.push(e);
+        }
     }
 
     fn on_init(&mut self, v: &Value, line: &str, out: &mut Translated) {
@@ -1023,7 +1206,22 @@ impl Translator {
         let ev = &v["event"];
         if str_at(ev, "type") == "message_start" {
             self.model_ran = true;
+            self.absorb_result = false;
+            if matches!(self.watch, Some((Watch::Result, _))) {
+                self.watch = None;
+            }
             self.start_runtime_turn(out, Some(line));
+        }
+        // The main agent's message stopped for good: the run's `result` is due.
+        if str_at(ev, "type") == "message_delta" && self.active {
+            let stop = ev.pointer("/delta/stop_reason").and_then(Value::as_str);
+            if stop.is_some_and(|r| !matches!(r, "tool_use" | "pause_turn")) {
+                let after = self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER);
+                self.watch = Some((Watch::Result, (self.clock)() + chrono_of(after)));
+            }
         }
         if str_at(ev, "type") != "content_block_delta" {
             return;
@@ -1504,6 +1702,17 @@ impl Translator {
     }
 
     fn on_result(&mut self, v: &Value, line: &str, out: &mut Translated) {
+        // The run a notification's turn was opened for had not shown a line yet.
+        let quiet_notice = matches!(self.watch, Some((Watch::NoticeRun, _)));
+        self.watch = None;
+        // The run of a turn ended for its missing `result` ends after all: absorbed. Its spend
+        // was that turn's (reported unknown): the total moves on, charged to no other turn.
+        if std::mem::take(&mut self.absorb_result) && !self.active && self.queued.is_empty() {
+            if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
+                self.cost_since(t);
+            }
+            return;
+        }
         // Claude consumed a task notification without asking the model anything (a resumed
         // session hears of a task its previous process left behind before it reads the
         // prompt). That `result` answers no prompt and ends no turn: a twr turn running goes
@@ -1515,11 +1724,20 @@ impl Translator {
             if self.active && self.turn.is_none() && self.runtime_turn.is_none() {
                 self.active = false;
             }
+            // The turn opened for that notification: nothing more comes for it.
+            if quiet_notice && self.active && self.turn.is_none() && self.runtime_turn.is_some() {
+                self.end_without_result(NO_RUN_KEY, out);
+            }
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
                 self.skip_cost(t);
             }
             return;
         }
+        self.end_turn_with(v, line, out);
+    }
+
+    /// Ends the running turn (or the queued one it opens) as `result` `v` says.
+    fn end_turn_with(&mut self, v: &Value, line: &str, out: &mut Translated) {
         // A run of the runtime's own that showed nothing before its `result` (an API error).
         self.start_runtime_turn(out, Some(line));
         let turn = self.in_turn();
@@ -2969,6 +3187,261 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(text, [Some(2)]);
         assert!(!t.busy());
+    }
+
+    fn task_line(subtype: &str, id: &str, extra: Value) -> String {
+        let mut v = json!({"type": "system", "subtype": subtype, "task_id": id, "session_id": "s"});
+        if let (Some(o), Some(x)) = (v.as_object_mut(), extra.as_object()) {
+            o.extend(x.clone());
+        }
+        v.to_string()
+    }
+
+    fn stream(event: Value) -> String {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": null}).to_string()
+    }
+
+    fn twr_key(e: &Emitted, key: &str) -> Option<Value> {
+        match &e.body {
+            EventBody::TurnEnded(p) => p.ext.as_ref()?.get("twr")?.get(key).cloned(),
+            _ => None,
+        }
+    }
+
+    const MESSAGE_START: &str =
+        r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":null}"#;
+
+    /// A first turn that leaves a background task of the main agent's (`b1`) running.
+    fn with_background_task(t: &mut Translator) {
+        t.user_message("run the tests in the background", 1);
+        feed(
+            t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "task_type": "local_bash", "description": "cargo test"}),
+                ),
+                &reply("Tests are running."),
+                &result(1, Some(1.0), false),
+            ],
+        );
+        assert!(!t.busy());
+    }
+
+    /// The end of a task the main agent put in the background starts a run of Claude's own,
+    /// with no `init` and its first output much later: the runtime's turn opens at that end, so
+    /// the hub writes no prompt into the run. The run's output and `result` are that turn's.
+    #[test]
+    fn a_background_task_end_opens_the_runtime_turn_at_once() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_updated",
+                "b1",
+                json!({"patch": {"status": "completed"}}),
+            )],
+        );
+        assert!(matches!(
+            events[0].body,
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated { running: false, .. })
+        ));
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+        assert!(t.busy() && t.deadline().is_some());
+        let events = feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("All tests passed."),
+                &result(2, Some(1.5), true),
+            ],
+        );
+        assert!(t.deadline().is_none(), "the run started");
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") Some(0.5)"]);
+        assert!(!t.busy());
+    }
+
+    /// Only the main agent's background tasks notify it: a foreground task's end, or a
+    /// subagent's task's (even one it put in the background), opens nothing; a task moved to
+    /// the background later (a `task_updated` patch) does.
+    #[test]
+    fn only_the_main_agents_background_tasks_open_a_turn_when_they_end() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line("task_started", "fg", json!({"is_backgrounded": false})),
+                &task_line(
+                    "task_started",
+                    "sub",
+                    json!({"is_backgrounded": true, "owned_by_subagent": true, "parent_task_id": "a1"}),
+                ),
+                &task_line("task_started", "later", json!({"is_backgrounded": false})),
+                &task_line(
+                    "task_updated",
+                    "later",
+                    json!({"patch": {"is_backgrounded": true}}),
+                ),
+                &reply("Working."),
+                &result(1, Some(1.0), false),
+            ],
+        );
+        for id in ["fg", "sub"] {
+            let events = feed(
+                &mut t,
+                &[&task_line(
+                    "task_notification",
+                    id,
+                    json!({"status": "completed"}),
+                )],
+            );
+            assert!(turn_marks(&events).is_empty(), "{id}: {events:?}");
+            assert!(!t.busy());
+        }
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "later",
+                json!({"status": "killed"}),
+            )],
+        );
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+    }
+
+    /// A task's end with a prompt queued opens nothing: the run is that prompt's.
+    #[test]
+    fn a_background_task_end_with_a_prompt_queued_opens_no_runtime_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        t.user_message("and now?", 2);
+        let events = feed(
+            &mut t,
+            &[
+                &task_line("task_notification", "b1", json!({"status": "completed"})),
+                INIT,
+                &reply("Done."),
+                &result(1, Some(1.5), false),
+            ],
+        );
+        assert_eq!(turn_marks(&events), ["end Some(2) None Some(0.5)"]);
+        assert!(t.deadline().is_none());
+    }
+
+    /// No run follows the notification: past its wait the turn ends `completed`, marked
+    /// `no_run`, with no usage; a `result` that asked the model nothing ends it at once.
+    #[test]
+    fn a_notification_turn_with_no_run_ends() {
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        let at = t.deadline().unwrap();
+        assert!(t
+            .expire(at - chrono::Duration::seconds(1))
+            .events
+            .is_empty());
+        // A task's line or a rate limit is no run.
+        feed(&mut t, &[&task_line("task_progress", "x", json!({}))]);
+        assert_eq!(t.deadline(), Some(at));
+        let events = t.expire(at).events;
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        assert!(!t.busy() && t.deadline().is_none());
+
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(&mut t, &[&end]);
+        let events = feed(&mut t, &[&result(0, Some(1.0), true)]);
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        assert!(!t.busy());
+    }
+
+    /// Claude 2.1.295+ folds a prompt written into a run it started itself into that run, and
+    /// writes no `result` for it: once the main agent's message stopped (`end_turn`) and
+    /// nothing came for the wait, the turn ends `completed`, marked `missing_result`. A late
+    /// `result` of that run is absorbed; the next prompt's run is a turn as usual.
+    #[test]
+    fn a_missing_result_ends_the_turn_and_a_late_one_is_absorbed() {
+        let mut t = Translator::new(TranslatorOptions {
+            missing_result_after: Some(std::time::Duration::from_secs(90)),
+            ..Default::default()
+        });
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[INIT, &reply("Hello."), &result(1, Some(1.0), false)],
+        );
+        t.user_message("Checking in", 2);
+        let stop = |reason: &str| {
+            stream(json!({"type": "message_delta", "delta": {"stop_reason": reason}}))
+        };
+        // A tool call's stop awaits no `result`; a new model message ends the wait.
+        feed(&mut t, &[MESSAGE_START, &stop("tool_use")]);
+        assert!(t.deadline().is_none());
+        feed(&mut t, &[&reply("Read the findings."), &stop("end_turn")]);
+        assert!(t.deadline().is_some());
+        feed(&mut t, &[MESSAGE_START]);
+        assert!(t.deadline().is_none(), "the model went on");
+        // The folded prompt's answer, and no `result`.
+        feed(
+            &mut t,
+            &[&reply("Done: fixed both findings."), &stop("end_turn")],
+        );
+        let at = t.deadline().unwrap();
+        let events = t.expire(at);
+        assert_eq!(turn_marks(&events.events), ["end Some(2) None None"]);
+        assert_eq!(
+            twr_key(&events.events[0], MISSING_RESULT_KEY),
+            Some(json!(true))
+        );
+        assert!(!t.busy());
+        assert!(feed(&mut t, &[&result(3, Some(2.0), false)]).is_empty());
+        t.user_message("next", 3);
+        let events = feed(
+            &mut t,
+            &[INIT, &reply("Next done."), &result(1, Some(2.5), false)],
+        );
+        assert_eq!(turn_marks(&events), ["end Some(3) None Some(0.5)"]);
+    }
+
+    /// A request for the user ends the wait for a `result`, and a stop with a request pending
+    /// ends nothing.
+    #[test]
+    fn a_request_for_the_user_is_no_missing_result() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("I need to run a command."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        assert!(t.deadline().is_some());
+        feed(
+            &mut t,
+            &[
+                r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu1"}}"#,
+            ],
+        );
+        assert!(t.deadline().is_none());
+        assert!(t
+            .expire(Utc::now() + chrono::Duration::hours(1))
+            .events
+            .is_empty());
+        assert!(t.busy());
     }
 
     /// A child agent's tool call in a run its `init` started with no prompt never opens a turn

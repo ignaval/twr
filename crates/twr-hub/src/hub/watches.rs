@@ -195,8 +195,13 @@ impl Core {
             ev.thread
         );
         self.orch.idle_fired.insert(ev.thread.clone(), turn);
-        self.orch
-            .push_held(&ev.thread, &ev.id, line, hits, ev.ts + IDLE_GRACE);
+        // A wake the hub has pending for it (`hub::wake`) starts a turn first, which drops
+        // the line; it goes out only when none started.
+        let due = match self.wake.due(&ev.thread) {
+            Some(wake) => (ev.ts + IDLE_GRACE).max(wake + IDLE_GRACE),
+            None => ev.ts + IDLE_GRACE,
+        };
+        self.orch.push_held(&ev.thread, &ev.id, line, hits, due);
     }
 
     /// Worker `ev.thread` runs background task `task` again (`ev`, a `task.updated` running

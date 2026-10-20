@@ -1728,13 +1728,19 @@ impl Core {
                 if by == Some("orchestrator") {
                     return;
                 }
-                let reason = serde_json::to_value(p.reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
+                // A hung-turn card is no routine stall (`hub::stall`).
+                let hung = is_hung_card(&p.ext);
+                let reason = if hung {
+                    "hung".to_string()
+                } else {
+                    serde_json::to_value(p.reason)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                };
                 Notice {
                     key: ev.id.clone(),
-                    urgent: p.reason != AttentionReason::Stalled,
+                    urgent: hung || p.reason != AttentionReason::Stalled,
                     attn_id: Some(p.attn_id.clone()),
                     thread: Some(ev.thread.clone()),
                     watches: Vec::new(),

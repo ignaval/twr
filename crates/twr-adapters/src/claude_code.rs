@@ -134,6 +134,9 @@ pub struct ClaudeCodeAdapter {
     stop_grace: Duration,
     max_line: usize,
     probe_timeout: Duration,
+    /// [`TranslatorOptions::missing_result_after`] and
+    /// [`TranslatorOptions::notice_run_after`] (`None`: the defaults).
+    waits: (Option<Duration>, Option<Duration>),
 }
 
 impl Default for ClaudeCodeAdapter {
@@ -150,6 +153,7 @@ impl ClaudeCodeAdapter {
             stop_grace: STOP_GRACE,
             max_line: process::MAX_LINE,
             probe_timeout: cli::PROBE_TIMEOUT,
+            waits: (None, None),
         }
     }
 
@@ -160,12 +164,21 @@ impl ClaudeCodeAdapter {
             stop_grace: STOP_GRACE,
             max_line: process::MAX_LINE,
             probe_timeout: cli::PROBE_TIMEOUT,
+            waits: (None, None),
         }
     }
 
     /// Changes how long `stop` waits before killing the process group.
     pub fn stop_grace(mut self, grace: Duration) -> Self {
         self.stop_grace = grace;
+        self
+    }
+
+    /// Changes how long after the main agent's message stopped a missing `result` ends the
+    /// turn ([`translate::MISSING_RESULT_AFTER`] by default), and how long a turn opened for a
+    /// background task's notification waits for its run ([`translate::NOTICE_RUN_AFTER`]).
+    pub fn turn_waits(mut self, missing_result: Duration, notice_run: Duration) -> Self {
+        self.waits = (Some(missing_result), Some(notice_run));
         self
     }
 
@@ -368,6 +381,7 @@ impl Adapter for ClaudeCodeAdapter {
             cfg,
             grace: self.stop_grace,
             max_line: self.max_line,
+            waits: self.waits,
         };
         let (handle, end) = AdapterHandle::pair();
         // The binary the process will run, on the `PATH` it gets: what the probe reads.
@@ -478,6 +492,7 @@ struct Start {
     first: Option<(String, u64)>,
     grace: Duration,
     max_line: usize,
+    waits: (Option<Duration>, Option<Duration>),
 }
 
 /// A started process with what its driver needs.
@@ -581,6 +596,8 @@ impl Start {
             exe: Some(bin.to_string_lossy().into_owned()),
             resumed,
             mode: plan.mode.to_string(),
+            missing_result_after: self.waits.0,
+            notice_run_after: self.waits.1,
         });
         if cfg.refresh_system_prompt {
             let mut metadata = serde_json::Map::new();
@@ -769,7 +786,17 @@ async fn drive(started: Started, mut end: AdapterEnd, early: VecDeque<AdapterCmd
     // Whether the process wrote anything to stdout (one refusing its command line does not).
     let mut heard = false;
     loop {
+        // What the translator awaits by a deadline (a missing `result`, a notification's run).
+        let awaited = tr.deadline().map(|at| {
+            tokio::time::Instant::now() + (at - chrono::Utc::now()).to_std().unwrap_or_default()
+        });
         tokio::select! {
+            _ = sleep_until_opt(awaited), if awaited.is_some() && stop_deadline.is_none() => {
+                let out = tr.expire(chrono::Utc::now());
+                if emit(&mut stdin, &end, &tail, out) {
+                    stop_deadline = Some(begin_stop(&mut tr, &mut stdin, grace));
+                }
+            }
             line = lines.next_line(), if stdout_open => match line {
                 Ok(Some(l)) => {
                     heard = true;

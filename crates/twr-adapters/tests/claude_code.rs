@@ -3396,3 +3396,107 @@ fn a_session_id_that_reads_as_an_option_is_never_passed() {
         .attach_command(&cfg, "02f89c0d-a971-4b50-aee7-5b68c144e4f6")
         .is_some());
 }
+
+/// Claude starts a run of its own when a task the main agent put in the background ends, with
+/// no `init`. The runtime's turn opens at that end (the hub then writes no prompt into the run),
+/// and when the run stops (`end_turn`) and no `result` ever comes (Claude 2.1.295+ after a
+/// prompt folded into such a run), the driver ends the turn after its wait, marked
+/// `missing_result`. A notification no run follows ends its turn after its own wait, `no_run`.
+#[tokio::test]
+async fn driver_ends_a_turn_whose_result_never_comes() {
+    let dir = tempfile::tempdir().unwrap();
+    let line = |v: Value| format!("echo '{v}'\n");
+    let task_end = |id: &str| {
+        line(
+            json!({"type": "system", "subtype": "task_notification", "task_id": id,
+                    "status": "completed", "session_id": "s"}),
+        )
+    };
+    let mut body = String::from("read first\n");
+    body += &line(serde_json::from_str(&init_in("default")).unwrap());
+    for id in ["b1", "b2"] {
+        body += &line(
+            json!({"type": "system", "subtype": "task_started", "task_id": id,
+                             "is_backgrounded": true, "task_type": "local_bash",
+                             "description": "cargo test", "session_id": "s"}),
+        );
+    }
+    body += &line(
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Running."}]}}),
+    );
+    body += &line(
+        json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": 1,
+                         "stop_reason": "end_turn", "session_id": "s", "total_cost_usd": 0.1,
+                         "usage": {"input_tokens": 1, "output_tokens": 1}}),
+    );
+    body += &task_end("b1");
+    body += &line(json!({"type": "stream_event", "parent_tool_use_id": null,
+                         "event": {"type": "message_start"}}));
+    body += &line(
+        json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Tests passed."}]}}),
+    );
+    body += &line(json!({"type": "stream_event", "parent_tool_use_id": null,
+                         "event": {"type": "message_delta", "delta": {"stop_reason": "end_turn"}}}));
+    // No `result`. Later the other task ends, and no run follows.
+    body += "sleep 2\n";
+    body += &task_end("b2");
+    body += "cat > /dev/null\n";
+    let bin = script(dir.path(), &body);
+    let mut h = ClaudeCodeAdapter::with_bin(&bin)
+        .stop_grace(Duration::from_millis(500))
+        .turn_waits(Duration::from_millis(400), Duration::from_millis(600))
+        .spawn(
+            SpawnConfig {
+                cwd: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            Some("run the tests in the background".into()),
+        )
+        .unwrap();
+    let mut rx = h.take_events().unwrap();
+    let ended = |evs: &[AdapterEvent]| -> Vec<(Option<u64>, Option<String>, Value)> {
+        evs.iter()
+            .filter_map(|e| match e {
+                AdapterEvent::Emit {
+                    body: EventBody::TurnEnded(t),
+                    turn,
+                    ..
+                } => {
+                    let twr = t.ext.as_ref().and_then(|x| x.get("twr")).cloned();
+                    let twr = twr.unwrap_or(Value::Null);
+                    Some((
+                        *turn,
+                        twr.get("runtime_turn")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        twr,
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let evs = until(&mut rx, |e| is_kind(e, "turn.ended")).await;
+    assert_eq!(ended(&evs)[0].0, Some(1));
+    // b1's end opens the runtime's turn before any output of its run.
+    let evs = until(&mut rx, |e| is_kind(e, "turn.started")).await;
+    assert!(matches!(
+        evs.last(),
+        Some(AdapterEvent::Emit { body: EventBody::TurnStarted(t), turn: None, .. })
+            if t.from == TurnFrom::Runtime
+    ));
+    assert!(evs.iter().any(|e| is_kind(e, "task.updated")));
+    let started = std::time::Instant::now();
+    let evs = until(&mut rx, |e| is_kind(e, "turn.ended")).await;
+    let (turn, runtime, twr) = ended(&evs).remove(0);
+    assert_eq!((turn, runtime.as_deref()), (None, Some("1")));
+    assert_eq!(twr["missing_result"], json!(true), "{twr}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+    // b2: a turn opens, no run comes, it ends.
+    let evs = until(&mut rx, |e| is_kind(e, "turn.ended")).await;
+    let (turn, runtime, twr) = ended(&evs).remove(0);
+    assert_eq!((turn, runtime.as_deref()), (None, Some("2")));
+    assert_eq!(twr["no_run"], json!(true), "{twr}");
+    h.stop().unwrap();
+    exited(&mut rx).await;
+}
