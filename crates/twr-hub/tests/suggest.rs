@@ -1108,3 +1108,75 @@ async fn turning_suggestions_on_probes_afresh() {
     assert_eq!(runs(&cli), 1);
     hub.shutdown().await;
 }
+
+/// Suggestions turned off while an ask waits (here, on the fresh probe of `/suggest on`): the
+/// TUI drops the ask's connection, and the hub drops the ask with it, before any model is
+/// asked.
+#[tokio::test]
+async fn an_ask_whose_client_hangs_up_asks_no_model() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "run the tests", false);
+    let hold = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (h, entered, out) = (Arc::clone(&hold), Arc::clone(&held), Arc::clone(&release));
+    PROBE.with(|p| {
+        *p.borrow_mut() = Some(Arc::new(move || {
+            let (h, entered, out) = (Arc::clone(&h), Arc::clone(&entered), Arc::clone(&out));
+            futures::FutureExt::boxed(async move {
+                if h.load(Ordering::SeqCst) {
+                    entered.notify_one();
+                    out.notified().await;
+                }
+                vec![
+                    probe("claude-code", true, AgentLogin::LoggedIn),
+                    probe("codex", false, AgentLogin::Unknown),
+                ]
+            })
+        }));
+    });
+    let hub = hub_probing(dir.path(), bin, None).await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let socket = dir.path().join("serve.sock");
+    let listener = twr_hub::server::bind(&socket).await.unwrap();
+    let serving = tokio::spawn(twr_hub::server::serve(
+        hub.clone(),
+        listener,
+        socket.clone(),
+        false,
+    ));
+    turn_ended(&hub, dir.path(), "one").await;
+    hold.store(true, Ordering::SeqCst);
+    let s = socket.clone();
+    let ask = tokio::spawn(async move {
+        let mut c = twr_core::client::Client::connect(&s).await.unwrap();
+        c.hello(serde_json::json!({"client": "tui"})).await.unwrap();
+        c.call(
+            "suggest.next",
+            serde_json::json!({"thread": "api", "turn": 1, "retry": true,
+                "models": {"claude-code": "claude-haiku-5-5", "codex": "gpt-6-luna"}}),
+        )
+        .await
+    });
+    timeout(WAIT, held.notified()).await.unwrap();
+    // Off: the ask's connection goes.
+    ask.abort();
+    let _ = ask.await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(runs(&cli), 0, "a model was asked after the client hung up");
+    serving.abort();
+    hub.shutdown().await;
+}

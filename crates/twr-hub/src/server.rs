@@ -1052,11 +1052,27 @@ async fn connection(
                     break;
                 }
             }
+            // A suggestion asked for is the client's only while it waits for it: its client
+            // gone (the user turned suggestions off), the ask goes too, before any model is
+            // asked, or with the CLI it started (`hub::suggest`).
+            "suggest.next" => {
+                let result = tokio::select! {
+                    r = call_async(&hub, &caller, &req.method, req.params) => r,
+                    () = hung_up(&mut reader) => break,
+                };
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
             "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
-            | "box.restart" | "box.projects" | "box.token" | "suggest.next" => {
+            | "box.restart" | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1375,6 +1391,16 @@ fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, RpcError> {
         return Ok(T::default());
     }
     serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+}
+
+/// Returns once the client closed its end of the connection (or it failed); never while it is
+/// open, whatever it sent meanwhile: what came stays in `reader` for the next read.
+async fn hung_up<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) {
+    use tokio::io::AsyncBufReadExt;
+    match reader.fill_buf().await {
+        Ok(b) if !b.is_empty() => std::future::pending().await,
+        _ => {}
+    }
 }
 
 /// `suggest.next`'s parameters: the thread, the turn, and what the client asks

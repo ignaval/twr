@@ -2373,6 +2373,9 @@ async fn drive(
     // Suggestion calls' answers: each call on a connection of its own, as it takes a second
     // or more and nothing else waits for it.
     let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
+    // The suggestion asks on their way: aborted once suggestions are off, which closes their
+    // connections, and the hub drops them, before any model is asked or with the call.
+    let mut asking: Vec<tokio::task::AbortHandle> = Vec::new();
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
     // (`Transcript::visible`), so nothing on screen changed, and a draw per event would slow
@@ -2506,13 +2509,20 @@ async fn drive(
             if state.shell_cwd_due() {
                 let _ = call_tx.send(("shell.cd", json!({})));
             }
+            asking.retain(|h| !h.is_finished());
+            if !state.view.suggest {
+                for h in asking.drain(..) {
+                    h.abort();
+                }
+            }
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
-                tokio::spawn(async move {
+                let task = tokio::spawn(async move {
                     let params = json!({"thread": ask.thread, "turn": ask.turn, "models": ask.models, "retry": ask.retry});
                     let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
                     let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
                 });
+                asking.push(task.abort_handle());
             }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
