@@ -157,6 +157,11 @@ impl AppState {
         } else {
             None
         };
+        self.shell_launching.push_back(Launch {
+            thread: dive.clone().or_else(|| self.main_thread()),
+            command: command.clone(),
+            cancel: false,
+        });
         vec![Action::ShellRun {
             thread: dive,
             command,
@@ -301,9 +306,16 @@ impl AppState {
 
     /// What `shell.run` returned: the command is this TUI's (Ctrl-C stops it).
     pub(crate) fn shell_started(&mut self, result: &Value) {
+        // The launch this answers: the oldest on its way (one connection answers in order).
+        let launch = self.shell_launching.pop_front();
         let (Some(job), Some(thread)) = (result["job"].as_str(), result["thread"].as_str()) else {
             return;
         };
+        // Ctrl-C came before this answer: it stops now.
+        if launch.is_some_and(|l| l.cancel) {
+            self.shell_cancels.push(job.to_string());
+            return;
+        }
         // Ended already (its end came before this answer): nothing to stop.
         let ended = self.shell_done.iter().any(|d| d == job);
         if let Some(cwd) = result["cwd"].as_str().filter(|_| {
@@ -377,6 +389,20 @@ impl AppState {
     /// runs and isn't being stopped; with none, quits.
     pub(crate) fn ctrl_c(&mut self) -> Vec<Action> {
         let main = self.main_thread();
+        // The newest is one sent and not answered yet: it stops as soon as its job is known.
+        if let Some(l) = self
+            .shell_launching
+            .iter_mut()
+            .rev()
+            .find(|l| l.thread == main && !l.cancel)
+        {
+            l.cancel = true;
+            self.view.status = Some(format!(
+                "stopping `{}` as it starts · Ctrl-C again quits",
+                l.command
+            ));
+            return Vec::new();
+        }
         let Some(s) = self
             .shell_jobs
             .iter_mut()
@@ -400,6 +426,64 @@ impl AppState {
         vec![Action::JobCancel {
             job: job.to_string(),
         }]
+    }
+}
+
+/// A `!` command sent and not answered yet ([`AppState::shell_launching`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launch {
+    /// The thread it runs for (the orchestrator's: the main pane's then).
+    pub thread: Option<String>,
+    /// The command line.
+    pub command: String,
+    /// Ctrl-C asked to stop it.
+    pub cancel: bool,
+}
+
+/// The `!` commands' state a view keeps across a switch to another workspace
+/// ([`crate::workspace::SavedView`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Saved {
+    cwd: Option<String>,
+    cwd_asked: bool,
+    cd_asked: bool,
+    cds: std::collections::VecDeque<bool>,
+    jobs: Vec<Started>,
+    done: std::collections::VecDeque<String>,
+    launching: std::collections::VecDeque<Launch>,
+    cancels: Vec<String>,
+}
+
+impl AppState {
+    /// The jobs to cancel now ([`AppState::shell_cancels`]).
+    pub fn take_shell_cancels(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.shell_cancels)
+    }
+
+    /// The `!` commands' state, for the view kept across a switch.
+    pub(crate) fn take_shell(&mut self) -> Saved {
+        Saved {
+            cwd: self.shell_cwd.take(),
+            cwd_asked: std::mem::take(&mut self.shell_cwd_asked),
+            cd_asked: std::mem::take(&mut self.shell_cd_asked),
+            cds: std::mem::take(&mut self.shell_cds),
+            jobs: std::mem::take(&mut self.shell_jobs),
+            done: std::mem::take(&mut self.shell_done),
+            launching: std::mem::take(&mut self.shell_launching),
+            cancels: std::mem::take(&mut self.shell_cancels),
+        }
+    }
+
+    /// Puts back the `!` commands' state of a view kept across a switch.
+    pub(crate) fn restore_shell(&mut self, s: Saved) {
+        self.shell_cwd = s.cwd;
+        self.shell_cwd_asked = s.cwd_asked;
+        self.shell_cd_asked = s.cd_asked;
+        self.shell_cds = s.cds;
+        self.shell_jobs = s.jobs;
+        self.shell_done = s.done;
+        self.shell_launching = s.launching;
+        self.shell_cancels = s.cancels;
     }
 }
 

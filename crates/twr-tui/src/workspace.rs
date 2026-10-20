@@ -93,6 +93,9 @@ pub struct SavedView {
     /// Answers to its messages that came while it was being restored
     /// ([`AppState::deferred`]): applied once it is.
     deferred: Vec<(&'static str, serde_json::Value)>,
+    /// Its `!` commands' state ([`crate::shell::Saved`]): the folder they run in, the `!cd`s
+    /// and launches on their way, the commands Ctrl-C stops.
+    shell: crate::shell::Saved,
 }
 
 /// What of a [`SavedView`] waits until the replay is applied ([`AppState::finish_restore`]):
@@ -368,6 +371,7 @@ impl AppState {
     /// The view to keep for this workspace while another is shown (the state is left
     /// without its transcripts: it is done with).
     pub fn take_view(&mut self) -> SavedView {
+        let shell = self.take_shell();
         let v = &self.view;
         // Up on the input line shows a history entry (unedited): what the user had typed is
         // the line to keep.
@@ -401,6 +405,7 @@ impl AppState {
             started_refs: std::mem::take(&mut self.started_refs),
             acted_turns: std::mem::take(&mut self.acted_turns),
             deferred: std::mem::take(&mut self.deferred),
+            shell,
             session_history: v
                 .history
                 .iter()
@@ -451,6 +456,7 @@ impl AppState {
         self.started_refs = saved.started_refs;
         self.acted_turns = saved.acted_turns;
         self.deferred = saved.deferred;
+        self.restore_shell(saved.shell);
         // The file's history goes before them as it is read ([`AppState::load_history`]).
         self.view.history = saved.session_history;
         self.restoring = Some(saved.restoring);

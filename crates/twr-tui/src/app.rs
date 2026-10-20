@@ -2226,6 +2226,12 @@ pub struct AppState {
     /// The latest `!` commands that ended (their jobs), at most 32: an answer to `shell.run`
     /// that comes after its command's end starts nothing to stop.
     pub shell_done: VecDeque<String>,
+    /// The `!` commands sent and not answered yet, in the order sent ([`crate::shell::Launch`]):
+    /// Ctrl-C meanwhile stops one as soon as its job is known.
+    pub shell_launching: VecDeque<crate::shell::Launch>,
+    /// Jobs to cancel now (a command Ctrl-C stopped before its answer came): the IO loop sends
+    /// `job.cancel` for each ([`AppState::take_shell_cancels`]).
+    pub shell_cancels: Vec<String>,
     /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
     pub shell_reads: HashMap<String, crate::shell::Reads>,
     /// The suggested next message, while it may show ([`crate::suggest`]).
@@ -2765,7 +2771,9 @@ impl AppState {
     /// listing the items it names, and `y` purges exactly those, by id.
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
-            "say" | "thread.send" | "message.withdraw" if self.restoring.is_some() => {
+            "say" | "thread.send" | "message.withdraw" | "shell.run" | "shell.cd"
+                if self.restoring.is_some() =>
+            {
                 self.deferred.push((method, result.clone()));
             }
             "say" | "thread.send" => self.sent_result(result),
@@ -21021,6 +21029,47 @@ pub(crate) mod tests {
                     cwd: Some("/work/x".into()),
                     share: false
                 }]
+            );
+        }
+
+        /// Ctrl-C right after Enter, before the hub answered: the command stops as soon as its
+        /// job is known, and the next Ctrl-C quits.
+        #[test]
+        fn ctrl_c_before_the_answer_stops_the_command_once_it_starts() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert!(st.view.status.as_deref().unwrap().contains("as it starts"));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J9", "thread": "t-orch", "name": "sleep 99", "cwd": "/w"}),
+            );
+            assert_eq!(st.take_shell_cancels(), vec!["J9".to_string()]);
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+        }
+
+        /// A switch to another workspace and back keeps where `!` commands run, the commands
+        /// Ctrl-C stops, and an answer that came meanwhile.
+        #[test]
+        fn a_workspace_switch_keeps_the_commands_state() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            type_line(&mut st, "!cd /w/x");
+            st.apply_result("shell.cd", &json!({"cwd": "/w/x"}));
+            type_line(&mut st, "!sleep 99");
+            let kept = st.take_view();
+            let mut back = with_orch();
+            back.restore_view(kept);
+            back.apply_result(
+                "shell.run",
+                &json!({"job": "J5", "thread": "t-orch", "name": "sleep 99", "cwd": "/w/x"}),
+            );
+            back.finish_restore();
+            assert_eq!(back.shell_cwd.as_deref(), Some("/w/x"));
+            assert_eq!(
+                back.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J5".into() }]
             );
         }
 

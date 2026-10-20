@@ -1764,7 +1764,13 @@ fn end_calls(
 /// The calls whose results the view follows a message with: what was sent and its ref, and
 /// taking it back ([`AppState::apply_result`]). A failed one comes as `{failed: true, ref}`
 /// (`ref`: the one it named, if any).
-const FOLLOWED: [&str; 3] = ["say", "thread.send", "message.withdraw"];
+const FOLLOWED: [&str; 5] = [
+    "say",
+    "thread.send",
+    "message.withdraw",
+    "shell.run",
+    "shell.cd",
+];
 
 /// A results channel of a view ([`ResultsOut`]).
 type ResultTx = mpsc::UnboundedSender<(&'static str, Value)>;
@@ -2350,6 +2356,9 @@ async fn drive(
             }
             if state.shell_cwd_due() {
                 let _ = call_tx.send(("shell.cd", json!({})));
+            }
+            for job in state.take_shell_cancels() {
+                let _ = call_tx.send(("job.cancel", json!({ "job": job })));
             }
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
