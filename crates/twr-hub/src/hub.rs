@@ -2186,6 +2186,14 @@ fn spawn_config(hub: &Inner, view: &ThreadView) -> SpawnConfig {
         repo: (!view.is_orchestrator())
             .then(|| view.repo.clone().map(PathBuf::from))
             .flatten(),
+        // A project's own setting only when the thread was made for that configured project,
+        // as for its `env`; never the orchestrator's (it is never in `auto`).
+        codex_auto: if view.is_orchestrator() {
+            Default::default()
+        } else {
+            hub.config
+                .codex_auto(view.project.as_deref().filter(|_| view.configured_project))
+        },
         ..Default::default()
     }
 }

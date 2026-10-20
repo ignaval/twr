@@ -2110,6 +2110,7 @@ impl Translator {
             }
             "item/started" => self.on_item_started(&p["item"], turn_id, line, out),
             "item/completed" => self.on_item_completed(&p["item"], turn_id, line, out),
+            "item/autoApprovalReview/completed" => self.on_auto_review(p, turn_id, line, out),
             "serverRequest/resolved" => {
                 let rid = &p["requestId"];
                 let Some(pi) = self
@@ -2211,6 +2212,82 @@ impl Translator {
         self.items.insert(id, call.input_summary.clone());
         let turn = self.turn_of(turn_id.as_deref());
         self.push(out, EventBody::AgentToolCall(call), turn, Some(line));
+    }
+
+    /// A decision of Codex's reviewer agent (`[codex] auto = "auto_review"`), which answers
+    /// what the sandbox does not allow instead of the user: an `auto_review` tool call (the
+    /// action it judged) and its result (`ok` when approved; the status, risk, authorization
+    /// and rationale), so the transcript shows what ran outside the sandbox unasked and what
+    /// was refused. The whole review is kept as `ext.codex.review`.
+    fn on_auto_review(
+        &mut self,
+        p: &Value,
+        turn_id: Option<String>,
+        line: &str,
+        out: &mut Translated,
+    ) {
+        let review = &p["review"];
+        let action = &p["action"];
+        let id = format!("auto_review:{}", str_at(p, "reviewId"));
+        let status = str_at(review, "status");
+        let approved = status == "approved";
+        let what = match str_at(action, "command") {
+            "" => compact(action),
+            command => command.to_string(),
+        };
+        let turn = self.turn_of(turn_id.as_deref());
+        let mut codex = Map::new();
+        codex.insert("item_type".into(), json!("autoApprovalReview"));
+        for (from, to) in [
+            ("targetItemId", "target_item_id"),
+            ("decisionSource", "decision_source"),
+        ] {
+            if let Some(x) = p.get(from).filter(|x| !x.is_null()) {
+                codex.insert(to.into(), x.clone());
+            }
+        }
+        codex.insert("action".into(), action.clone());
+        let call = AgentToolCall {
+            call_id: id.clone(),
+            tool: "auto_review".into(),
+            input_summary: one_line(&what, INPUT_SUMMARY_MAX),
+            input_ref: None,
+            risky: approved,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolCall(call), turn, Some(line));
+        let mut said = if status.is_empty() {
+            "no decision"
+        } else {
+            status
+        }
+        .to_string();
+        let grades: Vec<String> = [
+            ("riskLevel", "risk"),
+            ("userAuthorization", "authorization"),
+        ]
+        .into_iter()
+        .filter_map(|(k, name)| opt_str(review, k).map(|v| format!("{name} {v}")))
+        .collect();
+        if !grades.is_empty() {
+            said = format!("{said} ({})", grades.join(", "));
+        }
+        if let Some(why) = opt_str(review, "rationale") {
+            said = format!("{said}: {why}");
+        }
+        let mut codex = Map::new();
+        codex.insert("status".into(), json!(status));
+        codex.insert("review".into(), review.clone());
+        let result = AgentToolResult {
+            call_id: id,
+            ok: approved,
+            output_summary: one_line(&said, OUTPUT_SUMMARY_MAX),
+            output_ref: None,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolResult(result), turn, None);
     }
 
     fn on_item_completed(
@@ -2798,7 +2875,7 @@ pub(crate) fn sandbox_rank(sandbox: &str) -> Option<u8> {
 
 /// Checks the policy a `thread/start` / `thread/resume` result reports (`approvalPolicy`,
 /// `sandbox.type`, `approvalsReviewer`) against the request's `params`: each must be reported,
-/// known, and no wider than requested (the reviewer exactly `user`). Short of
+/// known, and no wider than requested (the reviewer `user`, or the `auto_review` asked for). Short of
 /// `dangerFullAccess` (which allows everything anyway, and only when asked for), the sandbox's
 /// extras are checked too ([`check_sandbox_extras`]): network access only when twr asked for
 /// it, and only writable roots twr asked for. Err says what is not.
@@ -2837,10 +2914,14 @@ pub fn check_policy(params: &Value, result: &Value) -> Result<(), String> {
             ))
         }
     }
+    // `auto_review` (`[codex] auto`) only when asked for; `guardian_subagent` is Codex's
+    // older name for it.
+    let asked = str_at(params, "approvalsReviewer");
     match result.get("approvalsReviewer").and_then(Value::as_str) {
         Some("user") => Ok(()),
+        Some("auto_review" | "guardian_subagent") if asked == "auto_review" => Ok(()),
         other => Err(format!(
-            "the thread reports approvalsReviewer {:?} where twr asked for \"user\"; approvals \
+            "the thread reports approvalsReviewer {:?} where twr asked for {asked:?}; approvals \
              would not reach the user",
             other.unwrap_or("(none)")
         )),
@@ -3654,6 +3735,117 @@ mod tests {
             r#"{"id":2,"result":{"thread":{"id":"th"},"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"readOnly"}}}"#,
         );
         assert!(out.fatal.is_none(), "{out:?}");
+    }
+
+    /// Codex's reviewer agent answers only where twr asked for it (`[codex] auto =
+    /// "auto_review"`): then `auto_review`, its older name `guardian_subagent`, or `user`
+    /// (narrower) pass; asked for `user`, only `user` does.
+    #[test]
+    fn the_auto_reviewer_is_accepted_only_when_asked_for() {
+        let params = |reviewer: &str| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": reviewer,
+                "sandbox": "read-only"})
+        };
+        let result = |reviewer: Value| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": reviewer,
+                "sandbox": {"type": "readOnly"}})
+        };
+        for got in ["auto_review", "guardian_subagent", "user"] {
+            assert_eq!(
+                check_policy(&params("auto_review"), &result(json!(got))),
+                Ok(()),
+                "{got}"
+            );
+        }
+        for got in [
+            json!("auto_review"),
+            json!("guardian_subagent"),
+            json!("someone"),
+            Value::Null,
+        ] {
+            let why = check_policy(&params("user"), &result(got.clone())).unwrap_err();
+            assert!(why.contains("approvalsReviewer"), "{why}");
+        }
+        for got in [json!("someone"), Value::Null] {
+            assert!(check_policy(&params("auto_review"), &result(got)).is_err());
+        }
+    }
+
+    /// Each decision of Codex's reviewer agent (as Codex 0.162.1 sent them) is in the
+    /// transcript: the action as an `auto_review` tool call, the decision as its result, `ok`
+    /// only when approved. The `started` notification and the `guardianWarning` repeating the
+    /// decision add nothing.
+    #[test]
+    fn auto_review_decisions_are_recorded_as_tool_calls() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let started = r#"{"method":"item/autoApprovalReview/started","params":{"threadId":"th","turnId":"tu1","startedAtMs":1,"reviewId":"r1","targetItemId":"exec-1","review":{"status":"inProgress","riskLevel":null,"userAuthorization":null,"rationale":null},"action":{"type":"command","source":"unifiedExec","command":"/bin/bash -lc 'git branch -d other'","cwd":"/w"}}}"#;
+        assert!(t.translate(started).events.is_empty());
+        let warning = r#"{"method":"guardianWarning","params":{"threadId":"th","message":"Automatic approval review approved (risk: medium, authorization: high): ..."}}"#;
+        assert!(t.translate(warning).events.is_empty());
+        let decided = |id: &str, status: &str, risk: &str| {
+            json!({"method": "item/autoApprovalReview/completed", "params": {
+                "threadId": "th", "turnId": "tu1", "startedAtMs": 1, "completedAtMs": 2,
+                "reviewId": id, "targetItemId": "exec-1", "decisionSource": "agent",
+                "review": {"status": status, "riskLevel": risk, "userAuthorization": "high",
+                    "rationale": "The user asked for it."},
+                "action": {"type": "command", "source": "unifiedExec",
+                    "command": "/bin/bash -lc 'git branch -d other'", "cwd": "/w"}}})
+            .to_string()
+        };
+        for (id, status, ok) in [("r1", "approved", true), ("r2", "denied", false)] {
+            let out = t.translate(&decided(id, status, "medium"));
+            let (call, result) = match &out.events[..] {
+                [Emitted {
+                    body: EventBody::AgentToolCall(c),
+                    turn: Some(1),
+                    ..
+                }, Emitted {
+                    body: EventBody::AgentToolResult(r),
+                    turn: Some(1),
+                    ..
+                }] => (c, r),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(call.tool, "auto_review");
+            assert_eq!(call.call_id, format!("auto_review:{id}"));
+            assert_eq!(call.input_summary, "/bin/bash -lc 'git branch -d other'");
+            assert_eq!(call.risky, ok);
+            assert_eq!(
+                call.ext.as_ref().unwrap()["codex"]["target_item_id"],
+                "exec-1"
+            );
+            assert_eq!(result.call_id, call.call_id);
+            assert_eq!(result.ok, ok);
+            assert_eq!(
+                result.output_summary,
+                format!("{status} (risk medium, authorization high): The user asked for it.")
+            );
+            assert_eq!(
+                result.ext.as_ref().unwrap()["codex"]["review"]["status"],
+                status
+            );
+        }
+        // An action that is not a command shows as JSON.
+        let other = json!({"method": "item/autoApprovalReview/completed", "params": {
+            "threadId": "th", "turnId": "tu1", "reviewId": "r3",
+            "review": {"status": "timedOut"}, "action": {"type": "network", "host": "x.dev"}}})
+        .to_string();
+        let out = t.translate(&other);
+        let [Emitted {
+            body: EventBody::AgentToolCall(c),
+            ..
+        }, Emitted {
+            body: EventBody::AgentToolResult(r),
+            ..
+        }] = &out.events[..]
+        else {
+            panic!("{:?}", out.events)
+        };
+        assert!(c.input_summary.contains("x.dev"), "{}", c.input_summary);
+        assert!(!r.ok);
+        assert_eq!(r.output_summary, "timedOut");
     }
 
     /// Relay rule: a form or URL elicitation is never answered for the user. It

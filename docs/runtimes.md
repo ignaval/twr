@@ -57,7 +57,7 @@ Codex has no single mode setting, so twr maps the mode to an approval policy and
 | `plan` | untrusted | read-only |
 | `read-only` | on-request | read-only |
 | `on-request` | on-request | workspace-write |
-| `auto` | on-request | workspace-write, plus network, the worktree's git metadata and the cargo and npm caches |
+| `auto` | on-request (`[codex] auto` can change it, below) | workspace-write, plus network, the worktree's git metadata, `/dev/shm` and build caches |
 | `acceptEdits` | untrusted | workspace-write |
 | `dontAsk` | never | read-only |
 | `never` | never | workspace-write |
@@ -65,15 +65,32 @@ Codex has no single mode setting, so twr maps the mode to an approval policy and
 
 When the mapping isn't exact, the thread's start event carries a note saying so.
 
-Codex has no auto mode of its own, so `auto` is Codex's on-request policy: commands inside the sandbox run without asking, and anything beyond it asks you. Codex's plain workspace sandbox is too tight for routine work in a twr worktree: it has no network, which blocks every socket (tests that bind a unix socket fail), and a worktree's git metadata lives in the main repository's `.git`, outside the worktree, so `git commit` asks. So in `auto`, twr widens the sandbox (checked with Codex 0.160.0):
+Codex has no auto mode of its own, so `auto` is Codex's on-request policy: commands inside the sandbox run without asking, and anything beyond it asks you. Codex's plain workspace sandbox is too tight for routine work in a twr worktree: it has no network, which blocks every socket (tests that bind a unix socket fail), and a worktree's git metadata lives in the main repository's `.git`, outside the worktree, so `git commit` asks. So in `auto`, twr widens the sandbox (checked with Codex 0.162.1):
 
 - network access is on;
-- the thread can write its worktree's git dir (`.git/worktrees/<name>`) and the repository's `.git/objects`, `.git/refs` and `.git/logs`, enough to commit, stash, tag and fetch. `.git/config` and `.git/hooks` stay read-only, because git runs what they name outside the sandbox. A thread working in a main checkout rather than a worktree still asks to commit. twr finds these directories from the repository the thread was made from, and the worktree's record there from git's own record of which worktree it belongs to, not from the worktree's own `.git` file or its git dir's `commondir`, which the agent can rewrite: if those point anywhere else, such as another worktree's record, nothing of git's is writable and a commit asks;
-- the thread can write the cargo caches (`$CARGO_HOME/registry` and `git`, `~/.cargo` by default; not `bin` or `config.toml`) and the npm cache (`$npm_config_cache`, else `~/.npm`), where they exist.
+- the thread can write its worktree's git dir (`.git/worktrees/<name>`) and the repository's `.git/objects`, `.git/refs` and `.git/logs`, enough to commit, stash, tag, fetch and rebase. `.git/config` and `.git/hooks` stay read-only, because git runs what they name outside the sandbox. A thread working in a main checkout rather than a worktree still asks to commit. twr finds these directories from the repository the thread was made from, and the worktree's record there from git's own record of which worktree it belongs to, not from the worktree's own `.git` file or its git dir's `commondir`, which the agent can rewrite: if those point anywhere else, such as another worktree's record, nothing of git's is writable and a commit asks;
+- the thread can write the cargo caches (`$CARGO_HOME/registry` and `git`, `~/.cargo` by default; not `bin` or `config.toml`), `$CARGO_TARGET_DIR` when the thread's environment sets one (`[threads] env`, a project's `env`, the hub's own), the npm cache (`$npm_config_cache`, else `~/.npm`) and pnpm's store (`$XDG_DATA_HOME/pnpm/store`, else `~/.local/share/pnpm/store`), where they exist. None of these may be or hold your home directory, the worktree or the repository's `.git`: such a path is left out;
+- the thread can write `/dev/shm`, scratch space like `/tmp` (which Codex's sandbox already lets it write). Without it, Codex gives each command an empty `/dev/shm` of its own, and what one command writes there is gone for the next.
+
+The repository's `.git` itself stays read-only. Git locks `.git/packed-refs` whenever it deletes a ref, so in a worktree `git branch -d`, `git tag -d` and the end of a cherry-pick or merge print `error: Unable to create '.../.git/packed-refs.lock': Read-only file system`, and those ask. A rebase prints the same error but has done its work. twr adds a short note about this to an `auto` thread's developer instructions, so Codex checks `git status` instead of asking to run the rebase again. Making `.git` writable would let the agent create files there, such as a `commondir` or a `config.worktree`, that your own git would then follow outside the sandbox.
 
 Writing anywhere else, such as another checkout, your home directory or `~/.cargo/bin`, still asks, and so does anything Codex itself decides to check with you first. Network access also opens local sockets, so a command can reach your user session's D-Bus and start something outside the sandbox (`systemd-run --user`). That is as open as Claude Code's auto mode, which has no OS sandbox. If you need the stricter sandbox, use `on-request`.
 
-Codex adds the `[sandbox_workspace_write]` `network_access` and `writable_roots` of your Codex config, or a project's `.codex/config.toml`, to any workspace-write sandbox unless twr overrides them. So in every mode with that sandbox twr sends both: in `auto` its own list and network on, in the others no network and no extra roots. If Codex still reports network access or a writable root twr didn't ask for, twr ends the session before any prompt. The thread's start event lists the roots as `ext.codex.sandbox_writable_roots`. `twr attach` passes the same settings, except that an attach to a thread on a runner box gets no extra roots, so a commit there asks.
+### Who answers when the sandbox says no
+
+What the `auto` sandbox doesn't allow, Codex asks to run outside it. `[codex] auto` in the [configuration](configuration.md) decides who answers, for every Codex thread in `auto`, and a project's `codex_auto` overrides it for that project's threads:
+
+| `[codex] auto` | Codex runs with | what happens |
+|---|---|---|
+| `ask` (the default) | `on-request`, reviewer `user` | a permission card; only you answer it |
+| `auto_review` | `on-request`, reviewer `auto_review` | Codex's reviewer agent decides, and you aren't asked: what it approves runs outside the sandbox, what it denies doesn't run. Each decision shows in the thread's transcript as an `auto_review` tool call, with the command, the risk Codex gave it and its reason |
+| `never` | `never` | nothing asks: what the sandbox refuses fails, and Codex works around it or reports it |
+
+`auto_review` is the closest to Claude Code's auto mode: a model, not you, decides which commands go beyond the sandbox. It is your Codex's own reviewer (`approvals_reviewer = "auto_review"` in Codex's config), which judges each request by its risk and by what you asked for. twr never sees a request before it decides. `never` takes nothing away from the sandbox and adds nothing to it: it only stops the asking. The other modes are unchanged: they always send the reviewer `user`. The hub reads `[codex] auto` when it starts, and a thread's runtime takes it when it starts or resumes; a runner box from before this setting asks.
+
+Codex adds the `[sandbox_workspace_write]` `network_access` and `writable_roots` of your Codex config, or a project's `.codex/config.toml`, to any workspace-write sandbox unless twr overrides them. So in every mode with that sandbox twr sends both: in `auto` its own list and network on, in the others no network and no extra roots. If Codex still reports network access or a writable root twr didn't ask for, or a reviewer other than the one twr asked for, twr ends the session before any prompt. The thread's start event lists the roots as `ext.codex.sandbox_writable_roots` and the reviewer as `ext.codex.approvals_reviewer`. `twr attach` passes the same settings, except that an attach to a thread on a runner box gets no extra roots, so a commit there asks.
+
+Codex's own allowlist, `prefix_rule` entries in `~/.codex/rules/*.rules` (or a trusted project's `.codex/rules`), applies to twr's threads too. Codex documents that a rule with `decision = "allow"` runs matching commands outside the sandbox without asking. twr adds no rules and never picks Codex's "always allow" answer for you.
 
 Grok Build takes `default`, `plan`, `dontAsk`, `acceptEdits`, `auto` and `bypassPermissions` as `--permission-mode`. In `auto`, Grok's own auto mode decides what to ask. `manual` becomes `default` and `read-only` becomes `plan`. Unless the mode is `bypassPermissions`, twr also turns Grok's always-approve off and cancels a session Grok reports as `yolo`. Even in `default` mode, grok 1.0.44 runs some shell commands it deems safe without asking. File writes ask.
 

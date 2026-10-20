@@ -55,6 +55,12 @@
 //! worktree = false     # overrides threads.worktree for this project
 //! # Added to the environment of this project's runtimes, over threads.env.
 //! env = { CARGO_TARGET_DIR = "/home/me/.cache/api-target" }
+//! codex_auto = "auto_review"   # overrides [codex] auto for this project's threads
+//!
+//! [codex]
+//! # What a Codex thread in `auto` does with a command its sandbox does not allow: "ask" you
+//! # (the default), let Codex's "auto_review" agent decide, or "never" run it.
+//! auto = "ask"
 //!
 //! [threads]
 //! thinking = false
@@ -101,6 +107,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::CodexAuto;
 use crate::notify::NotifyEvent;
 use crate::paths::Paths;
 
@@ -129,6 +136,8 @@ pub struct Config {
     pub background_timeout_secs: u64,
     /// Named runtimes (`[runtimes.<name>]`): ACP agent commands under a short name.
     pub runtimes: BTreeMap<String, RuntimePreset>,
+    /// Codex settings (`[codex]`).
+    pub codex: CodexConfig,
     /// The hub's notification command (`[notify]`): off unless `command` is set.
     pub notify: NotifyConfig,
     /// Terminal UI settings (read by the TUI when it starts, not by the hub).
@@ -176,6 +185,7 @@ impl Default for Config {
             stall_after_secs: 600,
             background_timeout_secs: 86400,
             runtimes: BTreeMap::new(),
+            codex: CodexConfig::default(),
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
             project_roots: None,
@@ -846,6 +856,19 @@ pub struct ProjectConfig {
     /// What an idle trim of this project's threads may delete, replacing `[threads]
     /// idle_trim_disposable` ([`Config::idle_trim_disposable`]).
     pub idle_trim_disposable: Option<Vec<String>>,
+    /// What this project's Codex threads in `auto` do with a command their sandbox does not
+    /// allow, over `[codex] auto` ([`Config::codex_auto`]).
+    pub codex_auto: Option<CodexAuto>,
+}
+
+/// `[codex]`: settings of the Codex runtime.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodexConfig {
+    /// What a Codex thread in `auto` does with a command its sandbox does not allow
+    /// ([`CodexAuto`]): ask the user (the default), let Codex's reviewer agent decide, or
+    /// never run it.
+    pub auto: CodexAuto,
 }
 
 impl ProjectConfig {
@@ -1371,6 +1394,15 @@ impl Config {
             env.extend(p.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         env.into_iter().collect()
+    }
+
+    /// What a Codex thread of `project` in `auto` does with a command its sandbox does not
+    /// allow: `[projects.<project>] codex_auto`, else `[codex] auto`.
+    pub fn codex_auto(&self, project: Option<&str>) -> CodexAuto {
+        project
+            .and_then(|p| self.projects.get(p))
+            .and_then(|p| p.codex_auto)
+            .unwrap_or(self.codex.auto)
     }
 
     /// What an idle trim of a thread of `project` may delete (of `threads.park_disposable`):
@@ -1961,6 +1993,51 @@ mod tests {
         let c = Config::from_toml_str("[projects.api]\nrepo = \"/a\"\nworktree = false\n").unwrap();
         assert!(!c.project_worktree("api"));
         assert!(c.project_worktree("other"));
+    }
+
+    /// `[codex] auto` (who answers what a Codex `auto` thread's sandbox does not allow):
+    /// `ask` by default, a project's `codex_auto` wins for its threads, and anything but the
+    /// three values (or another key under `[codex]`) is refused.
+    #[test]
+    fn codex_auto_defaults_project_override_and_checks() {
+        let c = Config::from_toml_str("").unwrap();
+        assert_eq!(c.codex.auto, CodexAuto::Ask);
+        assert_eq!(c.codex_auto(None), CodexAuto::Ask);
+        assert_eq!(c.codex_auto(Some("api")), CodexAuto::Ask);
+        let c = Config::from_toml_str(
+            r#"
+            [codex]
+            auto = "never"
+            [projects.api]
+            repo = "/src/api"
+            codex_auto = "auto_review"
+            [projects.web]
+            repo = "/src/web"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.codex.auto, CodexAuto::Never);
+        assert_eq!(c.codex_auto(Some("api")), CodexAuto::AutoReview);
+        assert_eq!(c.codex_auto(Some("web")), CodexAuto::Never);
+        assert_eq!(c.codex_auto(Some("/some/path")), CodexAuto::Never);
+        assert_eq!(c.codex_auto(None), CodexAuto::Never);
+        for v in CodexAuto::ALL {
+            let c =
+                Config::from_toml_str(&format!("[codex]\nauto = \"{}\"\n", v.as_str())).unwrap();
+            assert_eq!(c.codex.auto, v);
+            assert_eq!(CodexAuto::parse(v.as_str()), Some(v));
+        }
+        for bad in [
+            "[codex]\nauto = \"yes\"\n",
+            "[codex]\nauto = \"auto-review\"\n",
+            "[codex]\nauto = \"Never\"\n",
+            "[codex]\nauto = true\n",
+            "[codex]\nmode = \"never\"\n",
+            "[projects.api]\nrepo = \"/a\"\ncodex_auto = \"always\"\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+        assert_eq!(CodexAuto::parse("yes"), None);
     }
 
     #[test]

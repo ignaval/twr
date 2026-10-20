@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use twr_core::config::{
-    BoxConfig, BoxProjectConfig, Config, HubConfig, NotifyConfig, OrchestratorConfig,
+    BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig, NotifyConfig, OrchestratorConfig,
     ProjectConfig, RuntimePreset, ThreadsConfig, TrashConfig, TuiConfig, TuiNotifyConfig,
     DEFAULT_PROJECT_ROOTS,
 };
@@ -42,10 +42,12 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         stall_after_secs,
         background_timeout_secs,
         runtimes,
+        codex,
         notify: hook,
         tui,
         project_roots,
     } = config;
+    let CodexConfig { auto: codex_auto } = codex;
     // The command often holds a secret (an ntfy topic, a webhook's URL): whether it is set.
     let NotifyConfig {
         command: hook_command,
@@ -110,6 +112,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
                 base,
                 trim_idle_after,
                 idle_trim_disposable,
+                codex_auto,
             } = p;
             (
                 name.clone(),
@@ -121,6 +124,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
                     "base": base,
                     "trim_idle_after": trim_idle_after,
                     "idle_trim_disposable": idle_trim_disposable,
+                    "codex_auto": codex_auto.map(|a| a.as_str()),
                     "env_names": env.keys().collect::<Vec<_>>(),
                 }),
             )
@@ -199,6 +203,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "memory_high": memory_high,
         },
         "trash": { "keep_days": keep_days },
+        "codex": { "auto": codex_auto.as_str() },
         "notify": {
             "command_set": !hook_command.is_empty(),
             "events": hook_events,

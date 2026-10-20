@@ -24,6 +24,7 @@
 //! | `item/permissions/requestApproval`                 | `attention.raised{permission}` "Allow network access, write a for this turn? <reason>" (every path listed; anything twr does not recognize, or a summary over 1000 chars, makes it deny-only) |
 //! | `item/tool/requestUserInput`, `agentMessage.questions` | `attention.raised{question}` per question |
 //! | `serverRequest/resolved` for an unanswered request | `attention.resolved{by: timeout}`            |
+//! | `item/autoApprovalReview/completed` (`[codex] auto = "auto_review"`) | `agent.tool_call{auto_review}` (the action judged) + `agent.tool_result` (`ok` when approved; status, risk, rationale) |
 //! | `turn/completed{status}`                           | `turn.ended{completed / interrupted / error}` (failed: `ext.twr.error` with the cause; not signed in: plus the `codex login` hint, never transient) |
 //!
 //! Answers: `allow` → `{decision: "accept"}`, anything else → `{decision: "decline"}` (MCP
@@ -48,6 +49,7 @@
 //! | `thinking`             | `agent.thinking` from reasoning items + `summary: "auto"` on `turn/start` |
 //! | `env`                  | process environment                                                  |
 //! | `repo`                 | where the `auto` sandbox's git roots come from, see "The `auto` sandbox" below |
+//! | `codex_auto`           | who answers what the `auto` sandbox does not allow ([`run_policy`]) |
 //! | `resume_session`       | `thread/resume{threadId}` with every setting passed again (Codex does not keep the permission settings across processes; a model or effort left out keeps the thread's, see [`crate::resume_keeps`]) |
 //!
 //! ## Permission modes
@@ -100,21 +102,34 @@
 //! - `sandbox_workspace_write.writable_roots` = [`auto_writable_roots`]: the worktree's git dir
 //!   and the common dir's `objects`, `refs` and `logs` (not its `config` or `hooks`), found
 //!   from the repository the thread was made from ([`SpawnConfig::repo`]) and not from the
-//!   worktree's own pointers, which the agent can rewrite, and the cargo and npm caches.
-//!   These replace any `writable_roots` of the user's Codex config.
+//!   worktree's own pointers, which the agent can rewrite; the cargo, npm and pnpm caches and
+//!   `$CARGO_TARGET_DIR`; and `/dev/shm` (Codex's sandbox otherwise mounts an empty one of its
+//!   own). These replace any `writable_roots` of the user's Codex config.
+//! - [`AUTO_SANDBOX_NOTE`] in its developer instructions: git cannot lock the common dir's
+//!   `packed-refs` (deleting a ref prints an error; a rebase still succeeds), which Codex
+//!   took for a failure and asked to rerun outside the sandbox.
+//!
+//! The common dir itself stays read-only: making it writable for `packed-refs.lock` would let
+//! the agent create a `commondir` or `config.worktree` there, which the user's own git would
+//! follow outside the sandbox.
 //!
 //! Network access opens every local socket too, the user's D-Bus included: a command could
 //! start another one outside the sandbox (`systemd-run --user`). That is as open as Claude
 //! Code's auto mode, which has no OS sandbox; writes elsewhere still ask.
 //!
-//! `approvalsReviewer: "user"` is always sent: a user config with `approvals_reviewer =
-//! "auto_review"` would otherwise send approvals to Codex's reviewer agent instead of twr.
+//! What the sandbox does not allow, Codex asks to run outside it, and
+//! [`SpawnConfig::codex_auto`] (`[codex] auto`) decides who answers ([`run_policy`]): the user
+//! (`ask`, the default: `approvalsReviewer: "user"`), Codex's reviewer agent (`auto_review`:
+//! `approvalsReviewer: "auto_review"`; its decisions show in the transcript as `auto_review`
+//! tool calls, [`translate`]), or nobody (`never`: `approvalPolicy: "never"`). Every other mode
+//! sends `approvalsReviewer: "user"`: a user config with `approvals_reviewer = "auto_review"`
+//! would otherwise send approvals to Codex's reviewer agent instead of twr.
 //!
 //! What the thread runs with is checked, not assumed: the `thread/start` / `thread/resume`
 //! result must report an `approvalPolicy`, a `sandbox.type` and an `approvalsReviewer`, the
 //! first two no wider than requested (policies `untrusted` < `on-request`/`on-failure` <
 //! `never`; sandboxes `readOnly` < `workspaceWrite` < `dangerFullAccess`; anything else is
-//! unknown) and the reviewer exactly `user`; short of `dangerFullAccess`, the sandbox's
+//! unknown) and the reviewer `user` (or `auto_review`, when asked for); short of `dangerFullAccess`, the sandbox's
 //! `networkAccess` may be true only when twr asked for it, and each of its `writableRoots`
 //! must be one twr asked for. Otherwise the session ends before any prompt
 //! ([`translate::check_policy`]). The sandbox's `networkAccess` and `writableRoots` are
@@ -146,7 +161,7 @@ use tokio::process::{Child, ChildStdin};
 use tokio::sync::mpsc;
 use twr_core::adapter::{
     Adapter, AdapterCmd, AdapterEnd, AdapterEvent, AdapterHandle, AdapterInfo, AttachApplies,
-    SpawnConfig, Tier,
+    CodexAuto, SpawnConfig, Tier,
 };
 
 pub use translate::{Emitted, Open, Translated, Translator, TranslatorOptions};
@@ -247,6 +262,54 @@ pub fn policy(
     let (approval, sandbox, _) = mode_policy(mode)?;
     let no_builtins = builtin_tools.is_some_and(<[String]>::is_empty);
     Ok((approval, if no_builtins { "read-only" } else { sandbox }))
+}
+
+/// What a thread of `cfg` runs with: `(approvalPolicy, approvalsReviewer, sandbox)`. [`policy`]
+/// with the reviewer `user`, except for an `auto` thread with a `workspace-write` sandbox,
+/// where [`SpawnConfig::codex_auto`] decides who answers what the sandbox does not allow:
+/// the user (`on-request`, `user`: the default), Codex's reviewer agent (`on-request`,
+/// `auto_review`), or nobody (`never`).
+pub fn run_policy(cfg: &SpawnConfig) -> anyhow::Result<(&'static str, &'static str, &'static str)> {
+    let (approval, sandbox) = policy(&cfg.mode, cfg.builtin_tools.as_deref())?;
+    if !is_auto_sandbox(cfg) {
+        return Ok((approval, "user", sandbox));
+    }
+    Ok(match cfg.codex_auto {
+        CodexAuto::Ask => (approval, "user", sandbox),
+        CodexAuto::AutoReview => (approval, "auto_review", sandbox),
+        CodexAuto::Never => ("never", "user", sandbox),
+    })
+}
+
+/// Whether `cfg` is an `auto` thread with a `workspace-write` sandbox (not one with no built-in
+/// tools, whose sandbox is read-only): the widened sandbox of the module doc, and
+/// [`SpawnConfig::codex_auto`].
+fn is_auto_sandbox(cfg: &SpawnConfig) -> bool {
+    matches!(native(&cfg.mode), Ok("auto"))
+        && policy(&cfg.mode, cfg.builtin_tools.as_deref())
+            .is_ok_and(|(_, sandbox)| sandbox == "workspace-write")
+}
+
+/// [`mode_note`] for `cfg`, plus what its [`SpawnConfig::codex_auto`] changes (an `auto`
+/// thread's that is not the default).
+pub fn run_note(cfg: &SpawnConfig) -> Option<String> {
+    let note = mode_note(&cfg.mode, cfg.builtin_tools.as_deref());
+    let auto = match cfg.codex_auto {
+        _ if !is_auto_sandbox(cfg) => None,
+        CodexAuto::Ask => None,
+        CodexAuto::AutoReview => Some(
+            "codex auto = \"auto_review\": approvalsReviewer auto_review; Codex's reviewer agent, \
+             not you, answers what the sandbox does not allow",
+        ),
+        CodexAuto::Never => Some(
+            "codex auto = \"never\": approvalPolicy never; nothing asks, and what the sandbox \
+             does not allow fails",
+        ),
+    };
+    match (note, auto) {
+        (Some(n), Some(a)) => Some(format!("{n}; {a}")),
+        (n, a) => n.or(a.map(str::to_string)),
+    }
 }
 
 /// Why the Codex policy for `mode` is not an exact match of it (None when it is, or when the
@@ -372,7 +435,7 @@ fn mode_policy(mode: &str) -> anyhow::Result<(&'static str, &'static str, Option
             Some(
                 "Codex has no auto mode; approvalPolicy on-request with a workspace-write \
                  sandbox that also has network access and can write the worktree's git \
-                 metadata and the cargo and npm caches: commands inside it run without \
+                 metadata, /dev/shm and build caches: commands inside it run without \
                  asking, anything beyond it asks",
             ),
         ),
@@ -463,14 +526,34 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 ///   worktree records and back to it, through no symbolic link. Otherwise (or with no
 ///   `repo`) no git metadata is writable, and a commit asks;
 /// - the cargo caches `$CARGO_HOME/registry` and `$CARGO_HOME/git` (`CARGO_HOME` defaulting
-///   to `~/.cargo`; its `bin` and `config.toml` stay read-only);
-/// - the npm cache, `$npm_config_cache` (or `NPM_CONFIG_CACHE`) else `~/.npm`.
+///   to `~/.cargo`; its `bin` and `config.toml` stay read-only), and `$CARGO_TARGET_DIR`
+///   when the runtime's environment sets one (`[threads] env`, a project's `env`, the hub's);
+/// - the npm cache, `$npm_config_cache` (or `NPM_CONFIG_CACHE`) else `~/.npm`, and pnpm's
+///   store (`$XDG_DATA_HOME/pnpm/store`, else `~/.local/share/pnpm/store`; `~/Library/pnpm/store`
+///   on macOS). Both are content-addressed and checked against their hashes when read;
+/// - [`SHARED_MEMORY`] (`/dev/shm`), scratch space like `/tmp`: without it the sandbox has
+///   an empty one of its own, whose files are gone when the command ends.
+///
+/// None of them may hold `$HOME`, `cwd` or the repository's git dir (a `CARGO_TARGET_DIR` of
+/// `~` or of the worktrees' folder would open them all): such a root is left out. A directory
+/// every user may write to qualifies only with the sticky bit, as `/dev/shm` and `/tmp` have
+/// it.
 ///
 /// `env` looks up variables (empty counts as unset).
 pub fn auto_writable_roots(
     cwd: &Path,
     repo: Option<&Path>,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    writable_roots(cwd, repo, env, Path::new(SHARED_MEMORY))
+}
+
+/// [`auto_writable_roots`] with `shared_memory` for [`SHARED_MEMORY`].
+fn writable_roots(
+    cwd: &Path,
+    repo: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    shared_memory: &Path,
 ) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
     let var = |k: &str| {
@@ -479,7 +562,15 @@ pub fn auto_writable_roots(
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
     };
+    let Ok(canonical_cwd) = cwd.canonicalize() else {
+        return Vec::new();
+    };
     let mut roots = Vec::new();
+    // What no root may hold: the worktree, the repository's git dir, the home folder.
+    let mut keep_out = vec![canonical_cwd.clone()];
+    if let Some(common) = repo.and_then(|r| common_dir_of(r, &canonical_cwd)) {
+        keep_out.push(common);
+    }
     if let Some((git_dir, common)) = repo.and_then(|r| linked_worktree_git_dirs(cwd, r)) {
         roots.push(git_dir);
         // Each a directory of the common dir itself, not a link out of it.
@@ -491,29 +582,50 @@ pub fn auto_writable_roots(
         );
     }
     let home = var("HOME");
+    if let Some(home) = home.as_ref().and_then(|h| h.canonicalize().ok()) {
+        keep_out.push(home);
+    }
     if let Some(cargo) = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo"))) {
         roots.extend(["registry", "git"].map(|d| cargo.join(d)));
     }
+    roots.extend(var("CARGO_TARGET_DIR"));
     if let Some(npm) = var("npm_config_cache")
         .or_else(|| var("NPM_CONFIG_CACHE"))
         .or_else(|| home.as_ref().map(|h| h.join(".npm")))
     {
         roots.push(npm);
     }
+    if let Some(data) =
+        var("XDG_DATA_HOME").or_else(|| home.as_ref().map(|h| h.join(".local/share")))
+    {
+        roots.push(data.join("pnpm/store"));
+    }
+    if cfg!(target_os = "macos") {
+        roots.extend(home.as_ref().map(|h| h.join("Library/pnpm/store")));
+    }
+    roots.push(shared_memory.to_path_buf());
     let Ok(owner) = std::fs::metadata(cwd).map(|m| m.uid()) else {
         return Vec::new();
     };
     let mut out: Vec<PathBuf> = Vec::new();
     for r in roots {
         let Ok(r) = r.canonicalize() else { continue };
-        let writable = std::fs::metadata(&r)
-            .is_ok_and(|m| m.is_dir() && m.uid() == owner && m.mode() & 0o200 != 0);
-        if writable && !out.contains(&r) {
+        let writable = std::fs::metadata(&r).is_ok_and(|m| {
+            let own = m.uid() == owner && m.mode() & 0o200 != 0;
+            let shared = m.mode() & 0o1002 == 0o1002;
+            m.is_dir() && (own || shared)
+        });
+        let holds_kept_out = keep_out.iter().any(|k| k.starts_with(&r));
+        if writable && !holds_kept_out && !out.contains(&r) {
             out.push(r);
         }
     }
     out
 }
+
+/// The shared memory folder an `auto` sandbox may write ([`auto_writable_roots`]), where it
+/// exists (Linux).
+pub const SHARED_MEMORY: &str = "/dev/shm";
 
 /// `(git dir, common dir)` of the linked worktree of `repo` that `cwd` is in (canonical).
 ///
@@ -776,14 +888,28 @@ pub fn thread_config(cfg: &SpawnConfig) -> anyhow::Result<Option<Map<String, Val
 /// servers of their own (`codex_apps` for apps, verified with Codex 0.160.0).
 pub const STRICT_MCP_FEATURES_OFF: &[&str] = &["apps", "plugins"];
 
+/// What twr adds to the developer instructions of an `auto` thread (after
+/// [`SpawnConfig::system_append`]): what its sandbox lets it write, and the one git message
+/// it prints for work that is done. Without it, Codex asked to run again outside the sandbox
+/// a rebase that had already succeeded.
+pub const AUTO_SANDBOX_NOTE: &str = "twr: this thread runs in Codex's workspace-write sandbox \
+    with network access. Besides the working directory, its writable roots include /tmp, \
+    $TMPDIR, /dev/shm (where there is one) and build caches, and, in a linked worktree, the \
+    worktree's git metadata, so commit, stash, tag, fetch and rebase work. Git cannot lock the \
+    repository's packed-refs file here, so a git command that deletes a ref prints \
+    `error: Unable to create '.../packed-refs.lock': Read-only file system`. When that command \
+    also reports success (a rebase's `Successfully rebased` or `is up to date`), its work is \
+    done: check `git status` and `git log` before asking to run it again outside the sandbox. \
+    `ps` here sees only the sandbox's own processes.";
+
 /// How the thread is opened: `thread/start`, or `thread/resume` when `cfg.resume_session` is
 /// set. Every setting is sent both ways (Codex does not keep the permission settings across
 /// processes; a model or effort left out keeps the thread's: [`crate::resume_keeps`]).
 pub fn thread_params(cfg: &SpawnConfig) -> anyhow::Result<Open> {
-    let (approval, sandbox) = policy(&cfg.mode, cfg.builtin_tools.as_deref())?;
-    let mode_note = mode_note(&cfg.mode, cfg.builtin_tools.as_deref());
+    let (approval, reviewer, sandbox) = run_policy(cfg)?;
+    let mode_note = run_note(cfg);
     if let Some(note) = &mode_note {
-        tracing::info!(mode = %cfg.mode, approval, sandbox, %note, "codex: permission mode mapped inexactly");
+        tracing::info!(mode = %cfg.mode, approval, reviewer, sandbox, %note, "codex: permission mode mapped inexactly");
     }
     let mut p = Map::new();
     if let Some(id) = &cfg.resume_session {
@@ -793,13 +919,23 @@ pub fn thread_params(cfg: &SpawnConfig) -> anyhow::Result<Open> {
         p.insert("cwd".into(), json!(cfg.cwd.to_string_lossy()));
     }
     p.insert("approvalPolicy".into(), json!(approval));
-    p.insert("approvalsReviewer".into(), json!("user"));
+    p.insert("approvalsReviewer".into(), json!(reviewer));
     p.insert("sandbox".into(), json!(sandbox));
     if let Some(m) = cfg.model.as_deref().filter(|m| !m.is_empty()) {
         p.insert("model".into(), json!(m));
     }
-    if let Some(s) = cfg.system_append.as_deref().filter(|s| !s.is_empty()) {
-        p.insert("developerInstructions".into(), json!(s));
+    let instructions: Vec<&str> = cfg
+        .system_append
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .into_iter()
+        .chain(is_auto_sandbox(cfg).then_some(AUTO_SANDBOX_NOTE))
+        .collect();
+    if !instructions.is_empty() {
+        p.insert(
+            "developerInstructions".into(),
+            json!(instructions.join("\n\n")),
+        );
     }
     if let Some(c) = thread_config(cfg)? {
         p.insert("config".into(), Value::Object(c));
@@ -849,7 +985,7 @@ impl CodexAdapter {
         {
             return None;
         }
-        let (approval, sandbox) = policy(&cfg.mode, cfg.builtin_tools.as_deref()).ok()?;
+        let (approval, reviewer, sandbox) = run_policy(cfg).ok()?;
         let mut cmd = std::process::Command::new(self.bin());
         cmd.args([
             "resume",
@@ -859,7 +995,7 @@ impl CodexAdapter {
             "--sandbox",
             sandbox,
             "-c",
-            "approvals_reviewer=\"user\"",
+            &format!("approvals_reviewer={}", json!(reviewer)),
         ]);
         for (k, v) in sandbox_overrides(cfg, local_roots) {
             cmd.args(["-c".to_string(), format!("{k}={v}")]);
@@ -1402,6 +1538,16 @@ mod tests {
         None
     }
 
+    /// [`auto_writable_roots`] without a shared memory folder (the real `/dev/shm` would be in
+    /// every list).
+    fn roots(
+        cwd: &Path,
+        repo: Option<&Path>,
+        env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> Vec<PathBuf> {
+        writable_roots(cwd, repo, env, Path::new("/nonexistent/twr-test-shm"))
+    }
+
     /// The incident behind the `auto` sandbox: a Codex auto thread asked to `git commit`
     /// because its worktree's git metadata is in the main repository's `.git`. The worktree's
     /// git dir and the common objects, refs and logs become writable; config and hooks do not.
@@ -1416,16 +1562,12 @@ mod tests {
                 .iter()
                 .map(|d| common.join(d))
                 .collect();
-            assert_eq!(
-                auto_writable_roots(&wt, repo, no_env),
-                want,
-                "relative {relative}"
-            );
+            assert_eq!(roots(&wt, repo, no_env), want, "relative {relative}");
             // From a subdirectory too, like git.
-            assert_eq!(auto_writable_roots(&wt.join("src"), repo, no_env), want);
+            assert_eq!(roots(&wt.join("src"), repo, no_env), want);
             // A repository without logs (core.logAllRefUpdates off) just has fewer roots.
             std::fs::remove_dir(common.join("logs")).unwrap();
-            assert_eq!(auto_writable_roots(&wt, repo, no_env), want[..3]);
+            assert_eq!(roots(&wt, repo, no_env), want[..3]);
         }
     }
 
@@ -1437,15 +1579,15 @@ mod tests {
         let (_, common) = worktree(dir.path(), false);
         let main = dir.path().join("main");
         let repo = Some(main.as_path());
-        assert!(auto_writable_roots(&main, repo, no_env).is_empty());
+        assert!(roots(&main, repo, no_env).is_empty());
         let sub = dir.path().join("main/sub");
         std::fs::create_dir_all(common.join("modules/sub")).unwrap();
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join(".git"), "gitdir: ../.git/modules/sub\n").unwrap();
-        assert!(auto_writable_roots(&sub, repo, no_env).is_empty());
+        assert!(roots(&sub, repo, no_env).is_empty());
         let plain = tempfile::tempdir().unwrap();
-        assert!(auto_writable_roots(plain.path(), repo, no_env).is_empty());
-        assert!(auto_writable_roots(plain.path(), None, no_env).is_empty());
+        assert!(roots(plain.path(), repo, no_env).is_empty());
+        assert!(roots(plain.path(), None, no_env).is_empty());
     }
 
     /// The cargo caches (not `bin` or `config.toml`) and the npm cache, from their variables or
@@ -1478,7 +1620,7 @@ mod tests {
             }
         };
         assert_eq!(
-            auto_writable_roots(&cwd, None, env(&[])),
+            roots(&cwd, None, env(&[])),
             [
                 home.join(".cargo/registry"),
                 home.join(".cargo/git"),
@@ -1488,7 +1630,7 @@ mod tests {
         // CARGO_HOME wins (its git cache does not exist yet: skipped); so does the npm cache
         // variable, here pointing at the cargo registry: listed once.
         assert_eq!(
-            auto_writable_roots(
+            roots(
                 &cwd,
                 None,
                 env(&[
@@ -1501,7 +1643,7 @@ mod tests {
         // A cache the owner cannot write would make Codex fail every command: left out.
         let git = home.join(".cargo/git");
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o555)).unwrap();
-        assert!(!auto_writable_roots(&cwd, None, env(&[])).contains(&git));
+        assert!(!roots(&cwd, None, env(&[])).contains(&git));
         std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
         // Empty or relative variables count as unset; a cwd that does not exist gets nothing.
         let blank = |k: &str| match k {
@@ -1510,8 +1652,8 @@ mod tests {
             "npm_config_cache" => Some("relative/npm".into()),
             _ => None,
         };
-        assert_eq!(auto_writable_roots(&cwd, None, blank).len(), 3);
-        assert!(auto_writable_roots(&d.join("gone"), None, env(&[])).is_empty());
+        assert_eq!(roots(&cwd, None, blank).len(), 3);
+        assert!(roots(&d.join("gone"), None, env(&[])).is_empty());
     }
 
     /// A worktree's own pointers are the agent's to rewrite (an `auto` thread can write its
@@ -1527,9 +1669,8 @@ mod tests {
         let git_dir = common.join("worktrees/wt");
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let git_roots = |wt: &Path, repo: Option<&Path>| -> Vec<PathBuf> {
-            auto_writable_roots(wt, repo, no_env)
-        };
+        let git_roots =
+            |wt: &Path, repo: Option<&Path>| -> Vec<PathBuf> { roots(wt, repo, no_env) };
         assert_eq!(git_roots(&wt, repo).len(), 4);
         // Without the repository the thread was made from, nothing of git's.
         assert!(git_roots(&wt, None).is_empty());
@@ -1609,7 +1750,7 @@ mod tests {
         let common = main.join(".git");
         let (a, b) = (d.join("a"), d.join("b"));
         let repo = Some(main.as_path());
-        let roots = |wt: &Path| auto_writable_roots(wt, repo, no_env);
+        let roots = |wt: &Path| roots(wt, repo, no_env);
         assert!(roots(&a).contains(&common.join("worktrees/a")));
         assert!(roots(&b).contains(&common.join("worktrees/b")));
         let original = std::fs::read_to_string(a.join(".git")).unwrap();
@@ -1653,18 +1794,23 @@ mod tests {
             env: vec![
                 ("HOME".into(), "/nonexistent-twr".into()),
                 ("CARGO_HOME".into(), "".into()),
+                ("CARGO_TARGET_DIR".into(), "".into()),
                 ("npm_config_cache".into(), "".into()),
                 ("NPM_CONFIG_CACHE".into(), "".into()),
+                ("XDG_DATA_HOME".into(), "".into()),
             ],
             ..Default::default()
         };
         let m = sandbox_overrides(&cfg("auto"), true);
         assert_eq!(m[NETWORK_KEY], true);
-        assert_eq!(
-            m[WRITABLE_ROOTS_KEY],
-            json!(["worktrees/wt", "objects", "refs", "logs"]
-                .map(|d| common.join(d).display().to_string()))
-        );
+        // The shared memory folder, where there is one, comes last.
+        let shm = auto_writable_roots(dir.path(), None, no_env);
+        let mut want: Vec<PathBuf> = ["worktrees/wt", "objects", "refs", "logs"]
+            .iter()
+            .map(|d| common.join(d))
+            .collect();
+        want.extend(shm.iter().cloned());
+        assert_eq!(m[WRITABLE_ROOTS_KEY], json!(want));
         assert_eq!(sandbox_overrides(&cfg("AUTO"), true), m);
         let pinned = json!({NETWORK_KEY: false, WRITABLE_ROOTS_KEY: []});
         for other in ["manual", "on-request", "acceptEdits", "never", ""] {
@@ -1696,6 +1842,14 @@ mod tests {
         };
         let network_only = json!({NETWORK_KEY: true, WRITABLE_ROOTS_KEY: []});
         assert_eq!(Value::Object(sandbox_overrides(&bare, true)), network_only);
+        // Who answers is not the sandbox's business: the same overrides whatever it is.
+        for codex_auto in CodexAuto::ALL {
+            let c = SpawnConfig {
+                codex_auto,
+                ..cfg("auto")
+            };
+            assert_eq!(sandbox_overrides(&c, true), m);
+        }
         assert_eq!(
             Value::Object(sandbox_overrides(&cfg("auto"), false)),
             network_only
@@ -1713,6 +1867,230 @@ mod tests {
         let shell = builtin_overrides(Some(&["Bash".to_string()]));
         assert!(!shell.contains_key("features.shell_tool"));
         assert_eq!(shell["web_search"], "disabled");
+    }
+
+    /// What the `auto` sandbox also opens for routine work: `$CARGO_TARGET_DIR`, pnpm's store
+    /// and the shared memory folder (root's, sticky and writable by all, as `/dev/shm` is).
+    /// Codex threads asked to use `/dev/shm`, which the sandbox otherwise replaces with an
+    /// empty one of its own.
+    #[test]
+    fn auto_roots_cover_the_target_dir_pnpm_and_shared_memory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().canonicalize().unwrap();
+        let home = d.join("home");
+        for p in [
+            "home/.local/share/pnpm/store",
+            "target",
+            "xdg/pnpm/store",
+            "shm",
+            "cwd",
+        ] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        let shm = d.join("shm");
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let cwd = d.join("cwd");
+        let env = |vars: Vec<(&'static str, PathBuf)>| {
+            let home = home.clone();
+            move |k: &str| match k {
+                "HOME" => Some(home.clone().into_os_string()),
+                _ => vars
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| v.clone().into_os_string()),
+            }
+        };
+        assert_eq!(
+            writable_roots(&cwd, None, env(vec![]), &shm),
+            [home.join(".local/share/pnpm/store"), shm.clone()]
+        );
+        assert_eq!(
+            writable_roots(
+                &cwd,
+                None,
+                env(vec![
+                    ("CARGO_TARGET_DIR", d.join("target")),
+                    ("XDG_DATA_HOME", d.join("xdg")),
+                ]),
+                &shm
+            ),
+            [d.join("target"), d.join("xdg/pnpm/store"), shm.clone()]
+        );
+        // The real one, where there is one, is in the list.
+        let real = Path::new(SHARED_MEMORY);
+        let plain = tempfile::tempdir().unwrap();
+        if real.is_dir() {
+            assert_eq!(
+                auto_writable_roots(plain.path(), None, no_env),
+                [real.canonicalize().unwrap()]
+            );
+        }
+    }
+
+    /// No root may hold the home folder, the worktree or the repository's git dir: a
+    /// `CARGO_TARGET_DIR` (or a cache variable) pointing at one of them, or above one, would
+    /// open them all to the sandbox.
+    #[test]
+    fn auto_roots_never_hold_home_the_worktree_or_the_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, common) = worktree(dir.path(), false);
+        let d = dir.path().canonicalize().unwrap();
+        let home = d.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let main = d.join("main");
+        let repo = Some(main.as_path());
+        let git = ["worktrees/wt", "objects", "refs", "logs"].map(|x| common.join(x));
+        for bad in [
+            home.clone(),
+            d.clone(),
+            wt.clone(),
+            main.clone(),
+            common.clone(),
+            PathBuf::from("/"),
+        ] {
+            let env = |k: &str| match k {
+                "HOME" => Some(home.clone().into_os_string()),
+                "CARGO_TARGET_DIR" | "npm_config_cache" => Some(bad.clone().into_os_string()),
+                _ => None,
+            };
+            assert_eq!(roots(&wt, repo, env), git, "{}", bad.display());
+        }
+        // A folder beside them is fine.
+        let beside = d.join("target");
+        std::fs::create_dir_all(&beside).unwrap();
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into_os_string()),
+            "CARGO_TARGET_DIR" => Some(beside.clone().into_os_string()),
+            _ => None,
+        };
+        assert!(roots(&wt, repo, env).contains(&beside));
+    }
+
+    /// `[codex] auto` decides who answers what an `auto` thread's sandbox does not allow, and
+    /// nothing else: other modes, and an `auto` thread without built-in tools (read-only
+    /// sandbox), keep their policy and the reviewer `user`.
+    #[test]
+    fn codex_auto_picks_the_approval_policy_and_reviewer_of_auto() {
+        let cfg = |mode: &str, codex_auto| SpawnConfig {
+            mode: mode.into(),
+            codex_auto,
+            ..Default::default()
+        };
+        let ws = "workspace-write";
+        for (codex_auto, want) in [
+            (CodexAuto::Ask, ("on-request", "user", ws)),
+            (CodexAuto::AutoReview, ("on-request", "auto_review", ws)),
+            (CodexAuto::Never, ("never", "user", ws)),
+        ] {
+            assert_eq!(run_policy(&cfg("auto", codex_auto)).unwrap(), want);
+            assert_eq!(run_policy(&cfg("Auto", codex_auto)).unwrap(), want);
+            for (mode, approval, sandbox) in [
+                ("manual", "untrusted", ws),
+                ("on-request", "on-request", ws),
+                ("never", "never", ws),
+                ("plan", "untrusted", "read-only"),
+                ("bypassPermissions", "never", "danger-full-access"),
+            ] {
+                assert_eq!(
+                    run_policy(&cfg(mode, codex_auto)).unwrap(),
+                    (approval, "user", sandbox),
+                    "{mode} {codex_auto:?}"
+                );
+            }
+            let no_tools = SpawnConfig {
+                builtin_tools: Some(vec![]),
+                ..cfg("auto", codex_auto)
+            };
+            assert_eq!(
+                run_policy(&no_tools).unwrap(),
+                ("on-request", "user", "read-only")
+            );
+            assert!(run_policy(&cfg("nonsense", codex_auto)).is_err());
+        }
+        assert_eq!(
+            run_note(&cfg("auto", CodexAuto::Ask)),
+            mode_note("auto", None)
+        );
+        let note = run_note(&cfg("auto", CodexAuto::AutoReview)).unwrap();
+        assert!(note.contains("approvalsReviewer auto_review"), "{note}");
+        let note = run_note(&cfg("auto", CodexAuto::Never)).unwrap();
+        assert!(note.contains("approvalPolicy never"), "{note}");
+        assert_eq!(run_note(&cfg("manual", CodexAuto::Never)), None);
+    }
+
+    /// What `thread/start` carries for each setting: the policy and reviewer, and the sandbox
+    /// note in the developer instructions of an `auto` thread only, after twr's own text.
+    #[test]
+    fn auto_threads_start_with_their_reviewer_and_the_sandbox_note() {
+        let cfg = |mode: &str, codex_auto, append: Option<&str>| SpawnConfig {
+            mode: mode.into(),
+            codex_auto,
+            system_append: append.map(str::to_string),
+            ..Default::default()
+        };
+        let params = |c: &SpawnConfig| thread_params(c).unwrap().params;
+        let p = params(&cfg("auto", CodexAuto::AutoReview, None));
+        assert_eq!(
+            (&p["approvalPolicy"], &p["approvalsReviewer"], &p["sandbox"]),
+            (
+                &json!("on-request"),
+                &json!("auto_review"),
+                &json!("workspace-write")
+            )
+        );
+        assert_eq!(p["developerInstructions"], AUTO_SANDBOX_NOTE);
+        let p = params(&cfg("auto", CodexAuto::Never, Some("be brief")));
+        assert_eq!(
+            (&p["approvalPolicy"], &p["approvalsReviewer"]),
+            (&json!("never"), &json!("user"))
+        );
+        assert_eq!(
+            p["developerInstructions"],
+            format!("be brief\n\n{AUTO_SANDBOX_NOTE}")
+        );
+        let p = params(&cfg("manual", CodexAuto::AutoReview, Some("be brief")));
+        assert_eq!(
+            (&p["approvalPolicy"], &p["approvalsReviewer"]),
+            (&json!("untrusted"), &json!("user"))
+        );
+        assert_eq!(p["developerInstructions"], "be brief");
+        assert!(params(&cfg("manual", CodexAuto::Ask, None))
+            .get("developerInstructions")
+            .is_none());
+        let open = thread_params(&cfg("auto", CodexAuto::Never, None)).unwrap();
+        assert!(open.mode_note.unwrap().contains("approvalPolicy never"));
+    }
+
+    /// `twr attach` runs the interactive CLI with the same policy and reviewer.
+    #[test]
+    fn attach_passes_the_reviewer_and_policy_of_codex_auto() {
+        let args = |mode: &str, codex_auto| {
+            let cfg = SpawnConfig {
+                mode: mode.into(),
+                codex_auto,
+                ..Default::default()
+            };
+            let cmd = CodexAdapter::with_bin("codex")
+                .attach_command(&cfg, "sess-1")
+                .unwrap();
+            cmd.get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let has = |a: &[String], pair: [&str; 2]| a.windows(2).any(|w| w == pair);
+        let a = args("auto", CodexAuto::AutoReview);
+        assert!(has(&a, ["--ask-for-approval", "on-request"]), "{a:?}");
+        assert!(
+            has(&a, ["-c", "approvals_reviewer=\"auto_review\""]),
+            "{a:?}"
+        );
+        let a = args("auto", CodexAuto::Never);
+        assert!(has(&a, ["--ask-for-approval", "never"]), "{a:?}");
+        assert!(has(&a, ["-c", "approvals_reviewer=\"user\""]), "{a:?}");
+        let a = args("manual", CodexAuto::AutoReview);
+        assert!(has(&a, ["--ask-for-approval", "untrusted"]), "{a:?}");
+        assert!(has(&a, ["-c", "approvals_reviewer=\"user\""]), "{a:?}");
     }
 
     #[test]
