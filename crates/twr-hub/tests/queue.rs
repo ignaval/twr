@@ -37,6 +37,10 @@ impl Adapter for PtyLike {
 }
 
 async fn hub(dir: &Path) -> Hub {
+    try_hub(dir).await.unwrap()
+}
+
+async fn try_hub(dir: &Path) -> anyhow::Result<Hub> {
     let config = Config {
         default_runtime: "fake".into(),
         ..Default::default()
@@ -51,7 +55,7 @@ async fn hub(dir: &Path) -> Hub {
     });
     o.socket = Some(dir.join("hub.sock"));
     o.stop_timeout = Duration::from_secs(5);
-    Hub::open(o).await.unwrap()
+    Hub::open(o).await
 }
 
 async fn thread(hub: &Hub, dir: &Path, name: &str, runtime: &str) -> String {
@@ -346,4 +350,44 @@ async fn send_now_releases_a_queue_a_crash_held() {
     eventually(|| queue(&hub, "api")["total"] == 0).await;
     hub.stop_thread("api", "test").unwrap();
     hub.shutdown().await;
+}
+
+/// Sending the next message now lets a crash's hold go for good: a hub started after it, the
+/// message still waiting (its thread parked meanwhile), doesn't hold the queue again.
+#[tokio::test]
+async fn a_hold_send_now_released_stays_released_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub1 = hub(dir.path()).await;
+    let api = thread(&hub1, dir.path(), "api", "fake").await;
+    let mut sub = hub1.subscribe_control(0);
+    hub1.send_by(&api, "!crash", &tui()).unwrap();
+    until(&mut sub, is_kind_on("thread.crashed", &api)).await;
+    hub1.park_thread("api", true, true, &tui()).await.unwrap();
+    let orch = hub1
+        .send_by(&api, "from the orchestrator", &Caller::Orchestrator)
+        .unwrap();
+    assert_eq!(queue(&hub1, "api")["held"], true);
+    let r = hub1.send_now("api", orch.msg_ref, &tui()).unwrap();
+    assert_eq!(r["state"], "waiting", "{r}");
+    assert_eq!(queue(&hub1, "api")["held"], false);
+    hub1.shutdown().await;
+    drop((sub, hub1));
+    let hub2 = timeout(WAIT, async {
+        loop {
+            match try_hub(dir.path()).await {
+                Ok(h) => return h,
+                Err(e) => eprintln!("reopen: {e:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let q = queue(&hub2, "api");
+    assert_eq!(
+        (q["held"].as_bool(), refs(&q)),
+        (Some(false), vec![orch.msg_ref]),
+        "{q}"
+    );
+    hub2.shutdown().await;
 }

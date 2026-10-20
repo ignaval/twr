@@ -96,10 +96,23 @@ pub(super) fn shell_record(s: &ShellJob, cwd: &Path) -> Value {
 /// ([`plain_output`]); empty when it can't be read.
 pub(super) fn shell_output(log: &Path, max: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(log) else {
+    use std::os::unix::fs::OpenOptionsExt;
+    // As the job's log is read anywhere (`jobs::tail`): never through a link, never blocking
+    // on a FIFO put in its place, a regular file only.
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(super::OPEN_NOFOLLOW_NONBLOCK)
+        .open(log)
+    else {
         return String::new();
     };
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let Ok(meta) = f.metadata() else {
+        return String::new();
+    };
+    if !meta.is_file() {
+        return String::new();
+    }
+    let len = meta.len();
     let from = len.saturating_sub(max);
     if f.seek(SeekFrom::Start(from)).is_err() {
         return String::new();
@@ -289,6 +302,30 @@ mod tests {
         );
         let quiet = shell_prompt(&s, Path::new("/w"), "exited 0 after 0.1s", "  ");
         assert!(quiet.ends_with("It printed nothing."), "{quiet}");
+    }
+
+    /// The log is read as the job's is: a FIFO or a link put in its place reads as nothing,
+    /// at once.
+    #[test]
+    fn a_log_replaced_by_a_fifo_or_a_link_reads_as_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("job.log");
+        std::fs::write(&log, "printed\n").unwrap();
+        assert_eq!(shell_output(&log, 4096), "printed");
+        let other = d.path().join("secret");
+        std::fs::write(&other, "not the job's").unwrap();
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&other, &log).unwrap();
+        assert_eq!(shell_output(&log, 4096), "");
+        std::fs::remove_file(&log).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(&log)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let started = std::time::Instant::now();
+        assert_eq!(shell_output(&log, 4096), "");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

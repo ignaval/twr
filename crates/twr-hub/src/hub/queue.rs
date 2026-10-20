@@ -144,6 +144,18 @@ impl Core {
             .is_some_and(|v| v.current_turn == Some(turn) && v.current_turn_interrupted)
     }
 
+    /// The user asked for queued message `msg_ref` of thread `id` to run now: a failure that
+    /// held the queue lets it go, as their own send does, and durably (the row is marked the
+    /// user's ask, `user_sent`), so a hub started after a crash doesn't hold it again.
+    fn release_for(&mut self, id: &str, msg_ref: i64) -> Result<(), RpcError> {
+        if self.rt.get(id).is_some_and(|r| r.queue_held) {
+            let head = self.store.control_head().map_err(internal)?;
+            self.store.mark_user_sent(msg_ref, head).map_err(internal)?;
+        }
+        self.release_queue(id);
+        Ok(())
+    }
+
     fn send_now_locked(
         &mut self,
         hub: &Arc<Inner>,
@@ -194,7 +206,7 @@ impl Core {
         let view = self.view(id)?.clone();
         if let Some(turn) = view.current_turn {
             if view.current_turn_interrupted || view.current_turn_withdrawn {
-                self.release_queue(id);
+                self.release_for(id, msg_ref)?;
                 return Ok(with(json!({
                     "sent_now": true, "state": "interrupting", "turn": turn,
                 })));
@@ -224,7 +236,7 @@ impl Core {
                 }),
             );
             self.append_batch(hub, batch).map_err(append_err)?;
-            self.release_queue(id);
+            self.release_for(id, msg_ref)?;
             if let Some(live) = self.rt.get(id).and_then(|r| r.live.as_ref()) {
                 if live.handle.interrupt().is_err() {
                     // The runtime is exiting: its closing sequence ends the turn.
@@ -238,7 +250,7 @@ impl Core {
         // No turn runs: the queue waits on something else (a failure that held it, an attach,
         // a park, an offline box, a runtime being stopped). The user's ask releases a held
         // queue; the rest stays in the way.
-        self.release_queue(id);
+        self.release_for(id, msg_ref)?;
         let started = self
             .dispatch_next(hub, id)
             .map_err(|e| rpc(codes::INTERNAL, format!("{e:#}")))?;
