@@ -5,6 +5,7 @@ mod term;
 mod boxes;
 mod dial_in;
 mod pretty;
+mod terminal_setup;
 #[cfg(test)]
 mod test_support;
 
@@ -405,6 +406,20 @@ enum Cmd {
         /// One human-readable line per item.
         #[arg(long)]
         pretty: bool,
+    },
+    /// Make your terminal send Shift-Enter as Alt-Enter (ESC CR), which the TUI reads as a new
+    /// line everywhere, over mosh and SSH too, as Claude Code's /terminal-setup does. It edits
+    /// the terminal's settings file when it can do so safely (backing it up), leaves a
+    /// Shift-Enter binding already there alone, and otherwise prints the steps. Over SSH or
+    /// mosh it changes nothing: it prints what to change on the machine the terminal runs on.
+    TerminalSetup {
+        /// The terminal: terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode,
+        /// vscode-insiders, cursor, windsurf, vscodium or zed. Default: the one this runs in.
+        #[arg(long, value_name = "NAME")]
+        terminal: Option<String>,
+        /// Print the steps and change nothing (every terminal's when none is named or found).
+        #[arg(long)]
+        print: bool,
     },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
@@ -1467,6 +1482,34 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             update(version, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
+        // About the terminal, not a hub: no config needed.
+        Some(Cmd::TerminalSetup { terminal, print }) => {
+            let terminal = match terminal.as_deref() {
+                None => None,
+                Some(name) => Some(terminal_setup::Terminal::parse(name).ok_or_else(|| {
+                    anyhow!(
+                        "no terminal {name:?}: name one of {}",
+                        terminal_setup::ALL
+                            .iter()
+                            .map(|t| t.name())
+                            .chain(["vscode-insiders", "cursor", "windsurf", "vscodium"])
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?),
+            };
+            let place = terminal_setup::place(twr_tui::keys::under_mosh());
+            let agent = calling_agent();
+            let (lines, failed) = terminal_setup::run(&place, terminal, print, agent.as_deref());
+            for line in lines {
+                outln!("{line}");
+            }
+            return Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
         // Workspaces are the root's: these work from any workspace, existing or not.
         Some(Cmd::Ws { cmd }) => {
             ws(cmd, &paths).await?;
@@ -1558,6 +1601,7 @@ async fn run_simple(
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
+        | Cmd::TerminalSetup { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }

@@ -260,10 +260,30 @@ The input box is a text area: `Enter` sends what it holds, and `Shift-Enter` sta
 | Enter | send the whole text, all its lines, wherever the cursor is |
 | Shift-Enter, Alt-Enter, Ctrl-J | start a new line at the cursor |
 
-Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
+Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta), or set the terminal up to send `Alt-Enter` for `Shift-Enter` ([below](#shift-enter-over-mosh-and-ssh), `twr terminal-setup`). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
 
 - **tmux** doesn't speak the kitty protocol, but passes `Shift-Enter` on when its `extended-keys` option is on and it sends extended keys in the `CSI u` form: the TUI then asks tmux for them. In tmux.conf, `set -s extended-keys on` and `set -as terminal-features 'xterm*:extkeys'` (the terminal around tmux has to send them to tmux too); from tmux 3.5, also `set -s extended-keys-format csi-u`, as tmux's default xterm form is one the TUI can't read (with `extended-keys always` it would lose `Shift-Enter` altogether, and the TUI says so when it starts).
-- **mosh** passes neither on: over mosh `Shift-Enter` is always `Enter`, and the TUI says so when it starts. Its local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+- **mosh** passes neither on, so over mosh the terminal sends `Shift-Enter` as it does unasked: as `Enter`, unless it is set up to send `Alt-Enter` for it ([below](#shift-enter-over-mosh-and-ssh)). The TUI says so when it starts. mosh's local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+
+#### Shift-Enter over mosh and SSH
+
+The kitty keyboard protocol has to be asked for, and mosh never passes the request on to your terminal. What does cross mosh, unchanged, is what a key sends. So make your terminal send `Alt-Enter` (the two bytes `ESC CR`) for `Shift-Enter`: the TUI reads `Alt-Enter` as a new line everywhere, over mosh, SSH and tmux too. This is what Claude Code's `/terminal-setup` does, so a terminal set up for Claude Code is set up for twr already.
+
+`twr terminal-setup`, run on the machine your terminal runs on, does it for you: it finds the terminal from the environment (or `--terminal <name>`), adds the binding to its settings file when it can do so safely, backs the file up first (`<file>.twr-backup-<time>`), and leaves a `Shift-Enter` binding that is already there alone. It edits VS Code's (and Cursor's, Windsurf's, VSCodium's) `keybindings.json` and Zed's `keymap.json` when they are plain JSON, Alacritty's `alacritty.toml` when the table can be added, and Ghostty's and kitty's config files. For the others, over SSH or mosh, and with `--print`, it prints the steps instead and changes nothing. By hand:
+
+| Terminal | What to change |
+|---|---|
+| Terminal.app | `Shift-Enter` can't be changed. Settings → Profiles → Keyboard → check "Use Option as Meta key"; then `Option-Enter` starts a new line |
+| iTerm2 | Settings → Profiles → Keys → Key Mappings → `+`: shortcut `Shift-Enter`, action "Send Hex Codes", `0x1b 0x0d` |
+| Ghostty | in its config: `keybind = shift+enter=text:\x1b\r` |
+| kitty | in `kitty.conf`: `map shift+enter send_text all \x1b\r` |
+| WezTerm | in `.wezterm.lua`: `table.insert(config.keys, { key = 'Enter', mods = 'SHIFT', action = wezterm.action.SendString '\x1b\r' })` (after `config.keys = config.keys or {}`) |
+| Alacritty | in `alacritty.toml`: `[[keyboard.bindings]]` with `key = "Return"`, `mods = "Shift"`, `chars = "\u001B\r"` |
+| VS Code | in `keybindings.json`: `{"key": "shift+enter", "command": "workbench.action.terminal.sendSequence", "args": {"text": "\u001b\r"}, "when": "terminalFocus"}` |
+
+Reload the terminal's config afterwards (VS Code and Zed pick it up at once). iTerm2, Ghostty, kitty and WezTerm tell `Shift-Enter` apart on their own when the TUI runs on the same machine; the binding is for mosh. In those terminals the binding also changes what `Shift-Enter` sends to other programs: `Alt-Enter`, which most shells and editors read as `Enter`.
+
+Two more ways other programs use, and why the TUI doesn't: Claude Code also takes a `\` typed at the end of the line, then `Enter`, as a line break, but in the TUI a plain `Enter` always sends (what it means never depends on the text: a line typed before the first frame is dropped whole, up to its `Enter`, and that needs `Enter` to mean one thing). Some terminals and tmux can send `Shift-Enter` in xterm's form (`CSI 27;2;13~`), which the TUI's terminal library doesn't read: it never asks for that form, and a key sent in it does nothing (inside tmux, see above).
 
 The history keeps the last 500 lines, a line sent twice in a row once, in `tui-history` next to the connected hub's database (private to you), so it carries over to the next TUI on that instance. Several TUIs share the file; the lines sent last are written before the TUI exits. A word is a run of characters other than spaces. Pasted text goes in at the cursor with its line breaks; a tab becomes a space. A paste is never read as keys, so a pasted `1` doesn't answer a card and a pasted line break doesn't send anything. A paste while the action popup is open closes the popup and goes into the line.
 
