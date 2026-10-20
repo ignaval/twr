@@ -10,13 +10,13 @@
 //! from its last event or from when the oldest prompt queued for the thread arrived, whichever
 //! is later, while that prompt waits (a job's end, a message): the turn should have ended and
 //! did not (a runtime that wrote its reply and never closed the turn). Such a turn gets no
-//! plain stalled item meanwhile; it gets a distinct one, a hung-turn card ([`HUNG_KEY`]: `{turn, waiting}`), replacing an open plain
-//! one in the same batch: `"<thread>'s turn N seems hung: ..."` with the options
-//! [`HUNG_INTERRUPT`] (the turn is interrupted, as `message.send_now` does, and the prompt
-//! that waits runs next) and [`HUNG_WAIT`] (the card closes, and no other hung-turn card is
-//! raised for that turn; plain stalls go on). Only the user answers it. It notifies as `hung`
-//! (on by default, unlike `stalled`), and the orchestrator gets it as an urgent notice line
-//! (`reason=hung`).
+//! plain stalled item meanwhile; it gets a distinct one, a hung-turn card ([`HUNG_KEY`]:
+//! `{turn, waiting}`), replacing an open plain one in the same batch: `"<thread>'s turn N
+//! seems hung: ..."` with the options [`HUNG_INTERRUPT`] (the turn is interrupted, as
+//! `message.send_now` does, and the prompt that waits runs next) and [`HUNG_WAIT`] (the card
+//! closes, and no other hung-turn card is raised for that turn; plain stalls go on). Only the
+//! user answers it. It notifies as `hung` (on by default, unlike `stalled`), and the
+//! orchestrator gets it as an urgent notice line (`reason=hung`).
 //!
 //! The item resolves `by: timeout` (activity resumed) as soon as another progress event is appended
 //! to that thread, including the turn's end or the runtime's closing sequence: the resolution

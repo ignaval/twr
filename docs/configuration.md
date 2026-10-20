@@ -66,6 +66,7 @@ The values below are the defaults, except where a comment says "example".
 default_runtime = "claude-code"   # claude-code | codex | grok-build | acp:<command> | a [runtimes] name | pty:<command>
 stall_after_secs = 600            # foreground/background work silent this long raises stalled; 0 = off
 background_timeout_secs = 86400    # stop background-only work without task liveness for 24h; 0 = off
+wake_after_secs = 30              # wake a worker idle this long after its background work ended; 0 = off
 # Where a project given by its folder name is looked up (see below). Unset = these folders;
 # [] = no lookup.
 # project_roots = ["~/code", "~/src", "~/projects", "~/dev", "~/Developer", "~/repos", "~/git", "~/workspace"]
@@ -114,7 +115,7 @@ auto = "ask"                      # a Codex thread in `auto` whose sandbox says 
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 detail = false                    # true: what's asked or reported goes along (it may hold secrets)
 timeout_secs = 30                 # the command is ended after this long (1 to 600)
 
@@ -129,7 +130,7 @@ suggest_model = "haiku"           # the Claude Code model the suggestions come f
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
 when = "unfocused"                # always: also while the terminal has focus
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"

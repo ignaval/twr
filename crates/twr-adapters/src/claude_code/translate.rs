@@ -102,7 +102,8 @@
 //! `stop_reason` other than `tool_use` / `pause_turn`) in a running turn, the `result` is
 //! due. When nothing else comes within [`TranslatorOptions::missing_result_after`] (no new
 //! model message, request, `init` or `result`), [`Translator::expire`] ends the turn
-//! `completed` with `ext.twr.missing_result` (no usage), and a `result` that still comes
+//! `completed` with `ext.twr.missing_result` (no usage), and so does each turn queued meanwhile
+//! (its prompt was folded into that run: Claude starts no run for it), and a `result` that still comes
 //! before the next model output, with no prompt queued, is absorbed (its total read, charged
 //! to no turn; no turn ended or opened).
 
@@ -1124,8 +1125,13 @@ impl Translator {
         }
         match watch {
             Watch::Result => {
-                tracing::warn!(turn = ?self.turn, runtime_turn = ?self.runtime_turn, "claude-code: no `result` came after the turn's last message; ending the turn");
+                tracing::warn!(turn = ?self.turn, runtime_turn = ?self.runtime_turn, queued = ?self.queued, "claude-code: no `result` came after the turn's last message; ending the turn");
                 self.end_without_result(MISSING_RESULT_KEY, &mut out);
+                // Prompts written during that run that Claude never started: it folded them
+                // into the run, which answered them. Their turns end with it.
+                while !self.queued.is_empty() {
+                    self.end_without_result(MISSING_RESULT_KEY, &mut out);
+                }
                 self.absorb_result = true;
             }
             Watch::NoticeRun if self.turn.is_none() && self.runtime_turn.is_some() => {
@@ -3412,6 +3418,40 @@ mod tests {
             &[INIT, &reply("Next done."), &result(1, Some(2.5), false)],
         );
         assert_eq!(turn_marks(&events), ["end Some(3) None Some(0.5)"]);
+    }
+
+    /// The hub's prompt raced the turn a background task's end opened: Claude folds it into its
+    /// own run and writes no `result`. Both the runtime's turn and the prompt's end.
+    #[test]
+    fn a_prompt_folded_into_a_runtime_run_ends_with_it() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        t.user_message("Checking in", 2);
+        feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("The tests passed."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(
+            turn_marks(&events),
+            ["end None Some(\"1\") None", "end Some(2) None None"]
+        );
+        assert!(events
+            .iter()
+            .all(|e| twr_key(e, MISSING_RESULT_KEY) == Some(json!(true))));
+        assert!(!t.busy());
     }
 
     /// A request for the user ends the wait for a `result`, and a stop with a request pending

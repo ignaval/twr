@@ -1073,7 +1073,9 @@ Behaviors worth knowing when you follow the stream:
   background task left running (an interim report never fires one; a follow-up turn's report
   does). When an interim report's tasks end and no follow-up turn starts within 5 seconds of
   log time, it fires on the idle worker instead (`- thread=<name> idle: ...`); a task starting
-  meanwhile cancels that line, and the worker going idle again holds a new one. A failed turn,
+  meanwhile cancels that line, and the worker going idle again holds a new one. While the hub
+  is about to wake the worker (below), the line is held until that is decided, and the
+  woken turn's start drops it. A failed turn,
   and a report the orchestrator or a user wrote, fire nothing (an idle worker fires only after
   a turn that completed; a rewrite of an interim report stays interim while the turn's tasks
   run). Firing adds ` watch=<id> note="<note>"` to the report's notice line (or queues one for
@@ -1110,11 +1112,33 @@ Behaviors worth knowing when you follow the stream:
   notice, the orchestrator's `thread.send` or `thread.resume` (its `thread.send` returns `turn:
   null`), a prompt sent `after` other threads when they finish (it waits with the rest; the
   user's Send on its card does release it).
+- **Waking an idle worker** (`hub::wake`): when a worker's last task (not a user's `!`
+  command) ends with no turn open, its last turn completed and its report interim, and no turn
+  starts within `wake_after_secs` (default 30; 0 = off) of log time, with no task started
+  again and nothing queued, and the thread not stopped, parked, attached, crashed or blocked,
+  the hub queues it a prompt (`from: runtime`, source `hub`): "[twr] Your background work
+  finished after your turn N ended, and no turn started after it, so twr is waking you
+  (once). What ended: - <task or `job <name>: exited 0 after 3m` (twr job <id>; its whole
+  log: <path>)> ... Continue where you left off ...". A `conversation.update` on the worker in
+  the same batch records it (`ext.twr.auto_wake = {turn, tasks}`), and the orchestrator's
+  conversation repeats its text. Once per interim report, and at most 5 in a row with no turn
+  the user or the orchestrator started in between; then `ext.twr.auto_wake_skipped = {turn,
+  why}` instead. A wake still waiting is not kept across a hub restart.
 - **Stalled**: a thread with a running turn or background tasks, not waiting on the user, with
   no events for `stall_after_secs` (default 600; 0 = off) gets a hub `stalled` item ("No
-  activity for N min"); it resolves `by: timeout` as soon as the thread emits any other event.
-  A `task.updated` heartbeat (`heartbeat: true`) only says a task is still alive: it neither
-  counts as activity nor resolves the item.
+  activity for N min", "... from its background tasks" with no turn open); it resolves `by:
+  timeout` as soon as the thread emits any other event. A `task.updated` heartbeat
+  (`heartbeat: true`) only says a task is still alive: it neither counts as activity nor
+  resolves the item. No stall while a job of the thread's own (not a `!` command) runs and
+  renews, nor while a prompt waits behind the open turn: then, once the turn has been silent
+  for `min(stall_after_secs, 300)` seconds since its last event and since that prompt arrived,
+  the hub raises a hung-turn card, a `stalled` item with `ext.twr.hung = {turn, waiting}`,
+  summary "<name>'s turn N seems hung: no output from its runtime for ... while <what> waits
+  to start the next turn ...", options `interrupt` / `wait` (replacing an open plain stall in
+  the same batch). `interrupt` records the answer and interrupts the turn as
+  `message.send_now` does for the queue's head; `wait` (or a dismissal) closes it, and no other
+  hung-turn card comes for that turn. Only the user answers it (the orchestrator gets
+  `relay_forbidden`); it notifies as `hung` and is an urgent `reason=hung` notice line.
 - **Dismissing**: items the hub raised (a `say` question, `review`, `error`, `stalled`) can be
   closed without an answer by the user (`attention.dismiss`, `twr attention dismiss
   <id>@<rev>`, `dismiss` in the TUI's action popup): `attention.resolved{by: user, answer: cancel}`, and a

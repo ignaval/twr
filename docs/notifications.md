@@ -5,7 +5,7 @@ The TUI can alert the terminal it runs in ([tui.md](tui.md#notifications)), but 
 ```toml
 [notify]
 command = ["notify-send", "--app-name=twr", "{title}", "{body}"]
-# events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+# events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 # detail = false        # true: the text of what's asked or reported goes along
 # timeout_secs = 30     # the command is ended after this long
 ```
@@ -20,6 +20,7 @@ The hub decides what's worth telling you by the same rules the TUI uses, and `ev
 
 - a new permission, question or confirm card, or a delete card the orchestrator asked for;
 - a failure left for you, after any automatic retry;
+- a turn that seems hung: open and silent while something waits to start the next one (`hung`);
 - a turn to review, a worker that finished a turn, and the orchestrator's reply to your message;
 - a stall, if you add `stalled`.
 
