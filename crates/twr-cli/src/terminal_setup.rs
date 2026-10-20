@@ -580,9 +580,10 @@ fn vscode(text: &str) -> Change {
             b["key"]
                 .as_str()
                 .is_some_and(|k| k.replace(' ', "").eq_ignore_ascii_case("shift+enter"))
+                // No `when`: it applies in terminals too.
                 && b["when"]
                     .as_str()
-                    .is_some_and(|w| w.contains("terminalFocus"))
+                    .is_none_or(|w| w.trim().is_empty() || w.contains("terminalFocus"))
         })
         .collect();
     if shift_enter.iter().any(|b| {
@@ -612,9 +613,10 @@ fn zed(text: &str) -> Change {
     let bound: Vec<&serde_json::Value> = list
         .iter()
         .filter(|b| {
+            // No context: it applies in terminals too.
             b["context"]
                 .as_str()
-                .is_some_and(|c| c.contains("Terminal"))
+                .is_none_or(|c| c.trim().is_empty() || c.contains("Terminal"))
         })
         .filter_map(|b| b["bindings"].get("shift-enter"))
         .collect();
@@ -978,6 +980,17 @@ mod tests {
             edit(&place, t).unwrap(),
             Outcome::Other { file: file.clone() }
         );
+        // One without `when` applies in terminals too: left alone.
+        std::fs::write(
+            &file,
+            r#"[{"key": "shift+enter", "command": "workbench.action.terminal.sendSequence",
+                "args": {"text": "\n"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            edit(&place, t).unwrap(),
+            Outcome::Other { file: file.clone() }
+        );
         // Comments (VS Code allows them): not rewritten.
         let commented = "// my keys\n[]\n";
         std::fs::write(&file, commented).unwrap();
@@ -1002,7 +1015,17 @@ mod tests {
         );
         assert_eq!(
             edit(&place, Terminal::Zed).unwrap(),
-            Outcome::Already { file }
+            Outcome::Already { file: file.clone() }
+        );
+        // A shift-enter binding without a context applies in the terminal too: left alone.
+        std::fs::write(
+            &file,
+            r#"[{"bindings": {"shift-enter": "editor::Newline"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            edit(&place, Terminal::Zed).unwrap(),
+            Outcome::Other { file }
         );
     }
 
