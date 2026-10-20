@@ -153,8 +153,9 @@ struct WireEvent {
     turn: Option<u64>,
     source: Source,
     kind: String,
+    /// Parsed by `kind` ([`EventBody::from_kind_json`]); `None` for `null` or none.
     #[serde(default)]
-    data: Value,
+    data: Option<Box<serde_json::value::RawValue>>,
     #[serde(default)]
     raw: Option<String>,
 }
@@ -196,7 +197,8 @@ impl Serialize for Event {
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let w = WireEvent::deserialize(deserializer)?;
-        let body = EventBody::from_kind_data(&w.kind, w.data).map_err(serde::de::Error::custom)?;
+        let body = EventBody::from_kind_json(&w.kind, w.data.as_deref().map(|d| d.get()))
+            .map_err(serde::de::Error::custom)?;
         Ok(Event {
             v: w.v,
             id: w.id,
@@ -1530,6 +1532,31 @@ macro_rules! event_body {
                     _ => Ok(EventBody::Unknown { kind: kind.to_string(), data }),
                 }
             }
+
+            /// [`EventBody::from_kind_data`] from `data`'s JSON text (`None`: `null`), parsed
+            /// straight into the kind's payload, without a [`Value`] in between: what reading
+            /// the log and the hub's streams spends most of its time on. JSON that does not
+            /// parse that way (a key given twice, which a [`Value`] takes the last of) goes the
+            /// way of [`EventBody::from_kind_data`], so both accept and build the same.
+            pub fn from_kind_json(kind: &str, data: Option<&str>) -> Result<Self, serde_json::Error> {
+                let Some(json) = data else {
+                    return Self::from_kind_data(kind, Value::Null);
+                };
+                let direct = match kind {
+                    $( $kind => serde_json::from_str(json).map(EventBody::$variant), )*
+                    _ => return Self::from_kind_data(kind, serde_json::from_str(json)?),
+                };
+                direct.or_else(|_| Self::from_kind_data(kind, serde_json::from_str(json)?))
+            }
+
+            /// Whether the payload may hold a field moved to the blob store
+            /// ([`crate::blob::has_capped`] of [`EventBody::data`]). `false` is certain:
+            /// serialized, it has no `_capped` anywhere (twr's JSON never escapes the
+            /// underscore or the letters); `true` asks for the full check.
+            pub fn maybe_capped(&self) -> bool {
+                serde_json::to_string(&DataOf(self))
+                    .map_or(true, |s| s.contains(crate::blob::CAPPED_KEY))
+            }
         }
     };
 }
@@ -1959,6 +1986,82 @@ mod tests {
             let json = serde_json::to_string(&ev).unwrap();
             let back: Event = serde_json::from_str(&json).unwrap();
             assert_eq!(back, ev, "round trip of {json}");
+        }
+    }
+
+    /// The payload parsed straight from its text ([`EventBody::from_kind_json`]) is what the
+    /// `Value` way builds ([`EventBody::from_kind_data`]), for every kind, with unknown fields,
+    /// `null`, an unknown kind and a key given twice (where a `Value` keeps the last); and both
+    /// refuse what the other refuses.
+    #[test]
+    fn a_payload_parsed_from_its_text_is_the_one_a_value_gives() {
+        let value_way = |kind: &str, json: &str| {
+            serde_json::from_str::<Value>(json)
+                .and_then(|v| EventBody::from_kind_data(kind, v))
+        };
+        let mut cases: Vec<(String, String)> = all_bodies()
+            .into_iter()
+            .map(|b| {
+                let mut data = b.data().unwrap();
+                if let Some(m) = data.as_object_mut() {
+                    m.insert("from_a_later_build".into(), json!({"x": [1, 2.5, null]}));
+                }
+                (b.kind().to_string(), data.to_string())
+            })
+            .collect();
+        for kind in KNOWN_KINDS {
+            cases.push((kind.to_string(), "null".into()));
+            cases.push((kind.to_string(), "{}".into()));
+            cases.push((kind.to_string(), "[1]".into()));
+            cases.push((kind.to_string(), "{\"text\": 1}".into()));
+        }
+        cases.push(("agent.text".into(), r#"{"text":"a","text":"b"}"#.into()));
+        cases.push(("thread.renamed".into(), r#"{"name":"x","name":"y","by":"user"}"#.into()));
+        cases.push(("from.a.later.build".into(), r#"{"a":1,"a":2}"#.into()));
+        cases.push(("agent.text".into(), "{".into()));
+        for (kind, json) in &cases {
+            let direct = EventBody::from_kind_json(kind, Some(json));
+            match (direct, value_way(kind, json)) {
+                (Ok(d), Ok(v)) => assert_eq!(d, v, "{kind} {json}"),
+                (Err(_), Err(_)) => {}
+                (d, v) => panic!("{kind} {json}: {d:?} but {v:?}"),
+            }
+        }
+        assert_eq!(
+            EventBody::from_kind_json("agent.text", None).unwrap(),
+            EventBody::from_kind_data("agent.text", Value::Null).unwrap()
+        );
+        // The envelope too, `null` and missing `data` alike.
+        let ev = Event::new("t1", 1, None, Source::Hub, EventBody::AgentText(Default::default()));
+        let mut v = serde_json::to_value(&ev).unwrap();
+        v["data"] = Value::Null;
+        assert_eq!(serde_json::from_value::<Event>(v.clone()).unwrap(), ev);
+        v.as_object_mut().unwrap().remove("data");
+        assert_eq!(serde_json::from_str::<Event>(&v.to_string()).unwrap(), ev);
+    }
+
+    /// [`EventBody::maybe_capped`] is never `false` for a payload with a field moved to the
+    /// blob store, wherever the marker is.
+    #[test]
+    fn maybe_capped_never_misses_a_capped_payload() {
+        use crate::blob::{cap_payload, has_capped, MemoryBlobStore};
+        let store = MemoryBlobStore::new();
+        for body in all_bodies() {
+            assert_eq!(
+                body.maybe_capped(),
+                has_capped(&body.data().unwrap()),
+                "{body:?}"
+            );
+            let mut data = body.data().unwrap();
+            if let Some(m) = data.as_object_mut() {
+                m.insert("big".into(), json!("x".repeat(10_000)));
+                m.insert("nested".into(), json!({"list": vec!["y".repeat(100); 100]}));
+            }
+            cap_payload(&mut data, &store).unwrap();
+            let capped = EventBody::from_kind_data(body.kind(), data.clone()).unwrap();
+            if has_capped(&capped.data().unwrap()) {
+                assert!(capped.maybe_capped(), "{}", body.kind());
+            }
         }
     }
 

@@ -203,7 +203,33 @@ impl Serialize for ServerMessage {
 
 impl<'de> Deserialize<'de> for ServerMessage {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let v = Value::deserialize(d)?;
+        // A message with a `stream` key is a stream item, else a response. Told from its
+        // JSON text and parsed from it straight into its type: a subscription's replay is
+        // thousands of items, and a `Value` of each costs more than reading it.
+        /// Whether the key is there, whatever its value (`null` too).
+        fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+            serde::de::IgnoredAny::deserialize(d).map(|_| true)
+        }
+        #[derive(Deserialize)]
+        struct Keys {
+            #[serde(default, deserialize_with = "present")]
+            stream: bool,
+        }
+        let raw = Box::<serde_json::value::RawValue>::deserialize(d)?;
+        let json = raw.get();
+        let direct = serde_json::from_str::<Keys>(json).and_then(|k| {
+            if k.stream {
+                serde_json::from_str(json).map(|i| ServerMessage::Stream(Box::new(i)))
+            } else {
+                serde_json::from_str(json).map(ServerMessage::Response)
+            }
+        });
+        if let Ok(msg) = direct {
+            return Ok(msg);
+        }
+        // What does not parse that way (a key given twice, which a `Value` takes the last
+        // of) is read as it always was.
+        let v: Value = serde_json::from_str(json).map_err(serde::de::Error::custom)?;
         let is_stream = v.get("stream").is_some();
         if is_stream {
             serde_json::from_value(v)
@@ -384,6 +410,61 @@ mod tests {
 
         let m: ServerMessage = serde_json::from_str(r#"{"id":1,"result":true}"#).unwrap();
         assert_eq!(m, ServerMessage::Response(Response::ok(1, json!(true))));
+    }
+
+    /// A message parsed from its text straight into its type is the one a `Value` gives,
+    /// and what one way refuses the other refuses: `stream` decides even when `null`, a key
+    /// given twice keeps its last value.
+    #[test]
+    fn server_messages_parse_as_through_a_value() {
+        let value_way = |json: &str| -> Result<ServerMessage, String> {
+            let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            if v.get("stream").is_some() {
+                serde_json::from_value(v)
+                    .map(|i| ServerMessage::Stream(Box::new(i)))
+                    .map_err(|e| e.to_string())
+            } else {
+                serde_json::from_value(v)
+                    .map(ServerMessage::Response)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let ev = crate::event::Event::new(
+            "t1",
+            7,
+            Some(2),
+            Source::Adapter("codex".into()),
+            EventBody::AgentText(crate::event::AgentText {
+                text: "hi \u{1F600} \"quoted\"\n".into(),
+                ..Default::default()
+            }),
+        );
+        let item = serde_json::to_string(&StreamItem {
+            stream: StreamKind::Control,
+            gseq: Some(9),
+            event: ev,
+        })
+        .unwrap();
+        let cases = [
+            item.clone(),
+            item.replacen("{", r#"{"gseq":1,"#, 1),
+            item.replacen(r#""stream":"control""#, r#""stream":null"#, 1),
+            r#"{"id":1,"result":true}"#.to_string(),
+            r#"{"id":1,"result":{"a":[1,2]},"id":2}"#.to_string(),
+            r#"{"id":3,"error":{"code":-32601,"message":"no such method"}}"#.to_string(),
+            r#"{"id":1,"result":true,"stream":null}"#.to_string(),
+            r#"{"stream":"thread"}"#.to_string(),
+            "[1,2]".to_string(),
+            "{".to_string(),
+        ];
+        for json in &cases {
+            let direct = serde_json::from_str::<ServerMessage>(json).map_err(|e| e.to_string());
+            match (direct, value_way(json)) {
+                (Ok(d), Ok(v)) => assert_eq!(d, v, "{json}"),
+                (Err(_), Err(_)) => {}
+                (d, v) => panic!("{json}: {d:?} but {v:?}"),
+            }
+        }
     }
 
     #[tokio::test]

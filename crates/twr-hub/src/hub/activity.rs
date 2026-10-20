@@ -84,21 +84,45 @@ impl Activity {
 }
 
 /// `s` on one line (whitespace runs, line breaks included, become one space), cut to `max`
-/// characters with `…`.
+/// characters with `…`. Reads `s` only as far as the line it gives: it runs for every bit of
+/// text an agent streams, and a hub start folds them all.
 pub(super) fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        return flat;
+    let mut flat = String::new();
+    let mut n = 0;
+    for word in s.split_whitespace() {
+        if n > 0 {
+            flat.push(' ');
+            n += 1;
+        }
+        flat.push_str(word);
+        n += word.chars().count();
+        if n > max {
+            let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+            out.push('…');
+            return out;
+        }
     }
-    let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    flat
 }
 
-/// The end of `s` on one line, at most `max` characters, with `…` before it when cut.
+/// The end of `s` on one line, at most `max` characters, with `…` before it when cut. Reads
+/// `s` from its end only as far as that, as [`one_line`] does from its start.
 fn tail(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let n = flat.chars().count();
+    // The last words, the last first, until they are longer than `max`.
+    let mut words = Vec::new();
+    let mut n = 0;
+    for word in s.split_whitespace().rev() {
+        if !words.is_empty() {
+            n += 1;
+        }
+        n += word.chars().count();
+        words.push(word);
+        if n > max {
+            break;
+        }
+    }
+    words.reverse();
+    let flat = words.join(" ");
     if n <= max {
         return flat;
     }
@@ -190,9 +214,10 @@ impl Core {
                 if !said.is_empty() {
                     a.said = Some(said);
                 }
-                let line = last_line(&a.text).to_string();
+                let line = last_line(&a.text);
                 if !line.trim().is_empty() {
-                    act(a, line);
+                    a.last = Some(one_line(line, DOING_MAX));
+                    a.at = Some(at);
                 }
                 // A final message is complete: what streams next is another one.
                 if t.is_final {
@@ -455,6 +480,52 @@ pub(super) fn add_context(ext: &mut Option<JsonMap>, context: Value) {
 
 #[cfg(test)]
 mod tests {
+
+    /// [`one_line`] and [`tail`] give what flattening all of `s` gives, though they read
+    /// only as much of it as they show: random text of words, runs of every kind of
+    /// whitespace and characters of several widths, at limits around its length.
+    #[test]
+    fn one_line_and_tail_read_only_what_they_show() {
+        fn flat(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        fn one_line_whole(s: &str, max: usize) -> String {
+            let flat = flat(s);
+            if flat.chars().count() <= max {
+                return flat;
+            }
+            let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+        fn tail_whole(s: &str, max: usize) -> String {
+            let flat = flat(s);
+            let n = flat.chars().count();
+            if n <= max {
+                return flat;
+            }
+            let mut out = String::from("…");
+            out.extend(flat.chars().skip(n - max.saturating_sub(1)));
+            out
+        }
+        let alphabet = ['a', 'b', ' ', ' ', '\n', '\t', '\u{3000}', 'é', '😀', '…'];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..3000 {
+            let len = next(40);
+            let s: String = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+            for max in [0, 1, 2, 3, 5, 8, 13, 21, 40, 600] {
+                assert_eq!(one_line(&s, max), one_line_whole(&s, max), "{s:?} {max}");
+                assert_eq!(tail(&s, max), tail_whole(&s, max), "{s:?} {max}");
+            }
+        }
+    }
+
     use super::*;
     use crate::hub::{Hub, HubOptions};
     use twr_core::config::Config;

@@ -94,6 +94,7 @@ impl Hub {
             last: since,
             head,
             backlog: VecDeque::new(),
+            lines: VecDeque::new(),
         }
     }
 
@@ -116,8 +117,33 @@ impl Hub {
             last: since_seq,
             head,
             backlog: VecDeque::new(),
+            lines: VecDeque::new(),
         })
     }
+}
+
+/// Appends the line a subscription writes for `event` (a control item with its `gseq`), with
+/// its newline.
+pub(crate) fn stream_line(
+    buf: &mut Vec<u8>,
+    gseq: Option<u64>,
+    event: &Event,
+) -> serde_json::Result<()> {
+    /// [`twr_core::proto::StreamItem`], borrowing its event.
+    #[derive(serde::Serialize)]
+    struct Item<'a> {
+        stream: twr_core::proto::StreamKind,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gseq: Option<u64>,
+        event: &'a Event,
+    }
+    let stream = match gseq {
+        Some(_) => twr_core::proto::StreamKind::Control,
+        None => twr_core::proto::StreamKind::Thread,
+    };
+    serde_json::to_writer(&mut *buf, &Item { stream, gseq, event })?;
+    buf.push(b'\n');
+    Ok(())
 }
 
 /// Waits until `rx` satisfies `f`, without holding the (non-`Send`) watch guard.
@@ -170,6 +196,8 @@ pub struct ControlSubscription {
     /// Everything up to here is committed and readable from SQLite.
     head: u64,
     backlog: VecDeque<(u64, Event)>,
+    /// Stored items read as their lines ([`ControlSubscription::write_stored`]).
+    lines: VecDeque<(u64, Vec<u8>)>,
 }
 
 impl ControlSubscription {
@@ -178,8 +206,45 @@ impl ControlSubscription {
         self.head
     }
 
-    /// The next item; `Ok(None)` once the hub has shut down.
-    pub async fn next(&mut self) -> anyhow::Result<Option<ControlItem>> {
+    /// Appends the line of the next item committed up to the head known to `buf`, read from
+    /// the store as a line ([`store::read_control_lines`]); `Ok(false)` when the next one is
+    /// still to come live. Never waits. What [`ControlSubscription::next`] read already goes
+    /// first.
+    pub fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        loop {
+            if let Some((g, ev)) = self.backlog.pop_front() {
+                if g > self.last {
+                    self.last = g;
+                    stream_line(buf, Some(g), &ev)?;
+                    return Ok(true);
+                }
+                continue;
+            }
+            if let Some((g, line)) = self.lines.pop_front() {
+                if g > self.last {
+                    self.last = g;
+                    buf.extend_from_slice(&line);
+                    return Ok(true);
+                }
+                continue;
+            }
+            if self.last < self.head {
+                let rows =
+                    store::read_control_lines(&self.hub.reader(), self.last, CATCH_UP_BATCH)?;
+                if rows.is_empty() {
+                    // Nothing more is committed than what we already delivered.
+                    self.head = self.last;
+                }
+                self.lines.extend(rows);
+                continue;
+            }
+            return Ok(false);
+        }
+    }
+
+    /// The next item committed up to the head known, read from the store; `Ok(None)` when
+    /// the next one is still to come live. Never waits.
+    fn next_stored(&mut self) -> anyhow::Result<Option<ControlItem>> {
         loop {
             if let Some((g, ev)) = self.backlog.pop_front() {
                 if g > self.last {
@@ -196,6 +261,16 @@ impl ControlSubscription {
                 }
                 self.backlog.extend(rows);
                 continue;
+            }
+            return Ok(None);
+        }
+    }
+
+    /// The next item; `Ok(None)` once the hub has shut down.
+    pub async fn next(&mut self) -> anyhow::Result<Option<ControlItem>> {
+        loop {
+            if let Some(item) = self.next_stored()? {
+                return Ok(Some(item));
             }
             match wake(&mut self.rx, &mut self.state).await {
                 Wake::Item((g, ev)) => {
@@ -224,6 +299,8 @@ pub struct ThreadSubscription {
     last: u64,
     head: u64,
     backlog: VecDeque<Event>,
+    /// Stored events read as their lines ([`ThreadSubscription::write_stored`]).
+    lines: VecDeque<(u64, Vec<u8>)>,
 }
 
 impl ThreadSubscription {
@@ -237,8 +314,48 @@ impl ThreadSubscription {
         self.head
     }
 
-    /// The next event; `Ok(None)` once the hub has shut down.
-    pub async fn next(&mut self) -> anyhow::Result<Option<Arc<Event>>> {
+    /// Appends the line of the next event logged up to the head known to `buf`, read from
+    /// the store as a line ([`store::read_thread_lines`]); `Ok(false)` when the next one is
+    /// still to come live. Never waits. What [`ThreadSubscription::next`] read already goes
+    /// first.
+    pub fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        loop {
+            if let Some(ev) = self.backlog.pop_front() {
+                if ev.seq > self.last {
+                    self.last = ev.seq;
+                    stream_line(buf, None, &ev)?;
+                    return Ok(true);
+                }
+                continue;
+            }
+            if let Some((seq, line)) = self.lines.pop_front() {
+                if seq > self.last {
+                    self.last = seq;
+                    buf.extend_from_slice(&line);
+                    return Ok(true);
+                }
+                continue;
+            }
+            if self.last < self.head {
+                let rows = store::read_thread_lines(
+                    &self.hub.reader(),
+                    &self.thread,
+                    self.last,
+                    CATCH_UP_BATCH,
+                )?;
+                if rows.is_empty() {
+                    self.head = self.last;
+                }
+                self.lines.extend(rows);
+                continue;
+            }
+            return Ok(false);
+        }
+    }
+
+    /// The next event logged up to the head known, read from the store; `Ok(None)` when the
+    /// next one is still to come live. Never waits.
+    fn next_stored(&mut self) -> anyhow::Result<Option<Arc<Event>>> {
         loop {
             if let Some(ev) = self.backlog.pop_front() {
                 if ev.seq > self.last {
@@ -259,6 +376,16 @@ impl ThreadSubscription {
                 }
                 self.backlog.extend(rows);
                 continue;
+            }
+            return Ok(None);
+        }
+    }
+
+    /// The next event; `Ok(None)` once the hub has shut down.
+    pub async fn next(&mut self) -> anyhow::Result<Option<Arc<Event>>> {
+        loop {
+            if let Some(ev) = self.next_stored()? {
+                return Ok(Some(ev));
             }
             match wake(&mut self.rx, &mut self.state).await {
                 Wake::Item(ev) => {

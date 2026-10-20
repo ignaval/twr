@@ -658,6 +658,9 @@ pub struct Sent {
     /// The first Esc on an empty line armed the second, at this time ([`UNSEND_WINDOW`]):
     /// the input box's title shows the hint meanwhile.
     pub armed: Option<Instant>,
+    /// The main pane's thread the armed second Esc counts in: the message's own, or, when the
+    /// first Esc left the dive the message went to, the orchestrator's it went back to.
+    pub armed_in: Option<String>,
     /// The hint ran out unused: for this message Esc goes on to its other steps (`/unsend`
     /// still takes it back).
     pub spent: bool,
@@ -4569,22 +4572,27 @@ impl AppState {
     /// the second, within that time, takes it back ([`AppState::unsend`]). A hint that ran
     /// out is spent: for that message Esc goes on to its other steps. `None`: this Esc is not
     /// the double Esc's.
+    ///
+    /// The first Esc that leaves the dive the message went to leaves it at once: going back
+    /// never waits for the second. It arms the second there, in the orchestrator conversation,
+    /// and that one takes the message back and returns to its dive, where the text goes back
+    /// in the box.
     fn unsend_esc(&mut self, now: Instant) -> Option<Vec<Action>> {
         if !self.view.input.is_empty() {
             return None;
         }
         let here = self.main_thread();
         if let Some(at) = self.sent.as_ref().and_then(|s| s.armed) {
-            // Armed for another thread than the one shown now (a dive left, Ctrl-G): no
+            // Armed for another view than the one shown now (a dive left since, Ctrl-G): no
             // second Esc for it; this one does what Esc does here.
-            if self.sent.as_ref().is_some_and(|s| s.thread != here) {
+            if self.sent.as_ref().is_some_and(|s| s.armed_in != here) {
                 if let Some(s) = self.sent.as_mut() {
                     s.armed = None;
                 }
                 return None;
             }
             if now.saturating_duration_since(at) < UNSEND_WINDOW {
-                return Some(self.unsend());
+                return Some(self.unsend_armed());
             }
             self.expire_unsend(now);
             return None;
@@ -4593,8 +4601,33 @@ impl AppState {
         if s.spent || s.thread != here || self.unsend_check().is_err() {
             return None;
         }
-        self.sent.as_mut()?.armed = Some(now);
+        let armed_in = if self.esc_does() == EscDoes::Leave {
+            self.leave_dive();
+            self.view.status = None;
+            self.main_thread()
+        } else {
+            here
+        };
+        let s = self.sent.as_mut()?;
+        s.armed = Some(now);
+        s.armed_in = armed_in;
         Some(Vec::new())
+    }
+
+    /// The armed second Esc (or tap): takes the last message back ([`AppState::unsend`]).
+    /// Armed by the Esc that left its dive, it returns there first, so the text goes back in
+    /// the box it was typed in.
+    fn unsend_armed(&mut self) -> Vec<Action> {
+        let back_to = self
+            .sent
+            .as_ref()
+            .filter(|s| s.armed_in != s.thread)
+            .and_then(|s| s.thread.clone());
+        let actions = self.unsend();
+        if let Some(thread) = back_to.filter(|_| !actions.is_empty()) {
+            self.dive(&thread);
+        }
+        actions
     }
 
     /// The input box's title while the double Esc is armed, nothing is typed, the main pane
@@ -4603,7 +4636,7 @@ impl AppState {
     pub fn unsend_hint(&self) -> Option<String> {
         let s = self.sent.as_ref().filter(|s| s.armed.is_some())?;
         if !self.view.input.is_empty()
-            || s.thread != self.main_thread()
+            || s.armed_in != self.main_thread()
             || self.unsend_check().is_err()
         {
             return None;
@@ -4611,6 +4644,12 @@ impl AppState {
         let thread = s.thread.as_deref().and_then(|t| self.registry.get(t))?;
         Some(if thread.is_orchestrator() {
             " Esc or tap again: take back your last message ".to_string()
+        } else if s.armed_in != s.thread {
+            // Back from its dive.
+            format!(
+                " Esc or tap again: take back your message to {} ",
+                thread.name
+            )
         } else {
             format!(
                 " Esc or tap again: take back your message to {} · /back leaves ",
@@ -6389,11 +6428,12 @@ impl AppState {
     /// nothing is typed, the main pane shows the message's thread, and it can still be taken
     /// back.
     pub fn take_back_offered(&self) -> bool {
+        let here = self.main_thread();
         self.view.input.is_empty()
             && self
                 .sent
                 .as_ref()
-                .is_some_and(|s| s.thread == self.main_thread())
+                .is_some_and(|s| s.thread == here || (s.armed.is_some() && s.armed_in == here))
             && self.unsend_check().is_ok()
     }
 
@@ -6401,15 +6441,21 @@ impl AppState {
     /// takes the message back within [`UNSEND_WINDOW`], as Esc Esc does (the hint in the
     /// box's title says so meanwhile).
     fn tap_unsend(&mut self, now: Instant) -> Vec<Action> {
+        self.expire_unsend(now);
         if !self.take_back_offered() {
             return Vec::new();
         }
-        let armed = self.sent.as_ref().and_then(|s| s.armed);
-        if armed.is_some_and(|at| now.saturating_duration_since(at) < UNSEND_WINDOW) {
-            return self.unsend();
+        let here = self.main_thread();
+        if self
+            .sent
+            .as_ref()
+            .is_some_and(|s| s.armed.is_some() && s.armed_in == here)
+        {
+            return self.unsend_armed();
         }
         if let Some(s) = self.sent.as_mut() {
             s.armed = Some(now);
+            s.armed_in = here;
         }
         Vec::new()
     }
@@ -18087,7 +18133,8 @@ pub(crate) mod tests {
 
     /// The second Esc counts for [`UNSEND_WINDOW`]: after it, the hint is spent and Esc goes
     /// on to its other steps (here: releasing the card) for that message. With text typed
-    /// Esc never arms. In a dive the hint names the thread, and Esc then leaves the dive.
+    /// Esc never arms. In a dive the first Esc leaves at once, and the hint, back in the
+    /// orchestrator conversation, names the thread.
     #[test]
     fn outside_its_window_the_double_esc_lets_esc_go_on() {
         let mut st = with_orch();
@@ -18126,15 +18173,19 @@ pub(crate) mod tests {
             serde_json::json!({"thread": "t-beta", "ref": 4, "turn": null, "pending": 1}),
         );
         st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None, "Esc left the dive at once");
         assert_eq!(
             st.unsend_hint().as_deref(),
-            Some(" Esc or tap again: take back your message to beta · /back leaves ")
+            Some(" Esc or tap again: take back your message to beta ")
         );
         st.sent.as_mut().unwrap().armed = Some(late);
         st.expire_unsend(Instant::now());
         assert_eq!(st.unsend_hint(), None);
-        st.handle_key(key(KeyCode::Esc));
-        assert_eq!(st.view.dive, None, "Esc left the dive");
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "too late: nothing taken back"
+        );
+        assert_eq!(st.view.dive, None);
         // `/unsend` still takes it back, from anywhere; its text then waits in the history.
         let back = type_line(&mut st, "/unsend");
         assert_eq!(
@@ -18393,6 +18444,9 @@ pub(crate) mod tests {
             "and the docs",
             serde_json::json!({"thread": "t-beta", "ref": 30, "turn": null, "pending": 1}),
         );
+        // A card selected in the dive: Esc would release it, so it arms in the dive.
+        st.set_focus(Some("t-alpha".into()));
+        assert_eq!(st.esc_does(), EscDoes::Release);
         assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(st.unsend_hint().is_some());
         assert!(type_line(&mut st, "/back").is_empty());
@@ -18403,6 +18457,96 @@ pub(crate) mod tests {
             "nothing taken back"
         );
         assert_eq!(st.sent.as_ref().unwrap().armed, None);
+        // Armed back in the orchestrator conversation by the Esc that left the dive, it is
+        // that view's: diving in again, Esc takes nothing back (and leaves).
+        st.sent.as_mut().unwrap().spent = false;
+        st.set_focus(None);
+        st.dive("t-beta");
+        assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(st.view.dive, None);
+        assert!(st.unsend_hint().is_some());
+        assert!(type_line(&mut st, "/open beta").is_empty());
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+        assert_eq!(st.unsend_hint(), None);
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        assert_eq!(st.view.dive, None, "the Esc left the dive");
+        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+    }
+
+    /// Esc leaves a dive at once, even with a message there that can still be taken back: it
+    /// never waits for the double Esc's second. That one, in the orchestrator conversation
+    /// within [`UNSEND_WINDOW`], takes the message back and returns to the dive, where the
+    /// text goes back in the box. A tap on the take-back control does the same.
+    #[test]
+    fn esc_leaves_a_dive_at_once_and_a_second_takes_the_message_back() {
+        let mut st = with_orch();
+        let mut b = beta_script(60);
+        control(&mut st, &[b.turn_ended(TurnResult::Completed)]);
+        st.dive("t-beta");
+        send_line(
+            &mut st,
+            "and the changelog",
+            serde_json::json!({"thread": "t-beta", "ref": 31, "turn": null, "pending": 1}),
+        );
+        assert!(st.take_back_offered());
+        assert_eq!(st.esc_does(), EscDoes::Leave);
+        // No time passes: the Esc acts on the spot, without a timer.
+        assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(st.view.dive, None, "back in the orchestrator conversation");
+        assert_eq!(st.main_thread().as_deref(), Some("t-orch"));
+        assert_eq!(
+            st.unsend_hint().as_deref(),
+            Some(" Esc or tap again: take back your message to beta ")
+        );
+        let screen = screen_text(&draw(&mut st, 120, 30));
+        assert!(
+            screen.contains("→ orchestrator  Esc or tap again: take back your message to beta"),
+            "{screen}"
+        );
+        assert!(st.take_back_offered(), "the take-back control is offered there too");
+        let back = st.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            back,
+            [Action::Withdraw {
+                thread: "t-beta".into(),
+                msg_ref: 31
+            }]
+        );
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"), "back in its dive");
+        taken_back(&mut st, 31);
+        assert_eq!(st.view.input.as_str(), "and the changelog");
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("taken back: your message is in the box again")
+        );
+
+        // A tap on the take-back control, back in the orchestrator conversation.
+        st.view.input.clear();
+        send_line(
+            &mut st,
+            "and the readme",
+            serde_json::json!({"thread": "t-beta", "ref": 32, "turn": null, "pending": 1}),
+        );
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None);
+        let back = st.tap_unsend(Instant::now());
+        assert_eq!(
+            back,
+            [Action::Withdraw {
+                thread: "t-beta".into(),
+                msg_ref: 32
+            }]
+        );
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+
+        // Nothing to take back: Esc leaves too, and arms nothing.
+        st.sent = None;
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None);
+        assert_eq!(st.unsend_deadline(), None);
     }
 
     /// A withdrawal's answer is matched by its ref: a message sent while it was on its way

@@ -15,6 +15,7 @@
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
 //! - [`testkit`]: event-sequence builders for tests
+//! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
 
 pub mod activity;
@@ -35,6 +36,7 @@ pub mod reduce;
 pub mod runner;
 pub mod sealed;
 pub mod testkit;
+pub mod trace;
 pub mod usage;
 
 /// twr's version: the package version, plus `+dev.<build>` for a build made from a checkout by

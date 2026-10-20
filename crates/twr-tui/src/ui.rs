@@ -55,6 +55,28 @@ pub fn side_width(width: u16) -> u16 {
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
 /// the trash overlay, the action popup or the `/` popup over it when open, and the mouse
 /// selection. Returns the text panes drawn.
+/// What the screen shows while the hub's control log is replayed, before the first frame of
+/// the view: how far the replay is. No key acts on it (the view is not drawn yet).
+pub fn render_loading(frame: &mut Frame, state: &AppState) {
+    let area = frame.area();
+    let text = match state.catch_up {
+        Some(head) if head > 0 && head < u64::MAX => format!(
+            "Loading… {} of {head} events",
+            state.last_gseq.min(head)
+        ),
+        _ => "Loading…".to_string(),
+    };
+    let row = Rect::new(area.x, area.y + area.height / 2, area.width, area.height.min(1));
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Center),
+        row,
+    );
+}
+
 pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     state.wraps.next_frame();
     let mut panes = Panes::default();

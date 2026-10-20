@@ -42,8 +42,10 @@ pub use job_gate::job_gate_main;
 pub async fn run(mut opts: HubOptions, socket: PathBuf) -> anyhow::Result<()> {
     let boxes_lock = opts.boxes_lock.take();
     let lock = hub::lock_data_dir(&opts.db_path, Some(&socket)).await?;
+    twr_core::trace::mark("hub: data directory locked");
     let runners = listener::RunnerListener::bind(&opts.config.hub).await?;
     let listener = server::bind(&socket).await?;
+    twr_core::trace::mark("hub: socket bound");
     // A command that edits boxes.toml from now on finds the socket, and asks this hub.
     drop(boxes_lock);
     // The orchestrator's MCP server connects back here.
