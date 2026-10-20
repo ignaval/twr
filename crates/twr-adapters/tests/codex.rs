@@ -903,7 +903,7 @@ fn failed_turns_say_why() {
 }
 
 /// A `thread/start` result reporting exactly what `manual` asks for.
-const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
+const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"cwd":"/tmp/sandbox-codex","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
 
 #[test]
 fn reasoning_only_when_thinking() {
@@ -1681,7 +1681,7 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
     let read = id_of(&out.replies, "config/read");
     let out = tr.translate(&json!({"id": read, "result": {"config": {}}}).to_string());
     let open = id_of(&out.replies, "thread/start");
-    let opened = json!({"id": open, "result": {"thread": {"id": "th"},
+    let opened = json!({"id": open, "result": {"thread": {"id": "th"}, "cwd": wt,
         "approvalPolicy": "on-request", "approvalsReviewer": "user",
         "sandbox": {"type": "workspaceWrite", "writableRoots": roots, "networkAccess": true,
                     "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}});
@@ -1703,7 +1703,7 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     use twr_adapters::codex::translate::check_policy;
     let result = |sandbox: Value| {
-        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted",
+        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted", "cwd": FIXTURE_CWD,
                "approvalsReviewer": "user", "sandbox": sandbox})
     };
     let ww = |extra: Value| {
@@ -1743,6 +1743,7 @@ fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     asked["config"]["sandbox_workspace_write.writable_roots"] = json!(["/srv/cache"]);
     let mut on_request = ww(json!({"writableRoots": ["/srv/cache/"], "networkAccess": true}));
     on_request["approvalPolicy"] = json!("on-request");
+    on_request["cwd"] = json!(std::env::temp_dir());
     assert_eq!(check_policy(&asked, &on_request), Ok(()));
     on_request["sandbox"]["writableRoots"] = json!(["/srv/cache", "/home/u"]);
     assert!(check_policy(&asked, &on_request).is_err());

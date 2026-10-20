@@ -546,8 +546,8 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 /// - it is not and does not hold `$HOME`, `cwd`, the repository's git dir or any of its
 ///   checkouts (a `CARGO_TARGET_DIR` of `~` or of the worktrees' folder would open them all),
 ///   and does not lie in the git dir or a checkout;
-/// - it is the owner's, and no other user can replace it or a directory above it
-///   ([`held_by`]);
+/// - it is the runtime's user's (twr's effective uid: the sandbox runs as it, whoever owns
+///   `cwd`), and no other user can replace it or a directory above it ([`held_by`]);
 /// - it does not lie in anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`, the shared
 ///   memory folder or another root. Codex's sandbox finds its roots again for each command,
 ///   so a root in a folder the agent can write could be swapped for a link to anywhere
@@ -584,9 +584,8 @@ fn writable_roots(
     let Ok(canonical_cwd) = cwd.canonicalize() else {
         return Vec::new();
     };
-    let Ok(owner) = std::fs::metadata(cwd).map(|m| m.uid()) else {
-        return Vec::new();
-    };
+    // The runtime's user, whom the sandbox runs as (not whoever owns `cwd`).
+    let owner = twr_core::paths::effective_uid();
     let common = repo.and_then(|r| common_dir_of(r, &canonical_cwd));
     let home = var("HOME");
     let canonical_home = home.as_ref().and_then(|h| h.canonicalize().ok());

@@ -2099,12 +2099,7 @@ impl Translator {
             let reported = json!({"approvalPolicy": st["approvalPolicy"],
                 "approvalsReviewer": st["approvalsReviewer"], "sandbox": st["sandboxPolicy"],
                 "cwd": st["cwd"]});
-            let cwd_reported = st["cwd"].is_string() || str_at(&self.open.params, "cwd").is_empty();
-            let checked = match cwd_reported {
-                true => check_policy(&self.open.params, &reported),
-                false => Err("the settings report no cwd".to_string()),
-            };
-            if let Err(why) = checked {
+            if let Err(why) = check_policy(&self.open.params, &reported) {
                 tracing::error!(%why, "codex: refusing a thread whose settings now allow more than twr asked for");
                 out.fatal = Some(format!("codex thread/settings/updated: {why}"));
             }
@@ -3034,12 +3029,19 @@ pub fn check_policy(params: &Value, result: &Value) -> Result<(), String> {
 
 /// Checks the `cwd` a result reports against the request's: a `workspace-write` sandbox lets
 /// commands write their cwd, so it must be the one asked for (the same path, or one that
-/// resolves to the same directory). Not reported (or null): as asked. Nothing asked: no check.
+/// resolves to the same directory), and reported when the result's sandbox is
+/// `workspaceWrite` (every Codex twr knows, back to 0.155, reports it). Under another
+/// sandbox, one not reported passes. Nothing asked: no check.
 fn check_cwd(params: &Value, result: &Value) -> Result<(), String> {
     let asked = str_at(params, "cwd");
     if asked.is_empty() {
         return Ok(());
     }
+    let writes_cwd = result
+        .get("sandbox")
+        .and_then(|s| s.as_str().or_else(|| s.get("type").and_then(Value::as_str)))
+        .and_then(sandbox_rank)
+        != Some(0);
     let same = |got: &str| {
         Path::new(got) == Path::new(asked)
             || matches!(
@@ -3048,11 +3050,11 @@ fn check_cwd(params: &Value, result: &Value) -> Result<(), String> {
             )
     };
     match result.get("cwd") {
-        None | Some(Value::Null) => Ok(()),
+        None | Some(Value::Null) if !writes_cwd => Ok(()),
         Some(Value::String(got)) if same(got) => Ok(()),
-        Some(other) => Err(format!(
+        other => Err(format!(
             "the thread reports cwd {} where twr asked for {asked:?}; commands could write there",
-            compact(other)
+            other.map_or("(none)".to_string(), compact)
         )),
     }
 }
@@ -4075,8 +4077,13 @@ mod tests {
         };
         assert_eq!(check_policy(&params, &result(json!("/w/wt"))), Ok(()));
         assert_eq!(check_policy(&params, &result(json!("/w/wt/"))), Ok(()));
-        assert_eq!(check_policy(&params, &result(Value::Null)), Ok(()));
-        for bad in [json!("/home/u"), json!("/w"), json!(["/w/wt"])] {
+        // A read-only sandbox writes no cwd: one not reported passes there.
+        let mut ro = params.clone();
+        ro["sandbox"] = json!("read-only");
+        let mut ro_result = result(Value::Null);
+        ro_result["sandbox"] = json!({"type": "readOnly"});
+        assert_eq!(check_policy(&ro, &ro_result), Ok(()));
+        for bad in [json!("/home/u"), json!("/w"), json!(["/w/wt"]), Value::Null] {
             let why = check_policy(&params, &result(bad.clone())).unwrap_err();
             assert!(why.contains("cwd"), "{bad}: {why}");
         }
@@ -4108,6 +4115,25 @@ mod tests {
                 "params": {"threadId": "th", "threadSettings": st}})
             .to_string()
         };
+        // Opening without a cwd (a workspace-write sandbox writes it) is refused too.
+        let mut t2 = Translator::new(
+            TranslatorOptions::default(),
+            Open {
+                method: "thread/start",
+                params: params.clone(),
+                mode_note: None,
+                added_instructions: None,
+            },
+        );
+        t2.start();
+        t2.translate(r#"{"id":1,"result":{}}"#);
+        let out = t2.translate(
+            &json!({"id": 2, "result": {"thread": {"id": "th"},
+                "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}}})
+            .to_string(),
+        );
+        assert!(out.fatal.unwrap().contains("cwd"));
         assert!(t.translate(&settings(Some("/w/wt"))).fatal.is_none());
         assert!(t.translate(&settings(Some("/home/u"))).fatal.is_some());
         assert!(t.translate(&settings(None)).fatal.is_some());
