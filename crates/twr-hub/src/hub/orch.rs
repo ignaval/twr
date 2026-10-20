@@ -4173,8 +4173,13 @@ mod tests {
         assert_eq!(q.0.len(), 1, "{q:?}");
         assert_eq!(q.0[0].0, again.id, "a new line, not {}", first.id);
         assert!(lines_of(&q)[0].contains(&format!("watch={w1} ")), "{q:?}");
-        let due = hub.inner.core().orch.notices[0].idle;
-        assert_eq!(due, Some(again.ts + watch::IDLE_GRACE));
+        // Held until the hub's wake of the worker (`hub::wake`) is decided, then the grace.
+        let core = hub.inner.core();
+        assert_eq!(
+            core.orch.notices[0].idle,
+            Some(again.ts + core.wake.after + watch::IDLE_GRACE)
+        );
+        drop(core);
         drop(hub);
     }
 
