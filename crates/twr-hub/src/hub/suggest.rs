@@ -27,8 +27,8 @@
 //!   nothing billed to a key, the text sent nowhere else). Measured with Claude Code 2.1.304
 //!   and `claude-haiku-5-5`: about 780 input tokens with twr's prompt (cached after the first
 //!   call), 20 output, $0.0002 at list price uncached and $0.00002 cached.
-//! - **Codex:** `codex exec` with the user's own login (`$CODEX_HOME`'s; no `OPENAI_*` or
-//!   `CODEX_*` from the hub's environment): no session saved (`--ephemeral`), none of the user's
+//! - **Codex:** `codex exec` with the user's own login (no `OPENAI_*` or `CODEX_*` from the
+//!   hub's environment, but `CODEX_HOME`: the home twr checked, [`codex_home`]): no session saved (`--ephemeral`), none of the user's
 //!   config, rules, project `AGENTS.md` or skills (`--ignore-user-config`, `--ignore-rules`,
 //!   `project_doc_max_bytes=0`, `skills.include_instructions=false`), twr's prompt as the
 //!   model's instructions (`model_instructions_file`), a read-only sandbox that asks nothing,
@@ -241,16 +241,61 @@ pub(super) fn codex_global_instructions(dir: &Path) -> Option<PathBuf> {
         .find(|f| std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
-/// The Codex home the hub's Codex would use: `given` ([`super::HubOptions::suggest_codex_home`]),
-/// else `$CODEX_HOME`, else `~/.codex`.
+/// The Codex home the hub's Codex uses ([`codex_home_from`] with this process's environment
+/// and account); a suggestion call passes it to Codex as `CODEX_HOME`, so that the home twr
+/// checked is the one Codex reads.
 fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
-    if let Some(dir) = given {
-        return Some(dir.to_path_buf());
+    codex_home_from(
+        given,
+        std::env::var_os("CODEX_HOME"),
+        std::env::var_os("HOME"),
+        account_home,
+    )
+}
+
+/// The Codex home, absolute, as Codex 0.162.1 finds it: `given`
+/// ([`super::HubOptions::suggest_codex_home`]), else `codex_home` (`$CODEX_HOME`) when set,
+/// else `.codex` in `home` (`$HOME`) when set, else in the account's home directory
+/// (`account`, as Codex's `dirs::home_dir` falls back to the password database). `None` when
+/// none is found: Codex isn't asked then.
+fn codex_home_from(
+    given: Option<&Path>,
+    codex_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    account: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
+    let dir = match given {
+        Some(dir) => dir.to_path_buf(),
+        None => set(codex_home)
+            .or_else(|| set(home).map(|h| h.join(".codex")))
+            .or_else(|| account().map(|h| h.join(".codex")))?,
+    };
+    std::path::absolute(dir).ok()
+}
+
+/// This account's home directory in the password database (`getpwuid_r`).
+fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 16 * 1024];
+    // SAFETY: getpwuid_r writes the entry into `pwd` and its strings into `buf`, both ours and
+    // as large as we say; `found` points at `pwd` or is null. Nothing is kept past `buf`.
+    unsafe {
+        let mut pwd: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let rc = libc::getpwuid_r(
+            libc::geteuid(),
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut found,
+        );
+        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
+        (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
     }
-    std::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
 }
 
 /// Why `runtime` can't run suggestions at all now: its CLI missing or signed out (the
@@ -264,11 +309,10 @@ fn cant_run(runtime: &'static str, probe: &Probe, s: &Suggestions, now: Instant)
         return Some(why.to_string());
     }
     if runtime == "codex" {
-        if let Some(f) = probe
-            .codex_home
-            .as_deref()
-            .and_then(codex_global_instructions)
-        {
+        let Some(home) = probe.codex_home.as_deref() else {
+            return Some("twr can't tell which Codex home Codex would use".into());
+        };
+        if let Some(f) = codex_global_instructions(home) {
             return Some(format!(
                 "Codex would send your global {} along",
                 f.file_name().unwrap_or_default().to_string_lossy()
@@ -671,6 +715,7 @@ async fn ask_codex(
     input: &str,
     dir: &Path,
     system: &Path,
+    codex_home: &Path,
     marker: &str,
 ) -> Result<(String, f64), String> {
     let mut cmd = tokio::process::Command::new(bin);
@@ -705,15 +750,18 @@ async fn ask_codex(
     for f in CODEX_FEATURES_OFF {
         cmd.arg("-c").arg(format!("features.{f}=false"));
     }
-    // A TOML string (JSON's escapes are TOML's): a path that would read as another value
-    // stays a path.
+    // Absolute (Codex reads a relative one from the folder it runs in), and a TOML string
+    // (JSON's escapes are TOML's): a path that would read as another value stays a path.
+    let system = std::path::absolute(system).map_err(|e| e.to_string())?;
     let path = serde_json::to_string(&system.to_string_lossy()).map_err(|e| e.to_string())?;
     cmd.arg("-c").arg(format!("model_instructions_file={path}"));
     cmd.arg("-");
     cmd.current_dir(dir);
     // The user's login only (`$CODEX_HOME`'s): no API key, endpoint or provider from the hub's
     // environment.
-    scrub_env(&mut cmd, marker, &["OPENAI_", "CODEX_"], &["CODEX_HOME"]);
+    scrub_env(&mut cmd, marker, &["OPENAI_", "CODEX_"], &[]);
+    // The home whose global instructions twr checked ([`codex_global_instructions`]).
+    cmd.env("CODEX_HOME", codex_home);
     let (out, _) = run_cli(cmd, bin, title("codex"), input, |line| {
         let kind = codex_tool_item(line)?;
         Some(format!(
@@ -986,10 +1034,13 @@ impl Hub {
             Err(e) => Err(format!("cannot make {}: {e:#}", dir.display())),
             Ok(()) if rt == "codex" => match system_file(&dir) {
                 Err(e) => Err(e),
-                Ok(system) => {
-                    let bin = &hub.suggest_codex_bin;
-                    ask_codex(bin, &model, &input, &dir, &system, &marker).await
-                }
+                Ok(system) => match &probe.codex_home {
+                    Some(home) => {
+                        let bin = &hub.suggest_codex_bin;
+                        ask_codex(bin, &model, &input, &dir, &system, home, &marker).await
+                    }
+                    None => Err("twr can't tell which Codex home Codex would use".into()),
+                },
             },
             Ok(()) => ask_claude(&hub.suggest_bin, &model, &input, &dir, &marker).await,
         };
@@ -1200,6 +1251,44 @@ mod tests {
             "an hour on"
         );
         assert!(s.down("claude-code", now, &probe(&[], None)).is_none());
+    }
+
+    /// Codex's home as Codex finds it: `$CODEX_HOME`, else `$HOME/.codex`, else the account's
+    /// home's `.codex` (an unset or empty variable is no value), always absolute; none found,
+    /// none.
+    #[test]
+    fn the_codex_home_is_found_as_codex_finds_it() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        let account = || Some(PathBuf::from("/home/acct"));
+        let none = || None;
+        let got = |given, ch, home, acct: &dyn Fn() -> Option<PathBuf>| {
+            codex_home_from(given, ch, home, acct)
+        };
+        assert_eq!(
+            got(Some(Path::new("/t/ch")), os("/x"), os("/h"), &account),
+            Some(PathBuf::from("/t/ch"))
+        );
+        assert_eq!(
+            got(None, os("/x"), os("/h"), &account),
+            Some(PathBuf::from("/x"))
+        );
+        assert_eq!(
+            got(None, os(""), os("/h"), &account),
+            Some(PathBuf::from("/h/.codex"))
+        );
+        assert_eq!(
+            got(None, None, None, &account),
+            Some(PathBuf::from("/home/acct/.codex"))
+        );
+        assert_eq!(
+            got(None, None, os(""), &account),
+            Some(PathBuf::from("/home/acct/.codex"))
+        );
+        assert_eq!(got(None, None, None, &none), None);
+        let rel = got(None, os("rel/codex"), None, &none).unwrap();
+        assert!(rel.is_absolute() && rel.ends_with("rel/codex"), "{rel:?}");
+        // This account has a home in the password database.
+        assert!(account_home().is_some_and(|h| h.is_absolute()));
     }
 
     /// Codex's global instructions: `AGENTS.override.md`, else `AGENTS.md`, when not empty.

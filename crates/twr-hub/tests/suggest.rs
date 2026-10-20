@@ -724,6 +724,8 @@ async fn codex_answers_with_its_small_model_and_nothing_of_the_users() {
         .find_map(|a| a.strip_prefix("model_instructions_file="))
         .unwrap();
     let file: String = serde_json::from_str(instructions).unwrap();
+    // Absolute: Codex reads a relative one from the folder it runs in.
+    assert!(Path::new(&file).is_absolute(), "{file}");
     assert!(std::fs::read_to_string(&file)
         .unwrap()
         .contains("reply exactly NONE"));
@@ -737,6 +739,13 @@ async fn codex_answers_with_its_small_model_and_nothing_of_the_users() {
     assert!(cwd.trim_end().ends_with("data/suggest"), "{cwd}");
     let env = std::fs::read_to_string(cli.join("env")).unwrap();
     assert!(!env.contains("OPENAI_API_KEY"), "{env}");
+    // The Codex home whose global instructions the hub checked is the one Codex reads.
+    let home = dir.path().join("codex-home");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("CODEX_HOME={}", home.display())),
+        "{env}"
+    );
     assert!(
         env.lines().any(|l| l == format!("TWR_AGENT={api}:suggest")),
         "{env}"
