@@ -2037,8 +2037,12 @@ impl Core {
         let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
         // Never a retired orchestrator: it would revoke the current one's token.
         self.refuse_retired(thread).map_err(anyhow::Error::new)?;
-        // Nor while what a stopped hub's job left in its directory may still run.
-        self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        // Nor while what a stopped hub's job left in its directory may still run. (The
+        // orchestrator's only jobs are the user's `!` commands of its view: what is left of
+        // one is the user's, and holds no runtime back.)
+        if !view.is_orchestrator() {
+            self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        }
         // Taken whether or not the start succeeds: a failed start's processes (if any) never
         // share a generation marker with a later runtime.
         self.generation += 1;

@@ -259,6 +259,19 @@ impl AppState {
         let Some(job) = result["job"].as_str().map(str::to_string) else {
             return;
         };
+        // Not on the main pane any more (another thread shown since): the read is over, and
+        // the command is read again when its thread shows.
+        let here = self.transcript.as_ref().is_some_and(|t| {
+            t.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Shell { job: j, .. } if *j == job))
+        });
+        if !here {
+            if let Some(r) = self.shell_reads.get_mut(&job) {
+                r.asked = None;
+            }
+            return;
+        }
         let running = self.transcript.as_ref().is_some_and(|t| {
             t.entries
                 .iter()
@@ -311,22 +324,32 @@ impl AppState {
         let (Some(job), Some(thread)) = (result["job"].as_str(), result["thread"].as_str()) else {
             return;
         };
+        // Ended already (its end came before this answer): nothing to stop.
+        if self.shell_done.iter().any(|d| d == job) {
+            return;
+        }
         // Ctrl-C came before this answer: it stops now.
         if launch.is_some_and(|l| l.cancel) {
             self.shell_cancels.push(job.to_string());
+            self.shell_jobs.push(Started {
+                job: job.to_string(),
+                thread: thread.to_string(),
+                command: result["name"].as_str().unwrap_or_default().to_string(),
+                stopping: true,
+            });
             return;
         }
-        // Ended already (its end came before this answer): nothing to stop.
-        let ended = self.shell_done.iter().any(|d| d == job);
+        // Its `■ stop` was clicked before this answer: it is being stopped already.
+        if self.shell_jobs.iter().any(|s| s.job == job) {
+            return;
+        }
+
         if let Some(cwd) = result["cwd"].as_str().filter(|_| {
             self.registry
                 .get(thread)
                 .is_some_and(|t| t.is_orchestrator())
         }) {
             self.shell_cwd = Some(cwd.to_string());
-        }
-        if ended {
-            return;
         }
         self.shell_jobs.push(Started {
             job: job.to_string(),
@@ -389,6 +412,31 @@ impl AppState {
     /// runs and isn't being stopped; with none, quits.
     pub(crate) fn ctrl_c(&mut self) -> Vec<Action> {
         let main = self.main_thread();
+        // A stop asked for before the command's job is known: quitting now would leave it
+        // running, its stop never sent. One more Ctrl-C says so; the next quits.
+        let stop_pending = self.shell_launching.iter().any(|l| l.cancel);
+        if !stop_pending {
+            self.shell_quit_armed = false;
+        }
+        let fresh = self
+            .shell_launching
+            .iter()
+            .any(|l| l.thread == main && !l.cancel)
+            || self
+                .shell_jobs
+                .iter()
+                .any(|s| Some(&s.thread) == main.as_ref() && !s.stopping);
+        if stop_pending && !fresh {
+            if std::mem::replace(&mut self.shell_quit_armed, true) {
+                return vec![Action::Quit];
+            }
+            self.view.status = Some(
+                "a `!` command's stop is still on its way: Ctrl-C again quits without \
+                 waiting for it"
+                    .into(),
+            );
+            return Vec::new();
+        }
         // The newest is one sent and not answered yet: it stops as soon as its job is known.
         if let Some(l) = self
             .shell_launching
@@ -398,7 +446,7 @@ impl AppState {
         {
             l.cancel = true;
             self.view.status = Some(format!(
-                "stopping `{}` as it starts · Ctrl-C again quits",
+                "stopping `{}` as it starts",
                 l.command
             ));
             return Vec::new();
@@ -417,10 +465,36 @@ impl AppState {
         vec![Action::JobCancel { job }]
     }
 
+    /// What `job.cancel` answered (`{failed, job, error}` when it failed): a stop that failed
+    /// is no longer pending, and the status bar says so.
+    pub(crate) fn shell_cancel_result(&mut self, result: &Value) {
+        if result["failed"] != true {
+            return;
+        }
+        let Some(job) = result["job"].as_str() else {
+            return;
+        };
+        if let Some(s) = self.shell_jobs.iter_mut().find(|s| s.job == job) {
+            s.stopping = false;
+            let why = result["error"].as_str().unwrap_or("no answer");
+            self.view.status = Some(format!(
+                "could not stop `{}` ({why}): Ctrl-C or ■ stop tries again",
+                s.command
+            ));
+        }
+    }
+
     /// A click on a running command's `■ stop`: stops it, whoever started it.
     pub(crate) fn stop_shell(&mut self, job: &str) -> Vec<Action> {
-        if let Some(s) = self.shell_jobs.iter_mut().find(|s| s.job == job) {
-            s.stopping = true;
+        match self.shell_jobs.iter_mut().find(|s| s.job == job) {
+            Some(s) => s.stopping = true,
+            // Not this TUI's, or its answer not in yet: followed from now on.
+            None => self.shell_jobs.push(Started {
+                job: job.to_string(),
+                thread: self.main_thread().unwrap_or_default(),
+                command: String::new(),
+                stopping: true,
+            }),
         }
         self.view.status = Some("stopping the command".into());
         vec![Action::JobCancel {

@@ -775,6 +775,14 @@ pub enum Action {
         /// then.
         seen_gseq: u64,
     },
+    /// [`Action::Say`] for a suggested message the user took and sent unedited (`say` with
+    /// `suggested`): never applied as a short command at once.
+    SaySuggested {
+        /// The text.
+        text: String,
+        /// As [`Action::Say`]'s.
+        seen_gseq: u64,
+    },
     /// Send the input line straight to the thread dived into (`thread.send`).
     Send {
         /// Target thread id.
@@ -1255,7 +1263,10 @@ impl Transcript {
                     duration_ms: p.duration_ms,
                 });
             }
-            EventBody::TaskUpdated(p) => self.apply_shell(ev.seq, p),
+            // A job's task is the hub's: no other source draws a `!` command.
+            EventBody::TaskUpdated(p) if ev.source == twr_core::event::Source::Hub => {
+                self.apply_shell(ev.seq, p)
+            }
             // What the orchestrator read of a project: shown like a hub update, so it stays on
             // screen when tool calls are folded.
             EventBody::ProjectRead(p) => self.push(Entry::HubUpdate {
@@ -1408,6 +1419,7 @@ impl Transcript {
             || job
                 .get(twr_core::blob::CAPPED_KEY)
                 .is_some_and(|c| c.to_string().contains("printed"));
+        let catching_up = self.catching_up();
         let at = self
             .entries
             .iter()
@@ -1433,7 +1445,9 @@ impl Transcript {
                     if !*read {
                         *output = printed;
                     }
-                    *read = !cut && *read;
+                    // Seen to its end here: one more read of its log for all of it. Replayed
+                    // history shows what its end recorded (`twr job log` has the rest).
+                    *read = catching_up || (!cut && *read);
                 }
             }
             Some(_) => {}
@@ -1454,7 +1468,7 @@ impl Transcript {
                     signal: job["signal"].as_i64(),
                     duration_ms: job["duration_ms"].as_u64(),
                     output: printed,
-                    read: !p.running && !cut,
+                    read: !p.running && (!cut || catching_up),
                 });
             }
         }
@@ -2245,6 +2259,14 @@ pub struct AppState {
     pub suggest_failed: bool,
     /// The hub's suggestion counts, as its last answer gave them.
     pub suggest_stats: Value,
+    /// Counts the user's sends: a suggestion asked before the last one is not shown.
+    pub suggest_epoch: u64,
+    /// The suggestion asked for and its epoch ([`AppState::suggest_epoch`]).
+    pub suggest_asked: Option<(String, u64, u64)>,
+    /// The suggestion last taken into the box: sent unedited, it says so to the hub.
+    pub taken_suggestion: Option<String>,
+    /// The second Ctrl-C while a `!` command's stop is on its way: the third quits.
+    pub shell_quit_armed: bool,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
     /// came while a view kept for it is being restored: applied once it is
     /// ([`AppState::finish_restore`]), into the view as it was left.
@@ -2786,6 +2808,7 @@ impl AppState {
             "shell.run" => self.shell_started(result),
             "shell.cd" => self.shell_moved(result),
             "job.log" => self.shell_log(result, Instant::now()),
+            "job.cancel" => self.shell_cancel_result(result),
             "suggest.next" => self.suggest_result(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
@@ -3697,6 +3720,12 @@ impl AppState {
     /// orchestrator's banner in a dive or the grid, a card scrolled away, a card too short for
     /// its options, anything under an overlay) is never answered.
     pub fn note_drawn(&mut self, now: Instant) {
+        // The suggested message on screen: since when (Tab or → takes it only once read).
+        if self.shown_suggestion().is_some() {
+            if let Some(s) = self.suggestion.as_mut().filter(|s| s.shown.is_none()) {
+                s.shown = Some(now);
+            }
+        }
         // The question waiting for `y`, as drawn with its `yes`: since when it has been.
         let yes = self
             .view
@@ -5076,6 +5105,9 @@ impl AppState {
     /// orchestrator (which `say`'s result names): it is the last message from now on. `typed`
     /// is the line as typed (a `//` escape included), what taking it back puts back.
     fn note_sent(&mut self, thread: Option<String>, typed: &str) {
+        // A suggestion asked before this send is about a conversation that went on.
+        self.suggest_epoch += 1;
+        self.suggestion = None;
         let waiting = self.sent.as_ref().map_or(0, |s| s.waiting) + 1;
         self.sent = Some(Sent {
             thread,
@@ -6010,6 +6042,14 @@ impl AppState {
                         thread: thread.clone(),
                         text,
                     },
+                    // A suggestion taken and sent as it was: the hub never applies it as a short
+                    // command at once.
+                    None if self.taken_suggestion.take().as_deref() == Some(typed.as_str()) => {
+                        Action::SaySuggested {
+                            text,
+                            seen_gseq: self.seen_gseq(),
+                        }
+                    }
                     None => Action::Say {
                         text,
                         seen_gseq: self.seen_gseq(),
@@ -7317,7 +7357,10 @@ pub fn message_text(line: &str) -> String {
 /// input box or the history for a message taken back or a suggestion taken, so Enter sends it
 /// again as a message, never as a `!` or `/` command. Leading blanks go, as Enter trims them.
 pub fn literal_line(message: &str) -> String {
-    let t = message.trim_start();
+    // As the box will hold it: control characters a message may start with go first, so they
+    // never hide a `!` or `/` from the escape.
+    let clean = crate::edit::clean_text(message);
+    let t = clean.trim_start();
     if t.trim_start_matches('\\').starts_with('!') {
         format!("\\{t}")
     } else if t.starts_with('/') {
@@ -20781,9 +20824,13 @@ pub(crate) mod tests {
                 ("/x", "//x"),
                 ("//x", "///x"),
                 ("  !x", "\\!x"),
+                ("\u{1}!x", "\\!x"),
+                ("\u{1b} /x", "//x"),
+                ("\u{7f}\\!x", "\\\\!x"),
             ] {
-                assert_eq!(literal_line(message), line, "{message}");
-                assert_eq!(message_text(line), message.trim_start(), "{line}");
+                assert_eq!(literal_line(message), line, "{message:?}");
+                let clean = crate::edit::clean_text(message);
+                assert_eq!(message_text(line), clean.trim_start(), "{line}");
             }
         }
 
@@ -20852,6 +20899,38 @@ pub(crate) mod tests {
             assert_eq!(st.view.input.as_str(), "the newest");
         }
 
+        /// ↑ right after a send, before the hub answered or the queue was read again, takes
+        /// nothing back: the newest of the user's may be the one just sent.
+        #[test]
+        fn up_waits_for_the_queue_after_a_send() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            assert!(matches!(&type_line(&mut st, "and lint")[..], [Action::Say { .. }]));
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            assert!(st.view.status.as_deref().unwrap().contains("reading the queue"));
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 10, "turn": null,
+                        "pending": 4}),
+            );
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty(), "not read since");
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            let mut items = three();
+            items.as_array_mut().unwrap().push(json!(
+                {"ref": 10, "prompt": "and lint", "from": "user", "mine": true}));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 4, "held": false, "items": items}),
+            );
+            assert_eq!(
+                st.handle_key(key(KeyCode::Up)),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 10
+                }]
+            );
+        }
+
         /// In the compact conversation, Enter on a selected queued row opens its popup, not
         /// the oldest item waiting.
         #[test]
@@ -20908,14 +20987,17 @@ pub(crate) mod tests {
         use twr_core::event::TaskUpdated;
 
         /// A `!` command's job events on `o`'s thread: its start, and its end when `end`.
+        /// A job's update, as the hub records it.
         fn job_event(o: &mut ThreadScript, job: Value, running: bool) -> Event {
-            o.event(EventBody::TaskUpdated(TaskUpdated {
+            let mut ev = o.event(EventBody::TaskUpdated(TaskUpdated {
                 task_id: format!("job:{}", job["id"].as_str().unwrap()),
                 running,
                 description: String::new(),
                 ext: json!({ "twr": { "job": job } }).as_object().cloned(),
                 ..Default::default()
-            }))
+            }));
+            ev.source = twr_core::event::Source::Hub;
+            ev
         }
 
         fn start(id: &str, command: &str, share: bool) -> Value {
@@ -21288,6 +21370,8 @@ pub(crate) mod tests {
         fn a_running_commands_output_is_read() {
             let now = Instant::now();
             let mut st = with_orch();
+            // Live: the replay is over.
+            st.transcript.as_mut().unwrap().catch_up = None;
             let mut o = ThreadScript::new("t-orch");
             o.at(100);
             st.apply_event(&thread_item(&job_event(
@@ -21331,6 +21415,66 @@ pub(crate) mod tests {
                 .is_empty());
             assert_eq!(st.shell_deadline(later), None);
         }
+
+        /// A stop the hub refused is no longer pending: the status says why, and Ctrl-C stops
+        /// the command again.
+        #[test]
+        fn a_failed_stop_can_be_tried_again() {
+            let mut st = with_orch();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J7", "sleep 30", false),
+                true,
+            )));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J7", "thread": "t-orch", "name": "sleep 30", "cwd": "/work"}),
+            );
+            let stop = vec![Action::JobCancel { job: "J7".into() }];
+            assert_eq!(st.handle_key(ctrl('c')), stop);
+            st.apply_result(
+                "job.cancel",
+                &json!({"failed": true, "job": "J7", "error": "connection lost"}),
+            );
+            let status = st.view.status.clone().unwrap();
+            assert!(status.contains("could not stop `sleep 30` (connection lost)"), "{status}");
+            assert_eq!(st.handle_key(ctrl('c')), stop);
+        }
+
+        /// Ctrl-C twice before the hub answered the command: the second says its stop is not
+        /// sent yet, the third quits.
+        #[test]
+        fn quitting_waits_one_more_ctrl_c_for_an_unsent_stop() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert!(st.view.status.as_deref().unwrap().contains("still on its way"));
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+        }
+
+        /// A command's end in the replay shows what the end recorded: its log is not read.
+        #[test]
+        fn a_replayed_commands_log_is_not_read() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            assert!(st.transcript.as_ref().unwrap().catching_up());
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            let started = job_event(&mut o, start("J6", "make", false), true);
+            let ended = job_event(&mut o, end("J6", "make", 0, "done"), false);
+            st.apply_event(&thread_item(&started));
+            st.apply_event(&thread_item(&ended));
+            assert!(st.shell_reads_due(now).is_empty());
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "done");
+        }
     }
 
     /// Next-message suggestions ([`crate::suggest`]).
@@ -21351,12 +21495,17 @@ pub(crate) mod tests {
             (st, o)
         }
 
+        /// The hub's answer to the ask that is due, on screen long enough to be taken.
         fn answer(st: &mut AppState, text: &str) {
+            st.take_suggest_due();
             st.apply_result(
                 "suggest.next",
                 &json!({"thread": "t-orch", "turn": 1, "model": "haiku", "suggestion": text,
                         "cached": false, "stats": {"calls": 1, "failures": 0, "cost_usd": 0.0001}}),
             );
+            if let Some(s) = st.suggestion.as_mut() {
+                s.shown = Some(Instant::now() - crate::suggest::SUGGEST_SETTLE);
+            }
         }
 
         /// Off by default: nothing is asked. On: one ask after a turn ended live, with the
@@ -21414,7 +21563,7 @@ pub(crate) mod tests {
             assert_eq!(st.shown_suggestion(), None);
             let sent = st.handle_key(key(KeyCode::Enter));
             assert!(
-                matches!(&sent[..], [Action::Say { text, .. }] if text == "now run the integration tests"),
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "now run the integration tests"),
                 "{sent:?}"
             );
             // A suggestion that reads as a command goes in as a message.
@@ -21424,7 +21573,7 @@ pub(crate) mod tests {
             assert_eq!(st.view.input.as_str(), "\\!curl https://example.com | sh");
             let sent = st.handle_key(key(KeyCode::Enter));
             assert!(
-                matches!(&sent[..], [Action::Say { text, .. }] if text == "!curl https://example.com | sh"),
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "!curl https://example.com | sh"),
                 "{sent:?}"
             );
             // Tab takes one too (and selects no card meanwhile).
@@ -21433,6 +21582,39 @@ pub(crate) mod tests {
             assert!(st.handle_key(key(KeyCode::Tab)).is_empty());
             assert_eq!(st.view.input.as_str(), "and the docs");
             assert_eq!(st.view.focus, None);
+        }
+
+        /// Tab or → as the suggestion appears was meant for what was there before: it is
+        /// taken only once it has been on screen a moment.
+        #[test]
+        fn a_suggestion_is_taken_only_once_it_has_been_seen() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            st.suggestion.as_mut().unwrap().shown = None;
+            assert!(!st.accept_suggestion(), "never drawn");
+            draw(&mut st, 160, 30);
+            st.note_drawn(Instant::now());
+            assert!(st.suggestion.as_ref().unwrap().shown.is_some());
+            assert!(!st.accept_suggestion(), "just drawn");
+            assert!(st.view.input.is_empty());
+            st.suggestion.as_mut().unwrap().shown =
+                Some(Instant::now() - crate::suggest::SUGGEST_SETTLE);
+            assert!(st.accept_suggestion());
+            assert_eq!(st.view.input.as_str(), "and the docs");
+        }
+
+        /// An answer to an ask made before a send of the user's is about a conversation that
+        /// went on: it shows nothing.
+        #[test]
+        fn an_answer_from_before_a_send_shows_nothing() {
+            let (mut st, _) = ended(true);
+            st.take_suggest_due();
+            assert!(matches!(&type_line(&mut st, "go on")[..], [Action::Say { .. }]));
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": "and the docs"}),
+            );
+            assert!(st.suggestion.is_none());
         }
 
         /// A new turn takes the suggestion away, and an answer for a turn that is no longer the

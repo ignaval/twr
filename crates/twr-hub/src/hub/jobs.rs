@@ -446,6 +446,13 @@ impl Core {
         self.refuse_deleting(id)?;
         let name = view.name.clone();
         let shell = req.shell.clone();
+        // A `!` command is the user's, from `shell.run` only.
+        if shell.is_some() != (by == JobBy::Shell) {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "a `!` command comes from shell.run only",
+            ));
+        }
         // The orchestrator's view runs the user's `!` commands, recorded on its thread; its
         // agent runs no job.
         if view.is_orchestrator() && shell.is_none() {
@@ -746,6 +753,13 @@ impl Core {
                 "a thread's agent cancels only its own thread's jobs",
             ));
         }
+        // The user's `!` commands: only the user stops them.
+        if only.is_some() && self.jobs.jobs.get(&id).is_some_and(|j| j.shell.is_some()) {
+            return Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                "a `!` command is the user's: only the user stops it",
+            ));
+        }
         if let Some(j) = self.jobs.jobs.get(&id) {
             j.cancel.cancel("cancelled", true);
         }
@@ -756,7 +770,18 @@ impl Core {
     /// nothing: whatever stopped it should not start it again.
     pub(super) fn cancel_jobs_of(&self, thread: &str, why: &str) -> usize {
         let mut n = 0;
-        for j in self.jobs.jobs.values().filter(|j| j.thread == thread) {
+        // The orchestrator's runtime stopping (a stop, a reset, a switch) leaves the user's `!`
+        // commands of its view running: they are no work of its.
+        let orch = self
+            .registry
+            .get(thread)
+            .is_some_and(|v| v.is_orchestrator());
+        for j in self
+            .jobs
+            .jobs
+            .values()
+            .filter(|j| j.thread == thread && !(orch && j.shell.is_some()))
+        {
             j.cancel.cancel(why, false);
             n += 1;
         }
@@ -890,7 +915,8 @@ impl Core {
                 .registry
                 .get(&thread)
                 .is_none_or(|v| v.stopped || v.parked);
-            let told = !(job.quiet || resting)
+            // The user's `!` commands are theirs: an agent is never asked to run one again.
+            let told = !(job.quiet || job.shell || resting)
                 && {
                     let prompt = format!(
                         "[twr job {id}] {description}: lost, the hub stopped while it ran. Run it \
@@ -1143,7 +1169,7 @@ async fn run_job(hub: Arc<Inner>, id: String) {
 
 /// Starts job `id`'s process and waits for its end, renewing its task meanwhile.
 async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Instant) -> Outcome {
-    let Some((argv, cwd, env, log, timeout, name)) = ({
+    let Some((argv, cwd, env, log, timeout, name, shell)) = ({
         let core = hub.core();
         core.jobs.jobs.get(id).map(|j| {
             (
@@ -1153,6 +1179,7 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
                 j.log.clone(),
                 j.timeout,
                 j.name.clone(),
+                j.shell.is_some(),
             )
         })
     }) else {
@@ -1253,7 +1280,8 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
             _ = cancel.cancelled() => break Outcome::Cancelled(cancel.why()),
             _ = sleep_until_opt(deadline) => break Outcome::TimedOut,
             _ = renew.tick() => {
-                progress(hub, id, format!("job {name}: running {}", duration_text(started.elapsed())), true);
+                let what = if shell { "!" } else { "job" };
+                progress(hub, id, format!("{what} {name}: running {}", duration_text(started.elapsed())), true);
             }
             _ = snapshot.tick(), if reading.is_none() => {
                 let hook = hub.job_members_hook.clone();
@@ -1454,6 +1482,7 @@ fn release(
     let Some((thread, by)) = core.jobs.jobs.get(id).map(|j| (j.thread.clone(), j.by)) else {
         return Err(Outcome::Cancelled("gone".into()));
     };
+    let shell = by == JobBy::Shell;
     if cancel.is_set() {
         return Err(Outcome::Cancelled(cancel.why()));
     }
@@ -1465,7 +1494,7 @@ fn release(
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),
         running: true,
-        description: format!("job {name}: running"),
+        description: format!("{} {name}: running", if shell { "!" } else { "job" }),
         ext: twr_ext_map(json!({"job": {"id": id, "pgid": pid, "start_time": start_time}})),
         ..Default::default()
     });

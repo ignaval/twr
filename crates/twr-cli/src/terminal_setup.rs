@@ -375,7 +375,23 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
     let Some(file) = place.file(t) else {
         return Ok(Outcome::Manual);
     };
-    let old = match std::fs::read_to_string(&file) {
+    // A link (a dotfiles manager's) or anything but a regular file: not replaced, by hand.
+    match std::fs::symlink_metadata(&file) {
+        Ok(m) if m.file_type().is_symlink() => {
+            return Ok(Outcome::Unsafe {
+                file,
+                why: "it is a link (to a dotfiles folder?); twr won't replace it".into(),
+            })
+        }
+        Ok(m) if !m.is_file() => {
+            return Ok(Outcome::Unsafe {
+                file,
+                why: "it is not a regular file".into(),
+            })
+        }
+        _ => {}
+    }
+    let old = match read_plain(&file) {
         Ok(s) => Some(s),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
@@ -417,8 +433,9 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
             let mut name = file.file_name().unwrap_or_default().to_os_string();
             name.push(format!(".twr-backup-{stamp}"));
             let backup = file.with_file_name(name);
-            std::fs::copy(&file, &backup)
-                .with_context(|| format!("backing up {}", file.display()))?;
+            create_private(&backup, old.as_deref().unwrap_or_default()).with_context(|| {
+                format!("backing up {} to {}", file.display(), backup.display())
+            })?;
             Some(backup)
         }
         None => {
@@ -438,14 +455,55 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
 fn write_replacing(file: &Path, text: &str) -> anyhow::Result<()> {
     let dir = file.parent().unwrap_or(Path::new("."));
     let mut name = file.file_name().unwrap_or_default().to_os_string();
-    name.push(".twr-new");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    name.push(format!(".twr-new-{}-{nonce:x}", std::process::id()));
     let tmp = dir.join(name);
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(file) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    let mut f = create_private(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    // The mode the file had (it was read as a regular file, not through a link).
+    if let Some(meta) = std::fs::symlink_metadata(file).ok().filter(|m| m.is_file()) {
+        let _ = f.set_permissions(meta.permissions());
     }
-    std::fs::rename(&tmp, file).with_context(|| format!("replacing {}", file.display()))?;
+    use std::io::Write;
+    let _ = f.flush();
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, file) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", file.display()));
+    }
     Ok(())
+}
+
+/// Creates `path` anew (never through a link, never over a file that is there), private to
+/// the user, holding `text`.
+fn create_private(path: &Path, text: &str) -> std::io::Result<std::fs::File> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.write_all(text.as_bytes())?;
+    Ok(f)
+}
+
+/// The text of `path`, read without following a link or waiting on a FIFO put in its place.
+fn read_plain(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    Ok(s)
 }
 
 /// What a settings file needs.
@@ -1035,6 +1093,41 @@ mod tests {
             edit(&place, Terminal::Kitty).unwrap(),
             Outcome::Already { file: kitty }
         );
+    }
+
+    /// A config that is a link (a dotfiles folder) or a FIFO is left alone; a link planted at
+    /// a backup's or a temporary file's name is never written through.
+    #[test]
+    fn links_and_fifos_are_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let place = place_in(dir.path(), false);
+        let conf = dir.path().join(".config/kitty");
+        std::fs::create_dir_all(&conf).unwrap();
+        let target = dir.path().join("dotfiles-kitty.conf");
+        std::fs::write(&target, "font_size 12\n").unwrap();
+        std::os::unix::fs::symlink(&target, conf.join("kitty.conf")).unwrap();
+        assert!(matches!(
+            edit(&place, Terminal::Kitty).unwrap(),
+            Outcome::Unsafe { .. }
+        ));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "font_size 12\n");
+        std::fs::remove_file(conf.join("kitty.conf")).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(conf.join("kitty.conf"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(matches!(
+            edit(&place, Terminal::Kitty).unwrap(),
+            Outcome::Unsafe { .. }
+        ));
+        // `create_private` never writes through a link.
+        let secret = dir.path().join("secret");
+        std::fs::write(&secret, "key").unwrap();
+        let planted = dir.path().join("planted");
+        std::os::unix::fs::symlink(&secret, &planted).unwrap();
+        assert!(create_private(&planted, "x").is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "key");
     }
 
     #[test]

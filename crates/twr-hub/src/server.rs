@@ -1667,6 +1667,10 @@ struct SayParams {
     seen_gseq: Option<u64>,
     /// `"orchestrator"`: hand the message to the orchestrator without routing it.
     to: Option<String>,
+    /// The message is a suggested one the user took unedited (`hub::suggest`): never applied
+    /// as a short command at once.
+    #[serde(default)]
+    suggested: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1991,7 +1995,9 @@ async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => hub.say_to_orchestrator(&p.message, p.seen_gseq, caller),
+        Some("orchestrator") => {
+            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
+        }
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),

@@ -75,8 +75,11 @@ impl Hub {
             .iter()
             .map(|r| {
                 let (text, truncated) = preview(&r.prompt, QUEUE_PREVIEW_MAX);
+                // Sent as it stands by the user: a gated send let go later holds the reports
+                // agents wrote, which no edit may put in the user's input box as theirs.
                 let mine = r.from == TurnFrom::User
-                    && matches!(r.source, twr_core::event::Source::User(_));
+                    && matches!(r.source, twr_core::event::Source::User(_))
+                    && r.user_sent;
                 json!({
                     "ref": r.id,
                     "prompt": text,

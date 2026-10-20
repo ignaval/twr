@@ -611,6 +611,19 @@ impl Hub {
         seen_gseq: Option<u64>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
+        self.say_to_orchestrator_as(message, seen_gseq, caller, false)
+    }
+
+    /// [`Hub::say_to_orchestrator`]; `suggested`: the message is a suggestion the user took
+    /// unedited (`hub::suggest`), never applied as a short command at once: it goes to the
+    /// orchestrator as a message, whatever it reads like now.
+    pub fn say_to_orchestrator_as(
+        &self,
+        message: &str,
+        seen_gseq: Option<u64>,
+        caller: &Caller,
+        suggested: bool,
+    ) -> Result<Value, RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
                 codes::BAD_REQUEST,
@@ -661,8 +674,10 @@ impl Hub {
         // orchestrator is reused), so a failure after it loses nothing.
         let orch = core.ensure_orchestrator(&self.inner)?;
         let seen = seen_cap(seen_gseq, core.gseq);
-        if let Some(result) = core.apply_command(&self.inner, &orch, message, seen, caller)? {
-            return Ok(result);
+        if !suggested {
+            if let Some(result) = core.apply_command(&self.inner, &orch, message, seen, caller)? {
+                return Ok(result);
+            }
         }
         let mut batch = Batch::default();
         let d = batch.push(

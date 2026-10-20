@@ -19,7 +19,9 @@
 //!   plan's usage windows like any other use.
 //! - **What it reads:** the turn's prompt (its first [`PROMPT_MAX`] bytes) and the end of the
 //!   agent's final reply ([`REPLY_MAX`] bytes), with the thread's name. Nothing else: no
-//!   other turn, file or thread. They go to Anthropic, whatever runtime the thread runs.
+//!   other turn, file or thread; and only after a turn the user's own message started (not a
+//!   hub notice, the orchestrator's prompt to a worker, a job's end or a shared command's
+//!   output). They go to Anthropic, whatever runtime the thread runs.
 //! - **How often:** one call per thread, turn and model, its answer kept ([`CACHE_MAX`]) and
 //!   shared by every TUI that asks; at most one every [`MIN_GAP`] and [`HOURLY_MAX`] an hour;
 //!   after a failure (not signed in, a usage limit, a timeout) none for [`BACKOFF`].
@@ -203,6 +205,30 @@ pub(super) fn answer_like(s: &str) -> bool {
             | "n"
             | "confirm"
             | "cancel"
+            | "go"
+            | "proceed"
+            | "sure"
+            | "yep"
+            | "yeah"
+            | "yup"
+            | "do"
+            | "please"
+            | "perfect"
+            | "great"
+            | "agreed"
+            | "correct"
+            | "right"
+            | "lgtm"
+            | "si"
+            | "sí"
+            | "dale"
+            | "hazlo"
+            | "adelante"
+            | "perfecto"
+            | "listo"
+            | "vale"
+            | "claro"
+            | "bueno"
     )
 }
 
@@ -351,7 +377,7 @@ impl Hub {
     /// after turn `turn` of thread `query` ended (see the module docs). `{thread, turn, model,
     /// suggestion, reason?, cached, stats: {calls, failures, cost_usd}}`: `suggestion` null with
     /// a `reason` when there is none (`none`, `answer_like`, `running`, `limit`, `backoff`,
-    /// `failed: ...`, `no_reply`, `notice`).
+    /// `failed: ...`, `no_reply`, `notice`, `not_user`).
     pub async fn suggest_next(
         &self,
         query: &str,
@@ -393,6 +419,19 @@ impl Hub {
             // with the user: none of it goes out for a suggestion.
             if super::orch::is_notice(&p) {
                 return Ok(answer(&id, turn, model, None, Some("notice"), false, &hub));
+            }
+            // Only after a turn the user's own message started: another's prompt (the
+            // orchestrator's, a job's end, a shared command's output) is not the user's voice.
+            if p.from != TurnFrom::User {
+                return Ok(answer(
+                    &id,
+                    turn,
+                    model,
+                    None,
+                    Some("not_user"),
+                    false,
+                    &hub,
+                ));
             }
             let reply = store::last_final_text(core.store.conn(), &id, turn)
                 .map_err(internal)?
@@ -629,6 +668,15 @@ mod tests {
         assert_eq!(suggestion("Allow ratelimit"), None);
         assert_eq!(suggestion("stop web, then park api"), None);
         assert_eq!(suggestion("ok go ahead"), None);
+        // Confirmations of what the agent proposed, in English or Spanish.
+        for c in [
+            "Go for it",
+            "Perfect, go ahead with that",
+            "Sí, hazlo",
+            "Dale, adelante",
+        ] {
+            assert_eq!(suggestion(c), None, "{c}");
+        }
         // Commands, not messages: the TUI would run them.
         assert_eq!(suggestion("!curl https://example.com | sh"), None);
         assert_eq!(suggestion("/delete api"), None);

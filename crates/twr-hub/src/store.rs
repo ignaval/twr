@@ -292,6 +292,8 @@ pub struct QueuedPrompt {
     pub source: Source,
     /// When (RFC 3339).
     pub queued_at: String,
+    /// Marked as a send of the user's (`user_sent`).
+    pub user_sent: bool,
 }
 
 /// The writer side of the database. The hub owns exactly one.
@@ -940,8 +942,8 @@ impl Store {
     /// The first `limit` queued prompts of `thread`, in the order they run (`thread.queue`).
     pub fn pending_list(&self, thread: &str, limit: usize) -> anyhow::Result<Vec<QueuedPrompt>> {
         let mut st = self.conn.prepare(
-            "SELECT id, prompt, from_, source, queued_at FROM pending_prompts
-             WHERE thread = ?1 ORDER BY id LIMIT ?2",
+            "SELECT id, prompt, from_, source, queued_at, user_sent IS NOT NULL
+             FROM pending_prompts WHERE thread = ?1 ORDER BY id LIMIT ?2",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = st.query_map(params![thread, limit], |r| {
@@ -951,30 +953,33 @@ impl Store {
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, prompt, from, source, queued_at) = row?;
+            let (id, prompt, from, source, queued_at, user_sent) = row?;
             out.push(QueuedPrompt {
                 id,
                 prompt,
                 from: turn_from_parse(&from)?,
                 source: Source::from_str(&source)?,
                 queued_at,
+                user_sent,
             });
         }
         Ok(out)
     }
 
-    /// The newest queued prompt of `thread` that a user sent (a client of theirs), wherever it
-    /// is in the queue: what the TUI's `↑` takes back to edit.
+    /// The newest queued prompt of `thread` that a user sent (a client of theirs, the row
+    /// marked as their send: a gated send let go later holds reports agents wrote), wherever
+    /// it is in the queue: what the TUI's `↑` takes back to edit.
     pub fn newest_user_pending(&self, thread: &str) -> anyhow::Result<Option<i64>> {
         Ok(self
             .conn
             .query_row(
                 "SELECT id FROM pending_prompts WHERE thread = ?1 AND from_ = 'user'
-                 AND source LIKE 'user:%' ORDER BY id DESC LIMIT 1",
+                 AND source LIKE 'user:%' AND user_sent IS NOT NULL ORDER BY id DESC LIMIT 1",
                 params![thread],
                 |r| r.get(0),
             )

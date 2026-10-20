@@ -1403,11 +1403,14 @@ impl Core {
                 // Its first turn: the handoff (if any) is delivered, or never will be.
                 self.orch.pending_handoff = None;
                 // A message taken back is told by every turn the hub starts with a prompt
-                // until one completes. A turn the runtime starts on its own
-                // right after a taken-back one continues that work: it is taken back too,
-                // unless a user message arrived since.
+                // until one completes. A turn the runtime starts on its own (its own events,
+                // not a prompt the hub queued) right after a taken-back one continues that
+                // work: it is taken back too, unless a user message arrived since.
                 let n = ev.turn.unwrap_or_default();
-                if p.from == TurnFrom::Runtime {
+                // A turn the hub started from a prompt it queued for the runtime (a shared `!!`
+                // command's output, a job's end) is no continuation: it is told, as any prompt
+                // the hub delivers.
+                if p.from == TurnFrom::Runtime && ev.source != Source::Hub {
                     if n > 0
                         && self.orch.withdrawn_turns.contains(&(n - 1))
                         && self.orch.latest_arrival <= self.orch.withdrawn_at
@@ -1482,7 +1485,14 @@ impl Core {
                 self.orch.withdrawn_at = self.gseq;
                 if let Some(t) = self.orch.turn.as_mut().filter(|t| Some(t.turn) == ev.turn) {
                     t.proposals.clear();
-                    let taken = (t.turn, t.prompt.clone(), None);
+                    // Only the user's own words are quoted back: a turn the hub started (a shared
+                    // command's output) is told without its text.
+                    let quoted = if t.user {
+                        t.prompt.clone()
+                    } else {
+                        String::new()
+                    };
+                    let taken = (t.turn, quoted, None);
                     self.orch.taken_back.push(taken);
                 }
             }
@@ -2402,6 +2412,11 @@ impl Core {
             .iter()
             .filter(|(_, _, told)| *told == Some(turn))
             .map(|(_, prompt, _)| {
+                if prompt.trim().is_empty() {
+                    return "The user stopped a turn the hub had started (not a message of \
+                            theirs); disregard what it asked for and anything begun for it."
+                        .to_string();
+                }
                 format!(
                     "The user took back their message «{}»; disregard it and anything begun \
                      for it.",

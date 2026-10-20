@@ -62,6 +62,11 @@ pub fn submit_request(action: &Action) -> Option<(&'static str, Value)> {
             "say",
             json!({ "message": text, "seen_gseq": seen_gseq, "to": "orchestrator" }),
         )),
+        Action::SaySuggested { text, seen_gseq } => Some((
+            "say",
+            json!({ "message": text, "seen_gseq": seen_gseq, "to": "orchestrator",
+                    "suggested": true }),
+        )),
         Action::Send { thread, text } => {
             Some(("thread.send", json!({"thread": thread, "prompt": text})))
         }
@@ -413,7 +418,9 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             Some(("attention.respond", p))
         }
-        Action::Say { .. } | Action::Send { .. } => submit_request(action),
+        Action::Say { .. } | Action::SaySuggested { .. } | Action::Send { .. } => {
+            submit_request(action)
+        }
         Action::Withdraw { thread, msg_ref } => Some((
             "message.withdraw",
             json!({"thread": thread, "ref": msg_ref}),
@@ -1813,8 +1820,6 @@ async fn serve_calls(
                     || method == "thread.activity"
                     || method == "thread.queue"
                     || method == "message.send_now"
-                    || method == "shell.run"
-                    || method == "shell.cd"
                     || method == "job.log"
                     || method == "hub.info"
                     || method == "trash.list"
@@ -1830,6 +1835,11 @@ async fn serve_calls(
                     || method == "thread.queue" =>
             {
                 let _ = results.view.send((method, Value::Null));
+            }
+            // A stop that failed: said, and no longer pending.
+            Err(e) if method == "job.cancel" => {
+                let failed = json!({"failed": true, "job": named_job, "error": format!("{e:#}")});
+                let _ = results.view.send((method, failed));
             }
             // A command's log that can't be read: it shows what its end recorded.
             Err(_) if method == "job.log" => {

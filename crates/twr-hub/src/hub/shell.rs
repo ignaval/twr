@@ -109,7 +109,9 @@ pub(super) fn shell_output(log: &Path, max: u64) -> String {
     let Ok(meta) = f.metadata() else {
         return String::new();
     };
-    if !meta.is_file() {
+    // A regular file of this job's alone (no hard link to another file put in its place).
+    use std::os::unix::fs::MetadataExt;
+    if !meta.is_file() || meta.nlink() != 1 {
         return String::new();
     }
     let len = meta.len();
@@ -150,10 +152,11 @@ fn fence_for(text: &str) -> String {
 /// how it ended (`what`) and the end of its output, quoted as data.
 pub(super) fn shell_prompt(s: &ShellJob, cwd: &Path, what: &str, output: &str) -> String {
     let command_fence = fence_for(&s.command);
+    // The folder on one line, as text: its name is no instruction either.
+    let folder = crate::report::display_text(&cwd.display().to_string(), false);
     let head = format!(
-        "[twr: the user ran a shell command and shared it with you] In {}, they ran\n\
+        "[twr: the user ran a shell command and shared it with you] In {folder}, they ran\n\
          {command_fence}\n{}\n{command_fence}\nwhich {what}.",
-        cwd.display(),
         s.command
     );
     if output.trim().is_empty() {
@@ -199,6 +202,20 @@ impl Hub {
         if command.contains('\0') {
             return Err(rpc(codes::BAD_REQUEST, "the command holds a NUL byte"));
         }
+        // The folder is looked at before the hub's lock is taken: a slow filesystem holds up
+        // this request only.
+        let asked_dir = match req.cwd.as_deref() {
+            Some(d) => {
+                let base = super::orch::orchestrator_cwd(&self.inner.config);
+                Some(resolve_dir(&base, d).map_err(|e| rpc(codes::BAD_REQUEST, e))?)
+            }
+            None => None,
+        };
+        let default_dir = match &asked_dir {
+            Some(_) => None,
+            None => resolve_dir(&super::orch::orchestrator_cwd(&self.inner.config), ".").ok(),
+        };
+        let program = shell_program();
         let mut core = self.inner.core();
         let id = match &req.thread {
             Some(t) => core.resolve(t)?,
@@ -212,12 +229,12 @@ impl Hub {
         };
         let view = core.view(&id)?.clone();
         let cwd = if view.is_orchestrator() {
-            let base = super::orch::orchestrator_cwd(&self.inner.config);
-            let dir = match req.cwd.as_deref() {
-                Some(d) => resolve_dir(&base, d),
-                None => resolve_dir(&base, "."),
-            }
-            .map_err(|e| rpc(codes::BAD_REQUEST, e))?;
+            let dir = asked_dir.or(default_dir).ok_or_else(|| {
+                rpc(
+                    codes::BAD_REQUEST,
+                    "the orchestrator's folder is not there: `!cd` to another",
+                )
+            })?;
             Some(dir)
         } else {
             if req.cwd.is_some() {
@@ -232,7 +249,8 @@ impl Hub {
             None
         };
         let start = JobStart {
-            argv: vec![shell_program(), "-c".into(), command.clone()],
+            // `--`: a command that starts with `-` is the command, not the shell's options.
+            argv: vec![program, "-c".into(), "--".into(), command.clone()],
             name: Some(shell_name(&command)),
             shell: Some(ShellJob {
                 command,

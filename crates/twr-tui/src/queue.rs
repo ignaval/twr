@@ -69,6 +69,8 @@ pub struct QueueView {
     pub fetched: Option<Instant>,
     /// Something changed since the last read: read again at once.
     pub dirty: bool,
+    /// Something changed then, and no read asked since has answered: the list may be stale.
+    pub changed: Option<Instant>,
     /// The last read failed: the next waits [`QUEUE_RETRY`].
     pub failed: bool,
 }
@@ -125,6 +127,7 @@ impl AppState {
     pub fn queue_changed(&mut self, thread: &str) {
         if let Some(q) = self.queue.as_mut().filter(|q| q.thread == thread) {
             q.dirty = true;
+            q.changed = Some(Instant::now());
         }
     }
 
@@ -190,6 +193,11 @@ impl AppState {
         if result["thread"].as_str() != Some(q.thread.as_str()) {
             return;
         }
+        if let (Some(asked), Some(changed)) = (q.asked, q.changed) {
+            if asked >= changed {
+                q.changed = None;
+            }
+        }
         q.asked = None;
         q.fetched = Some(now);
         q.failed = false;
@@ -212,7 +220,15 @@ impl AppState {
         if !self.view.input.is_empty() {
             return None;
         }
-        let newest = self.shown_queue()?.newest_mine?;
+        let q = self.shown_queue()?;
+        let newest = q.newest_mine?;
+        // A message sent and not answered yet, or a list read before a change: the newest of
+        // the user's may not be the one listed.
+        let unsure = q.changed.is_some() || self.sent.as_ref().is_some_and(|s| s.waiting > 0);
+        if unsure {
+            self.view.status = Some("reading the queue: ↑ again in a moment".into());
+            return Some(Vec::new());
+        }
         Some(self.retract_queued(newest, Retract::Edit))
     }
 

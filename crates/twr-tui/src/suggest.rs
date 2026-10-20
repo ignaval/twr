@@ -19,7 +19,13 @@ pub struct Suggestion {
     pub turn: u64,
     /// The message.
     pub text: String,
+    /// When a frame first showed it (Tab or → takes it only [`SUGGEST_SETTLE`] after).
+    pub shown: Option<std::time::Instant>,
 }
+
+/// How long a suggestion must have been on screen before Tab or → takes it: a key pressed as
+/// it appeared was meant for what was there before (Tab selects a card).
+pub const SUGGEST_SETTLE: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// A suggestion to ask for ([`AppState::take_suggest_due`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +67,7 @@ impl AppState {
         if !self.view.suggest {
             return None;
         }
+        self.suggest_asked = Some((thread.clone(), turn, self.suggest_epoch));
         Some(Ask {
             thread,
             turn,
@@ -89,7 +96,12 @@ impl AppState {
         let Some(text) = r["suggestion"].as_str().filter(|t| !t.trim().is_empty()) else {
             return;
         };
-        let still = self.main_thread().as_deref() == Some(thread)
+        // Asked before a send of the user's since: about a conversation that went on.
+        let asked = self.suggest_asked.as_ref().is_some_and(|(t, n, epoch)| {
+            t == thread && *n == turn && *epoch == self.suggest_epoch
+        });
+        let still = asked
+            && self.main_thread().as_deref() == Some(thread)
             && self
                 .registry
                 .get(thread)
@@ -99,6 +111,7 @@ impl AppState {
                 thread: thread.to_string(),
                 turn,
                 text: text.to_string(),
+                shown: None,
             });
         }
     }
@@ -136,10 +149,21 @@ impl AppState {
         let Some(text) = self.shown_suggestion().map(str::to_string) else {
             return false;
         };
+        // Only one read: drawn, and on screen a moment before the key.
+        let read = self
+            .suggestion
+            .as_ref()
+            .and_then(|s| s.shown)
+            .is_some_and(|at| at.elapsed() >= SUGGEST_SETTLE);
+        if !read {
+            return false;
+        }
         self.suggestion = None;
         let (cols, rows) = (self.input_cols(), self.input_rows());
         // A message, never a command: a suggestion that starts with `!` or `/` is escaped.
-        self.view.input.set(&crate::app::literal_line(&text));
+        let line = crate::app::literal_line(&text);
+        self.view.input.set(&line);
+        self.taken_suggestion = Some(line);
         self.view.input.keep_visible(cols, rows);
         self.view.popup_sel = 0;
         true
