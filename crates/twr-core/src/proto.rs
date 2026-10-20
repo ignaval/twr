@@ -6,6 +6,10 @@
 //!
 //! A subscription request is answered with a normal response, after which the server writes
 //! stream items on the same connection until it closes.
+//!
+//! An error with id 0 is about the connection, which the hub closes next: a line it could not
+//! read (`bad_request`), or the hub stopping ([`codes::STOPPING`]). The request a client waits
+//! for then was not done ([`crate::client::HubClosed`]).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

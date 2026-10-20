@@ -107,35 +107,65 @@ pub fn build_id() -> Option<&'static str> {
 /// removed or moved), the error says so and what to do.
 pub fn current_exe() -> anyhow::Result<std::path::PathBuf> {
     use anyhow::Context;
+    use std::os::unix::fs::MetadataExt;
     let exe = std::env::current_exe().context("locating the twr executable")?;
-    exe_to_start(exe, |p| p.is_file())
+    let linux = cfg!(target_os = "linux");
+    // The running file, whatever its name now (Linux: `/proc/self/exe` opens it even deleted).
+    let running = if linux {
+        std::fs::metadata("/proc/self/exe")
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    } else {
+        None
+    };
+    exe_to_start(exe, linux, |p| match std::fs::metadata(p) {
+        Ok(m) if m.is_file() && running == Some((m.dev(), m.ino())) => Found::Running,
+        Ok(m) if m.is_file() => Found::Other,
+        _ => Found::Missing,
+    })
 }
 
-/// [`current_exe`] of what `std::env::current_exe` read (`exe`), with `is_file` telling which
-/// paths name a file.
+/// What a path names, to [`exe_to_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// The file this process runs.
+    Running,
+    /// Another file.
+    Other,
+    /// No file.
+    Missing,
+}
+
+/// [`current_exe`] of what `std::env::current_exe` read (`exe`), on Linux (`linux`) or not,
+/// with `found` telling what a path names.
 fn exe_to_start(
     exe: std::path::PathBuf,
-    is_file: impl Fn(&std::path::Path) -> bool,
+    linux: bool,
+    found: impl Fn(&std::path::Path) -> Found,
 ) -> anyhow::Result<std::path::PathBuf> {
     use std::os::unix::ffi::OsStrExt;
-    if is_file(&exe) {
+    if found(&exe) == Found::Running {
         return Ok(exe);
     }
-    // What the kernel appends to `/proc/self/exe` once the file is gone from its path.
+    // What Linux appends to `/proc/self/exe` once the file is gone from its path. A file that
+    // has that name but is not the running one is someone else's: what is at `<path>` now is
+    // what replaced it.
     let replaced = exe
         .as_os_str()
         .as_bytes()
         .strip_suffix(b" (deleted)")
+        .filter(|_| linux)
         .map(|p| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p)));
-    match replaced {
-        Some(path) if is_file(&path) => Ok(path),
-        replaced => Err(anyhow::anyhow!(
-            "the twr executable this process started from, {}, is gone (removed or moved since \
-             it started): start twr again from a shell where the installed twr is on PATH \
-             (quit and reopen the TUI)",
-            replaced.as_deref().unwrap_or(&exe).display()
-        )),
+    let path = replaced.unwrap_or(exe);
+    if found(&path) != Found::Missing {
+        return Ok(path);
     }
+    Err(anyhow::anyhow!(
+        "the twr executable this process started from, {}, is gone (removed or moved since it \
+         started): start twr again from a shell where the installed twr is on PATH (quit and \
+         reopen the TUI)",
+        path.display()
+    ))
 }
 
 /// The build id of the executable at `path`: the first [`BUILD_ID_LEN`] lowercase hex digits
@@ -191,23 +221,51 @@ mod tests {
         }
     }
 
-    /// The path `current_exe` read is started when it names a file; `<path> (deleted)` (Linux,
-    /// once the file was replaced) starts what replaced it, and fails when nothing did.
+    /// The path `current_exe` read is started when it names a file; on Linux,
+    /// `<path> (deleted)` (once the file was replaced) starts what replaced it, unless it is
+    /// the running file's own name, and fails when nothing did.
     #[test]
     fn the_exe_to_start_survives_a_replaced_file() {
+        use super::Found::{self, *};
         use std::path::{Path, PathBuf};
-        let files = [Path::new("/bin/twr"), Path::new("/odd/twr (deleted)")];
-        let is_file = |p: &Path| files.contains(&p);
-        let start = |p: &str| super::exe_to_start(PathBuf::from(p), is_file);
-        assert_eq!(start("/bin/twr").unwrap(), Path::new("/bin/twr"));
-        assert_eq!(start("/bin/twr (deleted)").unwrap(), Path::new("/bin/twr"));
-        // A file really named so.
+        let start = |p: &str, linux: bool, files: &[(&str, Found)]| {
+            let found = |q: &Path| {
+                files
+                    .iter()
+                    .find(|(f, _)| Path::new(f) == q)
+                    .map_or(Missing, |(_, k)| *k)
+            };
+            super::exe_to_start(PathBuf::from(p), linux, found)
+        };
+        let ok = |r: anyhow::Result<PathBuf>| r.unwrap().display().to_string();
         assert_eq!(
-            start("/odd/twr (deleted)").unwrap(),
-            Path::new("/odd/twr (deleted)")
+            ok(start("/bin/twr", true, &[("/bin/twr", Running)])),
+            "/bin/twr"
         );
-        for gone in ["/gone/twr (deleted)", "/gone/twr"] {
-            let e = start(gone).unwrap_err().to_string();
+        // Replaced: the new build.
+        let new = [("/bin/twr", Other)];
+        assert_eq!(ok(start("/bin/twr (deleted)", true, &new)), "/bin/twr");
+        // Replaced, beside an unrelated file named like the old one.
+        let both = [("/bin/twr", Other), ("/bin/twr (deleted)", Other)];
+        assert_eq!(ok(start("/bin/twr (deleted)", true, &both)), "/bin/twr");
+        // A running file really named so.
+        let odd = [("/odd/twr (deleted)", Running), ("/odd/twr", Other)];
+        assert_eq!(
+            ok(start("/odd/twr (deleted)", true, &odd)),
+            "/odd/twr (deleted)"
+        );
+        // Not Linux: the name means nothing (macOS keeps the path, which the new build has).
+        assert_eq!(ok(start("/bin/twr", false, &new)), "/bin/twr");
+        let e = start("/bin/twr (deleted)", false, &new)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("/bin/twr (deleted), is gone"), "{e}");
+        for (gone, linux) in [
+            ("/gone/twr (deleted)", true),
+            ("/gone/twr", true),
+            ("/gone/twr", false),
+        ] {
+            let e = start(gone, linux, &[]).unwrap_err().to_string();
             assert!(e.contains("/gone/twr, is gone"), "{e}");
             assert!(e.contains("start twr again"), "{e}");
         }

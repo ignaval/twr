@@ -10,12 +10,12 @@ use anyhow::{anyhow, Context};
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::blob::BlobFetch;
 use crate::proto::{
-    codes, read_frame, write_frame, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
+    codes, encode_line, read_frame, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
     PROTOCOL_VERSION,
 };
 
@@ -233,7 +233,8 @@ impl Client {
             method: method.to_string(),
             params,
         };
-        if let Err(e) = write_frame(&mut self.writer, &req).await {
+        let line = encode_line(&req).context("encoding request")?;
+        if let Err(e) = self.writer.write_all(line.as_bytes()).await {
             if !connection_closed(&e) {
                 return Err(anyhow::Error::new(e).context("writing request to hub"));
             }
@@ -243,6 +244,14 @@ impl Client {
                 .await
                 .unwrap_or(None);
             return Err(HubClosed::new(method, false, said, Some(e)).into());
+        }
+        // Written whole (a socket's flush does nothing, another stream's may), the hub may have
+        // it: a failure from here on may come after it was done.
+        if let Err(e) = self.writer.flush().await {
+            if !connection_closed(&e) {
+                return Err(anyhow::Error::new(e).context("writing request to hub"));
+            }
+            return Err(HubClosed::new(method, true, None, Some(e)).into());
         }
         loop {
             let msg = match read_frame::<_, ServerMessage>(&mut self.reader).await {
@@ -448,7 +457,7 @@ impl Subscription {
 mod tests {
     use super::*;
     use crate::event::{Event, EventBody, SessionPayload, Source};
-    use crate::proto::{codes, Response, RpcError, StreamKind};
+    use crate::proto::{codes, write_frame, Response, RpcError, StreamKind};
     use futures::StreamExt;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -545,6 +554,50 @@ mod tests {
             "the hub closed the connection before answering thread.send; it may have been \
              done, so check before trying again; is it running? `twr info`"
         );
+    }
+
+    /// A stream that takes every byte, then fails to flush: the hub may have the request.
+    struct FlushFails(tokio::io::DuplexStream);
+
+    impl AsyncRead for FlushFails {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushFails {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// A request written whole whose flush fails may have been done: never resent.
+    #[tokio::test]
+    async fn a_failed_flush_after_a_whole_request_is_not_resendable() {
+        let (c, _hub) = tokio::io::duplex(1 << 16);
+        let mut c = Client::from_io(FlushFails(c));
+        let (closed, _) = closed_on(&mut c).await;
+        assert!(closed.maybe_done && !closed.resendable(), "{closed:?}");
     }
 
     /// A request the hub could not read (an oversized line, malformed JSON) is refused with
