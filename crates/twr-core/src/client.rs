@@ -86,6 +86,119 @@ fn check_socket_owner(path: &Path, peer: std::io::Result<u32>, me: u32) -> anyho
     }
 }
 
+/// How long a call whose request could not be written waits for what the hub said as it
+/// closed the connection ([`parting_words`]): it is already there, or never comes.
+const PARTING_READ: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The hub closed a call's connection before answering it: it stopped or restarted (or
+/// crashed) since the connection was opened, or could not read the request. [`Client::call`]
+/// returns it (`err.downcast_ref::<HubClosed>()`); its source is the I/O error that showed it,
+/// if one did.
+#[derive(Debug)]
+pub struct HubClosed {
+    /// The method called.
+    pub method: String,
+    /// Whether the hub may have done it: it had the request whole and closed before it
+    /// answered. When not, nothing was done ([`HubClosed::resendable`]).
+    pub maybe_done: bool,
+    /// What the hub said as it closed: its error for the connection (request 0), such as
+    /// [`codes::STOPPING`] or a request it could not read ([`codes::BAD_REQUEST`]).
+    pub said: Option<RpcError>,
+    io: Option<std::io::Error>,
+}
+
+impl HubClosed {
+    fn new(
+        method: &str,
+        maybe_done: bool,
+        said: Option<RpcError>,
+        io: Option<std::io::Error>,
+    ) -> HubClosed {
+        HubClosed {
+            method: method.to_string(),
+            maybe_done,
+            said,
+            io,
+        }
+    }
+
+    /// Whether the request can be sent again on a new connection: the hub did nothing with it
+    /// and did not refuse it (it closed this connection, it stopped). Even a `thread.send` then
+    /// goes once.
+    pub fn resendable(&self) -> bool {
+        !self.maybe_done
+            && self
+                .said
+                .as_ref()
+                .is_none_or(|e| e.code == codes::STOPPING)
+    }
+}
+
+impl std::fmt::Display for HubClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let method = &self.method;
+        match &self.said {
+            Some(e) if e.code != codes::STOPPING => {
+                return write!(
+                    f,
+                    "the hub refused the request for {method} and closed the connection: {}",
+                    e.message
+                );
+            }
+            _ => {}
+        }
+        if self.maybe_done {
+            write!(
+                f,
+                "the hub closed the connection before answering {method}; it may have been \
+                 done, so check before trying again"
+            )?;
+        } else {
+            write!(
+                f,
+                "the hub closed the connection before {method} reached it (nothing was done)"
+            )?;
+        }
+        if let Some(e) = &self.said {
+            write!(f, ": {}", e.message)?;
+        } else if let Some(e) = &self.io {
+            write!(f, " ({e})")?;
+        }
+        write!(f, "; is it running? `twr info`")
+    }
+}
+
+impl std::error::Error for HubClosed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.io.as_ref().map(|e| e as _)
+    }
+}
+
+/// Whether I/O error `e` on a hub connection means the hub closed it.
+fn connection_closed(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+    )
+}
+
+/// The hub's error for a connection it closed (a response to request 0), read from what is
+/// left of it.
+async fn parting_words(reader: &mut Reader) -> Option<RpcError> {
+    loop {
+        match read_frame::<_, ServerMessage>(reader).await {
+            Ok(Some(ServerMessage::Response(r))) if r.id == 0 => {
+                if let Err(e) = r.result {
+                    return Some(e);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
 impl Client {
     /// Connects to the hub socket at `path`. A path too long for a Unix socket fails with a
     /// clear message ([`crate::paths::check_socket_path`]), and so does a socket whose listener
@@ -125,17 +238,36 @@ impl Client {
             method: method.to_string(),
             params,
         };
-        write_frame(&mut self.writer, &req)
-            .await
-            .context("writing request to hub")?;
-        loop {
-            let msg: Option<ServerMessage> = read_frame(&mut self.reader)
+        if let Err(e) = write_frame(&mut self.writer, &req).await {
+            if !connection_closed(&e) {
+                return Err(anyhow::Error::new(e).context("writing request to hub"));
+            }
+            // Not written whole, so its newline never reached the hub, which acts on whole
+            // lines only: it did nothing. What it said as it hung up may be waiting to be read.
+            let said = tokio::time::timeout(PARTING_READ, parting_words(&mut self.reader))
                 .await
-                .context("reading from hub")?;
+                .unwrap_or(None);
+            return Err(HubClosed::new(method, false, said, Some(e)).into());
+        }
+        loop {
+            let msg = match read_frame::<_, ServerMessage>(&mut self.reader).await {
+                Ok(msg) => msg,
+                Err(e) if connection_closed(&e) => {
+                    return Err(HubClosed::new(method, true, None, Some(e)).into());
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("reading from hub")),
+            };
             match msg {
-                None => return Err(anyhow!("hub closed the connection during {method}")),
+                None => return Err(HubClosed::new(method, true, None, None).into()),
                 Some(ServerMessage::Response(r)) if r.id == id => {
                     return r.result.map_err(anyhow::Error::new);
+                }
+                // The hub's error for the connection (request 0), which it closes next: it is
+                // stopping (it read nothing more, this request included), or it could not read
+                // the request's line (malformed, or longer than `MAX_FRAME`).
+                Some(ServerMessage::Response(r)) if r.id == 0 && r.result.is_err() => {
+                    let said = r.result.err();
+                    return Err(HubClosed::new(method, false, said, None).into());
                 }
                 Some(ServerMessage::Response(r)) => {
                     tracing::debug!(id = r.id, "ignoring response to another request");

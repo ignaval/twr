@@ -55,6 +55,9 @@ pub mod codes {
     /// The orchestrator tried to answer a permission or question the user did not explicitly
     /// answer in its current turn, or to resolve an item it may only annotate (relay rule).
     pub const RELAY_FORBIDDEN: &str = "relay_forbidden";
+    /// The hub is stopping: what it says to a connection it closes as it stops (as the reply
+    /// to request 0), so a client that writes to it later knows why it is gone.
+    pub const STOPPING: &str = "stopping";
     /// Anything else.
     pub const INTERNAL: &str = "internal";
 }

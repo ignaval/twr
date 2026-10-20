@@ -888,6 +888,14 @@ async fn connection(
         let frame = tokio::select! {
             f = read_frame::<_, Request>(&mut reader) => f,
             _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
+                // A connection for calls is told why it closes (as the reply to request 0): a
+                // client that keeps one open (the TUI, the MCP server) and writes to it later
+                // reads why its call failed, and knows nothing was done. A subscription's
+                // stream ends its connection itself.
+                if subs.is_empty() {
+                    let gone = RpcError::new(codes::STOPPING, "the hub is stopping");
+                    let _ = send(&writer, &Response::err(0, gone)).await;
+                }
                 // Subscriptions end on their own once they have flushed. Attach leases are
                 // left for the next hub to close (`thread.detached` reason `hub_restart`).
                 while subs.join_next().await.is_some() {}
