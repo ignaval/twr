@@ -1957,7 +1957,7 @@ mod tests {
         };
         assert_eq!(
             writable_roots(&cwd, None, env(None), &shm, tmp),
-            [shm.clone()]
+            std::slice::from_ref(&shm)
         );
         assert_eq!(
             writable_roots(&cwd, None, env(Some(d.join("target"))), &shm, tmp),
