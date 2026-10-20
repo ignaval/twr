@@ -2053,21 +2053,32 @@ pub async fn run_with(
     // What was told in earlier runs, and the Shift-Enter offer (only where it can be
     // remembered: it must not come back every start).
     let seen_file = firstrun::state_file();
-    let seen = seen_file.as_deref().map(firstrun::load).unwrap_or_default();
-    let mut offer = seen_file.as_ref().and_then(|_| {
-        let place = terminal_setup::place(keys.mosh);
-        let agent = agent.is_some()
-            // (A thread's processes carry `TWR_AGENT`, `twr_runner::reap::AGENT_ENV`.)
-            || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty());
-        firstrun::terminal_offer(&keys, &place, agent, &seen, terminal_setup::prepare)
-    });
-    // Remembered, the mosh notice is the offer's, told once; a tmux that loses Shift-Enter
-    // says how to fix tmux instead of any offer.
-    if seen_file.is_some() && keys.notice == Some(keys::MOSH_NOTICE) {
+    let mut seen = seen_file.as_deref().map(firstrun::load).unwrap_or_default();
+    let mut offer = None;
+    if let Some(file) = &seen_file {
+        offer = if keys.notice == Some(keys::TMUX_NOTICE) {
+            // A tmux that loses Shift-Enter: how to fix tmux, instead of any offer.
+            let key = firstrun::TMUX_FORMAT_KEY;
+            (!seen.terminal.contains_key(key)).then(|| firstrun::TerminalOffer::Notice {
+                key: key.into(),
+                text: keys::TMUX_NOTICE.into(),
+            })
+        } else {
+            let place = terminal_setup::place(keys.mosh);
+            let agent = agent.is_some()
+                // (A thread's processes carry `TWR_AGENT`, `twr_runner::reap::AGENT_ENV`.)
+                || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty());
+            firstrun::terminal_offer(&keys, &place, agent, &seen, terminal_setup::prepare)
+        };
+        // Remembered, the startup notices are told once (the mosh one among the offers).
         keys.notice = None;
-    }
-    if keys.notice.is_some() {
-        offer = None;
+        // A question takes one of the place's few offers, under the file's lock.
+        if let Some(firstrun::TerminalOffer::Edit { key, .. }) = &offer {
+            match firstrun::reserve_offer(file, key) {
+                Ok((true, now)) => seen = now,
+                _ => offer = None,
+            }
+        }
     }
     if tui.mouse {
         set_mouse_capture(true).context("enabling the mouse")?;
@@ -2498,7 +2509,7 @@ async fn drive(
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
                 tokio::spawn(async move {
-                    let params = json!({"thread": ask.thread, "turn": ask.turn, "model": ask.model});
+                    let params = json!({"thread": ask.thread, "turn": ask.turn, "models": ask.models});
                     let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
                     let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
                 });

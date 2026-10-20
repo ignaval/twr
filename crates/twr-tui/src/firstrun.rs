@@ -1,7 +1,7 @@
 //! What the TUI tells the user once, and remembers having told across runs ([`Seen`], in
 //! `<root data>/tui-state.json`, [`state_file`]):
 //!
-//! - **Suggestions are on** ([`SUGGEST_NOTICE`]): the first time a next-message suggestion is
+//! - **Suggestions are on** ([`suggest_notice`]): the first time a next-message suggestion is
 //!   due, the status bar says what it sends, to whom, what it costs and how to turn it off,
 //!   and no suggestion is asked for before a frame showed that ([`crate::suggest`]).
 //! - **Suggestions can't run here** (the hub has no Claude Code CLI, or one not signed in):
@@ -31,7 +31,7 @@ use crate::terminal_setup::{Outcome, Place, Prepared, Terminal};
 /// What the TUI has told the user, across runs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Seen {
-    /// The suggestions notice ([`SUGGEST_NOTICE`]) was shown.
+    /// The suggestions notice ([`suggest_notice`]) was shown.
     pub suggest_notice: bool,
     /// The notice that suggestions can't run here was shown.
     pub suggest_unavailable: bool,
@@ -45,7 +45,7 @@ pub struct Seen {
 /// One thing told once ([`crate::app::AppState::show_once`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Once {
-    /// [`SUGGEST_NOTICE`].
+    /// [`suggest_notice`].
     SuggestNotice,
     /// [`suggest_unavailable_notice`].
     SuggestUnavailable,
@@ -130,10 +130,33 @@ pub fn load(path: &Path) -> Seen {
         .unwrap_or_default()
 }
 
-/// Adds `seen` to the file at `path` (made private, its folder too), under an exclusive lock
-/// on `<path>.lock`: what another TUI wrote meanwhile stays ([`Seen::merge`]). The new file
-/// replaces the old one whole.
+/// Adds `seen` to the file at `path` ([`update`]): what another TUI wrote meanwhile stays
+/// ([`Seen::merge`]).
 pub fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
+    update(path, |all| all.merge(seen))
+}
+
+/// Takes one of the Shift-Enter offers left for place `key` ([`MAX_OFFERS`]), in the file at
+/// `path` under its lock, so that TUIs starting together make no more between them: whether
+/// one was left (none once the place was answered or told), and the state as the file now
+/// holds it.
+pub fn reserve_offer(path: &Path, key: &str) -> std::io::Result<(bool, Seen)> {
+    let mut got = false;
+    let mut now = Seen::default();
+    update(path, |all| {
+        let made = all.terminal_offers.entry(key.to_string()).or_default();
+        if !all.terminal.contains_key(key) && *made < MAX_OFFERS {
+            *made += 1;
+            got = true;
+        }
+        now = all.clone();
+    })?;
+    Ok((got, now))
+}
+
+/// Changes the state in the file at `path` with `change` (the file and its folder made
+/// private), under an exclusive lock on `<path>.lock`; the new file replaces the old one whole.
+pub fn update(path: &Path, change: impl FnOnce(&mut Seen)) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
         twr_core::paths::ensure_private_dir(dir).map_err(std::io::Error::other)?;
@@ -141,7 +164,7 @@ pub fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
     let lock = twr_core::paths::open_private_append(&path.with_extension("lock"))?;
     lock.lock()?;
     let mut all = load(path);
-    all.merge(seen);
+    change(&mut all);
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = twr_core::paths::open_private_append(&tmp)?;
@@ -157,11 +180,18 @@ pub fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The status bar's notice the first time a suggestion is due ([`Once::SuggestNotice`]).
-pub const SUGGEST_NOTICE: &str = "suggestions are on: after a turn of the thread you see ends, \
-     its prompt (2 KB) and the end of its reply (6 KB) go to Anthropic through your Claude Code \
-     login, to Haiku by default, counting toward your plan's usage · Tab or → takes one · \
-     /suggest off, or [tui] suggest = false, turns them off";
+/// The status bar's notice the first time a suggestion is due ([`Once::SuggestNotice`]),
+/// naming the models `models` names.
+pub fn suggest_notice(models: &twr_core::config::SuggestModels) -> String {
+    format!(
+        "suggestions are on: after a turn of the thread you see ends, its prompt (2 KB) and the \
+         end of its reply (6 KB) go to a small model with your own login, {} through Claude Code \
+         (to Anthropic) or {} through Codex (to OpenAI), the thread's own runtime first: about \
+         $0.0002 each at list price, counting toward your plan's usage · Tab or → takes one · \
+         /suggest off, or [tui] suggest = false, turns them off",
+        models.claude_code, models.codex
+    )
+}
 
 /// The one notice that suggestions can't run here, `why` being the hub's reason.
 pub fn suggest_unavailable_notice(why: &str) -> String {
@@ -171,6 +201,10 @@ pub fn suggest_unavailable_notice(why: &str) -> String {
          them off"
     )
 }
+
+/// The place key of the notice that tmux sends Shift-Enter in a form twr can't read
+/// ([`crate::keys::TMUX_NOTICE`]), told once like the others.
+pub const TMUX_FORMAT_KEY: &str = "tmux-extended-keys-format";
 
 /// Unanswered Shift-Enter offers made for a place before the TUI stops making them.
 pub const MAX_OFFERS: u32 = 3;
@@ -397,6 +431,32 @@ mod tests {
         assert_eq!(b.terminal["local:alacritty"], "yes");
         assert_eq!(b.terminal["mosh"], "shown");
         assert_eq!(b.terminal_offers["local:alacritty"], 3);
+    }
+
+    /// Offers are taken under the file's lock: TUIs starting together make no more than
+    /// [`MAX_OFFERS`] between them, and none once the place was answered.
+    #[test]
+    fn offers_are_reserved_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui-state.json");
+        let got: Vec<bool> = std::thread::scope(|s| {
+            let runs: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| reserve_offer(&path, "local:zed").unwrap().0))
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(
+            got.iter().filter(|g| **g).count(),
+            MAX_OFFERS as usize,
+            "{got:?}"
+        );
+        assert_eq!(load(&path).terminal_offers["local:zed"], MAX_OFFERS);
+        let mut answered = Seen::default();
+        answered.terminal.insert("local:vscode".into(), "no".into());
+        save(&path, &answered).unwrap();
+        let (got, now) = reserve_offer(&path, "local:vscode").unwrap();
+        assert!(!got);
+        assert_eq!(now.terminal["local:vscode"], "no");
     }
 
     /// Saving adds to what the file holds (another TUI's), and the file is private.

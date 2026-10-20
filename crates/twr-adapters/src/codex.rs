@@ -123,7 +123,9 @@
 //! reviewer agent (`auto_review`, the config's default: `approvalsReviewer: "auto_review"`;
 //! its decisions show in the transcript as `auto_review` tool calls, [`translate`]), the user
 //! (`ask`: `approvalsReviewer: "user"`, also what a [`SpawnConfig`] that names nothing asks
-//! for), or nobody (`never`: `approvalPolicy: "never"`). Every other mode
+//! for), or nobody (`never`: `approvalPolicy: "never"`). `twr attach` of an `auto_review`
+//! thread asks the user in Codex's terminal instead (reviewer `user`): twr records none of
+//! what happens there ([`CodexAdapter::resume_command`]). Every other mode
 //! sends `approvalsReviewer: "user"`: a user config with `approvals_reviewer = "auto_review"`
 //! would otherwise send approvals to Codex's reviewer agent instead of twr.
 //!
@@ -1145,7 +1147,17 @@ impl CodexAdapter {
         {
             return None;
         }
-        let (approval, reviewer, sandbox) = run_policy(cfg).ok()?;
+        // Attached, the user is at the terminal, and Codex's own TUI shows its reviews, which
+        // twr never sees: an `auto_review` thread asks the user there instead, so that every
+        // decision of the reviewer is one twr recorded.
+        let attached = SpawnConfig {
+            codex_auto: match cfg.codex_auto {
+                CodexAuto::AutoReview => CodexAuto::Ask,
+                other => other,
+            },
+            ..cfg.clone()
+        };
+        let (approval, reviewer, sandbox) = run_policy(&attached).ok()?;
         let mut cmd = std::process::Command::new(self.bin());
         cmd.args([
             "resume",
@@ -2614,7 +2626,9 @@ mod tests {
         assert!(open.mode_note.unwrap().contains("approvalPolicy never"));
     }
 
-    /// `twr attach` runs the interactive CLI with the same policy and reviewer.
+    /// `twr attach` runs the interactive CLI with the same policy, and the reviewer `user`: an
+    /// `auto_review` thread attached asks the user at the terminal, as twr would record none
+    /// of the reviewer's decisions there.
     #[test]
     fn attach_passes_the_reviewer_and_policy_of_codex_auto() {
         let args = |mode: &str, codex_auto| {
@@ -2633,10 +2647,8 @@ mod tests {
         let has = |a: &[String], pair: [&str; 2]| a.windows(2).any(|w| w == pair);
         let a = args("auto", CodexAuto::AutoReview);
         assert!(has(&a, ["--ask-for-approval", "on-request"]), "{a:?}");
-        assert!(
-            has(&a, ["-c", "approvals_reviewer=\"auto_review\""]),
-            "{a:?}"
-        );
+        assert!(has(&a, ["-c", "approvals_reviewer=\"user\""]), "{a:?}");
+        assert!(!a.iter().any(|x| x.contains("auto_review")), "{a:?}");
         let a = args("auto", CodexAuto::Never);
         assert!(has(&a, ["--ask-for-approval", "never"]), "{a:?}");
         assert!(has(&a, ["-c", "approvals_reviewer=\"user\""]), "{a:?}");

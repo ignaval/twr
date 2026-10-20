@@ -1855,10 +1855,21 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             struct SuggestParams {
                 thread: String,
                 turn: u64,
-                model: String,
+                /// Claude Code's model (a client from before `models`).
+                model: Option<String>,
+                /// The model for each runtime (`twr_core::config::SuggestModels`).
+                models: Option<twr_core::config::SuggestModels>,
             }
             let p: SuggestParams = params(p)?;
-            hub.suggest_next(&p.thread, p.turn, &p.model, caller).await
+            let models = match (p.models, p.model) {
+                (Some(m), _) => m,
+                (None, Some(model)) => twr_core::config::SuggestModels {
+                    claude_code: model,
+                    ..Default::default()
+                },
+                (None, None) => hub.config().tui.suggest_model.clone(),
+            };
+            hub.suggest_next(&p.thread, p.turn, &models, caller).await
         }
         "usage.threads" => {
             #[derive(Default, Deserialize)]

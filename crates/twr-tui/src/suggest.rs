@@ -7,7 +7,7 @@
 //! sent by itself. A new turn, or another thread on the main pane, takes it away.
 //!
 //! The first one due waits for the notice that says what suggestions send and how to turn
-//! them off ([`crate::firstrun::SUGGEST_NOTICE`]) to be on screen; it is asked for only then,
+//! them off ([`crate::firstrun::suggest_notice`]) to be on screen; it is asked for only then,
 //! and the notice is never shown again. Where the hub can't run them (no Claude Code CLI, or
 //! none signed in: `hub.info` `suggest.unavailable`, or a call's `unavailable: ...` reason),
 //! they stop for the session without a call, with one notice ever
@@ -43,7 +43,9 @@ pub const SUGGEST_SETTLE: std::time::Duration = std::time::Duration::from_millis
 pub struct Ask {
     pub thread: String,
     pub turn: u64,
-    pub model: String,
+    /// The model for each runtime that may answer (`[tui] suggest_model`): the hub picks the
+    /// runtime.
+    pub models: twr_core::config::SuggestModels,
 }
 
 impl AppState {
@@ -74,7 +76,7 @@ impl AppState {
 
     /// The suggestion to ask for now, if one is due; it is then on its way. The first one ever
     /// waits for the notice of what suggestions send to have been on screen
-    /// ([`crate::firstrun::SUGGEST_NOTICE`]): until then it stays due, and the notice is shown.
+    /// ([`crate::firstrun::suggest_notice`]): until then it stays due, and the notice is shown.
     pub fn take_suggest_due(&mut self) -> Option<Ask> {
         if !self.view.suggest {
             self.suggest_due = None;
@@ -82,10 +84,21 @@ impl AppState {
         }
         if !self.seen.suggest_notice {
             self.suggest_due.as_ref()?;
-            // Another notice told once, or a question, has the status bar: after it.
-            let notice = crate::firstrun::SUGGEST_NOTICE;
-            if self.once.is_none() && self.view.confirm.is_none() {
-                self.show_once(crate::firstrun::Once::SuggestNotice, notice.to_string());
+            let notice = crate::firstrun::suggest_notice(&self.view.suggest_model);
+            let on_screen = self.view.status.as_deref() == Some(notice.as_str());
+            match &self.once {
+                // A question has the status bar: after it.
+                _ if self.view.confirm.is_some() => {}
+                // Shown, not drawn yet: wait for a frame.
+                Some((crate::firstrun::Once::SuggestNotice, _)) if on_screen => {}
+                // Shown, then replaced before a frame showed it: shown again.
+                Some((crate::firstrun::Once::SuggestNotice, _)) => {
+                    self.view.status = Some(notice);
+                }
+                // Another notice told once that a frame hasn't shown: after it, unless it was
+                // replaced meanwhile (it comes back at the next start).
+                Some((_, text)) if self.view.status.as_deref() == Some(text) => {}
+                _ => self.show_once(crate::firstrun::Once::SuggestNotice, notice),
             }
             return None;
         }
@@ -94,7 +107,7 @@ impl AppState {
         Some(Ask {
             thread,
             turn,
-            model: self.view.suggest_model.clone(),
+            models: self.view.suggest_model.clone(),
         })
     }
 
@@ -264,11 +277,7 @@ impl AppState {
         self.view.suggest = on;
         self.suggest_turned_on = on;
         self.suggest_off_why = None;
-        // What the status bar says next tells what the notice would have.
-        if !self.seen.suggest_notice {
-            self.seen.suggest_notice = true;
-            self.seen_dirty = true;
-        }
+        // The notice is told only by itself, drawn whole: what `/suggest` says is not it.
         if self
             .once
             .as_ref()
@@ -282,12 +291,14 @@ impl AppState {
         }
         self.suggest_failed = false;
         let calls = self.suggest_stats["calls"].as_u64().unwrap_or(0);
+        let m = &self.view.suggest_model;
         self.view.status = Some(if on {
             format!(
-                "suggestions on ({}): after a turn of the thread you see, its prompt and the end \
-                 of its reply go to Anthropic with your Claude Code login · Tab or → takes one \
+                "suggestions on: after a turn of the thread you see, its prompt and the end of \
+                 its reply go to {} through Claude Code (to Anthropic) or {} through Codex (to \
+                 OpenAI), the thread's own runtime first, with your login · Tab or → takes one \
                  · {calls} asked so far",
-                self.view.suggest_model
+                m.claude_code, m.codex
             )
         } else {
             "suggestions off".to_string()

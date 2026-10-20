@@ -297,8 +297,8 @@ pub struct ViewState {
     pub compact_width: u16,
     /// Next-message suggestions on (`[tui] suggest`, `/suggest`; [`crate::suggest`]).
     pub suggest: bool,
-    /// The model they come from (`[tui] suggest_model`).
-    pub suggest_model: String,
+    /// The small model they come from, per runtime (`[tui] suggest_model`).
+    pub suggest_model: twr_core::config::SuggestModels,
     /// `/compact on|off`: the compact layout on or off whatever the width; `None`: by the
     /// width.
     pub compact: Option<bool>,
@@ -3773,9 +3773,16 @@ impl AppState {
     /// orchestrator's banner in a dive or the grid, a card scrolled away, a card too short for
     /// its options, anything under an overlay) is never answered.
     pub fn note_drawn(&mut self, now: Instant) {
-        // A notice told once, on screen in the status bar: told.
+        // A notice told once, drawn whole in the status bar (not cut, not under an overlay):
+        // told.
         if let Some((what, text)) = &self.once {
-            if self.view.confirm.is_none() && self.view.status.as_deref() == Some(text) {
+            let drawn = self
+                .view
+                .panes
+                .status
+                .as_ref()
+                .is_some_and(|(t, _)| t == text);
+            if drawn && self.view.status.as_deref() == Some(text) {
                 self.seen.told(what);
                 self.seen_dirty = true;
                 self.once = None;
@@ -7038,16 +7045,24 @@ impl AppState {
         vec![c.action]
     }
 
-    /// Whether the question waiting for `y` has been on screen, with its `yes`, for
-    /// [`CARD_SETTLE`] ([`ViewState::confirm_seen`]).
+    /// Whether the question waiting for `y` had been on screen, with its `yes`, for
+    /// [`CARD_SETTLE`] ([`ViewState::confirm_seen`]) when the input being handled was read
+    /// ([`AppState::input_at`]; now, without one): a key read earlier and handled late was
+    /// meant for what was there then.
     fn confirm_read(&self) -> bool {
         let Some(c) = &self.view.confirm else {
             return false;
         };
+        let at = self.input_at.unwrap_or_else(Instant::now);
         self.view
             .confirm_seen
             .as_ref()
-            .is_some_and(|(prompt, since)| *prompt == c.prompt && since.elapsed() >= CARD_SETTLE)
+            .is_some_and(|(prompt, since)| {
+                *prompt == c.prompt
+                    && at
+                        .checked_duration_since(*since)
+                        .is_some_and(|d| d >= CARD_SETTLE)
+            })
     }
 
     /// A key while an offer the TUI made by itself is on screen ([`Confirm::offer`]): `y`
@@ -7098,17 +7113,15 @@ impl AppState {
     }
 
     /// Puts the Shift-Enter offer on screen at startup ([`crate::firstrun::terminal_offer`]):
-    /// a question for `y` or `n` ([`Confirm::offer`]), or a notice told once. The offer counts
-    /// as made once more.
+    /// a question for `y` or `n` ([`Confirm::offer`], counted as made by
+    /// [`crate::firstrun::reserve_offer`]), or a notice told once.
     pub fn offer_terminal(&mut self, offer: crate::firstrun::TerminalOffer) {
         use crate::firstrun::{Once, TerminalOffer};
         match &offer {
             TerminalOffer::Notice { key, text } => {
                 self.show_once(Once::Terminal(key.clone()), text.clone());
             }
-            TerminalOffer::Edit { key, .. } => {
-                *self.seen.terminal_offers.entry(key.clone()).or_default() += 1;
-                self.seen_dirty = true;
+            TerminalOffer::Edit { .. } => {
                 self.view.confirm = Some(Confirm {
                     prompt: offer.question().unwrap_or_default(),
                     pending: "setting Shift-Enter up…".into(),
@@ -21849,7 +21862,6 @@ pub(crate) mod tests {
         fn y_and_n_answer_the_offer_once_read() {
             for (k, yes) in [('y', true), ('Y', true), ('n', false)] {
                 let mut st = offered();
-                assert_eq!(st.seen.terminal_offers["local:alacritty"], 1);
                 let shift = if k.is_ascii_uppercase() {
                     KeyModifiers::SHIFT
                 } else {
@@ -21875,6 +21887,13 @@ pub(crate) mod tests {
         /// offer goes for this run (unanswered: it comes back next start).
         #[test]
         fn other_keys_go_where_they_would() {
+            // Read in time, but the key was read before: typed, however late it is handled.
+            let mut st = offered();
+            let since = st.view.confirm_seen.as_ref().unwrap().1;
+            st.input_at = Some(since + CARD_SETTLE / 2);
+            assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "y");
+            assert!(st.view.confirm.is_none());
             // Just shown: the `y` is typed.
             let mut st = with_orch();
             st.offer_terminal(edit());
@@ -21964,7 +21983,7 @@ pub(crate) mod tests {
             let mut st = with_orch();
             st.seen.suggest_notice = true;
             st.view.suggest = on;
-            st.view.suggest_model = "haiku".into();
+            st.view.suggest_model = Default::default();
             let mut o = ThreadScript::new("t-orch");
             o.at(200);
             let started = o.turn_started("fix it");
@@ -21998,7 +22017,7 @@ pub(crate) mod tests {
                 Some(crate::suggest::Ask {
                     thread: "t-orch".into(),
                     turn: 1,
-                    model: "haiku".into()
+                    models: twr_core::config::SuggestModels::default(),
                 })
             );
             assert_eq!(st.take_suggest_due(), None, "asked once");
@@ -22017,10 +22036,15 @@ pub(crate) mod tests {
             let (mut st, _) = ended(true);
             st.seen.suggest_notice = false;
             assert_eq!(st.take_suggest_due(), None, "not before the notice");
-            let notice = crate::firstrun::SUGGEST_NOTICE;
+            let notice = crate::firstrun::suggest_notice(&st.view.suggest_model);
+            let notice = notice.as_str();
             assert_eq!(st.view.status.as_deref(), Some(notice));
             for says in [
                 "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "$0.0002",
                 "Claude Code",
                 "/suggest off",
                 "suggest = false",
@@ -22031,20 +22055,33 @@ pub(crate) mod tests {
             assert_eq!(st.take_suggest_due(), None, "still not drawn");
             // Replaced before a frame showed it: shown again.
             st.view.status = Some("something else".into());
-            st.once = None;
             assert_eq!(st.take_suggest_due(), None);
             assert_eq!(st.view.status.as_deref(), Some(notice));
-            let screen = screen_text(&draw(&mut st, 200, 40));
+            // Under the help (or cut), it is not on screen: not told.
+            st.view.help = true;
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "under the help");
+            assert_eq!(st.take_suggest_due(), None);
+            st.view.help = false;
+            draw(&mut st, 60, 12);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "cut short");
+            let screen = screen_text(&draw(&mut st, 400, 40));
             assert!(screen.contains("suggestions are on"), "{screen}");
             st.note_drawn(Instant::now());
             assert!(st.seen.suggest_notice && st.seen_dirty);
             assert!(st.take_suggest_due().is_some(), "asked once shown");
-            // `/suggest off` before any was due tells it too: no notice later.
+            // `/suggest off` and back on tells nothing: the notice still comes first.
             let (mut st, _) = ended(true);
             st.seen.suggest_notice = false;
             st.toggle_suggest(Some(false));
-            assert!(st.seen.suggest_notice);
             assert_eq!(st.take_suggest_due(), None);
+            assert!(!st.seen.suggest_notice);
+            st.toggle_suggest(Some(true));
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert_eq!(st.take_suggest_due(), None);
+            assert_eq!(st.view.status.as_deref(), Some(notice));
         }
 
         /// Where the hub can't run suggestions (no Claude Code CLI, or none signed in) they
@@ -22439,12 +22476,10 @@ pub(crate) mod tests {
             assert_eq!(st.view.status.as_deref(), Some("suggestions off"));
             type_line(&mut st, "/suggest");
             assert!(st.view.suggest);
-            assert!(st
-                .view
-                .status
-                .as_deref()
-                .unwrap()
-                .contains("go to Anthropic"));
+            let said = st.view.status.as_deref().unwrap();
+            for says in ["claude-haiku-5-5", "Anthropic", "gpt-6-luna", "OpenAI"] {
+                assert!(said.contains(says), "{said}");
+            }
         }
     }
 }

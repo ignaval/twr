@@ -86,7 +86,9 @@
 //! card_order = "stable"  # stable (default): cards keep their place; "attention": most recent first
 //! suggest = true       # a small model suggests your next message (ghost text, Tab takes it);
 //!                      # false: none (sends nothing to Anthropic for it)
-//! suggest_model = "haiku"  # the Claude Code model suggestions come from
+//! # The small model suggestions come from, per runtime (a string: Claude Code's). Only a
+//! # Haiku for Claude Code, a Luna (mini, nano) for Codex: a large one is never used.
+//! suggest_model = { claude-code = "claude-haiku-5-5", codex = "gpt-6-luna" }
 //!
 //! [tui.notify]
 //! terminal = "bell"    # off (default) | bell | osc9 | osc777: how the TUI alerts its terminal
@@ -268,12 +270,107 @@ pub struct TuiConfig {
     /// reply to Anthropic through the Claude Code CLI, with your login; without the CLI or a
     /// login, nothing is sent. The TUI says so once, the first time one is due.
     pub suggest: bool,
-    /// The model suggestions come from (default `haiku`): a Claude Code model name or alias.
-    pub suggest_model: String,
+    /// The small model suggestions come from, per runtime ([`SuggestModels`]): Claude Code's
+    /// `claude-haiku-5-5` and Codex's `gpt-6-luna` by default.
+    pub suggest_model: SuggestModels,
 }
 
-/// The model next-message suggestions come from unless `[tui] suggest_model` names another.
-pub const DEFAULT_SUGGEST_MODEL: &str = "haiku";
+/// The model Claude Code's suggestions come from unless `[tui] suggest_model` names another:
+/// Haiku 5.5, pinned (the `haiku` alias ran it too with Claude Code 2.1.304).
+pub const DEFAULT_SUGGEST_MODEL: &str = "claude-haiku-5-5";
+/// The model Codex's suggestions come from unless `[tui] suggest_model` names another:
+/// GPT-6-Luna, Codex 0.162's "fast and affordable model for easier tasks" (`model/list`).
+pub const DEFAULT_SUGGEST_CODEX_MODEL: &str = "gpt-6-luna";
+
+/// `[tui] suggest_model`: the model next-message suggestions come from, for each runtime that
+/// can run them. A string names Claude Code's (`suggest_model = "claude-haiku-5-5"`); a table
+/// names either or both (`suggest_model = { claude-code = "claude-haiku-5-5", codex =
+/// "gpt-6-luna" }`), the other keeping its default. Only small models: one that looks large
+/// ([`suggest_model_too_large`]) is never used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SuggestModels {
+    /// Claude Code's (`claude -p --model`).
+    #[serde(rename = "claude-code")]
+    pub claude_code: String,
+    /// Codex's (`codex exec -m`).
+    pub codex: String,
+}
+
+impl Default for SuggestModels {
+    fn default() -> Self {
+        SuggestModels {
+            claude_code: DEFAULT_SUGGEST_MODEL.into(),
+            codex: DEFAULT_SUGGEST_CODEX_MODEL.into(),
+        }
+    }
+}
+
+impl SuggestModels {
+    /// The model for `runtime` (`claude-code`, `codex`); `None` for any other runtime.
+    pub fn of(&self, runtime: &str) -> Option<&str> {
+        match runtime {
+            "claude-code" => Some(&self.claude_code),
+            "codex" => Some(&self.codex),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SuggestModels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PerRuntime {
+            #[serde(rename = "claude-code")]
+            claude_code: Option<String>,
+            codex: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(
+            untagged,
+            expecting = "a model name, or a table of `claude-code` and `codex`"
+        )]
+        enum Raw {
+            One(String),
+            Per(PerRuntime),
+        }
+        let d0 = SuggestModels::default();
+        Ok(match Raw::deserialize(d)? {
+            Raw::One(m) => SuggestModels {
+                claude_code: m,
+                ..d0
+            },
+            Raw::Per(p) => SuggestModels {
+                claude_code: p.claude_code.unwrap_or(d0.claude_code),
+                codex: p.codex.unwrap_or(d0.codex),
+            },
+        })
+    }
+}
+
+/// Why `model` is no model for `runtime`'s suggestions (`None`: it is a small one): a
+/// suggestion runs after every turn, so only a small, cheap model may answer it. For Claude
+/// Code, a Haiku (`claude-haiku-5-5`, `haiku`); for Codex, a Luna, mini or nano
+/// (`gpt-6-luna`). Anything else (Sonnet, Opus, `gpt-6.1-sol`, `default`) looks large.
+pub fn suggest_model_too_large(runtime: &str, model: &str) -> Option<String> {
+    let m = model.to_ascii_lowercase();
+    let small = match runtime {
+        "claude-code" => m.contains("haiku"),
+        "codex" => m.contains("luna") || m.contains("mini") || m.contains("nano"),
+        _ => false,
+    };
+    (!small).then(|| {
+        let want = match runtime {
+            "codex" => DEFAULT_SUGGEST_CODEX_MODEL,
+            _ => DEFAULT_SUGGEST_MODEL,
+        };
+        format!(
+            "[tui] suggest_model names {model:?} for {runtime}, which looks like a large model: \
+             suggestions run after every turn, so they use only a small one (such as {want:?}), \
+             and none come from {runtime} until it names one"
+        )
+    })
+}
 
 /// `[tui] card_order`: how the TUI orders the cards within a group (what needs you first, then
 /// working, failed, done, idle and parked threads).
@@ -297,7 +394,7 @@ impl Default for TuiConfig {
             compact_width: 60,
             notify: TuiNotifyConfig::default(),
             suggest: true,
-            suggest_model: DEFAULT_SUGGEST_MODEL.to_string(),
+            suggest_model: SuggestModels::default(),
         }
     }
 }
@@ -1329,6 +1426,7 @@ impl Config {
                     .flatten()
             })
             .collect();
+        out.extend(self.tui_warnings());
         let Some(file) = file else {
             return out;
         };
@@ -1350,6 +1448,16 @@ impl Config {
             mode_of(&boxes_file).and_then(|mode| exposed_file_warning(&boxes_file, mode, theirs)),
         );
         out
+    }
+
+    /// [`Config::warnings`] about `[tui]`, which the file can't hold wrong: a suggestion model
+    /// that looks large ([`suggest_model_too_large`]).
+    fn tui_warnings(&self) -> Vec<String> {
+        let m = &self.tui.suggest_model;
+        [("claude-code", &m.claude_code), ("codex", &m.codex)]
+            .into_iter()
+            .filter_map(|(rt, model)| suggest_model_too_large(rt, model))
+            .collect()
     }
 
     /// Loads `path` (missing file = defaults).
@@ -1935,14 +2043,81 @@ mod tests {
         assert!(c.tui.mouse);
         let e = Config::from_toml_str("[tui]\nmice = false\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
-        // Suggestions: on, Haiku, unless asked otherwise (an empty `[tui]` too).
+        // Suggestions: on, Haiku 5.5 and GPT-6-Luna, unless asked otherwise (an empty `[tui]`
+        // too).
         assert!(c.tui.suggest);
-        assert_eq!(c.tui.suggest_model, "haiku");
+        let models = |claude: &str, codex: &str| SuggestModels {
+            claude_code: claude.into(),
+            codex: codex.into(),
+        };
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-5-5", "gpt-6-luna")
+        );
         assert!(Config::from_toml_str("[tui]\n").unwrap().tui.suggest);
+        // A string names Claude Code's; a table either or both.
         let c =
-            Config::from_toml_str("[tui]\nsuggest = false\nsuggest_model = \"sonnet\"\n").unwrap();
+            Config::from_toml_str("[tui]\nsuggest = false\nsuggest_model = \"haiku\"\n").unwrap();
         assert!(!c.tui.suggest);
-        assert_eq!(c.tui.suggest_model, "sonnet");
+        assert_eq!(c.tui.suggest_model, models("haiku", "gpt-6-luna"));
+        let c = Config::from_toml_str(
+            "[tui]\nsuggest_model = { claude-code = \"claude-haiku-4-5\", codex = \"gpt-5.6-luna\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-4-5", "gpt-5.6-luna")
+        );
+        let c = Config::from_toml_str("[tui.suggest_model]\ncodex = \"gpt-6-luna\"\n").unwrap();
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-5-5", "gpt-6-luna")
+        );
+        for bad in [
+            "[tui]\nsuggest_model = { grok = \"x\" }\n",
+            "[tui]\nsuggest_model = 3\n",
+            "[tui]\nsuggest_model = [\"haiku\"]\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Only small models answer suggestions: a Haiku for Claude Code, a Luna (or mini, nano)
+    /// for Codex. A large one is a warning of the hub's, and is never used.
+    #[test]
+    fn suggestion_models_must_be_small() {
+        for (rt, m) in [
+            ("claude-code", "claude-haiku-5-5"),
+            ("claude-code", "haiku"),
+            ("claude-code", "Claude-Haiku-4-5"),
+            ("codex", "gpt-6-luna"),
+            ("codex", "gpt-5.6-luna"),
+            ("codex", "gpt-5-mini"),
+        ] {
+            assert_eq!(suggest_model_too_large(rt, m), None, "{rt} {m}");
+        }
+        for (rt, m) in [
+            ("claude-code", "sonnet"),
+            ("claude-code", "claude-opus-5-5"),
+            ("claude-code", "claude-fable-5-1"),
+            ("claude-code", "default"),
+            ("codex", "gpt-6.1-sol"),
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.6-terra"),
+            ("grok-build", "grok-mini"),
+        ] {
+            let why = suggest_model_too_large(rt, m).unwrap();
+            assert!(why.contains("large model") && why.contains(m), "{why}");
+        }
+        assert!(Config::default().warnings(None).is_empty());
+        let c =
+            Config::from_toml_str("[tui]\nsuggest_model = { codex = \"gpt-6.1-sol\" }\n").unwrap();
+        let w = c.warnings(None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("gpt-6.1-sol") && w[0].contains("codex"),
+            "{w:?}"
+        );
     }
 
     #[test]

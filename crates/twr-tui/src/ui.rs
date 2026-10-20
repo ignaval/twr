@@ -7925,6 +7925,11 @@ fn render_status(
     }
     // Rows past the bar's height: the last one it has says the rest is cut.
     let fit = usize::from(area.height).max(1);
+    // The message is on screen whole only when nothing of the bar is cut (and no overlay
+    // covers it later, [`Panes::cover`]).
+    if let (None, Some(msg), true) = (&state.view.confirm, &state.view.status, rows.len() <= fit) {
+        panes.status = Some((msg.clone(), area));
+    }
     if rows.len() > fit {
         rows.truncate(fit);
         if let Some(last) = rows.last_mut() {
