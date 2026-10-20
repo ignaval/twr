@@ -2026,6 +2026,14 @@ impl Asks {
     }
 }
 
+/// The TUI gone, however it ended (quit, an error, a panic unwinding): no ask of its outlives
+/// it.
+impl Drop for Asks {
+    fn drop(&mut self) {
+        self.settle(false);
+    }
+}
+
 /// Runs the TUI against the hub listening on `socket` until the user quits.
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
     run_with(socket, None, None, None).await
@@ -2195,8 +2203,9 @@ pub async fn run_with(
             Err(e) => break (Err(e), writer),
         }
     };
-    // Nothing is sent once the user quit, from any workspace.
+    // Nothing is sent once the user quit, from any workspace: no suggestion asked either.
     abort_all(&mut ctx.all_callers);
+    ctx.asking.settle(false);
 
     // Nothing reads the terminal once it is the user's again.
     drop(input);
@@ -2935,6 +2944,11 @@ mod asks_tests {
         assert!(one.await.unwrap_err().is_cancelled());
         assert!(two.await.unwrap_err().is_cancelled());
         assert!(asks.0.is_empty());
+        // Dropped (the TUI quit, or failed): its asks go with it.
+        let three = tokio::spawn(std::future::pending::<()>());
+        asks.add(three.abort_handle());
+        drop(asks);
+        assert!(three.await.unwrap_err().is_cancelled());
     }
 }
 
