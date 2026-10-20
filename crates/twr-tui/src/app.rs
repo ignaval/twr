@@ -2217,6 +2217,10 @@ pub struct AppState {
     pub shell_cwd_asked: bool,
     /// The user's `!cd` is on its way: its answer says where commands run now.
     pub shell_cd_asked: bool,
+    /// The `shell.cd` calls on their way, in the order sent (answers come in that order, on
+    /// the one connection): `true` for the user's `!cd`, `false` for the TUI asking for the
+    /// folder's name.
+    pub shell_cds: VecDeque<bool>,
     /// The `!` commands this TUI started that still run, oldest first: Ctrl-C stops the newest.
     pub shell_jobs: Vec<crate::shell::Started>,
     /// The latest `!` commands that ended (their jobs), at most 32: an answer to `shell.run`
@@ -20980,6 +20984,40 @@ pub(crate) mod tests {
                 .as_deref()
                 .unwrap()
                 .contains("runs in its worktree"));
+        }
+
+        /// The TUI's ask for the folder's name and a user's `!cd` answer in the order sent:
+        /// the name, coming in while the `!cd` is still on its way, neither sets the folder nor
+        /// lets a command run before the `!cd` answered.
+        #[test]
+        fn a_late_folder_lookup_doesnt_undo_a_cd_on_its_way() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            typed(&mut st, "!");
+            assert!(st.shell_cwd_due(), "the folder's name is asked");
+            st.view.input.clear();
+            assert_eq!(
+                type_line(&mut st, "!cd /work/x"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: Some("/work/x".into())
+                }]
+            );
+            st.apply_result("shell.cd", &json!({"cwd": "/home/me"}));
+            assert_eq!(st.shell_cwd, None);
+            assert!(type_line(&mut st, "!rm file").is_empty(), "still waiting");
+            st.view.input.clear();
+            st.apply_result("shell.cd", &json!({"cwd": "/work/x"}));
+            assert_eq!(st.shell_cwd.as_deref(), Some("/work/x"));
+            assert_eq!(
+                type_line(&mut st, "!rm file"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm file".into(),
+                    cwd: Some("/work/x".into()),
+                    share: false
+                }]
+            );
         }
 
         /// A paste is never a key: a pasted `!` line runs only with a real Enter.

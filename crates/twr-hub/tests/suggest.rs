@@ -347,3 +347,25 @@ async fn a_notice_turn_gets_no_suggestion() {
     assert_eq!(runs(&cli), 0);
     hub.shutdown().await;
 }
+
+/// Two TUIs asking at once share one call: neither is turned away by the rate limit.
+#[tokio::test]
+async fn asks_at_once_share_one_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "deploy it", false);
+    let hub = hub(dir.path(), bin).await;
+    turn_ended(&hub, dir.path(), "build it").await;
+    let (one, two) = (tui(), Caller::user("tui2"));
+    let (a, b) = tokio::join!(
+        hub.suggest_next("api", 1, "haiku", &one),
+        hub.suggest_next("api", 1, "haiku", &two)
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(a["suggestion"], "deploy it", "{a}");
+    assert_eq!(b["suggestion"], "deploy it", "{b}");
+    assert_eq!(runs(&cli), 1);
+    hub.shutdown().await;
+}

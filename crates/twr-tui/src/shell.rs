@@ -147,6 +147,7 @@ impl AppState {
                 return Vec::new();
             }
             self.shell_cd_asked = true;
+            self.shell_cds.push_back(true);
             // `!cd` alone: back to where commands start, the orchestrator's folder.
             let cwd = dir.as_ref().and(self.shell_cwd.clone());
             return vec![Action::ShellCd { cwd, dir }];
@@ -175,6 +176,7 @@ impl AppState {
             return false;
         }
         self.shell_cwd_asked = true;
+        self.shell_cds.push_back(false);
         true
     }
 
@@ -318,17 +320,27 @@ impl AppState {
 
     /// What `shell.cd` returned: the orchestrator view's folder from now on.
     pub(crate) fn shell_moved(&mut self, result: &Value) {
+        // Which call this answers: the oldest on its way.
+        let users = self.shell_cds.pop_front().unwrap_or(false);
+        let more = self.shell_cds.iter().any(|u| *u);
+        if users {
+            // Another `!cd` after it still on its way: commands wait for that one too.
+            self.shell_cd_asked = more;
+        }
         // A failed `!cd` (its error is in the status bar): commands run where they did.
         if result["failed"] == true {
-            self.shell_cd_asked = false;
             return;
         }
-        if let Some(cwd) = result["cwd"].as_str() {
-            self.shell_cwd = Some(cwd.to_string());
-            // The user's `!cd`, not the TUI asking for the folder's name.
-            if std::mem::take(&mut self.shell_cd_asked) {
-                self.view.status = Some(format!("`!` commands run in {}", tilde(cwd)));
-            }
+        let Some(cwd) = result["cwd"].as_str() else {
+            return;
+        };
+        // The folder's name, asked before a `!cd` that hasn't answered yet: that one says.
+        if !users && (more || self.shell_cwd.is_some()) {
+            return;
+        }
+        self.shell_cwd = Some(cwd.to_string());
+        if users {
+            self.view.status = Some(format!("`!` commands run in {}", tilde(cwd)));
         }
     }
 

@@ -412,8 +412,10 @@ impl Hub {
                 let reason = a.is_none().then_some("none");
                 return Ok(answer(&id, turn, model, a, reason, true, &hub));
             }
+            // In flight: wait for it. Else, the limits allowing, reserve the call and register
+            // it as in flight under this same lock, so an ask that comes meanwhile shares it.
             match s.flight.get(&key) {
-                Some(rx) => Some(rx.clone()),
+                Some(rx) => Ok(rx.clone()),
                 None => {
                     let now = Instant::now();
                     if s.backoff_until.is_some_and(|t| now < t) {
@@ -434,40 +436,22 @@ impl Hub {
                         return Ok(answer(&id, turn, model, None, Some("limit"), false, &hub));
                     }
                     s.starts.push_back(now);
-                    None
+                    let (tx, rx) = tokio::sync::watch::channel(None);
+                    s.flight.insert(key.clone(), rx);
+                    Err(tx)
                 }
             }
         };
-        if let Some(mut rx) = waiting {
-            let got = rx
-                .wait_for(Option::is_some)
-                .await
-                .map(|a| a.clone())
-                .ok()
-                .flatten();
-            return Ok(match got {
-                Some(Ok(a)) => {
-                    let reason = a.is_none().then_some("none");
-                    answer(&id, turn, model, a, reason, true, &hub)
-                }
-                Some(Err(e)) => answer(
-                    &id,
-                    turn,
-                    model,
-                    None,
-                    Some(&format!("failed: {e}")),
-                    true,
-                    &hub,
-                ),
-                None => answer(&id, turn, model, None, Some("failed"), true, &hub),
-            });
-        }
-        let (tx, rx) = tokio::sync::watch::channel(None);
-        hub.suggestions
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .flight
-            .insert(key.clone(), rx);
+        let tx = match waiting {
+            Err(tx) => tx,
+            Ok(rx) => return Ok(wait_for(rx, &id, turn, model, &hub).await),
+        };
+        // Whatever ends this call (its answer, or the request dropped), it is no longer in
+        // flight: an ask after it finds its answer, or asks again.
+        let _flight = Flight {
+            hub: Arc::clone(&hub),
+            key: key.clone(),
+        };
         let dir = hub
             .db_path
             .parent()
@@ -519,6 +503,55 @@ impl Hub {
             false,
             &hub,
         ))
+    }
+}
+
+/// A suggestion call in flight ([`Suggestions::flight`]), removed when it ends.
+struct Flight {
+    hub: Arc<Inner>,
+    key: (String, u64, String),
+}
+
+impl Drop for Flight {
+    fn drop(&mut self) {
+        self.hub
+            .suggestions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .flight
+            .remove(&self.key);
+    }
+}
+
+/// An ask that came while the same call was in flight (`rx`): that call's answer.
+async fn wait_for(
+    mut rx: tokio::sync::watch::Receiver<Option<Answer>>,
+    id: &str,
+    turn: u64,
+    model: &str,
+    hub: &Inner,
+) -> Value {
+    let got = rx
+        .wait_for(Option::is_some)
+        .await
+        .map(|a| a.clone())
+        .ok()
+        .flatten();
+    match got {
+        Some(Ok(a)) => {
+            let reason = a.is_none().then_some("none");
+            answer(id, turn, model, a, reason, true, hub)
+        }
+        Some(Err(e)) => answer(
+            id,
+            turn,
+            model,
+            None,
+            Some(&format!("failed: {e}")),
+            true,
+            hub,
+        ),
+        None => answer(id, turn, model, None, Some("failed"), true, hub),
     }
 }
 
