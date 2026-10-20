@@ -253,12 +253,17 @@ impl AppState {
         if self.withdrawals.iter().any(|w| w.msg_ref == msg_ref) {
             return Vec::new();
         }
+        let suggested = self
+            .suggested_refs
+            .iter()
+            .any(|(t, r)| *t == thread && *r == msg_ref);
         self.withdrawals.push(Withdrawal {
             thread: thread.clone(),
             msg_ref,
             text,
             purpose,
             mine,
+            suggested,
         });
         if self.view.queued == Some(msg_ref) {
             self.view.queued = None;

@@ -237,6 +237,10 @@ async fn the_orchestrator_view_runs_in_its_folder() {
             .code,
         codes::BAD_REQUEST
     );
+    // A quoted name keeps its blanks.
+    std::fs::create_dir(home.join(" sub ")).unwrap();
+    let cd = hub.shell_cd(None, Some(" sub "), &tui()).unwrap();
+    assert_eq!(cd["cwd"].as_str(), home.join(" sub ").to_str());
     // The folder now is gone: a folder named from `/` still moves there, a relative one
     // can't.
     let gone = dir.path().join("gone");

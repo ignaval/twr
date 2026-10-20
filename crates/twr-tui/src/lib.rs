@@ -661,13 +661,39 @@ const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
 /// The entries of the history file at `path` (none when it cannot be read), oldest first.
-/// A line that is not a JSON string (torn by a crash, not UTF-8) costs only itself.
+/// A line that is neither (torn by a crash, not UTF-8) costs only itself.
 pub fn load_history(path: &Path) -> Vec<String> {
     std::fs::read(path)
         .unwrap_or_default()
         .split(|b| *b == b'\n')
-        .filter_map(|l| serde_json::from_slice::<String>(l).ok())
+        .filter_map(history_entry)
         .collect()
+}
+
+/// A history file line as the line to put back in the input box. A `!` command is stored as
+/// `{"shell": "!..."}` ([`history_line`]); a plain string that starts with `!` was a message
+/// sent before `!` ran commands, and comes back escaped (`\!...`), still a message.
+fn history_entry(line: &[u8]) -> Option<String> {
+    match serde_json::from_slice::<Value>(line).ok()? {
+        Value::String(s) if s.starts_with('!') => Some(format!("\\{s}")),
+        Value::String(s) => Some(s),
+        Value::Object(o) => o
+            .get("shell")
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with('!'))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// History entry `e` as a history file line ([`history_entry`]): a `!` command tagged, so a
+/// TUI from before `!` commands skips it rather than sending it as a message.
+fn history_line(e: &str) -> serde_json::Result<String> {
+    if e.starts_with('!') {
+        serde_json::to_string(&json!({ "shell": e }))
+    } else {
+        serde_json::to_string(e)
+    }
 }
 
 /// Whether the file at `path` is not empty and its last byte is not a line break.
@@ -703,11 +729,7 @@ pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
         writeln!(f)?;
     }
     for e in entries.iter().filter(|e| e.len() <= HISTORY_ENTRY_MAX) {
-        writeln!(
-            f,
-            "{}",
-            serde_json::to_string(e).map_err(std::io::Error::other)?
-        )?;
+        writeln!(f, "{}", history_line(e).map_err(std::io::Error::other)?)?;
     }
     drop(f);
     let all = load_history(path);
@@ -718,11 +740,7 @@ pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
             let mut f = twr_core::paths::open_private_append(&tmp)?;
             f.set_len(0)?;
             for e in keep {
-                writeln!(
-                    f,
-                    "{}",
-                    serde_json::to_string(e).map_err(std::io::Error::other)?
-                )?;
+                writeln!(f, "{}", history_line(e).map_err(std::io::Error::other)?)?;
             }
             f.sync_all()?;
             std::fs::rename(&tmp, path)
@@ -4229,6 +4247,22 @@ mod tests {
             t.clear().is_err(),
             "ratatui's own clear would have stopped the TUI"
         );
+    }
+
+    /// `!` commands are stored tagged; a plain `!...` line, from before `!` ran commands, was
+    /// a message and comes back as one.
+    #[test]
+    fn old_bang_lines_in_the_history_stay_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui-history");
+        std::fs::write(&path, "\"!important: read this\"\n").unwrap();
+        save_history(&path, &["!ls -la".into(), "\\!not a command".into()]).unwrap();
+        assert_eq!(
+            load_history(&path),
+            ["\\!important: read this", "!ls -la", "\\!not a command"]
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#"{"shell":"!ls -la"}"#), "{raw}");
     }
 
     #[test]

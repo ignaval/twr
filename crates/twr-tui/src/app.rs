@@ -682,6 +682,8 @@ pub struct Sent {
     pub spent: bool,
     /// A `message.withdraw` for it is on its way.
     pub withdrawing: bool,
+    /// A suggestion taken and sent as it was ([`Action::SaySuggested`]).
+    pub suggested: bool,
 }
 
 /// Where an armed double Esc counts ([`Sent::armed_in`]): the main pane's thread, the screen
@@ -711,6 +713,9 @@ pub struct Withdrawal {
     /// The user sent it: only then may its text go back in the box or the history, as theirs
     /// (a queued message of the orchestrator's, or a `!!` command's output, never does).
     pub mine: bool,
+    /// A suggestion sent as it was: back in the box it is still one, and it never goes to
+    /// the history.
+    pub suggested: bool,
 }
 
 /// Why a message is taken back ([`Withdrawal::purpose`]).
@@ -2273,6 +2278,9 @@ pub struct AppState {
     pub suggest_asked: Option<(String, u64, u64)>,
     /// The suggestion last taken into the box: sent unedited, it says so to the hub.
     pub taken_suggestion: Option<String>,
+    /// The latest suggestions sent as they were, `(thread, ref)`, at most [`STARTED_REFS`]:
+    /// taken back from the queue, one is still a suggestion.
+    pub suggested_refs: VecDeque<(String, i64)>,
     /// The second Ctrl-C while a `!` command's stop is on its way: the third quits.
     pub shell_quit_armed: bool,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
@@ -5074,6 +5082,7 @@ impl AppState {
                     text: s.text.clone(),
                     purpose: Retract::Unsend,
                     mine: true,
+                    suggested: s.suggested,
                 });
                 vec![Action::Withdraw { thread, msg_ref }]
             }
@@ -5113,7 +5122,7 @@ impl AppState {
     /// A message the input line sends now, to the thread dived into, else to the
     /// orchestrator (which `say`'s result names): it is the last message from now on. `typed`
     /// is the line as typed (a `//` escape included), what taking it back puts back.
-    fn note_sent(&mut self, thread: Option<String>, typed: &str) {
+    fn note_sent(&mut self, thread: Option<String>, typed: &str, suggested: bool) {
         // A suggestion asked before this send is about a conversation that went on.
         self.suggest_epoch += 1;
         self.suggestion = None;
@@ -5122,6 +5131,7 @@ impl AppState {
             thread,
             text: typed.to_string(),
             waiting,
+            suggested,
             ..Sent::default()
         });
     }
@@ -5148,6 +5158,15 @@ impl AppState {
         if let Some(t) = result["thread"].as_str() {
             s.thread = Some(t.to_string());
         }
+        if let (true, Some(t), Some(r)) = (s.suggested, s.thread.clone(), s.msg_ref) {
+            self.suggested_refs.push_back((t, r));
+            if self.suggested_refs.len() > STARTED_REFS {
+                self.suggested_refs.pop_front();
+            }
+        }
+        let Some(s) = self.sent.as_mut() else {
+            return;
+        };
         s.turn = result["turn"].as_u64().or_else(|| {
             let (thread, r) = (s.thread.as_deref()?, s.msg_ref?);
             self.started_refs
@@ -5255,6 +5274,15 @@ impl AppState {
                 self.set_timed_status("deleted from the queue".to_string(), Instant::now());
                 return;
             }
+            // A suggestion: in the box it is still one; never in the history.
+            if w.suggested && !(here && self.view.input.is_empty() && w.purpose != Retract::Delete)
+            {
+                self.set_timed_status(
+                    "taken back: it was a suggestion, so it is not kept in the history".into(),
+                    Instant::now(),
+                );
+                return;
+            }
             if w.purpose == Retract::Delete {
                 self.keep_taken_back(&text);
                 self.set_timed_status(
@@ -5267,6 +5295,9 @@ impl AppState {
                 let (cols, rows) = (self.input_cols(), self.input_rows());
                 self.view.input.set(&text);
                 self.view.input.keep_visible(cols, rows);
+                if w.suggested {
+                    self.taken_suggestion = Some(text.clone());
+                }
                 if w.purpose == Retract::Edit {
                     "taken back from the queue: edit it, Enter sends it again (at the queue's end)"
                 } else {
@@ -6022,7 +6053,12 @@ impl AppState {
                 if text.is_empty() {
                     return Vec::new();
                 }
-                self.remember(&text);
+                // A suggestion taken and sent as it was: it goes as one, and never to the
+                // history, from where it would come back as the user's own words.
+                let suggested = self.taken_suggestion.take().as_deref() == Some(text.as_str());
+                if !suggested {
+                    self.remember(&text);
+                }
                 // `!...` runs a shell command ([`crate::shell`]); `\!...` sends `!...`.
                 if text.starts_with('!') {
                     let actions = self.shell_line(&text);
@@ -6045,7 +6081,11 @@ impl AppState {
                 let typed = text.clone();
                 let text = message_text(&text);
                 // Only a dive sends to a thread; everything else goes to the orchestrator.
-                self.note_sent(self.view.dive.clone(), &typed);
+                self.note_sent(
+                    self.view.dive.clone(),
+                    &typed,
+                    suggested && self.view.dive.is_none(),
+                );
                 let action = match &self.view.dive {
                     Some(thread) => Action::Send {
                         thread: thread.clone(),
@@ -6053,12 +6093,10 @@ impl AppState {
                     },
                     // A suggestion taken and sent as it was: the hub never applies it as a short
                     // command at once.
-                    None if self.taken_suggestion.take().as_deref() == Some(typed.as_str()) => {
-                        Action::SaySuggested {
-                            text,
-                            seen_gseq: self.seen_gseq(),
-                        }
-                    }
+                    None if suggested => Action::SaySuggested {
+                        text,
+                        seen_gseq: self.seen_gseq(),
+                    },
                     None => Action::Say {
                         text,
                         seen_gseq: self.seen_gseq(),
@@ -21650,6 +21688,49 @@ pub(crate) mod tests {
             st.input_at = Some(shown + crate::suggest::SUGGEST_SETTLE);
             st.handle_key(key(KeyCode::Tab));
             assert_eq!(st.view.input.as_str(), "and the docs");
+        }
+
+        /// A suggestion stays one wherever its text goes: kept across a workspace switch, back
+        /// in the box after a take-back; it never goes to the history.
+        #[test]
+        fn a_suggestion_stays_one_across_a_switch_and_a_take_back() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            let kept = st.take_view();
+            let mut st = with_orch();
+            st.restore_view(kept);
+            st.finish_restore();
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "set web to bypass"),
+                "{sent:?}"
+            );
+            assert!(!st.view.history.iter().any(|h| h == "set web to bypass"));
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 61, "turn": null,
+                        "pending": 1}),
+            );
+            assert_eq!(
+                st.unsend(),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 61
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 61,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { .. }]),
+                "{sent:?}"
+            );
         }
 
         /// An answer to an ask made before a send of the user's is about a conversation that

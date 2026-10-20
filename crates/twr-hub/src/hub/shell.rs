@@ -281,7 +281,8 @@ impl Hub {
         }
         let default = super::orch::orchestrator_cwd(&self.inner.config);
         let bad = |e| rpc(codes::BAD_REQUEST, e);
-        let dir = dir.map(str::trim).filter(|d| !d.is_empty());
+        // As given: a quoted name may start or end with a blank.
+        let dir = dir.filter(|d| !d.is_empty());
         // A folder named from `/` or `~` needs no base: it moves even when the folder now (or
         // the orchestrator's) is gone, which is how one gets out of it.
         if let Some(d) = dir.filter(|d| Path::new(d).is_absolute() || is_home_relative(d)) {
