@@ -10,7 +10,7 @@ use twr_core::event::*;
 use twr_decisions::{DecisionContext, GradeContext, LadderRun};
 
 use super::append::hydrated_from_store;
-use super::{retry, twr_ext_map, Batch, Core, EndedTurn, Inner};
+use super::{retry, twr_ext, twr_ext_map, Batch, Core, EndedTurn, Inner};
 use crate::report;
 use crate::store;
 
@@ -113,6 +113,19 @@ impl Core {
     ) -> anyhow::Result<()> {
         if result == TurnResult::Interrupted {
             return Ok(());
+        }
+        // A turn its runtime opened for a background task's notification that saw no run
+        // (`ext.twr.no_run`): no report, so the interim one it followed stands, and the hub
+        // wakes the worker for that work (`hub::wake`).
+        if let Some(Event {
+            body: EventBody::TurnEnded(p),
+            ..
+        }) = self.stored_event(thread, Some(turn), "turn.ended")?
+        {
+            if twr_ext(&p.ext).is_some_and(|t| t.get(super::wake::NO_RUN_KEY) == Some(&json!(true)))
+            {
+                return Ok(());
+            }
         }
         let done = store::turn_reactions(self.store.conn(), thread, turn)?;
         let view = self.view(thread).map_err(anyhow::Error::new)?;

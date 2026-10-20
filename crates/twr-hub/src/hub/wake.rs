@@ -15,7 +15,13 @@
 //! source hub, like a job's wake): what ended since that turn, with each job's result and log,
 //! and that it should continue. A `conversation.update` on the worker records the wake
 //! (`ext.twr.auto_wake = {turn, tasks}`) in the same batch, which the user sees in the thread
-//! and the orchestrator in its conversation.
+//! and the orchestrator in its conversation. A runtime that is being stopped (a settings
+//! restart) or a box offline holds a wake up: it is tried again for [`WAKE_RETRY_FOR`].
+//!
+//! A turn the runtime opened for a background task's notification and ended with no run
+//! (`turn.ended` `ext.twr.no_run`, the Claude Code adapter's) handled nothing: it gets no
+//! report (`hub::reactions`), the interim one stands, and the worker is woken at once (the
+//! wait was the adapter's), for the tasks that ended before it.
 //!
 //! No loops: a worker is woken at most once per interim report (the recorded `turn`), and at
 //! most [`WAKE_CHAIN_MAX`] times in a row with no turn the user or the orchestrator started
@@ -43,6 +49,9 @@ use twr_core::event::*;
 use twr_core::reduce::ThreadView;
 
 use super::{twr_ext, twr_ext_map, Batch, Core, Inner};
+/// `turn.ended` `ext.twr` key of a turn its runtime opened for a background task's
+/// notification that saw no run (the Claude Code adapter's).
+pub(super) const NO_RUN_KEY: &str = twr_adapters::claude_code::translate::NO_RUN_KEY;
 use crate::report;
 
 /// `conversation.update` `ext.twr` key: the hub woke the worker, `{turn, tasks}`.
@@ -68,9 +77,26 @@ struct EndedTask {
 /// A wake waiting for its time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Pending {
-    /// The turn whose interim report the wake is for.
+    /// The turn whose interim report the wake is for (or the turn that ended `no_run`).
     turn: u64,
     due: DateTime<Utc>,
+    /// When it first came due: a wake held up by something passing (a runtime restarting,
+    /// its box offline) is tried again until [`WAKE_RETRY_FOR`] after that.
+    first_due: DateTime<Utc>,
+}
+
+/// How long a wake held up by something passing is tried again.
+const WAKE_RETRY_FOR: chrono::Duration = chrono::Duration::minutes(10);
+/// How often it is tried again meanwhile.
+const WAKE_RETRY_EVERY: chrono::Duration = chrono::Duration::seconds(2);
+
+/// Whether a wake can go out now ([`Core::wake_ready`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ready {
+    Now,
+    /// Something passing is in the way: try again.
+    Later,
+    Never,
 }
 
 /// The hub's wakes (see the module docs).
@@ -86,6 +112,10 @@ pub(super) struct WakeState {
     woken: HashMap<String, u64>,
     /// Wakes in a row per thread, with no turn of the user's or the orchestrator's since.
     chain: HashMap<String, u32>,
+    /// A thread's last turn, a turn its runtime opened for a background task's notification
+    /// that saw no run (`turn.ended` `ext.twr.no_run`): its interim report's work is still
+    /// unhandled.
+    no_run: HashMap<String, u64>,
 }
 
 impl WakeState {
@@ -95,17 +125,21 @@ impl WakeState {
     }
 }
 
-/// The turn whose interim report `view` waits on: its last turn, completed and reported with
-/// an interim report, no turn open and no own background work left.
-fn interim_turn(view: &ThreadView) -> Option<u64> {
-    if view.is_orchestrator()
+/// Whether `view` is a worker with no turn open and no own background work, neither stopped
+/// nor parked.
+fn idle_worker(view: &ThreadView) -> bool {
+    !(view.is_orchestrator()
         || view.id == HUB_THREAD
         || view.stopped
         || view.parked
         || view.current_turn.is_some()
-        || view.own_background()
-        || !view.reported
-    {
+        || view.own_background())
+}
+
+/// The turn whose interim report `view` waits on: its last turn, completed and reported with
+/// an interim report, no turn open and no own background work left.
+fn interim_turn(view: &ThreadView) -> Option<u64> {
+    if !idle_worker(view) || !view.reported {
         return None;
     }
     let r = view
@@ -147,37 +181,51 @@ impl Core {
                     return;
                 }
                 if let Some(turn) = interim_turn(v) {
-                    if self.wake.woken.get(&ev.thread) != Some(&turn) {
-                        self.wake.pending.insert(
-                            ev.thread.clone(),
-                            Pending {
-                                turn,
-                                due: ev.ts + self.wake.after,
-                            },
-                        );
-                    }
+                    self.schedule_wake(&ev.thread, turn, ev.ts + self.wake.after);
                 }
             }
-            // Busy again: a new wait starts when that task ends.
+            // Busy again (its own work, not a `!` command of the user's): a new wait starts
+            // when that task ends.
             EventBody::TaskUpdated(p) => {
                 if self
                     .registry
                     .get(&ev.thread)
-                    .is_some_and(|v| v.background_tasks.contains_key(&p.task_id))
+                    .is_some_and(|v| v.background_tasks.get(&p.task_id).is_some_and(|t| !t.shell))
                 {
                     self.wake.pending.remove(&ev.thread);
                 }
             }
             EventBody::TurnStarted(p) => {
                 self.wake.pending.remove(&ev.thread);
-                self.wake.ended.remove(&ev.thread);
+                self.wake.no_run.remove(&ev.thread);
                 // A turn of the user's or the orchestrator's: someone is looking after it.
                 if p.from != TurnFrom::Runtime {
                     self.wake.chain.remove(&ev.thread);
                 }
             }
-            EventBody::TurnEnded(_) => {
-                self.wake.ended.remove(&ev.thread);
+            // The tasks that ended before it were the turn's to handle; not those of a turn
+            // opened for a notification that saw no run: that turn handled nothing, and the
+            // worker is woken at once.
+            EventBody::TurnEnded(p) => {
+                let no_run = twr_ext(&p.ext)
+                    .and_then(|t| t.get(NO_RUN_KEY))
+                    .and_then(Value::as_bool)
+                    == Some(true);
+                let turn = ev.turn.or(self
+                    .registry
+                    .get(&ev.thread)
+                    .and_then(|v| v.last_turn.as_ref().map(|t| t.turn)));
+                match (no_run, turn) {
+                    (true, Some(turn)) if p.result == TurnResult::Completed => {
+                        self.wake.no_run.insert(ev.thread.clone(), turn);
+                        if self.wake.after > chrono::Duration::zero() {
+                            self.schedule_wake(&ev.thread, turn, ev.ts);
+                        }
+                    }
+                    _ => {
+                        self.wake.ended.remove(&ev.thread);
+                    }
+                }
             }
             EventBody::ConversationUpdate(p) => {
                 let Some(twr) = twr_ext(&p.ext) else {
@@ -197,10 +245,10 @@ impl Core {
                     *self.wake.chain.entry(ev.thread.clone()).or_default() += 1;
                 }
             }
-            EventBody::ThreadStopped(_) | EventBody::ThreadParked(_) => {
-                self.wake.pending.remove(&ev.thread);
-            }
+            // (A stop or park cancels nothing here: a stop that restarts the runtime for a
+            // settings change leaves the thread as it was, and a wake checks again when due.)
             EventBody::ThreadDeleted(_) => {
+                self.wake.no_run.remove(&ev.thread);
                 self.wake.pending.remove(&ev.thread);
                 self.wake.ended.remove(&ev.thread);
                 self.wake.woken.remove(&ev.thread);
@@ -225,40 +273,76 @@ impl Core {
             .collect();
         for (thread, p) in due {
             self.wake.pending.remove(&thread);
+            match self.wake_ready(&thread, p.turn) {
+                Ok(Ready::Now) => {}
+                Ok(Ready::Later) if now - p.first_due < WAKE_RETRY_FOR => {
+                    self.wake.pending.insert(
+                        thread,
+                        Pending {
+                            due: now + WAKE_RETRY_EVERY,
+                            ..p
+                        },
+                    );
+                    continue;
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    tracing::warn!(thread = %thread, error = %format!("{e:#}"), "could not tell whether to wake a thread after its background work");
+                    continue;
+                }
+            }
             if let Err(e) = self.wake_thread(hub, &thread, p.turn) {
                 tracing::warn!(thread = %thread, error = %format!("{e:#}"), "could not wake a thread after its background work");
             }
         }
     }
 
+    /// Waits to wake thread `thread` after turn `turn` until `due`, unless it was woken (or
+    /// not) for that turn already.
+    fn schedule_wake(&mut self, thread: &str, turn: u64, due: DateTime<Utc>) {
+        if self.wake.woken.get(thread) != Some(&turn) {
+            self.wake.pending.insert(
+                thread.to_string(),
+                Pending {
+                    turn,
+                    due,
+                    first_due: due,
+                },
+            );
+        }
+    }
+
     /// Whether thread `id` can take a wake for turn `turn` now: still idle after that turn's
-    /// interim report, nothing queued, nothing in the way of a turn.
-    fn wake_ready(&self, id: &str, turn: u64) -> anyhow::Result<bool> {
+    /// interim report (or its turn that saw no run), nothing queued, nothing in the way of a
+    /// turn; [`Ready::Later`] while its runtime is being stopped (a settings restart) or its
+    /// box is offline.
+    fn wake_ready(&self, id: &str, turn: u64) -> anyhow::Result<Ready> {
         let Some(v) = self.registry.get(id) else {
-            return Ok(false);
+            return Ok(Ready::Never);
         };
-        if interim_turn(v) != Some(turn)
+        let waits = interim_turn(v) == Some(turn)
+            || (self.wake.no_run.get(id) == Some(&turn)
+                && idle_worker(v)
+                && super::watches::turn_completed(v, Some(turn)));
+        if !waits
             || v.turns != turn
             || v.attached.is_some()
             || v.crashed
             || v.is_blocked()
             || self.wake.woken.get(id) == Some(&turn)
-            || !self.box_online(&v.box_name)
-            || self
-                .rt
-                .get(id)
-                .is_some_and(|r| r.queue_held || r.stop_requested)
+            || self.rt.get(id).is_some_and(|r| r.queue_held)
+            || self.store.pending_count(id)? > 0
         {
-            return Ok(false);
+            return Ok(Ready::Never);
         }
-        Ok(self.store.pending_count(id)? == 0)
+        if !self.box_online(&v.box_name) || self.rt.get(id).is_some_and(|r| r.stop_requested) {
+            return Ok(Ready::Later);
+        }
+        Ok(Ready::Now)
     }
 
-    /// Wakes thread `id` after turn `turn`'s interim report, if it still needs it.
+    /// Wakes thread `id` after turn `turn` (ready: [`Core::wake_ready`]).
     fn wake_thread(&mut self, hub: &Arc<Inner>, id: &str, turn: u64) -> anyhow::Result<()> {
-        if !self.wake_ready(id, turn)? {
-            return Ok(());
-        }
         let name = self.thread_name(id);
         let chain = self.wake.chain.get(id).copied().unwrap_or(0);
         let mut batch = Batch::default();
@@ -285,7 +369,15 @@ impl Core {
             return Ok(());
         }
         let ended = self.wake.ended.get(id).cloned().unwrap_or_default();
-        let prompt = wake_prompt(turn, &ended);
+        // The turn the work was left running by: the interim report's.
+        let shown = self
+            .registry
+            .get(id)
+            .and_then(|v| v.last_report.as_ref())
+            .filter(|r| report::interim_tasks(r) > 0)
+            .and_then(|r| r.turn)
+            .unwrap_or(turn);
+        let prompt = wake_prompt(shown, &ended);
         let tasks: Vec<Value> = ended
             .iter()
             .map(|t| match &t.job {

@@ -104,8 +104,8 @@
 //! model message, request, `init` or `result`), [`Translator::expire`] ends the turn
 //! `completed` with `ext.twr.missing_result` (no usage), and so does each turn queued meanwhile
 //! (its prompt was folded into that run: Claude starts no run for it), and a `result` that still comes
-//! before the next model output, with no prompt queued, is absorbed (its total read, charged
-//! to no turn; no turn ended or opened).
+//! before the next run shows (an `init` or model output), a prompt queued since or not, is
+//! absorbed (its total read, charged to no turn; no turn ended or opened).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -375,9 +375,12 @@ pub struct Translator {
     subagent_tasks: std::collections::HashSet<String>,
     /// What is awaited, and until when.
     watch: Option<(Watch, DateTime<Utc>)>,
-    /// A turn was ended for its missing `result`: a `result` before the next model output is
-    /// that run's, absorbed.
+    /// A turn was ended for its missing `result`: a `result` before the next run shows (its
+    /// `init` or model output) is that run's, absorbed.
     absorb_result: bool,
+    /// The runtime's turn was opened for a background task's notification and the main agent
+    /// has shown no output in it yet.
+    notice_quiet: bool,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
 }
@@ -423,6 +426,7 @@ impl Translator {
             subagent_tasks: Default::default(),
             watch: None,
             absorb_result: false,
+            notice_quiet: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
@@ -703,14 +707,15 @@ impl Translator {
                 return out;
             }
         };
-        // A line of a run: the notification's run started (a task's or a rate limit's line
-        // is none, nor the answer to a request of twr's).
+        // A line of the main agent's run: the notification's run started. Not a subagent's
+        // line, a task's, a rate limit's, the answer to a request of twr's, nor anything
+        // unknown (a `result` is [`Translator::on_result`]'s to judge).
         let kind = str_at(&v, "type");
+        let main = v.get("parent_tool_use_id").is_none_or(Value::is_null);
         let run_line = match kind {
-            "system" => !str_at(&v, "subtype").starts_with("task_"),
-            // (A `result` is [`Translator::on_result`]'s to judge.)
-            "rate_limit_event" | "control_response" | "result" => false,
-            _ => true,
+            "system" => matches!(str_at(&v, "subtype"), "init" | "api_retry"),
+            "stream_event" | "assistant" | "user" | "control_request" => main,
+            _ => false,
         };
         if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
             self.watch = None;
@@ -729,6 +734,8 @@ impl Translator {
                     if matches!(self.watch, Some((Watch::Result, _))) {
                         self.watch = None;
                     }
+                    // A new run: a `result` now is its own.
+                    self.absorb_result = false;
                     self.on_init(&v, line, &mut out);
                     self.read_usage(&mut out);
                 }
@@ -984,6 +991,7 @@ impl Translator {
             self.model_ran |= !child;
             if !child {
                 self.absorb_result = false;
+                self.notice_quiet = false;
             }
             self.start_runtime_turn(out, raw);
         }
@@ -1096,6 +1104,7 @@ impl Translator {
         }
         self.start_runtime_turn(out, Some(line));
         if self.runtime_turn.is_some() {
+            self.notice_quiet = true;
             let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
             self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
         }
@@ -1146,6 +1155,7 @@ impl Translator {
     /// Ends the running turn without a `result` of Claude's: `completed`, no usage, and
     /// `ext.twr.<why> = true`.
     fn end_without_result(&mut self, why: &str, out: &mut Translated) {
+        self.notice_quiet = false;
         let model_ran = self.model_ran;
         let synthetic = json!({"type": "result", "subtype": "success", "stop_reason": "end_turn"});
         let mut ended = Translated::default();
@@ -1213,6 +1223,7 @@ impl Translator {
         if str_at(ev, "type") == "message_start" {
             self.model_ran = true;
             self.absorb_result = false;
+            self.notice_quiet = false;
             if matches!(self.watch, Some((Watch::Result, _))) {
                 self.watch = None;
             }
@@ -1708,12 +1719,13 @@ impl Translator {
     }
 
     fn on_result(&mut self, v: &Value, line: &str, out: &mut Translated) {
-        // The run a notification's turn was opened for had not shown a line yet.
-        let quiet_notice = matches!(self.watch, Some((Watch::NoticeRun, _)));
+        // The run a notification's turn was opened for had shown no output of the main agent.
+        let quiet_notice = std::mem::take(&mut self.notice_quiet);
         self.watch = None;
-        // The run of a turn ended for its missing `result` ends after all: absorbed. Its spend
-        // was that turn's (reported unknown): the total moves on, charged to no other turn.
-        if std::mem::take(&mut self.absorb_result) && !self.active && self.queued.is_empty() {
+        // The run of a turn ended for its missing `result` ends after all: absorbed, also with
+        // a prompt queued since (its run has not shown: no `init`, no output). Its spend was
+        // that turn's (reported unknown): the total moves on, charged to no other turn.
+        if std::mem::take(&mut self.absorb_result) && !self.active {
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
                 self.cost_since(t);
             }
@@ -3411,13 +3423,46 @@ mod tests {
             Some(json!(true))
         );
         assert!(!t.busy());
-        assert!(feed(&mut t, &[&result(3, Some(2.0), false)]).is_empty());
+        // The next prompt is written before the late `result` comes: that `result` is still
+        // the old run's, and the prompt's turn is not ended by it.
         t.user_message("next", 3);
+        assert!(feed(&mut t, &[&result(3, Some(2.0), false)]).is_empty());
         let events = feed(
             &mut t,
             &[INIT, &reply("Next done."), &result(1, Some(2.5), false)],
         );
         assert_eq!(turn_marks(&events), ["end Some(3) None Some(0.5)"]);
+    }
+
+    /// A subagent's line is no run of the main agent's: it neither ends the wait for the
+    /// notification's run nor keeps a `result` that asked the model nothing from ending it.
+    #[test]
+    fn a_subagents_line_is_no_run_of_the_notification() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        let at = t.deadline().unwrap();
+        let child = json!({"type": "stream_event", "parent_tool_use_id": "toolu_9",
+                           "event": {"type": "message_start"}})
+        .to_string();
+        let child_text = json!({"type": "assistant", "parent_tool_use_id": "toolu_9",
+                                "message": {"content": [{"type": "text", "text": "sub"}]}})
+        .to_string();
+        feed(
+            &mut t,
+            &[&child, &child_text, r#"{"type":"something_new"}"#],
+        );
+        assert_eq!(t.deadline(), Some(at));
+        let events = feed(&mut t, &[&result(0, Some(1.0), true)]);
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
     }
 
     /// The hub's prompt raced the turn a background task's end opened: Claude folds it into its

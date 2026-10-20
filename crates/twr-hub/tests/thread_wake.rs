@@ -520,3 +520,94 @@ async fn background_work_waiting_on_a_job_does_not_stall() {
     );
     hub.shutdown().await;
 }
+
+/// A turn the runtime opened for a background task's notification that saw no run
+/// (`ext.twr.no_run`, the Claude Code adapter's): no report replaces the interim one, and the
+/// hub wakes the worker at once for the work that turn handled nothing of.
+#[tokio::test]
+async fn a_turn_that_saw_no_run_leaves_the_wake_to_the_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut ext = None;
+    set_twr_ext(&mut ext, RUNTIME_TURN_KEY, "r1".into());
+    let mut end_ext = ext.clone();
+    set_twr_ext(&mut end_ext, "no_run", true.into());
+    let mut script = vec![session()];
+    script.extend(interim("tests"));
+    script.extend([
+        Step::Sleep(100),
+        Step::EmitSession(task("tests", false)),
+        Step::EmitSession(EventBody::TurnStarted(TurnStarted {
+            from: TurnFrom::Runtime,
+            prompt: "[runtime resumed after background activity]".into(),
+            ext,
+            ..Default::default()
+        })),
+        Step::Sleep(100),
+        Step::EmitSession(EventBody::TurnEnded(TurnEnded {
+            ext: end_ext,
+            ..Default::default()
+        })),
+        Step::AwaitSend,
+        Step::Emit(text("The tests passed.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ]);
+    let mut o = opts(dir.path(), Some(script));
+    // Longer than the test waits: the wake after `no_run` does not wait for it.
+    o.wake_after = Some(Duration::from_secs(60));
+    let hub = Hub::open(o).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "run the tests", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| ended(e, 3)).await;
+    assert!(!evs
+        .iter()
+        .any(|e| e.kind() == "report.ready" && e.turn == Some(2)));
+    let woke = wakes(&evs);
+    assert_eq!(woke.len(), 1, "{woke:?}");
+    assert!(woke[0].contains("after your turn 1 ended"), "{}", woke[0]);
+    assert!(
+        woke[0].contains("- background tests (ended)"),
+        "{}",
+        woke[0]
+    );
+    hub.shutdown().await;
+}
+
+/// A `!` command of the user's run in the wait is no work of the worker's: the wake goes out.
+#[tokio::test]
+async fn a_users_shell_command_does_not_cancel_a_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![session()];
+    script.extend(interim("tests"));
+    script.extend([
+        Step::Sleep(100),
+        Step::EmitSession(task("tests", false)),
+        Step::AwaitSend,
+        Step::Emit(text("Done.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ]);
+    let mut o = opts(dir.path(), Some(script));
+    o.wake_after = Some(Duration::from_millis(1500));
+    let hub = Hub::open(o).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "run the tests", &Caller::user("test"))
+        .unwrap();
+    until(&hub, &api, |e| {
+        e.iter()
+            .any(|e| matches!(&e.body, EventBody::TaskUpdated(t) if !t.running))
+    })
+    .await;
+    let run: twr_hub::hub::ShellRun =
+        serde_json::from_value(json!({"thread": api, "command": "sleep 3"})).unwrap();
+    hub.shell_run(run, &Caller::user("test")).unwrap();
+    until(&hub, &api, |e| {
+        e.iter()
+            .any(|e| matches!(&e.body, EventBody::TaskUpdated(t) if t.running && t.task_id.starts_with("job:")))
+    })
+    .await;
+    let evs = until(&hub, &api, |e| ended(e, 2)).await;
+    assert_eq!(wakes(&evs).len(), 1);
+    hub.shutdown().await;
+}
