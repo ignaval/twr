@@ -203,33 +203,7 @@ impl Serialize for ServerMessage {
 
 impl<'de> Deserialize<'de> for ServerMessage {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // A message with a `stream` key is a stream item, else a response. Told from its
-        // JSON text and parsed from it straight into its type: a subscription's replay is
-        // thousands of items, and a `Value` of each costs more than reading it.
-        /// Whether the key is there, whatever its value (`null` too).
-        fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
-            serde::de::IgnoredAny::deserialize(d).map(|_| true)
-        }
-        #[derive(Deserialize)]
-        struct Keys {
-            #[serde(default, deserialize_with = "present")]
-            stream: bool,
-        }
-        let raw = Box::<serde_json::value::RawValue>::deserialize(d)?;
-        let json = raw.get();
-        let direct = serde_json::from_str::<Keys>(json).and_then(|k| {
-            if k.stream {
-                serde_json::from_str(json).map(|i| ServerMessage::Stream(Box::new(i)))
-            } else {
-                serde_json::from_str(json).map(ServerMessage::Response)
-            }
-        });
-        if let Ok(msg) = direct {
-            return Ok(msg);
-        }
-        // What does not parse that way (a key given twice, which a `Value` takes the last
-        // of) is read as it always was.
-        let v: Value = serde_json::from_str(json).map_err(serde::de::Error::custom)?;
+        let v = Value::deserialize(d)?;
         let is_stream = v.get("stream").is_some();
         if is_stream {
             serde_json::from_value(v)
@@ -241,6 +215,54 @@ impl<'de> Deserialize<'de> for ServerMessage {
                 .map_err(serde::de::Error::custom)
         }
     }
+}
+
+impl ServerMessage {
+    /// One line the hub wrote (without its newline), read as its `Deserialize` reads it, but
+    /// from the text straight into its types, a stream item's payload too: a subscription's
+    /// replay is thousands of items, and a `Value` of each costs more than reading it. What
+    /// does not parse that way is read the `Value` way, so what that accepts is built the same
+    /// ([`crate::event::EventBody::from_kind_json`] says what else it takes).
+    pub fn from_line(line: &[u8]) -> serde_json::Result<ServerMessage> {
+        /// Whether the key is there, whatever its value (`null` too).
+        fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+            serde::de::IgnoredAny::deserialize(d).map(|_| true)
+        }
+        #[derive(Deserialize)]
+        struct Keys {
+            #[serde(default, deserialize_with = "present")]
+            stream: bool,
+        }
+        #[derive(Deserialize)]
+        struct Item<'a> {
+            stream: StreamKind,
+            #[serde(default)]
+            gseq: Option<u64>,
+            #[serde(borrow)]
+            event: crate::event::WireEventText<'a>,
+        }
+        let direct = serde_json::from_slice::<Keys>(line).and_then(|k| {
+            if k.stream {
+                let i: Item = serde_json::from_slice(line)?;
+                Ok(ServerMessage::Stream(Box::new(StreamItem {
+                    stream: i.stream,
+                    gseq: i.gseq,
+                    event: i.event.into_event()?,
+                })))
+            } else {
+                serde_json::from_slice(line).map(ServerMessage::Response)
+            }
+        });
+        direct.or_else(|_| serde_json::from_slice(line))
+    }
+}
+
+/// [`read_frame`] of what the hub writes, read with [`ServerMessage::from_line`].
+pub async fn read_message<R>(r: &mut R) -> std::io::Result<Option<ServerMessage>>
+where
+    R: AsyncBufRead + Unpin + ?Sized,
+{
+    read_line_max(r, MAX_FRAME, ServerMessage::from_line).await
 }
 
 /// Serializes `msg` as one NDJSON line (with the trailing newline).
@@ -278,6 +300,18 @@ where
     R: AsyncBufRead + Unpin + ?Sized,
     T: DeserializeOwned,
 {
+    read_line_max(r, max, |line| serde_json::from_slice(line)).await
+}
+
+/// [`read_frame_max`] with each line parsed by `parse`.
+async fn read_line_max<R, T>(
+    r: &mut R,
+    max: usize,
+    parse: impl Fn(&[u8]) -> serde_json::Result<T>,
+) -> std::io::Result<Option<T>>
+where
+    R: AsyncBufRead + Unpin + ?Sized,
+{
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -301,7 +335,7 @@ where
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        return serde_json::from_slice(&buf)
+        return parse(&buf)
             .map(Some)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
     }
@@ -412,11 +446,46 @@ mod tests {
         assert_eq!(m, ServerMessage::Response(Response::ok(1, json!(true))));
     }
 
-    /// A message parsed from its text straight into its type is the one a `Value` gives,
-    /// and what one way refuses the other refuses: `stream` decides even when `null`, a key
-    /// given twice keeps its last value.
+    /// A message parsed from its text straight into its type ([`ServerMessage::from_line`])
+    /// is the one a `Value` gives, and what one way refuses the other refuses: `stream`
+    /// decides even when `null`, a key given twice keeps its last value. The `Deserialize`
+    /// impls stay the `Value` way, for any deserializer: inside an untagged enum (which
+    /// buffers what it reads), and through `from_value` without touching a number.
     #[test]
     fn server_messages_parse_as_through_a_value() {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Message(ServerMessage),
+            #[allow(dead_code)]
+            Other(u8),
+        }
+        let ev = crate::event::Event::new(
+            "t1",
+            1,
+            None,
+            Source::Hub,
+            EventBody::TurnEnded(crate::event::TurnEnded::default()),
+        );
+        let line = serde_json::to_string(&StreamItem {
+            stream: StreamKind::Thread,
+            gseq: None,
+            event: ev.clone(),
+        })
+        .unwrap();
+        let Either::Message(ServerMessage::Stream(item)) =
+            serde_json::from_str::<Either>(&line).unwrap()
+        else {
+            panic!("not a stream item");
+        };
+        assert_eq!(item.event, ev);
+        let m: ServerMessage =
+            serde_json::from_value(json!({"id": 1, "result": 51.248178375505404})).unwrap();
+        assert_eq!(
+            m,
+            ServerMessage::Response(Response::ok(1, json!(51.248178375505404)))
+        );
+
         let value_way = |json: &str| -> Result<ServerMessage, String> {
             let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
             if v.get("stream").is_some() {
@@ -458,7 +527,7 @@ mod tests {
             "{".to_string(),
         ];
         for json in &cases {
-            let direct = serde_json::from_str::<ServerMessage>(json).map_err(|e| e.to_string());
+            let direct = ServerMessage::from_line(json.as_bytes()).map_err(|e| e.to_string());
             match (direct, value_way(json)) {
                 (Ok(d), Ok(v)) => assert_eq!(d, v, "{json}"),
                 (Err(_), Err(_)) => {}

@@ -2441,10 +2441,14 @@ async fn drive(
                                 state.view.status = Some(format!("transcript: {e:#}"));
                                 thread_sub = None;
                                 state.transcript_stalled();
+                                // What it settled on is drawn, though an item of this batch
+                                // was still replayed.
+                                replaying = false;
                             }
                             None => {
                                 thread_sub = None;
                                 state.transcript_stalled();
+                                replaying = false;
                             }
                         }
                         applied += 1;

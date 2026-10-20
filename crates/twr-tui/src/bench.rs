@@ -113,12 +113,10 @@ fn from_file(var: &str) -> Option<Vec<String>> {
 fn decode(lines: &[String]) -> Vec<StreamItem> {
     lines
         .iter()
-        .map(
-            |l| match serde_json::from_str::<ServerMessage>(l).unwrap() {
-                ServerMessage::Stream(i) => *i,
-                ServerMessage::Response(r) => panic!("a response in the stream: {r:?}"),
-            },
-        )
+        .map(|l| match ServerMessage::from_line(l.as_bytes()).unwrap() {
+            ServerMessage::Stream(i) => *i,
+            ServerMessage::Response(r) => panic!("a response in the stream: {r:?}"),
+        })
         .collect()
 }
 

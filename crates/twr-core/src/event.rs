@@ -153,11 +153,48 @@ struct WireEvent {
     turn: Option<u64>,
     source: Source,
     kind: String,
-    /// Parsed by `kind` ([`EventBody::from_kind_json`]); `None` for `null` or none.
     #[serde(default)]
-    data: Option<Box<serde_json::value::RawValue>>,
+    data: Value,
     #[serde(default)]
     raw: Option<String>,
+}
+
+/// [`WireEvent`] with its `data` left as JSON text, parsed by `kind` straight into its type
+/// ([`EventBody::from_kind_json`]): only from serde_json's own text deserializer
+/// ([`crate::proto::ServerMessage::from_line`]), which alone has the text to lend.
+#[derive(Deserialize)]
+pub(crate) struct WireEventText<'a> {
+    v: u32,
+    id: String,
+    seq: u64,
+    #[serde(with = "rfc3339_millis")]
+    ts: DateTime<Utc>,
+    thread: String,
+    #[serde(default)]
+    turn: Option<u64>,
+    source: Source,
+    kind: String,
+    #[serde(default, borrow)]
+    data: Option<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+impl WireEventText<'_> {
+    /// The event.
+    pub(crate) fn into_event(self) -> Result<Event, serde_json::Error> {
+        Ok(Event {
+            body: EventBody::from_kind_json(&self.kind, self.data.map(|d| d.get()))?,
+            v: self.v,
+            id: self.id,
+            seq: self.seq,
+            ts: self.ts,
+            thread: self.thread,
+            turn: self.turn,
+            source: self.source,
+            raw: self.raw,
+        })
+    }
 }
 
 /// Borrowed wire shape used for serialization (keeps payload field order).
@@ -197,8 +234,7 @@ impl Serialize for Event {
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let w = WireEvent::deserialize(deserializer)?;
-        let body = EventBody::from_kind_json(&w.kind, w.data.as_deref().map(|d| d.get()))
-            .map_err(serde::de::Error::custom)?;
+        let body = EventBody::from_kind_data(&w.kind, w.data).map_err(serde::de::Error::custom)?;
         Ok(Event {
             v: w.v,
             id: w.id,
@@ -1537,7 +1573,9 @@ macro_rules! event_body {
             /// straight into the kind's payload, without a [`Value`] in between: what reading
             /// the log and the hub's streams spends most of its time on. JSON that does not
             /// parse that way (a key given twice, which a [`Value`] takes the last of) goes the
-            /// way of [`EventBody::from_kind_data`], so both accept and build the same.
+            /// way of [`EventBody::from_kind_data`]: what that one accepts, this one builds the
+            /// same. It also takes a number out of `f64`'s range in a field the payload ignores,
+            /// which a [`Value`] refuses (serde_json never writes one).
             pub fn from_kind_json(kind: &str, data: Option<&str>) -> Result<Self, serde_json::Error> {
                 let Some(json) = data else {
                     return Self::from_kind_data(kind, Value::Null);

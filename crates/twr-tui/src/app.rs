@@ -658,14 +658,27 @@ pub struct Sent {
     /// The first Esc on an empty line armed the second, at this time ([`UNSEND_WINDOW`]):
     /// the input box's title shows the hint meanwhile.
     pub armed: Option<Instant>,
-    /// The main pane's thread the armed second Esc counts in: the message's own, or, when the
-    /// first Esc left the dive the message went to, the orchestrator's it went back to.
-    pub armed_in: Option<String>,
+    /// The view the armed second Esc counts in: the message's thread's, or, when the first Esc
+    /// left the dive the message went to, the orchestrator conversation it went back to. In any
+    /// other view (another screen, another thread, even one left since) it takes nothing back.
+    pub armed_in: Option<ArmedView>,
     /// The hint ran out unused: for this message Esc goes on to its other steps (`/unsend`
     /// still takes it back).
     pub spent: bool,
     /// A `message.withdraw` for it is on its way.
     pub withdrawing: bool,
+}
+
+/// Where an armed double Esc counts ([`Sent::armed_in`]): the main pane's thread, the screen
+/// and the compact layout's pane it was armed in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmedView {
+    /// The main pane's thread.
+    pub main: Option<String>,
+    /// The screen.
+    pub screen: Screen,
+    /// The compact layout's pane.
+    pub pane: CompactPane,
 }
 
 /// A `message.withdraw` on its way ([`AppState::withdrawals`]).
@@ -3019,6 +3032,11 @@ impl AppState {
         if self.transcript.as_ref().map(|t| &t.thread) == main.as_ref() {
             return;
         }
+        // Another thread on the main pane: a double Esc armed for the one before is for no
+        // view any more, even once that one shows again.
+        if let Some(s) = self.sent.as_mut() {
+            s.armed = None;
+        }
         self.follow();
         self.view.expanded.clear();
         self.view.block = None;
@@ -4582,10 +4600,15 @@ impl AppState {
             return None;
         }
         let here = self.main_thread();
+        let view = self.armed_view();
         if let Some(at) = self.sent.as_ref().and_then(|s| s.armed) {
-            // Armed for another view than the one shown now (a dive left since, Ctrl-G): no
+            // Armed for another view than the one shown now (Ctrl-G, another screen): no
             // second Esc for it; this one does what Esc does here.
-            if self.sent.as_ref().is_some_and(|s| s.armed_in != here) {
+            if self
+                .sent
+                .as_ref()
+                .is_some_and(|s| s.armed_in.as_ref() != Some(&view))
+            {
                 if let Some(s) = self.sent.as_mut() {
                     s.armed = None;
                 }
@@ -4604,14 +4627,23 @@ impl AppState {
         let armed_in = if self.esc_does() == EscDoes::Leave {
             self.leave_dive();
             self.view.status = None;
-            self.main_thread()
+            self.armed_view()
         } else {
-            here
+            view
         };
         let s = self.sent.as_mut()?;
         s.armed = Some(now);
-        s.armed_in = armed_in;
+        s.armed_in = Some(armed_in);
         Some(Vec::new())
+    }
+
+    /// The view an armed double Esc counts in, as it is now ([`Sent::armed_in`]).
+    fn armed_view(&self) -> ArmedView {
+        ArmedView {
+            main: self.main_thread(),
+            screen: self.view.screen,
+            pane: self.view.compact_pane,
+        }
     }
 
     /// The armed second Esc (or tap): takes the last message back ([`AppState::unsend`]).
@@ -4621,7 +4653,7 @@ impl AppState {
         let back_to = self
             .sent
             .as_ref()
-            .filter(|s| s.armed_in != s.thread)
+            .filter(|s| s.armed_in.as_ref().is_some_and(|v| v.main != s.thread))
             .and_then(|s| s.thread.clone());
         let actions = self.unsend();
         if let Some(thread) = back_to.filter(|_| !actions.is_empty()) {
@@ -4636,7 +4668,7 @@ impl AppState {
     pub fn unsend_hint(&self) -> Option<String> {
         let s = self.sent.as_ref().filter(|s| s.armed.is_some())?;
         if !self.view.input.is_empty()
-            || s.armed_in != self.main_thread()
+            || s.armed_in.as_ref() != Some(&self.armed_view())
             || self.unsend_check().is_err()
         {
             return None;
@@ -4644,7 +4676,7 @@ impl AppState {
         let thread = s.thread.as_deref().and_then(|t| self.registry.get(t))?;
         Some(if thread.is_orchestrator() {
             " Esc or tap again: take back your last message ".to_string()
-        } else if s.armed_in != s.thread {
+        } else if s.armed_in.as_ref().is_some_and(|v| v.main != s.thread) {
             // Back from its dive.
             format!(
                 " Esc or tap again: take back your message to {} ",
@@ -6430,10 +6462,10 @@ impl AppState {
     pub fn take_back_offered(&self) -> bool {
         let here = self.main_thread();
         self.view.input.is_empty()
-            && self
-                .sent
-                .as_ref()
-                .is_some_and(|s| s.thread == here || (s.armed.is_some() && s.armed_in == here))
+            && self.sent.as_ref().is_some_and(|s| {
+                s.thread == here
+                    || (s.armed.is_some() && s.armed_in.as_ref() == Some(&self.armed_view()))
+            })
             && self.unsend_check().is_ok()
     }
 
@@ -6445,17 +6477,17 @@ impl AppState {
         if !self.take_back_offered() {
             return Vec::new();
         }
-        let here = self.main_thread();
+        let view = self.armed_view();
         if self
             .sent
             .as_ref()
-            .is_some_and(|s| s.armed.is_some() && s.armed_in == here)
+            .is_some_and(|s| s.armed.is_some() && s.armed_in.as_ref() == Some(&view))
         {
             return self.unsend_armed();
         }
         if let Some(s) = self.sent.as_mut() {
             s.armed = Some(now);
-            s.armed_in = here;
+            s.armed_in = Some(view);
         }
         Vec::new()
     }
@@ -18473,6 +18505,55 @@ pub(crate) mod tests {
             "nothing taken back"
         );
         assert_eq!(st.view.dive, None, "the Esc left the dive");
+        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+    }
+
+    /// The second Esc counts only in the view the first left the dive for: after Ctrl-G (the
+    /// grid), or another dive and `/back` (the same conversation shown again), Esc does what it
+    /// does there and takes nothing back, nor does a tap.
+    #[test]
+    fn a_take_back_armed_by_leaving_a_dive_is_for_that_view_only() {
+        let mut st = with_orch();
+        let mut b = beta_script(60);
+        control(&mut st, &[b.turn_ended(TurnResult::Completed)]);
+        let leave_armed = |st: &mut AppState, msg_ref: i64| {
+            st.dive("t-beta");
+            st.view.input.clear();
+            send_line(
+                st,
+                "and the man page",
+                serde_json::json!({"thread": "t-beta", "ref": msg_ref, "turn": null,
+                                   "pending": 1}),
+            );
+            assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+            assert_eq!(st.view.dive, None);
+            assert!(st.unsend_hint().is_some());
+        };
+        leave_armed(&mut st, 33);
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Grid);
+        assert_eq!(st.unsend_hint(), None);
+        assert!(!st.take_back_offered());
+        assert!(st.tap_unsend(Instant::now()).is_empty());
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+        assert_eq!(st.view.dive, None);
+
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Stack);
+        st.sent = None;
+        leave_armed(&mut st, 34);
+        assert!(type_line(&mut st, "/open gamma").is_empty());
+        assert!(type_line(&mut st, "/back").is_empty());
+        assert_eq!(st.main_thread().as_deref(), Some("t-orch"));
+        assert_eq!(st.unsend_hint(), None);
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
         assert_eq!(st.sent.as_ref().unwrap().armed, None);
     }
 
