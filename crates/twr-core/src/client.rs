@@ -97,8 +97,8 @@ const PARTING_READ: std::time::Duration = std::time::Duration::from_secs(1);
 pub struct HubClosed {
     /// The method called.
     pub method: String,
-    /// Whether the hub may have done it: it had the request whole and closed before it
-    /// answered. When not, nothing was done ([`HubClosed::resendable`]).
+    /// Whether the hub may have done it: it got some or all of the request and closed before
+    /// it answered. When not, nothing was done ([`HubClosed::resendable`]).
     pub maybe_done: bool,
     /// What the hub said as it closed: its error for the connection (request 0), such as
     /// [`codes::STOPPING`] or a request it could not read ([`codes::BAD_REQUEST`]).
@@ -234,16 +234,27 @@ impl Client {
             params,
         };
         let line = encode_line(&req).context("encoding request")?;
-        if let Err(e) = self.writer.write_all(line.as_bytes()).await {
-            if !connection_closed(&e) {
+        let mut sent = 0;
+        while sent < line.len() {
+            let e = match self.writer.write(&line.as_bytes()[sent..]).await {
+                Ok(0) => std::io::Error::from(std::io::ErrorKind::WriteZero),
+                Ok(n) => {
+                    sent += n;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => e,
+            };
+            if !connection_closed(&e) && e.kind() != std::io::ErrorKind::WriteZero {
                 return Err(anyhow::Error::new(e).context("writing request to hub"));
             }
-            // Not written whole, so its newline never reached the hub, which acts on whole
-            // lines only: it did nothing. What it said as it hung up may be waiting to be read.
+            // None of it was taken: the hub had closed the connection, and did nothing. (Some
+            // of it may be a request the hub reads to its end: then it may have done it.) What
+            // the hub said as it hung up may be waiting to be read.
             let said = tokio::time::timeout(PARTING_READ, parting_words(&mut self.reader))
                 .await
                 .unwrap_or(None);
-            return Err(HubClosed::new(method, false, said, Some(e)).into());
+            return Err(HubClosed::new(method, sent > 0, said, Some(e)).into());
         }
         // Written whole (a socket's flush does nothing, another stream's may), the hub may have
         // it: a failure from here on may come after it was done.
@@ -588,6 +599,68 @@ mod tests {
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// A stream that takes as many bytes as it holds, then fails.
+    struct TakesSome(usize);
+
+    impl AsyncRead for TakesSome {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TakesSome {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = self.0.min(buf.len());
+            self.0 -= n;
+            std::task::Poll::Ready(if n == 0 {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(n)
+            })
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A request the stream took part of (all but its newline, say: a hub reads a last line
+    /// without one) may have been done; one it took none of was not.
+    #[tokio::test]
+    async fn only_a_request_none_of_which_was_taken_is_resendable() {
+        let (closed, _) = closed_on(&mut Client::from_io(TakesSome(0))).await;
+        assert!(closed.resendable(), "{closed:?}");
+        let line = encode_line(&Request {
+            id: 1,
+            method: "thread.send".into(),
+            params: json!({"thread": "w1", "prompt": "hi"}),
+        })
+        .unwrap();
+        for taken in [1, line.len() - 1] {
+            let (closed, _) = closed_on(&mut Client::from_io(TakesSome(taken))).await;
+            assert!(
+                closed.maybe_done && !closed.resendable(),
+                "{taken}: {closed:?}"
+            );
         }
     }
 
