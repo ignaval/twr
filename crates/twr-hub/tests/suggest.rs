@@ -103,6 +103,9 @@ async fn hub_probing(
             futures::FutureExt::boxed(async move { probe })
         }));
     }
+    if let Some(probe) = PROBE.with(|p| p.borrow_mut().take()) {
+        o.agent_probe = Some(probe);
+    }
     // A `!!` command runs through the job gate, which this test binary isn't.
     o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
     Hub::open(o).await.unwrap()
@@ -110,6 +113,11 @@ async fn hub_probing(
 
 fn tui() -> Caller {
     Caller::user("tui")
+}
+
+thread_local! {
+    /// A probe for the next [`hub_probing`] on this thread to use instead of a fixed list.
+    static PROBE: std::cell::RefCell<Option<twr_hub::hub::AgentProbe>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The models a TUI asks with: `claude` for Claude Code, Codex's default.
@@ -1026,5 +1034,77 @@ async fn the_probe_says_when_suggestions_cannot_run() {
     let dir = tempfile::tempdir().unwrap();
     let hub = hub(dir.path(), dir.path().join("claude")).await;
     assert!(hub.info()["suggest"]["unavailable"].is_null());
+    hub.shutdown().await;
+}
+
+/// Signed in after the probe found nothing signed in, the user turns suggestions on: that
+/// ask probes the agents afresh, and Claude Code answers, not the minutes-old probe.
+#[tokio::test]
+async fn turning_suggestions_on_probes_afresh() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "run the tests", false);
+    let signed_in = Arc::new(AtomicBool::new(false));
+    let now = Arc::clone(&signed_in);
+    PROBE.with(|p| {
+        *p.borrow_mut() = Some(Arc::new(move || {
+            let login = if now.load(Ordering::SeqCst) {
+                AgentLogin::LoggedIn
+            } else {
+                AgentLogin::LoggedOut
+            };
+            let agents = vec![
+                probe("claude-code", true, login),
+                probe("codex", false, AgentLogin::Unknown),
+            ];
+            futures::FutureExt::boxed(async move { agents })
+        }));
+    });
+    let hub = hub_probing(dir.path(), bin, None).await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    signed_in.store(true, Ordering::SeqCst);
+    // Without a retry, the last probe stands.
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    let ask = twr_hub::SuggestAsk {
+        models: m("haiku"),
+        claude_only: false,
+        retry: true,
+    };
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    assert_eq!(r["suggestion"], "run the tests", "{r}");
+    assert_eq!(runs(&cli), 1);
     hub.shutdown().await;
 }

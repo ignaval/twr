@@ -840,7 +840,8 @@ pub struct SuggestAsk {
     /// Only Claude Code may answer: a client from before Codex answered suggestions, which
     /// told its user nothing of OpenAI.
     pub claude_only: bool,
-    /// The user turned suggestions on again: what calls found unable to run is tried again.
+    /// The user turned suggestions on again: the agents are probed afresh, and what calls
+    /// found unable to run is tried again.
     pub retry: bool,
 }
 
@@ -955,7 +956,13 @@ impl Hub {
                 allowed.join("+")
             ),
         );
-        let agents = hub.local_agents.known();
+        // Turned on again by the user (after signing in, say): the agents are probed afresh,
+        // not taken as the last probe, minutes old, found them.
+        let agents = if ask.retry {
+            hub.local_agents.probe().await
+        } else {
+            hub.local_agents.known()
+        };
         let probe = Probe {
             agents: &agents,
             at: hub.local_agents.probed_at(),
