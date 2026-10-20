@@ -95,7 +95,10 @@ pub struct SpawnConfig {
 
 /// What a Codex thread in `auto` mode does with a command its sandbox does not allow, when
 /// Codex asks to run it outside the sandbox: the config's `[codex] auto`, over which a
-/// project's `codex_auto` wins (`twr_adapters::codex`, "The `auto` sandbox").
+/// project's `codex_auto` wins (`twr_adapters::codex`, "The `auto` sandbox"). The config's
+/// default is [`CodexAuto::AutoReview`] (`twr_core::config::CodexConfig`); this type's own
+/// default, [`CodexAuto::Ask`], is what a thread runs with when nothing names a value: the
+/// orchestrator, and a runner told nothing by its hub.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CodexAuto {

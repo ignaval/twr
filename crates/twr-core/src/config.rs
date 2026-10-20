@@ -56,12 +56,13 @@
 //! worktree = false     # overrides threads.worktree for this project
 //! # Added to the environment of this project's runtimes, over threads.env.
 //! env = { CARGO_TARGET_DIR = "/home/me/.cache/api-target" }
-//! codex_auto = "auto_review"   # overrides [codex] auto for this project's threads
+//! codex_auto = "ask"   # overrides [codex] auto for this project's threads
 //!
 //! [codex]
-//! # What a Codex thread in `auto` does with a command its sandbox does not allow: "ask" you
-//! # (the default), let Codex's "auto_review" agent decide, or "never" run it.
-//! auto = "ask"
+//! # What a Codex thread in `auto` does with a command its sandbox does not allow: let Codex's
+//! # "auto_review" agent decide (the default: it runs what it approves outside the sandbox,
+//! # without asking you), "ask" you, or "never" run it.
+//! auto = "auto_review"
 //!
 //! [threads]
 //! thinking = false
@@ -882,13 +883,24 @@ pub struct ProjectConfig {
 }
 
 /// `[codex]`: settings of the Codex runtime.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodexConfig {
     /// What a Codex thread in `auto` does with a command its sandbox does not allow
-    /// ([`CodexAuto`]): ask the user (the default), let Codex's reviewer agent decide, or
+    /// ([`CodexAuto`]): let Codex's reviewer agent decide (the default), ask the user, or
     /// never run it.
     pub auto: CodexAuto,
+}
+
+impl Default for CodexConfig {
+    /// `auto = "auto_review"`: Codex's own reviewer answers what the `auto` sandbox does not
+    /// allow, as Claude Code's auto mode decides for itself. Not [`CodexAuto`]'s own default
+    /// (`ask`), which is what a thread runs with when nothing names a value.
+    fn default() -> Self {
+        CodexConfig {
+            auto: CodexAuto::AutoReview,
+        }
+    }
 }
 
 impl ProjectConfig {
@@ -2023,14 +2035,34 @@ mod tests {
     }
 
     /// `[codex] auto` (who answers what a Codex `auto` thread's sandbox does not allow):
-    /// `ask` by default, a project's `codex_auto` wins for its threads, and anything but the
-    /// three values (or another key under `[codex]`) is refused.
+    /// `auto_review` by default (an empty `[codex]` too), `ask` and `never` on request, a
+    /// project's `codex_auto` wins for its threads (`ask` included, under the default), and
+    /// anything but the three values (or another key under `[codex]`) is refused.
     #[test]
     fn codex_auto_defaults_project_override_and_checks() {
-        let c = Config::from_toml_str("").unwrap();
-        assert_eq!(c.codex.auto, CodexAuto::Ask);
-        assert_eq!(c.codex_auto(None), CodexAuto::Ask);
+        for text in ["", "[codex]\n"] {
+            let c = Config::from_toml_str(text).unwrap();
+            assert_eq!(c.codex.auto, CodexAuto::AutoReview);
+            assert_eq!(c.codex_auto(None), CodexAuto::AutoReview);
+            assert_eq!(c.codex_auto(Some("api")), CodexAuto::AutoReview);
+        }
+        assert_eq!(Config::default().codex.auto, CodexAuto::AutoReview);
+        // What a thread runs with when nothing names a value stays `ask`.
+        assert_eq!(CodexAuto::default(), CodexAuto::Ask);
+        let c = Config::from_toml_str(
+            r#"
+            [projects.api]
+            repo = "/src/api"
+            codex_auto = "ask"
+            [projects.web]
+            repo = "/src/web"
+            "#,
+        )
+        .unwrap();
         assert_eq!(c.codex_auto(Some("api")), CodexAuto::Ask);
+        assert_eq!(c.codex_auto(Some("web")), CodexAuto::AutoReview);
+        let c = Config::from_toml_str("[codex]\nauto = \"ask\"\n").unwrap();
+        assert_eq!(c.codex_auto(None), CodexAuto::Ask);
         let c = Config::from_toml_str(
             r#"
             [codex]

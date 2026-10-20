@@ -39,7 +39,7 @@
 //! | `SpawnConfig`          | Codex                                                                |
 //! |------------------------|----------------------------------------------------------------------|
 //! | `cwd`                  | process cwd + `cwd` param                                            |
-//! | `mode`                 | `approvalPolicy` + `sandbox`, see "Permission modes" below; always `approvalsReviewer: "user"` |
+//! | `mode`                 | `approvalPolicy` + `sandbox`, see "Permission modes" below; `approvalsReviewer: "user"`, but for an `auto` thread under `codex_auto` |
 //! | `model`                | `model` param                                                        |
 //! | `effort`               | `config.model_reasoning_effort` (one of [`EFFORTS`])                 |
 //! | `system_append`        | `developerInstructions` (added to the developer message; `baseInstructions` would replace Codex's own prompt) |
@@ -119,10 +119,11 @@
 //! Code's auto mode, which has no OS sandbox; writes elsewhere still ask.
 //!
 //! What the sandbox does not allow, Codex asks to run outside it, and
-//! [`SpawnConfig::codex_auto`] (`[codex] auto`) decides who answers ([`run_policy`]): the user
-//! (`ask`, the default: `approvalsReviewer: "user"`), Codex's reviewer agent (`auto_review`:
-//! `approvalsReviewer: "auto_review"`; its decisions show in the transcript as `auto_review`
-//! tool calls, [`translate`]), or nobody (`never`: `approvalPolicy: "never"`). Every other mode
+//! [`SpawnConfig::codex_auto`] (`[codex] auto`) decides who answers ([`run_policy`]): Codex's
+//! reviewer agent (`auto_review`, the config's default: `approvalsReviewer: "auto_review"`;
+//! its decisions show in the transcript as `auto_review` tool calls, [`translate`]), the user
+//! (`ask`: `approvalsReviewer: "user"`, also what a [`SpawnConfig`] that names nothing asks
+//! for), or nobody (`never`: `approvalPolicy: "never"`). Every other mode
 //! sends `approvalsReviewer: "user"`: a user config with `approvals_reviewer = "auto_review"`
 //! would otherwise send approvals to Codex's reviewer agent instead of twr.
 //!
@@ -268,8 +269,8 @@ pub fn policy(
 /// What a thread of `cfg` runs with: `(approvalPolicy, approvalsReviewer, sandbox)`. [`policy`]
 /// with the reviewer `user`, except for an `auto` thread with a `workspace-write` sandbox,
 /// where [`SpawnConfig::codex_auto`] decides who answers what the sandbox does not allow:
-/// the user (`on-request`, `user`: the default), Codex's reviewer agent (`on-request`,
-/// `auto_review`), or nobody (`never`).
+/// Codex's reviewer agent (`on-request`, `auto_review`: the config's default), the user
+/// (`on-request`, `user`), or nobody (`never`).
 pub fn run_policy(cfg: &SpawnConfig) -> anyhow::Result<(&'static str, &'static str, &'static str)> {
     let (approval, sandbox) = policy(&cfg.mode, cfg.builtin_tools.as_deref())?;
     if !is_auto_sandbox(cfg) {
@@ -292,7 +293,7 @@ fn is_auto_sandbox(cfg: &SpawnConfig) -> bool {
 }
 
 /// [`mode_note`] for `cfg`, plus what its [`SpawnConfig::codex_auto`] changes (an `auto`
-/// thread's that is not the default).
+/// thread's other than `ask`).
 pub fn run_note(cfg: &SpawnConfig) -> Option<String> {
     let note = mode_note(&cfg.mode, cfg.builtin_tools.as_deref());
     let auto = match cfg.codex_auto {
@@ -2485,6 +2486,30 @@ mod tests {
     /// sandbox), keep their policy and the reviewer `user`.
     #[test]
     fn codex_auto_picks_the_approval_policy_and_reviewer_of_auto() {
+        // With an empty config: Codex's reviewer for `auto`, and only for `auto`.
+        let default = twr_core::config::Config::default().codex_auto(None);
+        assert_eq!(default, CodexAuto::AutoReview);
+        let sent = |mode: &str| {
+            let p = thread_params(&SpawnConfig {
+                mode: mode.into(),
+                codex_auto: default,
+                ..Default::default()
+            })
+            .unwrap()
+            .params;
+            (p["approvalPolicy"].clone(), p["approvalsReviewer"].clone(), p["sandbox"].clone())
+        };
+        assert_eq!(
+            sent("auto"),
+            (json!("on-request"), json!("auto_review"), json!("workspace-write"))
+        );
+        for (mode, approval, sandbox) in [
+            ("plan", "untrusted", "read-only"),
+            ("read-only", "on-request", "read-only"),
+            ("dontAsk", "never", "read-only"),
+        ] {
+            assert_eq!(sent(mode), (json!(approval), json!("user"), json!(sandbox)), "{mode}");
+        }
         let cfg = |mode: &str, codex_auto| SpawnConfig {
             mode: mode.into(),
             codex_auto,
@@ -2503,6 +2528,8 @@ mod tests {
                 ("on-request", "on-request", ws),
                 ("never", "never", ws),
                 ("plan", "untrusted", "read-only"),
+                ("read-only", "on-request", "read-only"),
+                ("dontAsk", "never", "read-only"),
                 ("bypassPermissions", "never", "danger-full-access"),
             ] {
                 assert_eq!(

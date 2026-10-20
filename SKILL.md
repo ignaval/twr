@@ -185,6 +185,9 @@ see (none, or 0: a process of another pid namespace), is an agent of no known th
 ## Relay rule
 
 twr relays; it never answers an agent's permission prompt or question on the user's behalf.
+(By default a Codex thread in `auto` raises no permission for commands beyond its sandbox:
+Codex's own reviewer agent decides them (`[codex] auto = "auto_review"`), and the decisions
+show in the thread's transcript as `auto_review` tool calls, not as items to relay.)
 A worker's own shell is no user client: the hub refuses it everything but reads (see
 Identity, **Agents**). Only an explicit `attention.respond` from a user client answers one, plus one guarded case: the
 orchestrator may answer a permission or question only while its current turn was started by a

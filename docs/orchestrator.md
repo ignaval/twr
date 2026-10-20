@@ -87,7 +87,7 @@ Only a Claude Code orchestrator can be attached. The command `twr attach` runs f
 
 ## The relay rule
 
-twr relays. It never answers an agent's permission prompt or question on your behalf. Only you answer one, with `twr respond`, the TUI, or a message to the orchestrator that the hub reads as yours.
+twr relays. It never answers an agent's permission prompt or question on your behalf. Only you answer one, with `twr respond`, the TUI, or a message to the orchestrator that the hub reads as yours. One kind never reaches twr by default: what a Codex thread in `auto` asks to run outside its sandbox, which Codex's own reviewer agent answers (`[codex] auto`, [runtimes.md](runtimes.md#who-answers-when-the-sandbox-says-no)); the orchestrator sees those decisions only in the thread's transcript, as `auto_review` tool calls, and can't answer them.
 
 The orchestrator may pass on an answer to a permission or question only when all of these hold:
 
