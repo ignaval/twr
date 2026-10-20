@@ -88,6 +88,47 @@ pub struct SpawnConfig {
     /// only where both agree (`twr_adapters::codex::auto_writable_roots`). `None`: not known
     /// (no git metadata is made writable).
     pub repo: Option<PathBuf>,
+    /// What a Codex thread in `auto` does with a command its sandbox does not allow (`[codex]
+    /// auto`, `[projects.<name>] codex_auto`). Other runtimes and modes ignore it.
+    pub codex_auto: CodexAuto,
+}
+
+/// What a Codex thread in `auto` mode does with a command its sandbox does not allow, when
+/// Codex asks to run it outside the sandbox: the config's `[codex] auto`, over which a
+/// project's `codex_auto` wins (`twr_adapters::codex`, "The `auto` sandbox"). The config's
+/// default is [`CodexAuto::AutoReview`] (`twr_core::config::CodexConfig`); this type's own
+/// default, [`CodexAuto::Ask`], is what a thread runs with when nothing names a value: the
+/// orchestrator, and a runner told nothing by its hub.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexAuto {
+    /// Codex asks the user: a permission card (`approvalPolicy: on-request`, reviewer `user`).
+    #[default]
+    Ask,
+    /// Codex's own reviewer agent decides, and the user is not asked (`approvalsReviewer:
+    /// auto_review`): what it approves runs outside the sandbox.
+    AutoReview,
+    /// Nobody is asked (`approvalPolicy: never`): what the sandbox refuses fails.
+    Never,
+}
+
+impl CodexAuto {
+    /// Every value, as `[codex] auto` spells it.
+    pub const ALL: [CodexAuto; 3] = [CodexAuto::Ask, CodexAuto::AutoReview, CodexAuto::Never];
+
+    /// The config spelling: `ask`, `auto_review`, `never`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodexAuto::Ask => "ask",
+            CodexAuto::AutoReview => "auto_review",
+            CodexAuto::Never => "never",
+        }
+    }
+
+    /// The value a config spelling names; None for anything else.
+    pub fn parse(s: &str) -> Option<CodexAuto> {
+        CodexAuto::ALL.into_iter().find(|v| v.as_str() == s)
+    }
 }
 
 /// Static description of an adapter.

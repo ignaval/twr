@@ -785,3 +785,27 @@ async fn reset_over_the_socket_changes_only_the_selected_instance() {
     a.stop().await;
     b.stop().await;
 }
+
+/// A suggested message goes to the orchestrator only: routed (no `to`, or `to: null`), an
+/// `@thread yes` in it would answer as the user, so it is refused and nothing is sent.
+#[tokio::test]
+async fn a_suggested_say_must_go_to_the_orchestrator() {
+    let th = start().await;
+    let mut c = th.client("tui").await;
+    for params in [
+        json!({"message": "@api yes", "suggested": true}),
+        json!({"message": "@api yes", "suggested": true, "to": null}),
+    ] {
+        let e = c.call("say", params.clone()).await.unwrap_err();
+        assert_eq!(code(&e), "bad_request", "{params}: {e:#}");
+    }
+    let r = c
+        .call(
+            "say",
+            json!({"message": "and the docs", "suggested": true, "to": "orchestrator"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    th.stop().await;
+}

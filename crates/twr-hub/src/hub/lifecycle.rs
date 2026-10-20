@@ -49,13 +49,8 @@ impl Hub {
         // The hook's policy recalls the replay (a report it already knew of, rewritten later,
         // only revises it), and is fed from the commit path from here on: the past is no news.
         let (feed, hook_rx) = hook::HookFeed::new(&opts.config.notify).unzip();
-        let (core, reader) = Core::replay_with(&opts.db_path, feed)?;
-        let intents = core.store.spawn_intents()?;
-        let cap = opts.broadcast_capacity.max(1);
-        let (control_tx, _) = broadcast::channel(cap);
-        let (events_tx, _) = broadcast::channel(cap);
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
-        let stall_secs = opts.config.stall_after_secs;
+        // What the machine allows threads, found out (it runs `systemd-run`) while the log is
+        // replayed.
         let limits = {
             let threads = opts.config.threads.clone();
             let (run, ctl) = opts
@@ -65,9 +60,22 @@ impl Hub {
             tokio::task::spawn_blocking(move || {
                 super::limits::Limits::prepare(&threads, &run, &ctl)
             })
-            .await
-            .unwrap_or_default()
         };
+        let (mut core, reader) = Core::replay_with(&opts.db_path, feed)?;
+        core.wake.after = chrono::Duration::from_std(
+            opts.wake_after
+                .unwrap_or(Duration::from_secs(opts.config.wake_after_secs)),
+        )
+        .unwrap_or(chrono::Duration::MAX);
+        twr_core::trace::mark("hub: log replayed");
+        let intents = core.store.spawn_intents()?;
+        let cap = opts.broadcast_capacity.max(1);
+        let (control_tx, _) = broadcast::channel(cap);
+        let (events_tx, _) = broadcast::channel(cap);
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let stall_secs = opts.config.stall_after_secs;
+        let limits = limits.await.unwrap_or_default();
+        twr_core::trace::mark("hub: limits prepared");
         let warnings = opts.config.warnings(opts.config_file.as_deref());
         for w in &warnings {
             tracing::warn!("{w}");
@@ -120,6 +128,18 @@ impl Hub {
             socket: opts.socket,
             twr_exe: opts.twr_exe,
             job_gate_exe: opts.job_gate_exe,
+            suggest_bin: opts.suggest_bin.unwrap_or_else(|| {
+                std::env::var_os(twr_adapters::claude_code::BIN_ENV)
+                    .filter(|b| !b.is_empty())
+                    .map_or_else(|| PathBuf::from("claude"), PathBuf::from)
+            }),
+            suggest_codex_home: opts.suggest_codex_home,
+            suggest_codex_bin: opts.suggest_codex_bin.unwrap_or_else(|| {
+                std::env::var_os(twr_adapters::codex::BIN_ENV)
+                    .filter(|b| !b.is_empty())
+                    .map_or_else(|| PathBuf::from("codex"), PathBuf::from)
+            }),
+            suggestions: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,
             stall_after: opts.stall_after.unwrap_or(Duration::from_secs(stall_secs)),
@@ -167,6 +187,7 @@ impl Hub {
             let unreaped = reap_lost_jobs(&inner, lost).await;
             inner.core().hold_unreaped(&inner, &unreaped);
         }
+        twr_core::trace::mark("hub: lost jobs reaped");
         spawn_tasks(&inner, notify_rx);
         if let Some(rx) = hook_rx {
             let task = tokio::spawn(hook::hook_task(
@@ -181,6 +202,7 @@ impl Hub {
         // Kill survivors and wait for them to exit before anything can resume their session.
         reap_stale_runtimes(&inner, &stale).await?;
         reap_unreported_runtimes(&inner, &intents).await?;
+        twr_core::trace::mark("hub: stale runtimes reaped");
         let running_attaches = running_attaches(&inner).await?;
         inner
             .core()
@@ -189,9 +211,11 @@ impl Hub {
         // Spawn operations a crash left unfinished are settled from the log before anything can
         // ask for their status.
         hub.recover_spawns()?;
+        twr_core::trace::mark("hub: recovered");
         // What a crash left the log and the local box's trash disagreeing on, before anything
         // else can touch those threads.
         hub.reconcile_boxes(Some(LOCAL_BOX)).await;
+        twr_core::trace::mark("hub: local box reconciled");
         // Jobs a stopped hub ran and did not see end (what is left of them is gone already):
         // recorded lost.
         hub.inner.core().close_lost_jobs(&hub.inner);
@@ -201,6 +225,7 @@ impl Hub {
         for (rbox, ssh) in registered {
             boxes::start_box(&hub.inner, rbox, ssh);
         }
+        twr_core::trace::mark("hub: open");
         Ok(hub)
     }
 
@@ -456,8 +481,10 @@ impl Core {
         hook: Option<hook::HookFeed>,
     ) -> anyhow::Result<(Core, Connection)> {
         let store = Store::open(db_path)?;
+        twr_core::trace::mark("hub: store opened");
         let reader = store::connect(db_path)?;
         let events = store.load_all_with_gseq()?;
+        twr_core::trace::mark_with(|| format!("hub: {} events loaded", events.len()));
         let gseq = store.control_head()?;
         let mut core = Core {
             store,
@@ -491,6 +518,8 @@ impl Core {
             context_roots: HashMap::new(),
             hub_errors: HashMap::new(),
             stalled: HashMap::new(),
+            wake: Default::default(),
+            hung: Default::default(),
             activity: HashMap::new(),
             reserved_names: HashSet::new(),
             trash: Default::default(),
@@ -506,22 +535,38 @@ impl Core {
         // Reducers fold hydrated payloads: control kinds, agent text whose end the thread's
         // activity keeps (`hub::activity`; a capped one has a `text_ref`), and tool calls,
         // whose input and extras its activity line reads (a capped one keeps a preview).
+        // `TWR_TRACE_STARTUP`: the time hydration and the reducers took.
+        let timed = twr_core::trace::enabled();
+        let (mut hydrating, mut folding) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         for (ev, g) in &events {
             if let Some(g) = g {
                 core.gseq = *g;
             }
+            let t0 = timed.then(std::time::Instant::now);
             let folded_whole = ev.is_control()
                 || matches!(&ev.body, EventBody::AgentText(t) if !t.extra.is_empty())
                 || matches!(&ev.body, EventBody::AgentToolCall(_));
             let full = folded_whole
                 .then(|| hydrated_from_store(core.store.conn(), ev))
                 .flatten();
+            let t1 = timed.then(std::time::Instant::now);
             let ev = full.as_ref().unwrap_or(ev);
             core.apply(ev);
             if let Some(g) = g {
                 core.recall_hook(ev, *g);
             }
+            if let (Some(t0), Some(t1)) = (t0, t1) {
+                hydrating += t1 - t0;
+                folding += t1.elapsed();
+            }
         }
+        twr_core::trace::mark_with(|| {
+            format!(
+                "hub: log folded (hydration {}ms, reducers {}ms)",
+                hydrating.as_millis(),
+                folding.as_millis()
+            )
+        });
         core.gseq = gseq;
         drop(events);
         // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).

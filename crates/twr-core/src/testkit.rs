@@ -55,6 +55,7 @@ impl ThreadScript {
             | EventBody::TurnStarted(_)
             | EventBody::TurnEnded(_)
             | EventBody::TurnWithdrawn(_)
+            | EventBody::TurnInterrupted(_)
             | EventBody::AttentionRaised(_) => self.open_turn,
             _ => None,
         };
@@ -569,4 +570,94 @@ pub fn outbound_samples() -> Vec<(&'static str, crate::runner::HubMsg)> {
             ),
         ),
     ]
+}
+
+/// What a [`ScriptedHub`] does with one connection, after it answered `hello`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HubScript {
+    /// Closes it as a stopping hub does: says why (request 0, `stopping`), then hangs up.
+    Stop,
+    /// Reads the next request, then hangs up without answering it (a hub that crashed).
+    Crash,
+    /// Answers every request with `{}`.
+    Serve,
+}
+
+/// A stand-in hub on a Unix socket that serves its connections in order, the i-th as
+/// `scripts[i]` (later ones [`HubScript::Serve`]), and records the methods each one got.
+#[derive(Debug, Clone)]
+pub struct ScriptedHub {
+    /// The methods each connection got, in order of connection.
+    pub got: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    hung_up: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ScriptedHub {
+    /// Listens on `socket` (which must not exist).
+    pub fn start(socket: &std::path::Path, scripts: Vec<HubScript>) -> ScriptedHub {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let hub = ScriptedHub {
+            got: Default::default(),
+            hung_up: Default::default(),
+        };
+        let (got, hung_up) = (hub.got.clone(), hub.hung_up.clone());
+        tokio::spawn(async move {
+            for n in 0.. {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let script = scripts.get(n).copied().unwrap_or(HubScript::Serve);
+                got.lock().unwrap().push(Vec::new());
+                let (got, hung_up) = (got.clone(), hung_up.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = tokio::io::BufReader::new(r).lines();
+                    let reply = |id: &serde_json::Value, body: serde_json::Value| {
+                        let mut r = json!({ "id": id });
+                        r.as_object_mut()
+                            .unwrap()
+                            .extend(body.as_object().unwrap().clone());
+                        format!("{r}\n")
+                    };
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default().to_string();
+                        got.lock().unwrap()[n].push(method.clone());
+                        let answer = match (method == "hello", script) {
+                            (true, _) | (false, HubScript::Serve) => json!({"result": {}}),
+                            (false, _) => break,
+                        };
+                        if w.write_all(reply(&req["id"], answer).as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if method == "hello" && script == HubScript::Stop {
+                            let stopping = json!({"error": {
+                                "code": crate::proto::codes::STOPPING,
+                                "message": "the hub is stopping",
+                            }});
+                            let _ = w.write_all(reply(&json!(0), stopping).as_bytes()).await;
+                            break;
+                        }
+                    }
+                    drop(w);
+                    hung_up.notify_one();
+                });
+            }
+        });
+        hub
+    }
+
+    /// Waits until a connection's script hung up on it.
+    pub async fn hung_up(&self) {
+        self.hung_up.notified().await;
+    }
+
+    /// The methods each connection got so far.
+    pub fn got(&self) -> Vec<Vec<String>> {
+        self.got.lock().unwrap().clone()
+    }
 }

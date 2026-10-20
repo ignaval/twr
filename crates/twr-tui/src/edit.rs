@@ -63,6 +63,23 @@ pub(crate) fn cluster_width(g: &str) -> usize {
 }
 
 /// Display width of `s` in terminal cells: the sum of its clusters' ([`clusters`]).
+/// `s` as the input line takes it ([`LineInput::insert`]): a line break (`\r\n`, `\r` or
+/// `\n`) as `\n`, a tab as a space, other control characters dropped.
+pub fn clean_text(s: &str) -> String {
+    let mut clean = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' | '\r' => clean.push('\n'),
+            '\t' => clean.push(' '),
+            c if c.is_control() => {}
+            c => clean.push(c),
+        }
+    }
+    clean
+}
+
 pub fn width(s: &str) -> usize {
     clusters(s).into_iter().map(|(_, g)| cluster_width(g)).sum()
 }
@@ -141,17 +158,7 @@ impl LineInput {
     /// Inserts `s` at the cursor and moves the cursor after it. A line break (`\r\n`, `\r` or
     /// `\n`) goes in as `\n`, a tab as a space; other control characters are dropped.
     pub fn insert(&mut self, s: &str) {
-        let mut clean = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(c) = chars.next() {
-            match c {
-                '\r' if chars.peek() == Some(&'\n') => {}
-                '\n' | '\r' => clean.push('\n'),
-                '\t' => clean.push(' '),
-                c if c.is_control() => {}
-                c => clean.push(c),
-            }
-        }
+        let clean = clean_text(s);
         self.text.insert_str(self.cursor, &clean);
         self.cursor += clean.len();
         self.snap();

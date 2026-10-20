@@ -66,6 +66,7 @@ The values below are the defaults, except where a comment says "example".
 default_runtime = "claude-code"   # claude-code | codex | grok-build | acp:<command> | a [runtimes] name | pty:<command>
 stall_after_secs = 600            # foreground/background work silent this long raises stalled; 0 = off
 background_timeout_secs = 86400    # stop background-only work without task liveness for 24h; 0 = off
+wake_after_secs = 30              # wake a worker idle this long after its background work ended; 0 = off
 # Where a project given by its folder name is looked up (see below). Unset = these folders;
 # [] = no lookup.
 # project_roots = ["~/code", "~/src", "~/projects", "~/dev", "~/Developer", "~/repos", "~/git", "~/workspace"]
@@ -107,10 +108,14 @@ repo = "/home/me/code/api"        # the repository
 # base = "dev"                    # the branch its threads merge into: ahead/behind and conflicts on their cards
 # trim_idle_after = "24h"         # trim the build output of its threads idle this long (90m, 24h, 2d)
 # idle_trim_disposable = ["target/"]  # replaces [threads] idle_trim_disposable for this project
+# codex_auto = "ask"              # overrides [codex] auto for this project's threads
+
+[codex]
+auto = "auto_review"              # a Codex thread in `auto` whose sandbox says no: Codex's "auto_review" agent decides (the default), "ask" you, or "never" run it
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 detail = false                    # true: what's asked or reported goes along (it may hold secrets)
 timeout_secs = 30                 # the command is ended after this long (1 to 600)
 
@@ -119,11 +124,13 @@ mouse = true                      # the TUI selects and copies text; false = the
 animate = true                    # the working icon moves; false = a still _ marker
 card_order = "stable"             # "attention": the most recently active thread first, every move at once
 compact_width = 60                # narrower, one screen at a time (a phone); 0 = never
+suggest = true                    # a small model suggests your next message after a turn; false: none
+suggest_model = { claude-code = "claude-haiku-5-5", codex = "gpt-6-luna" }  # small models only
 
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
 when = "unfocused"                # always: also while the terminal has focus
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"
@@ -179,9 +186,13 @@ The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the
 
 `compact_width` is the width, in columns, below which the TUI shows one screen at a time: the conversation, what needs you, or the threads, switched with `/c`, `/n` and `/t`. It's meant for a phone over SSH or mosh. 0 turns it off; `/compact on|off` overrides it while the TUI runs. See [tui.md](tui.md#on-a-phone).
 
+`suggest` (on by default) has the TUI suggest your next message: after a turn of the thread you see ends, the hub asks a small model, through Claude Code's or Codex's CLI with your login, for a likely next message, which shows as ghost text in the empty input box until Tab or → takes it. The thread's own runtime answers when it is one of those two, else Claude Code, and the other only once the first turned out unable to run at all (from the next suggestion on). It sends that turn's prompt and the end of its reply to that runtime's provider (Anthropic or OpenAI), about $0.0002 a suggestion at list price, counted toward your plan's usage on a subscription: the TUI says so the first time a suggestion is due, before it asks for one. Without either CLI, or a login, on the hub's machine nothing is sent, and the TUI says so once. Set `suggest = false` to turn them off. `suggest_model` names the model for each runtime: `claude-code` (`claude-haiku-5-5` by default; any name `claude --model` takes) and `codex` (`gpt-6-luna` by default; any name in `codex debug models`); a plain string names Claude Code's. Only small models: a Claude Code model that isn't a Haiku, or a Codex one that isn't a Luna, mini or nano, is never used, nor replaced by the other runtime, and the hub warns about it when it starts (`hub.info` `warnings`). `/suggest on|off` turns it on or off while the TUI runs. See [tui.md](tui.md#suggestions).
+
 `[tui.notify]` has the TUI alert its terminal, with a bell or a desktop notification, when something needs you and the terminal isn't focused. The TUI reads it from the config of the machine it runs on. See [tui.md](tui.md#notifications).
 
-`default_mode` is passed to the runtime as its permission mode. The default, `auto`, is the agent's own auto mode: the agent decides which tool calls need asking, and whatever it asks comes to you as a permission card. twr itself still never answers a prompt. Set `manual` to have every edit and command that needs approval ask you. It isn't free text. The hub checks it when it starts and keeps it in its canonical spelling. An unknown mode is a config error and the hub doesn't start. Creating a thread on a runtime that can't take the mode fails. `twr mode <thread> <mode>` changes one thread's mode later. The orchestrator never runs in `auto`, whatever this says: it only asks. [runtimes.md](runtimes.md#permission-modes) lists the modes and how each runtime maps them.
+`default_mode` is passed to the runtime as its permission mode. The default, `auto`, is the agent's own auto mode: the agent decides which tool calls need asking, and whatever it asks comes to you as a permission card, except that a Codex thread's reviewer agent answers what its sandbox doesn't allow (`[codex] auto`, below). twr itself still never answers a prompt. Set `manual` to have every edit and command that needs approval ask you. It isn't free text. The hub checks it when it starts and keeps it in its canonical spelling. An unknown mode is a config error and the hub doesn't start. Creating a thread on a runtime that can't take the mode fails. `twr mode <thread> <mode>` changes one thread's mode later. The orchestrator never runs in `auto`, whatever this says: it only asks. [runtimes.md](runtimes.md#permission-modes) lists the modes and how each runtime maps them.
+
+`[codex] auto` decides who answers when a Codex thread in `auto` asks to run a command its sandbox doesn't allow: `auto_review` (the default) lets Codex's own reviewer agent approve or deny it without asking you, and the thread's transcript shows each decision; `ask` makes it a permission card for you; `never` asks nobody, so the command fails. `[projects.<name>] codex_auto` overrides it for that project's threads, and other runtimes and modes ignore both. `auto_review` lets commands run outside the sandbox that you never see first: set `auto = "ask"` to answer them yourself; [runtimes.md](runtimes.md#who-answers-when-the-sandbox-says-no) and [security-model.md](security-model.md#codex-auto) say what each value allows.
 
 `park_disposable` lists ignored paths that parking may delete along with a clean worktree. `name/` matches any directory with that name, and `name` matches any path component. Any other ignored file keeps the worktree. On Linux and macOS, deleting a thread deletes the same entries (its build output) instead of moving them to the trash, unless one holds a git repository or might ([usage.md](usage.md#delete-threads)). On other systems they go to the trash with the rest. `twr trim` deletes them too. See [worktrees.md](worktrees.md).
 

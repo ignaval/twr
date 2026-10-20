@@ -51,7 +51,7 @@ use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 
 use super::supervisor::split_runtime_attn_id;
-use super::{append_err, internal, rpc, twr_ext_map, Batch, Caller, Core, Hub, Inner, LOCAL_BOX};
+use super::{append_err, internal, rpc, twr_ext_map, Batch, Caller, Core, Hub, Inner};
 use crate::store;
 
 /// The orchestrator a call it makes is bound to, as the hub saw it when the request came in
@@ -196,10 +196,13 @@ impl Core {
         turn: u64,
         sign: RunningSign,
     ) {
-        if !self.turn_taken_back(thread, turn) {
+        let taken_back = self.turn_taken_back(thread, turn);
+        if !taken_back && !self.turn_interrupted(thread, turn) {
             return;
         }
-        if let RunningSign::Request(attn_id) = &sign {
+        // A request of a turn the user interrupted waits for the user as any other: the turn
+        // ends with the interrupt, and its end closes it.
+        if let (RunningSign::Request(attn_id), true) = (&sign, taken_back) {
             self.decline_taken_back(hub, thread, turn, attn_id);
         }
         let rt = self.rt(thread);
@@ -212,7 +215,12 @@ impl Core {
         }
         rt.reinterrupted = Some((turn, shown | sign.bit()));
         if let Some(live) = rt.live.as_ref() {
-            tracing::info!(thread, turn, ?sign, "interrupting a taken-back turn again");
+            tracing::info!(
+                thread,
+                turn,
+                ?sign,
+                "interrupting a taken-back or interrupted turn again"
+            );
             if live.handle.interrupt().is_err() {
                 tracing::info!(thread, turn, "the runtime was gone before the interrupt");
             }
@@ -330,19 +338,7 @@ impl Core {
         if view.current_turn_acted || self.orch_turn_acted(id, turn) {
             return refuse(Refusal::Acted, Some(turn));
         }
-        // The live process's runtime decides, not the thread's: a thread moved to another
-        // runtime finishes its turn on the previous one (`hub::restart`). Unknown: refused.
-        let rt = self.rt.get(id);
-        let live_runtime = rt
-            .filter(|r| r.live.is_some())
-            .and_then(|r| r.runtime_settings.as_ref())
-            .map(|s| s.runtime.as_str());
-        let interruptible = view.box_name == LOCAL_BOX
-            && live_runtime.is_some_and(|runtime| {
-                hub.host(&view.box_name)
-                    .is_some_and(|h| h.interrupts_turns(runtime))
-            });
-        if !interruptible {
+        if !self.turn_interruptible(hub, id, &view) {
             return refuse(Refusal::Uninterruptible, Some(turn));
         }
         // Recorded first: from here on the turn has no authority, whatever the runtime does

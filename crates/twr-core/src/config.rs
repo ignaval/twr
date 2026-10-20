@@ -4,6 +4,7 @@
 //! ```toml
 //! default_runtime = "claude-code"
 //! stall_after_secs = 600  # a running turn silent this long raises `stalled`; 0 = off
+//! wake_after_secs = 30    # wake a worker idle this long after its background work; 0 = off
 //! # Where `thread.new` looks for a project given by its folder name (`<root>/<name>` or
 //! # `<root>/*/<name>`, a git repository); unset = DEFAULT_PROJECT_ROOTS, [] = no lookup.
 //! project_roots = ["~/code", "~/src"]
@@ -55,6 +56,13 @@
 //! worktree = false     # overrides threads.worktree for this project
 //! # Added to the environment of this project's runtimes, over threads.env.
 //! env = { CARGO_TARGET_DIR = "/home/me/.cache/api-target" }
+//! codex_auto = "ask"   # overrides [codex] auto for this project's threads
+//!
+//! [codex]
+//! # What a Codex thread in `auto` does with a command its sandbox does not allow: let Codex's
+//! # "auto_review" agent decide (the default: it runs what it approves outside the sandbox,
+//! # without asking you), "ask" you, or "never" run it.
+//! auto = "auto_review"
 //!
 //! [threads]
 //! thinking = false
@@ -76,6 +84,11 @@
 //! mouse = true         # the TUI selects and copies text itself; false = the terminal's own
 //! animate = true       # the working icon moves; false = a still `twr_` marker
 //! card_order = "stable"  # stable (default): cards keep their place; "attention": most recent first
+//! suggest = true       # a small model suggests your next message (ghost text, Tab takes it);
+//!                      # false: none (sends nothing to Anthropic for it)
+//! # The small model suggestions come from, per runtime (a string: Claude Code's). Only a
+//! # Haiku for Claude Code, a Luna (mini, nano) for Codex: a large one is never used.
+//! suggest_model = { claude-code = "claude-haiku-5-5", codex = "gpt-6-luna" }
 //!
 //! [tui.notify]
 //! terminal = "bell"    # off (default) | bell | osc9 | osc777: how the TUI alerts its terminal
@@ -101,6 +114,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::adapter::CodexAuto;
 use crate::notify::NotifyEvent;
 use crate::paths::Paths;
 
@@ -127,8 +141,14 @@ pub struct Config {
     pub stall_after_secs: u64,
     /// Background-only work with no task liveness signal this long is stopped. Zero = off.
     pub background_timeout_secs: u64,
+    /// Seconds the hub waits, after a worker's background work ended with no turn after its
+    /// interim report, before it wakes the worker itself with a prompt saying what ended (once
+    /// per such report). Zero = never.
+    pub wake_after_secs: u64,
     /// Named runtimes (`[runtimes.<name>]`): ACP agent commands under a short name.
     pub runtimes: BTreeMap<String, RuntimePreset>,
+    /// Codex settings (`[codex]`).
+    pub codex: CodexConfig,
     /// The hub's notification command (`[notify]`): off unless `command` is set.
     pub notify: NotifyConfig,
     /// Terminal UI settings (read by the TUI when it starts, not by the hub).
@@ -175,7 +195,9 @@ impl Default for Config {
             trash: TrashConfig::default(),
             stall_after_secs: 600,
             background_timeout_secs: 86400,
+            wake_after_secs: 30,
             runtimes: BTreeMap::new(),
+            codex: CodexConfig::default(),
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
             project_roots: None,
@@ -242,6 +264,112 @@ pub struct TuiConfig {
     pub compact_width: u16,
     /// Terminal notifications (`[tui.notify]`): off unless `terminal` picks a way.
     pub notify: TuiNotifyConfig,
+    /// Suggest the next message (default `true`): after a turn of the thread on the main
+    /// pane ends, ask a small model for a likely next message, shown as ghost text in the
+    /// empty input box (Tab or → takes it). It sends that turn's prompt and the end of its
+    /// reply to Anthropic through the Claude Code CLI, with your login; without the CLI or a
+    /// login, nothing is sent. The TUI says so once, the first time one is due.
+    pub suggest: bool,
+    /// The small model suggestions come from, per runtime ([`SuggestModels`]): Claude Code's
+    /// `claude-haiku-5-5` and Codex's `gpt-6-luna` by default.
+    pub suggest_model: SuggestModels,
+}
+
+/// The model Claude Code's suggestions come from unless `[tui] suggest_model` names another:
+/// Haiku 5.5, pinned (the `haiku` alias ran it too with Claude Code 2.1.304).
+pub const DEFAULT_SUGGEST_MODEL: &str = "claude-haiku-5-5";
+/// The model Codex's suggestions come from unless `[tui] suggest_model` names another:
+/// GPT-6-Luna, Codex 0.162's "fast and affordable model for easier tasks" (`model/list`).
+pub const DEFAULT_SUGGEST_CODEX_MODEL: &str = "gpt-6-luna";
+
+/// `[tui] suggest_model`: the model next-message suggestions come from, for each runtime that
+/// can run them. A string names Claude Code's (`suggest_model = "claude-haiku-5-5"`); a table
+/// names either or both (`suggest_model = { claude-code = "claude-haiku-5-5", codex =
+/// "gpt-6-luna" }`), the other keeping its default. Only small models: one that looks large
+/// ([`suggest_model_too_large`]) is never used.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SuggestModels {
+    /// Claude Code's (`claude -p --model`).
+    #[serde(rename = "claude-code")]
+    pub claude_code: String,
+    /// Codex's (`codex exec -m`).
+    pub codex: String,
+}
+
+impl Default for SuggestModels {
+    fn default() -> Self {
+        SuggestModels {
+            claude_code: DEFAULT_SUGGEST_MODEL.into(),
+            codex: DEFAULT_SUGGEST_CODEX_MODEL.into(),
+        }
+    }
+}
+
+impl SuggestModels {
+    /// The model for `runtime` (`claude-code`, `codex`); `None` for any other runtime.
+    pub fn of(&self, runtime: &str) -> Option<&str> {
+        match runtime {
+            "claude-code" => Some(&self.claude_code),
+            "codex" => Some(&self.codex),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SuggestModels {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct PerRuntime {
+            #[serde(rename = "claude-code")]
+            claude_code: Option<String>,
+            codex: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(
+            untagged,
+            expecting = "a model name, or a table of `claude-code` and `codex`"
+        )]
+        enum Raw {
+            One(String),
+            Per(PerRuntime),
+        }
+        let d0 = SuggestModels::default();
+        Ok(match Raw::deserialize(d)? {
+            Raw::One(m) => SuggestModels {
+                claude_code: m,
+                ..d0
+            },
+            Raw::Per(p) => SuggestModels {
+                claude_code: p.claude_code.unwrap_or(d0.claude_code),
+                codex: p.codex.unwrap_or(d0.codex),
+            },
+        })
+    }
+}
+
+/// Why `model` is no model for `runtime`'s suggestions (`None`: it is a small one): a
+/// suggestion runs after every turn, so only a small, cheap model may answer it. For Claude
+/// Code, a Haiku (`claude-haiku-5-5`, `haiku`); for Codex, a Luna, mini or nano
+/// (`gpt-6-luna`). Anything else (Sonnet, Opus, `gpt-6.1-sol`, `default`) looks large.
+pub fn suggest_model_too_large(runtime: &str, model: &str) -> Option<String> {
+    let m = model.to_ascii_lowercase();
+    let small = match runtime {
+        "claude-code" => m.contains("haiku"),
+        "codex" => m.contains("luna") || m.contains("mini") || m.contains("nano"),
+        _ => false,
+    };
+    (!small).then(|| {
+        let want = match runtime {
+            "codex" => DEFAULT_SUGGEST_CODEX_MODEL,
+            _ => DEFAULT_SUGGEST_MODEL,
+        };
+        format!(
+            "[tui] suggest_model names {model:?} for {runtime}, which looks like a large model: \
+             suggestions run after every turn, so they use only a small one (such as {want:?}), \
+             and none come from {runtime} until it names one"
+        )
+    })
 }
 
 /// `[tui] card_order`: how the TUI orders the cards within a group (what needs you first, then
@@ -265,6 +393,8 @@ impl Default for TuiConfig {
             card_order: CardOrder::Stable,
             compact_width: 60,
             notify: TuiNotifyConfig::default(),
+            suggest: true,
+            suggest_model: SuggestModels::default(),
         }
     }
 }
@@ -846,6 +976,30 @@ pub struct ProjectConfig {
     /// What an idle trim of this project's threads may delete, replacing `[threads]
     /// idle_trim_disposable` ([`Config::idle_trim_disposable`]).
     pub idle_trim_disposable: Option<Vec<String>>,
+    /// What this project's Codex threads in `auto` do with a command their sandbox does not
+    /// allow, over `[codex] auto` ([`Config::codex_auto`]).
+    pub codex_auto: Option<CodexAuto>,
+}
+
+/// `[codex]`: settings of the Codex runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CodexConfig {
+    /// What a Codex thread in `auto` does with a command its sandbox does not allow
+    /// ([`CodexAuto`]): let Codex's reviewer agent decide (the default), ask the user, or
+    /// never run it.
+    pub auto: CodexAuto,
+}
+
+impl Default for CodexConfig {
+    /// `auto = "auto_review"`: Codex's own reviewer answers what the `auto` sandbox does not
+    /// allow, as Claude Code's auto mode decides for itself. Not [`CodexAuto`]'s own default
+    /// (`ask`), which is what a thread runs with when nothing names a value.
+    fn default() -> Self {
+        CodexConfig {
+            auto: CodexAuto::AutoReview,
+        }
+    }
 }
 
 impl ProjectConfig {
@@ -1272,6 +1426,7 @@ impl Config {
                     .flatten()
             })
             .collect();
+        out.extend(self.tui_warnings());
         let Some(file) = file else {
             return out;
         };
@@ -1293,6 +1448,16 @@ impl Config {
             mode_of(&boxes_file).and_then(|mode| exposed_file_warning(&boxes_file, mode, theirs)),
         );
         out
+    }
+
+    /// [`Config::warnings`] about `[tui]`, which the file can't hold wrong: a suggestion model
+    /// that looks large ([`suggest_model_too_large`]).
+    fn tui_warnings(&self) -> Vec<String> {
+        let m = &self.tui.suggest_model;
+        [("claude-code", &m.claude_code), ("codex", &m.codex)]
+            .into_iter()
+            .filter_map(|(rt, model)| suggest_model_too_large(rt, model))
+            .collect()
     }
 
     /// Loads `path` (missing file = defaults).
@@ -1371,6 +1536,15 @@ impl Config {
             env.extend(p.env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         env.into_iter().collect()
+    }
+
+    /// What a Codex thread of `project` in `auto` does with a command its sandbox does not
+    /// allow: `[projects.<project>] codex_auto`, else `[codex] auto`.
+    pub fn codex_auto(&self, project: Option<&str>) -> CodexAuto {
+        project
+            .and_then(|p| self.projects.get(p))
+            .and_then(|p| p.codex_auto)
+            .unwrap_or(self.codex.auto)
     }
 
     /// What an idle trim of a thread of `project` may delete (of `threads.park_disposable`):
@@ -1869,6 +2043,81 @@ mod tests {
         assert!(c.tui.mouse);
         let e = Config::from_toml_str("[tui]\nmice = false\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
+        // Suggestions: on, Haiku 5.5 and GPT-6-Luna, unless asked otherwise (an empty `[tui]`
+        // too).
+        assert!(c.tui.suggest);
+        let models = |claude: &str, codex: &str| SuggestModels {
+            claude_code: claude.into(),
+            codex: codex.into(),
+        };
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-5-5", "gpt-6-luna")
+        );
+        assert!(Config::from_toml_str("[tui]\n").unwrap().tui.suggest);
+        // A string names Claude Code's; a table either or both.
+        let c =
+            Config::from_toml_str("[tui]\nsuggest = false\nsuggest_model = \"haiku\"\n").unwrap();
+        assert!(!c.tui.suggest);
+        assert_eq!(c.tui.suggest_model, models("haiku", "gpt-6-luna"));
+        let c = Config::from_toml_str(
+            "[tui]\nsuggest_model = { claude-code = \"claude-haiku-4-5\", codex = \"gpt-5.6-luna\" }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-4-5", "gpt-5.6-luna")
+        );
+        let c = Config::from_toml_str("[tui.suggest_model]\ncodex = \"gpt-6-luna\"\n").unwrap();
+        assert_eq!(
+            c.tui.suggest_model,
+            models("claude-haiku-5-5", "gpt-6-luna")
+        );
+        for bad in [
+            "[tui]\nsuggest_model = { grok = \"x\" }\n",
+            "[tui]\nsuggest_model = 3\n",
+            "[tui]\nsuggest_model = [\"haiku\"]\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Only small models answer suggestions: a Haiku for Claude Code, a Luna (or mini, nano)
+    /// for Codex. A large one is a warning of the hub's, and is never used.
+    #[test]
+    fn suggestion_models_must_be_small() {
+        for (rt, m) in [
+            ("claude-code", "claude-haiku-5-5"),
+            ("claude-code", "haiku"),
+            ("claude-code", "Claude-Haiku-4-5"),
+            ("codex", "gpt-6-luna"),
+            ("codex", "gpt-5.6-luna"),
+            ("codex", "gpt-5-mini"),
+        ] {
+            assert_eq!(suggest_model_too_large(rt, m), None, "{rt} {m}");
+        }
+        for (rt, m) in [
+            ("claude-code", "sonnet"),
+            ("claude-code", "claude-opus-5-5"),
+            ("claude-code", "claude-fable-5-1"),
+            ("claude-code", "default"),
+            ("codex", "gpt-6.1-sol"),
+            ("codex", "gpt-6-astra"),
+            ("codex", "gpt-5.6-terra"),
+            ("grok-build", "grok-mini"),
+        ] {
+            let why = suggest_model_too_large(rt, m).unwrap();
+            assert!(why.contains("large model") && why.contains(m), "{why}");
+        }
+        assert!(Config::default().warnings(None).is_empty());
+        let c =
+            Config::from_toml_str("[tui]\nsuggest_model = { codex = \"gpt-6.1-sol\" }\n").unwrap();
+        let w = c.warnings(None);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("gpt-6.1-sol") && w[0].contains("codex"),
+            "{w:?}"
+        );
     }
 
     #[test]
@@ -1961,6 +2210,71 @@ mod tests {
         let c = Config::from_toml_str("[projects.api]\nrepo = \"/a\"\nworktree = false\n").unwrap();
         assert!(!c.project_worktree("api"));
         assert!(c.project_worktree("other"));
+    }
+
+    /// `[codex] auto` (who answers what a Codex `auto` thread's sandbox does not allow):
+    /// `auto_review` by default (an empty `[codex]` too), `ask` and `never` on request, a
+    /// project's `codex_auto` wins for its threads (`ask` included, under the default), and
+    /// anything but the three values (or another key under `[codex]`) is refused.
+    #[test]
+    fn codex_auto_defaults_project_override_and_checks() {
+        for text in ["", "[codex]\n"] {
+            let c = Config::from_toml_str(text).unwrap();
+            assert_eq!(c.codex.auto, CodexAuto::AutoReview);
+            assert_eq!(c.codex_auto(None), CodexAuto::AutoReview);
+            assert_eq!(c.codex_auto(Some("api")), CodexAuto::AutoReview);
+        }
+        assert_eq!(Config::default().codex.auto, CodexAuto::AutoReview);
+        // What a thread runs with when nothing names a value stays `ask`.
+        assert_eq!(CodexAuto::default(), CodexAuto::Ask);
+        let c = Config::from_toml_str(
+            r#"
+            [projects.api]
+            repo = "/src/api"
+            codex_auto = "ask"
+            [projects.web]
+            repo = "/src/web"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.codex_auto(Some("api")), CodexAuto::Ask);
+        assert_eq!(c.codex_auto(Some("web")), CodexAuto::AutoReview);
+        let c = Config::from_toml_str("[codex]\nauto = \"ask\"\n").unwrap();
+        assert_eq!(c.codex_auto(None), CodexAuto::Ask);
+        let c = Config::from_toml_str(
+            r#"
+            [codex]
+            auto = "never"
+            [projects.api]
+            repo = "/src/api"
+            codex_auto = "auto_review"
+            [projects.web]
+            repo = "/src/web"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.codex.auto, CodexAuto::Never);
+        assert_eq!(c.codex_auto(Some("api")), CodexAuto::AutoReview);
+        assert_eq!(c.codex_auto(Some("web")), CodexAuto::Never);
+        assert_eq!(c.codex_auto(Some("/some/path")), CodexAuto::Never);
+        assert_eq!(c.codex_auto(None), CodexAuto::Never);
+        for v in CodexAuto::ALL {
+            let c =
+                Config::from_toml_str(&format!("[codex]\nauto = \"{}\"\n", v.as_str())).unwrap();
+            assert_eq!(c.codex.auto, v);
+            assert_eq!(CodexAuto::parse(v.as_str()), Some(v));
+        }
+        for bad in [
+            "[codex]\nauto = \"yes\"\n",
+            "[codex]\nauto = \"auto-review\"\n",
+            "[codex]\nauto = \"Never\"\n",
+            "[codex]\nauto = true\n",
+            "[codex]\nmode = \"never\"\n",
+            "[projects.api]\nrepo = \"/a\"\ncodex_auto = \"always\"\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+        assert_eq!(CodexAuto::parse("yes"), None);
     }
 
     #[test]

@@ -611,6 +611,19 @@ impl Hub {
         seen_gseq: Option<u64>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
+        self.say_to_orchestrator_as(message, seen_gseq, caller, false)
+    }
+
+    /// [`Hub::say_to_orchestrator`]; `suggested`: the message is a suggestion the user took
+    /// unedited (`hub::suggest`), never applied as a short command at once: it goes to the
+    /// orchestrator as a message, whatever it reads like now.
+    pub fn say_to_orchestrator_as(
+        &self,
+        message: &str,
+        seen_gseq: Option<u64>,
+        caller: &Caller,
+        suggested: bool,
+    ) -> Result<Value, RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
                 codes::BAD_REQUEST,
@@ -659,10 +672,22 @@ impl Hub {
         }
         // Creating the orchestrator is its own append: it is idempotent (an existing
         // orchestrator is reused), so a failure after it loses nothing.
+        // A suggestion is never a command. One that reads as one now (a thread it names was
+        // made since it was suggested, an item it answers raised) would carry a command's
+        // authority into the orchestrator's turn (`Core::mode_check`, `Core::relay_check`
+        // read the message against the threads and items as they are when it arrives).
+        if suggested && core.reads_as_command(message) {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "this suggestion now reads as an answer or a mode change, and a suggestion never                  gives one: nothing was sent; type it yourself if you mean it",
+            ));
+        }
         let orch = core.ensure_orchestrator(&self.inner)?;
         let seen = seen_cap(seen_gseq, core.gseq);
-        if let Some(result) = core.apply_command(&self.inner, &orch, message, seen, caller)? {
-            return Ok(result);
+        if !suggested {
+            if let Some(result) = core.apply_command(&self.inner, &orch, message, seen, caller)? {
+                return Ok(result);
+            }
         }
         let mut batch = Batch::default();
         let d = batch.push(

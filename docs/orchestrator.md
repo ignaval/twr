@@ -87,7 +87,7 @@ Only a Claude Code orchestrator can be attached. The command `twr attach` runs f
 
 ## The relay rule
 
-twr relays. It never answers an agent's permission prompt or question on your behalf. Only you answer one, with `twr respond`, the TUI, or a message to the orchestrator that the hub reads as yours.
+twr relays. It never answers an agent's permission prompt or question on your behalf. Only you answer one, with `twr respond`, the TUI, or a message to the orchestrator that the hub reads as yours. One kind never reaches twr by default: what a Codex thread in `auto` asks to run outside its sandbox, which Codex's own reviewer agent answers (`[codex] auto`, [runtimes.md](runtimes.md#who-answers-when-the-sandbox-says-no)); the orchestrator sees those decisions only in the thread's transcript, as `auto_review` tool calls, and can't answer them.
 
 The orchestrator may pass on an answer to a permission or question only when all of these hold:
 
@@ -177,6 +177,10 @@ When a turn fails, the hub decides whether the failure was transient: a rate lim
 
 Workers often end a turn with work still running in the background, such as a test suite: "tests are running, I'll report when they finish". When twr tracks those tasks ([runtimes.md](runtimes.md#background-work-and-automatic-turns)), that turn's report is interim, and the conversation says so: "api yielded with 1 background task still running (interim report: the result comes later)". When the work ends, the runtime usually starts a turn of its own to report the result. That follow-up turn gets the final report: "api finished, in a follow-up turn it started after background work". A turn that ends without a reply says "Turn N finished without a reply", or, with tasks still running, "Turn N ended without a reply; 2 background tasks still running".
 
+When the work ends and no turn follows within `wake_after_secs` (30 s by default), the hub wakes the worker itself, once per interim report, and the conversation says so: "api's background work finished and no turn started after it: twr woke it to continue (after its interim report of turn 3)." The woken turn is a follow-up turn too, and its report is the final one. After 5 wakes in a row with no message from you or the orchestrator in between, the hub stops and says so ("twr did not wake it ... Send it a message to continue"): only then does a worker sit idle after an interim report. So the orchestrator need not check in on a worker whose background work just ended; a "checking in" prompt it sends while the runtime is already starting its own follow-up turn only gets in the way ([usage.md](usage.md#when-background-work-ends)).
+
+A turn that stays open and silent while something waits to start the next one (a job's end, a message) gets a hung-turn card: the orchestrator gets it as an urgent notice line, `reason=hung`, with the options `interrupt` and `wait`. Only you answer it.
+
 ## Watches
 
 A successful report starts no orchestrator turn: the orchestrator only sees it as a background fact with your next message. So when you ask it to do something once a worker finishes, such as "when twr-1 is done, send its branch to the integrator" or "tell me when the tests pass", it sets a watch with `watch_thread`, naming the thread (or `*` for every worker, now and later) and writing a note of what to do. The conversation shows it: "Watching twr-1: the orchestrator is woken the next time it finishes (w1). Note: send its branch to twr-integrator for review."
@@ -186,7 +190,7 @@ When all it would do on waking is send a worker a prompt, such as "when web is d
 When that worker ends a turn with a final report, the hub wakes the orchestrator with a `[twr notice]` turn holding the report, the watch's id and its note, and the orchestrator acts on it. A final report is one of a turn that completed with no background task left running:
 
 - An interim report never fires a watch. The follow-up turn's report does.
-- If the background work ends and no follow-up turn starts within 5 seconds, the watch fires on the idle worker, quoting its interim report. A new background task in that time cancels this; the 5 seconds start again when it ends.
+- If the background work ends and no follow-up turn starts within 5 seconds, the watch fires on the idle worker, quoting its interim report. A new background task in that time cancels this; the 5 seconds start again when it ends. While the hub is about to wake the worker (above), the line waits for that: the woken turn's report fires the watch, and the idle line goes out only when the hub doesn't wake it.
 - A failed turn fires nothing: its error card already wakes the orchestrator, and an automatic retry may follow.
 - Reports the orchestrator or you write fire nothing.
 

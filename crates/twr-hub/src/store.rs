@@ -279,6 +279,23 @@ pub struct PendingPrompt {
     pub said_after: Option<u64>,
 }
 
+/// A queued prompt as `thread.queue` lists it ([`Store::pending_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedPrompt {
+    /// Its row id: the message's ref, and its place in the queue.
+    pub id: i64,
+    /// The prompt.
+    pub prompt: String,
+    /// Who sent it.
+    pub from: TurnFrom,
+    /// Who queued it.
+    pub source: Source,
+    /// When (RFC 3339).
+    pub queued_at: String,
+    /// Marked as a send of the user's (`user_sent`).
+    pub user_sent: bool,
+}
+
 /// The writer side of the database. The hub owns exactly one.
 #[derive(Debug)]
 pub struct Store {
@@ -922,6 +939,67 @@ impl Store {
             .transpose()
     }
 
+    /// The first `limit` queued prompts of `thread`, in the order they run (`thread.queue`).
+    pub fn pending_list(&self, thread: &str, limit: usize) -> anyhow::Result<Vec<QueuedPrompt>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, prompt, from_, source, queued_at, user_sent IS NOT NULL
+             FROM pending_prompts WHERE thread = ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![thread, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, prompt, from, source, queued_at, user_sent) = row?;
+            out.push(QueuedPrompt {
+                id,
+                prompt,
+                from: turn_from_parse(&from)?,
+                source: Source::from_str(&source)?,
+                queued_at,
+                user_sent,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The newest queued prompt of `thread` that a user sent (a client of theirs, the row
+    /// marked as their send: a gated send let go later holds reports agents wrote), wherever
+    /// it is in the queue: what the TUI's `↑` takes back to edit.
+    pub fn newest_user_pending(&self, thread: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM pending_prompts WHERE thread = ?1 AND from_ = 'user'
+                 AND source LIKE 'user:%' AND user_sent IS NOT NULL ORDER BY id DESC LIMIT 1",
+                params![thread],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records that the user asked for queued prompt `id` to run (`message.send_now` on a held
+    /// queue), at control head `head`, as a send of theirs records it (`user_sent`): a hub
+    /// started after a crash finds the hold released ([`Store::user_sent_since`]). The row's
+    /// sender and authority (`from_`, `source`, `said_after`) stay as they were; a mark from
+    /// an earlier send of the user's (before the crash that holds the queue) moves to `head`.
+    /// Whether a row changed.
+    pub fn mark_user_sent(&mut self, id: i64, head: u64) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE pending_prompts SET user_sent = ?2
+             WHERE id = ?1 AND (user_sent IS NULL OR user_sent < ?2)",
+            params![id, to_i64(head)?],
+        )? > 0)
+    }
+
     /// Number of queued prompts of `thread`.
     pub fn pending_count(&self, thread: &str) -> anyhow::Result<u64> {
         let n: i64 = self.conn.query_row(
@@ -1041,15 +1119,20 @@ fn row_to_pending(r: &Row<'_>) -> rusqlite::Result<PendingRow> {
     ))
 }
 
-fn pending_from_row(
-    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
-) -> anyhow::Result<PendingPrompt> {
-    let from = match from.as_str() {
+/// A `pending_prompts.from_` value.
+fn turn_from_parse(from: &str) -> anyhow::Result<TurnFrom> {
+    Ok(match from {
         "user" => TurnFrom::User,
         "orchestrator" => TurnFrom::Orchestrator,
         "runtime" => TurnFrom::Runtime,
         other => bail!("bad pending prompt sender {other:?}"),
-    };
+    })
+}
+
+fn pending_from_row(
+    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
+) -> anyhow::Result<PendingPrompt> {
+    let from = turn_from_parse(&from)?;
     Ok(PendingPrompt {
         id,
         thread,
@@ -1101,8 +1184,8 @@ fn row_to_raw(r: &Row<'_>) -> rusqlite::Result<RawRow> {
 
 impl RawRow {
     fn into_event(self) -> anyhow::Result<Event> {
-        let data: serde_json::Value =
-            serde_json::from_str(&self.data).with_context(|| format!("event {} data", self.id))?;
+        let body = EventBody::from_kind_json(&self.kind, Some(&self.data))
+            .with_context(|| format!("event {} ({}) data", self.id, self.kind))?;
         Ok(Event {
             v: self.v,
             seq: self.seq as u64,
@@ -1110,8 +1193,7 @@ impl RawRow {
             thread: self.thread,
             turn: self.turn.map(|t| t as u64),
             source: Source::from_str(&self.source)?,
-            body: EventBody::from_kind_data(&self.kind, data)
-                .with_context(|| format!("event {} ({})", self.id, self.kind))?,
+            body,
             raw: self.raw,
             id: self.id,
         })
@@ -1133,6 +1215,102 @@ pub fn read_thread_events(
         row_to_raw,
     )?;
     rows.map(|r| r?.into_event()).collect()
+}
+
+/// [`read_thread_events`] as the lines a thread subscription writes ([`stream_line`]), each
+/// with its seq.
+pub fn read_thread_lines(
+    conn: &Connection,
+    thread: &str,
+    since_seq: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
+    ))?;
+    let rows = st.query_map(
+        params![thread, to_i64(since_seq)?, limit as i64],
+        row_to_raw,
+    )?;
+    rows.map(|r| {
+        let row = r?;
+        let seq = row.seq as u64;
+        let mut line = Vec::new();
+        stream_line(row, None, &mut line)?;
+        Ok((seq, line))
+    })
+    .collect()
+}
+
+/// The line a subscription writes for event row `row` (with its newline), a control item
+/// when it has a `gseq`: what serializing its [`twr_core::proto::StreamItem`] writes, read
+/// back the same. The row's `data` goes in as stored, without parsing it into its type and
+/// writing that back out, which costs a replay of thousands most of its time. Only a row
+/// whose `data` is not one JSON value on one line, or whose `ts` or `source` does not read,
+/// goes through its type ([`RawRow::into_event`]), which then also fails as it would.
+fn stream_line(row: RawRow, gseq: Option<u64>, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    use serde_json::value::RawValue;
+    let data = serde_json::from_str::<&RawValue>(&row.data)
+        .ok()
+        .filter(|d| !d.get().contains(['\n', '\r']));
+    // The envelope as `Event` writes it: the time to the millisecond in UTC, the source
+    // spelled its way.
+    let ts = DateTime::parse_from_rfc3339(&row.ts).ok().map(|t| {
+        t.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
+    let source = Source::from_str(&row.source).ok().map(|s| s.to_string());
+    let readable = row.seq >= 0 && row.turn.is_none_or(|t| t >= 0);
+    let (Some(data), Some(ts), Some(source), true) = (data, ts, source, readable) else {
+        let item = twr_core::proto::StreamItem {
+            stream: if gseq.is_some() {
+                twr_core::proto::StreamKind::Control
+            } else {
+                twr_core::proto::StreamKind::Thread
+            },
+            gseq,
+            event: row.into_event()?,
+        };
+        serde_json::to_writer(&mut *out, &item)?;
+        out.push(b'\n');
+        return Ok(());
+    };
+    let text = |out: &mut Vec<u8>, s: &str| serde_json::to_writer(&mut *out, s);
+    match gseq {
+        Some(g) => {
+            out.extend_from_slice(br#"{"stream":"control","gseq":"#);
+            out.extend_from_slice(g.to_string().as_bytes());
+        }
+        None => out.extend_from_slice(br#"{"stream":"thread""#),
+    }
+    out.extend_from_slice(br#","event":{"v":"#);
+    out.extend_from_slice(row.v.to_string().as_bytes());
+    out.extend_from_slice(br#","id":"#);
+    text(out, &row.id)?;
+    out.extend_from_slice(br#","seq":"#);
+    out.extend_from_slice(row.seq.to_string().as_bytes());
+    out.extend_from_slice(br#","ts":"#);
+    text(out, &ts)?;
+    out.extend_from_slice(br#","thread":"#);
+    text(out, &row.thread)?;
+    out.extend_from_slice(br#","turn":"#);
+    match row.turn {
+        Some(t) => out.extend_from_slice(t.to_string().as_bytes()),
+        None => out.extend_from_slice(b"null"),
+    }
+    out.extend_from_slice(br#","source":"#);
+    text(out, &source)?;
+    out.extend_from_slice(br#","kind":"#);
+    text(out, &row.kind)?;
+    out.extend_from_slice(br#","data":"#);
+    out.extend_from_slice(data.get().as_bytes());
+    out.extend_from_slice(br#","raw":"#);
+    match &row.raw {
+        Some(r) => text(out, r)?,
+        None => out.extend_from_slice(b"null"),
+    }
+    out.extend_from_slice(b"}}\n");
+    Ok(())
 }
 
 /// Semantic transcript rows. Hidden streaming text never consumes a page slot.
@@ -1236,6 +1414,48 @@ pub fn read_control(
     rows.map(|r| {
         let (g, raw) = r?;
         Ok((g, raw.into_event()?))
+    })
+    .collect()
+}
+
+/// [`read_control`] as the lines a control subscription writes ([`stream_line`]).
+pub fn read_control_lines(
+    conn: &Connection,
+    since: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT c.gseq, {cols} FROM control c JOIN events e ON e.thread = c.thread AND e.seq = c.seq
+         WHERE c.gseq > ?1 ORDER BY c.gseq LIMIT ?2"
+    ))?;
+    let rows = st.query_map(params![to_i64(since)?, limit as i64], |r| {
+        let gseq: i64 = r.get(0)?;
+        Ok((
+            gseq as u64,
+            RawRow {
+                thread: r.get(1)?,
+                seq: r.get(2)?,
+                id: r.get(3)?,
+                v: r.get(4)?,
+                ts: r.get(5)?,
+                turn: r.get(6)?,
+                source: r.get(7)?,
+                kind: r.get(8)?,
+                data: r.get(9)?,
+                raw: r.get(10)?,
+            },
+        ))
+    })?;
+    rows.map(|r| {
+        let (g, row) = r?;
+        let mut line = Vec::new();
+        stream_line(row, Some(g), &mut line)?;
+        Ok((g, line))
     })
     .collect()
 }
@@ -1684,6 +1904,120 @@ mod tests {
         })
     }
 
+    /// The lines a replay writes, with their `data` as stored, read back as exactly the items
+    /// serializing their events gives: for events of several kinds, control or not, and for
+    /// rows written otherwise (`data` over several lines, which goes through its type and
+    /// comes out on one; another offset and more digits in `ts`; a kind this build does not
+    /// know).
+    #[test]
+    fn stream_lines_read_as_the_items_they_stand_for() {
+        use twr_core::event::{AttentionRaised, TaskUpdated};
+        use twr_core::proto::{ServerMessage, StreamItem, StreamKind};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let bodies = vec![
+            EventBody::ThreadStarted(SessionPayload::default()),
+            text("hi \u{1F600} \"quoted\"\n\ttab"),
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "b1".into(),
+                running: true,
+                description: "tests".into(),
+                ext: serde_json::json!({"claude": {"n": 1.5}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }),
+            EventBody::AttentionRaised(AttentionRaised {
+                attn_id: "a1".into(),
+                summary: "rm -rf target?".into(),
+                options: vec!["yes".into(), "no".into()],
+                ..Default::default()
+            }),
+            EventBody::ThreadStopped(SessionPayload::default()),
+        ];
+        let mut seq = 0;
+        for body in bodies {
+            seq += 1;
+            let control = body.is_control();
+            let mut e = ev("t1", seq, body);
+            e.turn = (seq % 2 == 0).then_some(seq);
+            e.raw = (seq == 2).then(|| "sha256:00".to_string());
+            s.append(&e, control, AppendExtras::default()).unwrap();
+        }
+        for (data, ts, kind) in [
+            (
+                "{\n  \"task_id\": \"b2\",\n  \"running\": false\n}",
+                "2026-10-20T03:04:05.123Z",
+                "task.updated",
+            ),
+            (
+                r#"{"session_id":"s9"}"#,
+                "2026-10-20T05:04:05.123456+02:00",
+                "thread.stopped",
+            ),
+            (
+                r#"{"later":[1,{"x":null}]}"#,
+                "2026-10-20T03:04:05Z",
+                "thread.from_later",
+            ),
+        ] {
+            seq += 1;
+            s.conn
+                .execute(
+                    "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data, raw)
+                     VALUES ('t1', ?1, ?2, 1, ?3, NULL, 'user:tui', ?4, ?5, NULL)",
+                    params![seq as i64, format!("id-{seq}"), ts, kind, data],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO control (thread, seq) VALUES ('t1', ?1)",
+                    params![seq as i64],
+                )
+                .unwrap();
+        }
+        let read = |line: &[u8]| -> StreamItem {
+            assert_eq!(line.last(), Some(&b'\n'));
+            assert!(!line[..line.len() - 1].contains(&b'\n'), "one line");
+            match serde_json::from_slice(line).unwrap() {
+                ServerMessage::Stream(item) => *item,
+                ServerMessage::Response(r) => panic!("{r:?}"),
+            }
+        };
+        let through_type = |item: StreamItem| -> StreamItem {
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap()
+        };
+        let items = read_control(&s.conn, 0, 100).unwrap();
+        let lines = read_control_lines(&s.conn, 0, 100).unwrap();
+        assert_eq!(lines.len(), items.len());
+        assert!(items.len() >= 5, "{items:?}");
+        for ((g, event), (lg, line)) in items.into_iter().zip(&lines) {
+            assert_eq!(g, *lg);
+            let item = StreamItem {
+                stream: StreamKind::Control,
+                gseq: Some(g),
+                event,
+            };
+            assert_eq!(read(line), through_type(item));
+        }
+        let events = read_thread_events(&s.conn, "t1", 0, 100).unwrap();
+        let lines = read_thread_lines(&s.conn, "t1", 0, 100).unwrap();
+        assert_eq!(lines.len(), seq as usize);
+        assert_eq!(events.len(), lines.len());
+        for (event, (lseq, line)) in events.into_iter().zip(&lines) {
+            assert_eq!(event.seq, *lseq);
+            let item = StreamItem {
+                stream: StreamKind::Thread,
+                gseq: None,
+                event,
+            };
+            assert_eq!(read(line), through_type(item));
+        }
+        // From a seq on, at most a limit.
+        let some = read_thread_lines(&s.conn, "t1", 2, 3).unwrap();
+        assert_eq!(some.iter().map(|(q, _)| *q).collect::<Vec<_>>(), [3, 4, 5]);
+    }
+
     #[test]
     fn append_load_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -2086,6 +2420,11 @@ mod tests {
         assert!(s.user_sent_since("t1", 3).unwrap());
         assert!(!s.user_sent_since("t1", 4).unwrap());
         assert!(!s.user_sent_since("t2", 0).unwrap());
+        // Sent now after another crash: the user's earlier mark moves up, never back.
+        assert!(s.mark_user_sent(sent.queued[0], 9).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
+        assert!(!s.mark_user_sent(sent.queued[0], 5).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
     }
 
     #[test]

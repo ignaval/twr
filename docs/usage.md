@@ -132,7 +132,9 @@ twr job log 01J7Q                              # the end of a job's output (-n 2
 twr job cancel 01J7Q                           # SIGTERM to its process group, SIGKILL 5 s later
 ```
 
-`twr job run` returns at once with the job's id. The hub runs the command (as argv: `-- sh -c '...'` for a shell line) in the thread's worktree, with the environment its runtime gets, and its output, stdout and stderr together, goes to `<data dir>/jobs/<id>.log`. When it ends, the thread gets a prompt, as a turn its runtime started itself: `[twr job 01J7Q... cargo test] `cargo test --workspace` exited 101 after 14m 12s.`, the last 40 lines of its output and the path of its whole log. `--no-wake` skips that prompt.
+A line you type in the TUI that starts with `!` runs as a job too, at once, without slots: see [tui.md](tui.md#shell-commands). `twr job run` returns at once with the job's id. The hub runs the command (as argv: `-- sh -c '...'` for a shell line) in the thread's worktree, with the environment its runtime gets, and its output, stdout and stderr together, goes to `<data dir>/jobs/<id>.log`. When it ends, the thread gets a prompt, as a turn its runtime started itself: `[twr job 01J7Q... cargo test] `cargo test --workspace` exited 101 after 14m 12s.`, the last 40 lines of its output and the path of its whole log. `--no-wake` skips that prompt.
+
+An agent should let its jobs wake it, end its turn, and handle the result when the prompt comes, rather than start a quiet job and a watcher of its own. If its background work ends anyway with nothing to start the next turn (a `--no-wake` job, a watcher whose end the runtime didn't follow up), the hub wakes it itself: see [below](#when-background-work-ends).
 
 A job runs in a session of its own, without a controlling terminal, also when the hub runs in your terminal: a command that reads the terminal or sets its modes (a password prompt, `stty`, a pager) gets an error instead of stopping the job. What the command starts stays in the job's process group, which a cancel ends. A process that starts a session of its own (`setsid`) or daemonizes leaves that group: `twr job cancel` doesn't stop it.
 
@@ -176,7 +178,7 @@ An answer is an option label (`allow`, `deny`) or its number. A question without
 
 When you tell the orchestrator to answer or change a mode, the hub applies it at once only when your whole message is one short command, such as "allow both", "approve atlas, deny the webapp one" or "set api to plan mode", and only for permissions. Anything else ("allow teh webapp", "allow api if the tests pass", "allow api. What changed?", any answer to a question) is not applied yet. The hub puts what the orchestrator proposed on a confirm card for you, with Confirm and Cancel. `twr attention` lists the card on the `hub` thread, and `twr respond <id>@<rev> Confirm` applies it. See [orchestrator.md](orchestrator.md#short-commands) for the exact forms and [the confirm card](orchestrator.md#the-confirm-card).
 
-Items the hub raised itself can be dismissed: a "which thread should get this?" question, a confirm card, a review, an error, a stalled notice. A permission or question from an agent can't be dismissed, because the agent is waiting for the answer. Answer it or stop the thread.
+Items the hub raised itself can be dismissed: a "which thread should get this?" question, a confirm card, a review, an error, a stalled notice (a hung-turn card's dismissal is `wait`). A permission or question from an agent can't be dismissed, because the agent is waiting for the answer. Answer it or stop the thread.
 
 ### Changed questions
 
@@ -190,7 +192,17 @@ When a worker's turn finishes, the hub writes a short report from the agent's la
 
 A turn that fails with a rate limit, an overload or a network error gets one automatic retry. Any other failure, or a failed retry, raises an error card.
 
-A running turn or background task with no events for `stall_after_secs` (10 minutes by default) gets a stalled card. It closes by itself when the thread does anything. A background task's heartbeat, which only says it is still alive, doesn't count.
+A running turn or background task with no events for `stall_after_secs` (10 minutes by default) gets a stalled card. It closes by itself when the thread does anything. A background task's heartbeat, which only says it is still alive, doesn't count. While one of the thread's own jobs runs there is no stall: its turn, or the watcher its runtime left running, waits on the job. Once the job ends, the silence counts again.
+
+A turn that stays open and silent while something waits to start the next one (a job's end, a message you sent) gets a hung-turn card instead, after `stall_after_secs` or 5 minutes, whichever is shorter: "api's turn 35 seems hung: no output from its runtime for 5 min while the end of job 01M5... waits to start the next turn". `interrupt` interrupts the turn, as sending the waiting message now does, and what waits runs next; `wait` closes the card, and no other hung-turn card comes for that turn. It notifies as `hung`, which is on by default, unlike `stalled`.
+
+### When background work ends
+
+A worker's turn can end while work it started still runs: its runtime's background commands and watchers, or its jobs. That turn's report is interim, and the result comes in the next turn, which the runtime normally starts itself once the work ends, or which a job's prompt starts. If the work ends and no turn starts within `wake_after_secs` (30 s by default; `0` turns it off), the hub wakes the worker with a prompt of its own: `[twr] Your background work finished after your turn 3 ended, and no turn started after it, so twr is waking you (once).`, the tasks that ended (each job with its result and the path of its log), and that it should continue. The thread's conversation says twr woke it, and so does the orchestrator's.
+
+The hub wakes a worker once per interim report, and at most 5 times in a row without a message from you or the orchestrator in between; past that it says it did not wake it, and the worker waits for a message. It doesn't wake a thread you stopped or parked, one attached, failed or waiting on you, or one that already has a message queued.
+
+With Claude Code, the end of a command the agent ran in the background opens the turn Claude starts for it right away, before its first output, which can take a minute. Nothing is written into that run meanwhile: since Claude Code 2.1.295, a message folded into a run Claude started itself ends without the `result` that closes the turn. If a turn's last message stopped and no `result` comes within 2 minutes anyway, the adapter ends the turn itself.
 
 ## Attach
 
@@ -363,3 +375,5 @@ An invalid config reports failure for `default` while named workspaces are still
 When several workspaces are running, use `twr hub stop --all`, then reopen the workspaces you need (`twr`, `twr -w NAME`). The development installer (`docs/tools/dev-install.sh`) suggests this too. Pick a moment when stopping their local runtimes is appropriate.
 
 After the restart, a `twr` older than the hub, such as a TUI started before the update, is refused with a message to update it. A new hub can also change the format of its database. An older twr then refuses that database as newer than itself, so you can't go back to it on the same data.
+
+A TUI left open across an update starts the new build when it opens a workspace whose hub isn't running. When the hub it shows stops or restarts, the TUI says `hub closed the control stream`. What you send from it after that goes over a new connection to whichever hub runs there: a message the old hub never got is sent once, and one it may have acted on is not sent again (the status bar says to check). Quit and reopen the TUI to see the new hub. Any twr that says `the hub closed the connection before ...` lost its hub after it connected: the hub stopped, restarted or crashed. `twr info` says whether one runs.

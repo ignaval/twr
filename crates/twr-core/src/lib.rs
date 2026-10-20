@@ -15,6 +15,7 @@
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
 //! - [`testkit`]: event-sequence builders for tests
+//! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
 
 pub mod activity;
@@ -34,7 +35,9 @@ pub mod proto;
 pub mod reduce;
 pub mod runner;
 pub mod sealed;
+pub mod shell;
 pub mod testkit;
+pub mod trace;
 pub mod usage;
 
 /// twr's version: the package version, plus `+dev.<build>` for a build made from a checkout by
@@ -98,6 +101,76 @@ pub fn build_id() -> Option<&'static str> {
     ID.as_deref()
 }
 
+/// The executable to start another twr process with (the hub that `twr` and the TUI start):
+/// [`std::env::current_exe`], except after the file this process runs was replaced. An
+/// upgrade (`twr update`, the installer, `docs/tools/dev-install.sh`) renames the new build
+/// over the old one, and on Linux `current_exe` then reads `<path> (deleted)`, a path with no
+/// file, so starting it failed with "No such file or directory": the build now at `<path>` is
+/// started instead, as `twr` run again would. When no file is left at the path (twr was
+/// removed or moved), the error says so and what to do.
+pub fn current_exe() -> anyhow::Result<std::path::PathBuf> {
+    use anyhow::Context;
+    use std::os::unix::fs::MetadataExt;
+    let exe = std::env::current_exe().context("locating the twr executable")?;
+    let linux = cfg!(target_os = "linux");
+    // The running file, whatever its name now (Linux: `/proc/self/exe` opens it even deleted).
+    let running = if linux {
+        std::fs::metadata("/proc/self/exe")
+            .ok()
+            .map(|m| (m.dev(), m.ino()))
+    } else {
+        None
+    };
+    exe_to_start(exe, linux, |p| match std::fs::metadata(p) {
+        Ok(m) if m.is_file() && running == Some((m.dev(), m.ino())) => Found::Running,
+        Ok(m) if m.is_file() => Found::Other,
+        _ => Found::Missing,
+    })
+}
+
+/// What a path names, to [`exe_to_start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// The file this process runs.
+    Running,
+    /// Another file.
+    Other,
+    /// No file.
+    Missing,
+}
+
+/// [`current_exe`] of what `std::env::current_exe` read (`exe`), on Linux (`linux`) or not,
+/// with `found` telling what a path names.
+fn exe_to_start(
+    exe: std::path::PathBuf,
+    linux: bool,
+    found: impl Fn(&std::path::Path) -> Found,
+) -> anyhow::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if found(&exe) == Found::Running {
+        return Ok(exe);
+    }
+    // What Linux appends to `/proc/self/exe` once the file is gone from its path. A file that
+    // has that name but is not the running one is someone else's: what is at `<path>` now is
+    // what replaced it.
+    let replaced = exe
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+        .filter(|_| linux)
+        .map(|p| std::path::PathBuf::from(std::ffi::OsStr::from_bytes(p)));
+    let path = replaced.unwrap_or(exe);
+    if found(&path) != Found::Missing {
+        return Ok(path);
+    }
+    Err(anyhow::anyhow!(
+        "the twr executable this process started from, {}, is gone (removed or moved since it \
+         started): start twr again from a shell where the installed twr is on PATH (quit and \
+         reopen the TUI)",
+        path.display()
+    ))
+}
+
 /// The build id of the executable at `path`: the first [`BUILD_ID_LEN`] lowercase hex digits
 /// of the SHA-256 of the file's contents.
 pub fn build_id_of(path: &std::path::Path) -> std::io::Result<String> {
@@ -149,5 +222,129 @@ mod tests {
         ] {
             assert!(!super::valid_build_id(bad), "{bad}");
         }
+    }
+
+    /// The path `current_exe` read is started when it names a file; on Linux,
+    /// `<path> (deleted)` (once the file was replaced) starts what replaced it, unless it is
+    /// the running file's own name, and fails when nothing did.
+    #[test]
+    fn the_exe_to_start_survives_a_replaced_file() {
+        use super::Found::{self, *};
+        use std::path::{Path, PathBuf};
+        let start = |p: &str, linux: bool, files: &[(&str, Found)]| {
+            let found = |q: &Path| {
+                files
+                    .iter()
+                    .find(|(f, _)| Path::new(f) == q)
+                    .map_or(Missing, |(_, k)| *k)
+            };
+            super::exe_to_start(PathBuf::from(p), linux, found)
+        };
+        let ok = |r: anyhow::Result<PathBuf>| r.unwrap().display().to_string();
+        assert_eq!(
+            ok(start("/bin/twr", true, &[("/bin/twr", Running)])),
+            "/bin/twr"
+        );
+        // Replaced: the new build.
+        let new = [("/bin/twr", Other)];
+        assert_eq!(ok(start("/bin/twr (deleted)", true, &new)), "/bin/twr");
+        // Replaced, beside an unrelated file named like the old one.
+        let both = [("/bin/twr", Other), ("/bin/twr (deleted)", Other)];
+        assert_eq!(ok(start("/bin/twr (deleted)", true, &both)), "/bin/twr");
+        // A running file really named so.
+        let odd = [("/odd/twr (deleted)", Running), ("/odd/twr", Other)];
+        assert_eq!(
+            ok(start("/odd/twr (deleted)", true, &odd)),
+            "/odd/twr (deleted)"
+        );
+        // Not Linux: the name means nothing (macOS keeps the path, which the new build has).
+        assert_eq!(ok(start("/bin/twr", false, &new)), "/bin/twr");
+        let e = start("/bin/twr (deleted)", false, &new)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("/bin/twr (deleted), is gone"), "{e}");
+        for (gone, linux) in [
+            ("/gone/twr (deleted)", true),
+            ("/gone/twr", true),
+            ("/gone/twr", false),
+        ] {
+            let e = start(gone, linux, &[]).unwrap_err().to_string();
+            assert!(e.contains("/gone/twr, is gone"), "{e}");
+            assert!(e.contains("start twr again"), "{e}");
+        }
+    }
+
+    /// What [`replaced_exe_child`] runs as: the gate file it waits for.
+    const EXE_GATE_ENV: &str = "TWR_TEST_EXE_GATE";
+
+    /// Run by [`a_running_process_starts_the_build_that_replaced_it`] from a copy of this test
+    /// binary (nothing otherwise): once the gate file exists, prints what
+    /// [`super::current_exe`] says.
+    #[test]
+    fn replaced_exe_child() {
+        let Some(gate) = std::env::var_os(EXE_GATE_ENV) else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !std::path::Path::new(&gate).exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        match super::current_exe() {
+            Ok(p) => println!("exe=ok:{}", p.display()),
+            Err(e) => println!("exe=err:{e:#}"),
+        }
+    }
+
+    /// The real case: a process whose executable is renamed over (an upgrade) while it runs
+    /// starts the new build, and one whose executable is removed says so. Before, on Linux,
+    /// it tried `<path> (deleted)`: "No such file or directory".
+    #[test]
+    fn a_running_process_starts_the_build_that_replaced_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::env::current_exe().unwrap();
+        let run = |replace: bool| {
+            let exe = dir.path().join(if replace { "twr-up" } else { "twr-rm" });
+            let gate = dir.path().join(format!("gate-{replace}"));
+            std::fs::copy(&me, &exe).unwrap();
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args(["--exact", "tests::replaced_exe_child", "--nocapture", "-q"])
+                .env(EXE_GATE_ENV, &gate)
+                .stdout(std::process::Stdio::piped());
+            // A file just written can be busy for a moment ("Text file busy"): another test's
+            // fork may hold it open until its exec.
+            let mut tries = 0;
+            let child = loop {
+                match cmd.spawn() {
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 50 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    r => break r.unwrap(),
+                }
+            };
+            if replace {
+                let new = dir.path().join("twr-new");
+                std::fs::copy(&me, &new).unwrap();
+                std::fs::rename(&new, &exe).unwrap();
+            } else {
+                std::fs::remove_file(&exe).unwrap();
+            }
+            std::fs::write(&gate, "").unwrap();
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success());
+            let out = String::from_utf8(out.stdout).unwrap();
+            let line = out.lines().find(|l| l.starts_with("exe=")).unwrap_or("");
+            (exe, line.to_string())
+        };
+        let (exe, line) = run(true);
+        assert_eq!(line, format!("exe=ok:{}", exe.display()));
+        let (exe, line) = run(false);
+        assert!(
+            line.starts_with(&format!(
+                "exe=err:the twr executable this process started from, {}, is gone",
+                exe.display()
+            )),
+            "{line}"
+        );
     }
 }

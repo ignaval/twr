@@ -10,7 +10,7 @@ use twr_core::event::*;
 use twr_decisions::{DecisionContext, GradeContext, LadderRun};
 
 use super::append::hydrated_from_store;
-use super::{retry, twr_ext_map, Batch, Core, EndedTurn, Inner};
+use super::{retry, twr_ext, twr_ext_map, Batch, Core, EndedTurn, Inner};
 use crate::report;
 use crate::store;
 
@@ -114,14 +114,59 @@ impl Core {
         if result == TurnResult::Interrupted {
             return Ok(());
         }
+        // A turn its runtime opened for a background task's notification that saw no run
+        // (`ext.twr.no_run`) handled nothing: its report is the interim one it followed, again
+        // (`hub::wake`), so the worker still counts as yielded with that work unhandled.
+        if let Some(Event {
+            body: EventBody::TurnEnded(p),
+            ..
+        }) = self.stored_event(thread, Some(turn), "turn.ended")?
+        {
+            if twr_ext(&p.ext).is_some_and(|t| t.get(super::wake::NO_RUN_KEY) == Some(&json!(true)))
+            {
+                if self.logged_report(thread, turn)?.is_some() {
+                    return Ok(());
+                }
+                // Only a completed turn's interim report: a failed turn keeps its failure.
+                let report_turn = self
+                    .view(thread)
+                    .map_err(anyhow::Error::new)?
+                    .last_report
+                    .as_ref()
+                    .and_then(|r| r.turn);
+                let completed = match report_turn {
+                    Some(t) => matches!(
+                        self.stored_event(thread, Some(t), "turn.ended")?,
+                        Some(Event { body: EventBody::TurnEnded(e), .. })
+                            if e.result == TurnResult::Completed
+                    ),
+                    None => false,
+                };
+                let view = self.view(thread).map_err(anyhow::Error::new)?;
+                if let Some(report) = super::wake::no_run_report(view, turn).filter(|_| completed) {
+                    let mut batch = Batch::default();
+                    batch.push(
+                        thread,
+                        Some(turn),
+                        Source::Hub,
+                        EventBody::ReportReady(report),
+                    );
+                    self.append_batch(hub, batch)?;
+                    return Ok(());
+                }
+            }
+        }
         let done = store::turn_reactions(self.store.conn(), thread, turn)?;
         let view = self.view(thread).map_err(anyhow::Error::new)?;
         if view.is_orchestrator() {
             return self.react_to_orchestrator_turn_end(hub, thread, turn, result, &done);
         }
+        // The thread's own work only: a `!` command of the user's is no task its turn waits
+        // for, and its end starts no turn that would report again.
         let background_starts: serde_json::Map<String, Value> = view
             .background_tasks
             .iter()
+            .filter(|(_, t)| !t.shell)
             .map(|(id, t)| (id.clone(), json!(t.started_seq)))
             .collect();
         let background_count = background_starts.len();
@@ -556,6 +601,7 @@ pub(super) fn interim_tasks_running(
         .and_then(Value::as_object);
     running
         .iter()
+        .filter(|(_, t)| !t.shell)
         .filter(|(id, t)| match starts {
             Some(starts) => starts
                 .get(id.as_str())

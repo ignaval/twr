@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    is_confirm_card, is_delete_card, AttentionReason, Event, EventBody, Grade, JsonMap, Source,
-    TurnFrom, TurnResult, DELETE_KEY, HUB_THREAD,
+    is_confirm_card, is_delete_card, is_hung_card, AttentionReason, Event, EventBody, Grade,
+    JsonMap, Source, TurnFrom, TurnResult, DELETE_KEY, HUB_THREAD,
 };
 use crate::reduce::{AttentionStack, Registry};
 
@@ -44,6 +44,8 @@ pub enum NotifyEvent {
     Error,
     /// A finished turn graded `gave_up` or `needs_verification`.
     Review,
+    /// A turn silent while something waits to start the next one (a hung-turn card).
+    Hung,
     /// A running turn silent for `stall_after_secs`.
     Stalled,
     /// A worker finished a turn (`report.ready`), when no failure or review covers it.
@@ -64,6 +66,7 @@ impl NotifyEvent {
         NotifyEvent::Confirm,
         NotifyEvent::Error,
         NotifyEvent::Review,
+        NotifyEvent::Hung,
         NotifyEvent::Report,
         NotifyEvent::Reply,
     ];
@@ -76,6 +79,7 @@ impl NotifyEvent {
             NotifyEvent::Confirm => "waits for your confirmation",
             NotifyEvent::Error => "failed",
             NotifyEvent::Review => "needs review",
+            NotifyEvent::Hung => "seems hung",
             NotifyEvent::Stalled => "is stalled",
             NotifyEvent::Report => "finished",
             NotifyEvent::Reply => "replied",
@@ -219,6 +223,7 @@ impl Policy {
                         AttentionReason::Question => NotifyEvent::Question,
                         AttentionReason::Error => NotifyEvent::Error,
                         AttentionReason::Review => NotifyEvent::Review,
+                        AttentionReason::Stalled if is_hung_card(&p.ext) => NotifyEvent::Hung,
                         AttentionReason::Stalled => NotifyEvent::Stalled,
                     }
                 };
@@ -264,8 +269,9 @@ impl Policy {
                         .insert(turn);
                     // An interim report: the turn ended with background tasks still running,
                     // and the runtime's own turn after them reports again. The thread's tasks
-                    // say so too, for a report that lacks the marker.
-                    let interim = !view.background_tasks.is_empty()
+                    // say so too, for a report that lacks the marker (its own tasks: a `!`
+                    // command of the user's starts no turn that reports again).
+                    let interim = view.own_background()
                         || p.ext
                             .as_ref()
                             .and_then(|e| e.get("twr"))

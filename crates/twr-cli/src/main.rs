@@ -406,6 +406,20 @@ enum Cmd {
         #[arg(long)]
         pretty: bool,
     },
+    /// Make your terminal send Shift-Enter as Alt-Enter (ESC CR), which the TUI reads as a new
+    /// line everywhere, over mosh and SSH too, as Claude Code's /terminal-setup does. It edits
+    /// the terminal's settings file when it can do so safely (backing it up), leaves a
+    /// Shift-Enter binding already there alone, and otherwise prints the steps. Over SSH or
+    /// mosh it changes nothing: it prints what to change on the machine the terminal runs on.
+    TerminalSetup {
+        /// The terminal: terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode,
+        /// vscode-insiders, cursor, windsurf, vscodium or zed. Default: the one this runs in.
+        #[arg(long, value_name = "NAME")]
+        terminal: Option<String>,
+        /// Print the steps and change nothing (every terminal's when none is named or found).
+        #[arg(long)]
+        print: bool,
+    },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
     /// <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual
@@ -1014,6 +1028,14 @@ fn main() -> ExitCode {
         twr_hub::job_gate_main(std::env::args_os().skip(1).collect());
     }
     let cli = Cli::parse();
+    twr_core::trace::mark_with(|| {
+        let role = match &cli.cmd {
+            None => "tui",
+            Some(Cmd::Hub { cmd: None }) => "hub",
+            Some(_) => "cli",
+        };
+        format!("{role}: process started")
+    });
     let stopping_hub = matches!(
         cli.cmd,
         Some(Cmd::Hub {
@@ -1459,6 +1481,37 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             update(version, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
+        // About the terminal, not a hub: no config needed.
+        Some(Cmd::TerminalSetup { terminal, print }) => {
+            let terminal = match terminal.as_deref() {
+                None => None,
+                Some(name) => Some(twr_tui::terminal_setup::Terminal::parse(name).ok_or_else(
+                    || {
+                        anyhow!(
+                            "no terminal {name:?}: name one of {}",
+                            twr_tui::terminal_setup::ALL
+                                .iter()
+                                .map(|t| t.name())
+                                .chain(["vscode-insiders", "cursor", "windsurf", "vscodium"])
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                )?),
+            };
+            let place = twr_tui::terminal_setup::place(twr_tui::keys::under_mosh());
+            let agent = calling_agent();
+            let (lines, failed) =
+                twr_tui::terminal_setup::run(&place, terminal, print, agent.as_deref());
+            for line in lines {
+                outln!("{line}");
+            }
+            return Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
         // Workspaces are the root's: these work from any workspace, existing or not.
         Some(Cmd::Ws { cmd }) => {
             ws(cmd, &paths).await?;
@@ -1491,6 +1544,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         bail!("there is no workspace {name}{from}: create it with `twr ws new {name}` (`twr ws` lists them)");
     }
     let config = Config::load_from(&paths)?;
+    twr_core::trace::mark("cli: config loaded");
     if cli.socket.is_none() {
         let _ = EXPECTED_WORKSPACE.set(paths.workspace_name().to_string());
         // `hub.socket` is the default workspace's alone.
@@ -1549,6 +1603,7 @@ async fn run_simple(
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
+        | Cmd::TerminalSetup { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -2346,6 +2401,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         let paths = paths.clone();
         tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
     };
+    twr_core::trace::mark("hub: config read");
     let mut opts = HubOptions::new(paths.db_file(), config);
     opts.boxes_lock = boxes_lock;
     opts.config_file = Some(paths.config_file.clone());
@@ -2782,6 +2838,9 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     if e.downcast_ref::<RpcError>().is_some() {
         return false;
     }
+    if e.downcast_ref::<twr_core::client::HubClosed>().is_some() {
+        return true;
+    }
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>().is_some_and(|e| {
             matches!(
@@ -2792,12 +2851,7 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::UnexpectedEof
             )
         })
-    }) || matches!(
-        e.to_string().as_str(),
-        "hub closed the connection during hello"
-            | "hub closed the connection during hub.info"
-            | "hub closed the connection during hub.shutdown"
-    )
+    })
 }
 
 /// Default plus the same named directories as `twr ws`. Each stop has its own deadline
@@ -6599,8 +6653,10 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     let log_path = paths.hub_log();
     let log = twr_core::paths::open_private_append(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("locating the twr executable")?;
-    let mut cmd = std::process::Command::new(exe);
+    // Not `std::env::current_exe`: the TUI starts hubs as it switches workspaces, maybe after
+    // an upgrade replaced the file it runs ([`twr_core::current_exe`]).
+    let exe = twr_core::current_exe().context("starting the hub")?;
+    let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--socket")
         .arg(socket)
         .arg("--workspace")
@@ -6615,7 +6671,7 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
     twr_adapters::process::new_session_std(&mut cmd);
-    spawn_reaped(&mut cmd).context("starting the hub")?;
+    spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
     Ok(())
 }
 
@@ -6641,7 +6697,7 @@ async fn open_tui(
     tui: twr_core::config::TuiConfig,
 ) -> anyhow::Result<()> {
     wait_for_hub(socket, paths).await?;
-    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui)).await
+    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui), calling_agent()).await
 }
 
 /// The workspaces of a root, as the TUI switches between them: their hubs are started like
@@ -6697,7 +6753,9 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     let mut spawned: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        match probe_hub(socket).await? {
+        let probe = probe_hub(socket).await?;
+        twr_core::trace::mark_with(|| format!("cli: hub probe: {probe:?}"));
+        match probe {
             Probe::Answers => return Ok(()),
             Probe::Absent => match spawned {
                 None => {
@@ -8251,9 +8309,8 @@ mod tests {
     fn hub_stop_connection_retries_preserve_rpc_refusals() {
         let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(stop_connection_lost(&reset));
-        assert!(stop_connection_lost(&anyhow!(
-            "hub closed the connection during hello"
-        )));
+        let closed = twr_core::client::HubClosed::new("hub.info", true, None, None);
+        assert!(stop_connection_lost(&closed.into()));
         let refusal = anyhow::Error::from(RpcError::new(
             codes::UNAUTHORIZED,
             "hub closed the connection during hello",

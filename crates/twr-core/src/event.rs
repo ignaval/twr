@@ -52,6 +52,23 @@ pub fn is_confirm_card(thread: &str, ext: &Option<JsonMap>) -> bool {
             .any(|k| twr.and_then(|t| t.get(*k)).is_some_and(|v| !v.is_null()))
 }
 
+/// `attention.raised` `ext.twr` key of a hung-turn card (`twr-hub` `hub::stall`): a stalled item
+/// the hub raises when a turn has been silent while something waits to start the next one,
+/// `{turn, waiting}`, with the options [`HUNG_INTERRUPT`] and [`HUNG_WAIT`].
+pub const HUNG_KEY: &str = "hung";
+/// A hung-turn card's option that interrupts the turn so that what waits runs.
+pub const HUNG_INTERRUPT: &str = "interrupt";
+/// A hung-turn card's option that leaves the turn running.
+pub const HUNG_WAIT: &str = "wait";
+
+/// Whether an `attention.raised` with `ext` is a hung-turn card ([`HUNG_KEY`]).
+pub fn is_hung_card(ext: &Option<JsonMap>) -> bool {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(HUNG_KEY))
+        .is_some_and(|v| !v.is_null())
+}
+
 /// Whether an `attention.raised` on `thread` with `ext` is a delete card ([`DELETE_KEY`]).
 pub fn is_delete_card(thread: &str, ext: &Option<JsonMap>) -> bool {
     thread == HUB_THREAD
@@ -157,6 +174,44 @@ struct WireEvent {
     data: Value,
     #[serde(default)]
     raw: Option<String>,
+}
+
+/// [`WireEvent`] with its `data` left as JSON text, parsed by `kind` straight into its type
+/// ([`EventBody::from_kind_json`]): only from serde_json's own text deserializer
+/// ([`crate::proto::ServerMessage::from_line`]), which alone has the text to lend.
+#[derive(Deserialize)]
+pub(crate) struct WireEventText<'a> {
+    v: u32,
+    id: String,
+    seq: u64,
+    #[serde(with = "rfc3339_millis")]
+    ts: DateTime<Utc>,
+    thread: String,
+    #[serde(default)]
+    turn: Option<u64>,
+    source: Source,
+    kind: String,
+    #[serde(default, borrow)]
+    data: Option<&'a serde_json::value::RawValue>,
+    #[serde(default)]
+    raw: Option<String>,
+}
+
+impl WireEventText<'_> {
+    /// The event.
+    pub(crate) fn into_event(self) -> Result<Event, serde_json::Error> {
+        Ok(Event {
+            body: EventBody::from_kind_json(&self.kind, self.data.map(|d| d.get()))?,
+            v: self.v,
+            id: self.id,
+            seq: self.seq,
+            ts: self.ts,
+            thread: self.thread,
+            turn: self.turn,
+            source: self.source,
+            raw: self.raw,
+        })
+    }
 }
 
 /// Borrowed wire shape used for serialization (keeps payload field order).
@@ -979,6 +1034,27 @@ pub struct TurnWithdrawn {
     pub extra: JsonMap,
 }
 
+/// `turn.interrupted` (the thread, in the turn it interrupts): the user asked to send the next
+/// queued message now (`message.send_now`), so the hub asked the runtime to interrupt the turn
+/// that runs. The turn keeps what it did and its authority, as any turn the user interrupts;
+/// it ends `interrupted` whatever the runtime reports (no grade, report, review or retry), and
+/// the queued message `ref` is the next prompt the thread runs.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnInterrupted {
+    /// The queued message sent now ([`MESSAGE_REF_KEY`]).
+    #[serde(rename = "ref")]
+    pub msg_ref: i64,
+    /// The turn (also the event's `turn`).
+    pub turn: u64,
+    /// Extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
 /// A hub-authored update shown in the orchestrator conversation without a model turn.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1530,6 +1606,33 @@ macro_rules! event_body {
                     _ => Ok(EventBody::Unknown { kind: kind.to_string(), data }),
                 }
             }
+
+            /// [`EventBody::from_kind_data`] from `data`'s JSON text (`None`: `null`), parsed
+            /// straight into the kind's payload, without a [`Value`] in between: what reading
+            /// the log and the hub's streams spends most of its time on. JSON that does not
+            /// parse that way (a key given twice, which a [`Value`] takes the last of) goes the
+            /// way of [`EventBody::from_kind_data`]: what that one accepts, this one builds the
+            /// same. It also takes a number out of `f64`'s range in a field the payload ignores,
+            /// which a [`Value`] refuses (serde_json never writes one).
+            pub fn from_kind_json(kind: &str, data: Option<&str>) -> Result<Self, serde_json::Error> {
+                let Some(json) = data else {
+                    return Self::from_kind_data(kind, Value::Null);
+                };
+                let direct = match kind {
+                    $( $kind => serde_json::from_str(json).map(EventBody::$variant), )*
+                    _ => return Self::from_kind_data(kind, serde_json::from_str(json)?),
+                };
+                direct.or_else(|_| Self::from_kind_data(kind, serde_json::from_str(json)?))
+            }
+
+            /// Whether the payload may hold a field moved to the blob store
+            /// ([`crate::blob::has_capped`] of [`EventBody::data`]). `false` is certain:
+            /// serialized, it has no `_capped` anywhere (twr's JSON never escapes the
+            /// underscore or the letters); `true` asks for the full check.
+            pub fn maybe_capped(&self) -> bool {
+                serde_json::to_string(&DataOf(self))
+                    .map_or(true, |s| s.contains(crate::blob::CAPPED_KEY))
+            }
         }
     };
 }
@@ -1575,6 +1678,8 @@ event_body! {
     TurnEnded(TurnEnded) => "turn.ended",
     /// `turn.withdrawn`
     TurnWithdrawn(TurnWithdrawn) => "turn.withdrawn",
+    /// `turn.interrupted`
+    TurnInterrupted(TurnInterrupted) => "turn.interrupted",
     /// `prompt.withdrawn`
     PromptWithdrawn(PromptWithdrawn) => "prompt.withdrawn",
     /// Session-scoped background task lifecycle and liveness.
@@ -1634,7 +1739,8 @@ impl EventBody {
 /// Control-stream filter.
 ///
 /// The control stream's set: `thread.*`, `turn.started`, `turn.ended`, `turn.withdrawn` and
-/// `prompt.withdrawn` (a message the user took back), `task.updated`, `attention.*`,
+/// `prompt.withdrawn` (a message the user took back), `turn.interrupted` (the user sent the next
+/// queued message now), `task.updated`, `attention.*`,
 /// `report.*`, `decision.*`, and the small hub-relevant kinds `git.snapshot`, `runner.*`,
 /// `context.updated`, `conversation.update`, `account.*` (the hub's `account.usage`),
 /// `project.read` (an orchestrator read, shown to the user) and `worktree.*`. `agent.*` never
@@ -1644,6 +1750,7 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind == "turn.started"
         || kind == "turn.ended"
         || kind == "turn.withdrawn"
+        || kind == "turn.interrupted"
         || kind == "prompt.withdrawn"
         || kind == "task.updated"
         || kind.starts_with("attention.")
@@ -1807,6 +1914,11 @@ mod tests {
                 turn: 2,
                 ..Default::default()
             }),
+            EventBody::TurnInterrupted(TurnInterrupted {
+                msg_ref: 9,
+                turn: 3,
+                ..Default::default()
+            }),
             EventBody::PromptWithdrawn(PromptWithdrawn {
                 msg_ref: 8,
                 prompt: "never mind".into(),
@@ -1959,6 +2071,90 @@ mod tests {
             let json = serde_json::to_string(&ev).unwrap();
             let back: Event = serde_json::from_str(&json).unwrap();
             assert_eq!(back, ev, "round trip of {json}");
+        }
+    }
+
+    /// The payload parsed straight from its text ([`EventBody::from_kind_json`]) is what the
+    /// `Value` way builds ([`EventBody::from_kind_data`]), for every kind, with unknown fields,
+    /// `null`, an unknown kind and a key given twice (where a `Value` keeps the last); and both
+    /// refuse what the other refuses.
+    #[test]
+    fn a_payload_parsed_from_its_text_is_the_one_a_value_gives() {
+        let value_way = |kind: &str, json: &str| {
+            serde_json::from_str::<Value>(json).and_then(|v| EventBody::from_kind_data(kind, v))
+        };
+        let mut cases: Vec<(String, String)> = all_bodies()
+            .into_iter()
+            .map(|b| {
+                let mut data = b.data().unwrap();
+                if let Some(m) = data.as_object_mut() {
+                    m.insert("from_a_later_build".into(), json!({"x": [1, 2.5, null]}));
+                }
+                (b.kind().to_string(), data.to_string())
+            })
+            .collect();
+        for kind in KNOWN_KINDS {
+            cases.push((kind.to_string(), "null".into()));
+            cases.push((kind.to_string(), "{}".into()));
+            cases.push((kind.to_string(), "[1]".into()));
+            cases.push((kind.to_string(), "{\"text\": 1}".into()));
+        }
+        cases.push(("agent.text".into(), r#"{"text":"a","text":"b"}"#.into()));
+        cases.push((
+            "thread.renamed".into(),
+            r#"{"name":"x","name":"y","by":"user"}"#.into(),
+        ));
+        cases.push(("from.a.later.build".into(), r#"{"a":1,"a":2}"#.into()));
+        cases.push(("agent.text".into(), "{".into()));
+        for (kind, json) in &cases {
+            let direct = EventBody::from_kind_json(kind, Some(json));
+            match (direct, value_way(kind, json)) {
+                (Ok(d), Ok(v)) => assert_eq!(d, v, "{kind} {json}"),
+                (Err(_), Err(_)) => {}
+                (d, v) => panic!("{kind} {json}: {d:?} but {v:?}"),
+            }
+        }
+        assert_eq!(
+            EventBody::from_kind_json("agent.text", None).unwrap(),
+            EventBody::from_kind_data("agent.text", Value::Null).unwrap()
+        );
+        // The envelope too, `null` and missing `data` alike.
+        let ev = Event::new(
+            "t1",
+            1,
+            None,
+            Source::Hub,
+            EventBody::AgentText(Default::default()),
+        );
+        let mut v = serde_json::to_value(&ev).unwrap();
+        v["data"] = Value::Null;
+        assert_eq!(serde_json::from_value::<Event>(v.clone()).unwrap(), ev);
+        v.as_object_mut().unwrap().remove("data");
+        assert_eq!(serde_json::from_str::<Event>(&v.to_string()).unwrap(), ev);
+    }
+
+    /// [`EventBody::maybe_capped`] is never `false` for a payload with a field moved to the
+    /// blob store, wherever the marker is.
+    #[test]
+    fn maybe_capped_never_misses_a_capped_payload() {
+        use crate::blob::{cap_payload, has_capped, MemoryBlobStore};
+        let store = MemoryBlobStore::new();
+        for body in all_bodies() {
+            assert_eq!(
+                body.maybe_capped(),
+                has_capped(&body.data().unwrap()),
+                "{body:?}"
+            );
+            let mut data = body.data().unwrap();
+            if let Some(m) = data.as_object_mut() {
+                m.insert("big".into(), json!("x".repeat(10_000)));
+                m.insert("nested".into(), json!({"list": vec!["y".repeat(100); 100]}));
+            }
+            cap_payload(&mut data, &store).unwrap();
+            let capped = EventBody::from_kind_data(body.kind(), data.clone()).unwrap();
+            if has_capped(&capped.data().unwrap()) {
+                assert!(capped.maybe_capped(), "{}", body.kind());
+            }
         }
     }
 
@@ -2194,6 +2390,12 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(body.data().unwrap(), json!({"ref": 7, "turn": 2}));
+        let body = EventBody::TurnInterrupted(TurnInterrupted {
+            msg_ref: 9,
+            turn: 3,
+            ..Default::default()
+        });
+        assert_eq!(body.data().unwrap(), json!({"ref": 9, "turn": 3}));
         let back = EventBody::from_kind_data("prompt.withdrawn", json!({"ref": 8, "prompt": "x"}));
         assert_eq!(
             back.unwrap(),
@@ -2222,6 +2424,7 @@ mod tests {
             "turn.started",
             "turn.ended",
             "turn.withdrawn",
+            "turn.interrupted",
             "prompt.withdrawn",
             "task.updated",
             "attention.raised",

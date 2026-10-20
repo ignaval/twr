@@ -106,6 +106,8 @@ pub enum Slash {
     /// `/mouse [on|off]`: take the mouse (select and copy in the TUI) or leave it to the
     /// terminal; `None` toggles.
     Mouse(Option<bool>),
+    /// `/suggest [on|off]`: next-message suggestions for this TUI ([`crate::suggest`]).
+    Suggest(Option<bool>),
     /// `/ws [name]` (alias `/workspace`): list the workspaces, or switch to one (a new name
     /// asks to create it).
     Ws(Option<String>),
@@ -313,6 +315,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/mouse",
         "/mouse [on|off]",
         "mouse selection and wheel in the TUI, or the terminal's own",
+        &[ArgKind::OnOff],
+    ),
+    (
+        "/suggest",
+        "/suggest [on|off]",
+        "suggest your next message after a turn (a small model; Tab takes it)",
         &[ArgKind::OnOff],
     ),
     (
@@ -564,7 +572,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         }
         "/attach" => one(args).map(Slash::Attach),
         "/ws" => one(args).map(Slash::Ws),
-        "/parked" | "/sidebar" | "/focus" | "/mouse" | "/compact" => {
+        "/parked" | "/sidebar" | "/focus" | "/mouse" | "/compact" | "/suggest" => {
             let on = match one(args)?.as_deref() {
                 None => None,
                 Some("on") => Some(true),
@@ -576,6 +584,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                 "/sidebar" => Slash::Sidebar(on),
                 "/focus" => Slash::Focus(on),
                 "/compact" => Slash::Compact(on),
+                "/suggest" => Slash::Suggest(on),
                 _ => Slash::Mouse(on),
             })
         }

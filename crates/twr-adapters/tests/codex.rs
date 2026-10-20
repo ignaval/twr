@@ -903,7 +903,7 @@ fn failed_turns_say_why() {
 }
 
 /// A `thread/start` result reporting exactly what `manual` asks for.
-const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
+const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"cwd":"/tmp/sandbox-codex","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
 
 #[test]
 fn reasoning_only_when_thinking() {
@@ -1396,6 +1396,7 @@ fn thread_params_for_new_and_resumed_threads() {
         method,
         params,
         mode_note,
+        added_instructions,
     } = thread_params(&SpawnConfig {
         model: Some("gpt-6-astra".into()),
         system_append: Some("Be brief.".into()),
@@ -1404,6 +1405,10 @@ fn thread_params_for_new_and_resumed_threads() {
     .unwrap();
     assert_eq!(method, "thread/start");
     assert_eq!(mode_note, None, "manual maps exactly");
+    assert_eq!(
+        added_instructions, None,
+        "the sandbox note is for auto only"
+    );
     assert_eq!(
         params,
         json!({"cwd": FIXTURE_CWD, "approvalPolicy": "untrusted", "approvalsReviewer": "user",
@@ -1570,9 +1575,14 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
     )
     .unwrap();
     let common = common.canonicalize().unwrap();
+    // And the shared memory folder, where there is one (`/dev/shm`): all a folder outside
+    // any repository gets with no home.
+    let shm = twr_adapters::codex::auto_writable_roots(dir.path(), None, |_| None);
     let roots: Vec<String> = ["worktrees/wt", "objects", "refs", "logs"]
         .iter()
-        .map(|d| common.join(d).display().to_string())
+        .map(|d| common.join(d))
+        .chain(shm)
+        .map(|d| d.display().to_string())
         .collect();
     let auto = SpawnConfig {
         cwd: wt.clone(),
@@ -1657,8 +1667,21 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 
     let mut tr = new_translator(&auto, TranslatorOptions::default());
     tr.start();
-    tr.translate(r#"{"id":1,"result":{}}"#);
-    let opened = json!({"id": 2, "result": {"thread": {"id": "th"},
+    // The sandbox note goes after the config's own developer instructions: the config is
+    // read before the thread opens.
+    let id_of = |replies: &[String], method: &str| {
+        replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == method)
+            .map(|v| v["id"].clone())
+            .unwrap_or_else(|| panic!("no {method} in {replies:?}"))
+    };
+    let out = tr.translate(r#"{"id":1,"result":{}}"#);
+    let read = id_of(&out.replies, "config/read");
+    let out = tr.translate(&json!({"id": read, "result": {"config": {}}}).to_string());
+    let open = id_of(&out.replies, "thread/start");
+    let opened = json!({"id": open, "result": {"thread": {"id": "th"}, "cwd": wt,
         "approvalPolicy": "on-request", "approvalsReviewer": "user",
         "sandbox": {"type": "workspaceWrite", "writableRoots": roots, "networkAccess": true,
                     "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}});
@@ -1680,7 +1703,7 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     use twr_adapters::codex::translate::check_policy;
     let result = |sandbox: Value| {
-        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted",
+        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted", "cwd": FIXTURE_CWD,
                "approvalsReviewer": "user", "sandbox": sandbox})
     };
     let ww = |extra: Value| {
@@ -1720,6 +1743,7 @@ fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     asked["config"]["sandbox_workspace_write.writable_roots"] = json!(["/srv/cache"]);
     let mut on_request = ww(json!({"writableRoots": ["/srv/cache/"], "networkAccess": true}));
     on_request["approvalPolicy"] = json!("on-request");
+    on_request["cwd"] = json!(std::env::temp_dir());
     assert_eq!(check_policy(&asked, &on_request), Ok(()));
     on_request["sandbox"]["writableRoots"] = json!(["/srv/cache", "/home/u"]);
     assert!(check_policy(&asked, &on_request).is_err());
@@ -2040,6 +2064,9 @@ for line in open(fixture):
         if not got:
             sys.exit(3)
     else:
+        # Codex reports the cwd it runs in, which twr checks: the recording's is replaced,
+        # with the paths under it.
+        body = body.replace('/tmp/sandbox-codex', json.dumps(os.getcwd())[1:-1])
         sys.stdout.write(body + "\n"); sys.stdout.flush()
 while read_command():
     pass

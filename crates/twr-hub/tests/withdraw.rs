@@ -21,7 +21,7 @@ use twr_core::config::Config;
 use twr_core::event::*;
 use twr_core::proto::codes;
 use twr_hub::hub::ControlSubscription;
-use twr_hub::{Caller, Hub, HubOptions, NewThread, SwitchOptions};
+use twr_hub::{Caller, Hub, HubOptions, NewThread, ShellRun, SwitchOptions};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -199,6 +199,8 @@ impl Env {
             config_dir: Some(self.path().join("claude-config")),
         };
         o.stop_timeout = Duration::from_secs(5);
+        // A `!!` command runs through the job gate, which this test binary isn't.
+        o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
         o
     }
 
@@ -1168,6 +1170,57 @@ async fn a_notice_turn_after_a_withdrawn_one_is_told() {
     assert!(notice.starts_with("[twr background]"), "{notice}");
     assert!(notice.contains("«deploy everything»"), "{notice}");
     assert!(notice.contains("[twr notice]"), "{notice}");
+    hub.shutdown().await;
+}
+
+/// A turn the hub started for the orchestrator (a shared `!!` command's output) that the
+/// user stops is no message of theirs taken back: the next prompt says the user stopped a turn
+/// the hub had started, and quotes none of its text as the user's.
+#[tokio::test]
+async fn a_hub_started_turn_stopped_is_not_a_message_taken_back() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let mut sub = hub.subscribe_control(0);
+    hub.say_to_orchestrator("watch", Some(head(&hub)), &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    let orch = hub.orchestrator_thread().unwrap();
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    let shared = ShellRun {
+        thread: None,
+        command: "echo deploy everything".into(),
+        cwd: None,
+        share: true,
+    };
+    hub.shell_run(shared, &tui()).unwrap();
+    let (prompt, t2) = rt.next_turn().await;
+    assert!(
+        prompt.contains("[twr: the user ran a shell command and shared it with you]"),
+        "{prompt}"
+    );
+    let started = events_of(&hub, &orch)
+        .into_iter()
+        .find(|e| e.kind() == "turn.started" && e.turn == Some(t2))
+        .unwrap();
+    assert_eq!(started.source, Source::Hub);
+    let msg_ref = hub.thread_view(&orch).unwrap().current_turn_ref.unwrap();
+    let w = withdraw(&hub, "orchestrator", msg_ref);
+    assert_eq!(w["state"], "running", "{w}");
+    assert_eq!(rt.next_cmd().await, AdapterCmd::Interrupt);
+    rt.end_turn_as(t2, "", TurnResult::Interrupted);
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    hub.say_to_orchestrator("what now?", Some(head(&hub)), &tui())
+        .unwrap();
+    let (prompt, t3) = rt.next_turn().await;
+    assert!(
+        prompt.contains("The user stopped a turn the hub had started (not a message of theirs)"),
+        "{prompt}"
+    );
+    assert!(!prompt.contains("took back"), "{prompt}");
+    assert!(!prompt.contains("deploy everything"), "{prompt}");
+    rt.end_turn(t3, "Nothing.");
     hub.shutdown().await;
 }
 

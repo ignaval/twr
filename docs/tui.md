@@ -63,44 +63,57 @@ The cards are ordered by what needs you: permissions first, then questions, erro
 
 Only a card that comes to need you moves at once: a new permission, question, error, review or stall brings it to the top right away. Every other move waits about three seconds: a thread finishing, failing, going idle, or leaving the top once you answered its item. It also waits while you're using the cards: while a card or tile is selected, while its action popup or a detail view is open, and while the mouse pointer is over the cards (for at most 30 seconds after it last moved, and not after the terminal loses focus). Once nothing holds them, the cards move to their new places all at once. A new thread's card shows right away, in its place, and a deleted or hidden one goes. The same order holds in the column, the row of cards above a narrow conversation, and the grid. A list you scrolled down keeps showing the same card first when a card above it comes or goes.
 
-Cards have a fixed height: 7 rows, or 11 with an item open, the size a card keeps until its move is applied. A card's text changing (what it's doing, its report, its git state) never shifts the cards below it. A report too long for its card ends in `…`; the full report is in the card's action popup, the dive and the conversation. Grid tiles and the row of cards were fixed-height already.
+Cards have a fixed height: 7 rows (a title, 4 rows of status and report, the git line and the border), or 11 with an item open, the size a card keeps until its move is applied. A card's text changing (what it's doing, its report, its git state) never shifts the cards below it. A report too long for its card ends in `…`; the full report is in the card's action popup, the dive and the conversation. Grid tiles and the row of cards were fixed-height already.
 
 `[tui] card_order = "attention"` brings back the old order: within a group, the most recently active thread first, every move at once ([configuration.md](configuration.md)).
 
 Parked threads are hidden by default, unless one is pinned, has an open item (so a failure on a parked thread stays in view) or is the thread you are in a dive into. A dim line under the cards says how many are hidden, such as `2 parked hidden · /parked shows them`; where the cards have no room for it (the narrow row above the conversation, even with no card in it, or a grid header too narrow for it), the status bar's hints start with it. `/parked` lists them among the cards, and so does a tap on the note; `/parked` again hides them (`/parked on` and `/parked off` set it). Hidden threads still work everywhere else: commands, Tab completion and `@` mentions name them. Cards have a fixed height (see above). When they don't all fit, the edge cards say `↑ N more` or `↓ N more` (`< N more` and `N more >` in the narrow row).
 
-A card's title is the thread's project, dimmed, then its name (`twr · scroll-follow`), with its permission mode at the top right when the title has room for it. On a narrow card the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out, while the name and the mode stay. Under the title, a card has one section about the thread's status, then, at its bottom, who runs it and its git state:
+A card's title says which thread it is and who runs it: at its left the thread's project, dimmed, then its name (`twr · scroll-follow`); at its right the runtime and model (`claude-code · sonnet-4-5`), with the box token of a thread on a remote box (see below), then its permission mode, apart (`─ auto`). Under the title, a card has one section about the thread's status, and its git state on its last row:
 
 ```
-┌ twr · scroll-follow ─────────────── auto ┐
-│▃ running · implementing scroll anchoring │
-│· running tests                           │
-│                                          │
-│claude-code · sonnet-4-5                  │
-│twr/scroll-fol… · changes made · +3 vs dev│
-└──────────────────────────────────────────┘
-┌ docs · quickstart ───────────────── auto ┐
-│done ✓ · Rewrote the quick start around   │
-│three commands and moved the config       │
-│reference to its own page. All 41 links…  │
-│claude-code · sonnet-4-5                  │
-│twr/quickstart · 2 ahead of main          │
-└──────────────────────────────────────────┘
+┌ quickstart ─ claude-code · sonnet-4-5 ─ auto ┐
+│done ✓ · Rewrote the quick start around three │
+│commands and moved the config reference to its│
+│own page. All 41 links resolve; the old       │
+│anchors redirect.                             │
+│twr/quickstart · 2 ahead of main              │
+└──────────────────────────────────────────────┘
+┌ scroll-follow ──────────── sonnet-4-5 ─ auto ┐
+│▃ running · implementing scroll anchoring ·   │
+│running tests                                 │
+│                                              │
+│                                              │
+│twr/scroll-follow · changes made · +3 vs dev  │
+└──────────────────────────────────────────────┘
+┌ api-tests ── claude-code · sonnet-4-5 ─ auto ┐
+│▃ running tests · cargo test --workspace      │
+│ STALLED  No output for 12 minutes            │
+│1 wait  2 interrupt                           │
+│                                              │
+│                                              │
+│                                              │
+│                                              │
+│                                              │
+│twr/api-tests · changes made · +1/−2 vs dev   │
+└──────────────────────────────────────────────┘
 ```
+
+Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out, then the box's name is cut (`@gp… offline`). Only then does the mode go. The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the card's bottom border says it (`└ @gpu offline ──┘`), where the `↓ 3 more` of an edge card gives way to it if it must. The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
 
 The section starts with the state, then says what is going on, without saying anything twice:
 
-- an open item: the state alone (`waiting`), then its top attention item with numbered options;
+- an open item: its top attention item with numbered options, under the state. A thread waiting on you shows the state alone (`waiting`: the item says what it waits for), and so does one not at work (`done ?` over a review); a thread at work with an item open, such as a stalled notice or a review while it runs, still says what it does, above the item (`running tests · cargo test --workspace`);
 - else, while the thread works (running, waiting on background tasks, attached) or after it failed, what it is doing right now or why it failed (see [The activity line](#the-activity-line)): `running · implementing scroll anchoring`, `failed · turn 2 failed: rate limited`. When that line starts with the state's own word, it goes on from it (`waiting for permission: Bash: git push`, `failed: the state lock is held`), and waiting on background tasks it names the tasks (`background (1 bg) · cargo test --workspace`);
 - else its last report, dimmed and unlabeled, after the state (`done ✓ · Rewrote the quick start …`), in the rows the card has, cut with `…`. Without a report, the activity line, unless it is the state again (`idle · not started`, but `idle`, `parked` or `stopped` alone).
 
-It wraps over the rows the card has above its footer, and its last row ends in `…` when it is cut. So a card never shows a report of an earlier turn while its thread works, and never the activity line next to the report. The state says what the thread is: `failed` or `crashed` after an error, `stopped`, and, once a turn is done, the grade of its report: `done ✓` (success), `done ~` (partial), `done ✗` (gave up) or `done ?` (needs verification). Background tasks follow it (`background (1 bg)`). A selected card waiting on background tasks also shows, under the activity line, the report its turn ended with: an interim one, which the result comes after. The full report is in the card's [action popup](#the-action-popup), the dive and the conversation. Parked threads are dimmed.
+It wraps over the rows the card has above its git line, up to 4 on a card with nothing open in the column and on the compact Threads screen (8 in the row of cards above a narrow conversation, 6 on a grid tile), and its last row ends in `…` when it is cut. The section's first row, the state and the start of what the thread does, always shows: with a long item open, the item gives way before it (an item cut so is answered from its [action popup](#the-action-popup)), and where the section is left a single row, that row is the state and what follows it on one line, cut with `…` (`▃ running (1 bg) · implemen…`), though on a taller card they wrap over two rows. So a card never shows a report of an earlier turn while its thread works, and never the activity line next to the report. The state says what the thread is: `failed` or `crashed` after an error, `stopped`, and, once a turn is done, the grade of its report: `done ✓` (success), `done ~` (partial), `done ✗` (gave up) or `done ?` (needs verification). Background tasks follow it (`background (1 bg)`). A selected card waiting on background tasks also shows, under the activity line, the report its turn ended with: an interim one, which the result comes after. The full report is in the card's [action popup](#the-action-popup), the dive and the conversation. Parked threads are dimmed.
 
-Under the section, a row says who runs the thread: its runtime and model (`claude-code · sonnet-4-5`), and the last row is its git state ([The git line](#the-git-line)). A thread with no git state (a project that isn't a git repository) has the section down to the row of who runs it.
+The last row is the git state ([The git line](#the-git-line)). A thread with no git state (a project that isn't a git repository) has the section down to the card's bottom.
 
-The model is the one the runtime reports it runs, such as Claude Code's `claude-sonnet-4-5-20250929`, shortened on cards by dropping a trailing date and a leading `claude-`. Until the runtime reports one, the card shows the model you asked for, or `default model` when you asked for none. Some runtimes never report it: a `pty:` thread, or an ACP agent that doesn't say. A reasoning effort you set follows the model (`claude-code · fable-5-1 · high`, on cards, tiles and the dive header); a thread on the runtime's default effort shows none. Where the row is too narrow, the model is cut at its end with `…`.
+The model is the one the runtime reports it runs, such as Claude Code's `claude-sonnet-4-5-20250929`, shortened on cards by dropping a trailing date and a leading `claude-`. Until the runtime reports one, the card shows the model you asked for, or `default model` when you asked for none. Some runtimes never report it: a `pty:` thread, or an ACP agent that doesn't say. A reasoning effort you set follows the model (`claude-code · fable-5-1 · high`, in the titles of cards and tiles and in the dive header); a thread on the runtime's default effort shows none.
 
-A thread on a remote box has a box token after its runtime: `running · codex@gpu · gpt-5-codex`. A thread on the hub's own machine has none (`@local` is never shown). When the box isn't simply online, the token says why, in this order of precedence:
+A thread on a remote box has a box token after its runtime, in its card's title: `codex@gpu · gpt-5-codex`. A thread on the hub's own machine has none (`@local` is never shown). When the box isn't simply online, the token says why, in this order of precedence:
 
 | Token | Means |
 |---|---|
@@ -113,7 +126,7 @@ A thread on a remote box has a box token after its runtime: `running · codex@gp
 | `@gpu offline` (red) | no runner of the box is connected |
 | `@gpu reconnecting` (yellow) | the hub is connecting to the box |
 
-The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. A card keeps its height: when the row is too narrow, the model is cut first, then the runtime, then the box's name (`@gpu-wo… offline`); the box's state is never cut. With a request open on a card and too little room for everything, the request is kept whole first, then the row with the token of a box that isn't simply online, before the request's `why:` and `+N more` rows and the state. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
+The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. In a card's title the token gives way last, as above: the runtime first, then the model, then the box's name (`@gpu-wo… offline`); the box's state is never cut. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
 
 When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column.
 
@@ -178,7 +191,7 @@ A thread on a remote box has its box token after the runtime (`codex@gpu offline
 
 A dive selects nothing: the thread's card is drawn with a thin magenta border, as where your lines go, and a card you select is drawn with the thick yellow border as always. With nothing selected, `Enter` on an empty line opens the action popup of the thread you dived into, so you can answer its request without selecting its card first. The input box's title says `→ orbit-webapp-1` on magenta, and its placeholder says `message orbit-webapp-1 directly…`. In a dive, a line you type goes straight to that thread (`thread.send`), and the transcript shows the agent's prompts (one the orchestrator sent with a dim `from the orchestrator` row above it), its replies, tool calls and turn ends the same way. The tool calls fold the way the orchestrator's do, one dim line per run of calls (`Ran 2 shell commands, read 1 file, 1 failed (ctrl+o to expand)`): `Ctrl-O` shows them all and a click shows one run. Every turn end keeps its line in a dive (`✻ Worked for 12.4s`).
 
-With nothing selected, `Esc` returns to the orchestrator conversation; with a card selected, the first `Esc` releases it and the next one returns (`Shift-←` then `Esc` returns too). Right after you send the thread a message, the first `Esc` offers to [take it back](#taking-back-a-message) instead, for 2 seconds. `/back` returns at once. Back in the conversation, the card you had selected before the dive is selected again (unless you selected another one during it), and the row of cards is back on a narrow terminal. Leaving the stack view with `Ctrl-G` ends the dive too; the decisions overlay leaves it as it is. A line only ever goes to a thread you dived into, never to the selected card or the only thread there is.
+With nothing selected, `Esc` returns to the orchestrator conversation; with a card selected, the first `Esc` releases it and the next one returns (`Shift-←` then `Esc` returns too). Right after you send the thread a message, `Esc` still returns at once, and a second `Esc` within 2 seconds [takes the message back](#taking-back-a-message) and returns to the dive. `/back` returns too. Back in the conversation, the card you had selected before the dive is selected again (unless you selected another one during it), and the row of cards is back on a narrow terminal. Leaving the stack view with `Ctrl-G` ends the dive too; the decisions overlay leaves it as it is. A line only ever goes to a thread you dived into, never to the selected card or the only thread there is.
 
 A transcript opens with the thread's last 2000 events, drawn at once when they have all arrived rather than streaming in; until then the pane says it is loading. The TUI keeps the transcripts of the last 8 threads you left, the orchestrator's included, so going back to one shows it right away and only adds what happened since. A thread that logged more than 2000 events while you were away opens fresh on its last 2000. A deleted thread's transcript is dropped.
 
@@ -198,7 +211,7 @@ The transcript records each change, from `twr model`, the orchestrator or `/mode
 
 ![The grid view](img/tui-grid.svg)
 
-`Ctrl-G`, or `/grid`, switches to the grid: one tile per worker thread, at least 40 columns wide, with parked threads at the end, hidden as in the stack view unless `/parked` lists them. The orchestrator has no tile; when it needs you, the grid's header says so. A tile shows what a card does, in the same order: the project before the name and the permission mode in its title, the status section (the state, led by the [working icon](#what-is-working) while the thread works, then the top attention item, what it is doing now ([the activity line](#the-activity-line)) or its last report in the rows left, cut with `…`), who runs it with a remote box's [box token](#stack-view) (`codex@gpu · gpt-5-codex`), and last [the git line](#the-git-line) followed by the turn count (`twr/api · changes made · 3 ahead of dev · 3 turns`). The header counts the threads and the parked ones, and how many of those are hidden: `· 2 parked (1 hidden, /parked shows)`. `Tab`, `Shift-Tab` and all four Shift-arrows move between tiles, and a click selects one. `Enter`, or a click on the selected tile, opens its action popup, the same as its card's; its `talk to` row dives into the thread in the stack view, and `Esc` from there returns to the orchestrator conversation. A double click on a tile dives in too. `Ctrl-G`, or a click on `‹ stack` at the start of the header, goes back without diving; a click on the header's `/parked shows` lists the parked threads.
+`Ctrl-G`, or `/grid`, switches to the grid: one tile per worker thread, at least 40 columns wide, with parked threads at the end, hidden as in the stack view unless `/parked` lists them. The orchestrator has no tile; when it needs you, the grid's header says so. A tile shows what a card does, in the same order: its title as on a card (the project and the name, then who runs it with a remote box's [box token](#stack-view), `codex@gpu · gpt-5-codex`, then the permission mode), the status section in up to 6 rows (the state, led by the [working icon](#what-is-working) while the thread works, then what it is doing now ([the activity line](#the-activity-line)), the top attention item, or its last report in the rows left, cut with `…`), and last [the git line](#the-git-line) followed by the turn count (`twr/api · changes made · 3 ahead of dev · 3 turns`). The header counts the threads and the parked ones, and how many of those are hidden: `· 2 parked (1 hidden, /parked shows)`. `Tab`, `Shift-Tab` and all four Shift-arrows move between tiles, and a click selects one. `Enter`, or a click on the selected tile, opens its action popup, the same as its card's; its `talk to` row dives into the thread in the stack view, and `Esc` from there returns to the orchestrator conversation. A double click on a tile dives in too. `Ctrl-G`, or a click on `‹ stack` at the start of the header, goes back without diving; a click on the header's `/parked shows` lists the parked threads.
 
 ## Decision audit view
 
@@ -227,14 +240,14 @@ Each `Esc` does the first of these that applies, and never clears what you typed
 3. release the selection: a long block, then a request, then the conversation (outside a dive), then the selected card;
 4. in a dive, return to the orchestrator conversation.
 
-What you type goes to the orchestrator: the TUI sends it with `say` and `to: "orchestrator"`, so the hub doesn't route it anywhere else. The status bar says `sent to the orchestrator`, or that the message is queued, until the orchestrator starts its turn or answers, and for 2.5 seconds at most. A message that could not start (`queued, but it could not start: ...`) stays in the status bar until something replaces it. In a dive it goes to that thread. A line that starts with `/` is a command, never a message; start it with `//` to send a line that begins with `/`.
+What you type goes to the orchestrator: the TUI sends it with `say` and `to: "orchestrator"`, so the hub doesn't route it anywhere else. The status bar says `sent to the orchestrator`, or that the message is queued, until the orchestrator starts its turn or answers, and for 2.5 seconds at most. A queued message is listed above the input box until it runs ([Queued messages](#queued-messages)). A message that could not start (`queued, but it could not start: ...`) stays in the status bar until something replaces it. In a dive it goes to that thread. A line that starts with `/` is a command, never a message; start it with `//` to send a line that begins with `/`. A line that starts with `!` runs a [shell command](#shell-commands); start it with `\!` to send a line that begins with `!`.
 
 The input box is a text area: `Enter` sends what it holds, and `Shift-Enter` starts a new line. Each line wraps at the box's width: a word that doesn't fit moves to the next row, and a word wider than the box is cut at its edge. Wide characters such as CJK and emoji take two cells. A character drawn from several code points (an accented letter typed with a combining mark, an emoji with a skin tone, a flag, a keycap, a joined emoji such as 👩‍💻) stays whole: it never splits across rows, the arrow keys step over it, and Backspace and Delete remove all of it. The box starts one row tall and grows with the text and its lines, up to 6 rows or a third of the terminal's height, whichever is smaller; the main pane and the cards above it get shorter to make room. Past that it scrolls to keep the cursor's row in view. The box's border has the color of where the line goes (cyan for the orchestrator, magenta in a dive). Every view has it but the decisions overlay.
 
 | Key (typing) | Action |
 |---|---|
 | ←, → | move the cursor |
-| ↑, ↓ | move a row up or down in wrapped text, keeping the column. On the first row, `↑` recalls the lines you sent or ran before, newest first, and `↓` goes forward again, past the newest back to what you were typing; editing a recalled line makes it the line you are typing. With no history `↑` goes to the start, and on the last row `↓` goes to the end. While the `/` or `@` popup is open, they pick in the popup instead |
+| ↑, ↓ | move a row up or down in wrapped text, keeping the column. On an empty line with messages of yours [queued](#queued-messages) for the thread on the main pane, `↑` takes the newest back into the box to edit it. On the first row, `↑` recalls the lines you sent or ran before, newest first, and `↓` goes forward again, past the newest back to what you were typing; editing a recalled line makes it the line you are typing. With no history `↑` goes to the start, and on the last row `↓` goes to the end. While the `/` or `@` popup is open, they pick in the popup instead |
 | Home, End | to the start, to the end of the cursor's row (before the space the row wraps at); on an empty line, the main pane's top and bottom |
 | Ctrl-Home, Ctrl-End | the main pane's top, its bottom (following new text) |
 | Ctrl-↑, Ctrl-↓, Alt-↑, Alt-↓ | scroll the main pane a line; they are no rows of the line |
@@ -247,10 +260,38 @@ The input box is a text area: `Enter` sends what it holds, and `Shift-Enter` sta
 | Enter | send the whole text, all its lines, wherever the cursor is |
 | Shift-Enter, Alt-Enter, Ctrl-J | start a new line at the cursor |
 
-Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
+Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta), or set the terminal up to send `Alt-Enter` for `Shift-Enter` ([below](#shift-enter-over-mosh-and-ssh), `twr terminal-setup`). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
 
 - **tmux** doesn't speak the kitty protocol, but passes `Shift-Enter` on when its `extended-keys` option is on and it sends extended keys in the `CSI u` form: the TUI then asks tmux for them. In tmux.conf, `set -s extended-keys on` and `set -as terminal-features 'xterm*:extkeys'` (the terminal around tmux has to send them to tmux too); from tmux 3.5, also `set -s extended-keys-format csi-u`, as tmux's default xterm form is one the TUI can't read (with `extended-keys always` it would lose `Shift-Enter` altogether, and the TUI says so when it starts).
-- **mosh** passes neither on: over mosh `Shift-Enter` is always `Enter`, and the TUI says so when it starts. Its local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+- **mosh** passes neither on, so over mosh the terminal sends `Shift-Enter` as it does unasked: as `Enter`, unless it is set up to send `Alt-Enter` for it ([below](#shift-enter-over-mosh-and-ssh)). The TUI says so the first time it starts over mosh. mosh's local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+
+#### Shift-Enter over mosh and SSH
+
+The kitty keyboard protocol has to be asked for, and mosh never passes the request on to your terminal. What does cross mosh, unchanged, is what a key sends. So make your terminal send `Alt-Enter` (the two bytes `ESC CR`) for `Shift-Enter`: the TUI reads `Alt-Enter` as a new line everywhere, over mosh, SSH and tmux too. This is what Claude Code's `/terminal-setup` does, so a terminal set up for Claude Code is set up for twr already.
+
+`twr terminal-setup`, run on the machine your terminal runs on, does it for you: it finds the terminal from the environment (or `--terminal <name>`), adds the binding to its settings file when it can do so safely, backs the file up first (`<file>.twr-backup-<time>`), and leaves a `Shift-Enter` binding that is already there alone. It edits VS Code's (and Cursor's, Windsurf's, VSCodium's) `keybindings.json` and Zed's `keymap.json` when they are plain JSON, Alacritty's `alacritty.toml` when the table can be added, and Ghostty's and kitty's config files. For the others, over SSH or mosh, and with `--print`, it prints the steps instead and changes nothing.
+
+The TUI offers to do it. When it starts and `Shift-Enter` can't be told from `Enter` (no kitty keyboard protocol, and no tmux asked to pass it on), in a terminal on this machine whose settings file twr edits and that lacks the binding (VS Code and the editors built on it, Zed, and Alacritty, Ghostty or kitty when they don't speak the protocol), the status bar asks:
+
+```
+ Shift-Enter sends Enter in VS Code. Make it send Alt-Enter, a new line in twr, as Claude Code's /terminal-setup does? twr adds a key binding to ~/.config/Code/User/keybindings.json (backed up first) · y: yes · n: don't ask again  [ yes ] [ no ]
+```
+
+`y` edits the file as `twr terminal-setup` does and says what it did; `n` leaves it, and the TUI doesn't ask again in that terminal. The question takes `y` or `n` (or a tap on `yes` or `no`) only once it has been on screen a moment with nothing typed: any other key, or a paste, goes where it would without the question, and the question goes until the next start. Left unanswered, it comes back at most 3 starts. Over SSH or mosh, inside tmux or screen, or in a terminal twr can't tell or edit, the TUI can't change anything there: the status bar says once how to do it (`twr terminal-setup` on your terminal's machine, or the steps below). An agent's TUI never asks, and nothing is edited without your `y`. The answers are kept in `tui-state.json` in twr's data directory. By hand:
+
+| Terminal | What to change |
+|---|---|
+| Terminal.app | `Shift-Enter` can't be changed. Settings → Profiles → Keyboard → check "Use Option as Meta key"; then `Option-Enter` starts a new line |
+| iTerm2 | Settings → Profiles → Keys → Key Mappings → `+`: shortcut `Shift-Enter`, action "Send Hex Codes", `0x1b 0x0d` |
+| Ghostty | in its config: `keybind = shift+enter=text:\x1b\r` |
+| kitty | in `kitty.conf`: `map shift+enter send_text all \x1b\r` |
+| WezTerm | in `.wezterm.lua`: `table.insert(config.keys, { key = 'Enter', mods = 'SHIFT', action = wezterm.action.SendString '\x1b\r' })` (after `config.keys = config.keys or {}`) |
+| Alacritty | in `alacritty.toml`: `[[keyboard.bindings]]` with `key = "Return"`, `mods = "Shift"`, `chars = "\u001B\r"` |
+| VS Code | in `keybindings.json`: `{"key": "shift+enter", "command": "workbench.action.terminal.sendSequence", "args": {"text": "\u001b\r"}, "when": "terminalFocus"}` |
+
+Reload the terminal's config afterwards (VS Code and Zed pick it up at once). iTerm2, Ghostty, kitty and WezTerm tell `Shift-Enter` apart on their own when the TUI runs on the same machine; the binding is for mosh. In those terminals the binding also changes what `Shift-Enter` sends to other programs: `Alt-Enter`, which most shells and editors read as `Enter`.
+
+Two more ways other programs use, and why the TUI doesn't: Claude Code also takes a `\` typed at the end of the line, then `Enter`, as a line break, but in the TUI a plain `Enter` always sends (what it means never depends on the text: a line typed before the first frame is dropped whole, up to its `Enter`, and that needs `Enter` to mean one thing). Some terminals and tmux can send `Shift-Enter` in xterm's form (`CSI 27;2;13~`), which the TUI's terminal library doesn't read: it never asks for that form, and a key sent in it does nothing (inside tmux, see above).
 
 The history keeps the last 500 lines, a line sent twice in a row once, in `tui-history` next to the connected hub's database (private to you), so it carries over to the next TUI on that instance. Several TUIs share the file; the lines sent last are written before the TUI exits. A word is a run of characters other than spaces. Pasted text goes in at the cursor with its line breaks; a tab becomes a space. A paste is never read as keys, so a pasted `1` doesn't answer a card and a pasted line break doesn't send anything. A paste while the action popup is open closes the popup and goes into the line.
 
@@ -262,7 +303,7 @@ Open worker permission requests and questions also appear as full cards in the m
 
 ### Taking back a message
 
-To take back the message you just sent, press `Esc` twice with nothing typed. The first `Esc` only says what the second does, in the input box's title: `Esc or tap again: take back your last message`, or in a dive `Esc or tap again: take back your message to beta · /back leaves`. A second `Esc` within 2 seconds takes the message back. `/unsend` does the same in one step, from any view.
+To take back the message you just sent, press `Esc` twice with nothing typed. The first `Esc` only says what the second does, in the input box's title: `Esc or tap again: take back your last message`, or in a dive with a card selected `Esc or tap again: take back your message to beta · /back leaves`. In a dive with nothing selected, the first `Esc` returns to the orchestrator conversation at once, as it always does there, and the title says `Esc or tap again: take back your message to beta`. A second `Esc` within 2 seconds takes the message back (from the orchestrator conversation, it returns to beta's dive, where the text goes back in the box); after anything that changes the view in between (`Ctrl-G`, another dive), it does what `Esc` does there instead. `/unsend` does the same in one step, from any view.
 
 With the mouse, the input box's top border offers it while the message can still be taken back and nothing is typed: `↶ take back` at its right end. A tap on that border row arms it, as the first `Esc` does (the title then reads `Esc or tap again: take back your last message`), and a second tap within 2 seconds takes the message back. One stray tap only shows the hint.
 
@@ -286,6 +327,72 @@ Taken back, the message's line in the conversation is struck out and marked `tak
 A runtime may miss an interrupt that comes before it has begun the turn. While the taken-back turn is still open, the hub interrupts it again as soon as the runtime shows it is running it (its first text, thinking, tool call or request), and declines at once any permission or question it raises (the runtime gets `deny`; nothing waits for you). A tool call the runtime had already started before the interrupt reached it may still finish: taking a message back stops what comes next, not a command already running.
 
 There's no countdown: the chance ends when the turn first acts, not after a set time. When the 2 seconds pass, the hint goes, and `Esc` does its next step for that message; `/unsend` still takes it back. What the message's arrival did stays done: a [confirm card](orchestrator.md#the-confirm-card) it replaced stays replaced, and so does what it ended of the orchestrator's earlier turn.
+
+### Shell commands
+
+A line that starts with `!` is a shell command of yours, run without leaving the TUI, as Claude Code's bash mode does. While the line starts with `!`, the input box turns green and its title says where the command runs:
+
+```
+╭ ! shell  in ~/code/api · Enter runs it · shown only ─────────────────────────╮
+│!cargo test -p api                                                             │
+```
+
+- **Where it runs.** In a dive, in the thread's worktree. A thread on a remote box can't run one: run it there with `twr attach` or ssh. In the orchestrator conversation, in a folder of yours, at first the orchestrator's (`[orchestrator] cwd`, else your home directory); `!cd <folder>` moves it (relative to where it is, `~` for home; `!cd` alone goes back), for this TUI until you quit. Each command runs in a shell of its own, so a `cd` inside a longer command (`!cd src && make`) moves nothing after it. In a dive, `!cd` alone says so.
+- **Who runs it.** You do: the hub runs it as a [job](usage.md#jobs) of the thread, `$SHELL -c <command>`, with the environment the thread's runtime gets, in any mode. No agent and not the orchestrator can run one ([security-model.md](security-model.md#shell-commands-from-the-tui)). It has no terminal: a command that asks for a password or opens a pager gets an error. A `twr` it runs counts as the thread's agent: it reads, but changes nothing in the hub.
+- **What you see.** The command shows in the conversation with how it went: `⏵ running · Ctrl-C stops it` while it runs (`⏵ running` alone for one this TUI didn't start, which `■ stop` stops), then `✓ exit 0 · 1.2s`, `✗ exit 101 · 14m 2s`, `■ stopped`, with the folder, and the end of what it printed under it, colours and progress-bar redraws left out. The last 6 lines show; `Ctrl-O` shows the rest (up to the last 400 lines or 64 KiB of it) and folds it again. The TUI reads the output every half second while the command runs. The whole output is in the job's log (`twr job log <id>`).
+- **Stopping it.** `Ctrl-C` stops the newest command this TUI started on the thread you see, while it runs (the status bar says `Ctrl-C again quits`); with none running, `Ctrl-C` quits as always. A tap on `■ stop` on its status row stops it too, whichever TUI started it. Commands never block the TUI: you can type, send and run more while one runs.
+- **Who sees it.** `!` shows it to you only: nothing reaches the orchestrator's or the thread's turn. `!!` runs it the same way and, when it ends, sends the thread (or the orchestrator) the command, where it ran, how it ended and the end of its output (8 KiB), as a turn of its own marked as your command's output, not your message: it can't stand in for you to answer a permission or change a mode. The title says `!! shell … then sends its output to <thread>`. Either way the command, how it ended and the last 4 KiB of its output are recorded in the thread's log, in every TUI's conversation and in the history, and agents can read what is recorded.
+- **Starting a message with `!`.** Start it with `\!`: `\!important: ...` sends `!important: ...`.
+
+A pasted `!` line runs only when you press Enter, like any line. `↑` recalls `!` lines with the rest of the history.
+
+### Suggestions
+
+Unless `[tui] suggest = false` is in the [configuration](configuration.md) (or `/suggest off` while the TUI runs), the TUI suggests your next message after a turn of the thread you see ends, as Claude Code does. The suggestion shows as dim ghost text in the empty input box, and its title says `Tab or → takes the suggestion`:
+
+```
+╭ → orchestrator  Tab or → takes the suggestion · Enter sends ──────────────────╮
+│now run the integration tests                                                   │
+```
+
+- `Tab` or `→` puts it in the box, to edit or send with `Enter` as anything you type. While a suggestion shows, `Tab` takes it instead of selecting a card.
+- Typing types over it; with the line empty again it shows again. `Enter` on the empty line does what it always does: a suggestion is never sent unless you take it and press `Enter`, and then it is your message, from what you have seen when you send it.
+- A new turn of the thread takes it away; it shows only for the thread on the main pane, with nothing typed.
+
+Where it comes from: when a turn ends while the TUI watches and nothing is typed (not a hub notice turn of the orchestrator, which quotes other threads), the TUI asks the hub (`suggest.next`), which runs one small model once, with your own login:
+
+| runtime | model (`[tui] suggest_model`) | how | tokens a call | cost a call, list price |
+|---|---|---|---|---|
+| Claude Code | `claude-haiku-5-5` (Haiku 5.5) | `claude -p`: no tools, settings, hooks, MCP servers, CLAUDE.md or memory, no session kept | about 780 in, 20 out | $0.0002 the first time, $0.00002 once its prompt is cached |
+| Codex | `gpt-6-luna` (GPT-6-Luna) | `codex exec`: no session kept, none of your Codex config, rules, skills or project `AGENTS.md`, a read-only sandbox that asks nothing, every tool feature off (the call is stopped if the model starts any tool), low reasoning effort | about 5,100 in (3,500 of them cached after the first), 10 out | $0.0002 ($0.0005 uncached) |
+
+The thread's own runtime answers when it is one of the two (the orchestrator's for its conversation), so a Codex thread's text goes to OpenAI and a Claude Code thread's to Anthropic, where it went already; for any other runtime Claude Code answers, else Codex. The other one answers only once the first turned out unable to run at all (its CLI missing or not signed in), from the next suggestion on: never after a usage limit or a timeout, never for a model setting it refused, and never in the same call. Codex sends your global `~/.codex/AGENTS.md` with every request, whatever twr asks, so while you have one Codex answers no suggestion. `/suggest on` has the hub check the agents' CLIs afresh and try again what it found unable to run (after you signed in, say); its own check every few minutes notices too, for the next TUI. Both run in an empty folder. The model reads the turn's prompt (its first 2 KB), the end of the agent's last reply (6 KB) and the thread's name, nothing else. On a subscription a call counts toward your plan's usage windows, which the status bar shows as the runtimes report them; with an API login it costs about what the table says. `/suggest` says how many calls the hub made. Only small models answer suggestions: a Claude Code model that isn't a Haiku, or a Codex model that isn't a Luna (or a mini or nano), is never asked, no other runtime answers in its place, and the hub warns about it when it starts. The hub makes one call per turn, shared by every TUI that asks, at most one every 3 seconds and 60 an hour, and none for 10 minutes after a call fails (a usage limit, a timeout); the TUI says why once. A suggestion that reads as an answer or a command the hub would apply for you (`yes`, `2`, `allow api`, `set all to bypass`, `dale a ambos`, `stop web`), or as a `!` or `/` command, is dropped: those are yours to type. Nothing about suggestions is recorded in the event log.
+
+The first time a suggestion is due, the status bar says instead that suggestions are on, which models they use, where the text goes and what they cost, and how to turn them off (`/suggest off`, `[tui] suggest = false`); the TUI asks for the suggestion only once a frame has shown that notice whole (not cut, not under the help or another overlay), and never shows it again. When the hub's machine has neither runtime that can run them, no Claude Code or Codex CLI or none signed in (the hub checks, and a call that says so counts too), nothing is sent: suggestions stop for the TUI's run without a call and without error lines, and the status bar says why once, ever. Install and sign in to Claude Code or Codex, then `/suggest on`, to get them; `[tui] suggest = false` keeps them off. What the TUI has told you is kept in `tui-state.json` in twr's data directory.
+
+### Queued messages
+
+A message you send while its thread is busy waits in the thread's queue, which the hub keeps, and runs when the turn before it ends, one turn per message, in order. The messages waiting for the thread on the main pane (the orchestrator, or the thread you dived into) are listed right above the input box, the next to run first:
+
+```
+ ⧗ queued · fix the tests too
+ ⧗ queued · (from the orchestrator) check the api …
+ ⧗ queued · then deploy …                                              ↑ edits
+ + 2 more queued
+╭ → orchestrator  Enter sends ───────────────────────────────────────────────────╮
+```
+
+Each row shows the start of its message, `…` when there is more, and who sent it when it wasn't you (the orchestrator's messages to a worker, a job's wake). At most three are listed; `+ N more queued` counts the rest. The list is the hub's: the TUI reads it when something about it changes (a message sent, taken back or started, a turn ending) and every 2 seconds while the thread works or messages wait (every 10 seconds otherwise), so what another TUI or the orchestrator queues shows up too.
+
+- **Edit:** `↑` on an empty line takes your newest queued message back into the box (`↑ edits` on its row says which). Its whole text comes back from the hub, not the start the row shows. Edit it and press `Enter`: it is sent again as a new message, so it goes to the end of the queue, and like any message you send, it counts from what you have seen when you send it and ends what an earlier message's turn of the orchestrator could still do on your behalf. With text in the box, `↑` edits that text and recalls the history as usual.
+- **Select:** with the conversation selected (`Shift-←`), `Shift-↓` past its last block or request steps into the queued rows, and `Shift-↑` back up; a click on a row selects it too. The selected row is highlighted and says `Enter: edit, delete, send now`. `Esc` releases it.
+- **Act:** `Enter` on an empty line, or a tap on the selected row, opens its [action popup](#the-action-popup), with the message's text and who sent it, and these rows:
+  - `edit: back into the box` (only your own messages; it is picked as the popup opens, so `Enter`, `Enter` edits it);
+  - `delete`: takes it out of the queue; the text of a message of yours goes to the history (`↑`), someone else's (the orchestrator's, a `!!` command's output) goes for good, so it can never be sent again as yours;
+  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go.
+  With the mouse, `delete` and `send now` take two taps, as `stop` does.
+
+`Esc` twice, and `/unsend`, still take back the last message you sent, queued or not ([above](#taking-back-a-message)). Deleting or editing takes back with the same `message.withdraw`, so a message whose turn has just started, and hasn't acted yet, is taken back from its turn as `Esc Esc` would.
 
 ### The action popup
 
@@ -330,7 +437,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Key | Action |
 |---|---|
 | Enter | send what you typed; on an empty line, about the selection: a long block expands or collapses, a card, tile or request opens its [action popup](#the-action-popup) (in a dive with nothing selected, the dived thread's) |
-| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first) |
+| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first, and takes a [suggestion](#suggestions) shown in the empty box) |
 | Shift-↑, Shift-↓ | select the previous, the next card; with the conversation selected, its previous, next long block or request |
 | Shift-←, Shift-→ | select the conversation (see [Selecting the conversation](#selecting-the-conversation)); the cards again, the one selected before. In the grid, the four Shift-arrows move between tiles |
 | Esc | close a popup or overlay, else release the selection, else leave the dive (see [above](#typing-and-the-selection)); never clears what you typed |
@@ -345,7 +452,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Ctrl-L | repaint the whole screen |
 | Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the tab at that place, or the previous / next one |
 | ? | typed on an empty line: help, commands and keys (and what a card's rows say), wrapped to the screen's width (below 70 columns each command or key on a row of its own, what it does indented under it). Taller than the screen, it scrolls with ↑↓, PgUp/PgDn, Home/End and the wheel, and its bottom border says `↓ more` while there is more below; Esc or any other key closes it, and so does a click outside it or on the `✕` of its top border. After text, `?` is a character |
-| Ctrl-C | quit (also `/quit`); the TUI clears the screen it drew on |
+| Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise quit (also `/quit`); the TUI clears the screen it drew on |
 
 The decision table, pins, parking, stopping and the parked threads have no keys of their own: `/decisions`, the action popup or `/pin`, `/park`, `/resume`, `/stop` and `/parked`. A grid tile with an open item shows its options in place of the last report.
 
@@ -386,6 +493,8 @@ These controls are drawn to be clicked, each at least a row tall (most a whole r
 | `✕ close` | the decision table's summary line (the whole row) | closes the table, as `Esc` |
 | `✕` | a detail view's top border (a long request, an item too long for its popup) | back to the conversation, as `Esc` |
 | `↶ take back` | the input box's top border, right after you sent a message (the whole border row) | the first tap arms, the second within 2 s takes the message back, as `Esc Esc` |
+| `⧗ queued · …` | a queued message above the input box (the whole row) | selects it; on the selected one, opens its action popup ([Queued messages](#queued-messages)) |
+| `■ stop` | a running `!` command's status row in the conversation (the whole row) | stops it, as Ctrl-C does ([Shell commands](#shell-commands)) |
 | a popup's rows | the action popup | a tap picks a row, a tap on the picked row runs it (see [The action popup](#the-action-popup)) |
 | a popup's rows | the `/` or `@` popup | completes the row, as `Tab` |
 | a runtime | the orchestrator picker | picks it; on the picked one, chooses it |
@@ -437,7 +546,7 @@ Each tab is a filled block a third of the screen wide, the current one reversed,
 
 - **Chat** is the conversation alone, the orchestrator's or the thread you dived into, with the input box under it. On an empty line, Enter opens the item that has waited on you longest. A dive (Talk to it, `/open`) shows here, and so does an item too long for its popup.
 - **Needs you** lists every thread waiting on you, one line each, most urgent first, with its first item: `api · permission · Bash: git push`, and `(+2 more)` when it has more. ↑ and ↓ on an empty line pick one, and Enter opens its [action popup](#the-action-popup), where a digit answers it, as on a card; the next item comes up after.
-- **Threads** shows the threads' cards, the same cards as the stack view's ([Stack view](#stack-view)): the status section, then who runs the thread (with the box token of a remote box) and its git state, as wide as the screen, in the same order and with the same fixed heights. The selected card stays in view as ↑ and ↓ move on, the cards scroll with the wheel, and the edge cards say `↑ 2 more` or `↓ 3 more`. Enter opens a thread's popup, where Talk to it dives in.
+- **Threads** shows the threads' cards, the same cards as the stack view's ([Stack view](#stack-view)): the title with who runs the thread (and the box token of a remote box), the status section and the git state, as wide as the screen, in the same order and with the same fixed heights. The selected card stays in view as ↑ and ↓ move on, the cards scroll with the wheel, and the edge cards say `↑ 2 more` or `↓ 3 more`. Enter opens a thread's popup, where Talk to it dives in.
 
 `/c`, `/n` and `/t` switch between them, since Tab and the Shift-arrows are awkward on a phone keyboard, and so does a tap on a tab (the whole bar is tappable: each tab owns its third of the bar, every row of it and the gap after it). On the lists, a tap selects a row or card and a tap on the selected one opens its action popup, where `talk to` is already picked (one more tap dives in) and an option takes two taps once the item has been read (see [The action popup](#the-action-popup)). A swipe your terminal sends as the wheel scrolls a list, the cards or the conversation; one it sends as a drag selects and copies text. On the lists, Shift-↑ and Shift-↓ move like ↑ and ↓; in Chat they step through its long blocks and requests, as with the main pane selected. The compact layout has no grid: it shows the stack view's conversation. `/compact off` brings the full layout back on a narrow screen, for every workspace until you quit, and each workspace keeps the screen it was on. Answers go through the same checks as anywhere else, the guard against a key meant for something that just moved included.
 
@@ -460,7 +569,7 @@ A terminal that doesn't know the sequence ignores it. Windows Terminal doesn't s
 
 Over SSH the sequence reaches the terminal on your own machine, so the notification shows there. Inside tmux the TUI wraps OSC 9 and OSC 777 for tmux's passthrough, which needs `set -g allow-passthrough on`. Inside GNU screen it wraps them for screen's passthrough, which needs no setting. Screen passes at most 767 bytes, so the TUI shortens a long notification there. Nested tmux and screen aren't supported for OSC 9 and OSC 777: the TUI can't tell which one runs inside the other, so it rings the bell instead.
 
-By default the TUI notifies about a new permission, question or confirm card, a delete card the orchestrator asked for, a failure left for you, a turn to review, a worker that finished a turn, and the orchestrator's reply to your message. `events` picks what you get, and `stalled` adds stalls:
+By default the TUI notifies about a new permission, question or confirm card, a delete card the orchestrator asked for, a failure left for you, a turn to review, a turn that seems hung (`hung`), a worker that finished a turn, and the orchestrator's reply to your message. `events` picks what you get, and `stalled` adds stalls:
 
 ```toml
 events = ["permission", "question", "confirm", "error"]
@@ -500,6 +609,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/grid` | the grid, or back to the stack view, as Ctrl-G does |
 | `/decisions` | the decision audit table, over the view you are in; `Esc` closes it |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal; no argument toggles |
+| `/suggest [on\|off]` | [suggest your next message](#suggestions) after a turn (`[tui] suggest`); no argument toggles |
 | `/ws [name]` | list the [workspaces](#workspaces), or switch to one; a new name asks `y` to create it; alias `/workspace` |
 | `/help` | commands and keys, as `?` on an empty line |
 | `/quit` | quit, as Ctrl-C does |

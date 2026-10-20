@@ -31,7 +31,7 @@
 //! `ext.fake.mode`, the permission mode it was started with (`SpawnConfig::mode`; the fake
 //! applies none, the hub's mode-change tests read it), and `ext.fake.effort`, the reasoning
 //! effort it was started with (`SpawnConfig::effort`, null without one; for the hub's
-//! model-change tests).
+//! model-change tests), and `ext.fake.codex_auto` (`SpawnConfig::codex_auto`).
 //! Resuming a session id restores that count from a process-global map ([`transcript_len`]);
 //! unknown ids start at zero. `send` while a turn runs is queued and runs after it. `stop` exits with code 0 and no
 //! `turn.ended` (the hub closes the open turn), like a killed runtime; it also discards queued
@@ -171,6 +171,7 @@ impl Adapter for FakeAdapter {
                 .unwrap_or_else(|| DEFAULT_MODEL.into()),
             mode: cfg.mode.clone(),
             effort: cfg.effort.clone().filter(|e| !e.trim().is_empty()),
+            codex_auto: cfg.codex_auto.as_str(),
             queue: VecDeque::new(),
             interruptible: self.script.is_none(),
             deaf: false,
@@ -250,6 +251,8 @@ struct Session {
     mode: String,
     /// Reported in `thread.started` `ext.fake.effort` (null: none asked for).
     effort: Option<String>,
+    /// Reported in `thread.started` `ext.fake.codex_auto` (`SpawnConfig::codex_auto`).
+    codex_auto: &'static str,
     queue: VecDeque<(String, u64)>,
     interruptible: bool,
     /// `!deaf`: the next interrupt is ignored.
@@ -357,7 +360,8 @@ impl Session {
         ext.insert(
             NAME.into(),
             json!({"transcript_len": len, "resumed": resumed, "model": self.model,
-                   "mode": self.mode, "effort": self.effort}),
+                   "mode": self.mode, "effort": self.effort,
+                   "codex_auto": self.codex_auto}),
         );
         let started = EventBody::ThreadStarted(SessionPayload {
             session_id: Some(self.session_id.clone()),

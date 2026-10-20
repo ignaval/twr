@@ -1022,6 +1022,55 @@ pub fn read(scene: &Scene) -> Option<Vec<Action>> {
         .collect()
 }
 
+/// Whether `message` reads as a command of the grammar ([`read`]), one way or several, however
+/// its targets would resolve: an answer or a mode change for threads by name, quantity or
+/// mode. For text that must never be taken for one (a next message a model suggested).
+pub fn is_command(message: &str, threads: &[ThreadInfo]) -> bool {
+    let Some(toks) = tokens(message) else {
+        return false;
+    };
+    let mut p = Parser::new(&toks, threads);
+    p.parses(0, MAX_CLAUSES).0 > 0
+}
+
+#[cfg(test)]
+mod is_command_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_told_from_messages() {
+        let threads = vec![ThreadInfo {
+            id: "t-api".into(),
+            name: "api".into(),
+            aliases: Vec::new(),
+            former_names: Vec::new(),
+            project: None,
+            status: twr_core::reduce::ThreadStatus::Idle,
+            runtime: "claude-code".into(),
+            is_orchestrator: false,
+            stopped: false,
+            top_attention: None,
+            last_report: None,
+        }];
+        for c in [
+            "set all to bypass",
+            "dale a ambos",
+            "allow api",
+            "approve both",
+            "set api to auto mode",
+        ] {
+            assert!(is_command(c, &threads), "{c}");
+        }
+        for m in [
+            "now run the integration tests",
+            "check the api logs",
+            "what changed in api?",
+        ] {
+            assert!(!is_command(m, &threads), "{m}");
+        }
+    }
+}
+
 /// Fully resolved actions of an unambiguous command, suitable for direct user execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DirectAction {

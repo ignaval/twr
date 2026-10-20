@@ -55,7 +55,7 @@ use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
-use twr_core::client::Client;
+use twr_core::client::{Client, HubClosed};
 use twr_core::proto::{codes, RpcError};
 
 pub use render::OUTPUT_CAP;
@@ -756,37 +756,52 @@ impl TwrMcp {
     }
 
     /// One hub call on the shared connection. RPC errors keep the connection; transport
-    /// errors and timeouts drop it so the next call reconnects.
+    /// errors and timeouts drop it so the next call reconnects. A call the hub closed the
+    /// connection on before it reached it (a pooled connection left from a hub that stopped
+    /// or restarted since: nothing was done, [`HubClosed::resendable`]) goes once more on a new
+    /// connection; one the hub may have done is never sent again.
     async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
         let mut guard = self.connected().await?;
-        let Some(client) = guard.as_mut() else {
-            return Err("no hub connection".into());
-        };
-        match tokio::time::timeout(CALL_TIMEOUT, client.call(method, params)).await {
-            Ok(Ok(v)) => {
-                guard.healthy = true;
-                Ok(v)
-            }
-            Ok(Err(e)) => match e.downcast_ref::<RpcError>() {
-                Some(rpc) => {
+        let mut resent = false;
+        loop {
+            let Some(client) = guard.as_mut() else {
+                return Err("no hub connection".into());
+            };
+            let e = match tokio::time::timeout(CALL_TIMEOUT, client.call(method, params.clone()))
+                .await
+            {
+                Ok(Ok(v)) => {
                     guard.healthy = true;
-                    Err(hub_error(method, rpc))
+                    return Ok(v);
                 }
-                None => {
+                Ok(Err(e)) => e,
+                Err(_) => {
                     *guard = None;
-                    Err(format!(
-                        "hub connection failed during {method}: {e:#} (the next call reconnects; \
-                         check whether it took effect before retrying)"
-                    ))
+                    return Err(format!(
+                        "hub did not answer {method} within {}s (the next call reconnects; check \
+                         whether it took effect before retrying)",
+                        CALL_TIMEOUT.as_secs()
+                    ));
                 }
-            },
-            Err(_) => {
-                *guard = None;
-                Err(format!(
-                    "hub did not answer {method} within {}s (the next call reconnects; check \
-                     whether it took effect before retrying)",
-                    CALL_TIMEOUT.as_secs()
-                ))
+            };
+            if let Some(rpc) = e.downcast_ref::<RpcError>() {
+                guard.healthy = true;
+                return Err(hub_error(method, rpc));
+            }
+            *guard = None;
+            let Some(closed) = e.downcast_ref::<HubClosed>() else {
+                return Err(format!(
+                    "hub connection failed during {method}: {e:#} (the next call reconnects; \
+                     check whether it took effect before retrying)"
+                ));
+            };
+            if resent || !closed.resendable() {
+                return Err(format!("{e:#} (the next call reconnects)"));
+            }
+            resent = true;
+            match connect_hub(&self.inner.socket, &self.inner.token, CALL_TIMEOUT).await {
+                Ok(c) => *guard = Some(c),
+                Err(again) => return Err(format!("{e:#} (connecting again: {again:#})")),
             }
         }
     }
@@ -1742,6 +1757,36 @@ mod tests {
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
         // Nothing near the whole line was buffered.
         assert!(line.len() <= 1000 + 8192, "{}", line.len());
+    }
+
+    /// A pooled connection left from a hub that stopped (a restart): the call goes to the new
+    /// hub, once; one the hub may have done (it went away with the request) is not resent.
+    #[tokio::test]
+    async fn a_stale_pooled_connection_is_replaced_without_sending_twice() {
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Stop, HubScript::Crash]);
+        let docs = twr_docs::Library::with_pages(Vec::new());
+        let mcp = TwrMcp::connect(socket.clone(), "t".into(), docs)
+            .await
+            .unwrap();
+        hub.hung_up().await;
+        let send = json!({"thread": "w1", "prompt": "hi"});
+        let e = mcp.call("thread.send", send.clone()).await.unwrap_err();
+        assert!(e.contains("it may have been done"), "{e}");
+        assert!(e.ends_with("(the next call reconnects)"), "{e}");
+        // Resent once from the stale connection to the next one, which went away with it.
+        assert_eq!(hub.got(), [vec!["hello"], vec!["hello", "thread.send"]]);
+        mcp.call("thread.send", send).await.unwrap();
+        assert_eq!(
+            hub.got(),
+            [
+                vec!["hello"],
+                vec!["hello", "thread.send"],
+                vec!["hello", "thread.send"]
+            ]
+        );
     }
 
     #[tokio::test]

@@ -146,6 +146,7 @@ mod tests {
             result: TurnResult::Error,
             retry_of: None,
             withdrawn: false,
+            interrupted: false,
         });
         assert!(!is_working(&t), "failed");
         t.last_turn = Some(LastTurn {
@@ -153,6 +154,7 @@ mod tests {
             result: TurnResult::Completed,
             retry_of: None,
             withdrawn: false,
+            interrupted: false,
         });
         t.reported = true;
         assert!(!is_working(&t), "done");

@@ -112,6 +112,8 @@ mod append;
 mod attach;
 mod attention;
 mod background;
+#[cfg(test)]
+mod bench;
 mod box_agents;
 mod box_switch;
 mod boxes;
@@ -137,6 +139,7 @@ mod model;
 mod orch;
 mod project_read;
 mod proposal;
+mod queue;
 mod reactions;
 mod rename;
 mod restart;
@@ -144,15 +147,19 @@ mod retry;
 mod route;
 mod runners;
 mod runtime_spec;
+mod shell;
 mod spawn;
 mod stall;
 mod subscribe;
+mod suggest;
+pub use suggest::SuggestAsk;
 mod supervisor;
 mod switch;
 mod threads;
 mod trash;
 mod updates;
 mod usage;
+mod wake;
 mod watches;
 mod withdraw;
 
@@ -174,16 +181,19 @@ pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
     SUMMARY_WAIT_MAX,
 };
-pub use jobs::{AgentJobBy, JobStart, SlotPool};
+pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
+pub use shell::ShellRun;
+pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
 pub use usage::SpentBy;
+pub use wake::{WAKE_CHAIN_MAX, WAKE_PROMPT_START};
 pub use watches::{IDLE_GRACE, WATCHES_MAX, WATCH_NOTE_MAX};
 pub use withdraw::OrchCall;
 
@@ -288,6 +298,16 @@ pub struct HubOptions {
     /// (whose `main` runs the gate first thing). `None`: jobs are refused. Tests set this
     /// crate's `twr-job-gate`.
     pub job_gate_exe: Option<PathBuf>,
+    /// The Claude Code CLI that answers next-message suggestions (`hub::suggest`): `None`
+    /// uses `TWR_CLAUDE_BIN`, else `claude` on the hub's `PATH`. Tests give a script.
+    pub suggest_bin: Option<PathBuf>,
+    /// The Codex CLI that answers them for Codex threads, or when Claude Code can't
+    /// (`hub::suggest`): `None` uses `TWR_CODEX_BIN`, else `codex` on the hub's `PATH`. Tests
+    /// give a script, or a path that doesn't exist.
+    pub suggest_codex_bin: Option<PathBuf>,
+    /// The Codex home whose global instructions keep Codex from answering suggestions
+    /// (`hub::suggest`): `None` uses `$CODEX_HOME`, else `~/.codex`. Tests give a folder.
+    pub suggest_codex_home: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -295,6 +315,10 @@ pub struct HubOptions {
     /// How long a running turn may go without events before it is `stalled`; `None` uses
     /// `stall_after_secs` from the config. Zero turns the stall timer off.
     pub stall_after: Option<Duration>,
+    /// How long after a worker's background work ended, with no turn after its interim
+    /// report, the hub waits before it wakes the worker itself (`hub::wake`); `None` uses
+    /// `wake_after_secs` from the config. Zero: never.
+    pub wake_after: Option<Duration>,
     /// Period of the `git.snapshot` tick; `None` = [`GIT_TICK`] (30 s), zero = no tick
     /// (snapshots then only follow turn ends).
     pub git_tick: Option<Duration>,
@@ -436,8 +460,12 @@ impl HubOptions {
             socket: None,
             twr_exe: std::env::current_exe().ok(),
             job_gate_exe: std::env::current_exe().ok(),
+            suggest_bin: None,
+            suggest_codex_bin: None,
+            suggest_codex_home: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
+            wake_after: None,
             git_tick: None,
             trash_tick: None,
             disk_tick: None,
@@ -710,6 +738,14 @@ struct Inner {
     twr_exe: Option<PathBuf>,
     /// [`HubOptions::job_gate_exe`].
     job_gate_exe: Option<PathBuf>,
+    /// [`HubOptions::suggest_bin`], resolved.
+    suggest_bin: PathBuf,
+    /// [`HubOptions::suggest_codex_bin`], resolved.
+    suggest_codex_bin: PathBuf,
+    /// [`HubOptions::suggest_codex_home`] (`None`: read from the environment when needed).
+    suggest_codex_home: Option<PathBuf>,
+    /// Next-message suggestions asked and answered (`hub::suggest`).
+    suggestions: Mutex<suggest::Suggestions>,
     /// [`HubOptions::claude_policy`].
     claude_policy: twr_adapters::claude_code::guard::PolicySources,
     /// Wakes the notifier task ([`orch::notifier`]).
@@ -1279,6 +1315,10 @@ struct Core {
     hub_errors: HashMap<String, (String, Option<u64>)>,
     /// Open stalled item per thread: thread -> attn_id (`hub::stall`).
     stalled: HashMap<String, String>,
+    /// Workers to wake after their background work ended (`hub::wake`).
+    wake: wake::WakeState,
+    /// Hung-turn cards (`hub::stall`).
+    hung: stall::HungState,
     /// What each thread is doing now (`hub::activity`).
     activity: HashMap<String, activity::Activity>,
     /// Thread names being created (their worktree is being made, `hub::git`) or restored
@@ -2022,8 +2062,12 @@ impl Core {
         let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
         // Never a retired orchestrator: it would revoke the current one's token.
         self.refuse_retired(thread).map_err(anyhow::Error::new)?;
-        // Nor while what a stopped hub's job left in its directory may still run.
-        self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        // Nor while what a stopped hub's job left in its directory may still run. (The
+        // orchestrator's only jobs are the user's `!` commands of its view: what is left of
+        // one is the user's, and holds no runtime back.)
+        if !view.is_orchestrator() {
+            self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        }
         // Taken whether or not the start succeeds: a failed start's processes (if any) never
         // share a generation marker with a later runtime.
         self.generation += 1;
@@ -2186,6 +2230,14 @@ fn spawn_config(hub: &Inner, view: &ThreadView) -> SpawnConfig {
         repo: (!view.is_orchestrator())
             .then(|| view.repo.clone().map(PathBuf::from))
             .flatten(),
+        // A project's own setting only when the thread was made for that configured project,
+        // as for its `env`; never the orchestrator's (it is never in `auto`).
+        codex_auto: if view.is_orchestrator() {
+            Default::default()
+        } else {
+            hub.config
+                .codex_auto(view.project.as_deref().filter(|_| view.configured_project))
+        },
         ..Default::default()
     }
 }
@@ -2253,6 +2305,8 @@ impl Hub {
             .map(|b| box_agents::project_box(b, view))
             .collect();
         let agents = self.local_agents_json(view);
+        // Whether next-message suggestions can run here (`hub::suggest`).
+        let suggest_unavailable = self.suggest_unavailable();
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
         let core = self.inner.core();
@@ -2285,6 +2339,7 @@ impl Hub {
             "notify_hook": !self.inner.config.notify.command.is_empty(),
             "worker_limits": self.inner.limits.by(),
             "warnings": self.inner.warnings(),
+            "suggest": {"unavailable": suggest_unavailable},
         })
     }
 

@@ -131,6 +131,8 @@ pub(super) struct LocalAgents {
     probe: Option<AgentProbe>,
     /// The last probe's result (`None`: none ended yet).
     known: Mutex<Option<Vec<AgentInfo>>>,
+    /// When the last probe ended.
+    probed_at: Mutex<Option<std::time::Instant>>,
     /// Held by the probe running (one at a time).
     probing: tokio::sync::Mutex<()>,
 }
@@ -140,6 +142,7 @@ impl LocalAgents {
         LocalAgents {
             probe,
             known: Mutex::new(None),
+            probed_at: Mutex::new(None),
             probing: tokio::sync::Mutex::new(()),
         }
     }
@@ -158,6 +161,11 @@ impl LocalAgents {
             .unwrap_or_default()
     }
 
+    /// When the last probe ended (`None`: none did).
+    pub(super) fn probed_at(&self) -> Option<std::time::Instant> {
+        *self.probed_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Probes the agents now (after a probe under way ends) and keeps the result; without a
     /// probe, what is known (nothing).
     pub(super) async fn probe(&self) -> Vec<AgentInfo> {
@@ -172,6 +180,7 @@ impl LocalAgents {
             "probed the hub's own agent CLIs"
         );
         *self.known.lock().unwrap_or_else(|e| e.into_inner()) = Some(agents.clone());
+        *self.probed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
         agents
     }
 }

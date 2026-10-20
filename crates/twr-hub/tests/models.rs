@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 use twr_adapters::fake::FakeAdapter;
 use twr_core::adapter::{
-    Adapter, AdapterCmd, AdapterHandle, AdapterInfo, Answer, SpawnConfig, Tier,
+    Adapter, AdapterCmd, AdapterHandle, AdapterInfo, Answer, CodexAuto, SpawnConfig, Tier,
 };
 use twr_core::config::Config;
 use twr_core::event::*;
@@ -156,6 +156,103 @@ fn started_with(ev: &Event) -> Option<(Value, Value)> {
             Some((f["model"].clone(), f["effort"].clone()))
         }
         _ => None,
+    }
+}
+
+/// `[codex] auto` reaches every worker's runtime (`SpawnConfig::codex_auto`, reported by the
+/// fake as `ext.fake.codex_auto`), and a configured project's `codex_auto` wins for the
+/// threads made for that project; a thread of a folder that is no configured project gets
+/// the global one.
+#[tokio::test]
+async fn threads_start_with_their_codex_auto_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("api");
+    std::fs::create_dir(&repo).unwrap();
+    let mut o = opts(dir.path());
+    o.config.codex.auto = CodexAuto::Never;
+    o.config.projects.insert(
+        "api".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            codex_auto: Some(CodexAuto::AutoReview),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let plain = new_thread(&hub, dir.path(), "plain", "fake").await;
+    let api = hub
+        .new_thread(
+            NewThread {
+                project: "api".into(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                no_worktree: true,
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (t, want) in [(plain, "never"), (api, "auto_review")] {
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        send(&hub, &t, "hi");
+        let evs = until(&mut sub, is_report).await;
+        let got = evs.iter().find_map(|e| match &e.body {
+            EventBody::ThreadStarted(p) => Some(p.ext.as_ref()?["fake"]["codex_auto"].clone()),
+            _ => None,
+        });
+        assert_eq!(got, Some(json!(want)), "{t}");
+    }
+}
+
+/// With nothing in `[codex]`, a worker's runtime gets `auto_review` (Codex's reviewer
+/// answers what its `auto` sandbox does not allow), and a configured project's `codex_auto =
+/// "ask"` brings the user's cards back for that project's threads.
+#[tokio::test]
+async fn threads_start_with_auto_review_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("api");
+    std::fs::create_dir(&repo).unwrap();
+    let mut o = opts(dir.path());
+    assert_eq!(o.config.codex, twr_core::config::CodexConfig::default());
+    o.config.projects.insert(
+        "api".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            codex_auto: Some(CodexAuto::Ask),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let plain = new_thread(&hub, dir.path(), "plain", "fake").await;
+    let api = hub
+        .new_thread(
+            NewThread {
+                project: "api".into(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                no_worktree: true,
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (t, want) in [(plain, "auto_review"), (api, "ask")] {
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        send(&hub, &t, "hi");
+        let evs = until(&mut sub, is_report).await;
+        let got = evs.iter().find_map(|e| match &e.body {
+            EventBody::ThreadStarted(p) => Some(p.ext.as_ref()?["fake"]["codex_auto"].clone()),
+            _ => None,
+        });
+        assert_eq!(got, Some(json!(want)), "{t}");
     }
 }
 
