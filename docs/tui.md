@@ -240,14 +240,14 @@ Each `Esc` does the first of these that applies, and never clears what you typed
 3. release the selection: a long block, then a request, then the conversation (outside a dive), then the selected card;
 4. in a dive, return to the orchestrator conversation.
 
-What you type goes to the orchestrator: the TUI sends it with `say` and `to: "orchestrator"`, so the hub doesn't route it anywhere else. The status bar says `sent to the orchestrator`, or that the message is queued, until the orchestrator starts its turn or answers, and for 2.5 seconds at most. A message that could not start (`queued, but it could not start: ...`) stays in the status bar until something replaces it. In a dive it goes to that thread. A line that starts with `/` is a command, never a message; start it with `//` to send a line that begins with `/`.
+What you type goes to the orchestrator: the TUI sends it with `say` and `to: "orchestrator"`, so the hub doesn't route it anywhere else. The status bar says `sent to the orchestrator`, or that the message is queued, until the orchestrator starts its turn or answers, and for 2.5 seconds at most. A queued message is listed above the input box until it runs ([Queued messages](#queued-messages)). A message that could not start (`queued, but it could not start: ...`) stays in the status bar until something replaces it. In a dive it goes to that thread. A line that starts with `/` is a command, never a message; start it with `//` to send a line that begins with `/`. A line that starts with `!` runs a [shell command](#shell-commands); start it with `\!` to send a line that begins with `!`.
 
 The input box is a text area: `Enter` sends what it holds, and `Shift-Enter` starts a new line. Each line wraps at the box's width: a word that doesn't fit moves to the next row, and a word wider than the box is cut at its edge. Wide characters such as CJK and emoji take two cells. A character drawn from several code points (an accented letter typed with a combining mark, an emoji with a skin tone, a flag, a keycap, a joined emoji such as 👩‍💻) stays whole: it never splits across rows, the arrow keys step over it, and Backspace and Delete remove all of it. The box starts one row tall and grows with the text and its lines, up to 6 rows or a third of the terminal's height, whichever is smaller; the main pane and the cards above it get shorter to make room. Past that it scrolls to keep the cursor's row in view. The box's border has the color of where the line goes (cyan for the orchestrator, magenta in a dive). Every view has it but the decisions overlay.
 
 | Key (typing) | Action |
 |---|---|
 | ←, → | move the cursor |
-| ↑, ↓ | move a row up or down in wrapped text, keeping the column. On the first row, `↑` recalls the lines you sent or ran before, newest first, and `↓` goes forward again, past the newest back to what you were typing; editing a recalled line makes it the line you are typing. With no history `↑` goes to the start, and on the last row `↓` goes to the end. While the `/` or `@` popup is open, they pick in the popup instead |
+| ↑, ↓ | move a row up or down in wrapped text, keeping the column. On an empty line with messages of yours [queued](#queued-messages) for the thread on the main pane, `↑` takes the newest back into the box to edit it. On the first row, `↑` recalls the lines you sent or ran before, newest first, and `↓` goes forward again, past the newest back to what you were typing; editing a recalled line makes it the line you are typing. With no history `↑` goes to the start, and on the last row `↓` goes to the end. While the `/` or `@` popup is open, they pick in the popup instead |
 | Home, End | to the start, to the end of the cursor's row (before the space the row wraps at); on an empty line, the main pane's top and bottom |
 | Ctrl-Home, Ctrl-End | the main pane's top, its bottom (following new text) |
 | Ctrl-↑, Ctrl-↓, Alt-↑, Alt-↓ | scroll the main pane a line; they are no rows of the line |
@@ -260,10 +260,30 @@ The input box is a text area: `Enter` sends what it holds, and `Shift-Enter` sta
 | Enter | send the whole text, all its lines, wherever the cursor is |
 | Shift-Enter, Alt-Enter, Ctrl-J | start a new line at the cursor |
 
-Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
+Telling `Shift-Enter` from `Enter` takes the terminal's help. The TUI asks for the kitty keyboard protocol, which kitty, Ghostty, foot and Alacritty support, among others. In other terminals `Shift-Enter` sends the same code as `Enter` and sends the text; use `Ctrl-J`, which works everywhere, or `Alt-Enter` (on macOS, with Option set to act as Meta), or set the terminal up to send `Alt-Enter` for `Shift-Enter` ([below](#shift-enter-over-mosh-and-ssh), `twr terminal-setup`). The status bar's hints name `Shift-Enter` for a new line only once it is known to arrive (the protocol is on, or one came in), and `Ctrl-J` until then.
 
 - **tmux** doesn't speak the kitty protocol, but passes `Shift-Enter` on when its `extended-keys` option is on and it sends extended keys in the `CSI u` form: the TUI then asks tmux for them. In tmux.conf, `set -s extended-keys on` and `set -as terminal-features 'xterm*:extkeys'` (the terminal around tmux has to send them to tmux too); from tmux 3.5, also `set -s extended-keys-format csi-u`, as tmux's default xterm form is one the TUI can't read (with `extended-keys always` it would lose `Shift-Enter` altogether, and the TUI says so when it starts).
-- **mosh** passes neither on: over mosh `Shift-Enter` is always `Enter`, and the TUI says so when it starts. Its local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+- **mosh** passes neither on, so over mosh the terminal sends `Shift-Enter` as it does unasked: as `Enter`, unless it is set up to send `Alt-Enter` for it ([below](#shift-enter-over-mosh-and-ssh)). The TUI says so when it starts. mosh's local echo also guesses that typing inserts text, so until the TUI's own frame arrives it moves whatever is right of the cursor on the input row: the box's border and the cards beside it jump to the right as you type. Start mosh with `--predict-overwrite` (or `--predict=never`) to stop that.
+
+#### Shift-Enter over mosh and SSH
+
+The kitty keyboard protocol has to be asked for, and mosh never passes the request on to your terminal. What does cross mosh, unchanged, is what a key sends. So make your terminal send `Alt-Enter` (the two bytes `ESC CR`) for `Shift-Enter`: the TUI reads `Alt-Enter` as a new line everywhere, over mosh, SSH and tmux too. This is what Claude Code's `/terminal-setup` does, so a terminal set up for Claude Code is set up for twr already.
+
+`twr terminal-setup`, run on the machine your terminal runs on, does it for you: it finds the terminal from the environment (or `--terminal <name>`), adds the binding to its settings file when it can do so safely, backs the file up first (`<file>.twr-backup-<time>`), and leaves a `Shift-Enter` binding that is already there alone. It edits VS Code's (and Cursor's, Windsurf's, VSCodium's) `keybindings.json` and Zed's `keymap.json` when they are plain JSON, Alacritty's `alacritty.toml` when the table can be added, and Ghostty's and kitty's config files. For the others, over SSH or mosh, and with `--print`, it prints the steps instead and changes nothing. By hand:
+
+| Terminal | What to change |
+|---|---|
+| Terminal.app | `Shift-Enter` can't be changed. Settings → Profiles → Keyboard → check "Use Option as Meta key"; then `Option-Enter` starts a new line |
+| iTerm2 | Settings → Profiles → Keys → Key Mappings → `+`: shortcut `Shift-Enter`, action "Send Hex Codes", `0x1b 0x0d` |
+| Ghostty | in its config: `keybind = shift+enter=text:\x1b\r` |
+| kitty | in `kitty.conf`: `map shift+enter send_text all \x1b\r` |
+| WezTerm | in `.wezterm.lua`: `table.insert(config.keys, { key = 'Enter', mods = 'SHIFT', action = wezterm.action.SendString '\x1b\r' })` (after `config.keys = config.keys or {}`) |
+| Alacritty | in `alacritty.toml`: `[[keyboard.bindings]]` with `key = "Return"`, `mods = "Shift"`, `chars = "\u001B\r"` |
+| VS Code | in `keybindings.json`: `{"key": "shift+enter", "command": "workbench.action.terminal.sendSequence", "args": {"text": "\u001b\r"}, "when": "terminalFocus"}` |
+
+Reload the terminal's config afterwards (VS Code and Zed pick it up at once). iTerm2, Ghostty, kitty and WezTerm tell `Shift-Enter` apart on their own when the TUI runs on the same machine; the binding is for mosh. In those terminals the binding also changes what `Shift-Enter` sends to other programs: `Alt-Enter`, which most shells and editors read as `Enter`.
+
+Two more ways other programs use, and why the TUI doesn't: Claude Code also takes a `\` typed at the end of the line, then `Enter`, as a line break, but in the TUI a plain `Enter` always sends (what it means never depends on the text: a line typed before the first frame is dropped whole, up to its `Enter`, and that needs `Enter` to mean one thing). Some terminals and tmux can send `Shift-Enter` in xterm's form (`CSI 27;2;13~`), which the TUI's terminal library doesn't read: it never asks for that form, and a key sent in it does nothing (inside tmux, see above).
 
 The history keeps the last 500 lines, a line sent twice in a row once, in `tui-history` next to the connected hub's database (private to you), so it carries over to the next TUI on that instance. Several TUIs share the file; the lines sent last are written before the TUI exits. A word is a run of characters other than spaces. Pasted text goes in at the cursor with its line breaks; a tab becomes a space. A paste is never read as keys, so a pasted `1` doesn't answer a card and a pasted line break doesn't send anything. A paste while the action popup is open closes the popup and goes into the line.
 
@@ -299,6 +319,63 @@ Taken back, the message's line in the conversation is struck out and marked `tak
 A runtime may miss an interrupt that comes before it has begun the turn. While the taken-back turn is still open, the hub interrupts it again as soon as the runtime shows it is running it (its first text, thinking, tool call or request), and declines at once any permission or question it raises (the runtime gets `deny`; nothing waits for you). A tool call the runtime had already started before the interrupt reached it may still finish: taking a message back stops what comes next, not a command already running.
 
 There's no countdown: the chance ends when the turn first acts, not after a set time. When the 2 seconds pass, the hint goes, and `Esc` does its next step for that message; `/unsend` still takes it back. What the message's arrival did stays done: a [confirm card](orchestrator.md#the-confirm-card) it replaced stays replaced, and so does what it ended of the orchestrator's earlier turn.
+
+### Shell commands
+
+A line that starts with `!` is a shell command of yours, run without leaving the TUI, as Claude Code's bash mode does. While the line starts with `!`, the input box turns green and its title says where the command runs:
+
+```
+╭ ! shell  in ~/code/api · Enter runs it · shown only ─────────────────────────╮
+│!cargo test -p api                                                             │
+```
+
+- **Where it runs.** In a dive, in the thread's worktree. A thread on a remote box can't run one: run it there with `twr attach` or ssh. In the orchestrator conversation, in a folder of yours, at first the orchestrator's (`[orchestrator] cwd`, else your home directory); `!cd <folder>` moves it (relative to where it is, `~` for home; `!cd` alone goes back), for this TUI until you quit. Each command runs in a shell of its own, so a `cd` inside a longer command (`!cd src && make`) moves nothing after it. In a dive, `!cd` alone says so.
+- **Who runs it.** You do: the hub runs it as a [job](usage.md#jobs) of the thread, `$SHELL -c <command>`, with the environment the thread's runtime gets, in any mode. No agent and not the orchestrator can run one ([security-model.md](security-model.md#shell-commands-from-the-tui)). It has no terminal: a command that asks for a password or opens a pager gets an error. A `twr` it runs counts as the thread's agent: it reads, but changes nothing in the hub.
+- **What you see.** The command shows in the conversation with how it went: `⏵ running · Ctrl-C stops it` while it runs (`⏵ running` alone for one this TUI didn't start, which `■ stop` stops), then `✓ exit 0 · 1.2s`, `✗ exit 101 · 14m 2s`, `■ stopped`, with the folder, and the end of what it printed under it, colours and progress-bar redraws left out. The last 6 lines show; `Ctrl-O` shows the rest (up to the last 400 lines or 64 KiB of it) and folds it again. The TUI reads the output every half second while the command runs. The whole output is in the job's log (`twr job log <id>`).
+- **Stopping it.** `Ctrl-C` stops the newest command this TUI started on the thread you see, while it runs (the status bar says `Ctrl-C again quits`); with none running, `Ctrl-C` quits as always. A tap on `■ stop` on its status row stops it too, whichever TUI started it. Commands never block the TUI: you can type, send and run more while one runs.
+- **Who sees it.** `!` shows it to you only: nothing reaches the orchestrator's or the thread's turn. `!!` runs it the same way and, when it ends, sends the thread (or the orchestrator) the command, where it ran, how it ended and the end of its output (8 KiB), as a turn of its own marked as your command's output, not your message: it can't stand in for you to answer a permission or change a mode. The title says `!! shell … then sends its output to <thread>`. Either way the command, how it ended and the last 4 KiB of its output are recorded in the thread's log, in every TUI's conversation and in the history, and agents can read what is recorded.
+- **Starting a message with `!`.** Start it with `\!`: `\!important: ...` sends `!important: ...`.
+
+A pasted `!` line runs only when you press Enter, like any line. `↑` recalls `!` lines with the rest of the history.
+
+### Suggestions
+
+With `[tui] suggest = true` in the [configuration](configuration.md) (or `/suggest on` while the TUI runs), the TUI suggests your next message after a turn of the thread you see ends, as Claude Code does. The suggestion shows as dim ghost text in the empty input box, and its title says `Tab or → takes the suggestion`:
+
+```
+╭ → orchestrator  Tab or → takes the suggestion · Enter sends ──────────────────╮
+│now run the integration tests                                                   │
+```
+
+- `Tab` or `→` puts it in the box, to edit or send with `Enter` as anything you type. While a suggestion shows, `Tab` takes it instead of selecting a card.
+- Typing types over it; with the line empty again it shows again. `Enter` on the empty line does what it always does: a suggestion is never sent unless you take it and press `Enter`, and then it is your message, from what you have seen when you send it.
+- A new turn of the thread takes it away; it shows only for the thread on the main pane, with nothing typed.
+
+Where it comes from: when a turn ends while the TUI watches and nothing is typed (not a hub notice turn of the orchestrator, which quotes other threads), the TUI asks the hub (`suggest.next`), which runs the Claude Code CLI once, with your login (`claude -p --model haiku`, or `[tui] suggest_model`), with no tools, settings, hooks, MCP servers, CLAUDE.md or memory of yours, in an empty folder. The model reads the turn's prompt (its first 2 KB), the end of the agent's last reply (6 KB) and the thread's name, nothing else. That text goes to Anthropic whatever runtime the thread runs. Each call costs about 600 input tokens over the text (about $0.0001 with Haiku at list price) and counts toward your Claude plan's usage windows, which the status bar shows as the runtimes report them. The hub makes one call per turn, shared by every TUI that asks, at most one every 3 seconds and 60 an hour, and none for 10 minutes after a call fails (not signed in, a usage limit); the TUI says why once. A suggestion that reads as an answer or a command the hub would apply for you (`yes`, `2`, `allow api`, `set all to bypass`, `dale a ambos`, `stop web`), or as a `!` or `/` command, is dropped: those are yours to type. Nothing about suggestions is recorded in the event log. `/suggest` says how many calls the hub made.
+
+### Queued messages
+
+A message you send while its thread is busy waits in the thread's queue, which the hub keeps, and runs when the turn before it ends, one turn per message, in order. The messages waiting for the thread on the main pane (the orchestrator, or the thread you dived into) are listed right above the input box, the next to run first:
+
+```
+ ⧗ queued · fix the tests too
+ ⧗ queued · (from the orchestrator) check the api …
+ ⧗ queued · then deploy …                                              ↑ edits
+ + 2 more queued
+╭ → orchestrator  Enter sends ───────────────────────────────────────────────────╮
+```
+
+Each row shows the start of its message, `…` when there is more, and who sent it when it wasn't you (the orchestrator's messages to a worker, a job's wake). At most three are listed; `+ N more queued` counts the rest. The list is the hub's: the TUI reads it when something about it changes (a message sent, taken back or started, a turn ending) and every 2 seconds while the thread works or messages wait (every 10 seconds otherwise), so what another TUI or the orchestrator queues shows up too.
+
+- **Edit:** `↑` on an empty line takes your newest queued message back into the box (`↑ edits` on its row says which). Its whole text comes back from the hub, not the start the row shows. Edit it and press `Enter`: it is sent again as a new message, so it goes to the end of the queue, and like any message you send, it counts from what you have seen when you send it and ends what an earlier message's turn of the orchestrator could still do on your behalf. With text in the box, `↑` edits that text and recalls the history as usual.
+- **Select:** with the conversation selected (`Shift-←`), `Shift-↓` past its last block or request steps into the queued rows, and `Shift-↑` back up; a click on a row selects it too. The selected row is highlighted and says `Enter: edit, delete, send now`. `Esc` releases it.
+- **Act:** `Enter` on an empty line, or a tap on the selected row, opens its [action popup](#the-action-popup), with the message's text and who sent it, and these rows:
+  - `edit: back into the box` (only your own messages; it is picked as the popup opens, so `Enter`, `Enter` edits it);
+  - `delete`: takes it out of the queue; the text of a message of yours goes to the history (`↑`), someone else's (the orchestrator's, a `!!` command's output) goes for good, so it can never be sent again as yours;
+  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go.
+  With the mouse, `delete` and `send now` take two taps, as `stop` does.
+
+`Esc` twice, and `/unsend`, still take back the last message you sent, queued or not ([above](#taking-back-a-message)). Deleting or editing takes back with the same `message.withdraw`, so a message whose turn has just started, and hasn't acted yet, is taken back from its turn as `Esc Esc` would.
 
 ### The action popup
 
@@ -343,7 +420,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Key | Action |
 |---|---|
 | Enter | send what you typed; on an empty line, about the selection: a long block expands or collapses, a card, tile or request opens its [action popup](#the-action-popup) (in a dive with nothing selected, the dived thread's) |
-| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first) |
+| Tab, Shift-Tab | select the next, the previous card (`Tab` completes a `/` line or a popup's row first, and takes a [suggestion](#suggestions) shown in the empty box) |
 | Shift-↑, Shift-↓ | select the previous, the next card; with the conversation selected, its previous, next long block or request |
 | Shift-←, Shift-→ | select the conversation (see [Selecting the conversation](#selecting-the-conversation)); the cards again, the one selected before. In the grid, the four Shift-arrows move between tiles |
 | Esc | close a popup or overlay, else release the selection, else leave the dive (see [above](#typing-and-the-selection)); never clears what you typed |
@@ -358,7 +435,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Ctrl-L | repaint the whole screen |
 | Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the tab at that place, or the previous / next one |
 | ? | typed on an empty line: help, commands and keys (and what a card's rows say), wrapped to the screen's width (below 70 columns each command or key on a row of its own, what it does indented under it). Taller than the screen, it scrolls with ↑↓, PgUp/PgDn, Home/End and the wheel, and its bottom border says `↓ more` while there is more below; Esc or any other key closes it, and so does a click outside it or on the `✕` of its top border. After text, `?` is a character |
-| Ctrl-C | quit (also `/quit`); the TUI clears the screen it drew on |
+| Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise quit (also `/quit`); the TUI clears the screen it drew on |
 
 The decision table, pins, parking, stopping and the parked threads have no keys of their own: `/decisions`, the action popup or `/pin`, `/park`, `/resume`, `/stop` and `/parked`. A grid tile with an open item shows its options in place of the last report.
 
@@ -399,6 +476,8 @@ These controls are drawn to be clicked, each at least a row tall (most a whole r
 | `✕ close` | the decision table's summary line (the whole row) | closes the table, as `Esc` |
 | `✕` | a detail view's top border (a long request, an item too long for its popup) | back to the conversation, as `Esc` |
 | `↶ take back` | the input box's top border, right after you sent a message (the whole border row) | the first tap arms, the second within 2 s takes the message back, as `Esc Esc` |
+| `⧗ queued · …` | a queued message above the input box (the whole row) | selects it; on the selected one, opens its action popup ([Queued messages](#queued-messages)) |
+| `■ stop` | a running `!` command's status row in the conversation (the whole row) | stops it, as Ctrl-C does ([Shell commands](#shell-commands)) |
 | a popup's rows | the action popup | a tap picks a row, a tap on the picked row runs it (see [The action popup](#the-action-popup)) |
 | a popup's rows | the `/` or `@` popup | completes the row, as `Tab` |
 | a runtime | the orchestrator picker | picks it; on the picked one, chooses it |
@@ -513,6 +592,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/grid` | the grid, or back to the stack view, as Ctrl-G does |
 | `/decisions` | the decision audit table, over the view you are in; `Esc` closes it |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal; no argument toggles |
+| `/suggest [on\|off]` | [suggest your next message](#suggestions) after a turn (`[tui] suggest`); no argument toggles |
 | `/ws [name]` | list the [workspaces](#workspaces), or switch to one; a new name asks `y` to create it; alias `/workspace` |
 | `/help` | commands and keys, as `?` on an empty line |
 | `/quit` | quit, as Ctrl-C does |

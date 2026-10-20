@@ -139,6 +139,7 @@ mod model;
 mod orch;
 mod project_read;
 mod proposal;
+mod queue;
 mod reactions;
 mod rename;
 mod restart;
@@ -146,9 +147,11 @@ mod retry;
 mod route;
 mod runners;
 mod runtime_spec;
+mod shell;
 mod spawn;
 mod stall;
 mod subscribe;
+mod suggest;
 mod supervisor;
 mod switch;
 mod threads;
@@ -176,12 +179,13 @@ pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
     SUMMARY_WAIT_MAX,
 };
-pub use jobs::{AgentJobBy, JobStart, SlotPool};
+pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
+pub use shell::ShellRun;
 pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};
@@ -291,6 +295,9 @@ pub struct HubOptions {
     /// (whose `main` runs the gate first thing). `None`: jobs are refused. Tests set this
     /// crate's `twr-job-gate`.
     pub job_gate_exe: Option<PathBuf>,
+    /// The Claude Code CLI that answers next-message suggestions (`hub::suggest`): `None`
+    /// uses `TWR_CLAUDE_BIN`, else `claude` on the hub's `PATH`. Tests give a script.
+    pub suggest_bin: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -439,6 +446,7 @@ impl HubOptions {
             socket: None,
             twr_exe: std::env::current_exe().ok(),
             job_gate_exe: std::env::current_exe().ok(),
+            suggest_bin: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
             git_tick: None,
@@ -713,6 +721,10 @@ struct Inner {
     twr_exe: Option<PathBuf>,
     /// [`HubOptions::job_gate_exe`].
     job_gate_exe: Option<PathBuf>,
+    /// [`HubOptions::suggest_bin`], resolved.
+    suggest_bin: PathBuf,
+    /// Next-message suggestions asked and answered (`hub::suggest`).
+    suggestions: Mutex<suggest::Suggestions>,
     /// [`HubOptions::claude_policy`].
     claude_policy: twr_adapters::claude_code::guard::PolicySources,
     /// Wakes the notifier task ([`orch::notifier`]).
@@ -2025,8 +2037,12 @@ impl Core {
         let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
         // Never a retired orchestrator: it would revoke the current one's token.
         self.refuse_retired(thread).map_err(anyhow::Error::new)?;
-        // Nor while what a stopped hub's job left in its directory may still run.
-        self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        // Nor while what a stopped hub's job left in its directory may still run. (The
+        // orchestrator's only jobs are the user's `!` commands of its view: what is left of
+        // one is the user's, and holds no runtime back.)
+        if !view.is_orchestrator() {
+            self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
+        }
         // Taken whether or not the start succeeds: a failed start's processes (if any) never
         // share a generation marker with a later runtime.
         self.generation += 1;

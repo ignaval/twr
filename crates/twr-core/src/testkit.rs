@@ -55,6 +55,7 @@ impl ThreadScript {
             | EventBody::TurnStarted(_)
             | EventBody::TurnEnded(_)
             | EventBody::TurnWithdrawn(_)
+            | EventBody::TurnInterrupted(_)
             | EventBody::AttentionRaised(_) => self.open_turn,
             _ => None,
         };

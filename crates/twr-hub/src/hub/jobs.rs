@@ -63,6 +63,9 @@ use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 use twr_core::reduce::BackgroundTask;
 
+use super::shell::{
+    shell_output, shell_prompt, shell_record, SHELL_RECORD_BYTES, SHELL_SHARE_BYTES,
+};
 use super::{rpc, twr_ext_map, Core, Inner};
 
 /// How often a running or queued job renews its task (liveness, and what it says now).
@@ -111,6 +114,24 @@ pub struct JobStart {
     /// Prompt the thread when it ends (default true).
     #[serde(default)]
     pub wake: Option<bool>,
+    /// A `!` command the user runs from the TUI (`shell.run`, `hub::shell`): never from
+    /// `job.start`'s parameters.
+    #[serde(skip)]
+    pub shell: Option<ShellJob>,
+}
+
+/// What makes a job a user's `!` command (`hub::shell`): it runs at once (no slots, no queue),
+/// on the orchestrator's thread too, in `cwd` there; its end records the end of its output;
+/// and only when the user shared it (`!!`) does its thread get a prompt, one that quotes the
+/// command and its output as such.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellJob {
+    /// The command line, as typed after `!` (run with `$SHELL -c`).
+    pub command: String,
+    /// Where it runs: the orchestrator view's folder (the thread's worktree when `None`).
+    pub cwd: Option<PathBuf>,
+    /// Its command and output go to the thread when it ends (`!!`).
+    pub share: bool,
 }
 
 /// The hub's jobs (memory only: a job the hub did not see end is `lost` at the next start).
@@ -157,6 +178,8 @@ pub(super) struct JobRt {
     cancel: Arc<Cancel>,
     /// Since when it runs (`None`: queued).
     started: Option<Instant>,
+    /// A user's `!` command ([`ShellJob`]).
+    shell: Option<ShellJob>,
     /// Its directory held on the box ([`twr_runner::workdirs`]): no removal or trim of it
     /// runs while the job is queued or runs.
     _workdir: Option<twr_runner::workdirs::WorkdirUse>,
@@ -340,14 +363,22 @@ pub(super) fn tail(path: &Path, lines: usize) -> std::io::Result<String> {
     let mut buf = Vec::new();
     f.take(TAIL_BYTES).read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    // A cut first line is no line.
-    let text = if from > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        &text
+    // A cut first line is no line; but when the cut falls inside the last line, a long one,
+    // its end is the output, marked as cut.
+    let (text, cut) = match text.split_once('\n') {
+        Some((_, rest)) if from > 0 && !rest.trim().is_empty() => (rest.to_string(), false),
+        _ if from > 0 => (text.into_owned(), true),
+        _ => (text.into_owned(), false),
     };
     let all: Vec<&str> = text.lines().collect();
     let text = all[all.len().saturating_sub(lines)..].join("\n");
+    if cut {
+        let mark = "…";
+        return Ok(format!(
+            "{mark}{}",
+            keep_end(text, TAIL_BYTES as usize - mark.len())
+        ));
+    }
     Ok(keep_end(text, TAIL_BYTES as usize))
 }
 
@@ -422,8 +453,28 @@ impl Core {
         self.refuse_retired(id)?;
         self.refuse_deleting(id)?;
         let name = view.name.clone();
-        if view.is_orchestrator() {
+        let shell = req.shell.clone();
+        // A `!` command is the user's, from `shell.run` only.
+        if shell.is_some() != (by == JobBy::Shell) {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "a `!` command comes from shell.run only",
+            ));
+        }
+        // The orchestrator's view runs the user's `!` commands, recorded on its thread; its
+        // agent runs no job.
+        if view.is_orchestrator() && shell.is_none() {
             return Err(rpc(codes::BAD_REQUEST, "the orchestrator runs no jobs"));
+        }
+        if view.box_name != "local" && shell.is_some() {
+            return Err(rpc(
+                codes::CONFLICT,
+                format!(
+                    "{name} runs on box {}: `!` runs commands on the hub's own box only; \
+                     run it there with `twr attach {name}` or ssh",
+                    view.box_name
+                ),
+            ));
         }
         if view.box_name != "local" {
             return Err(rpc(
@@ -455,7 +506,7 @@ impl Core {
         if by == JobBy::Runtime && view.stopped {
             return Err(rpc(codes::CONFLICT, format!("{name} is stopped")));
         }
-        if by != JobBy::User {
+        if !by.is_user() {
             refuse_agent_job_mode(&view)?;
         }
         // Not while its worktree may go or change under it.
@@ -484,8 +535,13 @@ impl Core {
             }
         };
         let pool = self.slot_pool(hub);
-        let slots = req.slots.unwrap_or(1);
-        if slots == 0 || slots > pool.size() {
+        // A `!` command takes no slots: it runs at once, as typed in a terminal would.
+        let slots = if shell.is_some() {
+            0
+        } else {
+            req.slots.unwrap_or(1)
+        };
+        if shell.is_none() && (slots == 0 || slots > pool.size()) {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!(
@@ -501,7 +557,12 @@ impl Core {
                 format!("{name} has {mine} jobs queued or running already"),
             ));
         }
-        let cfg = super::spawn_config(hub, &view);
+        let mut cfg = super::spawn_config(hub, &view);
+        // The orchestrator view's folder, which the user picked (`!cd`): it is no worktree.
+        let own_dir = shell.as_ref().and_then(|s| s.cwd.clone());
+        if let Some(dir) = &own_dir {
+            cfg.cwd = dir.clone();
+        }
         if !cfg.cwd.is_dir() {
             return Err(rpc(
                 codes::CONFLICT,
@@ -509,7 +570,7 @@ impl Core {
             ));
         }
         // Held from now until it ends: a removal or trim of its directory waits or is refused.
-        let workdir = match hub.host(&view.box_name) {
+        let workdir = match hub.host(&view.box_name).filter(|_| own_dir.is_none()) {
             Some(host) => host
                 .use_workdir(&cfg.cwd, id)
                 .map_err(|e| rpc(codes::CONFLICT, format!("{e:#}")))?,
@@ -532,15 +593,30 @@ impl Core {
             ],
         );
         let display = job_name(&req.argv, req.name.as_deref());
-        let ahead = self.jobs.queue.len();
+        let ahead = if shell.is_some() {
+            0
+        } else {
+            self.jobs.queue.len()
+        };
+        let wake = match &shell {
+            Some(s) => s.share,
+            None => req.wake.unwrap_or(true),
+        };
+        let mut record = json!({
+            "id": job, "name": display, "argv": req.argv, "slots": slots,
+            "log": log, "wake": wake, "by": by.recorded(&source, id),
+        });
+        if let Some(s) = &shell {
+            record["shell"] = shell_record(s, &cfg.cwd);
+        }
         let body = EventBody::TaskUpdated(TaskUpdated {
             task_id: format!("{JOB_TASK_PREFIX}{job}"),
             running: true,
-            description: format!("job {display}: queued ({ahead} ahead)"),
-            ext: twr_ext_map(json!({"job": {
-                "id": job, "name": display, "argv": req.argv, "slots": slots,
-                "log": log, "wake": req.wake.unwrap_or(true), "by": by.recorded(&source, id),
-            }})),
+            description: match &shell {
+                Some(_) => format!("! {display}: running"),
+                None => format!("job {display}: queued ({ahead} ahead)"),
+            },
+            ext: twr_ext_map(json!({ "job": record })),
             ..Default::default()
         });
         // Recorded by the hub, which runs it (a job's task is the hub's), saying who asked. Not
@@ -561,14 +637,18 @@ impl Core {
                 cwd: cfg.cwd.clone(),
                 env,
                 timeout,
-                wake: req.wake.unwrap_or(true),
+                wake,
                 log: log.clone(),
                 cancel,
                 started: None,
+                shell: shell.clone(),
                 _workdir: workdir,
             },
         );
-        self.jobs.queue.push_back(job.clone());
+        // A `!` command waits for nothing: it is in no queue.
+        if shell.is_none() {
+            self.jobs.queue.push_back(job.clone());
+        }
         tokio::spawn(run_job(Arc::clone(hub), job.clone()));
         Ok(json!({
             "job": job,
@@ -577,6 +657,7 @@ impl Core {
             "name": display,
             "position": ahead,
             "log": log,
+            "cwd": cfg.cwd,
         }))
     }
 
@@ -680,6 +761,13 @@ impl Core {
                 "a thread's agent cancels only its own thread's jobs",
             ));
         }
+        // The user's `!` commands: only the user stops them.
+        if only.is_some() && self.jobs.jobs.get(&id).is_some_and(|j| j.shell.is_some()) {
+            return Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                "a `!` command is the user's: only the user stops it",
+            ));
+        }
         if let Some(j) = self.jobs.jobs.get(&id) {
             j.cancel.cancel("cancelled", true);
         }
@@ -690,7 +778,18 @@ impl Core {
     /// nothing: whatever stopped it should not start it again.
     pub(super) fn cancel_jobs_of(&self, thread: &str, why: &str) -> usize {
         let mut n = 0;
-        for j in self.jobs.jobs.values().filter(|j| j.thread == thread) {
+        // The orchestrator's runtime stopping (a stop, a reset, a switch) leaves the user's `!`
+        // commands of its view running: they are no work of its.
+        let orch = self
+            .registry
+            .get(thread)
+            .is_some_and(|v| v.is_orchestrator());
+        for j in self
+            .jobs
+            .jobs
+            .values()
+            .filter(|j| j.thread == thread && !(orch && j.shell.is_some()))
+        {
             j.cancel.cancel(why, false);
             n += 1;
         }
@@ -824,7 +923,8 @@ impl Core {
                 .registry
                 .get(&thread)
                 .is_none_or(|v| v.stopped || v.parked);
-            let told = !(job.quiet || resting)
+            // The user's `!` commands are theirs: an agent is never asked to run one again.
+            let told = !(job.quiet || job.shell || resting)
                 && {
                     let prompt = format!(
                         "[twr job {id}] {description}: lost, the hub stopped while it ran. Run it \
@@ -888,16 +988,23 @@ pub(super) enum JobBy {
     Runtime,
     /// A process of the CLI attached to the thread.
     Attach,
+    /// A user client's `!` command (`shell.run`).
+    Shell,
 }
 
 impl JobBy {
+    /// Whether the user asked for it (a job or a `!` command): no agent's mode rules.
+    fn is_user(self) -> bool {
+        matches!(self, JobBy::User | JobBy::Shell)
+    }
+
     /// Who asked for a job of thread `thread`, as its task records it (`ext.twr.job.by`):
     /// `user:<client>` (`source`) for a user, `agent:<thread id>` for the thread's runtime,
     /// `attach:<thread id>` for the CLI attached to it. An agent's connection says
     /// `user:<client>` as its source too, so its own is not what it is.
     fn recorded(self, source: &Source, thread: &str) -> String {
         match self {
-            JobBy::User => source.to_string(),
+            JobBy::User | JobBy::Shell => source.to_string(),
             JobBy::Runtime => format!("agent:{thread}"),
             JobBy::Attach => format!("attach:{thread}"),
         }
@@ -983,15 +1090,30 @@ fn signal_group(pgid: u32, sig: &str) {
 /// Runs job `id`: waits for its turn and its slots, runs it, records how it ended, and wakes
 /// its thread.
 async fn run_job(hub: Arc<Inner>, id: String) {
-    let Some((cancel, slots_wanted, name)) = ({
+    let Some((cancel, slots_wanted, name, shell)) = ({
         let core = hub.core();
-        core.jobs
-            .jobs
-            .get(&id)
-            .map(|j| (Arc::clone(&j.cancel), j.slots, j.name.clone()))
+        core.jobs.jobs.get(&id).map(|j| {
+            (
+                Arc::clone(&j.cancel),
+                j.slots,
+                j.name.clone(),
+                j.shell.is_some(),
+            )
+        })
     }) else {
         return;
     };
+    // A `!` command runs at once: no turn to wait for, no slots.
+    if shell {
+        let started = Instant::now();
+        let outcome = if cancel.is_set() {
+            Outcome::Cancelled(cancel.why())
+        } else {
+            run_process(&hub, &id, &cancel, started).await
+        };
+        finish(&hub, &id, outcome, started.elapsed()).await;
+        return;
+    }
     let pool = hub.core().slot_pool(&hub);
     let moved = Arc::clone(&hub.core().jobs.moved);
     // 1. Its turn, and its slots.
@@ -1055,7 +1177,7 @@ async fn run_job(hub: Arc<Inner>, id: String) {
 
 /// Starts job `id`'s process and waits for its end, renewing its task meanwhile.
 async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Instant) -> Outcome {
-    let Some((argv, cwd, env, log, timeout, name)) = ({
+    let Some((argv, cwd, env, log, timeout, name, shell)) = ({
         let core = hub.core();
         core.jobs.jobs.get(id).map(|j| {
             (
@@ -1065,6 +1187,7 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
                 j.log.clone(),
                 j.timeout,
                 j.name.clone(),
+                j.shell.is_some(),
             )
         })
     }) else {
@@ -1128,7 +1251,7 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
         if cancel.is_set() {
             return Outcome::Cancelled(cancel.why());
         }
-        if by != JobBy::User {
+        if !by.is_user() {
             if let Some(Err(e)) = core.registry.get(&thread).map(refuse_agent_job_mode) {
                 return Outcome::FailedToStart(e.message);
             }
@@ -1165,7 +1288,8 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
             _ = cancel.cancelled() => break Outcome::Cancelled(cancel.why()),
             _ = sleep_until_opt(deadline) => break Outcome::TimedOut,
             _ = renew.tick() => {
-                progress(hub, id, format!("job {name}: running {}", duration_text(started.elapsed())), true);
+                let what = if shell { "!" } else { "job" };
+                progress(hub, id, format!("{what} {name}: running {}", duration_text(started.elapsed())), true);
             }
             _ = snapshot.tick(), if reading.is_none() => {
                 let hook = hub.job_members_hook.clone();
@@ -1366,10 +1490,11 @@ fn release(
     let Some((thread, by)) = core.jobs.jobs.get(id).map(|j| (j.thread.clone(), j.by)) else {
         return Err(Outcome::Cancelled("gone".into()));
     };
+    let shell = by == JobBy::Shell;
     if cancel.is_set() {
         return Err(Outcome::Cancelled(cancel.why()));
     }
-    if by != JobBy::User {
+    if !by.is_user() {
         if let Some(Err(e)) = core.registry.get(&thread).map(refuse_agent_job_mode) {
             return Err(Outcome::FailedToStart(e.message));
         }
@@ -1377,7 +1502,7 @@ fn release(
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),
         running: true,
-        description: format!("job {name}: running"),
+        description: format!("{} {name}: running", if shell { "!" } else { "job" }),
         ext: twr_ext_map(json!({"job": {"id": id, "pgid": pid, "start_time": start_time}})),
         ..Default::default()
     });
@@ -1425,7 +1550,7 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 /// Records how job `id` ended and, unless it was told not to, prompts its thread: the two in
 /// one batch, retried a few times; the job stays listed until they are recorded.
 async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
-    let Some((thread, name, argv, log, wake)) = ({
+    let Some((thread, name, argv, log, wake, shell, cwd)) = ({
         let core = hub.core();
         core.jobs.jobs.get(id).map(|j| {
             (
@@ -1434,6 +1559,8 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
                 j.argv.clone(),
                 j.log.clone(),
                 j.wake && j.cancel.wakes(),
+                j.shell.clone(),
+                j.cwd.clone(),
             )
         })
     }) else {
@@ -1483,18 +1610,30 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
             format!("could not start: {why}"),
         ),
     };
+    let mut record = json!({
+        "id": id, "name": name, "argv": argv, "outcome": kind,
+        "exit": exit, "signal": signal, "duration_ms": took.as_millis() as u64,
+        "log": log,
+    });
+    // A `!` command's end keeps the end of what it printed: what the user saw, in the history.
+    if let Some(s) = &shell {
+        record["shell"] = shell_record(s, &cwd);
+        record["printed"] = json!(shell_output(&log, SHELL_RECORD_BYTES));
+    }
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),
         running: false,
-        description: format!("job {name}: {what}"),
-        ext: twr_ext_map(json!({"job": {
-            "id": id, "name": name, "argv": argv, "outcome": kind,
-            "exit": exit, "signal": signal, "duration_ms": took.as_millis() as u64,
-            "log": log,
-        }})),
+        description: match &shell {
+            Some(_) => format!("! {name}: {what}"),
+            None => format!("job {name}: {what}"),
+        },
+        ext: twr_ext_map(json!({ "job": record })),
         ..Default::default()
     });
     let prompt = wake.then(|| {
+        if let Some(s) = &shell {
+            return shell_prompt(s, &cwd, &what, &shell_output(&log, SHELL_SHARE_BYTES));
+        }
         let out = tail(&log, TAIL_LINES).unwrap_or_default();
         let output = if out.trim().is_empty() {
             "It printed nothing.".to_string()
@@ -1526,7 +1665,7 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
                 .jobs
                 .jobs
                 .get(id)
-                .is_some_and(|j| j.cancel.wakes() && (j.by == JobBy::User || !stopped));
+                .is_some_and(|j| j.cancel.wakes() && (j.by.is_user() || !stopped));
             let told = match prompt.as_ref().filter(|_| wakes) {
                 Some(p) => core
                     .push_prompt(&mut batch, &thread, p, TurnFrom::Runtime, Source::Hub, None)
@@ -1727,6 +1866,12 @@ mod tests {
         assert_eq!(t, "line 9997\nline 9998\nline 9999");
         std::fs::write(&p, "only\n").unwrap();
         assert_eq!(tail(&p, 40).unwrap(), "only");
+        // One line longer than the tail: its end, marked as cut, never nothing.
+        let long = format!("start{}end\n", "x".repeat(2 * TAIL_BYTES as usize));
+        std::fs::write(&p, long).unwrap();
+        let t = tail(&p, 40).unwrap();
+        assert!(t.starts_with('…') && t.ends_with("xend"), "{}", &t[..20]);
+        assert!(t.len() <= TAIL_BYTES as usize);
     }
 
     /// Output that is not UTF-8 reads as U+FFFD (three bytes for each byte): the text is cut

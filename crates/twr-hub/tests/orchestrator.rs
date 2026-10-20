@@ -3937,3 +3937,52 @@ async fn the_orchestrator_picks_a_box_and_is_warned_of_a_missing_agent() {
     assert_eq!(fresh["agents"][1]["version"], "codex-cli 0.160.0");
     hub.shutdown().await;
 }
+
+/// A suggestion the user took unedited (`say` with `suggested`) goes to the orchestrator as a
+/// message, never applied as a short command; one that reads as a command now (an answer, a
+/// mode change: the orchestrator's turn could act on it) is not sent at all. The same words
+/// typed are applied directly.
+#[tokio::test]
+async fn a_suggested_message_is_never_applied_as_a_command() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    let web = env.worker(&hub, "web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t, "Watching.");
+    permissions(&hub, &[&api]);
+    let mode = hub.thread_view(&web).unwrap().mode;
+    assert_ne!(mode, "plan");
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let e = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), true)
+            .unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{m}: {e:?}");
+        assert!(e.message.contains("nothing was sent"), "{m}: {e:?}");
+    }
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let r = hub
+        .say_to_orchestrator_as("and update the docs", Some(seen), &tui(), true)
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    let (prompt, t) = rt.next_turn().await;
+    assert!(prompt.ends_with("and update the docs"), "{prompt}");
+    rt.end_turn(t, "ok");
+    assert!(open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, mode);
+    // Typed, the same words apply.
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), false)
+            .unwrap();
+        assert_eq!(r["action"], "command", "{m}: {r}");
+    }
+    assert!(!open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, "plan");
+    drop(rt);
+    hub.shutdown().await;
+}

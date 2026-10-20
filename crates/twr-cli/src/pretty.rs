@@ -210,6 +210,8 @@ pub fn summary(ev: &Event) -> String {
         }
         // A message the user took back (`message.withdraw`).
         EventBody::TurnWithdrawn(p) => format!("ref={} taken back", p.msg_ref),
+        // The user sent the next queued message now (`message.send_now`).
+        EventBody::TurnInterrupted(p) => format!("interrupted to send ref={} now", p.msg_ref),
         EventBody::PromptWithdrawn(p) => {
             format!(
                 "ref={} taken back before it ran: {}",

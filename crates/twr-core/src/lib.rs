@@ -35,6 +35,7 @@ pub mod proto;
 pub mod reduce;
 pub mod runner;
 pub mod sealed;
+pub mod shell;
 pub mod testkit;
 pub mod trace;
 pub mod usage;

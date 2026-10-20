@@ -264,8 +264,9 @@ impl Policy {
                         .insert(turn);
                     // An interim report: the turn ended with background tasks still running,
                     // and the runtime's own turn after them reports again. The thread's tasks
-                    // say so too, for a report that lacks the marker.
-                    let interim = !view.background_tasks.is_empty()
+                    // say so too, for a report that lacks the marker (its own tasks: a `!`
+                    // command of the user's starts no turn that reports again).
+                    let interim = view.own_background()
                         || p.ext
                             .as_ref()
                             .and_then(|e| e.get("twr"))

@@ -279,6 +279,23 @@ pub struct PendingPrompt {
     pub said_after: Option<u64>,
 }
 
+/// A queued prompt as `thread.queue` lists it ([`Store::pending_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedPrompt {
+    /// Its row id: the message's ref, and its place in the queue.
+    pub id: i64,
+    /// The prompt.
+    pub prompt: String,
+    /// Who sent it.
+    pub from: TurnFrom,
+    /// Who queued it.
+    pub source: Source,
+    /// When (RFC 3339).
+    pub queued_at: String,
+    /// Marked as a send of the user's (`user_sent`).
+    pub user_sent: bool,
+}
+
 /// The writer side of the database. The hub owns exactly one.
 #[derive(Debug)]
 pub struct Store {
@@ -922,6 +939,67 @@ impl Store {
             .transpose()
     }
 
+    /// The first `limit` queued prompts of `thread`, in the order they run (`thread.queue`).
+    pub fn pending_list(&self, thread: &str, limit: usize) -> anyhow::Result<Vec<QueuedPrompt>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, prompt, from_, source, queued_at, user_sent IS NOT NULL
+             FROM pending_prompts WHERE thread = ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![thread, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, prompt, from, source, queued_at, user_sent) = row?;
+            out.push(QueuedPrompt {
+                id,
+                prompt,
+                from: turn_from_parse(&from)?,
+                source: Source::from_str(&source)?,
+                queued_at,
+                user_sent,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The newest queued prompt of `thread` that a user sent (a client of theirs, the row
+    /// marked as their send: a gated send let go later holds reports agents wrote), wherever
+    /// it is in the queue: what the TUI's `↑` takes back to edit.
+    pub fn newest_user_pending(&self, thread: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM pending_prompts WHERE thread = ?1 AND from_ = 'user'
+                 AND source LIKE 'user:%' AND user_sent IS NOT NULL ORDER BY id DESC LIMIT 1",
+                params![thread],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records that the user asked for queued prompt `id` to run (`message.send_now` on a held
+    /// queue), at control head `head`, as a send of theirs records it (`user_sent`): a hub
+    /// started after a crash finds the hold released ([`Store::user_sent_since`]). The row's
+    /// sender and authority (`from_`, `source`, `said_after`) stay as they were; a mark from
+    /// an earlier send of the user's (before the crash that holds the queue) moves to `head`.
+    /// Whether a row changed.
+    pub fn mark_user_sent(&mut self, id: i64, head: u64) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE pending_prompts SET user_sent = ?2
+             WHERE id = ?1 AND (user_sent IS NULL OR user_sent < ?2)",
+            params![id, to_i64(head)?],
+        )? > 0)
+    }
+
     /// Number of queued prompts of `thread`.
     pub fn pending_count(&self, thread: &str) -> anyhow::Result<u64> {
         let n: i64 = self.conn.query_row(
@@ -1041,15 +1119,20 @@ fn row_to_pending(r: &Row<'_>) -> rusqlite::Result<PendingRow> {
     ))
 }
 
-fn pending_from_row(
-    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
-) -> anyhow::Result<PendingPrompt> {
-    let from = match from.as_str() {
+/// A `pending_prompts.from_` value.
+fn turn_from_parse(from: &str) -> anyhow::Result<TurnFrom> {
+    Ok(match from {
         "user" => TurnFrom::User,
         "orchestrator" => TurnFrom::Orchestrator,
         "runtime" => TurnFrom::Runtime,
         other => bail!("bad pending prompt sender {other:?}"),
-    };
+    })
+}
+
+fn pending_from_row(
+    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
+) -> anyhow::Result<PendingPrompt> {
+    let from = turn_from_parse(&from)?;
     Ok(PendingPrompt {
         id,
         thread,
@@ -2337,6 +2420,11 @@ mod tests {
         assert!(s.user_sent_since("t1", 3).unwrap());
         assert!(!s.user_sent_since("t1", 4).unwrap());
         assert!(!s.user_sent_since("t2", 0).unwrap());
+        // Sent now after another crash: the user's earlier mark moves up, never back.
+        assert!(s.mark_user_sent(sent.queued[0], 9).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
+        assert!(!s.mark_user_sent(sent.queued[0], 5).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
     }
 
     #[test]

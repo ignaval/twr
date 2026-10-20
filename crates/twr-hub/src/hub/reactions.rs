@@ -119,9 +119,12 @@ impl Core {
         if view.is_orchestrator() {
             return self.react_to_orchestrator_turn_end(hub, thread, turn, result, &done);
         }
+        // The thread's own work only: a `!` command of the user's is no task its turn waits
+        // for, and its end starts no turn that would report again.
         let background_starts: serde_json::Map<String, Value> = view
             .background_tasks
             .iter()
+            .filter(|(_, t)| !t.shell)
             .map(|(id, t)| (id.clone(), json!(t.started_seq)))
             .collect();
         let background_count = background_starts.len();
@@ -556,6 +559,7 @@ pub(super) fn interim_tasks_running(
         .and_then(Value::as_object);
     running
         .iter()
+        .filter(|(_, t)| !t.shell)
         .filter(|(id, t)| match starts {
             Some(starts) => starts
                 .get(id.as_str())

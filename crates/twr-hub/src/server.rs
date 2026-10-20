@@ -22,6 +22,11 @@
 //! | `thread.send`       | `{thread, prompt}`                                  | `{thread, queued, ref, turn, pending, dispatch_error?}` |
 //! | `say`               | `{message, focused?, seen_gseq?}`                   | `{action, thread?, thread_name?, ref?, turn?, attn_id?, options?, answer?, decision_ids}` |
 //! | `message.withdraw`  | `{thread, ref}` (users only)                        | `{withdrawn: true, state: "queued" \| "running", thread, thread_name, ref, prompt, turn?}` or `{withdrawn: false, reason: "acted" \| "ended" \| "uninterruptible" \| "withdrawn" \| "unknown", message, thread, thread_name, ref, turn?}` (`hub::withdraw`) |
+//! | `message.send_now`  | `{thread, ref}` (users only)                        | `{sent_now: true, state: "interrupting" \| "started" \| "waiting", thread, thread_name, ref, turn?, message?}` or `{sent_now: false, reason: "unknown" \| "not_next" \| "uninterruptible", message, ...}`: runs the next queued message now, interrupting the turn that runs (`hub::queue`) |
+//! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, newest_mine, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
+//! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
+//! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
+//! | `suggest.next`      | `{thread, turn, model}` (users only)                | `{thread, turn, model, suggestion, reason?, cached, stats}`: a likely next message of the user's after turn `turn` ended, from `claude -p` with the user's login (`hub::suggest`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -662,6 +667,11 @@ pub const METHODS: &[&str] = &[
     "thread.transcript",
     "thread.subscribe",
     "message.withdraw",
+    "message.send_now",
+    "thread.queue",
+    "shell.run",
+    "shell.cd",
+    "suggest.next",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -1046,7 +1056,7 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
-            | "box.restart" | "box.projects" | "box.token" => {
+            | "box.restart" | "box.projects" | "box.token" | "suggest.next" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1638,7 +1648,7 @@ struct SendParams {
     from: TurnFrom,
 }
 
-/// `message.withdraw` parameters.
+/// `message.withdraw` and `message.send_now` parameters.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WithdrawParams {
@@ -1657,6 +1667,10 @@ struct SayParams {
     seen_gseq: Option<u64>,
     /// `"orchestrator"`: hand the message to the orchestrator without routing it.
     to: Option<String>,
+    /// The message is a suggested one the user took unedited (`hub::suggest`): never applied
+    /// as a short command at once.
+    #[serde(default)]
+    suggested: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1835,6 +1849,17 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             let p: ThreadRef = params(p)?;
             hub.trim_thread(&p.thread, caller).await
         }
+        "suggest.next" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct SuggestParams {
+                thread: String,
+                turn: u64,
+                model: String,
+            }
+            let p: SuggestParams = params(p)?;
+            hub.suggest_next(&p.thread, p.turn, &p.model, caller).await
+        }
         "usage.threads" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -1965,12 +1990,22 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
 
 async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
     let p: SayParams = params(p)?;
+    // A suggestion goes to the orchestrator only, where `say` keeps it from acting as a
+    // command; routed, an `@thread yes` in it would answer as the user.
+    if p.suggested && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => hub.say_to_orchestrator(&p.message, p.seen_gseq, caller),
+        Some("orchestrator") => {
+            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
+        }
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),
@@ -2388,6 +2423,30 @@ fn call(
         "message.withdraw" => {
             let p: WithdrawParams = params(p)?;
             hub.withdraw_message(&p.thread, p.msg_ref, caller)
+        }
+        "message.send_now" => {
+            let p: WithdrawParams = params(p)?;
+            hub.send_now(&p.thread, p.msg_ref, caller)
+        }
+        "thread.queue" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_queue(&p.thread, caller)
+        }
+        "shell.run" => {
+            let p: crate::hub::ShellRun = params(p)?;
+            hub.shell_run(p, caller)
+        }
+        "shell.cd" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShellCdParams {
+                #[serde(default)]
+                cwd: Option<String>,
+                #[serde(default)]
+                dir: Option<String>,
+            }
+            let p: ShellCdParams = params(p)?;
+            hub.shell_cd(p.cwd.as_deref(), p.dir.as_deref(), caller)
         }
         "thread.set_mode" => {
             let p: SetModeParams = params(p)?;

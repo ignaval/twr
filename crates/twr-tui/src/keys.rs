@@ -9,10 +9,14 @@
 //!   when tmux sends it as `CSI 13;2u` ([`tmux_plan`]): crossterm reads that form, and drops
 //!   the xterm form (`CSI 27;2;13~`) whole, so asking for that one would lose the key.
 //! - Over mosh, its terminal answers for the user's and passes on neither the kitty protocol
-//!   nor modifyOtherKeys: Shift-Enter is always a plain Enter there. Its local echo also
-//!   predicts that typing inserts, moving whatever is right of the cursor on the input row
-//!   (the box's border, the cards beside it) until the TUI's own frame arrives; `mosh
-//!   --predict-overwrite` predicts in place instead. Both go in a notice ([`MOSH_NOTICE`]).
+//!   nor modifyOtherKeys, so the terminal sends Shift-Enter as it does unasked: a plain Enter,
+//!   unless a key binding of its own makes it send something else. mosh passes the bytes of a
+//!   key on unchanged (measured with mosh 1.4), so a terminal set up to send Alt-Enter (`ESC
+//!   CR`) for Shift-Enter, as `twr terminal-setup` and Claude Code's `/terminal-setup` do,
+//!   breaks the line over mosh too. Its local echo also predicts that typing inserts, moving
+//!   whatever is right of the cursor on the input row (the box's border, the cards beside it)
+//!   until the TUI's own frame arrives; `mosh --predict-overwrite` predicts in place instead.
+//!   Both go in a notice ([`MOSH_NOTICE`]).
 
 use std::time::Duration;
 
@@ -33,8 +37,9 @@ pub const MODIFY_OTHER_KEYS_ON: &str = "\x1b[>4;1m";
 pub const MODIFY_OTHER_KEYS_OFF: &str = "\x1b[>4;0m";
 
 /// The startup notice over mosh.
-pub const MOSH_NOTICE: &str = "over mosh Shift-Enter is Enter: Ctrl-J starts a new line · \
-     mosh --predict-overwrite stops the input box's border jumping as you type";
+pub const MOSH_NOTICE: &str = "over mosh, Shift-Enter starts a new line once your terminal \
+     sends it as Alt-Enter (twr terminal-setup); Ctrl-J always does · mosh --predict-overwrite \
+     stops the input box's border jumping as you type";
 /// The startup notice inside a tmux that would send Shift-Enter in a form twr cannot read.
 pub const TMUX_NOTICE: &str = "tmux sends Shift-Enter in a form twr can't read: `set -s \
      extended-keys-format csi-u` fixes it · Ctrl-J starts a new line";

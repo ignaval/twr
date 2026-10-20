@@ -93,6 +93,16 @@ pub struct SavedView {
     /// Answers to its messages that came while it was being restored
     /// ([`AppState::deferred`]): applied once it is.
     deferred: Vec<(&'static str, serde_json::Value)>,
+    /// Its `!` commands' state ([`crate::shell::Saved`]): the folder they run in, the `!cd`s
+    /// and launches on their way, the commands Ctrl-C stops.
+    shell: crate::shell::Saved,
+    /// The suggestion taken into its input line ([`AppState::taken_suggestion`]): sent as it
+    /// is, it is still a suggestion.
+    taken_suggestion: Option<String>,
+    /// Its latest suggestions sent ([`AppState::suggested_refs`]).
+    suggested_refs: std::collections::VecDeque<(String, i64)>,
+    /// Which of its sends still to be answered were suggestions ([`AppState::sends_suggested`]).
+    sends_suggested: std::collections::VecDeque<bool>,
 }
 
 /// What of a [`SavedView`] waits until the replay is applied ([`AppState::finish_restore`]):
@@ -368,6 +378,10 @@ impl AppState {
     /// The view to keep for this workspace while another is shown (the state is left
     /// without its transcripts: it is done with).
     pub fn take_view(&mut self) -> SavedView {
+        let shell = self.take_shell();
+        let taken_suggestion = self.taken_suggestion.take();
+        let suggested_refs = std::mem::take(&mut self.suggested_refs);
+        let sends_suggested = std::mem::take(&mut self.sends_suggested);
         let v = &self.view;
         // Up on the input line shows a history entry (unedited): what the user had typed is
         // the line to keep.
@@ -401,6 +415,10 @@ impl AppState {
             started_refs: std::mem::take(&mut self.started_refs),
             acted_turns: std::mem::take(&mut self.acted_turns),
             deferred: std::mem::take(&mut self.deferred),
+            shell,
+            taken_suggestion,
+            suggested_refs,
+            sends_suggested,
             session_history: v
                 .history
                 .iter()
@@ -451,6 +469,10 @@ impl AppState {
         self.started_refs = saved.started_refs;
         self.acted_turns = saved.acted_turns;
         self.deferred = saved.deferred;
+        self.restore_shell(saved.shell);
+        self.taken_suggestion = saved.taken_suggestion;
+        self.suggested_refs = saved.suggested_refs;
+        self.sends_suggested = saved.sends_suggested;
         // The file's history goes before them as it is read ([`AppState::load_history`]).
         self.view.history = saved.session_history;
         self.restoring = Some(saved.restoring);
