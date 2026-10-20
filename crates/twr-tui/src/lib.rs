@@ -1792,12 +1792,15 @@ const SHELL_LAUNCHES_KEPT: usize = 64;
 /// The calls whose results the view follows a message with: what was sent and its ref, and
 /// taking it back ([`AppState::apply_result`]). A failed one comes as `{failed: true, ref}`
 /// (`ref`: the one it named, if any).
-const FOLLOWED: [&str; 5] = [
+const FOLLOWED: [&str; 6] = [
     "say",
     "thread.send",
     "message.withdraw",
     "shell.run",
     "shell.cd",
+    // After the `shell.run` it stops, in order: a failed stop is never lost by a switch,
+    // nor read before the command it is about.
+    "job.cancel",
 ];
 
 /// A results channel of a view ([`ResultsOut`]).
@@ -1885,7 +1888,7 @@ async fn serve_calls(
             // A stop that failed: said, and no longer pending.
             Err(e) if method == "job.cancel" => {
                 let failed = json!({"failed": true, "job": named_job, "error": format!("{e:#}")});
-                let _ = results.view.send((method, failed));
+                let _ = results.followed.send((method, failed));
             }
             // A command's log that can't be read: it shows what its end recorded.
             Err(_) if method == "job.log" => {
@@ -2990,6 +2993,9 @@ mod tests {
                         Err(anyhow::anyhow!("no such folder"))
                     }
                     "shell.run" => Ok(serde_json::json!({ "job": params["command"] })),
+                    "job.cancel" if params["job"] == "unstoppable" => {
+                        Err(anyhow::anyhow!("connection lost"))
+                    }
                     _ => Ok(serde_json::Value::Null),
                 }
             })
@@ -3100,6 +3106,62 @@ mod tests {
             seen.last(),
             Some(&("job.cancel", serde_json::json!({"job": "sleep 9"})))
         );
+    }
+
+    /// A stop that fails after a switch reaches the workspace, after the run it is about:
+    /// back on it, the command is no longer taken as stopping, and Ctrl-C stops it again.
+    #[tokio::test]
+    async fn a_failed_stop_after_a_switch_reaches_the_workspace_in_order() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (followed_tx, mut followed_rx) = mpsc::unbounded_channel();
+        let run = Action::ShellRun {
+            thread: None,
+            command: "unstoppable".into(),
+            cwd: None,
+            share: false,
+            launch: 1,
+        };
+        tx.send(super::action_request(&run).unwrap()).unwrap();
+        tx.send(super::action_request(&Action::ShellStopLaunch { launch: 1 }).unwrap())
+            .unwrap();
+        drop(tx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: mpsc::unbounded_channel().0,
+            followed: followed_tx,
+        };
+        super::serve_calls(Params(seen), rx, status, results, Default::default()).await;
+        let mut st = crate::app::tests::with_orch();
+        st.shell_launching.push_back(crate::shell::Launch {
+            id: 1,
+            thread: Some("t-orch".into()),
+            command: "unstoppable".into(),
+            cancel: true,
+        });
+        let mut methods = Vec::new();
+        while let Ok((method, mut r)) = followed_rx.try_recv() {
+            methods.push(method);
+            if method == "shell.run" {
+                r["thread"] = serde_json::json!("t-orch");
+                r["name"] = serde_json::json!("unstoppable");
+            }
+            st.apply_result(method, &r);
+        }
+        assert_eq!(methods, ["shell.run", "job.cancel"]);
+        assert!(st.shell_jobs.iter().all(|s| !s.stopping));
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("could not stop"));
     }
 
     /// A `!cd` that fails after the switch is answered to the workspace too: back on it, the

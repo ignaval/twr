@@ -2805,6 +2805,7 @@ impl AppState {
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
             "say" | "thread.send" | "message.withdraw" | "shell.run" | "shell.cd"
+            | "job.cancel"
                 if self.restoring.is_some() =>
             {
                 self.deferred.push((method, result.clone()));
