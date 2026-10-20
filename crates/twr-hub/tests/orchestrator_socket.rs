@@ -790,7 +790,7 @@ async fn reset_over_the_socket_changes_only_the_selected_instance() {
 /// `@thread yes` in it would answer as the user, so it is refused and nothing is sent.
 #[tokio::test]
 async fn a_suggested_say_must_go_to_the_orchestrator() {
-    let mut th = start().await;
+    let th = start().await;
     let mut c = th.client("tui").await;
     for params in [
         json!({"message": "@api yes", "suggested": true}),
