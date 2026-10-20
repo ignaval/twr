@@ -800,7 +800,13 @@ pub enum Action {
         cwd: Option<String>,
         /// `!!`: its output goes to the thread when it ends.
         share: bool,
+        /// Its number among this view's commands: what a stop asked before the answer names.
+        launch: u64,
     },
+    /// Stop `!` command `launch` once `shell.run` answered it (Ctrl-C before the answer):
+    /// sent at once, after the run on the same ordered calls, so it stops the command even if
+    /// the view that asked is gone when the answer comes.
+    ShellStopLaunch { launch: u64 },
     /// Move the orchestrator view's folder (`!cd`, `shell.cd`).
     ShellCd {
         /// The folder now (`None`: the orchestrator's).
@@ -2246,9 +2252,8 @@ pub struct AppState {
     /// The `!` commands sent and not answered yet, in the order sent ([`crate::shell::Launch`]):
     /// Ctrl-C meanwhile stops one as soon as its job is known.
     pub shell_launching: VecDeque<crate::shell::Launch>,
-    /// Jobs to cancel now (a command Ctrl-C stopped before its answer came): the IO loop sends
-    /// `job.cancel` for each ([`AppState::take_shell_cancels`]).
-    pub shell_cancels: Vec<String>,
+    /// The last `!` command's number ([`Action::ShellRun`]'s `launch`).
+    pub shell_launch_seq: u64,
     /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
     pub shell_reads: HashMap<String, crate::shell::Reads>,
     /// The suggested next message, while it may show ([`crate::suggest`]).
@@ -2261,6 +2266,9 @@ pub struct AppState {
     pub suggest_stats: Value,
     /// Counts the user's sends: a suggestion asked before the last one is not shown.
     pub suggest_epoch: u64,
+    /// When the input thread read the terminal event being handled (`None`: now): a key read
+    /// before a suggestion appeared never takes it, however late it is handled.
+    pub input_at: Option<Instant>,
     /// The suggestion asked for and its epoch ([`AppState::suggest_epoch`]).
     pub suggest_asked: Option<(String, u64, u64)>,
     /// The suggestion last taken into the box: sent unedited, it says so to the hub.
@@ -21033,7 +21041,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "ls -la".into(),
                     cwd: None,
-                    share: false
+                    share: false,
+                    launch: 1
                 }]
             );
             assert!(st.view.input.is_empty());
@@ -21044,7 +21053,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "cargo test".into(),
                     cwd: None,
-                    share: true
+                    share: true,
+                    launch: 2
                 }]
             );
             let sent = type_line(&mut st, "\\!important: read this");
@@ -21077,7 +21087,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "pwd".into(),
                     cwd: Some("/work/src".into()),
-                    share: false
+                    share: false,
+                    launch: 3
                 }]
             );
             // A command typed while a `!cd` is on its way waits for it: it would run in the
@@ -21110,7 +21121,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "rm file".into(),
                     cwd: Some("/work/src".into()),
-                    share: false
+                    share: false,
+                    launch: 4
                 }]
             );
             // `!cd` alone: back to the orchestrator's folder.
@@ -21129,7 +21141,8 @@ pub(crate) mod tests {
                     thread: Some("t-alpha".into()),
                     command: "git status".into(),
                     cwd: None,
-                    share: false
+                    share: false,
+                    launch: 5
                 }]
             );
             assert!(type_line(&mut st, "!cd src").is_empty());
@@ -21170,7 +21183,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "rm file".into(),
                     cwd: Some("/work/x".into()),
-                    share: false
+                    share: false,
+                    launch: 1
                 }]
             );
         }
@@ -21182,13 +21196,16 @@ pub(crate) mod tests {
             let mut st = with_orch();
             draw(&mut st, 120, 30);
             assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
-            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::ShellStopLaunch { launch: 1 }]
+            );
             assert!(st.view.status.as_deref().unwrap().contains("as it starts"));
             st.apply_result(
                 "shell.run",
                 &json!({"job": "J9", "thread": "t-orch", "name": "sleep 99", "cwd": "/w"}),
             );
-            assert_eq!(st.take_shell_cancels(), vec!["J9".to_string()]);
+            assert!(st.shell_jobs.iter().any(|s| s.job == "J9" && s.stopping));
             assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
         }
 
@@ -21230,7 +21247,8 @@ pub(crate) mod tests {
                     thread: None,
                     command: "rm -rf build".into(),
                     cwd: None,
-                    share: false
+                    share: false,
+                    launch: 1
                 }]
             );
         }
@@ -21461,7 +21479,10 @@ pub(crate) mod tests {
             let mut st = with_orch();
             draw(&mut st, 120, 30);
             assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
-            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::ShellStopLaunch { launch: 1 }]
+            );
             assert!(st.handle_key(ctrl('c')).is_empty());
             assert!(st
                 .view
@@ -21616,6 +21637,17 @@ pub(crate) mod tests {
             st.suggestion.as_mut().unwrap().shown =
                 Some(Instant::now() - crate::suggest::SUGGEST_SETTLE);
             assert!(st.accept_suggestion());
+            assert_eq!(st.view.input.as_str(), "and the docs");
+            // A key read before it settled, handled only now: not taken.
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            let shown = Instant::now() - Duration::from_secs(2);
+            st.suggestion.as_mut().unwrap().shown = Some(shown);
+            st.input_at = Some(shown + Duration::from_millis(100));
+            assert!(st.handle_key(key(KeyCode::Tab)).is_empty());
+            assert!(st.view.input.is_empty());
+            st.input_at = Some(shown + crate::suggest::SUGGEST_SETTLE);
+            st.handle_key(key(KeyCode::Tab));
             assert_eq!(st.view.input.as_str(), "and the docs");
         }
 

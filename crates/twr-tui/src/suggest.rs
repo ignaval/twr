@@ -150,12 +150,18 @@ impl AppState {
         let Some(text) = self.shown_suggestion().map(str::to_string) else {
             return false;
         };
-        // Only one read: drawn, and on screen a moment before the key.
+        // Only one read: drawn, and on screen a moment before the key was read (a key read
+        // earlier and handled late was meant for what was there then).
+        let key_at = self.input_at.unwrap_or_else(std::time::Instant::now);
         let read = self
             .suggestion
             .as_ref()
             .and_then(|s| s.shown)
-            .is_some_and(|at| at.elapsed() >= SUGGEST_SETTLE);
+            .is_some_and(|shown| {
+                key_at
+                    .checked_duration_since(shown)
+                    .is_some_and(|d| d >= SUGGEST_SETTLE)
+            });
         if !read {
             return false;
         }

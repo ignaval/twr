@@ -157,7 +157,10 @@ impl AppState {
         } else {
             None
         };
+        self.shell_launch_seq += 1;
+        let launch = self.shell_launch_seq;
         self.shell_launching.push_back(Launch {
+            id: launch,
             thread: dive.clone().or_else(|| self.main_thread()),
             command: command.clone(),
             cancel: false,
@@ -167,6 +170,7 @@ impl AppState {
             command,
             cwd,
             share,
+            launch,
         }]
     }
 
@@ -328,9 +332,8 @@ impl AppState {
         if self.shell_done.iter().any(|d| d == job) {
             return;
         }
-        // Ctrl-C came before this answer: it stops now.
+        // Ctrl-C came before this answer: its stop went right after it (ShellStopLaunch).
         if launch.is_some_and(|l| l.cancel) {
-            self.shell_cancels.push(job.to_string());
             self.shell_jobs.push(Started {
                 job: job.to_string(),
                 thread: thread.to_string(),
@@ -446,7 +449,7 @@ impl AppState {
         {
             l.cancel = true;
             self.view.status = Some(format!("stopping `{}` as it starts", l.command));
-            return Vec::new();
+            return vec![Action::ShellStopLaunch { launch: l.id }];
         }
         let Some(s) = self
             .shell_jobs
@@ -503,6 +506,8 @@ impl AppState {
 /// A `!` command sent and not answered yet ([`AppState::shell_launching`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launch {
+    /// Its number ([`Action::ShellRun`]'s `launch`).
+    pub id: u64,
     /// The thread it runs for (the orchestrator's: the main pane's then).
     pub thread: Option<String>,
     /// The command line.
@@ -522,15 +527,10 @@ pub struct Saved {
     jobs: Vec<Started>,
     done: std::collections::VecDeque<String>,
     launching: std::collections::VecDeque<Launch>,
-    cancels: Vec<String>,
+    launch_seq: u64,
 }
 
 impl AppState {
-    /// The jobs to cancel now ([`AppState::shell_cancels`]).
-    pub fn take_shell_cancels(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.shell_cancels)
-    }
-
     /// The `!` commands' state, for the view kept across a switch.
     pub(crate) fn take_shell(&mut self) -> Saved {
         Saved {
@@ -541,7 +541,7 @@ impl AppState {
             jobs: std::mem::take(&mut self.shell_jobs),
             done: std::mem::take(&mut self.shell_done),
             launching: std::mem::take(&mut self.shell_launching),
-            cancels: std::mem::take(&mut self.shell_cancels),
+            launch_seq: self.shell_launch_seq,
         }
     }
 
@@ -554,7 +554,7 @@ impl AppState {
         self.shell_jobs = s.jobs;
         self.shell_done = s.done;
         self.shell_launching = s.launching;
-        self.shell_cancels = s.cancels;
+        self.shell_launch_seq = self.shell_launch_seq.max(s.launch_seq);
     }
 }
 

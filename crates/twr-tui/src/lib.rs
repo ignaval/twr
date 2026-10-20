@@ -434,8 +434,10 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             command,
             cwd,
             share,
+            launch,
         } => {
-            let mut p = json!({ "command": command, "share": share });
+            // `launch` is the TUI's own (serve_calls takes it out).
+            let mut p = json!({ "command": command, "share": share, "launch": launch });
             if let Some(t) = thread {
                 p["thread"] = json!(t);
             }
@@ -446,6 +448,9 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         }
         Action::ShellCd { cwd, dir } => Some(("shell.cd", json!({ "cwd": cwd, "dir": dir }))),
         Action::JobCancel { job } => Some(("job.cancel", json!({ "job": job }))),
+        Action::ShellStopLaunch { launch } => {
+            Some((SHELL_STOP_LAUNCH, json!({ "launch": launch })))
+        }
         Action::SetMode { thread, mode } => {
             Some(("thread.set_mode", json!({"thread": thread, "mode": mode})))
         }
@@ -1768,6 +1773,13 @@ fn end_calls(
     }
 }
 
+/// The TUI's own call that stops a `!` command by its number once `shell.run` answered it
+/// ([`Action::ShellStopLaunch`]): `serve_calls` turns it into `job.cancel`.
+const SHELL_STOP_LAUNCH: &str = "tui.shell_stop_launch";
+
+/// How many `!` commands' jobs `serve_calls` keeps by number, for a stop that comes later.
+const SHELL_LAUNCHES_KEPT: usize = 64;
+
 /// The calls whose results the view follows a message with: what was sent and its ref, and
 /// taking it back ([`AppState::apply_result`]). A failed one comes as `{failed: true, ref}`
 /// (`ref`: the one it named, if any).
@@ -1805,10 +1817,36 @@ async fn serve_calls(
     status: StatusOut,
     results: ResultsOut,
 ) {
-    while let Some((method, params)) = rx.recv().await {
+    // The jobs of the latest `!` commands, by their numbers ([`Action::ShellRun`]).
+    let mut launched: std::collections::VecDeque<(Value, Value)> = Default::default();
+    while let Some((method, mut params)) = rx.recv().await {
+        let launch = match method {
+            "shell.run" => params.as_object_mut().and_then(|p| p.remove("launch")),
+            _ => None,
+        };
+        // A stop asked before the run was answered: the run came first on these calls, so
+        // its job is known now (none: it failed, nothing to stop).
+        let (method, params) = if method == SHELL_STOP_LAUNCH {
+            let Some(i) = launched.iter().position(|(n, _)| *n == params["launch"]) else {
+                continue;
+            };
+            let (_, job) = launched.remove(i).unwrap_or_default();
+            ("job.cancel", json!({ "job": job }))
+        } else {
+            (method, params)
+        };
         let named = params["ref"].clone();
         let named_job = params["job"].clone();
-        match calls.call(method, params).await {
+        let answer = calls.call(method, params).await;
+        if let (Some(n), Ok(r)) = (launch, &answer) {
+            if !r["job"].is_null() {
+                launched.push_back((n, r["job"].clone()));
+                if launched.len() > SHELL_LAUNCHES_KEPT {
+                    launched.pop_front();
+                }
+            }
+        }
+        match answer {
             // What a message did ("sent to the orchestrator") is news only for a moment.
             Ok(r) => {
                 if let Some(msg) = result_status(method, &r) {
@@ -2362,9 +2400,6 @@ async fn drive(
             if state.shell_cwd_due() {
                 let _ = call_tx.send(("shell.cd", json!({})));
             }
-            for job in state.take_shell_cancels() {
-                let _ = call_tx.send(("job.cancel", json!({ "job": job })));
-            }
             if let Some(ask) = state.take_suggest_due() {
                 let (socket, tx) = (socket.clone(), sug_tx.clone());
                 tokio::spawn(async move {
@@ -2410,7 +2445,9 @@ async fn drive(
                             if let Some(status) = status {
                                 state.view.status = Some(status.into());
                             }
+                            state.input_at = Some(at);
                             let actions = handle_terminal_event(&mut state, event, &screen, shown.is_some() && !ahead);
+                            state.input_at = None;
                             ctx.keys.shift_enter |= state.view.shift_enter;
                             actions
                         }
@@ -2911,6 +2948,82 @@ mod tests {
         assert_eq!((method, r["ref"].as_i64()), ("message.withdraw", Some(7)));
         let (_, r) = followed_rx.try_recv().unwrap();
         assert_eq!(r, serde_json::json!({"failed": true, "ref": 8}));
+    }
+
+    /// A hub that records each call with its params, and answers `shell.run` with a job named
+    /// after its command (`fail` fails).
+    struct Params(std::sync::Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>);
+
+    impl super::CallHub for Params {
+        fn call(
+            &mut self,
+            method: &'static str,
+            params: serde_json::Value,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<serde_json::Value>> {
+            self.0.lock().unwrap().push((method, params.clone()));
+            Box::pin(async move {
+                match method {
+                    "shell.run" if params["command"] == "fail" => {
+                        Err(anyhow::anyhow!("no such folder"))
+                    }
+                    "shell.run" => Ok(serde_json::json!({ "job": params["command"] })),
+                    _ => Ok(serde_json::Value::Null),
+                }
+            })
+        }
+    }
+
+    /// Ctrl-C before `shell.run` answered stops the command it names once the answer is in,
+    /// whether or not the view that asked is still there: the TUI's number for it never
+    /// reaches the hub, and a run that failed has nothing to stop.
+    #[tokio::test]
+    async fn a_stop_before_the_answer_cancels_that_command() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = |command: &str, launch| {
+            super::action_request(&Action::ShellRun {
+                thread: None,
+                command: command.into(),
+                cwd: None,
+                share: false,
+                launch,
+            })
+            .unwrap()
+        };
+        let stop = |launch| super::action_request(&Action::ShellStopLaunch { launch }).unwrap();
+        for call in [
+            run("sleep 1", 1),
+            run("sleep 2", 2),
+            run("fail", 3),
+            stop(2),
+            stop(3),
+        ] {
+            tx.send(call).unwrap();
+        }
+        // The switch: the view is gone.
+        drop(tx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: mpsc::unbounded_channel().0,
+            followed: mpsc::unbounded_channel().0,
+        };
+        super::serve_calls(Params(seen.clone()), rx, status, results).await;
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(_, p)| p.get("launch").is_none()),
+            "{seen:?}"
+        );
+        let cancels: Vec<_> = seen.iter().filter(|(m, _)| *m == "job.cancel").collect();
+        assert_eq!(
+            cancels,
+            [&("job.cancel", serde_json::json!({"job": "sleep 2"}))]
+        );
     }
 
     /// A `!cd` that fails after the switch is answered to the workspace too: back on it, the
