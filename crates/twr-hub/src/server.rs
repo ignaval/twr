@@ -1990,6 +1990,14 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
 
 async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
     let p: SayParams = params(p)?;
+    // A suggestion goes to the orchestrator only, where `say` keeps it from acting as a
+    // command; routed, an `@thread yes` in it would answer as the user.
+    if p.suggested && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)

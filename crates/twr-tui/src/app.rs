@@ -2278,8 +2278,9 @@ pub struct AppState {
     pub suggest_asked: Option<(String, u64, u64)>,
     /// The suggestion last taken into the box: sent unedited, it says so to the hub.
     pub taken_suggestion: Option<String>,
-    /// The latest suggestions sent as they were, `(thread, ref)`, at most [`STARTED_REFS`]:
-    /// taken back from the queue, one is still a suggestion.
+    /// The suggestions sent as they were, `(thread, ref)`, while they may still be queued
+    /// (one goes once its turn starts or it is taken back): taken back from the queue, one is
+    /// still a suggestion.
     pub suggested_refs: VecDeque<(String, i64)>,
     /// Whether each send still to be answered was a suggestion sent as it was, oldest first
     /// (one connection answers in order): every answer registers its own.
@@ -5159,9 +5160,6 @@ impl AppState {
         if self.sends_suggested.pop_front() == Some(true) {
             if let (Some(t), Some(r)) = (result["thread"].as_str(), result["ref"].as_i64()) {
                 self.suggested_refs.push_back((t.to_string(), r));
-                if self.suggested_refs.len() > STARTED_REFS {
-                    self.suggested_refs.pop_front();
-                }
             }
         }
         let Some(s) = self.sent.as_mut() else {
@@ -5198,6 +5196,9 @@ impl AppState {
     fn track_sent(&mut self, ev: &Event) {
         if let EventBody::TurnStarted(p) = &ev.body {
             if let (Some(r), Some(turn)) = (message_ref(p), ev.turn) {
+                // Running, it is out of the queue: no edit takes it back any more.
+                self.suggested_refs
+                    .retain(|(t, m)| !(*t == ev.thread && *m == r));
                 let started = (ev.thread.clone(), r, turn);
                 if !self.started_refs.contains(&started) {
                     self.started_refs.push_back(started);
@@ -5252,8 +5253,18 @@ impl AppState {
         else {
             return;
         };
-        let w = self.withdrawals.remove(i);
+        let mut w = self.withdrawals.remove(i);
         self.queue_changed(&w.thread);
+        // A suggestion whose send was answered after the withdrawal began (the queue's list can
+        // come first): its answer, ahead of this one on the same calls, registered it.
+        let known = self
+            .suggested_refs
+            .iter()
+            .position(|(t, r)| *t == w.thread && *r == w.msg_ref);
+        w.suggested |= known.is_some();
+        if let (Some(k), true) = (known, result["withdrawn"] == true) {
+            self.suggested_refs.remove(k);
+        }
         let last = self
             .sent
             .as_mut()
@@ -21847,6 +21858,54 @@ pub(crate) mod tests {
                 matches!(&sent[..], [Action::SaySuggested { .. }]),
                 "{sent:?}"
             );
+        }
+
+        /// The queue listed a suggestion before its send was answered, and an edit took it
+        /// back then: the send's answer, which comes before the withdrawal's, still marks it.
+        /// Suggestions stay marked however many come after, while they are queued.
+        #[test]
+        fn a_suggestion_edited_before_its_answer_stays_one() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            assert!(matches!(
+                &st.handle_key(key(KeyCode::Enter))[..],
+                [Action::SaySuggested { .. }]
+            ));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 91, "prompt": "set web to bypass", "from": "user", "mine": true}]}),
+            );
+            st.retract_queued(91, crate::app::Retract::Edit);
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 91, "turn": null,
+                        "pending": 1}),
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 91,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            assert_eq!(st.taken_suggestion.as_deref(), Some("set web to bypass"));
+            // Many suggestions later, the first still queued is still one.
+            st.view.input.clear();
+            st.taken_suggestion = None;
+            for i in 0..40 {
+                let text = format!("suggestion {i}");
+                st.view.input.set(&text);
+                st.taken_suggestion = Some(text);
+                st.handle_key(key(KeyCode::Enter));
+                st.apply_result(
+                    "say",
+                    &json!({"action": "delegate", "thread": "t-orch", "ref": 100 + i,
+                            "turn": null, "pending": 1}),
+                );
+            }
+            assert!(st.suggested_refs.contains(&("t-orch".to_string(), 100)));
         }
 
         /// An answer to an ask made before a send of the user's is about a conversation that
