@@ -105,7 +105,7 @@ impl Core {
             if v.attached.is_some() || v.is_blocked() || v.last_activity.is_none() {
                 continue;
             }
-            if let Some((turn, waiting)) = self.hung_turn(&v, now, hung_chrono)? {
+            if let Some((turn, waiting)) = self.hung_turn(v, now, hung_chrono)? {
                 let plain = self
                     .stalled
                     .get(&v.id)
@@ -126,7 +126,7 @@ impl Core {
                 // A job has its own timeout: only the runtime's own work stalls.
                 || !v.runtime_work()
                 // Its turn or its runtime's watcher waits on a job of its own.
-                || job_running(&v, now)
+                || job_running(v, now)
             {
                 continue;
             }
