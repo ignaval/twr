@@ -228,10 +228,14 @@ impl Core {
             }
             _ => None,
         };
-        // A turn whose message the user took back (`hub::withdraw`) ends `interrupted`,
-        // whatever its runtime reports (`ext.twr.runtime_result` keeps that): like any
-        // interrupted turn, it gets no grade, report, review or retry.
-        let withdrawn = ended.is_some() && turn.is_some_and(|t| self.turn_taken_back(thread, t));
+        // A turn whose message the user took back (`hub::withdraw`), or that the user
+        // interrupted to send the next queued message now (`message.send_now`), ends
+        // `interrupted`, whatever its runtime reports (`ext.twr.runtime_result` keeps that): like
+        // any interrupted turn, it gets no grade, report, review or retry.
+        let withdrawn = ended.is_some()
+            && turn.is_some_and(|t| {
+                self.turn_taken_back(thread, t) || self.turn_interrupted(thread, t)
+            });
         let ended = match (&mut body, withdrawn) {
             (EventBody::TurnEnded(p), true) => {
                 if p.result != TurnResult::Interrupted {

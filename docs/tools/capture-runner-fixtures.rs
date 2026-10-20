@@ -66,6 +66,7 @@ fn runner_emits(body: &EventBody) -> bool {
         | EventBody::ThreadDeleted(_)
         | EventBody::ThreadRestored(_)
         | EventBody::TurnWithdrawn(_)
+        | EventBody::TurnInterrupted(_)
         | EventBody::PromptWithdrawn(_)
         | EventBody::ConversationUpdate(_)
         | EventBody::AttentionAnnotated(_)

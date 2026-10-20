@@ -110,6 +110,10 @@ pub struct LastTurn {
     /// turn (no error item, no retry of a message taken back).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub withdrawn: bool,
+    /// The user interrupted it to send the next queued message now (`turn.interrupted`): no
+    /// crash after it makes it a failed turn either (its message is not run again).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// One task still owned by the current runtime process.
@@ -292,6 +296,10 @@ pub struct ThreadView {
     /// no authority and is being interrupted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current_turn_withdrawn: bool,
+    /// The user interrupted the currently open turn to send the next queued message now
+    /// (`turn.interrupted`): it is being interrupted, and ends `interrupted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_turn_interrupted: bool,
     /// Every automatic retry seen: retry turn -> the turn it retried (`ext.twr.retry_of`).
     /// Kept per turn number so a `turn.ended` that arrives after `thread.crashed` (which closes
     /// the open turn) still knows its turn was a retry.
@@ -521,11 +529,14 @@ impl ThreadView {
             EventBody::ThreadCrashed(_) => {
                 self.crashed = true;
                 self.crashed_turn = match self.current_turn {
-                    Some(t) => (!self.current_turn_withdrawn).then_some(t),
+                    Some(t) => (!self.current_turn_withdrawn && !self.current_turn_interrupted)
+                        .then_some(t),
                     None => self
                         .last_turn
                         .as_ref()
-                        .filter(|t| t.result != TurnResult::Completed && !t.withdrawn)
+                        .filter(|t| {
+                            t.result != TurnResult::Completed && !t.withdrawn && !t.interrupted
+                        })
                         .map(|t| t.turn),
                 };
                 self.close_for_exit();
@@ -549,6 +560,7 @@ impl ThreadView {
                 self.current_turn_ref = message_ref(p);
                 self.current_turn_acted = false;
                 self.current_turn_withdrawn = false;
+                self.current_turn_interrupted = false;
                 if let Some(r) = self.current_turn_retry_of {
                     self.turn_retry_of.insert(n, r);
                 }
@@ -571,6 +583,7 @@ impl ThreadView {
                     result: p.result,
                     retry_of: retry,
                     withdrawn: self.current_turn == Some(n) && self.current_turn_withdrawn,
+                    interrupted: self.current_turn == Some(n) && self.current_turn_interrupted,
                 });
                 self.last_turn_retry_of = retry;
                 if self.current_turn == Some(n) || ev.turn.is_none() {
@@ -655,6 +668,9 @@ impl ThreadView {
             }
             EventBody::TurnWithdrawn(_) if self.in_open_turn(ev) => {
                 self.current_turn_withdrawn = true;
+            }
+            EventBody::TurnInterrupted(_) if self.in_open_turn(ev) => {
+                self.current_turn_interrupted = true;
             }
             EventBody::AttentionResolved(p) => {
                 self.open_attention.remove(&p.attn_id);
@@ -761,6 +777,7 @@ impl ThreadView {
         self.current_turn_ref = None;
         self.current_turn_acted = false;
         self.current_turn_withdrawn = false;
+        self.current_turn_interrupted = false;
     }
 
     /// Whether `ev` was recorded in the currently open turn (not a request of the runtime's

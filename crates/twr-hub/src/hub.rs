@@ -139,6 +139,7 @@ mod model;
 mod orch;
 mod project_read;
 mod proposal;
+mod queue;
 mod reactions;
 mod rename;
 mod restart;
@@ -146,6 +147,7 @@ mod retry;
 mod route;
 mod runners;
 mod runtime_spec;
+mod shell;
 mod spawn;
 mod stall;
 mod subscribe;
@@ -176,12 +178,13 @@ pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
     SUMMARY_WAIT_MAX,
 };
-pub use jobs::{AgentJobBy, JobStart, SlotPool};
+pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
+pub use shell::ShellRun;
 pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};

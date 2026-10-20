@@ -279,6 +279,21 @@ pub struct PendingPrompt {
     pub said_after: Option<u64>,
 }
 
+/// A queued prompt as `thread.queue` lists it ([`Store::pending_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedPrompt {
+    /// Its row id: the message's ref, and its place in the queue.
+    pub id: i64,
+    /// The prompt.
+    pub prompt: String,
+    /// Who sent it.
+    pub from: TurnFrom,
+    /// Who queued it.
+    pub source: Source,
+    /// When (RFC 3339).
+    pub queued_at: String,
+}
+
 /// The writer side of the database. The hub owns exactly one.
 #[derive(Debug)]
 pub struct Store {
@@ -922,6 +937,36 @@ impl Store {
             .transpose()
     }
 
+    /// The first `limit` queued prompts of `thread`, in the order they run (`thread.queue`).
+    pub fn pending_list(&self, thread: &str, limit: usize) -> anyhow::Result<Vec<QueuedPrompt>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, prompt, from_, source, queued_at FROM pending_prompts
+             WHERE thread = ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![thread, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, prompt, from, source, queued_at) = row?;
+            out.push(QueuedPrompt {
+                id,
+                prompt,
+                from: turn_from_parse(&from)?,
+                source: Source::from_str(&source)?,
+                queued_at,
+            });
+        }
+        Ok(out)
+    }
+
     /// Number of queued prompts of `thread`.
     pub fn pending_count(&self, thread: &str) -> anyhow::Result<u64> {
         let n: i64 = self.conn.query_row(
@@ -1041,15 +1086,20 @@ fn row_to_pending(r: &Row<'_>) -> rusqlite::Result<PendingRow> {
     ))
 }
 
-fn pending_from_row(
-    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
-) -> anyhow::Result<PendingPrompt> {
-    let from = match from.as_str() {
+/// A `pending_prompts.from_` value.
+fn turn_from_parse(from: &str) -> anyhow::Result<TurnFrom> {
+    Ok(match from {
         "user" => TurnFrom::User,
         "orchestrator" => TurnFrom::Orchestrator,
         "runtime" => TurnFrom::Runtime,
         other => bail!("bad pending prompt sender {other:?}"),
-    };
+    })
+}
+
+fn pending_from_row(
+    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
+) -> anyhow::Result<PendingPrompt> {
+    let from = turn_from_parse(&from)?;
     Ok(PendingPrompt {
         id,
         thread,

@@ -333,6 +333,17 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
          with it yet (the first Esc says so in the box's title; /unsend does it too)",
     ),
     (
+        "!command",
+        "run a shell command of yours: in a dive in the thread's worktree, else in the \
+         orchestrator's folder (!cd moves it); shown only. !! also sends its output to the \
+         thread. Ctrl-C stops it; \\! starts a message with !",
+    ),
+    (
+        "⧗ queued",
+        "messages waiting for the thread are listed above the input box: Shift-↓ from the \
+         conversation (or a click) selects one, Enter edits, deletes or sends it now",
+    ),
+    (
         "Ctrl-↑↓, Alt-↑↓",
         "scroll the main pane a line (Alt where the system takes Ctrl-↑↓, as on macOS)",
     ),
@@ -366,7 +377,10 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
         "?",
         "this help, typed on an empty line (after text it types)",
     ),
-    ("Ctrl-C", "quit (/quit)"),
+    (
+        "Ctrl-C",
+        "stop the ! command you started on this thread while it runs, else quit (/quit)",
+    ),
 ];
 
 /// Keys of the input line, listed by the help overlay.
@@ -374,7 +388,8 @@ pub const HELP_EDIT_KEYS: &[(&str, &str)] = &[
     ("←→", "move the cursor"),
     (
         "↑↓",
-        "a row up or down in wrapped text; on the first row, Up recalls the lines you sent \
+        "a row up or down in wrapped text; on an empty line with messages of yours queued, Up \
+         takes the newest back to edit it; on the first row, Up recalls the lines you sent \
          before (Down goes forward again, past the newest back to what you were typing)",
     ),
     (
@@ -910,9 +925,11 @@ fn render_stack(
         (upper, None)
     };
     // The input box is under the main pane only: the column of cards beside it keeps its
-    // height however many rows the box grows to.
-    let [top, input] = Layout::vertical([
+    // height however many rows the box grows to. The main pane's thread's queued messages are
+    // listed right above it.
+    let [top, queued, input] = Layout::vertical([
         Constraint::Min(3),
+        Constraint::Length(queue_height(state)),
         Constraint::Length(input_height(
             state,
             Rect {
@@ -948,6 +965,7 @@ fn render_stack(
         render_main(frame, main, state, panes);
         noted
     };
+    render_queue(frame, queued, state, panes);
     render_input(frame, input, state, panes);
     // The note on hidden parked threads the card area had no room for leads the hints.
     let parked = parked_note(state).filter(|_| !noted);
@@ -3766,6 +3784,7 @@ fn block_key(entry: &Entry, index: usize, threads: &Threads) -> String {
         Entry::HubUpdate { seq, .. } => ("update", *seq),
         Entry::Tool { call_id, .. } => return format!("block:{thread}:tool:{call_id}"),
         Entry::TurnEnd { .. } => ("end", 0),
+        Entry::Shell { seq, .. } => ("shell", *seq),
     };
     // Synthetic entries used by offscreen callers may have no event position.
     let id = if seq == 0 {
@@ -4555,6 +4574,10 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
             let (mark, rest) = text.split_at(text.find(' ').map_or(0, |i| i + 1));
             v.marked(0, (mark, style), Vec::new(), rest, style);
         }
+        Entry::Shell { .. } => {
+            v.block(Kind::Block);
+            shell_rows(v, e, threads);
+        }
         Entry::Notice { level, text, .. } => {
             v.block(Kind::Compact);
             let (mark, color) = match level {
@@ -4564,6 +4587,125 @@ fn entry_rows(v: &mut View, e: &Entry, threads: &Threads) {
             };
             let style = Style::default().fg(color);
             v.marked(0, (mark, style), Vec::new(), text, style);
+        }
+    }
+}
+
+/// The color of a `!` command: the input box while its line is one, the `!` of its entry.
+pub const SHELL_COLOR: Color = Color::Green;
+
+/// The link of a running `!` command's `■ stop` (then its job).
+pub const SHELL_STOP: &str = "shell-stop:";
+
+/// Most lines of a `!` command's output shown while Ctrl-O folds (the end of it).
+pub const SHELL_TAIL_ROWS: usize = 6;
+
+/// A `!` command: `! command`, then how it ended (or `running · Ctrl-C stops it`, `■ stop`
+/// to click), where it ran and whether its output went to the thread, then the end of what it
+/// printed (all of it with Ctrl-O).
+fn shell_rows(v: &mut View, e: &Entry, threads: &Threads) {
+    let Entry::Shell {
+        job,
+        command,
+        cwd,
+        share,
+        running,
+        outcome,
+        exit,
+        signal,
+        duration_ms,
+        output,
+        ..
+    } = e
+    else {
+        return;
+    };
+    let dim = Style::default().fg(MUTED);
+    let bang = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    v.marked(
+        0,
+        ("! ", bang),
+        Vec::new(),
+        command,
+        Style::default().add_modifier(Modifier::BOLD),
+    );
+    let took = duration_ms.map(duration_text);
+    let (mark, text, color) = match (*running, outcome.as_deref(), exit, signal) {
+        (true, ..) => ("⏵ ", "running · Ctrl-C stops it".to_string(), Color::Yellow),
+        (false, Some("exited"), Some(0), _) => ("✓ ", "exit 0".to_string(), Color::Green),
+        (false, Some("exited"), Some(c), _) => ("✗ ", format!("exit {c}"), Color::Red),
+        (false, Some("exited"), None, Some(s)) => {
+            ("✗ ", format!("killed by signal {s}"), Color::Red)
+        }
+        (false, Some("cancelled"), ..) => ("■ ", "stopped".to_string(), Color::Yellow),
+        (false, Some("timed_out"), ..) => ("✗ ", "timed out".to_string(), Color::Red),
+        (false, Some("failed_to_start"), ..) => ("✗ ", "could not start".to_string(), Color::Red),
+        (false, Some("lost"), ..) => (
+            "✗ ",
+            "lost: the hub stopped while it ran".to_string(),
+            Color::Red,
+        ),
+        (false, ..) => ("· ", "ended".to_string(), MUTED),
+    };
+    let on_orchestrator = threads
+        .state
+        .and_then(|s| s.transcript.as_ref())
+        .and_then(|t| threads.state?.registry.get(&t.thread))
+        .is_none_or(|t| t.is_orchestrator());
+    let told = match (*share, on_orchestrator) {
+        (false, _) => "shown only".to_string(),
+        (true, true) => "output sent to the orchestrator".to_string(),
+        (true, false) => "output sent to the thread".to_string(),
+    };
+    let mut status = text;
+    if let (Some(t), false) = (&took, *running) {
+        status.push_str(&format!(" · {t}"));
+    }
+    status.push_str(&format!(" · in {} · {told}", crate::shell::tilde(cwd)));
+    if *running {
+        status.push_str(" · ■ stop");
+    }
+    v.marked(
+        2,
+        (mark, Style::default().fg(color)),
+        Vec::new(),
+        &status,
+        dim,
+    );
+    if *running {
+        if let Some(row) = v.out.last_mut() {
+            row.2 = Some(format!("{SHELL_STOP}{job}"));
+        }
+    }
+    let lines: Vec<&str> = output.lines().collect();
+    let all = threads.state.is_some_and(|s| s.view.expand_all);
+    let shown = if all {
+        lines.len()
+    } else {
+        lines.len().min(SHELL_TAIL_ROWS)
+    };
+    let hidden = lines.len() - shown;
+    if hidden > 0 {
+        v.marked(
+            4,
+            ("", dim),
+            Vec::new(),
+            &format!(
+                "… {hidden} earlier line{} (ctrl+o to expand)",
+                if hidden == 1 { "" } else { "s" }
+            ),
+            dim,
+        );
+    }
+    let out = Style::default().fg(Color::Gray);
+    for line in &lines[hidden..] {
+        if line.is_empty() {
+            v.out
+                .push((Line::default(), Join::Newline, None, Edge::None));
+        } else {
+            v.marked(4, ("", out), Vec::new(), line, out);
         }
     }
 }
@@ -6622,6 +6764,86 @@ fn input_height(state: &AppState, area: Rect) -> u16 {
     u16::try_from(rows).unwrap_or(1).saturating_add(2)
 }
 
+/// Rows the queued messages above the input box take ([`render_queue`]): one per message
+/// listed, at most [`crate::queue::QUEUE_ROWS`], and one saying how many more wait.
+pub fn queue_height(state: &AppState) -> u16 {
+    let Some(q) = state.shown_queue() else {
+        return 0;
+    };
+    let shown = q.items.len().min(crate::queue::QUEUE_ROWS);
+    let more = usize::from(q.total > shown as u64);
+    u16::try_from(shown + more).unwrap_or(0)
+}
+
+/// The main pane's thread's queued messages, the next to run first, right above the input
+/// box: `⧗ ` and the start of each (who sent it when not the user), the selected one
+/// highlighted, the user's newest with `↑ edits` while the line is empty, and `+N more queued`
+/// when more wait. A tap on a row selects it, on the selected one opens its popup.
+fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
+    let Some(q) = state.shown_queue() else {
+        return;
+    };
+    if area.height == 0 || area.width < 4 {
+        return;
+    }
+    let width = usize::from(area.width);
+    let dim = Style::default().fg(Color::DarkGray);
+    let newest_mine = q.items.iter().rev().find(|i| i.mine).map(|i| i.msg_ref);
+    let shown: Vec<&crate::queue::Queued> = q.items.iter().take(crate::queue::QUEUE_ROWS).collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (row, it) in shown.iter().enumerate() {
+        let selected = state.view.queued == Some(it.msg_ref);
+        let hint = if selected {
+            " Enter: edit, delete, send now "
+        } else if Some(it.msg_ref) == newest_mine
+            && state.view.input.is_empty()
+            && state.view.queued.is_none()
+        {
+            " ↑ edits "
+        } else {
+            ""
+        };
+        let who = if it.mine {
+            String::new()
+        } else {
+            format!("({}) ", queued_sender(it))
+        };
+        let first = it.prompt.lines().next().unwrap_or_default();
+        let more = it.prompt.lines().nth(1).is_some() || it.truncated;
+        let text = format!(" ⧗ queued · {who}{first}{}", if more { " …" } else { "" });
+        let room = width.saturating_sub(crate::edit::width(hint));
+        let text = truncate_cells(&text, room);
+        let pad = width.saturating_sub(crate::edit::width(&text) + crate::edit::width(hint));
+        let style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(text, style),
+            Span::styled(" ".repeat(pad), style),
+            Span::styled(hint.to_string(), if selected { style } else { dim }),
+        ]));
+        let y = area.y + u16::try_from(row).unwrap_or(0);
+        if y < area.y + area.height {
+            panes.target(
+                Rect::new(area.x, y, area.width, 1),
+                Target::Queued(it.msg_ref),
+            );
+        }
+    }
+    let rest = q.total.saturating_sub(shown.len() as u64);
+    if rest > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(" + {rest} more queued"),
+            dim,
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// The input box: the line being typed, wrapped at its width and scrolled to the cursor's row
 /// ([`LineInput::view`]), under a title that says where it goes in that target's color and
 /// label (`→ orchestrator`, `→ <thread>` in a dive), filled like the main pane's header.
@@ -6641,12 +6863,32 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
         (true, _) => " · Esc: back to the orchestrator",
     };
     let dim = Style::default().fg(Color::DarkGray);
+    let shell = state.shell_mode();
+    // A `!` line is a shell command: the box says so, in green, with where it runs.
+    let color = if shell.is_some() { SHELL_COLOR } else { color };
     let style = Style::default().fg(color);
     // While the double Esc is armed, what the second Esc does, in place of what Enter does.
-    let says = state
-        .unsend_hint()
-        .unwrap_or_else(|| format!(" Enter sends{back} "));
-    let title = vec![Span::styled(to, label), Span::styled(says, style)];
+    let says = state.unsend_hint().unwrap_or_else(|| match &shell {
+        Some(m) if m.share => format!(
+            " in {} · Enter runs it, then sends its output to {}{back} ",
+            m.place, m.target
+        ),
+        Some(m) => format!(" in {} · Enter runs it · shown only{back} ", m.place),
+        None => format!(" Enter sends{back} "),
+    });
+    let title = match &shell {
+        Some(m) => vec![
+            Span::styled(
+                if m.share { " !! shell " } else { " ! shell " },
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(SHELL_COLOR)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(says, style),
+        ],
+        None => vec![Span::styled(to, label), Span::styled(says, style)],
+    };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(style)
@@ -6839,6 +7081,10 @@ fn render_action_popup(
     let card = match &popup.target {
         ActionTarget::Card(id) => id.clone(),
         ActionTarget::Request(_) => item.map(|i| i.thread.clone()).unwrap_or_default(),
+        ActionTarget::Queued(_) => state
+            .shown_queue()
+            .map(|q| q.thread.clone())
+            .unwrap_or_default(),
     };
     // Each row on lines of its own, a cell in from the border: its label, or `label` in its
     // place.
@@ -7054,6 +7300,7 @@ fn render_action_popup(
             }
         ),
         (ActionTarget::Request(_), None) => " ? ".to_string(),
+        (ActionTarget::Queued(_), _) => " queued message ".to_string(),
     };
     let footer = match (popup.filter.is_empty(), windowed) {
         (true, false) => " Enter runs · Esc closes ".to_string(),
@@ -7106,11 +7353,48 @@ fn render_action_popup(
 /// on it, `width` cells wide: a dim line naming its turn and grade, then the report in full
 /// (cards show what of it fits in their slot), or, when only a capped preview of it is known
 /// (its fetch failed), the preview, the line saying so. Nothing for anything else.
+/// A queued message's rows in its action popup: who sent it and its text (the start the queue
+/// listed; `…` when the hub cut it).
+fn popup_queued_rows(state: &AppState, msg_ref: i64, width: usize) -> Vec<Line<'static>> {
+    let Some(it) = state
+        .shown_queue()
+        .and_then(|q| q.items.iter().find(|i| i.msg_ref == msg_ref))
+    else {
+        return Vec::new();
+    };
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut rows = wrap_line(
+        Line::from(Span::styled(format!("QUEUED · {}", queued_sender(it)), dim)),
+        width,
+    );
+    let mut text = it.prompt.clone();
+    if it.truncated {
+        text.push('…');
+    }
+    for line in text.lines() {
+        rows.extend(wrap_line(Line::from(Span::raw(line.to_string())), width));
+    }
+    rows
+}
+
+/// Who sent a queued message, as its row and popup say it.
+pub fn queued_sender(it: &crate::queue::Queued) -> &'static str {
+    match (it.mine, it.from.as_str()) {
+        (true, _) => "yours",
+        (false, "orchestrator") => "from the orchestrator",
+        (false, "runtime") => "from a job or the runtime",
+        (false, _) => "from another client",
+    }
+}
+
 fn popup_report_rows(
     state: &AppState,
     target: &crate::app::ActionTarget,
     width: usize,
 ) -> Vec<Line<'static>> {
+    if let crate::app::ActionTarget::Queued(r) = target {
+        return popup_queued_rows(state, *r, width);
+    }
     let crate::app::ActionTarget::Card(id) = target else {
         return Vec::new();
     };

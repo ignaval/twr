@@ -99,7 +99,7 @@ A [job](usage.md#jobs) is a command the hub runs for a thread, in its worktree, 
 - The hub checks where a start or a cancel comes from at each request, not only when the connection opened: the process that opened the connection must still be there and still run under its thread's live runtime or attached CLI, its parent chain read twice and confirmed link by link, and the runtime or attach checked again when the request is applied. A process that left them (its parent exited), or that outlived them, still reads but starts and cancels no job. A process left over from an attach that ended doesn't count as the attached CLI, so it can't start jobs on a stopped thread.
 - The mode is checked when the job is queued and again right before its command runs, under the same lock as a mode change, so a job still waiting for its slots when the mode narrows doesn't start. A running job isn't stopped when the mode narrows.
 - A job an agent started doesn't wake a stopped thread when it ends: the prompt would start the thread's runtime again, with what the job printed.
-- The orchestrator runs no jobs. Jobs run only on the hub's own box.
+- The orchestrator runs no jobs. Jobs run only on the hub's own box. Your `!` commands from the TUI are jobs too, with rules of their own ([below](#shell-commands-from-the-tui)).
 - A thread has at most 8 jobs queued or running. A job has no time limit unless it asks for one.
 - Each job records who asked: `user:<client>`, `agent:<thread>` or `attach:<thread>`.
 
@@ -125,6 +125,16 @@ Codex is the one runtime whose `auto` mode runs inside an OS sandbox ([runtimes.
 twr checks what Codex says a thread runs with, when it opens and whenever its settings change during the session: an approval policy, sandbox, network access, writable folder, working directory or reviewer beyond what twr asked for ends the session, and so does a settings change too long to read.
 
 Only your config file sets it: no socket method, orchestrator tool or runner message carries it, and the hub reads it when it starts. A process that can write `config.toml` (any agent, which runs as you) can set it, as it can any setting ([What twr does not protect against](#what-twr-does-not-protect-against)). Codex's own allow rules (`prefix_rule` in `~/.codex/rules`) apply to twr's Codex threads too and run matching commands outside the sandbox without asking; twr adds none.
+
+## Shell commands from the TUI
+
+A line you type in the TUI that starts with `!` runs as a shell command of yours ([tui.md](tui.md#shell-commands)): `$SHELL -c <command>` (`/bin/sh` without a usable `$SHELL`), run by the hub as a [job](#jobs) of the thread you see.
+
+- **Only you.** The hub takes `shell.run` and `shell.cd` from user clients only: the orchestrator and any agent get `unauthorized`, whatever their mode, and no MCP tool reaches them. The TUI sends one only when you press Enter on a line that starts with `!`: a paste is never a key, so a pasted `!…` waits for your Enter, and a line typed before the TUI's first frame is dropped whole, as any line is.
+- **Where.** In a dive, in the thread's worktree; a thread on a remote box is refused (`!` runs commands on the hub's own box only). In the orchestrator conversation, in the folder you picked with `!cd`, by default the orchestrator's (`[orchestrator] cwd`, else `$HOME`); the commands are recorded on the orchestrator's thread.
+- **As what.** As a job: in a session and process group of its own without a terminal, with the environment the thread's runtime gets and its `TWR_AGENT` marker, so a `twr` it runs reads the hub but changes nothing (to change something with `twr`, use your own terminal). It takes no job slots and waits in no queue, runs in any mode, and counts toward the thread's 8 jobs. `job.cancel` (Ctrl-C in the TUI) ends its process group as it ends any job's.
+- **What is recorded.** The command, where it ran, who asked (`user:<client>`), how it ended, and the last 4 KiB of what it printed, on the job's `task.updated` events in the thread's log; its whole output is in its job log. Like everything recorded, any agent can read them (`thread.events`, `job.log`). The orchestrator's own transcript reads leave jobs out. Don't print secrets you wouldn't show an agent; run such commands in your own terminal.
+- **What reaches an agent.** With `!`, nothing reaches any agent's turn. With `!!`, when the command ends, the thread gets a prompt quoting the command, where it ran, how it ended and the last 8 KiB of its output, framed as the command's output and not your instructions. That prompt is queued with the job's end in one transaction, so it arrives even if the TUI quits. It is a turn the runtime starts (`from: runtime`), never your message: it carries none of your authority. The orchestrator can't relay an answer, change a mode or move a runtime on the strength of it, and a short command in the output is never applied. Command output is untrusted text, like anything an agent reads.
 
 ## git in repositories agents control
 

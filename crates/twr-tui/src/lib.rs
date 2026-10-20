@@ -22,7 +22,9 @@ pub mod keys;
 pub mod md;
 pub mod notify;
 pub mod order;
+pub mod queue;
 pub mod select;
+pub mod shell;
 pub mod slash;
 pub mod ui;
 pub mod workspace;
@@ -415,6 +417,27 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             "message.withdraw",
             json!({"thread": thread, "ref": msg_ref}),
         )),
+        Action::SendNow { thread, msg_ref } => Some((
+            "message.send_now",
+            json!({"thread": thread, "ref": msg_ref}),
+        )),
+        Action::ShellRun {
+            thread,
+            command,
+            cwd,
+            share,
+        } => {
+            let mut p = json!({ "command": command, "share": share });
+            if let Some(t) = thread {
+                p["thread"] = json!(t);
+            }
+            if let Some(c) = cwd {
+                p["cwd"] = json!(c);
+            }
+            Some(("shell.run", p))
+        }
+        Action::ShellCd { cwd, dir } => Some(("shell.cd", json!({ "cwd": cwd, "dir": dir }))),
+        Action::JobCancel { job } => Some(("job.cancel", json!({ "job": job }))),
         Action::SetMode { thread, mode } => {
             Some(("thread.set_mode", json!({"thread": thread, "mode": mode})))
         }
@@ -1770,6 +1793,7 @@ async fn serve_calls(
 ) {
     while let Some((method, params)) = rx.recv().await {
         let named = params["ref"].clone();
+        let named_job = params["job"].clone();
         match calls.call(method, params).await {
             // What a message did ("sent to the orchestrator") is news only for a moment.
             Ok(r) => {
@@ -1780,6 +1804,11 @@ async fn serve_calls(
                     let _ = results.followed.send((method, r));
                 } else if method == "orchestrator.reset"
                     || method == "thread.activity"
+                    || method == "thread.queue"
+                    || method == "message.send_now"
+                    || method == "shell.run"
+                    || method == "shell.cd"
+                    || method == "job.log"
                     || method == "hub.info"
                     || method == "trash.list"
                     || (method == "trash.empty" && is_dry_run(&r))
@@ -1788,8 +1817,18 @@ async fn serve_calls(
                 }
             }
             // A failed poll says nothing: the next one tries again.
-            Err(_) if method == "thread.activity" || method == "hub.info" => {
+            Err(_)
+                if method == "thread.activity"
+                    || method == "hub.info"
+                    || method == "thread.queue" =>
+            {
                 let _ = results.view.send((method, Value::Null));
+            }
+            // A command's log that can't be read: it shows what its end recorded.
+            Err(_) if method == "job.log" => {
+                let _ = results
+                    .view
+                    .send((method, json!({"failed": true, "job": named_job})));
             }
             Err(e) => {
                 status.send((error_status(method, &format!("{e:#}")), false));
@@ -2284,6 +2323,20 @@ async fn drive(
                     let _ = tx.send((attn, revision, r));
                 });
             }
+            // The main pane's thread's queue, read when it changed and while it moves.
+            if let Some(thread) = state.queue_due(std::time::Instant::now()) {
+                let _ = call_tx.send(("thread.queue", json!({ "thread": thread })));
+            }
+            // The output of `!` commands on the main pane's thread, and its folder.
+            for job in state.shell_reads_due(std::time::Instant::now()) {
+                let _ = call_tx.send((
+                    "job.log",
+                    json!({ "job": job, "lines": crate::shell::SHELL_READ_LINES }),
+                ));
+            }
+            if state.shell_cwd_due() {
+                let _ = call_tx.send(("shell.cd", json!({})));
+            }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
             let retry = state
@@ -2470,6 +2523,10 @@ async fn drive(
                 _ = sleep_opt(state.order_deadline(std::time::Instant::now())) => {
                     state.settle_order(std::time::Instant::now());
                 }
+                // The queue is due to be read: loop to read it.
+                _ = sleep_opt(state.queue_deadline(std::time::Instant::now())) => {}
+                // A running command's output is due to be read: loop to read it.
+                _ = sleep_opt(state.shell_deadline(std::time::Instant::now())) => {}
                 // The double Esc's hint is due to go.
                 _ = sleep_opt(state.unsend_deadline()) => {
                     state.expire_unsend(std::time::Instant::now());

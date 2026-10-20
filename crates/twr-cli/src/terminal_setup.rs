@@ -25,7 +25,7 @@ pub const SEQUENCE: &str = "\x1b\r";
 /// The terminals `twr terminal-setup` knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Terminal {
-    AppleTerminal,
+    AppleApp,
     ITerm2,
     Ghostty,
     Kitty,
@@ -60,7 +60,7 @@ impl Editor {
 
 /// Every terminal, in the order `--print` lists them.
 pub const ALL: &[Terminal] = &[
-    Terminal::AppleTerminal,
+    Terminal::AppleApp,
     Terminal::ITerm2,
     Terminal::Ghostty,
     Terminal::Kitty,
@@ -74,7 +74,7 @@ impl Terminal {
     /// Its name, as `--terminal` takes it.
     pub fn name(self) -> &'static str {
         match self {
-            Terminal::AppleTerminal => "terminal.app",
+            Terminal::AppleApp => "terminal.app",
             Terminal::ITerm2 => "iterm2",
             Terminal::Ghostty => "ghostty",
             Terminal::Kitty => "kitty",
@@ -92,7 +92,7 @@ impl Terminal {
     /// How people call it.
     pub fn title(self) -> &'static str {
         match self {
-            Terminal::AppleTerminal => "Terminal.app",
+            Terminal::AppleApp => "Terminal.app",
             Terminal::ITerm2 => "iTerm2",
             Terminal::Ghostty => "Ghostty",
             Terminal::Kitty => "kitty",
@@ -115,7 +115,7 @@ impl Terminal {
             .flat_map(char::to_lowercase)
             .collect();
         Some(match key.as_str() {
-            "terminal" | "terminalapp" | "appleterminal" => Terminal::AppleTerminal,
+            "terminal" | "terminalapp" | "appleterminal" => Terminal::AppleApp,
             "iterm" | "iterm2" | "itermapp" => Terminal::ITerm2,
             "ghostty" => Terminal::Ghostty,
             "kitty" => Terminal::Kitty,
@@ -158,7 +158,7 @@ pub fn detect(var: &impl Fn(&str) -> Option<String>) -> Option<Terminal> {
     let set = |k: &str| var(k).is_some_and(|v| !v.is_empty());
     let program = var("TERM_PROGRAM").unwrap_or_default();
     match program.as_str() {
-        "Apple_Terminal" => return Some(Terminal::AppleTerminal),
+        "Apple_Terminal" => return Some(Terminal::AppleApp),
         "iTerm.app" => return Some(Terminal::ITerm2),
         "ghostty" => return Some(Terminal::Ghostty),
         "WezTerm" => return Some(Terminal::WezTerm),
@@ -275,7 +275,7 @@ impl Place {
                 .clone()
                 .unwrap_or_else(|| config.join("kitty"))
                 .join("kitty.conf")],
-            Terminal::ITerm2 | Terminal::AppleTerminal | Terminal::WezTerm => Vec::new(),
+            Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => Vec::new(),
         }
     }
 
@@ -293,7 +293,7 @@ impl Place {
 /// What to do by hand for `t`, as lines to print.
 pub fn instructions(t: Terminal) -> Vec<String> {
     let lines: &[&str] = match t {
-        Terminal::AppleTerminal => &[
+        Terminal::AppleApp => &[
             "Terminal.app can't change what Shift-Enter sends. Use Option-Enter instead:",
             "  Settings → Profiles → (your profile) → Keyboard → check \"Use Option as Meta key\".",
             "  Option-Enter then sends ESC CR, which twr reads as a new line (over mosh too).",
@@ -403,7 +403,7 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
             |l| l.contains("\\x1b\\r") || l.contains("\\e\\r"),
             "map shift+enter send_text all \\x1b\\r",
         ),
-        Terminal::ITerm2 | Terminal::AppleTerminal | Terminal::WezTerm => {
+        Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => {
             return Ok(Outcome::Manual)
         }
     };
@@ -784,7 +784,7 @@ mod tests {
         let d = |pairs: &[(&str, &str)]| detect(&env_of(pairs));
         assert_eq!(
             d(&[("TERM_PROGRAM", "Apple_Terminal")]),
-            Some(Terminal::AppleTerminal)
+            Some(Terminal::AppleApp)
         );
         assert_eq!(d(&[("TERM_PROGRAM", "iTerm.app")]), Some(Terminal::ITerm2));
         assert_eq!(d(&[("TERM_PROGRAM", "ghostty")]), Some(Terminal::Ghostty));
@@ -831,7 +831,7 @@ mod tests {
     fn names_given_with_terminal_parse_loosely() {
         assert_eq!(
             Terminal::parse("Terminal.app"),
-            Some(Terminal::AppleTerminal)
+            Some(Terminal::AppleApp)
         );
         assert_eq!(Terminal::parse("iTerm2"), Some(Terminal::ITerm2));
         assert_eq!(

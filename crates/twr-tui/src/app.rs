@@ -245,6 +245,9 @@ pub struct ViewState {
     /// while the transcript as last drawn has it ([`AppState::note_panes`]); its expansion is
     /// kept in `long_expanded`.
     pub block: Option<String>,
+    /// The queued message selected above the input box, by its ref ([`crate::queue`]): Enter
+    /// on an empty line opens its action popup.
+    pub queued: Option<i64>,
     /// The selected row of the popup above the input line (`/` commands, `@` mentions).
     pub popup_sel: usize,
     /// The line the popup was closed on (Esc): it stays closed until the line changes.
@@ -531,6 +534,8 @@ pub enum ActionTarget {
     Card(String),
     /// A worker request selected in the main conversation, by attention id.
     Request(String),
+    /// A queued message of the main pane's thread, by its ref ([`crate::queue`]).
+    Queued(i64),
 }
 
 /// What the next Esc does ([`AppState::esc_does`]).
@@ -566,6 +571,12 @@ pub enum ActionKind {
     Resume,
     /// Says how to attach to the thread from another terminal (`/attach`).
     Attach,
+    /// Takes a queued message back into the input box, to edit and send again.
+    Edit,
+    /// Takes a queued message back for good (its text goes to the history).
+    Delete,
+    /// Sends the next queued message now, interrupting the turn that runs.
+    SendNow,
 }
 
 /// One row of the action popup: what it does and what it says.
@@ -688,8 +699,23 @@ pub struct Withdrawal {
     pub thread: String,
     /// Its ref.
     pub msg_ref: i64,
-    /// The line as typed, what goes back in the box.
+    /// The line as typed, what goes back in the box (a queued message's preview: its whole
+    /// text comes back with the answer).
     pub text: String,
+    /// Why it is taken back.
+    pub purpose: Retract,
+}
+
+/// Why a message is taken back ([`Withdrawal::purpose`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Retract {
+    /// The last message sent, with Esc twice or `/unsend`: back in the box, as typed.
+    #[default]
+    Unsend,
+    /// A queued message, to edit it: its whole text back in the box (`↑`, `edit`).
+    Edit,
+    /// A queued message, to delete it: its text to the history (`delete`).
+    Delete,
 }
 
 /// Why the last message cannot be taken back ([`AppState::unsend_check`]).
@@ -749,7 +775,39 @@ pub enum Action {
         /// The text.
         text: String,
     },
-    /// Take back a message sent (`message.withdraw`): Esc twice on an empty line, `/unsend`.
+    /// Run the user's `!` command (`shell.run`, [`crate::shell`]).
+    ShellRun {
+        /// The thread dived into; `None`: the orchestrator's.
+        thread: Option<String>,
+        /// The command line, without the `!`.
+        command: String,
+        /// The orchestrator view's folder (`!cd`), when it was moved.
+        cwd: Option<String>,
+        /// `!!`: its output goes to the thread when it ends.
+        share: bool,
+    },
+    /// Move the orchestrator view's folder (`!cd`, `shell.cd`).
+    ShellCd {
+        /// The folder now (`None`: the orchestrator's).
+        cwd: Option<String>,
+        /// Where to (`None`: the orchestrator's folder).
+        dir: Option<String>,
+    },
+    /// Stop a running `!` command (`job.cancel`): Ctrl-C, or its `■ stop`.
+    JobCancel {
+        /// Its job.
+        job: String,
+    },
+    /// Run the next queued message now, interrupting the turn that runs
+    /// (`message.send_now`).
+    SendNow {
+        /// The thread it waits for.
+        thread: String,
+        /// Its ref.
+        msg_ref: i64,
+    },
+    /// Take back a message sent (`message.withdraw`): Esc twice on an empty line, `/unsend`,
+    /// or a queued message edited or deleted.
     Withdraw {
         /// The thread it went to.
         thread: String,
@@ -944,6 +1002,36 @@ pub enum Entry {
         result: TurnResult,
         /// Duration, if reported.
         duration_ms: Option<u64>,
+    },
+    /// A `!` command the user ran ([`crate::shell`]), from its job's `task.updated` events:
+    /// the command, where it ran, how it ended and what it printed.
+    Shell {
+        /// The seq of the event that started it, for persistent block identity.
+        seq: u64,
+        /// Its job.
+        job: String,
+        /// The command line.
+        command: String,
+        /// The folder it runs in.
+        cwd: String,
+        /// `!!`: its output goes to the thread when it ends.
+        share: bool,
+        /// Still running.
+        running: bool,
+        /// How it ended: `exited`, `cancelled`, `timed_out`, `failed_to_start`, `lost`.
+        outcome: Option<String>,
+        /// Its exit code.
+        exit: Option<i64>,
+        /// The signal that killed it.
+        signal: Option<i64>,
+        /// How long it ran.
+        duration_ms: Option<u64>,
+        /// What it printed: the end recorded with its end, or the end of its log as last read
+        /// (`job.log`), as plain text ([`twr_core::shell::plain_output`]).
+        output: String,
+        /// Its log was read after it ended (or there is nothing more to read): `output` is
+        /// all there is to show.
+        read: bool,
     },
     /// A one-line notice (attention raised/resolved, report, stop, crash).
     Notice {
@@ -1160,6 +1248,7 @@ impl Transcript {
                     duration_ms: p.duration_ms,
                 });
             }
+            EventBody::TaskUpdated(p) => self.apply_shell(ev.seq, p),
             // What the orchestrator read of a project: shown like a hub update, so it stays on
             // screen when tool calls are folded.
             EventBody::ProjectRead(p) => self.push(Entry::HubUpdate {
@@ -1288,6 +1377,79 @@ impl Transcript {
             let excess = self.entries.len() - TRANSCRIPT_MAX_ENTRIES;
             self.entries.drain(..excess);
             self.ids.drain(..excess);
+        }
+    }
+
+    /// A job's `task.updated` (`p`, at `seq`): a `!` command's starts its entry, its end
+    /// says how it ended and what it printed; other jobs' and other tasks' show nothing here.
+    fn apply_shell(&mut self, seq: u64, p: &twr_core::event::TaskUpdated) {
+        let Some(job) = p
+            .ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get("job"))
+        else {
+            return;
+        };
+        let Some(id) = job["id"].as_str() else {
+            return;
+        };
+        let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+        // Its end: what it printed, cut when the hub kept only a preview of it.
+        let printed = text(&job["printed"]);
+        let cut = job.get("printed_ref").is_some()
+            || job
+                .get(twr_core::blob::CAPPED_KEY)
+                .is_some_and(|c| c.to_string().contains("printed"));
+        let at = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Shell { job, .. } if job == id));
+        match at {
+            Some(i) if !p.running => {
+                if let Entry::Shell {
+                    running,
+                    outcome,
+                    exit,
+                    signal,
+                    duration_ms,
+                    output,
+                    read,
+                    ..
+                } = &mut self.entries[i]
+                {
+                    *running = false;
+                    *outcome = job["outcome"].as_str().map(str::to_string);
+                    *exit = job["exit"].as_i64();
+                    *signal = job["signal"].as_i64();
+                    *duration_ms = job["duration_ms"].as_u64();
+                    if !*read {
+                        *output = printed;
+                    }
+                    *read = !cut && *read;
+                }
+            }
+            Some(_) => {}
+            None => {
+                let Some(shell) = job.get("shell") else {
+                    return;
+                };
+                self.close_text();
+                self.push(Entry::Shell {
+                    seq,
+                    job: id.to_string(),
+                    command: text(&shell["command"]),
+                    cwd: text(&shell["cwd"]),
+                    share: shell["share"].as_bool().unwrap_or(false),
+                    running: p.running,
+                    outcome: job["outcome"].as_str().map(str::to_string),
+                    exit: job["exit"].as_i64(),
+                    signal: job["signal"].as_i64(),
+                    duration_ms: job["duration_ms"].as_u64(),
+                    output: printed,
+                    read: !p.running && !cut,
+                });
+            }
         }
     }
 
@@ -2043,6 +2205,18 @@ pub struct AppState {
     pub acted_turns: VecDeque<(String, u64)>,
     /// The `message.withdraw` calls on their way, matched to their answers by ref.
     pub withdrawals: Vec<Withdrawal>,
+    /// The main pane's thread's queued messages, as last read ([`crate::queue`]).
+    pub queue: Option<crate::queue::QueueView>,
+    /// The orchestrator view's folder for `!` commands, once known (`shell.cd`, `!cd`).
+    pub shell_cwd: Option<String>,
+    /// `shell.cd` was asked for the folder (once).
+    pub shell_cwd_asked: bool,
+    /// The user's `!cd` is on its way: its answer says where commands run now.
+    pub shell_cd_asked: bool,
+    /// The `!` commands this TUI started that still run, oldest first: Ctrl-C stops the newest.
+    pub shell_jobs: Vec<crate::shell::Started>,
+    /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
+    pub shell_reads: HashMap<String, crate::shell::Reads>,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
     /// came while a view kept for it is being restored: applied once it is
     /// ([`AppState::finish_restore`]), into the view as it was left.
@@ -2316,6 +2490,20 @@ impl AppState {
                 }
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
+            // A `!` command ended: Ctrl-C quits again.
+            EventBody::TaskUpdated(p) if !p.running => {
+                if let Some(job) = p.task_id.strip_prefix(twr_core::event::JOB_TASK_PREFIX) {
+                    let job = job.to_string();
+                    self.shell_ended(&job);
+                }
+            }
+            // The thread's queue moved: read it again when it is the main pane's.
+            EventBody::TurnStarted(_)
+            | EventBody::TurnEnded(_)
+            | EventBody::PromptWithdrawn(_)
+            | EventBody::TurnInterrupted(_)
+            | EventBody::ThreadStopped(_)
+            | EventBody::ThreadCrashed(_) => self.queue_changed(&ev.thread),
             EventBody::ThreadDeleted(p) => self.forget_thread(&ev.thread, p),
             EventBody::RunnerConnected(p) => self.apply_runner(true, p),
             EventBody::RunnerDisconnected(p) => self.apply_runner(false, p),
@@ -2550,6 +2738,11 @@ impl AppState {
             }
             "say" | "thread.send" => self.sent_result(result),
             "message.withdraw" => self.withdraw_result(result),
+            "thread.queue" => self.queue_result(result, Instant::now()),
+            "message.send_now" => self.send_now_result(result),
+            "shell.run" => self.shell_started(result),
+            "shell.cd" => self.shell_moved(result),
+            "job.log" => self.shell_log(result, Instant::now()),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
             "orchestrator.reset" => {
@@ -3411,6 +3604,10 @@ impl AppState {
     /// The item the selection's action popup answers: the request selected in the
     /// conversation, else the top item of the card it is about ([`AppState::selected_card`]).
     pub fn selected_attention(&self) -> Option<&AttentionItem> {
+        // A queued message selected has no item: its popup never answers the card's.
+        if self.view.queued.is_some() {
+            return None;
+        }
         // A resolved inline selection must not silently become another item's answer.
         if self.view.request.is_some() {
             self.selected_request()
@@ -4252,8 +4449,9 @@ impl AppState {
         // Any key ends a mouse selection (its text was copied when the button went up).
         self.view.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl-C stops a `!` command this TUI runs on the main pane's thread, else quits.
         if ctrl && key.code == KeyCode::Char('c') {
-            return vec![Action::Quit];
+            return self.ctrl_c();
         }
         // Ctrl-L repaints the whole screen, whatever else is open.
         if ctrl && key.code == KeyCode::Char('l') {
@@ -4544,6 +4742,9 @@ impl AppState {
         if let Some(actions) = self.unsend_esc(Instant::now()) {
             return actions;
         }
+        if self.view.queued.take().is_some() {
+            return Vec::new();
+        }
         if self.view.screen == Screen::Stack && self.view.block.take().is_some() {
             return Vec::new();
         }
@@ -4586,6 +4787,7 @@ impl AppState {
         }
         let main = self.main_focused();
         if (v.screen == Screen::Stack && v.block.is_some())
+            || v.queued.is_some()
             || v.request.is_some()
             || (main && v.dive.is_none())
             || (v.focus.is_some() && !main && !self.forced_focus())
@@ -4774,6 +4976,7 @@ impl AppState {
                     thread: thread.clone(),
                     msg_ref,
                     text: s.text.clone(),
+                    purpose: Retract::Unsend,
                 });
                 vec![Action::Withdraw { thread, msg_ref }]
             }
@@ -4828,6 +5031,11 @@ impl AppState {
     /// once, its turn (or the turn its ref started already), and whether that turn acted
     /// already; a short command has none (applied at once).
     fn sent_result(&mut self, result: &Value) {
+        // Queued or started, the thread's queue moved.
+        if let Some(t) = result["thread"].as_str() {
+            let t = t.to_string();
+            self.queue_changed(&t);
+        }
         let Some(s) = self.sent.as_mut() else {
             return;
         };
@@ -4917,6 +5125,7 @@ impl AppState {
             return;
         };
         let w = self.withdrawals.remove(i);
+        self.queue_changed(&w.thread);
         let last = self
             .sent
             .as_mut()
@@ -4932,11 +5141,30 @@ impl AppState {
                 self.sent = None;
             }
             let here = Some(&w.thread) == self.main_thread().as_ref();
+            // A queued message comes back whole from the hub: the list had a preview.
+            let text = match (w.purpose, result["prompt"].as_str()) {
+                (Retract::Edit | Retract::Delete, Some(full)) => full.to_string(),
+                _ => w.text.clone(),
+            };
+            if w.purpose == Retract::Delete {
+                self.keep_taken_back(&text);
+                self.set_timed_status(
+                    "deleted from the queue: its text is in the history (↑)".to_string(),
+                    Instant::now(),
+                );
+                return;
+            }
             let msg = if here && self.view.input.is_empty() {
-                self.view.input.set(&w.text);
-                "taken back: your message is in the box again"
+                let (cols, rows) = (self.input_cols(), self.input_rows());
+                self.view.input.set(&text);
+                self.view.input.keep_visible(cols, rows);
+                if w.purpose == Retract::Edit {
+                    "taken back from the queue: edit it, Enter sends it again (at the queue's end)"
+                } else {
+                    "taken back: your message is in the box again"
+                }
             } else {
-                self.keep_taken_back(&w.text);
+                self.keep_taken_back(&text);
                 if here {
                     "taken back: the box wasn't empty, so the message is in the history (↑)"
                 } else {
@@ -4982,6 +5210,9 @@ impl AppState {
     /// popup draws its item itself). None while the main pane is selected, or for a request
     /// no longer open: never another item in its place.
     pub fn selection_target(&self) -> Option<ActionTarget> {
+        if let Some(t) = self.queued_target() {
+            return Some(t);
+        }
         if let Some(i) = self.selected_request() {
             return Some(ActionTarget::Request(i.attn_id.clone()));
         }
@@ -5031,11 +5262,11 @@ impl AppState {
                     .as_ref()
                     .is_some_and(|s| s.attn_id == *id && s.revision == *rev)
             });
-        let sel = self
-            .action_rows(&target)
-            .iter()
-            .any(|r| r.kind == ActionKind::Talk)
-            .then_some(ActionKind::Talk);
+        // Talk to it, or a queued message's edit: rows Enter can run safely.
+        let rows = self.action_rows(&target);
+        let sel = [ActionKind::Talk, ActionKind::Edit]
+            .into_iter()
+            .find(|k| rows.iter().any(|r| r.kind == *k));
         self.view.shown = None;
         self.view.status = None;
         self.view.action = Some(ActionPopup {
@@ -5099,6 +5330,25 @@ impl AppState {
         };
         let dismissable = item.is_some_and(|i| i.thread == HUB_THREAD || !i.reason.is_blocking());
         match target {
+            ActionTarget::Queued(r) => {
+                let q = self.shown_queue();
+                let it = q.and_then(|q| q.items.iter().find(|i| i.msg_ref == *r));
+                if let Some(it) = it {
+                    let name = q
+                        .and_then(|q| self.registry.get(&q.thread))
+                        .map_or("the thread".to_string(), |t| t.name.clone());
+                    if it.mine {
+                        rows.push(row(ActionKind::Edit, "edit: back into the box"));
+                    }
+                    rows.push(row(ActionKind::Delete, "delete"));
+                    if q.and_then(|q| q.items.first()).map(|f| f.msg_ref) == Some(*r) {
+                        rows.push(row(
+                            ActionKind::SendNow,
+                            &format!("send now: interrupts {name}'s turn"),
+                        ));
+                    }
+                }
+            }
             ActionTarget::Request(_) => {
                 if let Some(t) = item.and_then(|i| self.registry.get(&i.thread)) {
                     rows.push(row(ActionKind::Talk, &format!("talk to {}", t.name)));
@@ -5289,9 +5539,19 @@ impl AppState {
         let Some(target) = self.view.action.as_ref().map(|p| p.target.clone()) else {
             return Vec::new();
         };
+        if let ActionTarget::Queued(r) = target {
+            self.view.action = None;
+            return match kind {
+                ActionKind::Edit => self.retract_queued(r, Retract::Edit),
+                ActionKind::Delete => self.retract_queued(r, Retract::Delete),
+                ActionKind::SendNow => self.send_queued_now(r),
+                _ => Vec::new(),
+            };
+        }
         let thread = match &target {
             ActionTarget::Card(id) => Some(id.clone()),
             ActionTarget::Request(_) => self.selected_attention().map(|i| i.thread.clone()),
+            ActionTarget::Queued(_) => None,
         };
         match kind {
             ActionKind::Answer(n) => {
@@ -5334,7 +5594,11 @@ impl AppState {
                     self.attach_via
                 ));
             }
-            ActionKind::Answer(_) | ActionKind::Dismiss => {}
+            ActionKind::Answer(_)
+            | ActionKind::Dismiss
+            | ActionKind::Edit
+            | ActionKind::Delete
+            | ActionKind::SendNow => {}
         }
         Vec::new()
     }
@@ -5359,7 +5623,8 @@ impl AppState {
         }
         let pools = self.pools();
         let mut s = slash::suggest(line, &pools);
-        if s.items.is_empty() {
+        // A `!` command is no message: its `@` is the shell's.
+        if s.items.is_empty() && !line.trim_start().starts_with('!') {
             s = slash::mention(line, self.view.input.cursor(), &pools);
         }
         (!s.items.is_empty()).then_some(s)
@@ -5619,6 +5884,13 @@ impl AppState {
         // Up on the first row and Down on the last browse the history; elsewhere they move
         // between the rows of the line.
         if key.modifiers.is_empty() {
+            // With messages of the user's queued, ↑ on an empty line takes the newest back to
+            // edit it ([`crate::queue`]); the history comes after.
+            if key.code == KeyCode::Up {
+                if let Some(actions) = self.edit_newest_queued() {
+                    return actions;
+                }
+            }
             match key.code {
                 KeyCode::Up if self.view.input.on_first_row(cols) && self.history_prev() => {
                     return Vec::new();
@@ -5642,6 +5914,19 @@ impl AppState {
                     return Vec::new();
                 }
                 self.remember(&text);
+                // `!...` runs a shell command ([`crate::shell`]); `\!...` sends `!...`.
+                if text.starts_with('!') {
+                    let actions = self.shell_line(&text);
+                    if !actions.is_empty() {
+                        self.view.input.clear();
+                        self.follow();
+                    }
+                    return actions;
+                }
+                let text = match text.strip_prefix('\\') {
+                    Some(rest) if rest.starts_with('!') => rest.to_string(),
+                    _ => text,
+                };
                 // `//...` sends `/...`; any other `/...` is a command, never a message.
                 if !text.starts_with("//") && text.starts_with('/') {
                     let (actions, done) = self.run_slash(&text);
@@ -5819,21 +6104,66 @@ impl AppState {
         if self.view.screen != Screen::Stack {
             return;
         }
+        // The queued messages listed under the conversation are its last steps: Shift-↓ goes
+        // on into them, Shift-↑ back up out of them.
+        let queued: Vec<i64> = self
+            .shown_queue()
+            .map(|q| {
+                q.items
+                    .iter()
+                    .take(crate::queue::QUEUE_ROWS)
+                    .map(|i| i.msg_ref)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(i) = self
+            .view
+            .queued
+            .and_then(|cur| queued.iter().position(|r| *r == cur))
+        {
+            match (previous, i) {
+                (false, i) => {
+                    if let Some(next) = queued.get(i + 1) {
+                        self.select_queued(*next);
+                    }
+                    return;
+                }
+                (true, i) if i > 0 => {
+                    self.select_queued(queued[i - 1]);
+                    return;
+                }
+                // Up from the first: the conversation's last step.
+                (true, _) => self.view.queued = None,
+            }
+        }
         let (key, head) = {
             let view = crate::ui::BlockView::new(self);
             let steps = view.steps();
             if steps.is_empty() {
+                if let (false, Some(first)) = (previous, queued.first()) {
+                    self.select_queued(*first);
+                }
                 return;
             }
+            let last = steps.len() - 1;
             let current = match (&self.view.request, &self.view.block) {
                 (Some(id), _) => Some(format!("request:{id}")),
                 (None, Some(block)) => Some(block.clone()),
                 (None, None) => None,
             };
             let at = current.and_then(|c| steps.iter().position(|(k, _)| *k == c));
+            // Down from the last step: the first queued message.
+            if let (false, Some(i), Some(first)) = (previous, at, queued.first()) {
+                if i == last {
+                    let first = *first;
+                    drop(view);
+                    self.select_queued(first);
+                    return;
+                }
+            }
             let index = match at {
                 Some(i) if previous => i.saturating_sub(1),
-                Some(i) => (i + 1).min(steps.len() - 1),
+                Some(i) => (i + 1).min(last),
                 None => {
                     let top = view.top().unwrap_or(0);
                     let height = self
@@ -6222,6 +6552,21 @@ impl AppState {
                     // A click is about something else than the action popup's rows: it
                     // closes the popup, then does what it does.
                     self.view.action = None;
+                    // A running `!` command's `■ stop`.
+                    let stop = (sel.pane.id == PaneId::Transcript)
+                        .then(|| {
+                            self.view
+                                .panes
+                                .get(&PaneId::Transcript)
+                                .filter(|p| p.area == sel.pane.area)
+                                .and_then(|p| p.link(y))
+                                .and_then(|l| l.strip_prefix(crate::ui::SHELL_STOP))
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    if let Some(job) = stop {
+                        return self.stop_shell(&job);
+                    }
                     self.click(&sel.pane, x, y);
                     return Vec::new();
                 }
@@ -6367,6 +6712,16 @@ impl AppState {
                 self.follow();
             }
             Target::Close => return self.close_top(),
+            // A queued message: a tap selects it, a tap on the selected one opens its popup.
+            Target::Queued(r) => {
+                if self.view.queued == Some(r) {
+                    if let Some(t) = self.queued_target() {
+                        self.open_action(t);
+                    }
+                } else if self.shown_queue().is_some() {
+                    self.select_queued(r);
+                }
+            }
             Target::Release => {
                 if self.view.request.take().is_some() {
                     self.view.shown = None;
@@ -6547,7 +6902,11 @@ impl AppState {
             .map(|i| (i.attn_id.clone(), i.revision));
         let guarded = matches!(
             kind,
-            ActionKind::Answer(_) | ActionKind::Dismiss | ActionKind::Stop
+            ActionKind::Answer(_)
+                | ActionKind::Dismiss
+                | ActionKind::Stop
+                | ActionKind::Delete
+                | ActionKind::SendNow
         );
         // On screen in full (the popup, or the main pane, drew it whole: [`ViewState::shown`])
         // and read: unchanged for CARD_SETTLE.
@@ -6611,7 +6970,7 @@ impl AppState {
                         Some(ActionTarget::Request(_)) => {
                             self.selected_request().is_some_and(|i| i.thread == *id)
                         }
-                        None => false,
+                        Some(ActionTarget::Queued(_)) | None => false,
                     } =>
             {
                 if let Some(t) = self.selection_target() {
@@ -20014,6 +20373,588 @@ pub(crate) mod tests {
             assert_eq!(spot(&st, &Target::TakeBack), (x, y));
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty(), "{out:?}");
+        }
+    }
+
+    /// The queue of the main pane's thread ([`crate::queue`]).
+    mod queued {
+        use super::*;
+        use crate::select::Target;
+        use serde_json::json;
+
+        /// The orchestrator conversation with `items` queued (`total` waiting in all), as the
+        /// hub listed them.
+        fn with_queue(items: Value, total: u64) -> AppState {
+            let mut st = with_orch();
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": total,
+                        "held": false, "items": items}),
+            );
+            st
+        }
+
+        fn three() -> Value {
+            json!([
+                {"ref": 7, "prompt": "fix the tests too", "truncated": false,
+                 "from": "user", "mine": true},
+                {"ref": 8, "prompt": "check the api\nand the web", "truncated": false,
+                 "from": "orchestrator", "mine": false},
+                {"ref": 9, "prompt": "then deploy", "truncated": true,
+                 "from": "user", "mine": true},
+            ])
+        }
+
+        /// They are listed right above the input box, the next first: who sent one when it
+        /// is not the user, `…` when there is more of it, `↑ edits` on the user's newest
+        /// while the line is empty, and how many more wait.
+        #[test]
+        fn queued_messages_are_listed_above_the_input_box() {
+            let mut st = with_queue(three(), 5);
+            let buf = draw(&mut st, 120, 30);
+            let rows: Vec<String> = screen_text(&buf).lines().map(str::to_string).collect();
+            let at = |needle: &str| {
+                rows.iter()
+                    .position(|r| r.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle:?} in\n{}", rows.join("\n")))
+            };
+            let first = at("⧗ queued · fix the tests too");
+            assert_eq!(
+                at("⧗ queued · (from the orchestrator) check the api …"),
+                first + 1
+            );
+            assert_eq!(at("⧗ queued · then deploy …"), first + 2);
+            assert!(rows[first + 2].contains("↑ edits"), "{}", rows[first + 2]);
+            assert!(!rows[first].contains("↑ edits"));
+            assert_eq!(at("+ 2 more queued"), first + 3);
+            // The input box's top border right under them.
+            assert!(
+                rows[first + 4].contains("→ orchestrator"),
+                "{}",
+                rows[first + 4]
+            );
+            // Typed text: no `↑ edits`.
+            typed(&mut st, "x");
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(!screen.contains("↑ edits"), "{screen}");
+            // Another thread on the main pane: not its queue.
+            st.view.input.clear();
+            st.dive("t-alpha");
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(!screen.contains("⧗ queued"), "{screen}");
+        }
+
+        /// ↑ on an empty line takes the user's newest queued message back (never the
+        /// orchestrator's); its whole text, as the hub returns it, goes in the box, and Enter
+        /// sends it again as a new message. With text typed, ↑ edits that.
+        #[test]
+        fn up_on_an_empty_line_takes_the_newest_queued_message_back_to_edit() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            typed(&mut st, "draft");
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            st.view.input.clear();
+            let out = st.handle_key(key(KeyCode::Up));
+            assert_eq!(
+                out,
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 9
+                }]
+            );
+            // A second ↑ before the answer asks nothing again.
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            let full = format!("then deploy {}", "x".repeat(3000));
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 9, "thread": "t-orch",
+                        "prompt": full}),
+            );
+            assert_eq!(st.view.input.as_str(), full);
+            assert!(
+                st.view
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("taken back from the queue")),
+                "{:?}",
+                st.view.status
+            );
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if *text == full),
+                "{sent:?}"
+            );
+        }
+
+        /// The queue is read when the main pane shows a thread, when something about it
+        /// changed, and while the thread works or messages wait; not while a read is on its
+        /// way, and not at all for an idle thread with nothing queued.
+        #[test]
+        fn the_queue_is_read_when_it_changes_and_while_it_moves() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            assert_eq!(st.queue_due(now).as_deref(), Some("t-orch"));
+            assert_eq!(st.queue_due(now), None, "a read is on its way");
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 0, "items": []}),
+            );
+            let busy = st
+                .registry
+                .get("t-orch")
+                .is_some_and(|v| v.current_turn.is_some());
+            if busy {
+                assert!(st.queue_deadline(now).is_some());
+            } else {
+                assert_eq!(st.queue_deadline(now), None, "idle, nothing queued");
+            }
+            // A message that queued: read again at once.
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 12, "turn": null,
+                        "pending": 1}),
+            );
+            assert_eq!(st.queue_deadline(now), Some(now));
+            assert_eq!(st.queue_due(now).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 12, "prompt": "x", "from": "user", "mine": true}]}),
+            );
+            // Messages wait: read again after a while.
+            let next = st.queue_deadline(now).unwrap();
+            assert!(next > now && next <= now + crate::queue::QUEUE_POLL + Duration::from_secs(1));
+            // A failed read (an older hub): the next one waits longer.
+            assert_eq!(st.queue_due(next).as_deref(), Some("t-orch"));
+            st.apply_result("thread.queue", &Value::Null);
+            assert!(st.queue_deadline(next).unwrap() >= now + Duration::from_secs(29));
+        }
+
+        /// Shift-↓ from the conversation goes on into the queued rows, Shift-↑ back; Enter
+        /// opens a selected one's popup: edit (the user's), delete, and send now (the next
+        /// one only); Esc releases it.
+        #[test]
+        fn a_selected_queued_message_opens_a_popup_to_edit_delete_or_send_it_now() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            st.handle_key(shift(KeyCode::Left));
+            let mut seen = Vec::new();
+            for _ in 0..12 {
+                st.handle_key(shift(KeyCode::Down));
+                seen.push(st.view.queued);
+            }
+            assert_eq!(seen.last(), Some(&Some(9)), "{seen:?}");
+            assert!(
+                seen.contains(&Some(7)) && seen.contains(&Some(8)),
+                "{seen:?}"
+            );
+            st.handle_key(shift(KeyCode::Up));
+            assert_eq!(st.view.queued, Some(8));
+            // The orchestrator's: delete only (not the next one: no send now).
+            assert_eq!(st.selection_target(), Some(ActionTarget::Queued(8)));
+            let rows = st.action_rows(&ActionTarget::Queued(8));
+            assert_eq!(
+                rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+                vec![ActionKind::Delete]
+            );
+            st.handle_key(shift(KeyCode::Up));
+            assert_eq!(st.view.queued, Some(7));
+            let rows = st.action_rows(&ActionTarget::Queued(7));
+            assert_eq!(
+                rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+                vec![ActionKind::Edit, ActionKind::Delete, ActionKind::SendNow]
+            );
+            // The popup opens on edit, never on what Enter would not undo.
+            draw(&mut st, 120, 30);
+            assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+            assert_eq!(st.view.action.as_ref().unwrap().sel, Some(ActionKind::Edit));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(screen.contains("QUEUED · yours"), "{screen}");
+            st.handle_key(key(KeyCode::Esc));
+            assert!(st.view.action.is_none());
+            let out = run_row(&mut st, ActionKind::SendNow);
+            assert_eq!(
+                out,
+                vec![Action::SendNow {
+                    thread: "t-orch".into(),
+                    msg_ref: 7
+                }]
+            );
+            st.apply_result(
+                "message.send_now",
+                &json!({"sent_now": true, "state": "interrupting", "thread": "t-orch",
+                        "thread_name": "orchestrator", "ref": 7, "turn": 3}),
+            );
+            assert!(
+                st.view
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("runs next")),
+                "{:?}",
+                st.view.status
+            );
+            // Delete: its text goes to the history.
+            st.select_queued(9);
+            draw(&mut st, 120, 30);
+            let out = run_row(&mut st, ActionKind::Delete);
+            assert_eq!(
+                out,
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 9
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 9,
+                        "prompt": "then deploy, all of it"}),
+            );
+            assert_eq!(
+                st.view.history.last().map(String::as_str),
+                Some("then deploy, all of it")
+            );
+            assert!(st.view.input.is_empty());
+            // Esc releases a selected row.
+            st.select_queued(7);
+            st.handle_key(key(KeyCode::Esc));
+            assert_eq!(st.view.queued, None);
+        }
+
+        /// A tap selects a queued row, a tap on the selected one opens its popup.
+        #[test]
+        fn a_tap_selects_a_queued_message_and_another_opens_its_popup() {
+            let mut st = with_queue(three(), 3);
+            let screen = crate::ui::draw_offscreen(&mut st, 120, 30, Instant::now());
+            let (r, _) = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .find(|(_, t)| *t == Target::Queued(8))
+                .cloned()
+                .expect("a queued row drawn");
+            let (x, y) = (r.x + 2, r.y);
+            let left = MouseButton::Left;
+            let tap = |st: &mut AppState, screen: &Buffer| {
+                st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), screen);
+                let screen = crate::ui::draw_offscreen(st, 120, 30, Instant::now());
+                st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
+                crate::ui::draw_offscreen(st, 120, 30, Instant::now())
+            };
+            let screen = tap(&mut st, &screen);
+            assert_eq!(st.view.queued, Some(8));
+            assert!(st.view.action.is_none());
+            tap(&mut st, &screen);
+            assert_eq!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(8))
+            );
+        }
+    }
+
+    /// `!` commands ([`crate::shell`]).
+    mod shell_cmds {
+        use super::*;
+        use serde_json::json;
+        use twr_core::event::TaskUpdated;
+
+        /// A `!` command's job events on `o`'s thread: its start, and its end when `end`.
+        fn job_event(o: &mut ThreadScript, job: Value, running: bool) -> Event {
+            o.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: format!("job:{}", job["id"].as_str().unwrap()),
+                running,
+                description: String::new(),
+                ext: json!({ "twr": { "job": job } }).as_object().cloned(),
+                ..Default::default()
+            }))
+        }
+
+        fn start(id: &str, command: &str, share: bool) -> Value {
+            json!({"id": id, "name": command, "argv": ["/bin/sh", "-c", command],
+                   "wake": share, "by": "user:tui",
+                   "shell": {"command": command, "cwd": "/work/api", "share": share}})
+        }
+
+        fn end(id: &str, command: &str, exit: i64, printed: &str) -> Value {
+            json!({"id": id, "name": command, "outcome": "exited", "exit": exit,
+                   "duration_ms": 1234, "printed": printed,
+                   "shell": {"command": command, "cwd": "/work/api", "share": false}})
+        }
+
+        /// Enter on a `!` line runs it (`!!` shares it), in the dived thread or the
+        /// orchestrator's folder; `\!` sends a message that starts with `!`; a bare `!` or a
+        /// dive's `!cd` says what to do; the orchestrator view's `!cd` moves its folder.
+        #[test]
+        fn a_bang_line_runs_a_command() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                type_line(&mut st, "!ls -la"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "ls -la".into(),
+                    cwd: None,
+                    share: false
+                }]
+            );
+            assert!(st.view.input.is_empty());
+            assert_eq!(st.view.history.last().map(String::as_str), Some("!ls -la"));
+            assert_eq!(
+                type_line(&mut st, "!! cargo test"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "cargo test".into(),
+                    cwd: None,
+                    share: true
+                }]
+            );
+            let sent = type_line(&mut st, "\\!important: read this");
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!important: read this"),
+                "{sent:?}"
+            );
+            assert!(type_line(&mut st, "!").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("type a command"));
+            assert_eq!(st.view.input.as_str(), "!", "the line stays to fix");
+            st.view.input.clear();
+            assert_eq!(
+                type_line(&mut st, "!cd src"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: Some("src".into())
+                }]
+            );
+            st.apply_result("shell.cd", &json!({"cwd": "/work/src"}));
+            assert_eq!(st.shell_cwd.as_deref(), Some("/work/src"));
+            assert!(st.view.status.as_deref().unwrap().contains("/work/src"));
+            assert_eq!(
+                type_line(&mut st, "!pwd"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "pwd".into(),
+                    cwd: Some("/work/src".into()),
+                    share: false
+                }]
+            );
+            // `!cd` alone: back to the orchestrator's folder.
+            assert_eq!(
+                type_line(&mut st, "!cd"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: None
+                }]
+            );
+            // In a dive: its thread, its worktree.
+            st.dive("t-alpha");
+            assert_eq!(
+                type_line(&mut st, "!git status"),
+                vec![Action::ShellRun {
+                    thread: Some("t-alpha".into()),
+                    command: "git status".into(),
+                    cwd: None,
+                    share: false
+                }]
+            );
+            assert!(type_line(&mut st, "!cd src").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("runs in its worktree"));
+        }
+
+        /// A paste is never a key: a pasted `!` line runs only with a real Enter.
+        #[test]
+        fn a_pasted_bang_line_waits_for_enter() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            st.handle_paste("!rm -rf build\n");
+            assert_eq!(st.view.input.as_str(), "!rm -rf build\n");
+            let out = st.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                out,
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm -rf build".into(),
+                    cwd: None,
+                    share: false
+                }]
+            );
+        }
+
+        /// The input box says when its line is a shell command, where it runs, and whether
+        /// its output goes on.
+        #[test]
+        fn the_input_box_shows_shell_mode() {
+            let mut st = with_orch();
+            typed(&mut st, "!ls");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(
+                screen.contains(
+                    " ! shell  in the orchestrator's folder · Enter runs it · shown only"
+                ),
+                "{screen}"
+            );
+            st.view.input.clear();
+            typed(&mut st, "!!ls");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(
+                screen.contains(
+                    " !! shell  in the orchestrator's folder · Enter runs it, then sends its \
+                     output to the orchestrator"
+                ),
+                "{screen}"
+            );
+            // An `@` in a command is the shell's: no thread popup.
+            st.view.input.clear();
+            typed(&mut st, "!echo @al");
+            assert!(st.popup().is_none());
+        }
+
+        /// A command shows in the conversation: running, with `■ stop`; then how it ended and
+        /// the end of its output, all of it with Ctrl-O.
+        #[test]
+        fn a_command_shows_its_end_and_output() {
+            let mut st = with_orch();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J1", "cargo test", false),
+                true,
+            )));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(screen.contains("! cargo test"), "{screen}");
+            assert!(
+                screen.contains("⏵ running · Ctrl-C stops it · in /work/api · shown only · ■ stop"),
+                "{screen}"
+            );
+            let printed: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                end("J1", "cargo test", 0, printed.trim_end()),
+                false,
+            )));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(
+                screen.contains("✓ exit 0 · 1.2s · in /work/api · shown only"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("… 4 earlier lines (ctrl+o to expand)"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("line 10") && !screen.contains("line 4\n"),
+                "{screen}"
+            );
+            st.handle_key(ctrl('o'));
+            let screen = screen_text(&draw(&mut st, 120, 40));
+            assert!(
+                screen.contains("line 1 ") || screen.contains("line 1\n"),
+                "{screen}"
+            );
+            assert!(!screen.contains("earlier line"), "{screen}");
+        }
+
+        /// Ctrl-C stops the newest command this TUI started on the main pane's thread, and
+        /// quits only once none runs; a click on `■ stop` stops one too.
+        #[test]
+        fn ctrl_c_stops_a_command_before_it_quits() {
+            let mut st = with_orch();
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J2", "sleep 30", false),
+                true,
+            )));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J2", "thread": "t-orch", "name": "sleep 30", "cwd": "/work"}),
+            );
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J2".into() }]
+            );
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Ctrl-C again quits"));
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+            // Its end (on both streams): nothing left to stop.
+            let ended = job_event(&mut o, end("J2", "sleep 30", 0, ""), false);
+            st.apply_control(&ended);
+            st.apply_event(&thread_item(&ended));
+            assert!(st.shell_jobs.is_empty());
+            // The `■ stop` of a running one.
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J3", "sleep 9", false),
+                true,
+            )));
+            let screen = draw(&mut st, 120, 30);
+            let text = screen_text(&screen);
+            let y = text
+                .lines()
+                .position(|l| l.contains("■ stop"))
+                .expect("a stop row") as u16;
+            let left = MouseButton::Left;
+            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            let screen = draw(&mut st, 120, 30);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            assert_eq!(out, vec![Action::JobCancel { job: "J3".into() }]);
+        }
+
+        /// A running command's output is read every so often, and once more after it ended;
+        /// what the read returns is shown as plain text.
+        #[test]
+        fn a_running_commands_output_is_read() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J4", "make", false),
+                true,
+            )));
+            assert_eq!(st.shell_reads_due(now), vec!["J4".to_string()]);
+            assert!(st.shell_reads_due(now).is_empty(), "one read at a time");
+            st.apply_result(
+                "job.log",
+                &json!({"job": "J4", "text": "\u{1b}[32mbuilding\u{1b}[0m\n50%\r100%"}),
+            );
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "building\n100%");
+            assert!(st.shell_reads_due(now).is_empty(), "read just now");
+            assert!(st.shell_deadline(now).is_some());
+            // It ended: one more read, then none.
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                end("J4", "make", 2, "x"),
+                false,
+            )));
+            let later = now + crate::shell::SHELL_POLL;
+            assert_eq!(st.shell_reads_due(later), vec!["J4".to_string()]);
+            st.apply_result("job.log", &json!({"job": "J4", "text": "all of it"}));
+            assert!(st
+                .shell_reads_due(later + Duration::from_secs(5))
+                .is_empty());
+            assert_eq!(st.shell_deadline(later), None);
         }
     }
 }

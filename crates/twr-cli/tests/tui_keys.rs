@@ -16,8 +16,7 @@ const WAIT: Duration = Duration::from_secs(30);
 
 /// A user token the test's hub and clients share: from inside a twr thread they would count as
 /// its agent otherwise (debug builds only).
-fn test_token() -> std::path::PathBuf {
-    let dir = tempfile::tempdir().unwrap().keep();
+fn test_token(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("user.token");
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
@@ -70,7 +69,8 @@ fn poll<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 fn line_break_bytes_from_the_terminal_break_the_line() {
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
-    let token = test_token();
+    let tokens = tempfile::tempdir().unwrap();
+    let token = test_token(tokens.path());
     std::fs::write(
         home.join("config.toml"),
         "[orchestrator]\nruntime = \"fake\"\n",

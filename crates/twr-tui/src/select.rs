@@ -88,6 +88,9 @@ pub enum Target {
     FocusOff,
     /// A `N parked hidden · /parked shows them` note: lists the parked threads.
     Parked,
+    /// A queued message listed above the input box, by its ref: selects it, and a tap on the
+    /// selected one opens its action popup (Enter).
+    Queued(i64),
 }
 
 /// How a drawn row continues the row above it in the copied text.

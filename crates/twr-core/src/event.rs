@@ -1017,6 +1017,27 @@ pub struct TurnWithdrawn {
     pub extra: JsonMap,
 }
 
+/// `turn.interrupted` (the thread, in the turn it interrupts): the user asked to send the next
+/// queued message now (`message.send_now`), so the hub asked the runtime to interrupt the turn
+/// that runs. The turn keeps what it did and its authority, as any turn the user interrupts;
+/// it ends `interrupted` whatever the runtime reports (no grade, report, review or retry), and
+/// the queued message `ref` is the next prompt the thread runs.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TurnInterrupted {
+    /// The queued message sent now ([`MESSAGE_REF_KEY`]).
+    #[serde(rename = "ref")]
+    pub msg_ref: i64,
+    /// The turn (also the event's `turn`).
+    pub turn: u64,
+    /// Extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
 /// A hub-authored update shown in the orchestrator conversation without a model turn.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1640,6 +1661,8 @@ event_body! {
     TurnEnded(TurnEnded) => "turn.ended",
     /// `turn.withdrawn`
     TurnWithdrawn(TurnWithdrawn) => "turn.withdrawn",
+    /// `turn.interrupted`
+    TurnInterrupted(TurnInterrupted) => "turn.interrupted",
     /// `prompt.withdrawn`
     PromptWithdrawn(PromptWithdrawn) => "prompt.withdrawn",
     /// Session-scoped background task lifecycle and liveness.
@@ -1699,7 +1722,8 @@ impl EventBody {
 /// Control-stream filter.
 ///
 /// The control stream's set: `thread.*`, `turn.started`, `turn.ended`, `turn.withdrawn` and
-/// `prompt.withdrawn` (a message the user took back), `task.updated`, `attention.*`,
+/// `prompt.withdrawn` (a message the user took back), `turn.interrupted` (the user sent the next
+/// queued message now), `task.updated`, `attention.*`,
 /// `report.*`, `decision.*`, and the small hub-relevant kinds `git.snapshot`, `runner.*`,
 /// `context.updated`, `conversation.update`, `account.*` (the hub's `account.usage`),
 /// `project.read` (an orchestrator read, shown to the user) and `worktree.*`. `agent.*` never
@@ -1709,6 +1733,7 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind == "turn.started"
         || kind == "turn.ended"
         || kind == "turn.withdrawn"
+        || kind == "turn.interrupted"
         || kind == "prompt.withdrawn"
         || kind == "task.updated"
         || kind.starts_with("attention.")
@@ -1870,6 +1895,11 @@ mod tests {
             EventBody::TurnWithdrawn(TurnWithdrawn {
                 msg_ref: 7,
                 turn: 2,
+                ..Default::default()
+            }),
+            EventBody::TurnInterrupted(TurnInterrupted {
+                msg_ref: 9,
+                turn: 3,
                 ..Default::default()
             }),
             EventBody::PromptWithdrawn(PromptWithdrawn {
@@ -2343,6 +2373,12 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(body.data().unwrap(), json!({"ref": 7, "turn": 2}));
+        let body = EventBody::TurnInterrupted(TurnInterrupted {
+            msg_ref: 9,
+            turn: 3,
+            ..Default::default()
+        });
+        assert_eq!(body.data().unwrap(), json!({"ref": 9, "turn": 3}));
         let back = EventBody::from_kind_data("prompt.withdrawn", json!({"ref": 8, "prompt": "x"}));
         assert_eq!(
             back.unwrap(),
@@ -2371,6 +2407,7 @@ mod tests {
             "turn.started",
             "turn.ended",
             "turn.withdrawn",
+            "turn.interrupted",
             "prompt.withdrawn",
             "task.updated",
             "attention.raised",

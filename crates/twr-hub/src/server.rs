@@ -22,6 +22,10 @@
 //! | `thread.send`       | `{thread, prompt}`                                  | `{thread, queued, ref, turn, pending, dispatch_error?}` |
 //! | `say`               | `{message, focused?, seen_gseq?}`                   | `{action, thread?, thread_name?, ref?, turn?, attn_id?, options?, answer?, decision_ids}` |
 //! | `message.withdraw`  | `{thread, ref}` (users only)                        | `{withdrawn: true, state: "queued" \| "running", thread, thread_name, ref, prompt, turn?}` or `{withdrawn: false, reason: "acted" \| "ended" \| "uninterruptible" \| "withdrawn" \| "unknown", message, thread, thread_name, ref, turn?}` (`hub::withdraw`) |
+//! | `message.send_now`  | `{thread, ref}` (users only)                        | `{sent_now: true, state: "interrupting" \| "started" \| "waiting", thread, thread_name, ref, turn?, message?}` or `{sent_now: false, reason: "unknown" \| "not_next" \| "uninterruptible", message, ...}`: runs the next queued message now, interrupting the turn that runs (`hub::queue`) |
+//! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
+//! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
+//! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -662,6 +666,10 @@ pub const METHODS: &[&str] = &[
     "thread.transcript",
     "thread.subscribe",
     "message.withdraw",
+    "message.send_now",
+    "thread.queue",
+    "shell.run",
+    "shell.cd",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -1638,7 +1646,7 @@ struct SendParams {
     from: TurnFrom,
 }
 
-/// `message.withdraw` parameters.
+/// `message.withdraw` and `message.send_now` parameters.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WithdrawParams {
@@ -2388,6 +2396,30 @@ fn call(
         "message.withdraw" => {
             let p: WithdrawParams = params(p)?;
             hub.withdraw_message(&p.thread, p.msg_ref, caller)
+        }
+        "message.send_now" => {
+            let p: WithdrawParams = params(p)?;
+            hub.send_now(&p.thread, p.msg_ref, caller)
+        }
+        "thread.queue" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_queue(&p.thread, caller)
+        }
+        "shell.run" => {
+            let p: crate::hub::ShellRun = params(p)?;
+            hub.shell_run(p, caller)
+        }
+        "shell.cd" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShellCdParams {
+                #[serde(default)]
+                cwd: Option<String>,
+                #[serde(default)]
+                dir: Option<String>,
+            }
+            let p: ShellCdParams = params(p)?;
+            hub.shell_cd(p.cwd.as_deref(), p.dir.as_deref(), caller)
         }
         "thread.set_mode" => {
             let p: SetModeParams = params(p)?;
