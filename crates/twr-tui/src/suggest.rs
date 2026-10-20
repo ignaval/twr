@@ -97,9 +97,10 @@ impl AppState {
             return;
         };
         // Asked before a send of the user's since: about a conversation that went on.
-        let asked = self.suggest_asked.as_ref().is_some_and(|(t, n, epoch)| {
-            t == thread && *n == turn && *epoch == self.suggest_epoch
-        });
+        let asked = self
+            .suggest_asked
+            .as_ref()
+            .is_some_and(|(t, n, epoch)| t == thread && *n == turn && *epoch == self.suggest_epoch);
         let still = asked
             && self.main_thread().as_deref() == Some(thread)
             && self

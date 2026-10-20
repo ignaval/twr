@@ -445,10 +445,7 @@ impl AppState {
             .find(|l| l.thread == main && !l.cancel)
         {
             l.cancel = true;
-            self.view.status = Some(format!(
-                "stopping `{}` as it starts",
-                l.command
-            ));
+            self.view.status = Some(format!("stopping `{}` as it starts", l.command));
             return Vec::new();
         }
         let Some(s) = self

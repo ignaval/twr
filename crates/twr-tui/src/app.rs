@@ -20905,9 +20905,17 @@ pub(crate) mod tests {
         fn up_waits_for_the_queue_after_a_send() {
             let mut st = with_queue(three(), 3);
             draw(&mut st, 120, 30);
-            assert!(matches!(&type_line(&mut st, "and lint")[..], [Action::Say { .. }]));
+            assert!(matches!(
+                &type_line(&mut st, "and lint")[..],
+                [Action::Say { .. }]
+            ));
             assert!(st.handle_key(key(KeyCode::Up)).is_empty());
-            assert!(st.view.status.as_deref().unwrap().contains("reading the queue"));
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("reading the queue"));
             st.apply_result(
                 "say",
                 &json!({"action": "delegate", "thread": "t-orch", "ref": 10, "turn": null,
@@ -21439,7 +21447,10 @@ pub(crate) mod tests {
                 &json!({"failed": true, "job": "J7", "error": "connection lost"}),
             );
             let status = st.view.status.clone().unwrap();
-            assert!(status.contains("could not stop `sleep 30` (connection lost)"), "{status}");
+            assert!(
+                status.contains("could not stop `sleep 30` (connection lost)"),
+                "{status}"
+            );
             assert_eq!(st.handle_key(ctrl('c')), stop);
         }
 
@@ -21452,7 +21463,12 @@ pub(crate) mod tests {
             assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
             assert!(st.handle_key(ctrl('c')).is_empty());
             assert!(st.handle_key(ctrl('c')).is_empty());
-            assert!(st.view.status.as_deref().unwrap().contains("still on its way"));
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("still on its way"));
             assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
         }
 
@@ -21609,7 +21625,10 @@ pub(crate) mod tests {
         fn an_answer_from_before_a_send_shows_nothing() {
             let (mut st, _) = ended(true);
             st.take_suggest_due();
-            assert!(matches!(&type_line(&mut st, "go on")[..], [Action::Say { .. }]));
+            assert!(matches!(
+                &type_line(&mut st, "go on")[..],
+                [Action::Say { .. }]
+            ));
             st.apply_result(
                 "suggest.next",
                 &json!({"thread": "t-orch", "turn": 1, "suggestion": "and the docs"}),

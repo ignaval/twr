@@ -14,7 +14,7 @@ use twr_core::adapter::Adapter;
 use twr_core::config::Config;
 use twr_core::proto::codes;
 use twr_hub::hub::ControlSubscription;
-use twr_hub::{Caller, Hub, HubOptions, NewThread};
+use twr_hub::{Caller, Hub, HubOptions, NewThread, ShellRun};
 
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -83,6 +83,8 @@ async fn hub(dir: &Path, bin: PathBuf) -> Hub {
     o.socket = Some(dir.join("hub.sock"));
     o.stop_timeout = Duration::from_secs(5);
     o.suggest_bin = Some(bin);
+    // A `!!` command runs through the job gate, which this test binary isn't.
+    o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
     Hub::open(o).await.unwrap()
 }
 
@@ -393,4 +395,57 @@ async fn a_suggestion_that_reads_as_a_command_is_dropped() {
         );
         hub.shutdown().await;
     }
+}
+
+/// Only a turn the user's own message started is asked about: after one the orchestrator's
+/// message started, or a shared `!!` command's output (the hub's prompt, the runtime's turn),
+/// there is no suggestion (`not_user`) and the CLI is not run.
+#[tokio::test]
+async fn a_turn_the_user_did_not_start_gets_no_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "Now run the integration tests", false);
+    let hub = hub(dir.path(), bin).await;
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    let v = hub
+        .new_thread(
+            NewThread {
+                project: project.to_string_lossy().into_owned(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap();
+    let api = v["id"].as_str().unwrap().to_string();
+    let mut sub = hub.subscribe_control(0);
+    hub.send_by(&api, "fix the login bug", &Caller::Orchestrator)
+        .unwrap();
+    until_ended(&mut sub, &api, 1).await;
+    let shared = ShellRun {
+        thread: Some(api.clone()),
+        command: "echo the tests pass".into(),
+        cwd: None,
+        share: true,
+    };
+    hub.shell_run(shared, &tui()).unwrap();
+    until_ended(&mut sub, &api, 2).await;
+    for turn in [1, 2] {
+        let r = hub
+            .suggest_next("api", turn, "haiku", &tui())
+            .await
+            .unwrap();
+        assert_eq!(
+            (r["suggestion"].is_null(), r["reason"].as_str()),
+            (true, Some("not_user")),
+            "{turn}: {r}"
+        );
+    }
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
 }

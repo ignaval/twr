@@ -3937,3 +3937,46 @@ async fn the_orchestrator_picks_a_box_and_is_warned_of_a_missing_agent() {
     assert_eq!(fresh["agents"][1]["version"], "codex-cli 0.160.0");
     hub.shutdown().await;
 }
+
+/// A suggestion the user took unedited (`say` with `suggested`) goes to the orchestrator as a
+/// message, never applied as a short command at once, however it reads now; the same words
+/// typed are applied directly.
+#[tokio::test]
+async fn a_suggested_message_is_never_applied_as_a_command() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    let web = env.worker(&hub, "web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t, "Watching.");
+    permissions(&hub, &[&api]);
+    let mode = hub.thread_view(&web).unwrap().mode;
+    assert_ne!(mode, "plan");
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), true)
+            .unwrap();
+        assert_eq!(r["action"], "delegate", "{m}: {r}");
+        assert!(r["ref"].as_i64().is_some(), "{m}: {r}");
+        let (prompt, t) = rt.next_turn().await;
+        assert!(prompt.ends_with(m), "{m}: {prompt}");
+        rt.end_turn(t, "ok");
+    }
+    assert!(open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, mode);
+    // Typed, the same words apply.
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), false)
+            .unwrap();
+        assert_eq!(r["action"], "command", "{m}: {r}");
+    }
+    assert!(!open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, "plan");
+    drop(rt);
+    hub.shutdown().await;
+}
