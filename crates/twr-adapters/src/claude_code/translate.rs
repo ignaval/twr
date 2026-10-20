@@ -719,13 +719,15 @@ impl Translator {
             }
         };
         // A line of the main agent's run: the notification's run started. Not a subagent's
-        // line, a task's, a rate limit's, the answer to a request of twr's, nor anything
-        // unknown (a `result` is [`Translator::on_result`]'s to judge).
+        // line, a task's, a rate limit's, the answer to a request of twr's, a request for the
+        // user (a subagent's carries no mark of it; while one is open the wait is held, and it
+        // starts again when the last closes), nor anything unknown (a `result` is
+        // [`Translator::on_result`]'s to judge).
         let kind = str_at(&v, "type");
         let main = v.get("parent_tool_use_id").is_none_or(Value::is_null);
         let run_line = match kind {
             "system" => matches!(str_at(&v, "subtype"), "init" | "api_retry"),
-            "stream_event" | "assistant" | "user" | "control_request" => main,
+            "stream_event" | "assistant" | "user" => main,
             _ => false,
         };
         if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
@@ -1764,16 +1766,6 @@ impl Translator {
     }
 
     fn on_result(&mut self, v: &Value, line: &str, out: &mut Translated) {
-        // The run of a turn ended for its missing `result` ends after all: absorbed, whatever
-        // is open or queued now (no run showed since: no `init`, no model output; a turn opened
-        // since for another task's notification is still waiting for its run). Its spend was
-        // that turn's (reported unknown): the total moves on, charged to no other turn.
-        if std::mem::take(&mut self.absorb_result) {
-            if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
-                self.cost_since(t);
-            }
-            return;
-        }
         // Claude consumed a task notification without asking the model anything (a resumed
         // session hears of a task its previous process left behind before it reads the
         // prompt). That `result` answers no prompt and ends no turn: a twr turn running goes
@@ -1798,6 +1790,17 @@ impl Translator {
             }
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
                 self.skip_cost(t);
+            }
+            return;
+        }
+        // The run of a turn ended for its missing `result` ends after all: absorbed, whatever
+        // is open or queued now (no run showed since: no `init`, no model output; a turn opened
+        // since for another task's notification is still waiting for its run). A `result` that
+        // asked the model nothing (above) is never that run's. Its spend was that turn's
+        // (reported unknown): the total moves on, charged to no other turn.
+        if std::mem::take(&mut self.absorb_result) {
+            if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
+                self.cost_since(t);
             }
             return;
         }
@@ -3657,6 +3660,57 @@ mod tests {
             .is_empty());
         let events = t.expire(fresh).events;
         assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
+    }
+
+    /// A request for the user during a notification's turn (a subagent's: it carries no mark
+    /// of it) is no run of the main agent's: the wait for the run holds while it is open, and
+    /// starts again when it closes.
+    #[test]
+    fn a_request_during_a_notifications_turn_holds_its_wait() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[
+                &task_line("task_notification", "b1", json!({"status": "completed"})),
+                r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu1"}}"#,
+            ],
+        );
+        let at = t.deadline().unwrap();
+        assert!(t.expire(at).events.is_empty());
+        t.respond("r1", &Answer::new("deny")).unwrap();
+        let fresh = t.deadline().unwrap();
+        let events = t.expire(fresh).events;
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
+    /// After a turn ended for its missing `result`, a `result` that asked the model nothing
+    /// (another task's notice) leaves the late `result` of that run still to be absorbed: the
+    /// next prompt's turn is not ended by it.
+    #[test]
+    fn a_notice_result_does_not_use_up_the_late_results_absorption() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("Done."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        t.expire(t.deadline().unwrap());
+        t.user_message("next", 2);
+        assert!(turn_marks(&feed(&mut t, &[&result(0, Some(1.0), true)])).is_empty());
+        assert!(feed(&mut t, &[&result(2, Some(1.5), false)]).is_empty());
+        let events = feed(
+            &mut t,
+            &[INIT, &reply("Next."), &result(1, Some(2.0), false)],
+        );
+        // (What the notice's `result` added goes to the next charged turn, as ever.)
+        assert_eq!(turn_marks(&events), ["end Some(2) None Some(1.5)"]);
     }
 
     /// After a failed turn a background task's end opens no turn (the hub keeps the failure and
