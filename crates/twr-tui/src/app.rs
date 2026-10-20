@@ -2281,6 +2281,9 @@ pub struct AppState {
     /// The latest suggestions sent as they were, `(thread, ref)`, at most [`STARTED_REFS`]:
     /// taken back from the queue, one is still a suggestion.
     pub suggested_refs: VecDeque<(String, i64)>,
+    /// Whether each send still to be answered was a suggestion sent as it was, oldest first
+    /// (one connection answers in order): every answer registers its own.
+    pub sends_suggested: VecDeque<bool>,
     /// The second Ctrl-C while a `!` command's stop is on its way: the third quits.
     pub shell_quit_armed: bool,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
@@ -3248,6 +3251,10 @@ impl AppState {
         self.view.compact_pane = pane;
         self.view.action = None;
         self.view.shown = None;
+        // The queue is listed in the conversation tab only: a row of it stays selected there.
+        if pane != CompactPane::Chat {
+            self.view.queued = None;
+        }
         // A list's selection is a card: nothing of the conversation stays selected, and its
         // first row is selected when none of its rows is.
         self.fit_compact();
@@ -3278,6 +3285,7 @@ impl AppState {
         self.view.main_focus = false;
         self.view.request = None;
         self.view.block = None;
+        self.view.queued = None;
         self.set_focus(Some(first));
         if let Some(target) = self.selection_target() {
             self.open_action(target);
@@ -5126,6 +5134,7 @@ impl AppState {
         // A suggestion asked before this send is about a conversation that went on.
         self.suggest_epoch += 1;
         self.suggestion = None;
+        self.sends_suggested.push_back(suggested);
         let waiting = self.sent.as_ref().map_or(0, |s| s.waiting) + 1;
         self.sent = Some(Sent {
             thread,
@@ -5146,6 +5155,15 @@ impl AppState {
             let t = t.to_string();
             self.queue_changed(&t);
         }
+        // A suggestion's ref, whichever send this answers (a later send replaced `sent`).
+        if self.sends_suggested.pop_front() == Some(true) {
+            if let (Some(t), Some(r)) = (result["thread"].as_str(), result["ref"].as_i64()) {
+                self.suggested_refs.push_back((t.to_string(), r));
+                if self.suggested_refs.len() > STARTED_REFS {
+                    self.suggested_refs.pop_front();
+                }
+            }
+        }
         let Some(s) = self.sent.as_mut() else {
             return;
         };
@@ -5158,15 +5176,6 @@ impl AppState {
         if let Some(t) = result["thread"].as_str() {
             s.thread = Some(t.to_string());
         }
-        if let (true, Some(t), Some(r)) = (s.suggested, s.thread.clone(), s.msg_ref) {
-            self.suggested_refs.push_back((t, r));
-            if self.suggested_refs.len() > STARTED_REFS {
-                self.suggested_refs.pop_front();
-            }
-        }
-        let Some(s) = self.sent.as_mut() else {
-            return;
-        };
         s.turn = result["turn"].as_u64().or_else(|| {
             let (thread, r) = (s.thread.as_deref()?, s.msg_ref?);
             self.started_refs
@@ -21001,6 +21010,18 @@ pub(crate) mod tests {
                 st.action_popup().map(|p| p.target.clone()),
                 Some(ActionTarget::Queued(7))
             );
+            // Another tab lists no queue: its selection goes, Enter is the list's.
+            st.view.action = None;
+            st.select_queued(7);
+            st.show_pane(CompactPane::Threads);
+            assert_eq!(st.view.queued, None);
+            assert!(st.shown_queue().is_none());
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Enter));
+            assert_ne!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(7))
+            );
         }
 
         /// A tap selects a queued row, a tap on the selected one opens its popup.
@@ -21731,6 +21752,45 @@ pub(crate) mod tests {
                 matches!(&sent[..], [Action::SaySuggested { .. }]),
                 "{sent:?}"
             );
+        }
+
+        /// A suggestion sent, then a message of the user's before the first was answered:
+        /// each answer registers its own send, so the queued suggestion is still one when it
+        /// is taken back to edit.
+        #[test]
+        fn overlapping_sends_keep_the_suggestions_ref() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            assert!(matches!(
+                &st.handle_key(key(KeyCode::Enter))[..],
+                [Action::SaySuggested { .. }]
+            ));
+            assert!(matches!(
+                &type_line(&mut st, "and lint")[..],
+                [Action::Say { .. }]
+            ));
+            for r in [71, 72] {
+                st.apply_result(
+                    "say",
+                    &json!({"action": "delegate", "thread": "t-orch", "ref": r, "turn": null,
+                            "pending": 2}),
+                );
+            }
+            assert!(st.suggested_refs.contains(&("t-orch".to_string(), 71)));
+            assert!(!st.suggested_refs.contains(&("t-orch".to_string(), 72)));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 2, "items": [
+                    {"ref": 71, "prompt": "set web to bypass", "from": "user", "mine": true},
+                    {"ref": 72, "prompt": "and lint", "from": "user", "mine": true}]}),
+            );
+            st.retract_queued(71, crate::app::Retract::Edit);
+            assert!(st
+                .withdrawals
+                .iter()
+                .any(|w| w.msg_ref == 71 && w.suggested));
         }
 
         /// An answer to an ask made before a send of the user's is about a conversation that

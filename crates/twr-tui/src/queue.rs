@@ -107,13 +107,14 @@ fn items(result: &Value) -> Vec<Queued> {
 
 impl AppState {
     /// The queue the main pane's thread has, while there is something in it to list: in the
-    /// stack view (the compact layout's conversation included) only.
+    /// stack view (in the compact layout, its conversation tab) only.
     pub fn shown_queue(&self) -> Option<&QueueView> {
         let main = self.main_thread()?;
+        let chat = !self.compact() || self.view.compact_pane == crate::app::CompactPane::Chat;
         self.queue
             .as_ref()
             .filter(|q| q.thread == main && !q.items.is_empty())
-            .filter(|_| self.view.screen == Screen::Stack)
+            .filter(|_| self.view.screen == Screen::Stack && chat)
     }
 
     /// The queued message selected ([`crate::app::ViewState::queued`]), while it is listed.

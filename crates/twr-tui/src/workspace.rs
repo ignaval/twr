@@ -101,6 +101,8 @@ pub struct SavedView {
     taken_suggestion: Option<String>,
     /// Its latest suggestions sent ([`AppState::suggested_refs`]).
     suggested_refs: std::collections::VecDeque<(String, i64)>,
+    /// Which of its sends still to be answered were suggestions ([`AppState::sends_suggested`]).
+    sends_suggested: std::collections::VecDeque<bool>,
 }
 
 /// What of a [`SavedView`] waits until the replay is applied ([`AppState::finish_restore`]):
@@ -379,6 +381,7 @@ impl AppState {
         let shell = self.take_shell();
         let taken_suggestion = self.taken_suggestion.take();
         let suggested_refs = std::mem::take(&mut self.suggested_refs);
+        let sends_suggested = std::mem::take(&mut self.sends_suggested);
         let v = &self.view;
         // Up on the input line shows a history entry (unedited): what the user had typed is
         // the line to keep.
@@ -415,6 +418,7 @@ impl AppState {
             shell,
             taken_suggestion,
             suggested_refs,
+            sends_suggested,
             session_history: v
                 .history
                 .iter()
@@ -468,6 +472,7 @@ impl AppState {
         self.restore_shell(saved.shell);
         self.taken_suggestion = saved.taken_suggestion;
         self.suggested_refs = saved.suggested_refs;
+        self.sends_suggested = saved.sends_suggested;
         // The file's history goes before them as it is read ([`AppState::load_history`]).
         self.view.history = saved.session_history;
         self.restoring = Some(saved.restoring);

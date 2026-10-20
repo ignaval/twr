@@ -129,12 +129,14 @@ pub(super) fn shell_output(log: &Path, max: u64) -> String {
         return String::new();
     }
     let text = String::from_utf8_lossy(&buf);
-    let text = if from > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        &text
+    let text = match text.split_once('\n') {
+        // Cut: from the first whole line on.
+        Some((_, rest)) if from > 0 && !rest.trim().is_empty() => rest.to_string(),
+        // Cut inside the last line, a long one: its end, marked as cut.
+        _ if from > 0 => format!("…{text}"),
+        _ => text.into_owned(),
     };
-    twr_core::shell::plain_output(text).trim_end().to_string()
+    twr_core::shell::plain_output(&text).trim_end().to_string()
 }
 
 /// A fence for `text` that `text` can't close: one more backtick than its longest run, at
@@ -354,6 +356,21 @@ mod tests {
         let started = std::time::Instant::now();
         assert_eq!(shell_output(&log, 4096), "");
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    /// The end of the output from its first whole line; when the cut falls inside one long
+    /// last line, that line's end, marked as cut, never nothing.
+    #[test]
+    fn a_long_last_line_keeps_its_end() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("job.log");
+        std::fs::write(&log, "first\nsecond\nthird\n").unwrap();
+        assert_eq!(shell_output(&log, 13), "third");
+        for end in ["", "\n"] {
+            std::fs::write(&log, format!("{{\"a\": \"{}\"}}{end}", "x".repeat(100))).unwrap();
+            let out = shell_output(&log, 20);
+            assert!(out.starts_with('…') && out.ends_with("xx\"}"), "{out:?}");
+        }
     }
 
     #[test]
