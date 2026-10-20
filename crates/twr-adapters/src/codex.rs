@@ -2238,7 +2238,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             roots_with(&main, vec![target_var.clone()]),
-            [target.clone()]
+            std::slice::from_ref(&target)
         );
         std::fs::remove_dir_all(common.join("worktrees/other")).unwrap();
         // `$TMPDIR` below the target: the target is left out.
@@ -2246,14 +2246,14 @@ mod tests {
         let tmpdir = ("TMPDIR", target.join("temp/session").display().to_string());
         assert_eq!(
             roots_with(&main, vec![target_var.clone(), tmpdir]),
-            [shm.clone()]
+            std::slice::from_ref(&shm)
         );
         // `$TMPDIR` in the shared memory folder: that is left out.
         std::fs::create_dir_all(shm.join("user/temp")).unwrap();
         let in_shm = ("TMPDIR", shm.join("user/temp").display().to_string());
         assert_eq!(
             roots_with(&main, vec![target_var.clone(), in_shm]),
-            [target.clone()]
+            std::slice::from_ref(&target)
         );
         // A `$TMPDIR` not named as it is (relative, not made yet, `..` after a folder that
         // is not there): neither named roots nor shared memory.
