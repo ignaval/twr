@@ -1831,11 +1831,6 @@ async fn serve_calls(
             {
                 let _ = results.view.send((method, Value::Null));
             }
-            // A failed `!cd`: said, and commands run where they did.
-            Err(e) if method == "shell.cd" => {
-                status.send((error_status(method, &format!("{e:#}")), false));
-                let _ = results.view.send((method, json!({"failed": true})));
-            }
             // A command's log that can't be read: it shows what its end recorded.
             Err(_) if method == "job.log" => {
                 let _ = results
@@ -2750,6 +2745,9 @@ mod tests {
                         Err(anyhow::anyhow!("connection lost"))
                     }
                     "message.withdraw" => Ok(params),
+                    "shell.cd" if params["dir"] == "/missing" => {
+                        Err(anyhow::anyhow!("/missing: No such file or directory"))
+                    }
                     _ => Ok(serde_json::Value::Null),
                 }
             })
@@ -2903,6 +2901,44 @@ mod tests {
         assert_eq!((method, r["ref"].as_i64()), ("message.withdraw", Some(7)));
         let (_, r) = followed_rx.try_recv().unwrap();
         assert_eq!(r, serde_json::json!({"failed": true, "ref": 8}));
+    }
+
+    /// A `!cd` that fails after the switch is answered to the workspace too: back on it, the
+    /// TUI knows the `!cd` is over, and commands run again.
+    #[tokio::test]
+    async fn a_failed_cd_after_a_switch_reaches_the_workspace() {
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, view_rx) = mpsc::unbounded_channel();
+        let (followed_tx, mut followed_rx) = mpsc::unbounded_channel();
+        tx.send((
+            "shell.cd",
+            serde_json::json!({"cwd": null, "dir": "/missing"}),
+        ))
+        .unwrap();
+        drop(tx);
+        drop(view_rx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: followed_tx,
+        };
+        super::serve_calls(Recording(seen, None), rx, status, results).await;
+        let (method, r) = followed_rx.try_recv().unwrap();
+        assert_eq!(method, "shell.cd");
+        assert_eq!(r["failed"], true);
+        // The view back: the `!cd` is over.
+        let mut st = crate::app::AppState::new();
+        st.shell_cd_asked = true;
+        st.shell_cds.push_back(true);
+        st.apply_result(method, &r);
+        assert!(!st.shell_cd_asked);
+        assert!(st.shell_cds.is_empty());
     }
 
     /// A view left by a switch keeps sending its calls (it is not stopped), and the next view
