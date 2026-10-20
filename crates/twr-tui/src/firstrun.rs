@@ -287,7 +287,10 @@ pub fn terminal_offer(
     seen: &Seen,
     prepare: impl Fn(&Place, Terminal) -> anyhow::Result<Prepared>,
 ) -> Option<TerminalOffer> {
-    if keys.shift_enter || keys.tmux_asked || agent {
+    // tmux asked to pass Shift-Enter on may do so, but not over mosh, which never passes the
+    // terminal's extended keys on to tmux.
+    let tmux_may = keys.tmux_asked && place.remote != Some("mosh");
+    if keys.shift_enter || tmux_may || agent {
         return None;
     }
     let key = place_key(place);
@@ -514,6 +517,31 @@ mod tests {
         };
         assert_eq!(
             terminal_offer(&asked, &alacritty, false, &seen, write(file)),
+            None
+        );
+        // But not over mosh, which passes no extended key on to tmux: the mosh notice, once.
+        let over_mosh = Place {
+            remote: Some("mosh"),
+            multiplexer: Some("tmux"),
+            ..alacritty.clone()
+        };
+        let asked_mosh = Keys {
+            tmux_asked: true,
+            mosh: true,
+            ..Keys::default()
+        };
+        let got = terminal_offer(&asked_mosh, &over_mosh, false, &seen, write(file)).unwrap();
+        assert_eq!(
+            got,
+            TerminalOffer::Notice {
+                key: "mosh".into(),
+                text: crate::keys::MOSH_NOTICE.into()
+            }
+        );
+        let mut told = Seen::default();
+        told.told(&Once::Terminal("mosh".into()));
+        assert_eq!(
+            terminal_offer(&asked_mosh, &over_mosh, false, &told, write(file)),
             None
         );
         assert_eq!(
