@@ -554,9 +554,9 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 ///   below a root, could be swapped for a link to anywhere between two commands. A
 ///   `$TMPDIR` not named as it is (relative, missing, through a link or `..`) opens none, nor
 ///   the shared memory folder, which is also left out when it holds `$TMPDIR`;
-/// - the repository's checkouts can be found (from `repo`'s git dir, even when it lies in
-///   `cwd`), so that none of them is opened: otherwise neither these nor the shared memory
-///   folder are.
+/// - the repository's checkouts can be found ([`checkouts`]: from `repo`'s git dir, even
+///   when it lies in `cwd`; `repo` the main checkout or a bare repository), so that none of
+///   them is opened: otherwise neither these nor the shared memory folder are.
 ///
 /// The shared memory folder qualifies as root's, sticky and writable by all, with no other
 /// user able to replace it, and none of the repository's checkouts in it. (Codex lets every
@@ -595,7 +595,11 @@ fn writable_roots(
     // whose git dir lies in its cwd). A repository whose checkouts can't be found gets no
     // root but its git metadata.
     let repo_git = repo.and_then(|r| common_dir_of(r, None));
-    let repo_known = repo.is_none() || repo_git.is_some();
+    let repo_checkouts: Option<Vec<PathBuf>> = match (repo, &repo_git) {
+        (Some(r), Some(g)) => checkouts(r, g),
+        _ => None,
+    };
+    let repo_known = repo.is_none() || repo_checkouts.is_some();
     // Codex lets commands write `$TMPDIR` (resolving a relative one against the cwd, `..`
     // taken out): twr takes it only as a folder named as it is (absolute, existing, no link
     // or `..` on the way), and with any other opens neither named roots nor shared memory.
@@ -632,7 +636,7 @@ fn writable_roots(
     let shared = shared_memory.canonicalize().ok();
     // What no root may hold: the worktree, the repository's git dir and its other checkouts,
     // the home folder.
-    let mut repo_checkouts: Vec<PathBuf> = repo_git.as_deref().map(checkouts).unwrap_or_default();
+    let mut repo_checkouts: Vec<PathBuf> = repo_checkouts.unwrap_or_default();
     repo_checkouts.extend(repo.and_then(|r| r.canonicalize().ok()));
     let keep_out: Vec<PathBuf> = [
         Some(canonical_cwd.clone()),
@@ -729,16 +733,23 @@ fn held_by(path: &Path, owner: u32) -> bool {
     })
 }
 
-/// The checkouts of the repository whose git common dir is `common` (canonical): its main
-/// checkout (the folder holding a `.git` directory) and each linked worktree its records name
-/// (a record's `gitdir` names the worktree's `.git` file), as far as they resolve.
-fn checkouts(common: &Path) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-    if common.file_name() == Some(std::ffi::OsStr::new(".git")) {
-        out.extend(common.parent().map(Path::to_path_buf));
+/// The checkouts of repository `repo`, whose git common dir is `common` (canonical): its main
+/// checkout and each linked worktree its records name (a record's `gitdir` names the
+/// worktree's `.git` file), as far as they resolve. Only where the main checkout is known:
+/// `repo` is it (its `.git` is `common`), or the repository is bare (`common` is `repo`).
+/// None otherwise (`repo` is a linked checkout, or the git dir lives apart from the main
+/// checkout, `git init --separate-git-dir`): git itself can't find that main checkout.
+fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
+    let repo = repo.canonicalize().ok()?;
+    let dot_git = repo.join(".git");
+    let main_here = std::fs::symlink_metadata(&dot_git).is_ok_and(|m| m.is_dir())
+        && dot_git.canonicalize().is_ok_and(|g| g == common);
+    if !main_here && repo != common {
+        return None;
     }
+    let mut out: Vec<PathBuf> = vec![repo];
     let Ok(records) = std::fs::read_dir(common.join("worktrees")) else {
-        return out;
+        return Some(out);
     };
     for record in records.flatten() {
         let Ok(text) = std::fs::read_to_string(record.path().join("gitdir")) else {
@@ -749,7 +760,7 @@ fn checkouts(common: &Path) -> Vec<PathBuf> {
             out.push(worktree);
         }
     }
-    out
+    Some(out)
 }
 
 /// `(git dir, common dir)` of the linked worktree of `repo` that `cwd` is in (canonical).
@@ -2272,6 +2283,68 @@ mod tests {
             _ => None,
         };
         assert!(writable_roots(&d.join("nowt"), Some(&gone), env, &shm, &tmp).is_empty());
+    }
+
+    /// A git dir that lives apart from its main checkout (`git init --separate-git-dir`): git
+    /// can't find that checkout, so twr can't keep it out, and opens no named root and no
+    /// shared memory folder (which could hold it); the worktree's own git metadata stays
+    /// writable. The review's case: the project's `repo` is a linked checkout.
+    #[test]
+    fn a_main_checkout_twr_cannot_find_opens_no_optional_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().canonicalize().unwrap();
+        let git = d.join("gitdata");
+        for p in [
+            "gitdata/objects",
+            "gitdata/refs",
+            "gitdata/logs",
+            "gitdata/hooks",
+            "home",
+            "shm/main",
+            "target",
+        ] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        std::fs::write(
+            d.join("shm/main/.git"),
+            format!("gitdir: {}\n", git.display()),
+        )
+        .unwrap();
+        let shm = d.join("shm");
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        // Two linked checkouts: the project's (`linked`) and the thread's (`wt`).
+        for name in ["linked", "wt"] {
+            let record = git.join("worktrees").join(name);
+            std::fs::create_dir_all(&record).unwrap();
+            std::fs::write(record.join("commondir"), "../..\n").unwrap();
+            let checkout = d.join(name);
+            std::fs::create_dir_all(&checkout).unwrap();
+            std::fs::write(
+                record.join("gitdir"),
+                format!("{}\n", checkout.join(".git").display()),
+            )
+            .unwrap();
+            std::fs::write(
+                checkout.join(".git"),
+                format!("gitdir: {}\n", record.display()),
+            )
+            .unwrap();
+        }
+        let home = d.join("home");
+        let target = d.join("target");
+        let env = |k: &str| match k {
+            "HOME" => Some(home.clone().into_os_string()),
+            "CARGO_TARGET_DIR" => Some(target.clone().into_os_string()),
+            _ => None,
+        };
+        let linked = d.join("linked");
+        let roots = writable_roots(&d.join("wt"), Some(&linked), env, &shm, &d.join("tmp"));
+        let want: Vec<PathBuf> = ["worktrees/wt", "objects", "refs", "logs"]
+            .iter()
+            .map(|x| git.join(x))
+            .collect();
+        assert_eq!(roots, want);
     }
 
     /// No root may hold the home folder, the worktree or the repository's git dir: a
