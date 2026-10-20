@@ -293,6 +293,8 @@ impl Core {
             }
             _ => {}
         }
+        // Before the orchestrator's: a worker's idle line waits for its wake (`hub::wake`).
+        self.track_wake(ev);
         self.track_orchestrator(ev);
         self.track_context(ev);
         self.track_stall(ev);

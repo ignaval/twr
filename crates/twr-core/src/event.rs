@@ -52,6 +52,23 @@ pub fn is_confirm_card(thread: &str, ext: &Option<JsonMap>) -> bool {
             .any(|k| twr.and_then(|t| t.get(*k)).is_some_and(|v| !v.is_null()))
 }
 
+/// `attention.raised` `ext.twr` key of a hung-turn card (`twr-hub` `hub::stall`): a stalled item
+/// the hub raises when a turn has been silent while something waits to start the next one,
+/// `{turn, waiting}`, with the options [`HUNG_INTERRUPT`] and [`HUNG_WAIT`].
+pub const HUNG_KEY: &str = "hung";
+/// A hung-turn card's option that interrupts the turn so that what waits runs.
+pub const HUNG_INTERRUPT: &str = "interrupt";
+/// A hung-turn card's option that leaves the turn running.
+pub const HUNG_WAIT: &str = "wait";
+
+/// Whether an `attention.raised` with `ext` is a hung-turn card ([`HUNG_KEY`]).
+pub fn is_hung_card(ext: &Option<JsonMap>) -> bool {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(HUNG_KEY))
+        .is_some_and(|v| !v.is_null())
+}
+
 /// Whether an `attention.raised` on `thread` with `ext` is a delete card ([`DELETE_KEY`]).
 pub fn is_delete_card(thread: &str, ext: &Option<JsonMap>) -> bool {
     thread == HUB_THREAD

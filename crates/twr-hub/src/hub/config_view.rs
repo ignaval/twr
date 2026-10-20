@@ -41,6 +41,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         trash,
         stall_after_secs,
         background_timeout_secs,
+        wake_after_secs,
         runtimes,
         codex,
         notify: hook,
@@ -182,6 +183,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         "project_roots_default": roots_default,
         "stall_after_secs": stall_after_secs,
         "background_timeout_secs": background_timeout_secs,
+        "wake_after_secs": wake_after_secs,
         "orchestrator": {
             "runtime": orch_runtime.as_deref().map(runtime_shown),
             "model": orch_model,

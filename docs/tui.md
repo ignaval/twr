@@ -552,7 +552,7 @@ A terminal that doesn't know the sequence ignores it. Windows Terminal doesn't s
 
 Over SSH the sequence reaches the terminal on your own machine, so the notification shows there. Inside tmux the TUI wraps OSC 9 and OSC 777 for tmux's passthrough, which needs `set -g allow-passthrough on`. Inside GNU screen it wraps them for screen's passthrough, which needs no setting. Screen passes at most 767 bytes, so the TUI shortens a long notification there. Nested tmux and screen aren't supported for OSC 9 and OSC 777: the TUI can't tell which one runs inside the other, so it rings the bell instead.
 
-By default the TUI notifies about a new permission, question or confirm card, a delete card the orchestrator asked for, a failure left for you, a turn to review, a worker that finished a turn, and the orchestrator's reply to your message. `events` picks what you get, and `stalled` adds stalls:
+By default the TUI notifies about a new permission, question or confirm card, a delete card the orchestrator asked for, a failure left for you, a turn to review, a turn that seems hung (`hung`), a worker that finished a turn, and the orchestrator's reply to your message. `events` picks what you get, and `stalled` adds stalls:
 
 ```toml
 events = ["permission", "question", "confirm", "error"]

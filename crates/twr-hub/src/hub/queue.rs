@@ -150,7 +150,7 @@ impl Core {
     /// The user asked for queued message `msg_ref` of thread `id` to run now: a failure that
     /// held the queue lets it go, as their own send does, and durably (the row is marked the
     /// user's ask, `user_sent`), so a hub started after a crash doesn't hold it again.
-    fn release_for(&mut self, id: &str, msg_ref: i64) -> Result<(), RpcError> {
+    pub(super) fn release_for(&mut self, id: &str, msg_ref: i64) -> Result<(), RpcError> {
         if self.rt.get(id).is_some_and(|r| r.queue_held) {
             let head = self.store.control_head().map_err(internal)?;
             self.store.mark_user_sent(msg_ref, head).map_err(internal)?;
@@ -159,7 +159,7 @@ impl Core {
         Ok(())
     }
 
-    fn send_now_locked(
+    pub(super) fn send_now_locked(
         &mut self,
         hub: &Arc<Inner>,
         id: &str,

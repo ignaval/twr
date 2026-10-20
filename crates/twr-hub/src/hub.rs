@@ -158,6 +158,7 @@ mod threads;
 mod trash;
 mod updates;
 mod usage;
+mod wake;
 mod watches;
 mod withdraw;
 
@@ -191,6 +192,7 @@ pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
 pub use usage::SpentBy;
+pub use wake::{WAKE_CHAIN_MAX, WAKE_PROMPT_START};
 pub use watches::{IDLE_GRACE, WATCHES_MAX, WATCH_NOTE_MAX};
 pub use withdraw::OrchCall;
 
@@ -305,6 +307,10 @@ pub struct HubOptions {
     /// How long a running turn may go without events before it is `stalled`; `None` uses
     /// `stall_after_secs` from the config. Zero turns the stall timer off.
     pub stall_after: Option<Duration>,
+    /// How long after a worker's background work ended, with no turn after its interim
+    /// report, the hub waits before it wakes the worker itself (`hub::wake`); `None` uses
+    /// `wake_after_secs` from the config. Zero: never.
+    pub wake_after: Option<Duration>,
     /// Period of the `git.snapshot` tick; `None` = [`GIT_TICK`] (30 s), zero = no tick
     /// (snapshots then only follow turn ends).
     pub git_tick: Option<Duration>,
@@ -449,6 +455,7 @@ impl HubOptions {
             suggest_bin: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
+            wake_after: None,
             git_tick: None,
             trash_tick: None,
             disk_tick: None,
@@ -1294,6 +1301,10 @@ struct Core {
     hub_errors: HashMap<String, (String, Option<u64>)>,
     /// Open stalled item per thread: thread -> attn_id (`hub::stall`).
     stalled: HashMap<String, String>,
+    /// Workers to wake after their background work ended (`hub::wake`).
+    wake: wake::WakeState,
+    /// Hung-turn cards (`hub::stall`).
+    hung: stall::HungState,
     /// What each thread is doing now (`hub::activity`).
     activity: HashMap<String, activity::Activity>,
     /// Thread names being created (their worktree is being made, `hub::git`) or restored

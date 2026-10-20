@@ -1,8 +1,9 @@
 //! Watches (`hub::watches`): the orchestrator asks to be woken when a worker finishes. A final
 //! report fires a watch with a notice turn; an interim one (the turn yielded with background
 //! tasks running) does not, its follow-up turn's report does, and a worker gone idle after an
-//! interim report fires it once the grace has passed. Watches replay from the log, go with
-//! their thread and with a conversation reset.
+//! interim report fires it once the grace has passed, unless the hub wakes it (`hub::wake`):
+//! then the woken turn's report fires it. Watches replay from the log, go with their thread
+//! and with a conversation reset.
 //!
 //! The orchestrator's runtime is a test adapter that hands every session to the test
 //! ([`OrchRt`]); workers run the fake adapter, scripted when a test needs background work.
@@ -157,6 +158,8 @@ impl Env {
             config_dir: Some(self.path().join("claude-config")),
         };
         o.stop_timeout = Duration::from_secs(5);
+        // The hub's own wake of an idle worker (`hub::wake`) is off but where a test says.
+        o.wake_after = Some(Duration::ZERO);
         o
     }
 
@@ -510,6 +513,102 @@ async fn an_idle_worker_after_an_interim_report_fires_its_watch_after_the_grace(
     assert!(updates(&hub, &api)
         .iter()
         .any(|t| t == "api background work finished."));
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// The tasks end and no follow-up turn starts, but the hub wakes the worker (`hub::wake`):
+/// the idle line waits for that and goes with the woken turn's start; the watch fires on that
+/// turn's report, a follow-up's. The orchestrator's conversation says the hub woke it.
+#[tokio::test]
+async fn a_worker_the_hub_wakes_fires_its_watch_with_the_woken_turns_report() {
+    let mut env = Env::new();
+    let mut script = interim_turn();
+    script.extend([
+        Step::Sleep(300),
+        Step::EmitSession(task(false)),
+        Step::AwaitSend,
+        Step::Emit(EventBody::AgentText(AgentText {
+            text: "All tests passed. Committed c3d4e5f.".into(),
+            is_final: true,
+            ..Default::default()
+        })),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ]);
+    let mut o = env.opts(Some(script));
+    // Longer than the idle line's own grace: that line waits for the wake all the same.
+    o.wake_after = Some(IDLE_GRACE.to_std().unwrap() + Duration::from_secs(1));
+    let hub = Hub::open(o).await.unwrap();
+    let api = env.worker(&hub, "api").await;
+    let (mut rt, t1) = env.orchestrator(&hub).await;
+    watch(&hub, &api, "send its branch to twr-integrator", false);
+    rt.end_turn(t1, "Watching api.");
+
+    hub.send_by(&api, "run the tests", &tui()).unwrap();
+    let (notice, t2) = rt.next_turn().await;
+    assert!(!notice.contains("idle:"), "{notice}");
+    assert!(
+        notice.contains("- thread=api report turn=2 follow_up=true grade=success"),
+        "{notice}"
+    );
+    assert!(notice.contains(" watch=w1 "), "{notice}");
+    rt.end_turn(t2, "Sent.");
+    assert!(updates(&hub, &api).iter().any(|t| t
+        .starts_with("api's background work finished and no turn started after it: twr woke it")));
+    rt.no_turn(IDLE_GRACE.to_std().unwrap() + Duration::from_millis(800))
+        .await;
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// The runtime opens a turn for the tasks' notification that sees no run (the Claude Code
+/// adapter's `no_run`): with the hub's wake off, the worker is idle after it, and the watch
+/// fires on that, quoting the interim report the turn repeats.
+#[tokio::test]
+async fn a_turn_that_saw_no_run_leaves_its_worker_idle_for_the_watch() {
+    let mut env = Env::new();
+    let mut script = interim_turn();
+    let mut ext = None;
+    set_twr_ext(&mut ext, RUNTIME_TURN_KEY, "r1".into());
+    let mut end_ext = ext.clone();
+    set_twr_ext(&mut end_ext, "no_run", true.into());
+    script.extend([
+        Step::Sleep(300),
+        Step::EmitSession(task(false)),
+        Step::EmitSession(EventBody::TurnStarted(TurnStarted {
+            from: TurnFrom::Runtime,
+            prompt: "[runtime resumed after background activity]".into(),
+            ext,
+            ..Default::default()
+        })),
+        Step::Sleep(200),
+        Step::EmitSession(EventBody::TurnEnded(TurnEnded {
+            ext: end_ext,
+            ..Default::default()
+        })),
+        Step::Sleep(60_000),
+    ]);
+    let hub = env.hub(Some(script)).await;
+    let api = env.worker(&hub, "api").await;
+    let (mut rt, t1) = env.orchestrator(&hub).await;
+    watch(&hub, &api, "send its branch to twr-integrator", false);
+    rt.end_turn(t1, "Watching api.");
+    hub.send_by(&api, "run the tests", &tui()).unwrap();
+    let (notice, t2) = rt.next_turn().await;
+    let line = notice
+        .lines()
+        .find(|l| l.starts_with("- thread=api idle:"))
+        .unwrap_or_else(|| panic!("{notice}"));
+    assert!(line.contains("summary=\"Tests are running"), "{line}");
+    assert!(line.contains(" watch=w1 "), "{line}");
+    rt.end_turn(t2, "Noted.");
+    // The repeated report says nothing new in the conversation.
+    let yielded = updates(&hub, &api)
+        .iter()
+        .filter(|t| t.contains("yielded with"))
+        .count();
+    assert_eq!(yielded, 1);
     drop(rt);
     hub.shutdown().await;
 }

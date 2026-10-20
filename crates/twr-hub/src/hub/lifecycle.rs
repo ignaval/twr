@@ -61,7 +61,12 @@ impl Hub {
                 super::limits::Limits::prepare(&threads, &run, &ctl)
             })
         };
-        let (core, reader) = Core::replay_with(&opts.db_path, feed)?;
+        let (mut core, reader) = Core::replay_with(&opts.db_path, feed)?;
+        core.wake.after = chrono::Duration::from_std(
+            opts.wake_after
+                .unwrap_or(Duration::from_secs(opts.config.wake_after_secs)),
+        )
+        .unwrap_or(chrono::Duration::MAX);
         twr_core::trace::mark("hub: log replayed");
         let intents = core.store.spawn_intents()?;
         let cap = opts.broadcast_capacity.max(1);
@@ -507,6 +512,8 @@ impl Core {
             context_roots: HashMap::new(),
             hub_errors: HashMap::new(),
             stalled: HashMap::new(),
+            wake: Default::default(),
+            hung: Default::default(),
             activity: HashMap::new(),
             reserved_names: HashSet::new(),
             trash: Default::default(),

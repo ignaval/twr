@@ -14,7 +14,9 @@
 //! which the runtime may start itself after that work (`turn.started{from: runtime}`), does
 //! with its own report. When the tasks end and no follow-up turn starts within
 //! [`IDLE_GRACE`] (by log time), the watch fires on that instead: the worker went idle after an
-//! interim report. A background task starting meanwhile cancels that line (the worker is busy
+//! interim report. While the hub has a wake pending for the worker (`hub::wake`), the line is
+//! held until [`IDLE_GRACE`] after that wake is due: the woken turn's start drops it, and it
+//! goes out only when the hub did not wake the worker. A background task starting meanwhile cancels that line (the worker is busy
 //! again); when it ends, a new line waits a full grace. A failed turn fires nothing, on its report or when its tasks end (its error
 //! card already notifies, and an automatic retry may follow); neither do reports written by
 //! the orchestrator or a user. A rewrite of an interim report stays interim while the turn's
@@ -195,8 +197,13 @@ impl Core {
             ev.thread
         );
         self.orch.idle_fired.insert(ev.thread.clone(), turn);
-        self.orch
-            .push_held(&ev.thread, &ev.id, line, hits, ev.ts + IDLE_GRACE);
+        // A wake the hub has pending for it (`hub::wake`) starts a turn first, which drops
+        // the line; it goes out only when none started.
+        let due = match self.wake.due(&ev.thread) {
+            Some(wake) => (ev.ts + IDLE_GRACE).max(wake + IDLE_GRACE),
+            None => ev.ts + IDLE_GRACE,
+        };
+        self.orch.push_held(&ev.thread, &ev.id, line, hits, due);
     }
 
     /// Worker `ev.thread` runs background task `task` again (`ev`, a `task.updated` running

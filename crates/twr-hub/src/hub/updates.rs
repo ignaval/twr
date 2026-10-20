@@ -54,6 +54,7 @@ impl Core {
                             AttentionReason::Question => "asks",
                             AttentionReason::Error => "failed",
                             AttentionReason::Review => "needs review",
+                            AttentionReason::Stalled if is_hung_card(&p.ext) => "seems hung",
                             AttentionReason::Stalled => "is stalled",
                         },
                         cut(&p.summary, 600)
@@ -61,6 +62,10 @@ impl Core {
                     Some(e.thread.clone()),
                     twr_ext_map(json!({"attn_id": p.attn_id})),
                 ),
+                // The report of a turn that saw no run repeats one already said (`hub::wake`).
+                (EventBody::ReportReady(p), Some(_)) if super::wake::no_run_of(p).is_some() => {
+                    continue;
+                }
                 // Said from the report's own marks: tasks another turn runs now are not its.
                 (EventBody::ReportReady(p), Some(v)) => {
                     let tasks = crate::report::interim_tasks(p);
@@ -97,6 +102,16 @@ impl Core {
                         Some(e.thread.clone()),
                         None,
                     )
+                }
+                // The hub woke the worker after its background work, or chose not to
+                // (`hub::wake`): said as the worker's record says it.
+                (EventBody::ConversationUpdate(p), Some(_))
+                    if twr_ext(&p.ext).is_some_and(|t| {
+                        t.contains_key(super::wake::AUTO_WAKE_KEY)
+                            || t.contains_key(super::wake::AUTO_WAKE_SKIPPED_KEY)
+                    }) =>
+                {
+                    (p.text.clone(), Some(e.thread.clone()), None)
                 }
                 (EventBody::AttentionResolved(p), Some(v))
                     if self

@@ -84,6 +84,8 @@ impl Core {
         for thread in ready {
             self.try_dispatch(hub, &thread)?;
         }
+        // Workers idle after their background work ended (`hub::wake`).
+        self.check_wakes(hub);
         Ok(())
     }
 }

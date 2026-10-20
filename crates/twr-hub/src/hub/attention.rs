@@ -326,6 +326,17 @@ impl Core {
                 .answer_after_card(hub, attn_id, &id, decision.as_deref(), caller)
                 .map(|ev| Relay::Applied(Box::new(ev)));
         }
+        // A hung-turn card: only the user answers it, and Interrupt interrupts the turn
+        // (`hub::stall`).
+        if self.hung_card(attn_id) {
+            let decision = match response {
+                Response::Dismiss => None,
+                r => Some(answer_of(r, &item, attn_id)?.decision),
+            };
+            return self
+                .answer_hung_card(hub, &item, decision.as_deref(), caller)
+                .map(|ev| Relay::Applied(Box::new(ev)));
+        }
         let card = self.hub_cards.get(attn_id).cloned();
         if card.is_some() && caller.is_orchestrator() {
             return Err(rpc(

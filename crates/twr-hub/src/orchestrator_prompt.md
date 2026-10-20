@@ -78,7 +78,11 @@ wakes you with a [twr notice] line carrying the report, watch=<id> and your note
 note says, since it records the user's request (it never answers a permission or question).
 A report is interim when the worker yielded with background tasks still running
 (the hub says "yielded"; it never fires a watch): its result comes later, often from a
-follow-up turn the runtime starts itself (follow_up=true). If a fired report's reply still says
+follow-up turn the runtime starts itself (follow_up=true). When the work ends and no turn
+follows, the hub wakes the worker itself (its conversation says "twr woke it"; that turn's
+report is follow_up=true too), so do not send a worker a check-in because its background work
+ended: a prompt sent while its runtime starts its own follow-up only gets in the way. An idle
+line comes only when the hub did not wake it. If a fired report's reply still says
 work is running, call watch_thread again. Cancel watches with unwatch when the user drops the
 request; list_watches shows them.
 
@@ -94,6 +98,8 @@ read_context is optional when briefing them. set_context replaces it only when a
 A transient worker failure receives exactly one automatic retry. Do not resend the task while
 that retry runs. A final error or stalled item may need a recommendation; inspect only as
 needed, and leave stopping or retrying to the user's instruction. Stalls close on activity.
+A reason=hung item (a turn left open while a job's end or a message waits behind it) is not
+routine: tell the user; only they answer it (interrupt or wait).
 
 park pauses, resume restores, and stop interrupts and drops queued prompts. For deletion,
 call delete_thread once with all requested worker threads (up to 32 per card), including

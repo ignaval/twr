@@ -5,8 +5,9 @@
 //! `ext.twr.send_after = {id, prompt, after: [{thread, turn}], source, from}`: `turn` is the last
 //! turn each thread it waits for had ended then. It goes out when every one of them has
 //! finished a turn after that one and settled: no turn open, no background work or job, no
-//! prompt queued, its report written, and nothing from its runtime for [`GRACE`] (a runtime
-//! may start a turn of its own once its background work ends). A thread parked or stopped
+//! prompt queued, its report written, no wake of the hub's pending for it (`hub::wake`), and
+//! nothing from its runtime for [`GRACE`] (a runtime may start a turn of its own once its
+//! background work ends). A thread parked or stopped
 //! since has settled at once, whatever is queued for it: nothing runs it until it is resumed
 //! (a completed turn whose report is missing then counts as not finished well). Then the
 //! prompt is queued on the thread as its sender sent it (the user, or the orchestrator),
@@ -439,6 +440,11 @@ impl Core {
         // A completed turn's report is written after it ends.
         if completed && !v.reported {
             return GateState::Waiting(None);
+        }
+        // The hub is about to wake it after its background work (`hub::wake`): not finished.
+        if let Some(due) = self.wake.due(&gate.thread) {
+            let left = (due - chrono::Utc::now()).to_std().unwrap_or_default();
+            return GateState::Waiting(Some(now + left + Duration::from_secs(1)));
         }
         // Settled long enough: the runtime starts no turn of its own any more.
         let quiet = v

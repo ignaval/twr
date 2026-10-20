@@ -71,7 +71,8 @@
 //! notice turn holds at most [`NOTICE_MAX_LINES`] lines; the rest wait for the next one, which
 //! follows its end. A notice turn is `turn.started{from: orchestrator}` with source `hub` and
 //! `ext.twr.notice = true`; it records what it chose (the lines it left, by the event that
-//! queued each: [`NOTICES_LEFT_KEY`]; the watches it fired; when it chose them), so its
+//! queued each: [`NOTICES_LEFT_KEY`]; the lines still held then: [`NOTICES_HELD_KEY`]; the
+//! watches it fired; when it chose them), so its
 //! `turn.started` takes the same lines off the queue live and on replay. Stopping, parking or
 //! attaching the orchestrator drops the queue; a crashed orchestrator keeps it but is not
 //! restarted for notices (they go out after the next turn the user gives it). A reset carries
@@ -180,6 +181,10 @@ const PENDING_NOTICES_KEY: &str = "pending_worker_notices";
 /// Notice `turn.started` `ext.twr` key: the keys of the lines due then that it left for the
 /// next notice turn (past [`NOTICE_MAX_LINES`]); every other line due then went with it.
 pub(super) const NOTICES_LEFT_KEY: &str = "notices_left";
+/// Notice `turn.started` `ext.twr` key: the keys of the lines still held when it chose
+/// (a worker gone idle, its line due later); they stay queued, live and on replay alike,
+/// whatever the replay makes of their due time (it depends on the hub's settings).
+pub(super) const NOTICES_HELD_KEY: &str = "notices_held";
 
 /// Most non-urgent notices queued (the newest are kept).
 pub const NOTICE_QUEUE_MAX: usize = 200;
@@ -975,6 +980,18 @@ impl OrchState {
         self.notices.len() != before
     }
 
+    /// Holds the line about worker `thread` going idle until `until` at least (its wake is
+    /// still being tried, `hub::wake`).
+    pub(super) fn hold_idle(&mut self, thread: &str, until: DateTime<Utc>) {
+        for n in &mut self.notices {
+            if n.thread.as_deref() == Some(thread) {
+                if let Some(due) = n.idle.as_mut() {
+                    *due = (*due).max(until);
+                }
+            }
+        }
+    }
+
     /// When the earliest held notice comes due.
     pub(super) fn next_due(&self) -> Option<DateTime<Utc>> {
         self.notices.iter().filter_map(|n| n.idle).min()
@@ -1453,13 +1470,18 @@ impl Core {
                 // it delivered are used up.
                 if notice && !handoff::is_handoff(p) {
                     let cutoff = watch::notice_cutoff(p, ev.ts);
-                    let left = twr_ext(&p.ext)
-                        .and_then(|t| t.get(NOTICES_LEFT_KEY))
-                        .and_then(Value::as_array);
-                    self.orch.notices.retain(|n| {
-                        n.held(cutoff)
-                            || left.is_some_and(|l| l.iter().any(|k| k.as_str() == Some(&n.key)))
-                    });
+                    let listed = |key: &str| {
+                        twr_ext(&p.ext)
+                            .and_then(|t| t.get(key))
+                            .and_then(Value::as_array)
+                    };
+                    let (left, held) = (listed(NOTICES_LEFT_KEY), listed(NOTICES_HELD_KEY));
+                    let has = |l: Option<&Vec<Value>>, key: &str| {
+                        l.is_some_and(|l| l.iter().any(|k| k.as_str() == Some(key)))
+                    };
+                    self.orch
+                        .notices
+                        .retain(|n| n.held(cutoff) || has(left, &n.key) || has(held, &n.key));
                     self.orch.notices_dropped = 0;
                     if let Some(fired) = twr_ext(&p.ext)
                         .and_then(|t| t.get(watch::WATCHES_FIRED_KEY))
@@ -1515,6 +1537,11 @@ impl Core {
                 }
             }
             EventBody::TaskUpdated(p) if !p.running => self.queue_idle_watches(ev),
+            // A turn that saw no run repeats the interim report it followed (`hub::wake`): the
+            // worker is idle after it again.
+            EventBody::ReportReady(p) if super::wake::no_run_of(p).is_some() => {
+                self.queue_idle_watches(ev)
+            }
             EventBody::TaskUpdated(p) => self.cancel_idle_watches(ev, &p.task_id),
             // (Its open items were resolved in the same batch, before.)
             EventBody::ThreadDeleted(p) => {
@@ -1728,13 +1755,19 @@ impl Core {
                 if by == Some("orchestrator") {
                     return;
                 }
-                let reason = serde_json::to_value(p.reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default();
+                // A hung-turn card is no routine stall (`hub::stall`).
+                let hung = is_hung_card(&p.ext);
+                let reason = if hung {
+                    "hung".to_string()
+                } else {
+                    serde_json::to_value(p.reason)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_string))
+                        .unwrap_or_default()
+                };
                 Notice {
                     key: ev.id.clone(),
-                    urgent: p.reason != AttentionReason::Stalled,
+                    urgent: hung || p.reason != AttentionReason::Stalled,
                     attn_id: Some(p.attn_id.clone()),
                     thread: Some(ev.thread.clone()),
                     watches: Vec::new(),
@@ -1933,8 +1966,16 @@ impl Core {
         if !fired.is_empty() {
             ext[watch::WATCHES_FIRED_KEY] = json!(fired.iter().map(|w| &w.id).collect::<Vec<_>>());
         }
-        if self.orch.notices.iter().any(|n| n.held(now)) {
+        let held: Vec<&str> = self
+            .orch
+            .notices
+            .iter()
+            .filter(|n| n.held(now))
+            .map(|n| n.key.as_str())
+            .collect();
+        if !held.is_empty() {
             ext[watch::NOTICE_CUTOFF_KEY] = json!(now.to_rfc3339());
+            ext[NOTICES_HELD_KEY] = json!(held);
         }
         if !left.is_empty() {
             ext[NOTICES_LEFT_KEY] = json!(left);
@@ -4167,8 +4208,84 @@ mod tests {
         assert_eq!(q.0.len(), 1, "{q:?}");
         assert_eq!(q.0[0].0, again.id, "a new line, not {}", first.id);
         assert!(lines_of(&q)[0].contains(&format!("watch={w1} ")), "{q:?}");
-        let due = hub.inner.core().orch.notices[0].idle;
-        assert_eq!(due, Some(again.ts + watch::IDLE_GRACE));
+        // Held until the hub's wake of the worker (`hub::wake`) is decided, then the grace.
+        let core = hub.inner.core();
+        assert_eq!(
+            core.orch.notices[0].idle,
+            Some(again.ts + core.wake.after + watch::IDLE_GRACE)
+        );
+        drop(core);
+        drop(hub);
+    }
+
+    /// A line held for the hub's wake of its worker (`hub::wake`, due later than any replay
+    /// can tell: the replay knows no wake) stays queued past a notice turn that went out
+    /// meanwhile, live and on replay: the turn records it as held.
+    #[tokio::test]
+    async fn a_line_held_for_a_wake_survives_a_notice_turn_on_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api", "web"]).await;
+        let w1 = set_watch(&hub, "api", true);
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        let ended = hub
+            .append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        assert!(hub.inner.core().wake.due("api").is_some());
+        finish(&hub, "web", 1, Grade::NeedsVerification);
+        let (text, ext) = notice_now(&hub).unwrap();
+        assert!(!text.contains("idle:"), "{text}");
+        assert_eq!(ext[NOTICES_HELD_KEY], json!([ended.id]));
+        let q = replayed_queue(&hub, &db);
+        assert_eq!(q.0.len(), 1, "{q:?}");
+        assert!(lines_of(&q)[0].contains("thread=api idle:"), "{q:?}");
+        assert!(lines_of(&q)[0].contains(&format!("watch={w1} ")), "{q:?}");
+        drop(hub);
+    }
+
+    /// The hub's wake of a worker is recorded (`hub::wake`): its held idle line goes with that
+    /// record, live and on replay, whatever holds the woken turn up (its report fires the
+    /// watches).
+    #[tokio::test]
+    async fn a_recorded_wake_takes_the_idle_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let w1 = set_watch(&hub, "api", false);
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        hub.append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        assert_eq!(replayed_queue(&hub, &db).0.len(), 1);
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::ConversationUpdate(ConversationUpdate {
+                text: "api's background work finished: twr woke it".into(),
+                about_thread: Some("api".into()),
+                ext: twr_ext_map(json!({"auto_wake": {"turn": 1, "tasks": []}})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), vec![w1]));
         drop(hub);
     }
 
