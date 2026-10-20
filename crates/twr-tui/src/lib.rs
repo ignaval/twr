@@ -14,6 +14,8 @@
 //! required for the report path to work without a screen.
 
 pub mod app;
+#[cfg(test)]
+mod bench;
 pub mod edit;
 pub mod icon;
 pub mod keys;
@@ -35,7 +37,7 @@ use crossterm::event::{
     EnableFocusChange, EnableMouseCapture, Event as TermEvent, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
@@ -783,6 +785,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// tried again later).
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the control log replay's progress is drawn while it runs.
+const LOADING_EVERY: Duration = Duration::from_millis(100);
+
+/// Most items of a stream (control, transcript) applied in one pass of the TUI's loop,
+/// between draws.
+const CONTROL_BATCH: usize = 512;
+
 /// How many of the latest events of the main pane's thread the transcript replays.
 pub const TRANSCRIPT_TAIL: u64 = 2000;
 
@@ -914,7 +923,12 @@ async fn subscribe_thread(
             .await?;
         let head = sub.ack()["head"].as_u64().unwrap_or(head);
         let blobs = connect(socket).await?;
-        let items = hydrating(Box::pin(sub.into_stream()), blobs, socket, HYDRATE_TIMEOUT);
+        let items = read_ahead(hydrating(
+            Box::pin(sub.into_stream()),
+            blobs,
+            socket,
+            HYDRATE_TIMEOUT,
+        ));
         Ok((items, since, head))
     })
     .await
@@ -928,6 +942,11 @@ pub async fn hydrate_item<F: BlobFetch>(
     item: &StreamItem,
     fetch: &mut F,
 ) -> anyhow::Result<Option<StreamItem>> {
+    // Most items have nothing moved: told without building their `data` (a replay asks this
+    // of every item).
+    if !item.event.body.maybe_capped() {
+        return Ok(None);
+    }
     let mut data = item.event.body.data()?;
     if !has_capped(&data) {
         return Ok(None);
@@ -957,6 +976,59 @@ fn hydrating(stream: ItemStream, blobs: Client, socket: &Path, limit: Duration) 
         },
     ))
 }
+
+/// `stream` read on a task of its own, ahead of the loop that takes it, in order, its error
+/// or end last: reading and decoding a replay of thousands takes longer than applying it, and
+/// runs meanwhile on another core, while the loop stays free to draw and read keys. What is
+/// ready goes over in batches of up to [`READ_AHEAD`] items (at most [`READ_AHEAD_BATCHES`]
+/// batches ahead), so the loop wakes once for many. Once the stream returned is dropped, the
+/// task ends at once, and the subscription with it (its connection closes), as it would
+/// without the task: it may wait for a live item that never comes.
+fn read_ahead(mut stream: ItemStream) -> ItemStream {
+    let (tx, rx) = mpsc::channel::<Vec<anyhow::Result<StreamItem>>>(READ_AHEAD_BATCHES);
+    tokio::spawn(async move {
+        loop {
+            let first = tokio::select! {
+                item = stream.next() => item,
+                () = tx.closed() => return,
+            };
+            let Some(first) = first else {
+                return;
+            };
+            let mut done = first.is_err();
+            let mut batch = vec![first];
+            while !done && batch.len() < READ_AHEAD {
+                match stream.next().now_or_never() {
+                    Some(Some(item)) => {
+                        done = item.is_err();
+                        batch.push(item);
+                    }
+                    Some(None) => done = true,
+                    None => break,
+                }
+            }
+            if tx.send(batch).await.is_err() || done {
+                return;
+            }
+        }
+    });
+    Box::pin(futures::stream::unfold(
+        (rx, std::collections::VecDeque::new()),
+        |(mut rx, mut ready)| async move {
+            if ready.is_empty() {
+                ready.extend(rx.recv().await?);
+            }
+            let item = ready.pop_front()?;
+            Some((item, (rx, ready)))
+        },
+    ))
+}
+
+/// Most items [`read_ahead`] hands over at once.
+const READ_AHEAD: usize = 512;
+
+/// How many batches [`read_ahead`] reads ahead.
+const READ_AHEAD_BATCHES: usize = 4;
 
 /// The blob connection of a stream being hydrated ([`hydrating`]). A fetch that failed or ran
 /// out of time may have left part of a reply unread on it, which the next one would read as
@@ -1330,6 +1402,7 @@ impl Session {
             expect_workspace(socket, expected);
         }
         let mut calls = connect(socket).await?;
+        twr_core::trace::mark("tui: connected");
         // Identify the connected hub, even when the client used an explicit socket.
         let info = within(CONNECT_TIMEOUT, "asking for the instance", async {
             calls.call("hub.info", Value::Null).await
@@ -1339,6 +1412,7 @@ impl Session {
             check_hub_workspace(&info, expected, socket)?;
         }
         // The runtimes `/orch` completes, and whether the agent was ever chosen.
+        twr_core::trace::mark("tui: hub.info answered");
         let show = within(CONNECT_TIMEOUT, "asking for the orchestrator", async {
             calls.call("orchestrator.show", Value::Null).await
         })
@@ -1358,13 +1432,14 @@ impl Session {
         .await?;
         // The replay up to the ack's head is the initial state; focus waits for it.
         let head = control.ack()["head"].as_u64().unwrap_or(0);
+        twr_core::trace::mark_with(|| format!("tui: control subscribed (head {head})"));
         let blobs = connect(socket).await?;
-        let control = hydrating(
+        let control = read_ahead(hydrating(
             Box::pin(control.into_stream()),
             blobs,
             socket,
             HYDRATE_TIMEOUT,
-        );
+        ));
         Ok(Session {
             socket: socket.to_path_buf(),
             calls,
@@ -1796,6 +1871,7 @@ pub async fn run_with(
         Session::connect(&socket, switching.as_ref().map(|s| s.current.as_str())).await?;
 
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
+    twr_core::trace::mark("tui: terminal initialized");
     let guard = TerminalGuard;
     // A terminal without an alternate screen (or one that keeps what was on it) still shows
     // the shell's lines: the first frame draws only what is not blank, so they would stay.
@@ -2095,6 +2171,12 @@ async fn drive(
     // (`Transcript::visible`), so nothing on screen changed, and a draw per event would slow
     // a replay of thousands down.
     let mut replaying = false;
+    // `TWR_TRACE_STARTUP`: what the last frame traced showed, and how many control and
+    // transcript items were applied.
+    let mut traced: Option<(Option<String>, bool, bool)> = None;
+    let (mut control_items, mut transcript_items) = (0u64, 0u64);
+    // When the replay's progress was last drawn ([`ui::render_loading`]).
+    let mut loading_drawn: Option<std::time::Instant> = None;
 
     let end: anyhow::Result<End> = async {
         loop {
@@ -2122,6 +2204,17 @@ async fn drive(
                     state.transcript_stalled();
                 }
             }
+            // While the control log is replayed, how far it is, now and then: the view is
+            // not drawn until it is all applied, and no key acts until then.
+            if replaying_control
+                && loading_drawn.is_none_or(|at: std::time::Instant| at.elapsed() >= LOADING_EVERY)
+            {
+                terminal.draw(|f| ui::render_loading(f, &state))?;
+                if loading_drawn.is_none() {
+                    twr_core::trace::mark("tui: loading frame");
+                }
+                loading_drawn = Some(std::time::Instant::now());
+            }
             if !std::mem::take(&mut replaying) && !replaying_control {
                 // The grid's Shift-arrows need the column count the grid is drawn with, the
                 // input box the height it may grow in.
@@ -2140,7 +2233,30 @@ async fn drive(
                 state.settle_order(std::time::Instant::now());
                 state.view.frame = icon::frame_at(epoch.elapsed());
                 let mut panes = select::Panes::default();
+                let drawing = std::time::Instant::now();
                 let drawn = terminal.draw(|f| panes = ui::render(f, &state))?;
+                if twr_core::trace::enabled() {
+                    let drew = drawing.elapsed().as_micros();
+                    let now = (
+                        state.main_thread(),
+                        state.transcript.is_some(),
+                        state.transcript_catching_up(),
+                    );
+                    if traced.as_ref() != Some(&now) {
+                        twr_core::trace::mark(&format!(
+                            "tui: frame (main {}, transcript {}, {} control items, {} transcript items, drawn in {drew}us)",
+                            now.0.as_deref().unwrap_or("none"),
+                            match (now.1, now.2) {
+                                (false, _) => "none",
+                                (true, true) => "loading",
+                                (true, false) => "shown",
+                            },
+                            control_items,
+                            transcript_items,
+                        ));
+                        traced = Some(now);
+                    }
+                }
                 if state.view.selection.is_some() {
                     screen = drawn.buffer.clone();
                 }
@@ -2195,6 +2311,9 @@ async fn drive(
                         if let Some(looking) = attendance.step(control.is_some() && notifier.attended(*at), *at) {
                             let _ = looking_tx.send(Some(looking));
                         }
+                    }
+                    if let Some((_, Ok(TermEvent::Key(k)))) = &key {
+                        twr_core::trace::mark_with(|| format!("tui: key {:?}", k.code));
                     }
                     let actions = match key {
                         Some((at, Ok(event))) => {
@@ -2268,39 +2387,74 @@ async fn drive(
                         }
                     }
                 }
-                item = next_opt(&mut control) => match item {
-                    Some(Ok(item)) => {
-                        apply_control(&mut state, notifier, &item, std::time::Instant::now());
-                    }
-                    Some(Err(e)) => {
-                        control_lost(&mut state, notifier, format!("control stream: {e:#}"));
-                        control = None;
-                        // What it can't show any more, the user doesn't see here.
-                        if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
-                            let _ = looking_tx.send(Some(looking));
+                item = next_opt(&mut control) => {
+                    // What else came already is applied in the same pass, before a draw: a
+                    // replay of thousands goes by in batches, not a pass of the loop each.
+                    let mut next = Some(item);
+                    let mut applied = 0;
+                    while let Some(item) = next.take() {
+                        match item {
+                            Some(Ok(item)) => {
+                                let replaying = state.catch_up.is_some();
+                                apply_control(&mut state, notifier, &item, std::time::Instant::now());
+                                control_items += 1;
+                                if replaying && state.catch_up.is_none() {
+                                    twr_core::trace::mark_with(|| {
+                                        format!("tui: control replay applied ({control_items} items)")
+                                    });
+                                }
+                            }
+                            Some(Err(e)) => {
+                                control_lost(&mut state, notifier, format!("control stream: {e:#}"));
+                                control = None;
+                                // What it can't show any more, the user doesn't see here.
+                                if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
+                                    let _ = looking_tx.send(Some(looking));
+                                }
+                            }
+                            None => {
+                                control_lost(&mut state, notifier, "hub closed the control stream".into());
+                                control = None;
+                                if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
+                                    let _ = looking_tx.send(Some(looking));
+                                }
+                            }
                         }
-                    }
-                    None => {
-                        control_lost(&mut state, notifier, "hub closed the control stream".into());
-                        control = None;
-                        if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
-                            let _ = looking_tx.send(Some(looking));
+                        applied += 1;
+                        if applied < CONTROL_BATCH {
+                            next = control.as_mut().and_then(|c| c.next().now_or_never());
                         }
                     }
                 },
-                item = next_opt(&mut thread_sub) => match item {
-                    Some(Ok(item)) => {
-                        state.apply_event(&item);
-                        replaying = state.transcript_catching_up();
-                    }
-                    Some(Err(e)) => {
-                        state.view.status = Some(format!("transcript: {e:#}"));
-                        thread_sub = None;
-                        state.transcript_stalled();
-                    }
-                    None => {
-                        thread_sub = None;
-                        state.transcript_stalled();
+                item = next_opt(&mut thread_sub) => {
+                    // Like the control stream's: what came already in the same pass.
+                    let mut next = Some(item);
+                    let mut applied = 0;
+                    while let Some(item) = next.take() {
+                        match item {
+                            Some(Ok(item)) => {
+                                state.apply_event(&item);
+                                transcript_items += 1;
+                                replaying = state.transcript_catching_up();
+                            }
+                            Some(Err(e)) => {
+                                state.view.status = Some(format!("transcript: {e:#}"));
+                                thread_sub = None;
+                                state.transcript_stalled();
+                                // What it settled on is drawn, though an item of this batch
+                                // was still replayed.
+                                replaying = false;
+                            }
+                            None => {
+                                thread_sub = None;
+                                state.transcript_stalled();
+                                replaying = false;
+                            }
+                        }
+                        applied += 1;
+                        if applied < CONTROL_BATCH {
+                            next = thread_sub.as_mut().and_then(|s| s.next().now_or_never());
+                        }
                     }
                 },
                 Some((msg, transient)) = err_rx.recv() => {
@@ -2437,6 +2591,10 @@ async fn drive(
                     if follow.current(&t, generation) {
                         match r {
                             Ok((s, since, head)) => {
+                                twr_core::trace::mark_with(|| {
+                                    format!("tui: transcript subscribed ({t} after {since}, head {head})")
+                                });
+                                transcript_items = 0;
                                 if let Some(tr) = state.transcript.as_mut().filter(|tr| tr.thread == t) {
                                     tr.resume(since, head);
                                 }
@@ -4213,6 +4371,67 @@ mod tests {
         assert!(names(&["web", "api"])
             .unwrap()
             .starts_with("the delete card for web and api is"));
+    }
+
+    /// [`read_ahead`] passes every item on, in order, its error last; and dropping what it
+    /// returns drops the stream it reads at once, though that one waits for an item that
+    /// never comes (an idle thread's transcript: its subscription must not outlive the view).
+    #[tokio::test]
+    async fn read_ahead_keeps_the_order_and_lets_go_of_its_stream() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use twr_core::testkit::ThreadScript;
+        let mut t = ThreadScript::new("t1");
+        let items: Vec<anyhow::Result<StreamItem>> = (0..2000)
+            .map(|i| {
+                Ok(StreamItem {
+                    stream: twr_core::proto::StreamKind::Thread,
+                    gseq: None,
+                    event: t.text(&format!("line {i}")),
+                })
+            })
+            .chain(std::iter::once(Err(anyhow::anyhow!("lost"))))
+            .collect();
+        let read: Vec<_> = read_ahead(Box::pin(futures::stream::iter(items)))
+            .collect()
+            .await;
+        assert_eq!(read.len(), 2001);
+        for (i, item) in read[..2000].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap().event.seq, i as u64 + 1);
+        }
+        assert!(read[2000].is_err());
+
+        /// Says when it is dropped.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(gone.clone());
+        let first = Ok(StreamItem {
+            stream: twr_core::proto::StreamKind::Thread,
+            gseq: None,
+            event: t.text("only this"),
+        });
+        let idle = futures::stream::once(async move { first })
+            .chain(futures::stream::pending())
+            .map(move |item| {
+                let _held = &guard;
+                item
+            });
+        let mut s = read_ahead(Box::pin(idle));
+        assert!(s.next().await.unwrap().is_ok());
+        assert!(!gone.load(Ordering::SeqCst));
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !gone.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream read is dropped with the one returned");
     }
 
     #[tokio::test]

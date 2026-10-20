@@ -112,6 +112,8 @@ mod append;
 mod attach;
 mod attention;
 mod background;
+#[cfg(test)]
+mod bench;
 mod box_agents;
 mod box_switch;
 mod boxes;
@@ -180,6 +182,7 @@ pub use lifecycle::lock_opened;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
+pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
 pub use subscribe::{ControlSubscription, ThreadSubscription};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};

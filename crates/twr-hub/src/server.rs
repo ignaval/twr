@@ -480,6 +480,7 @@ pub async fn serve(
     let mut signalled = false;
     let sub_count = Arc::new(SubCount::default());
     tokio::pin!(signal);
+    twr_core::trace::mark("hub: serving");
     loop {
         tokio::select! {
             r = listener.accept() => match r {
@@ -866,7 +867,14 @@ async fn connection(
     default_client: String,
     sub_count: Arc<SubCount>,
 ) {
+    let walked = std::time::Instant::now();
     let (peer, PeerWalk { process, agent }) = agent_of(&hub, &stream).await;
+    twr_core::trace::mark_with(|| {
+        format!(
+            "hub: connection {default_client} classified in {}us",
+            walked.elapsed().as_micros()
+        )
+    });
     if let Some(a) = &agent {
         tracing::info!(thread = ?a.thread, peer = a.peer, why = ?a.why, "a connection from a thread's agent: it reads, and starts and cancels its own thread's jobs only");
     }
@@ -1235,37 +1243,10 @@ async fn pump_control(
     w: Writer,
     id: u64,
     ack: Value,
-    mut sub: crate::hub::ControlSubscription,
+    sub: crate::hub::ControlSubscription,
     _slot: SubSlot,
 ) {
-    if send(&w, &Response::ok(id, ack)).await.is_err() {
-        return;
-    }
-    loop {
-        match sub.next().await {
-            Ok(Some((gseq, ev))) => {
-                let item = Item {
-                    stream: StreamKind::Control,
-                    gseq: Some(gseq),
-                    event: &ev,
-                };
-                if send(&w, &item).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = send(
-                    &w,
-                    &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
-                )
-                .await;
-                break;
-            }
-        }
-    }
-    // End of stream: close our side so the client sees EOF.
-    let _ = w.lock().await.shutdown().await;
+    pump(w, id, ack, sub).await;
 }
 
 /// Serves thread subscription `sub` like [`pump_control`].
@@ -1273,35 +1254,109 @@ async fn pump_thread(
     w: Writer,
     id: u64,
     ack: Value,
-    mut sub: crate::hub::ThreadSubscription,
+    sub: crate::hub::ThreadSubscription,
     _slot: SubSlot,
 ) {
+    pump(w, id, ack, sub).await;
+}
+
+/// Most bytes of items [`pump`] writes at once.
+const WRITE_BATCH: usize = 64 * 1024;
+
+/// A subscription [`pump`] serves.
+trait Feed: Send {
+    type Item: Send;
+    /// The next item; `Ok(None)` once the hub has shut down.
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
+    /// Appends the line of the next item already in the store to `buf`; `Ok(false)` when none
+    /// is, without waiting.
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
+    /// Appends `item` to `buf` as its line.
+    fn line(item: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()>;
+}
+
+impl Feed for crate::hub::ControlSubscription {
+    type Item = crate::hub::ControlItem;
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+        crate::hub::ControlSubscription::next(self)
+    }
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        crate::hub::ControlSubscription::write_stored(self, buf)
+    }
+    fn line((gseq, ev): &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+        crate::hub::stream_line(buf, Some(*gseq), ev)
+    }
+}
+
+impl Feed for crate::hub::ThreadSubscription {
+    type Item = Arc<Event>;
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+        crate::hub::ThreadSubscription::next(self)
+    }
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        crate::hub::ThreadSubscription::write_stored(self, buf)
+    }
+    fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+        crate::hub::stream_line(buf, None, ev)
+    }
+}
+
+/// Serves subscription `sub` (request `id`, acknowledged with `ack`) until it ends: what the
+/// store holds first, in writes of up to [`WRITE_BATCH`] bytes (a replay of thousands goes out
+/// in few writes, not one each, its rows written out as stored), then each live item as it
+/// comes.
+async fn pump<F: Feed>(w: Writer, id: u64, ack: Value, mut sub: F) {
     if send(&w, &Response::ok(id, ack)).await.is_err() {
         return;
     }
+    let mut buf = Vec::new();
     loop {
-        match sub.next().await {
-            Ok(Some(ev)) => {
-                let item = Item {
-                    stream: StreamKind::Thread,
-                    gseq: None,
-                    event: &ev,
-                };
-                if send(&w, &item).await.is_err() {
-                    return;
+        buf.clear();
+        let mut failed = None;
+        while buf.len() < WRITE_BATCH {
+            match sub.write_stored(&mut buf) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = send(
-                    &w,
-                    &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
-                )
-                .await;
-                break;
+        }
+        // Nothing stored left: the next item comes live.
+        if buf.is_empty() && failed.is_none() {
+            match sub.next().await {
+                Ok(Some(item)) => {
+                    if F::line(&item, &mut buf).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => failed = Some(e),
             }
         }
+        if !buf.is_empty() {
+            let mut out = w.lock().await;
+            if out.write_all(&buf).await.is_err() || out.flush().await.is_err() {
+                return;
+            }
+        }
+        if let Some(e) = failed {
+            let _ = send(
+                &w,
+                &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
+            )
+            .await;
+            break;
+        }
     }
+    // End of stream: close our side so the client sees EOF.
     let _ = w.lock().await.shutdown().await;
 }
 
@@ -2529,6 +2584,109 @@ mod tests {
     use super::*;
     use crate::HubOptions;
     use twr_core::config::Config;
+
+    /// A subscription of `stored` items in the store, then `live` ones (each a wait), then the
+    /// hub's end; or an error after `fail_after` items.
+    struct FakeFeed {
+        next: u64,
+        stored: u64,
+        live: u64,
+        fail_after: Option<u64>,
+    }
+
+    impl FakeFeed {
+        fn take(&mut self) -> anyhow::Result<Option<Arc<Event>>> {
+            if self.fail_after == Some(self.next) {
+                anyhow::bail!("the store failed");
+            }
+            self.next += 1;
+            let body = twr_core::event::EventBody::AgentText(twr_core::event::AgentText {
+                text: format!("event {} {}", self.next, "x".repeat(200)),
+                ..Default::default()
+            });
+            Ok(Some(Arc::new(Event::new(
+                "t1",
+                self.next,
+                None,
+                twr_core::event::Source::Hub,
+                body,
+            ))))
+        }
+    }
+
+    impl Feed for FakeFeed {
+        type Item = Arc<Event>;
+        async fn next(&mut self) -> anyhow::Result<Option<Self::Item>> {
+            if self.next >= self.stored + self.live {
+                return Ok(None);
+            }
+            if self.next >= self.stored {
+                tokio::task::yield_now().await;
+            }
+            self.take()
+        }
+        fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+            if self.next >= self.stored {
+                return Ok(false);
+            }
+            let ev = self.take()?.unwrap();
+            crate::hub::stream_line(buf, None, &ev)?;
+            Ok(true)
+        }
+        fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+            crate::hub::stream_line(buf, None, ev)
+        }
+    }
+
+    /// What `feed` pumps: the lines read on the other end, up to its EOF.
+    async fn pumped(feed: FakeFeed) -> Vec<Value> {
+        use tokio::io::AsyncBufReadExt;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (_r, w) = a.into_split();
+        let task = tokio::spawn(pump(Arc::new(Mutex::new(w)), 5, json!({"head": 0}), feed));
+        let mut lines = BufReader::new(b).lines();
+        let mut out = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            out.push(serde_json::from_str(&line).unwrap());
+        }
+        task.await.unwrap();
+        out
+    }
+
+    /// A replay goes out in writes of many items, and every item arrives, once and in order,
+    /// whatever the batches: the stored ones, then the live ones, then the end of the stream.
+    /// A store that fails mid-replay sends what came before it, then the error, then ends.
+    #[tokio::test]
+    async fn a_pumped_replay_arrives_whole_and_in_order() {
+        let out = pumped(FakeFeed {
+            next: 0,
+            stored: 3000,
+            live: 5,
+            fail_after: None,
+        })
+        .await;
+        assert_eq!(out[0], json!({"id": 5, "result": {"head": 0}}));
+        let seqs: Vec<u64> = out[1..]
+            .iter()
+            .map(|l| l["event"]["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (1..=3005).collect::<Vec<_>>());
+
+        let out = pumped(FakeFeed {
+            next: 0,
+            stored: 3000,
+            live: 0,
+            fail_after: Some(1234),
+        })
+        .await;
+        assert_eq!(out.len(), 1 + 1234 + 1);
+        assert_eq!(out[1234]["event"]["seq"], 1234);
+        assert_eq!(out[1235]["id"], 5);
+        assert!(out[1235]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the store failed"));
+    }
 
     /// A connection from this test process that presented `token`, opened by this process
     /// started at `start_time` as the hub read it (`None`: it could not be read).

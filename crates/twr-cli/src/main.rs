@@ -1014,6 +1014,14 @@ fn main() -> ExitCode {
         twr_hub::job_gate_main(std::env::args_os().skip(1).collect());
     }
     let cli = Cli::parse();
+    twr_core::trace::mark_with(|| {
+        let role = match &cli.cmd {
+            None => "tui",
+            Some(Cmd::Hub { cmd: None }) => "hub",
+            Some(_) => "cli",
+        };
+        format!("{role}: process started")
+    });
     let stopping_hub = matches!(
         cli.cmd,
         Some(Cmd::Hub {
@@ -1491,6 +1499,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         bail!("there is no workspace {name}{from}: create it with `twr ws new {name}` (`twr ws` lists them)");
     }
     let config = Config::load_from(&paths)?;
+    twr_core::trace::mark("cli: config loaded");
     if cli.socket.is_none() {
         let _ = EXPECTED_WORKSPACE.set(paths.workspace_name().to_string());
         // `hub.socket` is the default workspace's alone.
@@ -2346,6 +2355,7 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
         let paths = paths.clone();
         tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
     };
+    twr_core::trace::mark("hub: config read");
     let mut opts = HubOptions::new(paths.db_file(), config);
     opts.boxes_lock = boxes_lock;
     opts.config_file = Some(paths.config_file.clone());
@@ -6697,7 +6707,9 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     let mut spawned: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        match probe_hub(socket).await? {
+        let probe = probe_hub(socket).await?;
+        twr_core::trace::mark_with(|| format!("cli: hub probe: {probe:?}"));
+        match probe {
             Probe::Answers => return Ok(()),
             Probe::Absent => match spawned {
                 None => {

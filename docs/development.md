@@ -34,6 +34,22 @@ What doesn't pay off for twr's own threads:
 - sccache (`RUSTC_WRAPPER=sccache`) shares compiled dependencies between worktrees, but only saves build time: each `target/` still gets its own copies, the cache adds its own, and it doesn't cache incrementally built workspace crates or linked executables, which are most of the size.
 - Merging the integration test files of each crate into one test binary (`tests/it/main.rs` with a module per file) would save most of the executables' size and link time, about 1.5 GB per worktree for `twr-hub` alone with line tables. But it means moving every test file, which conflicts with every branch in flight, and tests that run in one process share its state. It's worth doing once few branches are open.
 
+## Timing startup
+
+`TWR_TRACE_STARTUP=<file>` has every twr process that sees the variable append one line per step to the file: `<microseconds since the Unix epoch> <pid> <step>`. Bare `twr` passes it on to the hub it starts, so one file has both sides:
+
+```sh
+TWR_TRACE_STARTUP=/tmp/twr-start.log twr
+```
+
+The CLI marks loading the config and each probe of the hub socket; the hub, locking its data, binding its socket, opening the store, loading and folding the log, recovering and serving, and how long it took to tell who each connection is; the TUI, connecting, subscribing to the control stream, the `Loading…` frame, the end of the control replay, the transcript's subscription, each key, and each frame that shows another thread or loading state, with how long it took to draw. Without the variable nothing is written.
+
+`crates/twr-tui/src/bench.rs` times what the TUI does with a replay: decoding a control stream of about 30 000 items, applying it, decoding and applying the orchestrator's last 2000 events, laying out the conversation and drawing it. It makes its log up by default; `TWR_BENCH_CONTROL` and `TWR_BENCH_TRANSCRIPT` name files of a real hub's stream lines instead (what `control.subscribe` and `thread.subscribe` push):
+
+```sh
+cargo test --release -p twr-tui --lib -- --ignored --nocapture replay_bench
+```
+
 ## The fake runtime
 
 The `fake` runtime plays a prompt line by line. Lines that start with a directive do something; other lines become the agent's reply. It's only available with `TWR_ENABLE_FAKE=1`, because `!write` writes files.

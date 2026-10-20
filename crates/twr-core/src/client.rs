@@ -15,7 +15,7 @@ use tokio::net::UnixStream;
 
 use crate::blob::BlobFetch;
 use crate::proto::{
-    codes, encode_line, read_frame, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
+    codes, encode_line, read_message, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
     PROTOCOL_VERSION,
 };
 
@@ -182,7 +182,7 @@ fn connection_closed(e: &std::io::Error) -> bool {
 /// left of it.
 async fn parting_words(reader: &mut Reader) -> Option<RpcError> {
     loop {
-        match read_frame::<_, ServerMessage>(reader).await {
+        match read_message(reader).await {
             Ok(Some(ServerMessage::Response(r))) if r.id == 0 => {
                 if let Err(e) = r.result {
                     return Some(e);
@@ -265,7 +265,7 @@ impl Client {
             return Err(HubClosed::new(method, true, None, Some(e)).into());
         }
         loop {
-            let msg = match read_frame::<_, ServerMessage>(&mut self.reader).await {
+            let msg = match read_message(&mut self.reader).await {
                 Ok(msg) => msg,
                 Err(e) if connection_closed(&e) => {
                     return Err(HubClosed::new(method, true, None, Some(e)).into());
@@ -436,7 +436,7 @@ impl Subscription {
     /// Next pushed item; `Ok(None)` when the hub closes the stream.
     pub async fn next(&mut self) -> anyhow::Result<Option<StreamItem>> {
         loop {
-            let msg: Option<ServerMessage> = read_frame(&mut self.reader)
+            let msg: Option<ServerMessage> = read_message(&mut self.reader)
                 .await
                 .context("reading subscription")?;
             match msg {
@@ -468,7 +468,7 @@ impl Subscription {
 mod tests {
     use super::*;
     use crate::event::{Event, EventBody, SessionPayload, Source};
-    use crate::proto::{codes, write_frame, Response, RpcError, StreamKind};
+    use crate::proto::{codes, read_frame, write_frame, Response, RpcError, StreamKind};
     use futures::StreamExt;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

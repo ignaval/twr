@@ -106,6 +106,11 @@ fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
 /// The event with its payload hydrated from `conn`'s blobs, when it has capped fields (`None`
 /// otherwise, or when hydration fails, which is logged).
 pub(super) fn hydrated_from_store(conn: &Connection, ev: &Event) -> Option<Event> {
+    // Most events have nothing moved: told without building their `data` (a hub start asks
+    // this of every control event of the log).
+    if !ev.body.maybe_capped() {
+        return None;
+    }
     let mut data = ev.body.data().ok()?;
     if !has_capped(&data) {
         return None;
@@ -298,8 +303,19 @@ impl Core {
     /// Folds `ev`; for a control event `self.gseq` is its own control position (set by the
     /// callers first), which is the revision of an `attention.raised`.
     pub(super) fn apply(&mut self, ev: &Event) {
-        self.seqs.insert(ev.thread.clone(), ev.seq);
-        self.last_ts.insert(ev.thread.clone(), ev.ts);
+        // (No new key for a thread already known: this runs for every event of the log.)
+        match self.seqs.get_mut(&ev.thread) {
+            Some(seq) => *seq = ev.seq,
+            None => {
+                self.seqs.insert(ev.thread.clone(), ev.seq);
+            }
+        }
+        match self.last_ts.get_mut(&ev.thread) {
+            Some(ts) => *ts = ev.ts,
+            None => {
+                self.last_ts.insert(ev.thread.clone(), ev.ts);
+            }
+        }
         self.registry.apply(ev);
         self.attention
             .apply_at(ev, ev.is_control().then_some(self.gseq));
