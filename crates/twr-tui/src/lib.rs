@@ -1734,19 +1734,28 @@ async fn forward_unread(
 /// view's (left by a switch and still sending what it had been asked), is done: one
 /// workspace's calls go out in the order they were asked, across switches.
 fn spawn_calls(
-    previous: Option<tokio::task::JoinHandle<()>>,
+    previous: Option<Calls>,
     calls: impl CallHub + 'static,
     rx: mpsc::UnboundedReceiver<(&'static str, Value)>,
     status: StatusOut,
     results: ResultsOut,
-) -> tokio::task::JoinHandle<()> {
+) -> Calls {
     tokio::spawn(async move {
-        if let Some(previous) = previous {
-            let _ = previous.await;
-        }
-        serve_calls(calls, rx, status, results).await;
+        // The earlier view's `!` commands too: a stop asked here may name one of them.
+        let launched = match previous {
+            Some(previous) => previous.await.unwrap_or_default(),
+            None => Launched::default(),
+        };
+        serve_calls(calls, rx, status, results, launched).await
     })
 }
+
+/// The jobs of a workspace's latest `!` commands, by the TUI's numbers for them
+/// ([`Action::ShellRun`]'s `launch`), at most [`SHELL_LAUNCHES_KEPT`].
+type Launched = std::collections::VecDeque<(Value, Value)>;
+
+/// A workspace view's calls ([`spawn_calls`]): what it ends with is its [`Launched`].
+type Calls = tokio::task::JoinHandle<Launched>;
 
 /// Stops every view's calls in `callers` (quitting): also those a later view of their
 /// workspace waits for, and those of workspaces in the background.
@@ -1761,9 +1770,9 @@ fn abort_all(callers: &mut Vec<tokio::task::AbortHandle>) {
 /// it (`callers`); quitting stops it.
 fn end_calls(
     switching: bool,
-    caller: tokio::task::JoinHandle<()>,
+    caller: Calls,
     workspace: Option<&str>,
-    callers: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    callers: &mut std::collections::HashMap<String, Calls>,
 ) {
     match (switching, workspace) {
         (true, Some(w)) => {
@@ -1816,9 +1825,8 @@ async fn serve_calls(
     mut rx: mpsc::UnboundedReceiver<(&'static str, Value)>,
     status: StatusOut,
     results: ResultsOut,
-) {
-    // The jobs of the latest `!` commands, by their numbers ([`Action::ShellRun`]).
-    let mut launched: std::collections::VecDeque<(Value, Value)> = Default::default();
+    mut launched: Launched,
+) -> Launched {
     while let Some((method, mut params)) = rx.recv().await {
         let launch = match method {
             "shell.run" => params.as_object_mut().and_then(|p| p.remove("launch")),
@@ -1894,6 +1902,7 @@ async fn serve_calls(
             }
         }
     }
+    launched
 }
 
 /// Why [`drive`] returned.
@@ -1915,7 +1924,7 @@ enum End {
 /// working icon, and the workspaces with how many items each one had waiting when last seen.
 struct Shared {
     /// The calls each workspace left by a switch is still sending ([`end_calls`]).
-    callers: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    callers: std::collections::HashMap<String, Calls>,
     /// Every view's calls ever started: quitting stops all that still run ([`abort_all`]).
     all_callers: Vec<tokio::task::AbortHandle>,
     /// Errors of calls a workspace left asked for, once another one shows ([`serve_calls`]).
@@ -2902,7 +2911,14 @@ mod tests {
             late: Some((late_tx, "a".into())),
             selection: " -w a".into(),
         };
-        super::serve_calls(Recording(seen.clone(), None), rx, status, results).await;
+        super::serve_calls(
+            Recording(seen.clone(), None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         assert_eq!(*seen.lock().unwrap(), ["say", "fail"]);
         let (msg, transient) = late_rx.try_recv().unwrap();
         assert!(msg.starts_with("workspace a: "), "{msg}");
@@ -2943,7 +2959,14 @@ mod tests {
             view: view_tx,
             followed: followed_tx,
         };
-        super::serve_calls(Recording(seen, None), rx, status, results).await;
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         let (method, r) = followed_rx.try_recv().unwrap();
         assert_eq!((method, r["ref"].as_i64()), ("message.withdraw", Some(7)));
         let (_, r) = followed_rx.try_recv().unwrap();
@@ -3013,7 +3036,14 @@ mod tests {
             view: mpsc::unbounded_channel().0,
             followed: mpsc::unbounded_channel().0,
         };
-        super::serve_calls(Params(seen.clone()), rx, status, results).await;
+        super::serve_calls(
+            Params(seen.clone()),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         let seen = seen.lock().unwrap();
         assert!(
             seen.iter().all(|(_, p)| p.get("launch").is_none()),
@@ -3023,6 +3053,52 @@ mod tests {
         assert_eq!(
             cancels,
             [&("job.cancel", serde_json::json!({"job": "sleep 2"}))]
+        );
+    }
+
+    /// A command run by a view left by a switch, stopped from the workspace's next view
+    /// before its answer was read there: the next view's calls know its job.
+    #[tokio::test]
+    async fn a_stop_from_the_next_view_cancels_the_earlier_views_command() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = || {
+            (
+                super::StatusOut {
+                    tx: mpsc::unbounded_channel().0,
+                    late: None,
+                    selection: String::new(),
+                },
+                super::ResultsOut {
+                    view: mpsc::unbounded_channel().0,
+                    followed: mpsc::unbounded_channel().0,
+                },
+            )
+        };
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let run = Action::ShellRun {
+            thread: None,
+            command: "sleep 9".into(),
+            cwd: None,
+            share: false,
+            launch: 4,
+        };
+        tx1.send(super::action_request(&run).unwrap()).unwrap();
+        drop(tx1);
+        let (status, results) = out();
+        let first = super::spawn_calls(None, Params(seen.clone()), rx1, status, results);
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        tx2.send(super::action_request(&Action::ShellStopLaunch { launch: 4 }).unwrap())
+            .unwrap();
+        drop(tx2);
+        let (status, results) = out();
+        let second = super::spawn_calls(Some(first), Params(seen.clone()), rx2, status, results);
+        second.await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.last(),
+            Some(&("job.cancel", serde_json::json!({"job": "sleep 9"})))
         );
     }
 
@@ -3051,7 +3127,14 @@ mod tests {
             view: view_tx,
             followed: followed_tx,
         };
-        super::serve_calls(Recording(seen, None), rx, status, results).await;
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         let (method, r) = followed_rx.try_recv().unwrap();
         assert_eq!(method, "shell.cd");
         assert_eq!(r["failed"], true);

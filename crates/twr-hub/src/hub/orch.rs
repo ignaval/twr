@@ -1755,7 +1755,7 @@ impl Core {
                     return;
                 };
                 // An interim report: the result comes later.
-                if !view.background_tasks.is_empty() || report::interim_tasks(p) > 0 {
+                if view.own_background() || report::interim_tasks(p) > 0 {
                     return;
                 }
                 if p.written_by == "orchestrator" {

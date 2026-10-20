@@ -70,6 +70,11 @@ fn shell_program() -> String {
         .unwrap_or_else(|| "/bin/sh".to_string())
 }
 
+/// Whether `dir` is `~` or under it (what [`resolve_dir`] takes from `$HOME`).
+fn is_home_relative(dir: &str) -> bool {
+    dir == "~" || dir.starts_with("~/")
+}
+
 /// `dir`, with `~` for the home directory, against `base` when relative; the folder it names
 /// (resolved), or why not.
 pub fn resolve_dir(base: &Path, dir: &str) -> Result<PathBuf, String> {
@@ -275,12 +280,16 @@ impl Hub {
             return Err(rpc(codes::UNAUTHORIZED, "only the user runs `!` commands"));
         }
         let default = super::orch::orchestrator_cwd(&self.inner.config);
-        let base = match cwd {
-            Some(c) => resolve_dir(&default, c).map_err(|e| rpc(codes::BAD_REQUEST, e))?,
-            None => resolve_dir(&default, ".").map_err(|e| rpc(codes::BAD_REQUEST, e))?,
-        };
-        let to = match dir.map(str::trim).filter(|d| !d.is_empty()) {
-            Some(d) => resolve_dir(&base, d).map_err(|e| rpc(codes::BAD_REQUEST, e))?,
+        let bad = |e| rpc(codes::BAD_REQUEST, e);
+        let dir = dir.map(str::trim).filter(|d| !d.is_empty());
+        // A folder named from `/` or `~` needs no base: it moves even when the folder now (or
+        // the orchestrator's) is gone, which is how one gets out of it.
+        if let Some(d) = dir.filter(|d| Path::new(d).is_absolute() || is_home_relative(d)) {
+            return Ok(json!({ "cwd": resolve_dir(&default, d).map_err(bad)? }));
+        }
+        let base = resolve_dir(&default, cwd.unwrap_or(".")).map_err(bad)?;
+        let to = match dir {
+            Some(d) => resolve_dir(&base, d).map_err(bad)?,
             None => base,
         };
         Ok(json!({ "cwd": to }))

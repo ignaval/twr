@@ -237,6 +237,19 @@ async fn the_orchestrator_view_runs_in_its_folder() {
             .code,
         codes::BAD_REQUEST
     );
+    // The folder now is gone: a folder named from `/` still moves there, a relative one
+    // can't.
+    let gone = dir.path().join("gone");
+    let cd = hub
+        .shell_cd(gone.to_str(), sub_dir.to_str(), &tui())
+        .unwrap();
+    assert_eq!(cd["cwd"].as_str(), sub_dir.to_str());
+    assert_eq!(
+        hub.shell_cd(gone.to_str(), Some("sub"), &tui())
+            .unwrap_err()
+            .code,
+        codes::BAD_REQUEST
+    );
     let mut sub = hub.subscribe_control(0);
     let r = hub
         .shell_run(run(None, "pwd", sub_dir.to_str(), false), &tui())
@@ -506,5 +519,49 @@ async fn a_lost_shared_command_queues_no_prompt() {
         "{q}"
     );
     hub.stop_thread("api", "test").unwrap();
+    hub.shutdown().await;
+}
+
+/// A worker's turn that ends while a `!` command of the user's runs in its worktree is not
+/// interim: the command starts no turn that would report again, so the hub's report is final,
+/// and so is one written later, which raises its review at once.
+#[tokio::test]
+async fn a_command_running_leaves_a_workers_report_final() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path()).await;
+    let api = thread(&hub, dir.path(), "api").await;
+    let mut sub = hub.subscribe_control(0);
+    let r = hub
+        .shell_run(run(Some("api"), "sleep 60", None, false), &tui())
+        .unwrap();
+    let job = r["job"].as_str().unwrap().to_string();
+    running(&hub, &job).await;
+    hub.send_by(&api, "do it", &tui()).unwrap();
+    let report = timeout(WAIT, async {
+        loop {
+            let (_, ev) = sub.next().await.unwrap().expect("hub stopped");
+            if let EventBody::ReportReady(p) = &ev.body {
+                if ev.thread == api {
+                    return p.clone();
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let twr = Value::Object(report.ext.unwrap_or_default())["twr"].clone();
+    assert!(twr["background_tasks"].is_null(), "{twr}");
+    let written = hub
+        .write_report(
+            &api,
+            Some(1),
+            "Done, untested.",
+            Grade::NeedsVerification,
+            &Caller::Orchestrator,
+        )
+        .unwrap();
+    assert!(!written["review"].is_null(), "{written}");
+    assert!(live(&hub, &job), "still running");
+    hub.cancel_job(&job, None).unwrap();
     hub.shutdown().await;
 }
