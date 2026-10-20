@@ -2782,6 +2782,9 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     if e.downcast_ref::<RpcError>().is_some() {
         return false;
     }
+    if e.downcast_ref::<twr_core::client::HubClosed>().is_some() {
+        return true;
+    }
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>().is_some_and(|e| {
             matches!(
@@ -2792,12 +2795,7 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::UnexpectedEof
             )
         })
-    }) || matches!(
-        e.to_string().as_str(),
-        "hub closed the connection during hello"
-            | "hub closed the connection during hub.info"
-            | "hub closed the connection during hub.shutdown"
-    )
+    })
 }
 
 /// Default plus the same named directories as `twr ws`. Each stop has its own deadline
@@ -8253,9 +8251,8 @@ mod tests {
     fn hub_stop_connection_retries_preserve_rpc_refusals() {
         let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(stop_connection_lost(&reset));
-        assert!(stop_connection_lost(&anyhow!(
-            "hub closed the connection during hello"
-        )));
+        let closed = twr_core::client::HubClosed::new("hub.info", true, None, None);
+        assert!(stop_connection_lost(&closed.into()));
         let refusal = anyhow::Error::from(RpcError::new(
             codes::UNAUTHORIZED,
             "hub closed the connection during hello",

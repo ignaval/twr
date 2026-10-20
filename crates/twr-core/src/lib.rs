@@ -279,7 +279,10 @@ mod tests {
         assert_eq!(line, format!("exe=ok:{}", exe.display()));
         let (exe, line) = run(false);
         assert!(
-            line.starts_with(&format!("exe=err:the twr executable this process started from, {}, is gone", exe.display())),
+            line.starts_with(&format!(
+                "exe=err:the twr executable this process started from, {}, is gone",
+                exe.display()
+            )),
             "{line}"
         );
     }

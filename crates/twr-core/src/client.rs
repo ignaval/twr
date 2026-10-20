@@ -92,8 +92,7 @@ const PARTING_READ: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The hub closed a call's connection before answering it: it stopped or restarted (or
 /// crashed) since the connection was opened, or could not read the request. [`Client::call`]
-/// returns it (`err.downcast_ref::<HubClosed>()`); its source is the I/O error that showed it,
-/// if one did.
+/// returns it (`err.downcast_ref::<HubClosed>()`).
 #[derive(Debug)]
 pub struct HubClosed {
     /// The method called.
@@ -104,11 +103,14 @@ pub struct HubClosed {
     /// What the hub said as it closed: its error for the connection (request 0), such as
     /// [`codes::STOPPING`] or a request it could not read ([`codes::BAD_REQUEST`]).
     pub said: Option<RpcError>,
+    /// The I/O error that showed the connection was closed, if one did.
     io: Option<std::io::Error>,
 }
 
 impl HubClosed {
-    fn new(
+    /// The error for `method` ([`HubClosed::maybe_done`], [`HubClosed::said`]), with the I/O
+    /// error that showed it (`io`).
+    pub fn new(
         method: &str,
         maybe_done: bool,
         said: Option<RpcError>,
@@ -126,11 +128,7 @@ impl HubClosed {
     /// and did not refuse it (it closed this connection, it stopped). Even a `thread.send` then
     /// goes once.
     pub fn resendable(&self) -> bool {
-        !self.maybe_done
-            && self
-                .said
-                .as_ref()
-                .is_none_or(|e| e.code == codes::STOPPING)
+        !self.maybe_done && self.said.as_ref().is_none_or(|e| e.code == codes::STOPPING)
     }
 }
 
@@ -168,11 +166,8 @@ impl std::fmt::Display for HubClosed {
     }
 }
 
-impl std::error::Error for HubClosed {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.io.as_ref().map(|e| e as _)
-    }
-}
+// Without a source: the I/O error is part of the message, before what to do.
+impl std::error::Error for HubClosed {}
 
 /// Whether I/O error `e` on a hub connection means the hub closed it.
 fn connection_closed(e: &std::io::Error) -> bool {
@@ -470,6 +465,112 @@ mod tests {
         );
         assert_eq!(user_token_of(" \n"), None);
         assert_eq!(user_token_of(&"x".repeat(257)), None);
+    }
+
+    /// A client and the hub's end of its connection.
+    fn pair() -> (Client, tokio::net::UnixStream) {
+        let (c, h) = tokio::net::UnixStream::pair().unwrap();
+        (Client::from_io(c), h)
+    }
+
+    fn line(r: &Response) -> Vec<u8> {
+        let mut l = serde_json::to_vec(r).unwrap();
+        l.push(b'\n');
+        l
+    }
+
+    fn stopping() -> Response {
+        Response::err(0, RpcError::new(codes::STOPPING, "the hub is stopping"))
+    }
+
+    async fn closed_on(c: &mut Client) -> (HubClosed, String) {
+        let e = c
+            .call("thread.send", json!({"thread": "w1", "prompt": "hi"}))
+            .await
+            .unwrap_err();
+        let shown = format!("{e:#}");
+        let closed = e.downcast::<HubClosed>().expect("a HubClosed");
+        (closed, shown)
+    }
+
+    /// A connection the hub closed as it stopped (the TUI's, the MCP server's, kept open):
+    /// the next call cannot be written, so nothing was done, and the error says why the hub
+    /// went (what it said as it closed) and what to check, not "Broken pipe".
+    #[tokio::test]
+    async fn a_call_on_a_connection_the_hub_closed_says_so() {
+        let (mut c, mut hub) = pair();
+        hub.write_all(&line(&stopping())).await.unwrap();
+        drop(hub);
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(!closed.maybe_done && closed.resendable(), "{closed:?}");
+        assert_eq!(closed.said.as_ref().unwrap().code, codes::STOPPING);
+        assert_eq!(
+            shown,
+            "the hub closed the connection before thread.send reached it (nothing was done): \
+             the hub is stopping; is it running? `twr info`"
+        );
+
+        // A hub that said nothing (one that crashed, or older than the notice).
+        let (mut c, hub) = pair();
+        drop(hub);
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(closed.resendable(), "{closed:?}");
+        assert!(
+            shown.starts_with(
+                "the hub closed the connection before thread.send reached it (nothing was \
+                 done) (Broken pipe"
+            ) && shown.ends_with("; is it running? `twr info`"),
+            "{shown}"
+        );
+    }
+
+    /// The hub read the request and closed before it answered: it may have been done, so it
+    /// is not sent again, and the error says to check.
+    #[tokio::test]
+    async fn a_call_the_hub_had_is_not_sent_again() {
+        let (mut c, hub) = pair();
+        let reader = tokio::spawn(async move {
+            let mut r = BufReader::new(hub);
+            let mut got = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut r, &mut got)
+                .await
+                .unwrap();
+            got
+        });
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(reader.await.unwrap().contains("thread.send"));
+        assert!(closed.maybe_done && !closed.resendable(), "{closed:?}");
+        assert_eq!(
+            shown,
+            "the hub closed the connection before answering thread.send; it may have been \
+             done, so check before trying again; is it running? `twr info`"
+        );
+    }
+
+    /// A request the hub could not read (an oversized line, malformed JSON) is refused with
+    /// its error for the connection (request 0), which the client used to skip.
+    #[tokio::test]
+    async fn a_request_the_hub_cannot_read_is_refused_with_why() {
+        let (mut c, hub) = pair();
+        tokio::spawn(async move {
+            let mut r = BufReader::new(hub);
+            let mut got = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut r, &mut got)
+                .await
+                .unwrap();
+            let e = RpcError::new(codes::BAD_REQUEST, "frame exceeds MAX_FRAME");
+            r.get_mut()
+                .write_all(&line(&Response::err(0, e)))
+                .await
+                .unwrap();
+        });
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(!closed.maybe_done && !closed.resendable(), "{closed:?}");
+        assert_eq!(
+            shown,
+            "the hub refused the request for thread.send and closed the connection: frame \
+             exceeds MAX_FRAME"
+        );
     }
 
     fn item(seq: u64) -> StreamItem {

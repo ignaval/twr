@@ -1150,7 +1150,7 @@ fn hub_stop_all_reports_a_socket_that_keeps_closing_connections() {
     assert!(
         stdout.contains("a: failed:")
             && stdout.contains("keeps closing connections")
-            && stdout.contains("closed the connection during hello"),
+            && stdout.contains("closed the connection before answering hello"),
         "{stdout}"
     );
     assert!(
