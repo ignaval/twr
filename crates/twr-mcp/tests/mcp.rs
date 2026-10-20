@@ -1747,8 +1747,10 @@ async fn reconnects_after_the_hub_connection_breaks() {
 
     let r = h.call("get_thread", json!({ "thread": "DROP" })).await;
     assert!(is_error(&r));
+    // The hub had the request (it may have done it): not sent again; the error says so.
     assert!(
-        text(&r).contains("hub connection failed during thread.get"),
+        text(&r).contains("the hub closed the connection before answering thread.get")
+            && text(&r).contains("(the next call reconnects)"),
         "{}",
         text(&r)
     );

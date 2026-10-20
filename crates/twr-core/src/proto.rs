@@ -6,6 +6,10 @@
 //!
 //! A subscription request is answered with a normal response, after which the server writes
 //! stream items on the same connection until it closes.
+//!
+//! An error with id 0 is about the connection, which the hub closes next: a line it could not
+//! read (`bad_request`), or the hub stopping ([`codes::STOPPING`]). The request a client waits
+//! for then was not done ([`crate::client::HubClosed`]).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -55,6 +59,9 @@ pub mod codes {
     /// The orchestrator tried to answer a permission or question the user did not explicitly
     /// answer in its current turn, or to resolve an item it may only annotate (relay rule).
     pub const RELAY_FORBIDDEN: &str = "relay_forbidden";
+    /// The hub is stopping: what it says to a connection it closes as it stops (as the reply
+    /// to request 0), so a client that writes to it later knows why it is gone.
+    pub const STOPPING: &str = "stopping";
     /// Anything else.
     pub const INTERNAL: &str = "internal";
 }

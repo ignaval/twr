@@ -784,6 +784,47 @@ async fn bad_frames_close_the_connection() {
     timeout(WAIT, th.task).await.unwrap().unwrap().unwrap();
 }
 
+/// A connection kept open across a hub stop (the TUI's, the MCP server's) is told why it
+/// closes: the next call on it fails saying the hub stopped and that nothing was done, which
+/// a client may resend on a new connection. A request the hub cannot read is refused with
+/// why. Before, both came out as "Broken pipe" or "closed the connection".
+#[tokio::test]
+async fn a_connection_left_open_across_a_stop_is_told_why() {
+    use twr_core::client::HubClosed;
+    let th = start().await;
+    let mut stale = Client::connect(&th.socket).await.unwrap();
+    stale.call("hub.info", Value::Null).await.unwrap();
+
+    let mut big = Client::connect(&th.socket).await.unwrap();
+    let prompt = "x".repeat(twr_core::proto::MAX_FRAME + 1);
+    let e = timeout(
+        WAIT,
+        big.call("thread.send", json!({"thread": "w1", "prompt": prompt})),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    let closed = e.downcast_ref::<HubClosed>().expect("a HubClosed");
+    assert!(!closed.resendable(), "{closed:?}");
+    assert_eq!(closed.said.as_ref().unwrap().code, codes::BAD_REQUEST);
+    assert!(
+        format!("{e:#}").contains("refused the request for thread.send"),
+        "{e:#}"
+    );
+
+    let mut c = Client::connect(&th.socket).await.unwrap();
+    c.call("hub.shutdown", Value::Null).await.unwrap();
+    timeout(WAIT, th.task).await.unwrap().unwrap().unwrap();
+    let e = stale
+        .call("thread.send", json!({"thread": "w1", "prompt": "hi"}))
+        .await
+        .unwrap_err();
+    let closed = e.downcast_ref::<HubClosed>().expect("a HubClosed");
+    assert!(closed.resendable(), "{closed:?}");
+    assert_eq!(closed.said.as_ref().unwrap().code, codes::STOPPING);
+    assert!(format!("{e:#}").contains("the hub is stopping"), "{e:#}");
+}
+
 // --- attach lease, attention.list, socket path length -------------------------------------------
 
 /// Control items until `pred` matches.

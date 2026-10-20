@@ -2782,6 +2782,9 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     if e.downcast_ref::<RpcError>().is_some() {
         return false;
     }
+    if e.downcast_ref::<twr_core::client::HubClosed>().is_some() {
+        return true;
+    }
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>().is_some_and(|e| {
             matches!(
@@ -2792,12 +2795,7 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::UnexpectedEof
             )
         })
-    }) || matches!(
-        e.to_string().as_str(),
-        "hub closed the connection during hello"
-            | "hub closed the connection during hub.info"
-            | "hub closed the connection during hub.shutdown"
-    )
+    })
 }
 
 /// Default plus the same named directories as `twr ws`. Each stop has its own deadline
@@ -6599,8 +6597,10 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     let log_path = paths.hub_log();
     let log = twr_core::paths::open_private_append(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("locating the twr executable")?;
-    let mut cmd = std::process::Command::new(exe);
+    // Not `std::env::current_exe`: the TUI starts hubs as it switches workspaces, maybe after
+    // an upgrade replaced the file it runs ([`twr_core::current_exe`]).
+    let exe = twr_core::current_exe().context("starting the hub")?;
+    let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--socket")
         .arg(socket)
         .arg("--workspace")
@@ -6615,7 +6615,7 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
     twr_adapters::process::new_session_std(&mut cmd);
-    spawn_reaped(&mut cmd).context("starting the hub")?;
+    spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
     Ok(())
 }
 
@@ -8251,9 +8251,8 @@ mod tests {
     fn hub_stop_connection_retries_preserve_rpc_refusals() {
         let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(stop_connection_lost(&reset));
-        assert!(stop_connection_lost(&anyhow!(
-            "hub closed the connection during hello"
-        )));
+        let closed = twr_core::client::HubClosed::new("hub.info", true, None, None);
+        assert!(stop_connection_lost(&closed.into()));
         let refusal = anyhow::Error::from(RpcError::new(
             codes::UNAUTHORIZED,
             "hub closed the connection during hello",

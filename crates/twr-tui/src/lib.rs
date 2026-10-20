@@ -39,7 +39,7 @@ use futures::{Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
-use twr_core::client::Client;
+use twr_core::client::{Client, HubClosed};
 use twr_core::event::EventBody;
 use twr_core::proto::StreamItem;
 
@@ -1498,6 +1498,58 @@ impl CallHub for Client {
     }
 }
 
+/// A view's calls connection to the hub on `socket`, opened again after the hub closed it (it
+/// stopped or restarted since: every later call failed with "Broken pipe" before). A call the
+/// hub closed the connection on before it reached it ([`HubClosed::resendable`]: nothing was
+/// done) is sent once more on the new connection, so a prompt is never sent twice; one the
+/// hub may have done is not, and says so.
+struct HubCalls {
+    socket: PathBuf,
+    client: Option<Client>,
+}
+
+impl CallHub for HubCalls {
+    fn call(
+        &mut self,
+        method: &'static str,
+        params: Value,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Value>> {
+        Box::pin(async move {
+            let client = match &mut self.client {
+                Some(c) => c,
+                None => self.client.insert(
+                    connect(&self.socket)
+                        .await
+                        .context("connecting to the hub again")?,
+                ),
+            };
+            let e = match client.call(method, params.clone()).await {
+                Err(e) if e.downcast_ref::<HubClosed>().is_some() => e,
+                r => return r,
+            };
+            self.client = None;
+            if !e
+                .downcast_ref::<HubClosed>()
+                .is_some_and(HubClosed::resendable)
+            {
+                return Err(e);
+            }
+            let mut client = match connect(&self.socket).await {
+                Ok(c) => c,
+                Err(again) => return Err(anyhow::anyhow!("{e:#} (connecting again: {again:#})")),
+            };
+            let r = client.call(method, params).await;
+            if !r
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<HubClosed>().is_some())
+            {
+                self.client = Some(client);
+            }
+            r
+        })
+    }
+}
+
 /// Where a task of one workspace's view says what happened: its status bar (`tx`) while the
 /// view lasts; once it is gone (a switch to another workspace), what is not transient goes to
 /// the next view's (`late`, with the workspace it came from). The commands a message quotes
@@ -1947,6 +1999,10 @@ async fn drive(
     let results = ResultsOut {
         view: result_tx,
         followed: followed_tx.clone(),
+    };
+    let calls = HubCalls {
+        socket: socket.clone(),
+        client: Some(calls),
     };
     let caller = spawn_calls(previous, calls, call_rx, status.clone(), results);
     ctx.all_callers.push(caller.abort_handle());
@@ -2450,6 +2506,84 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// The view's calls connection after the hub stopped and another started (a restart, an
+    /// upgrade): the prompt goes to the new hub, once, instead of "Broken pipe".
+    #[tokio::test]
+    async fn calls_reconnect_after_the_hub_restarted() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Stop]);
+        let first = super::connect(&socket).await.unwrap();
+        hub.hung_up().await;
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(first),
+        };
+        let params = json!({"thread": "w1", "prompt": "hi"});
+        calls.call("thread.send", params.clone()).await.unwrap();
+        calls.call("hub.info", Value::Null).await.unwrap();
+        assert_eq!(
+            hub.got(),
+            [vec!["hello"], vec!["hello", "thread.send", "hub.info"]]
+        );
+    }
+
+    /// A prompt the hub had when it went away (it may have been sent) is not sent again: the
+    /// error says to check; the next call connects again.
+    #[tokio::test]
+    async fn a_call_the_hub_may_have_done_is_not_resent() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Crash]);
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(super::connect(&socket).await.unwrap()),
+        };
+        let params = json!({"thread": "w1", "prompt": "hi"});
+        let e = calls.call("thread.send", params).await.unwrap_err();
+        assert!(format!("{e:#}").contains("it may have been done"), "{e:#}");
+        assert_eq!(hub.got(), [vec!["hello", "thread.send"]]);
+        calls.call("hub.info", Value::Null).await.unwrap();
+        assert_eq!(
+            hub.got(),
+            [vec!["hello", "thread.send"], vec!["hello", "hub.info"]]
+        );
+    }
+
+    /// No hub to connect to again: the error says why the call failed and why connecting
+    /// again did.
+    #[tokio::test]
+    async fn a_hub_that_stopped_for_good_is_said_so() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Stop]);
+        let first = super::connect(&socket).await.unwrap();
+        hub.hung_up().await;
+        std::fs::remove_file(&socket).unwrap();
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(first),
+        };
+        let e = calls
+            .call("thread.send", json!({"thread": "w1", "prompt": "hi"}))
+            .await
+            .unwrap_err();
+        let shown = format!("{e:#}");
+        assert!(
+            shown.starts_with(
+                "the hub closed the connection before thread.send reached it (nothing was \
+                 done): the hub is stopping; is it running? `twr info` (connecting again: "
+            ),
+            "{shown}"
+        );
     }
 
     /// Calls asked for before a switch are still sent once the view that asked is gone, and
