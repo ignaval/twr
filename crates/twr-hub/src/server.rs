@@ -1055,9 +1055,10 @@ async fn connection(
             // A suggestion asked for is the client's only while it waits for it: its client
             // gone (the user turned suggestions off), the ask goes too, before any model is
             // asked, or with the CLI it started (`hub::suggest`).
-            "suggest.next" => {
+            // (Dispatched by `call_async`: its own arm there is the method's.)
+            method @ "suggest.next" => {
                 let result = tokio::select! {
-                    r = call_async(&hub, &caller, &req.method, req.params) => r,
+                    r = call_async(&hub, &caller, method, req.params) => r,
                     () = hung_up(&mut reader) => break,
                 };
                 let resp = match result {
