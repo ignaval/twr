@@ -115,8 +115,8 @@ impl Core {
             return Ok(());
         }
         // A turn its runtime opened for a background task's notification that saw no run
-        // (`ext.twr.no_run`): no report, so the interim one it followed stands, and the hub
-        // wakes the worker for that work (`hub::wake`).
+        // (`ext.twr.no_run`) handled nothing: its report is the interim one it followed, again
+        // (`hub::wake`), so the worker still counts as yielded with that work unhandled.
         if let Some(Event {
             body: EventBody::TurnEnded(p),
             ..
@@ -124,7 +124,21 @@ impl Core {
         {
             if twr_ext(&p.ext).is_some_and(|t| t.get(super::wake::NO_RUN_KEY) == Some(&json!(true)))
             {
-                return Ok(());
+                if self.logged_report(thread, turn)?.is_some() {
+                    return Ok(());
+                }
+                let view = self.view(thread).map_err(anyhow::Error::new)?;
+                if let Some(report) = super::wake::no_run_report(view, turn) {
+                    let mut batch = Batch::default();
+                    batch.push(
+                        thread,
+                        Some(turn),
+                        Source::Hub,
+                        EventBody::ReportReady(report),
+                    );
+                    self.append_batch(hub, batch)?;
+                    return Ok(());
+                }
             }
         }
         let done = store::turn_reactions(self.store.conn(), thread, turn)?;

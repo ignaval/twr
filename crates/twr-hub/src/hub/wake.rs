@@ -19,9 +19,13 @@
 //! restart) or a box offline holds a wake up: it is tried again for [`WAKE_RETRY_FOR`].
 //!
 //! A turn the runtime opened for a background task's notification and ended with no run
-//! (`turn.ended` `ext.twr.no_run`, the Claude Code adapter's) handled nothing: it gets no
-//! report (`hub::reactions`), the interim one stands, and the worker is woken at once (the
-//! wait was the adapter's), for the tasks that ended before it.
+//! (`turn.ended` `ext.twr.no_run`, the Claude Code adapter's) handled nothing: its report is
+//! the interim report it followed, again ([`no_run_report`], marked `ext.twr.no_run_of =
+//! <that turn>`), so the worker is still one that yielded with its work unhandled, for the
+//! wake, the orchestrator's idle line and `send --after` alike. That report, once the worker
+//! has nothing else running, wakes it at once (the wait was the adapter's), for the tasks that
+//! ended before that turn; and when work of it still runs, the last task's end does, as for
+//! any interim report.
 //!
 //! No loops: a worker is woken at most once per interim report (the recorded `turn`), and at
 //! most [`WAKE_CHAIN_MAX`] times in a row with no turn the user or the orchestrator started
@@ -77,7 +81,7 @@ struct EndedTask {
 /// A wake waiting for its time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Pending {
-    /// The turn whose interim report the wake is for (or the turn that ended `no_run`).
+    /// The turn whose interim report the wake is for.
     turn: u64,
     due: DateTime<Utc>,
     /// When it first came due: a wake held up by something passing (a runtime restarting,
@@ -112,10 +116,31 @@ pub(super) struct WakeState {
     woken: HashMap<String, u64>,
     /// Wakes in a row per thread, with no turn of the user's or the orchestrator's since.
     chain: HashMap<String, u32>,
-    /// A thread's last turn, a turn its runtime opened for a background task's notification
-    /// that saw no run (`turn.ended` `ext.twr.no_run`): its interim report's work is still
-    /// unhandled.
-    no_run: HashMap<String, u64>,
+}
+
+/// `report.ready` `ext.twr` key of the report of a turn that saw no run ([`no_run_report`]):
+/// the turn whose interim report it repeats.
+pub(super) const NO_RUN_OF_KEY: &str = "no_run_of";
+
+/// The report of turn `turn` of `view`, a turn its runtime opened for a notification that saw
+/// no run: the interim report it followed, again, marked [`NO_RUN_OF_KEY`]. `None` when the
+/// last report is no interim one (the turn then reports as any other).
+pub(super) fn no_run_report(view: &ThreadView, turn: u64) -> Option<ReportReady> {
+    let r = view
+        .last_report
+        .as_ref()
+        .filter(|r| report::interim_tasks(r) > 0 && r.turn.is_some_and(|t| t < turn))?;
+    let mut report = r.clone();
+    report.turn = Some(turn);
+    report.written_by = "hub".into();
+    let of = no_run_of(r).or(r.turn);
+    set_twr_ext(&mut report.ext, NO_RUN_OF_KEY, json!(of));
+    Some(report)
+}
+
+/// The turn a report of a turn that saw no run repeats the interim report of.
+pub(super) fn no_run_of(r: &ReportReady) -> Option<u64> {
+    r.ext.as_ref()?.get("twr")?.get(NO_RUN_OF_KEY)?.as_u64()
 }
 
 impl WakeState {
@@ -125,21 +150,17 @@ impl WakeState {
     }
 }
 
-/// Whether `view` is a worker with no turn open and no own background work, neither stopped
-/// nor parked.
-fn idle_worker(view: &ThreadView) -> bool {
-    !(view.is_orchestrator()
+/// The turn whose interim report `view` waits on: its last turn, completed and reported with
+/// an interim report, no turn open and no own background work left.
+fn interim_turn(view: &ThreadView) -> Option<u64> {
+    if view.is_orchestrator()
         || view.id == HUB_THREAD
         || view.stopped
         || view.parked
         || view.current_turn.is_some()
-        || view.own_background())
-}
-
-/// The turn whose interim report `view` waits on: its last turn, completed and reported with
-/// an interim report, no turn open and no own background work left.
-fn interim_turn(view: &ThreadView) -> Option<u64> {
-    if !idle_worker(view) || !view.reported {
+        || view.own_background()
+        || !view.reported
+    {
         return None;
     }
     let r = view
@@ -197,33 +218,30 @@ impl Core {
             }
             EventBody::TurnStarted(p) => {
                 self.wake.pending.remove(&ev.thread);
-                self.wake.no_run.remove(&ev.thread);
                 // A turn of the user's or the orchestrator's: someone is looking after it.
                 if p.from != TurnFrom::Runtime {
                     self.wake.chain.remove(&ev.thread);
                 }
             }
             // The tasks that ended before it were the turn's to handle; not those of a turn
-            // opened for a notification that saw no run: that turn handled nothing, and the
-            // worker is woken at once.
+            // opened for a notification that saw no run: that turn handled nothing.
             EventBody::TurnEnded(p) => {
                 let no_run = twr_ext(&p.ext)
                     .and_then(|t| t.get(NO_RUN_KEY))
                     .and_then(Value::as_bool)
                     == Some(true);
-                let turn = ev.turn.or(self
-                    .registry
-                    .get(&ev.thread)
-                    .and_then(|v| v.last_turn.as_ref().map(|t| t.turn)));
-                match (no_run, turn) {
-                    (true, Some(turn)) if p.result == TurnResult::Completed => {
-                        self.wake.no_run.insert(ev.thread.clone(), turn);
-                        if self.wake.after > chrono::Duration::zero() {
-                            self.schedule_wake(&ev.thread, turn, ev.ts);
-                        }
-                    }
-                    _ => {
-                        self.wake.ended.remove(&ev.thread);
+                if !no_run {
+                    self.wake.ended.remove(&ev.thread);
+                }
+            }
+            // The report of a turn that saw no run, the worker idle: woken at once.
+            EventBody::ReportReady(p) if no_run_of(p).is_some() => {
+                let Some(v) = self.registry.get(&ev.thread) else {
+                    return;
+                };
+                if self.wake.after > chrono::Duration::zero() {
+                    if let Some(turn) = interim_turn(v) {
+                        self.schedule_wake(&ev.thread, turn, ev.ts);
                     }
                 }
             }
@@ -248,7 +266,6 @@ impl Core {
             // (A stop or park cancels nothing here: a stop that restarts the runtime for a
             // settings change leaves the thread as it was, and a wake checks again when due.)
             EventBody::ThreadDeleted(_) => {
-                self.wake.no_run.remove(&ev.thread);
                 self.wake.pending.remove(&ev.thread);
                 self.wake.ended.remove(&ev.thread);
                 self.wake.woken.remove(&ev.thread);
@@ -276,13 +293,11 @@ impl Core {
             match self.wake_ready(&thread, p.turn) {
                 Ok(Ready::Now) => {}
                 Ok(Ready::Later) if now - p.first_due < WAKE_RETRY_FOR => {
-                    self.wake.pending.insert(
-                        thread,
-                        Pending {
-                            due: now + WAKE_RETRY_EVERY,
-                            ..p
-                        },
-                    );
+                    let due = now + WAKE_RETRY_EVERY;
+                    // Its idle line keeps waiting for the wake.
+                    self.orch
+                        .hold_idle(&thread, due + super::watches::IDLE_GRACE);
+                    self.wake.pending.insert(thread, Pending { due, ..p });
                     continue;
                 }
                 Ok(_) => continue,
@@ -313,18 +328,13 @@ impl Core {
     }
 
     /// Whether thread `id` can take a wake for turn `turn` now: still idle after that turn's
-    /// interim report (or its turn that saw no run), nothing queued, nothing in the way of a
-    /// turn; [`Ready::Later`] while its runtime is being stopped (a settings restart) or its
+    /// interim report, nothing queued, nothing in the way of a turn; [`Ready::Later`] while its runtime is being stopped (a settings restart) or its
     /// box is offline.
     fn wake_ready(&self, id: &str, turn: u64) -> anyhow::Result<Ready> {
         let Some(v) = self.registry.get(id) else {
             return Ok(Ready::Never);
         };
-        let waits = interim_turn(v) == Some(turn)
-            || (self.wake.no_run.get(id) == Some(&turn)
-                && idle_worker(v)
-                && super::watches::turn_completed(v, Some(turn)));
-        if !waits
+        if interim_turn(v) != Some(turn)
             || v.turns != turn
             || v.attached.is_some()
             || v.crashed
@@ -374,8 +384,7 @@ impl Core {
             .registry
             .get(id)
             .and_then(|v| v.last_report.as_ref())
-            .filter(|r| report::interim_tasks(r) > 0)
-            .and_then(|r| r.turn)
+            .and_then(no_run_of)
             .unwrap_or(turn);
         let prompt = wake_prompt(shown, &ended);
         let tasks: Vec<Value> = ended

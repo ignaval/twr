@@ -116,9 +116,12 @@ impl Core {
             }
             // A prompt waits behind its open turn: the hung-turn check decides, within
             // `hung_after` of its arrival.
+            // (Not a turn being interrupted or taken back: no hung-turn card comes for it.)
             let behind = v
                 .current_turn
                 .is_some_and(|t| self.hung.answered.get(&v.id) != Some(&t))
+                && !v.current_turn_interrupted
+                && !v.current_turn_withdrawn
                 && self.store.pending_count(&v.id)? > 0;
             if behind
                 || self.stalled.contains_key(&v.id)

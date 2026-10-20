@@ -62,6 +62,10 @@ impl Core {
                     Some(e.thread.clone()),
                     twr_ext_map(json!({"attn_id": p.attn_id})),
                 ),
+                // The report of a turn that saw no run repeats one already said (`hub::wake`).
+                (EventBody::ReportReady(p), Some(_)) if super::wake::no_run_of(p).is_some() => {
+                    continue;
+                }
                 // Said from the report's own marks: tasks another turn runs now are not its.
                 (EventBody::ReportReady(p), Some(v)) => {
                     let tasks = crate::report::interim_tasks(p);

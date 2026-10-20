@@ -521,32 +521,45 @@ async fn background_work_waiting_on_a_job_does_not_stall() {
     hub.shutdown().await;
 }
 
-/// A turn the runtime opened for a background task's notification that saw no run
-/// (`ext.twr.no_run`, the Claude Code adapter's): no report replaces the interim one, and the
-/// hub wakes the worker at once for the work that turn handled nothing of.
-#[tokio::test]
-async fn a_turn_that_saw_no_run_leaves_the_wake_to_the_hub() {
-    let dir = tempfile::tempdir().unwrap();
+fn runtime_turn(id: &str, no_run: bool) -> [Step; 2] {
     let mut ext = None;
-    set_twr_ext(&mut ext, RUNTIME_TURN_KEY, "r1".into());
+    set_twr_ext(&mut ext, RUNTIME_TURN_KEY, id.into());
     let mut end_ext = ext.clone();
-    set_twr_ext(&mut end_ext, "no_run", true.into());
-    let mut script = vec![session()];
-    script.extend(interim("tests"));
-    script.extend([
-        Step::Sleep(100),
-        Step::EmitSession(task("tests", false)),
+    if no_run {
+        set_twr_ext(&mut end_ext, "no_run", true.into());
+    }
+    [
         Step::EmitSession(EventBody::TurnStarted(TurnStarted {
             from: TurnFrom::Runtime,
             prompt: "[runtime resumed after background activity]".into(),
             ext,
             ..Default::default()
         })),
-        Step::Sleep(100),
         Step::EmitSession(EventBody::TurnEnded(TurnEnded {
             ext: end_ext,
             ..Default::default()
         })),
+    ]
+}
+
+fn report_of(evs: &[Event], turn: u64) -> Option<ReportReady> {
+    evs.iter().rev().find_map(|e| match &e.body {
+        EventBody::ReportReady(r) if r.turn == Some(turn) => Some(r.clone()),
+        _ => None,
+    })
+}
+
+/// A turn the runtime opened for a background task's notification that saw no run
+/// (`ext.twr.no_run`, the Claude Code adapter's): its report repeats the interim one, and the
+/// hub wakes the worker at once for the work that turn handled nothing of.
+#[tokio::test]
+async fn a_turn_that_saw_no_run_leaves_the_wake_to_the_hub() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![session()];
+    script.extend(interim("tests"));
+    script.extend([Step::Sleep(100), Step::EmitSession(task("tests", false))]);
+    script.extend(runtime_turn("r1", true));
+    script.extend([
         Step::AwaitSend,
         Step::Emit(text("The tests passed.")),
         Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
@@ -560,9 +573,14 @@ async fn a_turn_that_saw_no_run_leaves_the_wake_to_the_hub() {
     hub.send_by(&api, "run the tests", &Caller::user("test"))
         .unwrap();
     let evs = until(&hub, &api, |e| ended(e, 3)).await;
-    assert!(!evs
-        .iter()
-        .any(|e| e.kind() == "report.ready" && e.turn == Some(2)));
+    let repeated = report_of(&evs, 2).expect("the no-run turn's report");
+    let first = report_of(&evs, 1).unwrap();
+    assert_eq!(repeated.summary, first.summary);
+    let twr = &repeated.ext.as_ref().unwrap()["twr"];
+    assert_eq!(
+        (&twr["no_run_of"], &twr["background_tasks"]),
+        (&json!(1), &json!(1))
+    );
     let woke = wakes(&evs);
     assert_eq!(woke.len(), 1, "{woke:?}");
     assert!(woke[0].contains("after your turn 1 ended"), "{}", woke[0]);
@@ -571,6 +589,78 @@ async fn a_turn_that_saw_no_run_leaves_the_wake_to_the_hub() {
         "{}",
         woke[0]
     );
+    hub.shutdown().await;
+}
+
+/// The same with work of the worker's still running when that turn ends: the wake waits for
+/// the last task's end, as after any interim report.
+#[tokio::test]
+async fn a_no_run_turns_wake_waits_for_the_rest_of_the_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![
+        session(),
+        Step::EmitSession(task("tests", true)),
+        Step::EmitSession(task("lint", true)),
+        Step::Emit(text("Running them in the background.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(100),
+        Step::EmitSession(task("tests", false)),
+    ];
+    script.extend(runtime_turn("r1", true));
+    script.extend([
+        Step::Sleep(1000),
+        Step::EmitSession(task("lint", false)),
+        Step::AwaitSend,
+        Step::Emit(text("Both passed.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ]);
+    let hub = Hub::open(opts(dir.path(), Some(script))).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "run the checks", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| ended(e, 3)).await;
+    let lint_end = evs
+        .iter()
+        .find(|e| matches!(&e.body, EventBody::TaskUpdated(t) if !t.running && t.task_id == "lint"))
+        .unwrap()
+        .ts;
+    let start = evs
+        .iter()
+        .find(|e| e.kind() == "turn.started" && e.turn == Some(3))
+        .unwrap();
+    assert!(start.ts - lint_end >= chrono::Duration::from_std(WAKE_AFTER).unwrap());
+    let woke = wakes(&evs);
+    assert_eq!(woke.len(), 1, "{woke:?}");
+    assert!(
+        woke[0].contains("- background tests (ended)")
+            && woke[0].contains("- background lint (ended)"),
+        "{}",
+        woke[0]
+    );
+    hub.shutdown().await;
+}
+
+/// The user interrupted a silent turn to send the next message now, and its runtime ignores
+/// the interrupt: no hung-turn card comes for a turn being interrupted, so the plain stall
+/// does.
+#[tokio::test]
+async fn an_interrupt_the_runtime_ignores_still_stalls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path(), None);
+    o.stall_after = Some(Duration::from_millis(500));
+    let hub = Hub::open(o).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    let user = Caller::user("test");
+    hub.send_by(&api, "!deaf\n!sleep 600000", &user).unwrap();
+    until(&hub, &api, |e| e.iter().any(|e| e.kind() == "turn.started")).await;
+    hub.send_by(&api, "next", &user).unwrap();
+    let queue = hub.thread_queue(&api, &user).unwrap();
+    let r = queue["items"][0]["ref"].as_i64().unwrap();
+    hub.send_now(&api, r, &user).unwrap();
+    let evs = until(&hub, &api, |e| !stalls(e).is_empty()).await;
+    assert!(evs.iter().any(|e| e.kind() == "turn.interrupted"));
+    assert!(stalls(&evs).iter().all(|s| !is_hung_card(&s.ext)));
     hub.shutdown().await;
 }
 

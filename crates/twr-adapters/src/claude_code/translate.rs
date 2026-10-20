@@ -1719,13 +1719,11 @@ impl Translator {
     }
 
     fn on_result(&mut self, v: &Value, line: &str, out: &mut Translated) {
-        // The run a notification's turn was opened for had shown no output of the main agent.
-        let quiet_notice = std::mem::take(&mut self.notice_quiet);
-        self.watch = None;
-        // The run of a turn ended for its missing `result` ends after all: absorbed, also with
-        // a prompt queued since (its run has not shown: no `init`, no output). Its spend was
+        // The run of a turn ended for its missing `result` ends after all: absorbed, whatever
+        // is open or queued now (no run showed since: no `init`, no model output; a turn opened
+        // since for another task's notification is still waiting for its run). Its spend was
         // that turn's (reported unknown): the total moves on, charged to no other turn.
-        if std::mem::take(&mut self.absorb_result) && !self.active {
+        if std::mem::take(&mut self.absorb_result) {
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
                 self.cost_since(t);
             }
@@ -1734,16 +1732,23 @@ impl Translator {
         // Claude consumed a task notification without asking the model anything (a resumed
         // session hears of a task its previous process left behind before it reads the
         // prompt). That `result` answers no prompt and ends no turn: a twr turn running goes
-        // on with what it saw so far (an interruption, an error's cause), and so does a runtime
-        // turn, opened only by model output; only an `init` that opened neither is undone.
+        // on with what it saw so far (an interruption, an error's cause) and keeps waiting for
+        // its own `result`, and so does a runtime turn that showed output; only an `init` that
+        // opened neither is undone.
         if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
             && v.get("num_turns").and_then(Value::as_u64) == Some(0)
         {
             if self.active && self.turn.is_none() && self.runtime_turn.is_none() {
                 self.active = false;
             }
-            // The turn opened for that notification: nothing more comes for it.
-            if quiet_notice && self.active && self.turn.is_none() && self.runtime_turn.is_some() {
+            // The turn opened for a notification whose run never showed: nothing more comes
+            // for it.
+            if self.notice_quiet
+                && self.active
+                && self.turn.is_none()
+                && self.runtime_turn.is_some()
+            {
+                self.watch = None;
                 self.end_without_result(NO_RUN_KEY, out);
             }
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
@@ -1751,6 +1756,8 @@ impl Translator {
             }
             return;
         }
+        self.watch = None;
+        self.notice_quiet = false;
         self.end_turn_with(v, line, out);
     }
 
@@ -3463,6 +3470,78 @@ mod tests {
         let events = feed(&mut t, &[&result(0, Some(1.0), true)]);
         assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
         assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
+    /// After a turn ended for its missing `result`, another background task ends (its
+    /// notification's turn opens) and then the old run's `result` comes: it is absorbed, and
+    /// the new turn waits for its own run.
+    #[test]
+    fn a_late_result_does_not_end_a_notifications_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "b2",
+                json!({"is_backgrounded": true, "task_type": "local_bash"}),
+            )],
+        );
+        t.user_message("Checking in", 2);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("On it."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(turn_marks(&events), ["end Some(2) None None"]);
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b2",
+                json!({"status": "completed"}),
+            )],
+        );
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+        let at = t.deadline().unwrap();
+        assert!(feed(&mut t, &[&result(2, Some(2.0), false)]).is_empty());
+        assert_eq!(t.deadline(), Some(at), "still waiting for its run");
+        let events = feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("b2 done."),
+                &result(1, Some(2.5), true),
+            ],
+        );
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") Some(0.5)"]);
+    }
+
+    /// A `result` that asked the model nothing (another task's notice) while a turn waits for
+    /// its missing `result` leaves that wait as it was.
+    #[test]
+    fn a_notice_result_keeps_the_wait_for_a_missing_result() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("Done."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let at = t.deadline().unwrap();
+        assert!(turn_marks(&feed(&mut t, &[&result(0, Some(1.0), true)])).is_empty());
+        assert_eq!(t.deadline(), Some(at));
+        let events = t.expire(at).events;
+        assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
     }
 
     /// The hub's prompt raced the turn a background task's end opened: Claude folds it into its

@@ -980,6 +980,18 @@ impl OrchState {
         self.notices.len() != before
     }
 
+    /// Holds the line about worker `thread` going idle until `until` at least (its wake is
+    /// still being tried, `hub::wake`).
+    pub(super) fn hold_idle(&mut self, thread: &str, until: DateTime<Utc>) {
+        for n in &mut self.notices {
+            if n.thread.as_deref() == Some(thread) {
+                if let Some(due) = n.idle.as_mut() {
+                    *due = (*due).max(until);
+                }
+            }
+        }
+    }
+
     /// When the earliest held notice comes due.
     pub(super) fn next_due(&self) -> Option<DateTime<Utc>> {
         self.notices.iter().filter_map(|n| n.idle).min()
@@ -1525,6 +1537,11 @@ impl Core {
                 }
             }
             EventBody::TaskUpdated(p) if !p.running => self.queue_idle_watches(ev),
+            // A turn that saw no run repeats the interim report it followed (`hub::wake`): the
+            // worker is idle after it again.
+            EventBody::ReportReady(p) if super::wake::no_run_of(p).is_some() => {
+                self.queue_idle_watches(ev)
+            }
             EventBody::TaskUpdated(p) => self.cancel_idle_watches(ev, &p.task_id),
             // (Its open items were resolved in the same batch, before.)
             EventBody::ThreadDeleted(p) => {

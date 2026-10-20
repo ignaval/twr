@@ -562,6 +562,57 @@ async fn a_worker_the_hub_wakes_fires_its_watch_with_the_woken_turns_report() {
     hub.shutdown().await;
 }
 
+/// The runtime opens a turn for the tasks' notification that sees no run (the Claude Code
+/// adapter's `no_run`): with the hub's wake off, the worker is idle after it, and the watch
+/// fires on that, quoting the interim report the turn repeats.
+#[tokio::test]
+async fn a_turn_that_saw_no_run_leaves_its_worker_idle_for_the_watch() {
+    let mut env = Env::new();
+    let mut script = interim_turn();
+    let mut ext = None;
+    set_twr_ext(&mut ext, RUNTIME_TURN_KEY, "r1".into());
+    let mut end_ext = ext.clone();
+    set_twr_ext(&mut end_ext, "no_run", true.into());
+    script.extend([
+        Step::Sleep(300),
+        Step::EmitSession(task(false)),
+        Step::EmitSession(EventBody::TurnStarted(TurnStarted {
+            from: TurnFrom::Runtime,
+            prompt: "[runtime resumed after background activity]".into(),
+            ext,
+            ..Default::default()
+        })),
+        Step::Sleep(200),
+        Step::EmitSession(EventBody::TurnEnded(TurnEnded {
+            ext: end_ext,
+            ..Default::default()
+        })),
+        Step::Sleep(60_000),
+    ]);
+    let hub = env.hub(Some(script)).await;
+    let api = env.worker(&hub, "api").await;
+    let (mut rt, t1) = env.orchestrator(&hub).await;
+    watch(&hub, &api, "send its branch to twr-integrator", false);
+    rt.end_turn(t1, "Watching api.");
+    hub.send_by(&api, "run the tests", &tui()).unwrap();
+    let (notice, t2) = rt.next_turn().await;
+    let line = notice
+        .lines()
+        .find(|l| l.starts_with("- thread=api idle:"))
+        .unwrap_or_else(|| panic!("{notice}"));
+    assert!(line.contains("summary=\"Tests are running"), "{line}");
+    assert!(line.contains(" watch=w1 "), "{line}");
+    rt.end_turn(t2, "Noted.");
+    // The repeated report says nothing new in the conversation.
+    let yielded = updates(&hub, &api)
+        .iter()
+        .filter(|t| t.contains("yielded with"))
+        .count();
+    assert_eq!(yielded, 1);
+    drop(rt);
+    hub.shutdown().await;
+}
+
 /// The tasks end while the orchestrator is busy, and the idle line comes due behind its turn;
 /// before that turn ends, the worker starts another task. It is not idle: the line goes, and
 /// the watch fires only a full grace after the new task ends.
