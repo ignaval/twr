@@ -17,6 +17,7 @@ pub mod app;
 #[cfg(test)]
 mod bench;
 pub mod edit;
+pub mod firstrun;
 pub mod icon;
 pub mod keys;
 pub mod md;
@@ -27,6 +28,7 @@ pub mod select;
 pub mod shell;
 pub mod slash;
 pub mod suggest;
+pub mod terminal_setup;
 pub mod ui;
 pub mod workspace;
 
@@ -403,7 +405,11 @@ pub fn error_status(method: &str, error: &str) -> String {
 /// The hub request for an [`Action`], or `None` for actions handled locally.
 pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
     match action {
-        Action::Quit | Action::Copy { .. } | Action::Mouse(_) | Action::Workspace { .. } => None,
+        Action::Quit
+        | Action::Copy { .. }
+        | Action::Mouse(_)
+        | Action::Workspace { .. }
+        | Action::TerminalSetup { .. } => None,
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -574,10 +580,11 @@ fn enhance_keyboard() -> keys::Keys {
         KEYBOARD_PUSHED.store(true, Ordering::SeqCst);
         return keys::Keys {
             shift_enter: true,
-            notice: None,
+            ..keys::Keys::default()
         };
     }
     let mut notice = None;
+    let mut tmux_asked = false;
     if std::env::var_os("TMUX").is_some_and(|t| !t.is_empty()) {
         let extended = keys::tmux_option("extended-keys");
         let format = keys::tmux_option("extended-keys-format");
@@ -590,13 +597,15 @@ fn enhance_keyboard() -> keys::Keys {
                     .is_ok()
                 {
                     MODIFY_OTHER_KEYS.store(true, Ordering::SeqCst);
+                    tmux_asked = true;
                 }
             }
             keys::TmuxPlan::Unreadable => notice = Some(keys::TMUX_NOTICE),
             keys::TmuxPlan::Nothing => {}
         }
     }
-    if keys::under_mosh() {
+    let mosh = keys::under_mosh();
+    if mosh {
         notice = Some(keys::MOSH_NOTICE);
     }
     // Whether Shift-Enter gets through tmux depends on the terminal around it too: the first
@@ -604,6 +613,8 @@ fn enhance_keyboard() -> keys::Keys {
     keys::Keys {
         shift_enter: false,
         notice,
+        tmux_asked,
+        mosh,
     }
 }
 
@@ -652,6 +663,23 @@ pub fn repaint<B: ratatui::backend::Backend>(
     // Both buffers blank: the next draw writes everything it draws.
     terminal.swap_buffers();
     Ok(())
+}
+
+/// Writes what this run told the user that is not saved yet ([`AppState::seen`]) to `file`,
+/// off the IO loop (the file's lock may be another TUI's for a moment); nowhere without one.
+fn save_seen(state: &mut AppState, file: Option<&Path>) {
+    if !std::mem::take(&mut state.seen_dirty) {
+        return;
+    }
+    let Some(file) = file else {
+        return;
+    };
+    let (file, seen) = (file.to_path_buf(), state.seen.clone());
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = firstrun::save(&file, &seen) {
+            twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
+        }
+    });
 }
 
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
@@ -1964,11 +1992,17 @@ struct Shared {
     compact: Option<bool>,
     /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
     suggest: Option<bool>,
+    /// What the TUI has told the user across runs, and where it keeps that
+    /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
+    seen: firstrun::Seen,
+    seen_file: Option<PathBuf>,
+    /// The Shift-Enter offer, for the first workspace shown ([`firstrun::terminal_offer`]).
+    offer: Option<firstrun::TerminalOffer>,
 }
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
-    run_with(socket, None, None).await
+    run_with(socket, None, None, None).await
 }
 
 /// The `[tui]` settings: `given` (what the CLI read from the config of the workspace it
@@ -1984,11 +2018,13 @@ pub fn tui_config(given: Option<twr_core::config::TuiConfig>) -> twr_core::confi
 
 /// Runs the TUI against the hub listening on `socket` until the user quits; with `switching`,
 /// on the workspace it names, with a tab per workspace to switch to ([`workspace`]). `tui`:
-/// the `[tui]` settings ([`tui_config`]).
+/// the `[tui]` settings ([`tui_config`]). `agent`: the thread's agent this TUI runs for, if
+/// it does (it then offers to change nothing of the user's terminal).
 pub async fn run_with(
     socket: PathBuf,
     switching: Option<Switching>,
     tui: Option<twr_core::config::TuiConfig>,
+    agent: Option<String>,
 ) -> anyhow::Result<()> {
     let tui = tui_config(tui);
     // Connect before touching the terminal so connection errors print normally.
@@ -2013,7 +2049,26 @@ pub async fn run_with(
     // pasted digit would answer a card).
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)
         .context("enabling bracketed paste")?;
-    let keys = enhance_keyboard();
+    let mut keys = enhance_keyboard();
+    // What was told in earlier runs, and the Shift-Enter offer (only where it can be
+    // remembered: it must not come back every start).
+    let seen_file = firstrun::state_file();
+    let seen = seen_file.as_deref().map(firstrun::load).unwrap_or_default();
+    let mut offer = seen_file.as_ref().and_then(|_| {
+        let place = terminal_setup::place(keys.mosh);
+        let agent = agent.is_some()
+            // (A thread's processes carry `TWR_AGENT`, `twr_runner::reap::AGENT_ENV`.)
+            || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty());
+        firstrun::terminal_offer(&keys, &place, agent, &seen, terminal_setup::prepare)
+    });
+    // Remembered, the mosh notice is the offer's, told once; a tmux that loses Shift-Enter
+    // says how to fix tmux instead of any offer.
+    if seen_file.is_some() && keys.notice == Some(keys::MOSH_NOTICE) {
+        keys.notice = None;
+    }
+    if keys.notice.is_some() {
+        offer = None;
+    }
     if tui.mouse {
         set_mouse_capture(true).context("enabling the mouse")?;
     }
@@ -2038,6 +2093,9 @@ pub async fn run_with(
         keys,
         compact: None,
         suggest: None,
+        seen,
+        seen_file,
+        offer,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2236,6 +2294,12 @@ async fn drive(
     if let Some(notice) = ctx.keys.notice.take() {
         state.view.status = Some(notice.into());
     }
+    state.seen = ctx.seen.clone();
+    if let Some(offer) = ctx.offer.take() {
+        state.offer_terminal(offer);
+    }
+    state.suggest_turned_on = ctx.suggest == Some(true);
+    state.apply_suggest_info(&info);
     // Another workspace's frame may be on screen: the first one starts from a clear screen.
     state.view.repaint = true;
     state.begin_catch_up(head);
@@ -2400,6 +2464,7 @@ async fn drive(
                 }
                 // What this frame drew in full is all an option key may answer.
                 state.note_drawn(std::time::Instant::now());
+                save_seen(&mut state, ctx.seen_file.as_deref());
                 if shown.replace(now_showing).is_none() {
                     typed_ahead.start(std::time::Instant::now());
                 }
@@ -2499,6 +2564,19 @@ async fn drive(
                                 if let Err(e) = set_mouse_capture(on) {
                                     state.view.status = Some(format!("/mouse: {e}"));
                                 }
+                                continue;
+                            }
+                            // The user's `y` to the Shift-Enter offer: the terminal's settings
+                            // file is edited here, by the user's own TUI ([`firstrun`]).
+                            Action::TerminalSetup { yes } => {
+                                if let Some(firstrun::TerminalOffer::Edit { place, terminal, .. }) =
+                                    state.answer_terminal_offer(yes)
+                                {
+                                    let outcome = terminal_setup::edit(&place, terminal);
+                                    state.view.status =
+                                        Some(firstrun::edit_status(terminal, &outcome, &place.home));
+                                }
+                                save_seen(&mut state, ctx.seen_file.as_deref());
                                 continue;
                             }
                             // The workspace's hub is opened (started when needed) and
@@ -2776,6 +2854,8 @@ async fn drive(
     // `/compact on|off` holds in the next workspace shown too.
     ctx.compact = state.view.compact;
     ctx.suggest = Some(state.view.suggest);
+    save_seen(&mut state, ctx.seen_file.as_deref());
+    ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
     drop(call_tx);

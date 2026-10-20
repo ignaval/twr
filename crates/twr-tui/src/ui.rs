@@ -10382,6 +10382,7 @@ mod tests {
             prompt: "reset the orchestrator? y/n".into(),
             pending: String::new(),
             alt: None,
+            offer: false,
         });
         let last = draw(&st, 220, 24).pop().unwrap();
         assert!(!last.contains("left:"), "{last}");

@@ -69,6 +69,11 @@ fn runs(dir: &Path) -> usize {
 }
 
 async fn hub(dir: &Path, bin: PathBuf) -> Hub {
+    hub_probing(dir, bin, None).await
+}
+
+/// [`hub`] whose own agent probe finds `claude` as `claude` says (`None`: it probes none).
+async fn hub_probing(dir: &Path, bin: PathBuf, claude: Option<twr_core::runner::AgentInfo>) -> Hub {
     let config = Config {
         default_runtime: "fake".into(),
         ..Default::default()
@@ -83,6 +88,12 @@ async fn hub(dir: &Path, bin: PathBuf) -> Hub {
     o.socket = Some(dir.join("hub.sock"));
     o.stop_timeout = Duration::from_secs(5);
     o.suggest_bin = Some(bin);
+    if let Some(claude) = claude {
+        o.agent_probe = Some(Arc::new(move || {
+            let claude = claude.clone();
+            futures::FutureExt::boxed(async move { vec![claude] })
+        }));
+    }
     // A `!!` command runs through the job gate, which this test binary isn't.
     o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
     Hub::open(o).await.unwrap()
@@ -277,20 +288,20 @@ async fn answers_none_running_turns_and_callers_are_refused() {
     hub.shutdown().await;
 }
 
-/// A failed call (not signed in, a usage limit) says why, and none follows for a while.
+/// A failed call (a usage limit) says why, and none follows for a while.
 #[tokio::test]
 async fn a_failure_holds_suggestions_back() {
     let dir = tempfile::tempdir().unwrap();
     let cli = dir.path().join("cli");
     std::fs::create_dir_all(&cli).unwrap();
     let bin = fake_claude(&cli);
-    answer(&cli, "Invalid API key · Please run /login", true);
+    answer(&cli, "You've hit your limit · resets 3pm", true);
     let hub = hub(dir.path(), bin).await;
     let api = turn_ended(&hub, dir.path(), "one").await;
     let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
     assert_eq!(
         r["reason"].as_str(),
-        Some("failed: Invalid API key · Please run /login"),
+        Some("failed: You've hit your limit · resets 3pm"),
         "{r}"
     );
     assert_eq!(r["stats"]["failures"], 1);
@@ -453,5 +464,101 @@ async fn a_turn_the_user_did_not_start_gets_no_suggestion() {
         );
     }
     assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// No Claude Code to ask: a CLI that isn't there, or that says it has no login (as Claude
+/// Code 2.1.304 does without one, or with a refused key), is `unavailable: ...`, for the TUI
+/// to stop asking; and none follows for a while either.
+#[tokio::test]
+async fn a_missing_or_signed_out_cli_is_unavailable() {
+    for (case, want) in [
+        ("missing", "unavailable: Claude Code's CLI ("),
+        (
+            "Not logged in · Please run /login",
+            "unavailable: Claude Code is not signed in",
+        ),
+        (
+            "Invalid API key · Please run /login",
+            "unavailable: Claude Code is not signed in",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let bin = if case == "missing" {
+            cli.join("no-such-claude")
+        } else {
+            let bin = fake_claude(&cli);
+            answer(&cli, case, true);
+            bin
+        };
+        let hub = hub(dir.path(), bin).await;
+        turn_ended(&hub, dir.path(), "one").await;
+        let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(reason.starts_with(want), "{case}: {r}");
+        assert!(r["suggestion"].is_null(), "{r}");
+        assert_eq!(r["stats"]["failures"], 1, "{r}");
+        hub.shutdown().await;
+    }
+}
+
+/// When the hub's own agent probe found no Claude Code CLI, or one signed out, nothing is run
+/// at all: `suggest.next` says `unavailable: ...`, and so does `hub.info` (`suggest`), for a
+/// TUI to stay quiet without asking. Signed in (or not probed), `hub.info` says nothing.
+#[tokio::test]
+async fn the_probe_says_when_suggestions_cannot_run() {
+    use twr_core::runner::{AgentInfo, AgentLogin};
+    let claude = |found: bool, login: AgentLogin| AgentInfo {
+        runtime: "claude-code".into(),
+        found,
+        login,
+        ..Default::default()
+    };
+    for (probe, want) in [
+        (
+            claude(false, AgentLogin::Unknown),
+            Some("unavailable: Claude Code's CLI (claude) is not installed"),
+        ),
+        (
+            claude(true, AgentLogin::LoggedOut),
+            Some("unavailable: Claude Code is not signed in"),
+        ),
+        (claude(true, AgentLogin::LoggedIn), None),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let bin = fake_claude(&cli);
+        answer(&cli, "run the tests", false);
+        let hub = hub_probing(dir.path(), bin, Some(probe)).await;
+        // The probe runs in the background once the hub is open.
+        timeout(WAIT, async {
+            while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(hub.info()["suggest"]["unavailable"].as_str(), want);
+        turn_ended(&hub, dir.path(), "one").await;
+        let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+        match want {
+            Some(why) => {
+                assert_eq!(r["reason"].as_str(), Some(why), "{r}");
+                assert_eq!(runs(&cli), 0, "nothing runs");
+            }
+            None => {
+                assert_eq!(r["suggestion"], "run the tests", "{r}");
+                assert_eq!(runs(&cli), 1);
+            }
+        }
+        hub.shutdown().await;
+    }
+    // Without a probe (and in tests), nothing is known: `hub.info` says nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), dir.path().join("claude")).await;
+    assert!(hub.info()["suggest"]["unavailable"].is_null());
     hub.shutdown().await;
 }

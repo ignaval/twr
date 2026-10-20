@@ -2291,6 +2291,8 @@ impl Hub {
             .map(|b| box_agents::project_box(b, view))
             .collect();
         let agents = self.local_agents_json(view);
+        // Whether next-message suggestions can run here (`hub::suggest`).
+        let suggest_unavailable = suggest::unavailable(&self.inner.local_agents.known());
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
         let core = self.inner.core();
@@ -2323,6 +2325,7 @@ impl Hub {
             "notify_hook": !self.inner.config.notify.command.is_empty(),
             "worker_limits": self.inner.limits.by(),
             "warnings": self.inner.warnings(),
+            "suggest": {"unavailable": suggest_unavailable},
         })
     }
 

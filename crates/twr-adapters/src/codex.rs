@@ -2497,18 +2497,30 @@ mod tests {
             })
             .unwrap()
             .params;
-            (p["approvalPolicy"].clone(), p["approvalsReviewer"].clone(), p["sandbox"].clone())
+            (
+                p["approvalPolicy"].clone(),
+                p["approvalsReviewer"].clone(),
+                p["sandbox"].clone(),
+            )
         };
         assert_eq!(
             sent("auto"),
-            (json!("on-request"), json!("auto_review"), json!("workspace-write"))
+            (
+                json!("on-request"),
+                json!("auto_review"),
+                json!("workspace-write")
+            )
         );
         for (mode, approval, sandbox) in [
             ("plan", "untrusted", "read-only"),
             ("read-only", "on-request", "read-only"),
             ("dontAsk", "never", "read-only"),
         ] {
-            assert_eq!(sent(mode), (json!(approval), json!("user"), json!(sandbox)), "{mode}");
+            assert_eq!(
+                sent(mode),
+                (json!(approval), json!("user"), json!(sandbox)),
+                "{mode}"
+            );
         }
         let cfg = |mode: &str, codex_auto| SpawnConfig {
             mode: mode.into(),

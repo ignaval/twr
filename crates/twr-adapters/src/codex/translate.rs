@@ -2402,7 +2402,8 @@ impl Translator {
     fn on_unread_auto_review(&mut self, head: &str, len: usize, out: &mut Translated) {
         let id = format!(
             "auto_review:{}",
-            head_string(head, "reviewId").unwrap_or_else(|| format!("unread-{}", self.unread_reviews))
+            head_string(head, "reviewId")
+                .unwrap_or_else(|| format!("unread-{}", self.unread_reviews))
         );
         self.unread_reviews += 1;
         let what = format!("a decision of {len} bytes, too long to read");
@@ -4109,11 +4110,22 @@ mod tests {
             assert_eq!(c.call_id, id);
             assert_eq!(r.call_id, id);
             assert!(c.risky && !r.ok);
-            assert!(c.input_summary.starts_with("unread: "), "{}", c.input_summary);
-            assert!(r.output_summary.contains("could not read"), "{}", r.output_summary);
+            assert!(
+                c.input_summary.starts_with("unread: "),
+                "{}",
+                c.input_summary
+            );
+            assert!(
+                r.output_summary.contains("could not read"),
+                "{}",
+                r.output_summary
+            );
         }
         assert_eq!(head_string(r#"{"reviewId":"a\"b"}"#, "reviewId"), None);
-        assert_eq!(head_string(r#"{"reviewId" : "ok-1"}"#, "reviewId").as_deref(), Some("ok-1"));
+        assert_eq!(
+            head_string(r#"{"reviewId" : "ok-1"}"#, "reviewId").as_deref(),
+            Some("ok-1")
+        );
     }
 
     /// The settings Codex reports during the session are held to what twr asked for, like

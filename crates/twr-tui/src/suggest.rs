@@ -1,14 +1,25 @@
-//! Next-message suggestions, when `[tui] suggest = true` (or `/suggest on`): after a turn of
-//! the main pane's thread ends while the TUI watches and nothing is typed, the TUI asks the
-//! hub for a likely next message (`suggest.next`, `twr_hub::hub::suggest`), off the IO loop
-//! on a connection of its own, and shows it as dim ghost text in the empty input box. Tab or
-//! → puts it in the box, to send with Enter like anything typed; typing anything else types
-//! over it, and Enter on the empty line does what it always does: a suggestion is never sent
-//! by itself. A new turn, or another thread on the main pane, takes it away.
+//! Next-message suggestions, on unless `[tui] suggest = false` (or `/suggest off`): after a
+//! turn of the main pane's thread ends while the TUI watches and nothing is typed, the TUI
+//! asks the hub for a likely next message (`suggest.next`, `twr_hub::hub::suggest`), off the
+//! IO loop on a connection of its own, and shows it as dim ghost text in the empty input box.
+//! Tab or → puts it in the box, to send with Enter like anything typed; typing anything else
+//! types over it, and Enter on the empty line does what it always does: a suggestion is never
+//! sent by itself. A new turn, or another thread on the main pane, takes it away.
+//!
+//! The first one due waits for the notice that says what suggestions send and how to turn
+//! them off ([`crate::firstrun::SUGGEST_NOTICE`]) to be on screen; it is asked for only then,
+//! and the notice is never shown again. Where the hub can't run them (no Claude Code CLI, or
+//! none signed in: `hub.info` `suggest.unavailable`, or a call's `unavailable: ...` reason),
+//! they stop for the session without a call, with one notice ever
+//! ([`AppState::suggest_unavailable`]).
 
 use serde_json::Value;
 
 use crate::app::{AppState, Screen};
+
+/// How the hub's reason starts when suggestions can't run there at all
+/// (`twr_hub::hub::suggest::UNAVAILABLE`).
+pub const UNAVAILABLE: &str = "unavailable: ";
 
 /// A suggested next message ([`AppState::suggestion`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,12 +72,24 @@ impl AppState {
         }
     }
 
-    /// The suggestion to ask for now, if one is due; it is then on its way.
+    /// The suggestion to ask for now, if one is due; it is then on its way. The first one ever
+    /// waits for the notice of what suggestions send to have been on screen
+    /// ([`crate::firstrun::SUGGEST_NOTICE`]): until then it stays due, and the notice is shown.
     pub fn take_suggest_due(&mut self) -> Option<Ask> {
-        let (thread, turn) = self.suggest_due.take()?;
         if !self.view.suggest {
+            self.suggest_due = None;
             return None;
         }
+        if !self.seen.suggest_notice {
+            self.suggest_due.as_ref()?;
+            // Another notice told once, or a question, has the status bar: after it.
+            let notice = crate::firstrun::SUGGEST_NOTICE;
+            if self.once.is_none() && self.view.confirm.is_none() {
+                self.show_once(crate::firstrun::Once::SuggestNotice, notice.to_string());
+            }
+            return None;
+        }
+        let (thread, turn) = self.suggest_due.take()?;
         self.suggest_asked = Some((thread.clone(), turn, self.suggest_epoch));
         Some(Ask {
             thread,
@@ -86,6 +109,14 @@ impl AppState {
             }
             return;
         };
+        if let Some(why) = r["reason"]
+            .as_str()
+            .and_then(|r| r.strip_prefix(UNAVAILABLE))
+        {
+            let why = why.to_string();
+            self.suggest_unavailable(&why);
+            return;
+        }
         if let Some(reason) = r["reason"]
             .as_str()
             .and_then(|r| r.strip_prefix("failed: "))
@@ -114,6 +145,56 @@ impl AppState {
                 text: text.to_string(),
                 shown: None,
             });
+        }
+    }
+
+    /// The hub can't run suggestions (`why`: no Claude Code CLI, or none signed in): none is
+    /// asked for again in this run, and the status bar says so once ever
+    /// ([`crate::firstrun::Seen::suggest_unavailable`]), when nothing else is on it.
+    pub(crate) fn suggest_unavailable(&mut self, why: &str) {
+        if self.view.suggest {
+            self.view.suggest = false;
+            self.suggestion = None;
+            self.suggest_due = None;
+            self.suggest_off_why = Some(why.to_string());
+            // The notice that suggestions are on would say what can't happen here.
+            if self
+                .once
+                .as_ref()
+                .is_some_and(|(w, _)| *w == crate::firstrun::Once::SuggestNotice)
+            {
+                self.once = None;
+                self.view.status = None;
+            }
+        }
+        self.tell_suggest_unavailable();
+    }
+
+    /// The notice that suggestions can't run here, once ever, when the status bar is free.
+    fn tell_suggest_unavailable(&mut self) {
+        let Some(why) = &self.suggest_off_why else {
+            return;
+        };
+        let busy = self.once.is_some() || self.view.confirm.is_some() || self.view.status.is_some();
+        if self.seen.suggest_unavailable || busy {
+            return;
+        }
+        let text = crate::firstrun::suggest_unavailable_notice(why);
+        self.show_once(crate::firstrun::Once::SuggestUnavailable, text);
+    }
+
+    /// What `hub.info` says of suggestions: `suggest.unavailable`, why they can't run there
+    /// (not after the user turned them on in this run: a call says it then).
+    pub(crate) fn apply_suggest_info(&mut self, info: &Value) {
+        let why = info["suggest"]["unavailable"]
+            .as_str()
+            .and_then(|r| r.strip_prefix(UNAVAILABLE));
+        match why {
+            Some(why) if !self.suggest_turned_on => {
+                let why = why.to_string();
+                self.suggest_unavailable(&why);
+            }
+            _ => self.tell_suggest_unavailable(),
         }
     }
 
@@ -181,6 +262,20 @@ impl AppState {
     pub(crate) fn toggle_suggest(&mut self, on: Option<bool>) {
         let on = on.unwrap_or(!self.view.suggest);
         self.view.suggest = on;
+        self.suggest_turned_on = on;
+        self.suggest_off_why = None;
+        // What the status bar says next tells what the notice would have.
+        if !self.seen.suggest_notice {
+            self.seen.suggest_notice = true;
+            self.seen_dirty = true;
+        }
+        if self
+            .once
+            .as_ref()
+            .is_some_and(|(w, _)| *w == crate::firstrun::Once::SuggestNotice)
+        {
+            self.once = None;
+        }
         if !on {
             self.suggestion = None;
             self.suggest_due = None;

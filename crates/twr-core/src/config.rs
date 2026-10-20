@@ -84,7 +84,8 @@
 //! mouse = true         # the TUI selects and copies text itself; false = the terminal's own
 //! animate = true       # the working icon moves; false = a still `twr_` marker
 //! card_order = "stable"  # stable (default): cards keep their place; "attention": most recent first
-//! suggest = false      # true: a small model suggests your next message (ghost text, Tab takes it)
+//! suggest = true       # a small model suggests your next message (ghost text, Tab takes it);
+//!                      # false: none (sends nothing to Anthropic for it)
 //! suggest_model = "haiku"  # the Claude Code model suggestions come from
 //!
 //! [tui.notify]
@@ -261,10 +262,11 @@ pub struct TuiConfig {
     pub compact_width: u16,
     /// Terminal notifications (`[tui.notify]`): off unless `terminal` picks a way.
     pub notify: TuiNotifyConfig,
-    /// Suggest the next message (default `false`): after a turn of the thread on the main
+    /// Suggest the next message (default `true`): after a turn of the thread on the main
     /// pane ends, ask a small model for a likely next message, shown as ghost text in the
     /// empty input box (Tab or → takes it). It sends that turn's prompt and the end of its
-    /// reply to Anthropic through the Claude Code CLI, with your login.
+    /// reply to Anthropic through the Claude Code CLI, with your login; without the CLI or a
+    /// login, nothing is sent. The TUI says so once, the first time one is due.
     pub suggest: bool,
     /// The model suggestions come from (default `haiku`): a Claude Code model name or alias.
     pub suggest_model: String,
@@ -294,7 +296,7 @@ impl Default for TuiConfig {
             card_order: CardOrder::Stable,
             compact_width: 60,
             notify: TuiNotifyConfig::default(),
-            suggest: false,
+            suggest: true,
             suggest_model: DEFAULT_SUGGEST_MODEL.to_string(),
         }
     }
@@ -1933,12 +1935,13 @@ mod tests {
         assert!(c.tui.mouse);
         let e = Config::from_toml_str("[tui]\nmice = false\n").unwrap_err();
         assert!(format!("{e:#}").contains("unknown field"), "{e:#}");
-        // Suggestions: off, Haiku, unless asked.
-        assert!(!c.tui.suggest);
-        assert_eq!(c.tui.suggest_model, "haiku");
-        let c =
-            Config::from_toml_str("[tui]\nsuggest = true\nsuggest_model = \"sonnet\"\n").unwrap();
+        // Suggestions: on, Haiku, unless asked otherwise (an empty `[tui]` too).
         assert!(c.tui.suggest);
+        assert_eq!(c.tui.suggest_model, "haiku");
+        assert!(Config::from_toml_str("[tui]\n").unwrap().tui.suggest);
+        let c =
+            Config::from_toml_str("[tui]\nsuggest = false\nsuggest_model = \"sonnet\"\n").unwrap();
+        assert!(!c.tui.suggest);
         assert_eq!(c.tui.suggest_model, "sonnet");
     }
 

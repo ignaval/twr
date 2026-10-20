@@ -307,6 +307,7 @@ impl AppState {
             prompt: format!("no workspace {name}: create it and switch to it? y/n"),
             pending: format!("creating workspace {name}..."),
             alt: None,
+            offer: false,
         });
         Vec::new()
     }

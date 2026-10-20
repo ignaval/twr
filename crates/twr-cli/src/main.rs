@@ -5,7 +5,6 @@ mod term;
 mod boxes;
 mod dial_in;
 mod pretty;
-mod terminal_setup;
 #[cfg(test)]
 mod test_support;
 
@@ -1486,21 +1485,24 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Some(Cmd::TerminalSetup { terminal, print }) => {
             let terminal = match terminal.as_deref() {
                 None => None,
-                Some(name) => Some(terminal_setup::Terminal::parse(name).ok_or_else(|| {
-                    anyhow!(
-                        "no terminal {name:?}: name one of {}",
-                        terminal_setup::ALL
-                            .iter()
-                            .map(|t| t.name())
-                            .chain(["vscode-insiders", "cursor", "windsurf", "vscodium"])
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?),
+                Some(name) => Some(twr_tui::terminal_setup::Terminal::parse(name).ok_or_else(
+                    || {
+                        anyhow!(
+                            "no terminal {name:?}: name one of {}",
+                            twr_tui::terminal_setup::ALL
+                                .iter()
+                                .map(|t| t.name())
+                                .chain(["vscode-insiders", "cursor", "windsurf", "vscodium"])
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                )?),
             };
-            let place = terminal_setup::place(twr_tui::keys::under_mosh());
+            let place = twr_tui::terminal_setup::place(twr_tui::keys::under_mosh());
             let agent = calling_agent();
-            let (lines, failed) = terminal_setup::run(&place, terminal, print, agent.as_deref());
+            let (lines, failed) =
+                twr_tui::terminal_setup::run(&place, terminal, print, agent.as_deref());
             for line in lines {
                 outln!("{line}");
             }
@@ -6695,7 +6697,7 @@ async fn open_tui(
     tui: twr_core::config::TuiConfig,
 ) -> anyhow::Result<()> {
     wait_for_hub(socket, paths).await?;
-    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui)).await
+    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui), calling_agent()).await
 }
 
 /// The workspaces of a root, as the TUI switches between them: their hubs are started like
