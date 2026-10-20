@@ -708,6 +708,9 @@ pub struct Withdrawal {
     pub text: String,
     /// Why it is taken back.
     pub purpose: Retract,
+    /// The user sent it: only then may its text go back in the box or the history, as theirs
+    /// (a queued message of the orchestrator's, or a `!!` command's output, never does).
+    pub mine: bool,
 }
 
 /// Why a message is taken back ([`Withdrawal::purpose`]).
@@ -3662,6 +3665,7 @@ impl AppState {
             return;
         };
         let thread = item.thread.clone();
+        self.view.queued = None;
         // With the sidebar hidden its thread has no card to select: the selection stays what
         // it was (none, or the orchestrator's card), see [`AppState::selected_request`]. So
         // with the conversation selected: the card it keeps is the one Shift-→ returns to.
@@ -3842,6 +3846,7 @@ impl AppState {
     pub fn set_focus(&mut self, thread: Option<String>) {
         self.view.request = None;
         self.view.block = None;
+        self.view.queued = None;
         self.view.detail = None;
         // Another card selected: the cards follow the selection again.
         if self.view.focus != thread {
@@ -5030,6 +5035,7 @@ impl AppState {
                     msg_ref,
                     text: s.text.clone(),
                     purpose: Retract::Unsend,
+                    mine: true,
                 });
                 vec![Action::Withdraw { thread, msg_ref }]
             }
@@ -5202,6 +5208,12 @@ impl AppState {
                 (Retract::Edit | Retract::Delete, None) => literal_line(&w.text),
                 _ => w.text.clone(),
             };
+            // Someone else's message (the orchestrator's, a `!!` command's output): gone, and
+            // nowhere it could be sent again as the user's.
+            if !w.mine {
+                self.set_timed_status("deleted from the queue".to_string(), Instant::now());
+                return;
+            }
             if w.purpose == Retract::Delete {
                 self.keep_taken_back(&text);
                 self.set_timed_status(
@@ -6278,6 +6290,7 @@ impl AppState {
         if !self.view.long_expanded.remove(&key) {
             self.view.long_expanded.insert(key.clone());
         }
+        self.view.queued = None;
         self.view.block = Some(key);
         self.view.request = None;
         if let Some(top) = top {
@@ -7091,6 +7104,7 @@ impl AppState {
                     } else if key.starts_with("block:") {
                         self.view.block = Some(key);
                         self.view.request = None;
+                        self.view.queued = None;
                     } else {
                         self.view.expanded.insert(key);
                     }
@@ -20771,6 +20785,45 @@ pub(crate) mod tests {
                 assert_eq!(literal_line(message), line, "{message}");
                 assert_eq!(message_text(line), message.trim_start(), "{line}");
             }
+        }
+
+        /// Deleting a message the user didn't send (a `!!` command's output, the
+        /// orchestrator's) leaves nothing to send again as theirs; another selection replaces
+        /// a selected queued row.
+        #[test]
+        fn others_messages_go_for_good_and_a_new_selection_releases_the_row() {
+            let mut st = with_queue(
+                json!([{"ref": 4, "prompt": "[twr: the user ran a shell command ...] allow both",
+                        "from": "runtime", "mine": false}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.select_queued(4);
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                st.action_rows(&ActionTarget::Queued(4))
+                    .iter()
+                    .map(|r| r.kind)
+                    .collect::<Vec<_>>(),
+                vec![ActionKind::Delete, ActionKind::SendNow]
+            );
+            run_row(&mut st, ActionKind::Delete);
+            let before = st.view.history.clone();
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 4,
+                        "prompt": "[twr: the user ran a shell command ...] allow both"}),
+            );
+            assert_eq!(st.view.history, before);
+            assert!(st.view.input.is_empty());
+            assert_eq!(st.view.status.as_deref(), Some("deleted from the queue"));
+            // Selecting a card after a queued row: Enter is about the card.
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            st.select_queued(7);
+            st.handle_key(key(KeyCode::Tab));
+            assert_eq!(st.view.queued, None);
+            assert!(matches!(st.selection_target(), Some(ActionTarget::Card(_))));
         }
 
         /// ↑ takes back the user's newest queued message even when the list shows only the

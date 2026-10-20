@@ -371,7 +371,7 @@ Each row shows the start of its message, `…` when there is more, and who sent 
 - **Select:** with the conversation selected (`Shift-←`), `Shift-↓` past its last block or request steps into the queued rows, and `Shift-↑` back up; a click on a row selects it too. The selected row is highlighted and says `Enter: edit, delete, send now`. `Esc` releases it.
 - **Act:** `Enter` on an empty line, or a tap on the selected row, opens its [action popup](#the-action-popup), with the message's text and who sent it, and these rows:
   - `edit: back into the box` (only your own messages; it is picked as the popup opens, so `Enter`, `Enter` edits it);
-  - `delete`: takes it out of the queue; its text goes to the history (`↑`);
+  - `delete`: takes it out of the queue; the text of a message of yours goes to the history (`↑`), someone else's (the orchestrator's, a `!!` command's output) goes for good, so it can never be sent again as yours;
   - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go.
   With the mouse, `delete` and `send now` take two taps, as `stop` does.
 

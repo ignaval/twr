@@ -224,11 +224,15 @@ impl AppState {
             return Vec::new();
         };
         // Listed, or the user's newest beyond the list: its text comes back from the hub.
-        let text = match q.items.iter().find(|i| i.msg_ref == msg_ref) {
-            Some(item) => item.prompt.clone(),
-            None if q.newest_mine == Some(msg_ref) => String::new(),
+        let (text, mine) = match q.items.iter().find(|i| i.msg_ref == msg_ref) {
+            Some(item) => (item.prompt.clone(), item.mine),
+            None if q.newest_mine == Some(msg_ref) => (String::new(), true),
             None => return Vec::new(),
         };
+        // Only the user's own messages are edited (their text comes back as theirs).
+        if purpose == Retract::Edit && !mine {
+            return Vec::new();
+        }
         let thread = q.thread.clone();
         if self.withdrawals.iter().any(|w| w.msg_ref == msg_ref) {
             return Vec::new();
@@ -238,6 +242,7 @@ impl AppState {
             msg_ref,
             text,
             purpose,
+            mine,
         });
         if self.view.queued == Some(msg_ref) {
             self.view.queued = None;
