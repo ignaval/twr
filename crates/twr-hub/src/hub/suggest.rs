@@ -257,7 +257,8 @@ fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
 /// ([`super::HubOptions::suggest_codex_home`]), else `codex_home` (`$CODEX_HOME`) when set,
 /// else `.codex` in `home` (`$HOME`) when set, else in the account's home directory
 /// (`account`, as Codex's `dirs::home_dir` falls back to the password database). `None` when
-/// none is found: Codex isn't asked then.
+/// none is found, or when it isn't UTF-8 (Codex reads `CODEX_HOME` as UTF-8 and falls back to
+/// another home when it isn't, one twr didn't check): Codex isn't asked then.
 fn codex_home_from(
     given: Option<&Path>,
     codex_home: Option<std::ffi::OsString>,
@@ -271,7 +272,9 @@ fn codex_home_from(
             .or_else(|| set(home).map(|h| h.join(".codex")))
             .or_else(|| account().map(|h| h.join(".codex")))?,
     };
-    std::path::absolute(dir).ok()
+    std::path::absolute(dir)
+        .ok()
+        .filter(|d| d.to_str().is_some())
 }
 
 /// This account's home directory in the password database (`getpwuid_r`).
@@ -1285,6 +1288,12 @@ mod tests {
             Some(PathBuf::from("/home/acct/.codex"))
         );
         assert_eq!(got(None, None, None, &none), None);
+        // Not UTF-8: Codex would not take it as `CODEX_HOME`, and read another home.
+        use std::os::unix::ffi::OsStringExt;
+        let bad = Some(std::ffi::OsString::from_vec(b"/tmp/codex-\xff".to_vec()));
+        assert_eq!(got(None, bad.clone(), os("/h"), &account), None);
+        let bad_home = Some(std::ffi::OsString::from_vec(b"/home/\xff".to_vec()));
+        assert_eq!(got(None, None, bad_home, &account), None);
         let rel = got(None, os("rel/codex"), None, &none).unwrap();
         assert!(rel.is_absolute() && rel.ends_with("rel/codex"), "{rel:?}");
         // This account has a home in the password database.
