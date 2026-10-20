@@ -110,7 +110,8 @@ pub(super) struct WakeState {
     /// replay schedules no wake); zero = never.
     pub(super) after: chrono::Duration,
     pending: HashMap<String, Pending>,
-    /// The tasks that ended since each thread's last turn ended.
+    /// The tasks that ended since each thread's last turn ended (one that saw no run aside):
+    /// those that ended during a turn are its to handle, and go with its end.
     ended: HashMap<String, Vec<EndedTask>>,
     /// The last turn the hub woke each thread after, or decided not to.
     woken: HashMap<String, u64>,
@@ -182,7 +183,7 @@ impl Core {
                 let Some(v) = self.registry.get(&ev.thread) else {
                     return;
                 };
-                if v.is_orchestrator() || ev.thread == HUB_THREAD || v.current_turn.is_some() {
+                if v.is_orchestrator() || ev.thread == HUB_THREAD {
                     return;
                 }
                 let job = twr_ext(&p.ext).and_then(|t| t.get("job"));

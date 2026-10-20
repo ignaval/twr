@@ -127,8 +127,23 @@ impl Core {
                 if self.logged_report(thread, turn)?.is_some() {
                     return Ok(());
                 }
+                // Only a completed turn's interim report: a failed turn keeps its failure.
+                let report_turn = self
+                    .view(thread)
+                    .map_err(anyhow::Error::new)?
+                    .last_report
+                    .as_ref()
+                    .and_then(|r| r.turn);
+                let completed = match report_turn {
+                    Some(t) => matches!(
+                        self.stored_event(thread, Some(t), "turn.ended")?,
+                        Some(Event { body: EventBody::TurnEnded(e), .. })
+                            if e.result == TurnResult::Completed
+                    ),
+                    None => false,
+                };
                 let view = self.view(thread).map_err(anyhow::Error::new)?;
-                if let Some(report) = super::wake::no_run_report(view, turn) {
+                if let Some(report) = super::wake::no_run_report(view, turn).filter(|_| completed) {
                     let mut batch = Batch::default();
                     batch.push(
                         thread,

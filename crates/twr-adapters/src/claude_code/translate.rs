@@ -90,22 +90,23 @@
 //! (`task_started` with `is_backgrounded: true`, or a later `task_updated` patch saying so; not
 //! `owned_by_subagent`) makes Claude start a run of its own for its notification, with no
 //! `init`, and its first output may come a minute later (time to first token). So that end,
-//! with no turn running or queued, opens the runtime's turn at once ([`Translator::task`]):
-//! the hub sees the thread busy and writes no prompt into that run. A prompt written into a
-//! run Claude started itself is folded into it, and since 2.1.295 such a run ends with no
-//! `result` at all, which left the turn open for hours. A turn so opened that sees no line of
-//! a run (output, a request, a `result`) within [`TranslatorOptions::notice_run_after`] is
-//! ended `completed` with `ext.twr.no_run` (Claude ran nothing); one ended by a `result` that
-//! asked the model nothing (`num_turns: 0`) ends then.
+//! with no turn running or queued and the last turn not failed, opens the runtime's turn at
+//! once: the hub sees the thread busy and writes no prompt into that run. A prompt written
+//! into a run Claude started itself is folded into it, and since 2.1.295 such a run ends with
+//! no `result` at all, which left the turn open for hours. A turn so opened that sees no line
+//! of the main agent's run (output, a request, an `init`) within
+//! [`TranslatorOptions::notice_run_after`] is ended `completed` with `ext.twr.no_run` (Claude
+//! ran nothing), and so is one whose run's `result` asked the model nothing (`num_turns: 0`).
 //!
 //! A missing `result`: once the main agent's message stops for good (`message_delta` with a
 //! `stop_reason` other than `tool_use` / `pause_turn`) in a running turn, the `result` is
 //! due. When nothing else comes within [`TranslatorOptions::missing_result_after`] (no new
-//! model message, request, `init` or `result`), [`Translator::expire`] ends the turn
-//! `completed` with `ext.twr.missing_result` (no usage), and so does each turn queued meanwhile
-//! (its prompt was folded into that run: Claude starts no run for it), and a `result` that still comes
-//! before the next run shows (an `init` or model output), a prompt queued since or not, is
-//! absorbed (its total read, charged to no turn; no turn ended or opened).
+//! model message, `init` or `result`; a request for the user holds it until answered, and the
+//! wait starts again then), [`Translator::expire`] ends the turn `completed` with
+//! `ext.twr.missing_result` (no usage), and so does each turn queued meanwhile (its prompt was
+//! folded into that run: Claude starts no run for it). A `result` that still comes before the
+//! next run shows (an `init` or model output), a prompt queued since or not, is absorbed (its
+//! total read, charged to no turn; no turn ended or opened).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -381,6 +382,8 @@ pub struct Translator {
     /// The runtime's turn was opened for a background task's notification and the main agent
     /// has shown no output in it yet.
     notice_quiet: bool,
+    /// The last turn ended `error`.
+    last_failed: bool,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
 }
@@ -427,6 +430,7 @@ impl Translator {
             watch: None,
             absorb_result: false,
             notice_quiet: false,
+            last_failed: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
@@ -749,13 +753,9 @@ impl Translator {
             "stream_event" => self.on_stream_event(&v, line, &mut out),
             "assistant" => self.on_assistant(&v, line, &mut out),
             "user" => self.on_user(&v, line, &mut out),
-            "control_request" => {
-                // Waiting on the user, not on a `result`.
-                if matches!(self.watch, Some((Watch::Result, _))) {
-                    self.watch = None;
-                }
-                self.on_control_request(&v, line, &mut out)
-            }
+            // (A request for the user only holds a missing `result`'s end while it is open:
+            // [`Translator::expire`].)
+            "control_request" => self.on_control_request(&v, line, &mut out),
             "control_cancel_request" => self.on_cancel(&v, line, &mut out),
             "rate_limit_event" => {
                 let status = v
@@ -1059,9 +1059,11 @@ impl Translator {
                 self.notifying.insert(id.to_string());
             }
         }
+        // Moved to the background while it runs (a finished task's late patch revives
+        // nothing).
         if v.pointer("/patch/is_backgrounded").and_then(Value::as_bool) == Some(true)
             && !self.subagent_tasks.contains(id)
-            && !id.is_empty()
+            && self.tasks.running.contains_key(id)
         {
             self.notifying.insert(id.to_string());
         }
@@ -1079,6 +1081,8 @@ impl Translator {
         {
             return;
         }
+        // Only a running task's end is one (a repeated completion is none).
+        let ended = terminal && self.tasks.running.contains_key(id);
         self.task(
             str_at(v, "task_id"),
             !terminal,
@@ -1089,7 +1093,7 @@ impl Translator {
         );
         if terminal {
             self.subagent_tasks.remove(id);
-            if self.notifying.remove(id) {
+            if self.notifying.remove(id) && ended {
                 self.open_notice_turn(out, line);
             }
         }
@@ -1098,8 +1102,10 @@ impl Translator {
     /// A background task of the main agent's ended: Claude starts a run of its own for its
     /// notification. With no turn running or queued, the runtime's turn opens now, not at the
     /// run's first output (see the module docs).
+    /// Not after a turn that failed: the run's first output opens its turn, and until then the
+    /// hub keeps that failure (its error card, its automatic retry).
     fn open_notice_turn(&mut self, out: &mut Translated, line: &str) {
-        if !self.started || self.busy() || self.failed {
+        if !self.started || self.busy() || self.failed || self.last_failed {
             return;
         }
         self.start_runtime_turn(out, Some(line));
@@ -1129,7 +1135,20 @@ impl Translator {
             return out;
         }
         self.watch = None;
-        if !self.active || !self.pending.is_empty() || self.failed {
+        if !self.active || self.failed {
+            return out;
+        }
+        // The user is asked something (a subagent's permission, say): the end waits for the
+        // answer, and the wait starts again from it.
+        if !self.pending.is_empty() {
+            let after = match watch {
+                Watch::Result => self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER),
+                Watch::NoticeRun => self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER),
+            };
+            self.watch = Some((watch, now + chrono_of(after)));
             return out;
         }
         match watch {
@@ -1792,6 +1811,7 @@ impl Translator {
         } else {
             TurnResult::Completed
         };
+        self.last_failed = result == TurnResult::Error;
 
         // Cost: cumulative per process. An interrupted turn's spend is not in the total (it
         // stays put, or reads 0 in a fresh process), and an errored turn reporting 0 did not
@@ -3578,10 +3598,10 @@ mod tests {
         assert!(!t.busy());
     }
 
-    /// A request for the user ends the wait for a `result`, and a stop with a request pending
-    /// ends nothing.
+    /// A request for the user (a subagent's permission after the main agent's last message)
+    /// holds a missing `result`'s end while it is open; once answered, the wait starts again.
     #[test]
-    fn a_request_for_the_user_is_no_missing_result() {
+    fn a_request_for_the_user_holds_a_missing_result() {
         let mut t = Translator::new(TranslatorOptions::default());
         t.user_message("hi", 1);
         feed(
@@ -3589,23 +3609,83 @@ mod tests {
             &[
                 INIT,
                 MESSAGE_START,
-                &reply("I need to run a command."),
+                &reply("Done."),
                 &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
-            ],
-        );
-        assert!(t.deadline().is_some());
-        feed(
-            &mut t,
-            &[
                 r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu1"}}"#,
             ],
         );
-        assert!(t.deadline().is_none());
-        assert!(t
-            .expire(Utc::now() + chrono::Duration::hours(1))
-            .events
-            .is_empty());
-        assert!(t.busy());
+        let at = t.deadline().unwrap();
+        assert!(t.expire(at).events.is_empty());
+        let again = t.deadline().unwrap();
+        assert!(again > at && t.busy());
+        t.respond("r1", &Answer::new("allow")).unwrap();
+        let events = t.expire(again).events;
+        assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
+    }
+
+    /// After a failed turn a background task's end opens no turn (the hub keeps the failure and
+    /// its retry); the run's first output does, as before.
+    #[test]
+    fn no_turn_opens_early_after_a_failed_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("run it", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "task_type": "local_bash"}),
+                ),
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":"end_turn","session_id":"s"}"#,
+            ],
+        );
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        assert!(turn_marks(&events).is_empty(), "{events:?}");
+        assert!(!t.busy());
+        let events = feed(&mut t, &[MESSAGE_START, &reply("Retrying.")]);
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+    }
+
+    /// A finished task's late patch revives nothing, and its completion said again opens no
+    /// turn.
+    #[test]
+    fn a_finished_task_opens_no_turn_again() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        feed(
+            &mut t,
+            &[MESSAGE_START, &reply("Done."), &result(1, Some(1.5), true)],
+        );
+        assert!(!t.busy());
+        let events = feed(
+            &mut t,
+            &[
+                &task_line(
+                    "task_updated",
+                    "b1",
+                    json!({"patch": {"is_backgrounded": true}}),
+                ),
+                &end,
+                &task_line(
+                    "task_updated",
+                    "b1",
+                    json!({"patch": {"status": "completed"}}),
+                ),
+            ],
+        );
+        assert!(turn_marks(&events).is_empty(), "{events:?}");
+        assert!(!t.busy());
     }
 
     /// A child agent's tool call in a run its `init` started with no prompt never opens a turn

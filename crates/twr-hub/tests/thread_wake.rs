@@ -641,6 +641,45 @@ async fn a_no_run_turns_wake_waits_for_the_rest_of_the_work() {
     hub.shutdown().await;
 }
 
+/// A task that ends while a turn that sees no run is open is unhandled too: the wake lists it.
+#[tokio::test]
+async fn a_task_ending_during_a_no_run_turn_is_in_the_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let [start, end] = runtime_turn("r1", true);
+    let script = vec![
+        session(),
+        Step::EmitSession(task("tests", true)),
+        Step::EmitSession(task("lint", true)),
+        Step::Emit(text("Running them in the background.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(100),
+        Step::EmitSession(task("tests", false)),
+        start,
+        Step::Sleep(100),
+        Step::EmitSession(task("lint", false)),
+        Step::Sleep(100),
+        end,
+        Step::AwaitSend,
+        Step::Emit(text("Both passed.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ];
+    let hub = Hub::open(opts(dir.path(), Some(script))).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "run the checks", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| ended(e, 3)).await;
+    let woke = wakes(&evs);
+    assert_eq!(woke.len(), 1, "{woke:?}");
+    assert!(
+        woke[0].contains("- background tests (ended)")
+            && woke[0].contains("- background lint (ended)"),
+        "{}",
+        woke[0]
+    );
+    hub.shutdown().await;
+}
+
 /// The user interrupted a silent turn to send the next message now, and its runtime ignores
 /// the interrupt: no hung-turn card comes for a turn being interrupted, so the plain stall
 /// does.
