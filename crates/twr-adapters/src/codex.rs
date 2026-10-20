@@ -548,11 +548,12 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 ///   and does not lie in the git dir or a checkout;
 /// - it is the runtime's user's (twr's effective uid: the sandbox runs as it, whoever owns
 ///   `cwd`), and no other user can replace it or a directory above it ([`held_by`]);
-/// - it neither lies in nor holds anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`
-///   (also before it exists), the shared memory folder; nor lies in another root. Codex's
-///   sandbox finds its roots again for each command, so a root in a folder the agent can
-///   write, or a scratch folder below a root, could be swapped for a link to anywhere between
-///   two commands. A relative `$TMPDIR` (Codex resolves it against the cwd) opens none;
+/// - it neither lies in nor holds anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`,
+///   the shared memory folder; nor lies in another root. Codex's sandbox finds its roots
+///   again for each command, so a root in a folder the agent can write, or a scratch folder
+///   below a root, could be swapped for a link to anywhere between two commands. A
+///   `$TMPDIR` not named as it is (relative, missing, through a link or `..`) opens none, nor
+///   the shared memory folder, which is also left out when it holds `$TMPDIR`;
 /// - the repository's checkouts can be found (from `repo`'s git dir, even when it lies in
 ///   `cwd`), so that none of them is opened: otherwise neither these nor the shared memory
 ///   folder are.
@@ -590,16 +591,18 @@ fn writable_roots(
     };
     // The runtime's user, whom the sandbox runs as (not whoever owns `cwd`).
     let owner = twr_core::paths::effective_uid();
-    let common = repo.and_then(|r| common_dir_of(r, Some(&canonical_cwd)));
     // What to keep out, found even where it grants nothing (a thread in the main checkout,
     // whose git dir lies in its cwd). A repository whose checkouts can't be found gets no
     // root but its git metadata.
     let repo_git = repo.and_then(|r| common_dir_of(r, None));
     let repo_known = repo.is_none() || repo_git.is_some();
-    // Codex lets commands write `$TMPDIR`, resolving a relative one against the cwd: twr
-    // takes an absolute one, and with a relative one opens no named root.
+    // Codex lets commands write `$TMPDIR` (resolving a relative one against the cwd, `..`
+    // taken out): twr takes it only as a folder named as it is (absolute, existing, no link
+    // or `..` on the way), and with any other opens neither named roots nor shared memory.
     let tmpdir = env("TMPDIR").filter(|v| !v.is_empty()).map(PathBuf::from);
-    let tmpdir_known = tmpdir.as_ref().is_none_or(|t| t.is_absolute());
+    let tmpdir_known = tmpdir
+        .as_ref()
+        .is_none_or(|t| t.canonicalize().ok().as_ref() == Some(t));
     let home = var("HOME");
     let canonical_home = home.as_ref().and_then(|h| h.canonicalize().ok());
     // Roots twr found itself (canonical), and those a variable named.
@@ -640,11 +643,11 @@ fn writable_roots(
     .flatten()
     .chain(repo_checkouts.iter().cloned())
     .collect();
-    // What commands can write besides the roots (`$TMPDIR` also before it exists).
+    // What commands can write besides the roots.
     let scratch: Vec<PathBuf> = [
         Some(canonical_cwd.clone()),
-        resolved(tmp),
-        tmpdir.as_deref().and_then(resolved),
+        tmp.canonicalize().ok(),
+        tmpdir.clone().filter(|_| tmpdir_known),
         shared.clone(),
     ]
     .into_iter()
@@ -696,10 +699,13 @@ fn writable_roots(
         std::fs::metadata(r).is_ok_and(|m| m.is_dir() && m.mode() & 0o1002 == 0o1002)
             && held_by(r, owner)
     };
-    if let Some(shm) =
-        shared.filter(|s| repo_known && s.as_path() == shared_memory && shared_dir(s))
+    if let Some(shm) = shared
+        .filter(|s| repo_known && tmpdir_known && s.as_path() == shared_memory && shared_dir(s))
     {
-        if !holds_kept_out(&shm) && !out.contains(&shm) {
+        // Holding another scratch folder (`$TMPDIR` in it): a folder between the two could
+        // become a link.
+        let holds_scratch = scratch.iter().any(|x| *x != shm && x.starts_with(&shm));
+        if !holds_kept_out(&shm) && !holds_scratch && !out.contains(&shm) {
             out.push(shm);
         }
     }
@@ -709,19 +715,6 @@ fn writable_roots(
 /// The shared memory folder an `auto` sandbox may write ([`auto_writable_roots`]), where it
 /// exists (Linux).
 pub const SHARED_MEMORY: &str = "/dev/shm";
-
-/// The absolute path `path` resolves to: its nearest existing ancestor canonical, with the
-/// rest of it after (a folder that does not exist yet). None for a relative path.
-fn resolved(path: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let (base, rest) = path.ancestors().find_map(|a| {
-        let canonical = a.canonicalize().ok()?;
-        Some((canonical, path.strip_prefix(a).ok()?.to_path_buf()))
-    })?;
-    Some(base.join(rest))
-}
 
 /// Whether no user but `owner` (and root) can replace `path` (canonical) or a directory above
 /// it: each is `owner`'s or root's, and one every user may write to has the sticky bit. A
@@ -2248,18 +2241,30 @@ mod tests {
             [target.clone()]
         );
         std::fs::remove_dir_all(common.join("worktrees/other")).unwrap();
-        // `$TMPDIR` below the target, not made yet: the target is left out.
+        // `$TMPDIR` below the target: the target is left out.
+        std::fs::create_dir_all(target.join("temp/session")).unwrap();
         let tmpdir = ("TMPDIR", target.join("temp/session").display().to_string());
         assert_eq!(
             roots_with(&main, vec![target_var.clone(), tmpdir]),
             [shm.clone()]
         );
-        // A relative `$TMPDIR`: no named root at all.
-        let relative = ("TMPDIR", "../scratch".to_string());
+        // `$TMPDIR` in the shared memory folder: that is left out.
+        std::fs::create_dir_all(shm.join("user/temp")).unwrap();
+        let in_shm = ("TMPDIR", shm.join("user/temp").display().to_string());
         assert_eq!(
-            roots_with(&main, vec![target_var.clone(), relative]),
-            [shm.clone()]
+            roots_with(&main, vec![target_var.clone(), in_shm]),
+            [target.clone()]
         );
+        // A `$TMPDIR` not named as it is (relative, not made yet, `..` after a folder that
+        // is not there): neither named roots nor shared memory.
+        for odd in [
+            "../scratch".to_string(),
+            target.join("later/session").display().to_string(),
+            format!("{}/missing/../cache/build/temp/session", d.display()),
+        ] {
+            let vars = vec![target_var.clone(), ("TMPDIR", odd.clone())];
+            assert!(roots_with(&main, vars).is_empty(), "{odd}");
+        }
         // A repository whose git dir can't be found: nothing but what twr found itself.
         let gone = d.join("gone");
         let env = |k: &str| match k {
