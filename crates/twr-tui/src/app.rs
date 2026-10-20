@@ -4227,9 +4227,24 @@ impl AppState {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        let view = self.armed_view();
+        let armed = self.sent.as_ref().and_then(|s| s.armed);
         let actions = self.key(key);
         self.sync_action();
+        self.disarm_on_view_change(&view, armed);
         actions
+    }
+
+    /// A double Esc armed before an input that changed the view (`view` before it, the arm
+    /// `armed` then) is for no view any more, even once that one shows again (`Ctrl-G` twice);
+    /// unless the input armed it anew, as the Esc that leaves a dive does.
+    fn disarm_on_view_change(&mut self, view: &ArmedView, armed: Option<Instant>) {
+        if self.armed_view() == *view {
+            return;
+        }
+        if let Some(s) = self.sent.as_mut().filter(|s| s.armed == armed) {
+            s.armed = None;
+        }
     }
 
     /// [`AppState::handle_key`], before the action popup is checked against the selection.
@@ -6110,9 +6125,12 @@ impl AppState {
     /// request or a long block; on the input line it puts the cursor there. The wheel scrolls
     /// the pane under the pointer, or moves the highlight of the popup under it.
     pub fn handle_mouse(&mut self, ev: MouseEvent, screen: &Buffer) -> Vec<Action> {
+        let view = self.armed_view();
+        let armed = self.sent.as_ref().and_then(|s| s.armed);
         let actions = self.mouse(ev, screen);
         // What the click moved the selection to: the popup is about it, or closes.
         self.sync_action();
+        self.disarm_on_view_change(&view, armed);
         actions
     }
 
@@ -18500,17 +18518,19 @@ pub(crate) mod tests {
         assert!(type_line(&mut st, "/open beta").is_empty());
         assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
         assert_eq!(st.unsend_hint(), None);
+        assert_eq!(st.sent.as_ref().unwrap().armed, None, "disarmed");
+        // In its dive again, Esc is a first Esc: it leaves and arms afresh.
         assert!(
             st.handle_key(key(KeyCode::Esc)).is_empty(),
             "nothing taken back"
         );
         assert_eq!(st.view.dive, None, "the Esc left the dive");
-        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+        assert!(st.unsend_hint().is_some());
     }
 
     /// The second Esc counts only in the view the first left the dive for: after Ctrl-G (the
-    /// grid), or another dive and `/back` (the same conversation shown again), Esc does what it
-    /// does there and takes nothing back, nor does a tap.
+    /// grid, and back), or another dive and `/back` (the same conversation shown again), Esc
+    /// does what it does there and takes nothing back, nor does a tap.
     #[test]
     fn a_take_back_armed_by_leaving_a_dive_is_for_that_view_only() {
         let mut st = with_orch();
@@ -18544,6 +18564,17 @@ pub(crate) mod tests {
 
         st.handle_key(ctrl('g'));
         assert_eq!(st.view.screen, Screen::Stack);
+        st.sent = None;
+        // To the grid and back: the same view again, but not the one it was armed in.
+        leave_armed(&mut st, 35);
+        st.handle_key(ctrl('g'));
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Stack);
+        assert_eq!(st.unsend_hint(), None);
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
         st.sent = None;
         leave_armed(&mut st, 34);
         assert!(type_line(&mut st, "/open gamma").is_empty());
