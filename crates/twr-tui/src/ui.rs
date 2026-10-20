@@ -3884,7 +3884,10 @@ fn long_rows(
         hint
     };
     for row in &mut rows {
-        row.2 = Some(key.clone());
+        // A command's `■ stop` stays a stop; the rest of the block's rows select it.
+        if !row.2.as_deref().is_some_and(|l| l.starts_with(SHELL_STOP)) {
+            row.2 = Some(key.clone());
+        }
         if selected && matches!(row.3, Edge::Top(_)) {
             for span in &mut row.0.spans {
                 span.style = span.style.fg(Color::Yellow);
@@ -4636,8 +4639,17 @@ fn shell_rows(v: &mut View, e: &Entry, threads: &Threads) {
         Style::default().add_modifier(Modifier::BOLD),
     );
     let took = duration_ms.map(duration_text);
+    // Ctrl-C stops the commands this TUI started; any running one has its `■ stop`.
+    let ours = threads
+        .state
+        .is_some_and(|s| s.shell_jobs.iter().any(|j| j.job == *job && !j.stopping));
+    let running_text = if ours {
+        "running · Ctrl-C stops it"
+    } else {
+        "running"
+    };
     let (mark, text, color) = match (*running, outcome.as_deref(), exit, signal) {
-        (true, ..) => ("⏵ ", "running · Ctrl-C stops it".to_string(), Color::Yellow),
+        (true, ..) => ("⏵ ", running_text.to_string(), Color::Yellow),
         (false, Some("exited"), Some(0), _) => ("✓ ", "exit 0".to_string(), Color::Green),
         (false, Some("exited"), Some(c), _) => ("✗ ", format!("exit {c}"), Color::Red),
         (false, Some("exited"), None, Some(s)) => {

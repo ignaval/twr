@@ -390,12 +390,16 @@ impl AppState {
     }
 
     /// A command's job ended (`task.updated`, not running): it is no longer this TUI's to stop.
-    pub(crate) fn shell_ended(&mut self, job: &str) {
+    pub(crate) fn shell_ended(&mut self, thread: &str, job: &str) {
         self.shell_done.push_back(job.to_string());
         if self.shell_done.len() > 32 {
             self.shell_done.pop_front();
         }
-        let Some(i) = self.shell_jobs.iter().position(|s| s.job == job) else {
+        let Some(i) = self
+            .shell_jobs
+            .iter()
+            .position(|s| s.job == job && s.thread == thread)
+        else {
             return;
         };
         let s = self.shell_jobs.remove(i);

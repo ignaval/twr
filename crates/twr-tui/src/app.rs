@@ -2560,11 +2560,13 @@ impl AppState {
                 }
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
-            // A `!` command ended: Ctrl-C quits again.
-            EventBody::TaskUpdated(p) if !p.running => {
+            // A `!` command ended (as the hub records it, nobody else): Ctrl-C quits again.
+            EventBody::TaskUpdated(p)
+                if !p.running && twr_core::event::is_job_task(&ev.source, &ev.body) =>
+            {
                 if let Some(job) = p.task_id.strip_prefix(twr_core::event::JOB_TASK_PREFIX) {
                     let job = job.to_string();
-                    self.shell_ended(&job);
+                    self.shell_ended(&ev.thread, &job);
                 }
             }
             // A turn ended while the TUI watched: a suggestion may be due; one started: the
@@ -21364,6 +21366,23 @@ pub(crate) mod tests {
             )));
             let screen = screen_text(&draw(&mut st, 120, 30));
             assert!(screen.contains("! cargo test"), "{screen}");
+            // Not started here (another TUI's, or from before this one): `■ stop` only.
+            assert!(
+                screen.contains("⏵ running · in /work/api · shown only · ■ stop"),
+                "{screen}"
+            );
+            // Started here: Ctrl-C stops it too.
+            st.shell_launching.push_back(crate::shell::Launch {
+                id: 1,
+                thread: Some("t-orch".into()),
+                command: "cargo test".into(),
+                cancel: false,
+            });
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J1", "thread": "t-orch", "name": "cargo test", "cwd": "/work/api"}),
+            );
+            let screen = screen_text(&draw(&mut st, 120, 30));
             assert!(
                 screen.contains("⏵ running · Ctrl-C stops it · in /work/api · shown only · ■ stop"),
                 "{screen}"
@@ -21579,6 +21598,60 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("still on its way"));
             assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+        }
+
+        /// Only the hub's record of a `!` command's end ends it here: a runtime's
+        /// `task.updated` naming its job leaves Ctrl-C stopping it.
+        #[test]
+        fn only_the_hubs_record_ends_a_command() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J8", "thread": "t-orch", "name": "sleep 99", "cwd": "/w"}),
+            );
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            let mut forged = job_event(&mut o, end("J8", "sleep 99", 0, ""), false);
+            forged.source = twr_core::event::Source::Adapter("claude-code".into());
+            st.apply_control(&forged);
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J8".into() }]
+            );
+        }
+
+        /// A long running command in the orchestrator conversation (its block cut to its
+        /// head) keeps its `■ stop`: a click on it stops the command.
+        #[test]
+        fn a_long_commands_stop_survives_the_block_cut() {
+            let mut st = with_orch();
+            st.transcript.as_mut().unwrap().catch_up = None;
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J5", "make", false),
+                true,
+            )));
+            let long: String = (0..6)
+                .map(|i| format!("{i}{}\n", "x".repeat(300)))
+                .collect();
+            st.shell_reads_due(Instant::now());
+            st.apply_result("job.log", &json!({"job": "J5", "text": long}));
+            let screen = draw(&mut st, 120, 40);
+            let text = screen_text(&screen);
+            assert!(text.contains("more lines"), "the block is cut:\n{text}");
+            let y = text
+                .lines()
+                .position(|l| l.contains("■ stop"))
+                .expect("a stop row") as u16;
+            let left = MouseButton::Left;
+            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            let screen = draw(&mut st, 120, 40);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            assert_eq!(out, vec![Action::JobCancel { job: "J5".into() }]);
         }
 
         /// A command's end in the replay shows what the end recorded: its log is not read.
