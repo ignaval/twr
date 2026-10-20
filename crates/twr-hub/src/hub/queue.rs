@@ -52,9 +52,11 @@ fn preview(s: &str, max: usize) -> (&str, bool) {
 
 impl Hub {
     /// `thread.queue {thread}` (users only): thread `query`'s queued messages, in the order
-    /// they run. `{thread, thread_name, total, held, items: [{ref, prompt, truncated, from,
-    /// mine, queued_at}]}`: `mine` is a message the user sent (from a client of theirs), `held`
-    /// says a failure holds the queue until the user's next send.
+    /// they run. `{thread, thread_name, total, held, newest_mine, items: [{ref, prompt,
+    /// truncated, from, mine, queued_at}]}`: `mine` is a message the user sent (from a client
+    /// of theirs), `newest_mine` the ref of the newest of those in the whole queue (the list
+    /// holds the first [`QUEUE_LIST_MAX`]), `held` says a failure holds the queue until the
+    /// user's next send.
     pub fn thread_queue(&self, query: &str, caller: &Caller) -> Result<Value, RpcError> {
         if caller.is_orchestrator() {
             return Err(rpc(
@@ -85,12 +87,14 @@ impl Hub {
                 })
             })
             .collect();
+        let newest_mine = core.store.newest_user_pending(&id).map_err(internal)?;
         Ok(json!({
             "thread": id,
             "thread_name": core.thread_name(&id),
             "total": total,
             "held": core.rt.get(&id).is_some_and(|r| r.queue_held),
             "items": items,
+            "newest_mine": newest_mine,
         }))
     }
 

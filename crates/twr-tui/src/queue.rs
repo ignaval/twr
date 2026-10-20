@@ -56,6 +56,8 @@ pub struct QueueView {
     pub total: u64,
     /// A failure holds the queue until the user's next send.
     pub held: bool,
+    /// The newest message of the user's in the whole queue (the list holds its start).
+    pub newest_mine: Option<i64>,
     /// A read is on its way, since then.
     pub asked: Option<Instant>,
     /// The last read answered then.
@@ -189,6 +191,11 @@ impl AppState {
         q.items = items(result);
         q.total = result["total"].as_u64().unwrap_or(q.items.len() as u64);
         q.held = result["held"].as_bool().unwrap_or(false);
+        // An older hub says nothing of it: the newest of the user's in the list.
+        q.newest_mine = result
+            .get("newest_mine")
+            .map(Value::as_i64)
+            .unwrap_or_else(|| q.items.iter().rev().find(|i| i.mine).map(|i| i.msg_ref));
         if self.view.queued.is_some() && self.selected_queued().is_none() {
             self.view.queued = None;
         }
@@ -200,8 +207,7 @@ impl AppState {
         if !self.view.input.is_empty() {
             return None;
         }
-        let q = self.shown_queue()?;
-        let newest = q.items.iter().rev().find(|i| i.mine)?.msg_ref;
+        let newest = self.shown_queue()?.newest_mine?;
         Some(self.retract_queued(newest, Retract::Edit))
     }
 
@@ -212,8 +218,11 @@ impl AppState {
         let Some(q) = self.shown_queue() else {
             return Vec::new();
         };
-        let Some(item) = q.items.iter().find(|i| i.msg_ref == msg_ref) else {
-            return Vec::new();
+        // Listed, or the user's newest beyond the list: its text comes back from the hub.
+        let text = match q.items.iter().find(|i| i.msg_ref == msg_ref) {
+            Some(item) => item.prompt.clone(),
+            None if q.newest_mine == Some(msg_ref) => String::new(),
+            None => return Vec::new(),
         };
         let thread = q.thread.clone();
         if self.withdrawals.iter().any(|w| w.msg_ref == msg_ref) {
@@ -222,7 +231,7 @@ impl AppState {
         self.withdrawals.push(Withdrawal {
             thread: thread.clone(),
             msg_ref,
-            text: item.prompt.clone(),
+            text,
             purpose,
         });
         if self.view.queued == Some(msg_ref) {

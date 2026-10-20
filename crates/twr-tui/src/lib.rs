@@ -1825,6 +1825,11 @@ async fn serve_calls(
             {
                 let _ = results.view.send((method, Value::Null));
             }
+            // A failed `!cd`: said, and commands run where they did.
+            Err(e) if method == "shell.cd" => {
+                status.send((error_status(method, &format!("{e:#}")), false));
+                let _ = results.view.send((method, json!({"failed": true})));
+            }
             // A command's log that can't be read: it shows what its end recorded.
             Err(_) if method == "job.log" => {
                 let _ = results

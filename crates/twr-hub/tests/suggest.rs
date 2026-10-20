@@ -295,3 +295,55 @@ async fn a_failure_holds_suggestions_back() {
     assert_eq!(runs(&cli), 1);
     hub.shutdown().await;
 }
+
+/// A hub notice turn of the orchestrator (other threads' reports and items) is no
+/// conversation with the user: nothing of it goes out for a suggestion.
+#[tokio::test]
+async fn a_notice_turn_gets_no_suggestion() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "check the report", false);
+    let mut config = Config {
+        default_runtime: "fake".into(),
+        ..Default::default()
+    };
+    config.orchestrator.runtime = Some("fake".into());
+    config.orchestrator.cwd = Some(dir.path().to_path_buf());
+    let mut o = HubOptions::new(dir.path().join("data").join("twr.db"), config);
+    o.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
+        match name {
+            "fake" => Some(Arc::new(FakeAdapter::new())),
+            _ => None,
+        }
+    });
+    o.socket = Some(dir.path().join("hub.sock"));
+    o.stop_timeout = Duration::from_secs(5);
+    o.suggest_bin = Some(bin);
+    let hub = Hub::open(o).await.unwrap();
+    let mut sub = hub.subscribe_control(0);
+    let r = hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let orch = r["thread"].as_str().unwrap().to_string();
+    until_ended(&mut sub, &orch, 1).await;
+    // A worker's failed turn: an error item, a notice turn for the orchestrator.
+    turn_ended(&hub, dir.path(), "!error").await;
+    until_ended(&mut sub, &orch, 2).await;
+    let (_, log) = hub.thread_events(&orch, 0, 10_000).unwrap();
+    let notice = log.iter().any(|e| {
+        e.turn == Some(2)
+            && e.kind() == "turn.started"
+            && e.body
+                .data()
+                .is_ok_and(|d| d["ext"]["twr"]["notice"] == true)
+    });
+    assert!(notice, "turn 2 is a notice");
+    let r = hub.suggest_next(&orch, 2, "haiku", &tui()).await.unwrap();
+    assert_eq!(
+        (r["suggestion"].is_null(), r["reason"].as_str()),
+        (true, Some("notice")),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}

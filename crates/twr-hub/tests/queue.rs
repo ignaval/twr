@@ -170,15 +170,16 @@ async fn the_queue_lists_waiting_messages_in_order() {
         (items[2]["mine"].as_bool(), items[2]["from"].as_str()),
         (Some(false), Some("orchestrator"))
     );
+    // The user's newest, wherever it is in the queue.
+    assert_eq!(q["newest_mine"].as_i64(), Some(third.msg_ref), "{q}");
     // Only the user reads it.
     assert!(hub.thread_queue("api", &Caller::Orchestrator).is_err());
     // Taking one back leaves the others in order; the full text comes back.
     let w = hub.withdraw_message("api", third.msg_ref, &tui()).unwrap();
     assert_eq!(w["prompt"].as_str(), Some(long.as_str()));
-    assert_eq!(
-        refs(&queue(&hub, "api")),
-        vec![second.msg_ref, orch.msg_ref]
-    );
+    let q = queue(&hub, "api");
+    assert_eq!(refs(&q), vec![second.msg_ref, orch.msg_ref]);
+    assert_eq!(q["newest_mine"].as_i64(), Some(second.msg_ref), "{q}");
     hub.stop_thread("api", "test").unwrap();
     hub.shutdown().await;
 }

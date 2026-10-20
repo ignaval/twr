@@ -131,6 +131,12 @@ impl AppState {
             return Vec::new();
         }
         let dive = self.view.dive.clone();
+        // A `!cd` on its way: where this would run is not known yet.
+        if dive.is_none() && self.shell_cd_asked {
+            self.view.status =
+                Some("the folder is still changing (`!cd`): press Enter again in a moment".into());
+            return Vec::new();
+        }
         if let Some(dir) = cd_target(&command).filter(|_| !share) {
             if let Some(t) = dive.as_ref().and_then(|d| self.registry.get(d)) {
                 self.view.status = Some(format!(
@@ -289,12 +295,17 @@ impl AppState {
         let (Some(job), Some(thread)) = (result["job"].as_str(), result["thread"].as_str()) else {
             return;
         };
+        // Ended already (its end came before this answer): nothing to stop.
+        let ended = self.shell_done.iter().any(|d| d == job);
         if let Some(cwd) = result["cwd"].as_str().filter(|_| {
             self.registry
                 .get(thread)
                 .is_some_and(|t| t.is_orchestrator())
         }) {
             self.shell_cwd = Some(cwd.to_string());
+        }
+        if ended {
+            return;
         }
         self.shell_jobs.push(Started {
             job: job.to_string(),
@@ -307,6 +318,11 @@ impl AppState {
 
     /// What `shell.cd` returned: the orchestrator view's folder from now on.
     pub(crate) fn shell_moved(&mut self, result: &Value) {
+        // A failed `!cd` (its error is in the status bar): commands run where they did.
+        if result["failed"] == true {
+            self.shell_cd_asked = false;
+            return;
+        }
         if let Some(cwd) = result["cwd"].as_str() {
             self.shell_cwd = Some(cwd.to_string());
             // The user's `!cd`, not the TUI asking for the folder's name.
@@ -318,7 +334,24 @@ impl AppState {
 
     /// A command's job ended (`task.updated`, not running): it is no longer this TUI's to stop.
     pub(crate) fn shell_ended(&mut self, job: &str) {
-        self.shell_jobs.retain(|s| s.job != job);
+        self.shell_done.push_back(job.to_string());
+        if self.shell_done.len() > 32 {
+            self.shell_done.pop_front();
+        }
+        let Some(i) = self.shell_jobs.iter().position(|s| s.job == job) else {
+            return;
+        };
+        let s = self.shell_jobs.remove(i);
+        // The status said it was being stopped: now it is.
+        let stopping = format!("stopping `{}`", s.command);
+        if self
+            .view
+            .status
+            .as_deref()
+            .is_some_and(|m| m.starts_with(&stopping))
+        {
+            self.view.status = Some(format!("stopped `{}`", s.command));
+        }
     }
 
     /// Ctrl-C: stops the newest command this TUI started on the main pane's thread that still

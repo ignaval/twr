@@ -332,7 +332,7 @@ impl Hub {
     /// after turn `turn` of thread `query` ended (see the module docs). `{thread, turn, model,
     /// suggestion, reason?, cached, stats: {calls, failures, cost_usd}}`: `suggestion` null with
     /// a `reason` when there is none (`none`, `answer_like`, `running`, `limit`, `backoff`,
-    /// `failed: ...`, `no_reply`).
+    /// `failed: ...`, `no_reply`, `notice`).
     pub async fn suggest_next(
         &self,
         query: &str,
@@ -370,6 +370,11 @@ impl Hub {
                     format!("{} has no turn {turn}", view.name),
                 ));
             };
+            // A hub notice turn carries other threads' reports and items, not a conversation
+            // with the user: none of it goes out for a suggestion.
+            if super::orch::is_notice(&p) {
+                return Ok(answer(&id, turn, model, None, Some("notice"), false, &hub));
+            }
             let reply = store::last_final_text(core.store.conn(), &id, turn)
                 .map_err(internal)?
                 .map(|e| core.full(e))

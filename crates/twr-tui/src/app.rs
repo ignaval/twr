@@ -2219,6 +2219,9 @@ pub struct AppState {
     pub shell_cd_asked: bool,
     /// The `!` commands this TUI started that still run, oldest first: Ctrl-C stops the newest.
     pub shell_jobs: Vec<crate::shell::Started>,
+    /// The latest `!` commands that ended (their jobs), at most 32: an answer to `shell.run`
+    /// that comes after its command's end starts nothing to stop.
+    pub shell_done: VecDeque<String>,
     /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
     pub shell_reads: HashMap<String, crate::shell::Reads>,
     /// The suggested next message, while it may show ([`crate::suggest`]).
@@ -20754,6 +20757,32 @@ pub(crate) mod tests {
             }
         }
 
+        /// ↑ takes back the user's newest queued message even when the list shows only the
+        /// start of the queue.
+        #[test]
+        fn up_takes_back_the_newest_beyond_the_list() {
+            let mut st = with_orch();
+            st.queue_due(Instant::now());
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 30, "newest_mine": 99, "items": [
+                    {"ref": 7, "prompt": "first", "from": "orchestrator", "mine": false}]}),
+            );
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                st.handle_key(key(KeyCode::Up)),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 99
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 99, "prompt": "the newest"}),
+            );
+            assert_eq!(st.view.input.as_str(), "the newest");
+        }
+
         /// In the compact conversation, Enter on a selected queued row opens its popup, not
         /// the oldest item waiting.
         #[test]
@@ -20892,6 +20921,39 @@ pub(crate) mod tests {
                     share: false
                 }]
             );
+            // A command typed while a `!cd` is on its way waits for it: it would run in the
+            // folder before.
+            assert_eq!(
+                type_line(&mut st, "!cd other"),
+                vec![Action::ShellCd {
+                    cwd: Some("/work/src".into()),
+                    dir: Some("other".into())
+                }]
+            );
+            assert!(type_line(&mut st, "!rm file").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("still changing"));
+            assert_eq!(
+                st.view.input.as_str(),
+                "!rm file",
+                "kept to run once it moved"
+            );
+            st.view.input.clear();
+            // It failed: commands run where they did.
+            st.apply_result("shell.cd", &json!({"failed": true}));
+            assert_eq!(
+                type_line(&mut st, "!rm file"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm file".into(),
+                    cwd: Some("/work/src".into()),
+                    share: false
+                }]
+            );
             // `!cd` alone: back to the orchestrator's folder.
             assert_eq!(
                 type_line(&mut st, "!cd"),
@@ -21022,6 +21084,15 @@ pub(crate) mod tests {
             assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
             let mut o = ThreadScript::new("t-orch");
             o.at(100);
+            // A command that ended before `shell.run` answered: nothing to stop.
+            let quick = job_event(&mut o, end("J1", "true", 0, ""), false);
+            st.apply_control(&quick);
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J1", "thread": "t-orch", "name": "true", "cwd": "/work"}),
+            );
+            assert!(st.shell_jobs.is_empty());
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
             st.apply_event(&thread_item(&job_event(
                 &mut o,
                 start("J2", "sleep 30", false),
@@ -21047,6 +21118,7 @@ pub(crate) mod tests {
             st.apply_control(&ended);
             st.apply_event(&thread_item(&ended));
             assert!(st.shell_jobs.is_empty());
+            assert_eq!(st.view.status.as_deref(), Some("stopped `sleep 30`"));
             // The `■ stop` of a running one.
             st.apply_event(&thread_item(&job_event(
                 &mut o,

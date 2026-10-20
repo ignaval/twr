@@ -967,6 +967,20 @@ impl Store {
         Ok(out)
     }
 
+    /// The newest queued prompt of `thread` that a user sent (a client of theirs), wherever it
+    /// is in the queue: what the TUI's `↑` takes back to edit.
+    pub fn newest_user_pending(&self, thread: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM pending_prompts WHERE thread = ?1 AND from_ = 'user'
+                 AND source LIKE 'user:%' ORDER BY id DESC LIMIT 1",
+                params![thread],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Number of queued prompts of `thread`.
     pub fn pending_count(&self, thread: &str) -> anyhow::Result<u64> {
         let n: i64 = self.conn.query_row(

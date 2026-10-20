@@ -6792,7 +6792,7 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     }
     let width = usize::from(area.width);
     let dim = Style::default().fg(Color::DarkGray);
-    let newest_mine = q.items.iter().rev().find(|i| i.mine).map(|i| i.msg_ref);
+    let newest_mine = q.newest_mine;
     let shown: Vec<&crate::queue::Queued> = q.items.iter().take(crate::queue::QUEUE_ROWS).collect();
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (row, it) in shown.iter().enumerate() {
@@ -7522,7 +7522,11 @@ fn screen_hints(state: &AppState) -> &'static str {
         return "↑↓ select · PgUp/Dn page · Enter open thread · f site · v provider · Esc close · ? help · Ctrl-C quit";
     }
     let compact = state.compact();
-    if state.action_popup().is_some() {
+    if let Some(p) = state.action_popup() {
+        // A queued message's: its rows only.
+        if matches!(p.target, crate::app::ActionTarget::Queued(_)) {
+            return "↑↓/tap pick · Enter/tap again run · type to filter · Esc close";
+        }
         return if compact {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
         } else {
