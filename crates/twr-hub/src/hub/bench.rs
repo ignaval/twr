@@ -26,7 +26,10 @@ fn make_log(path: &std::path::Path) {
         for turn in 0..12 {
             evs.push(s.turn_started(&format!("step {turn}")));
             for i in 0..30 {
-                evs.push(s.text(&format!("Looking at step {turn}, part {i}: {}", "x".repeat(200))));
+                evs.push(s.text(&format!(
+                    "Looking at step {turn}, part {i}: {}",
+                    "x".repeat(200)
+                )));
             }
             for i in 0..10 {
                 evs.push(s.event(EventBody::AgentToolCall(AgentToolCall {

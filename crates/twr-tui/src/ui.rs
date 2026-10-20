@@ -60,13 +60,17 @@ pub fn side_width(width: u16) -> u16 {
 pub fn render_loading(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
     let text = match state.catch_up {
-        Some(head) if head > 0 && head < u64::MAX => format!(
-            "Loading… {} of {head} events",
-            state.last_gseq.min(head)
-        ),
+        Some(head) if head > 0 && head < u64::MAX => {
+            format!("Loading… {} of {head} events", state.last_gseq.min(head))
+        }
         _ => "Loading…".to_string(),
     };
-    let row = Rect::new(area.x, area.y + area.height / 2, area.width, area.height.min(1));
+    let row = Rect::new(
+        area.x,
+        area.y + area.height / 2,
+        area.width,
+        area.height.min(1),
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             text,

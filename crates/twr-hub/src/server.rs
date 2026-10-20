@@ -1267,7 +1267,9 @@ const WRITE_BATCH: usize = 64 * 1024;
 trait Feed: Send {
     type Item: Send;
     /// The next item; `Ok(None)` once the hub has shut down.
-    fn next(&mut self) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
     /// Appends the line of the next item already in the store to `buf`; `Ok(false)` when none
     /// is, without waiting.
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
@@ -1277,7 +1279,9 @@ trait Feed: Send {
 
 impl Feed for crate::hub::ControlSubscription {
     type Item = crate::hub::ControlItem;
-    fn next(&mut self) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
         crate::hub::ControlSubscription::next(self)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
@@ -1290,7 +1294,9 @@ impl Feed for crate::hub::ControlSubscription {
 
 impl Feed for crate::hub::ThreadSubscription {
     type Item = Arc<Event>;
-    fn next(&mut self) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
         crate::hub::ThreadSubscription::next(self)
     }
     fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {

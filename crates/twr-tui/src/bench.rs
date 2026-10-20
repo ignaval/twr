@@ -198,13 +198,13 @@ fn replay_bench() {
     let (w, h) = (220, 55);
     let t = Instant::now();
     draw(&mut st, w, h);
-    eprintln!("{}  draw the orchestrator conversation, first", ms(t.elapsed()));
+    eprintln!(
+        "{}  draw the orchestrator conversation, first",
+        ms(t.elapsed())
+    );
     let t = Instant::now();
     for _ in 0..10 {
         draw(&mut st, w, h);
     }
-    eprintln!(
-        "{}  draw it again (mean of 10)",
-        ms(t.elapsed() / 10)
-    );
+    eprintln!("{}  draw it again (mean of 10)", ms(t.elapsed() / 10));
 }

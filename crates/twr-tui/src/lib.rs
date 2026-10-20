@@ -4381,7 +4381,7 @@ mod tests {
         let items: Vec<anyhow::Result<StreamItem>> = (0..2000)
             .map(|i| {
                 Ok(StreamItem {
-                    stream: StreamKind::Thread,
+                    stream: twr_core::proto::StreamKind::Thread,
                     gseq: None,
                     event: t.text(&format!("line {i}")),
                 })
@@ -4407,7 +4407,7 @@ mod tests {
         let gone = Arc::new(AtomicBool::new(false));
         let guard = Dropped(gone.clone());
         let first = Ok(StreamItem {
-            stream: StreamKind::Thread,
+            stream: twr_core::proto::StreamKind::Thread,
             gseq: None,
             event: t.text("only this"),
         });

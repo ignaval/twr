@@ -1172,9 +1172,10 @@ fn stream_line(row: RawRow, gseq: Option<u64>, out: &mut Vec<u8>) -> anyhow::Res
         .filter(|d| !d.get().contains(['\n', '\r']));
     // The envelope as `Event` writes it: the time to the millisecond in UTC, the source
     // spelled its way.
-    let ts = DateTime::parse_from_rfc3339(&row.ts)
-        .ok()
-        .map(|t| t.with_timezone(&Utc).to_rfc3339_opts(SecondsFormat::Millis, true));
+    let ts = DateTime::parse_from_rfc3339(&row.ts).ok().map(|t| {
+        t.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
     let source = Source::from_str(&row.source).ok().map(|s| s.to_string());
     let readable = row.seq >= 0 && row.turn.is_none_or(|t| t >= 0);
     let (Some(data), Some(ts), Some(source), true) = (data, ts, source, readable) else {
@@ -1838,7 +1839,9 @@ mod tests {
                 task_id: "b1".into(),
                 running: true,
                 description: "tests".into(),
-                ext: serde_json::json!({"claude": {"n": 1.5}}).as_object().cloned(),
+                ext: serde_json::json!({"claude": {"n": 1.5}})
+                    .as_object()
+                    .cloned(),
                 ..Default::default()
             }),
             EventBody::AttentionRaised(AttentionRaised {
@@ -1869,7 +1872,11 @@ mod tests {
                 "2026-10-20T05:04:05.123456+02:00",
                 "thread.stopped",
             ),
-            (r#"{"later":[1,{"x":null}]}"#, "2026-10-20T03:04:05Z", "thread.from_later"),
+            (
+                r#"{"later":[1,{"x":null}]}"#,
+                "2026-10-20T03:04:05Z",
+                "thread.from_later",
+            ),
         ] {
             seq += 1;
             s.conn

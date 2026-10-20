@@ -18506,7 +18506,10 @@ pub(crate) mod tests {
             screen.contains("→ orchestrator  Esc or tap again: take back your message to beta"),
             "{screen}"
         );
-        assert!(st.take_back_offered(), "the take-back control is offered there too");
+        assert!(
+            st.take_back_offered(),
+            "the take-back control is offered there too"
+        );
         let back = st.handle_key(key(KeyCode::Esc));
         assert_eq!(
             back,

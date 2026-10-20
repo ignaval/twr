@@ -1996,8 +1996,7 @@ mod tests {
     #[test]
     fn a_payload_parsed_from_its_text_is_the_one_a_value_gives() {
         let value_way = |kind: &str, json: &str| {
-            serde_json::from_str::<Value>(json)
-                .and_then(|v| EventBody::from_kind_data(kind, v))
+            serde_json::from_str::<Value>(json).and_then(|v| EventBody::from_kind_data(kind, v))
         };
         let mut cases: Vec<(String, String)> = all_bodies()
             .into_iter()
@@ -2016,7 +2015,10 @@ mod tests {
             cases.push((kind.to_string(), "{\"text\": 1}".into()));
         }
         cases.push(("agent.text".into(), r#"{"text":"a","text":"b"}"#.into()));
-        cases.push(("thread.renamed".into(), r#"{"name":"x","name":"y","by":"user"}"#.into()));
+        cases.push((
+            "thread.renamed".into(),
+            r#"{"name":"x","name":"y","by":"user"}"#.into(),
+        ));
         cases.push(("from.a.later.build".into(), r#"{"a":1,"a":2}"#.into()));
         cases.push(("agent.text".into(), "{".into()));
         for (kind, json) in &cases {
@@ -2032,7 +2034,13 @@ mod tests {
             EventBody::from_kind_data("agent.text", Value::Null).unwrap()
         );
         // The envelope too, `null` and missing `data` alike.
-        let ev = Event::new("t1", 1, None, Source::Hub, EventBody::AgentText(Default::default()));
+        let ev = Event::new(
+            "t1",
+            1,
+            None,
+            Source::Hub,
+            EventBody::AgentText(Default::default()),
+        );
         let mut v = serde_json::to_value(&ev).unwrap();
         v["data"] = Value::Null;
         assert_eq!(serde_json::from_value::<Event>(v.clone()).unwrap(), ev);

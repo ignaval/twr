@@ -141,7 +141,14 @@ pub(crate) fn stream_line(
         Some(_) => twr_core::proto::StreamKind::Control,
         None => twr_core::proto::StreamKind::Thread,
     };
-    serde_json::to_writer(&mut *buf, &Item { stream, gseq, event })?;
+    serde_json::to_writer(
+        &mut *buf,
+        &Item {
+            stream,
+            gseq,
+            event,
+        },
+    )?;
     buf.push(b'\n');
     Ok(())
 }
