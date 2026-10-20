@@ -138,7 +138,8 @@ impl AppState {
         };
         self.suggestion = None;
         let (cols, rows) = (self.input_cols(), self.input_rows());
-        self.view.input.set(&text);
+        // A message, never a command: a suggestion that starts with `!` or `/` is escaped.
+        self.view.input.set(&crate::app::literal_line(&text));
         self.view.input.keep_visible(cols, rows);
         self.view.popup_sel = 0;
         true

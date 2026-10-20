@@ -32,9 +32,8 @@ impl Core {
             let view = views
                 .entry(e.thread.clone())
                 .or_insert_with(|| self.registry.get(&e.thread).cloned());
-            let had_background = view
-                .as_ref()
-                .is_some_and(|v| !v.background_tasks.is_empty());
+            // The user's `!` commands are theirs: the orchestrator hears nothing of them.
+            let had_background = view.as_ref().is_some_and(|v| v.own_background());
             if let Some(view) = view {
                 view.apply(&Event::new(
                     &e.thread,
@@ -90,7 +89,7 @@ impl Core {
                 (EventBody::TaskUpdated(p), Some(v))
                     if !p.running
                         && had_background
-                        && v.background_tasks.is_empty()
+                        && !v.own_background()
                         && v.current_turn.is_none() =>
                 {
                     (

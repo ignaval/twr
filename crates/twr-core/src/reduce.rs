@@ -134,6 +134,10 @@ pub struct BackgroundTask {
     /// A job started not to tell its thread when it ends (`ext.twr.job.wake: false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// A `!` command the user ran from the TUI (`ext.twr.job.shell`): the user's own work, not
+    /// the thread's (the orchestrator is told nothing of it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell: bool,
     /// A job's process group as the hub recorded it before the job's command ran
     /// (`ext.twr.job.pgid`, the group's leader's pid, and `ext.twr.job.start_time`, its start
     /// time): what a later hub kills of it when the hub that ran it stopped first.
@@ -365,6 +369,12 @@ impl ThreadView {
     /// runs whatever the runtime does).
     pub fn runtime_tasks(&self) -> bool {
         self.background_tasks.values().any(|t| !t.job)
+    }
+
+    /// Whether the thread has background work of its own: a task of its runtime's or a job,
+    /// not a `!` command the user runs ([`BackgroundTask::shell`]).
+    pub fn own_background(&self) -> bool {
+        self.background_tasks.values().any(|t| !t.shell)
     }
 
     /// An empty view for `id`.
@@ -615,6 +625,12 @@ impl ThreadView {
                                     .and_then(|j| j.get("wake"))
                                     .and_then(serde_json::Value::as_bool)
                                     == Some(false),
+                            shell: job
+                                && p.ext
+                                    .as_ref()
+                                    .and_then(|e| e.get("twr"))
+                                    .and_then(|t| t.get("job"))
+                                    .is_some_and(|j| j.get("shell").is_some()),
                         });
                     if !p.description.is_empty() {
                         task.description.clone_from(&p.description);

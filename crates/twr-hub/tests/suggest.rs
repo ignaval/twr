@@ -32,6 +32,10 @@ for a in "$@"; do printf '%s\n' "$a" >> "$here/argv"; done
 cat > "$here/stdin"
 pwd > "$here/cwd"
 env > "$here/env"
+if [ -f "$here/leave" ]; then
+  sleep 300 > /dev/null 2>&1 < /dev/null &
+  echo $! > "$here/left"
+fi
 cat "$here/answer.json"
 "#,
     )
@@ -45,6 +49,17 @@ fn answer(dir: &Path, result: &str, error: bool) {
     let v = serde_json::json!({"type": "result", "is_error": error, "result": result,
                                "total_cost_usd": 0.0001});
     std::fs::write(dir.join("answer.json"), v.to_string()).unwrap();
+}
+
+/// Whether `pid` is a zombie (ended, not yet reaped by its parent, here init).
+fn zombie(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|s| {
+            s.rsplit_once(')')
+                .map(|(_, r)| r.trim_start().starts_with('Z'))
+        })
+        .unwrap_or(true)
 }
 
 fn runs(dir: &Path) -> usize {
@@ -122,6 +137,11 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
     std::fs::create_dir_all(&cli).unwrap();
     let bin = fake_claude(&cli);
     answer(&cli, "\"Now run the integration tests\"\n", false);
+    // An API key or another endpoint in the hub's environment: not the CLI's (the user's
+    // login only, and the text goes nowhere else). And what it leaves running goes with it.
+    std::env::set_var("ANTHROPIC_API_KEY", "sk-sentinel");
+    std::env::set_var("ANTHROPIC_BASE_URL", "http://127.0.0.1:9");
+    std::fs::write(cli.join("leave"), "").unwrap();
     let hub = hub(dir.path(), bin).await;
     let api = turn_ended(
         &hub,
@@ -172,6 +192,24 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
     );
     assert!(!env.contains("TWR_ORCH_TOKEN="));
     assert!(!env.contains("TWR_RUNNER_TOKEN="));
+    assert!(!env.contains("ANTHROPIC_"), "{env}");
+    let left: i32 = std::fs::read_to_string(cli.join("left"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // SAFETY: signal 0 checks the process exists; nothing is sent.
+    let alive = || unsafe { libc::kill(left, 0) } == 0 && !zombie(left);
+    for _ in 0..50 {
+        if !alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !alive(),
+        "what the CLI left running ({left}) outlived the call"
+    );
     // Asked again (another TUI): the same answer, no second run.
     let again = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
     assert_eq!(

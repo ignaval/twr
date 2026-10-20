@@ -279,3 +279,37 @@ async fn a_command_is_cancelled_and_only_the_user_runs_one() {
     assert_eq!(e.code, codes::BAD_REQUEST);
     hub.shutdown().await;
 }
+
+/// A worker's `!` command is the user's: when it ends, the orchestrator's conversation hears
+/// nothing of it (no "background work finished").
+#[tokio::test]
+async fn the_orchestrator_hears_nothing_of_a_workers_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path()).await;
+    let _api = thread(&hub, dir.path(), "api").await;
+    hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let orch = hub
+        .shell_run(run(None, "true", None, false), &tui())
+        .unwrap()["thread"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut sub = hub.subscribe_control(0);
+    let r = hub
+        .shell_run(run(Some("api"), "echo hi", None, false), &tui())
+        .unwrap();
+    ended(&mut sub, r["job"].as_str().unwrap()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let updates: Vec<String> = events_of(&hub, &orch)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::ConversationUpdate(p) => Some(p.text),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        updates.iter().all(|t| !t.contains("background work")),
+        "{updates:?}"
+    );
+    hub.shutdown().await;
+}
