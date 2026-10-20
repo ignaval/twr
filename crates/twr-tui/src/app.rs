@@ -20558,8 +20558,8 @@ pub(crate) mod tests {
         }
 
         /// The queue is read when the main pane shows a thread, when something about it
-        /// changed, and while the thread works or messages wait; not while a read is on its
-        /// way, and not at all for an idle thread with nothing queued.
+        /// changed, often while the thread works or messages wait, now and then otherwise; not
+        /// while a read is on its way.
         #[test]
         fn the_queue_is_read_when_it_changes_and_while_it_moves() {
             let now = Instant::now();
@@ -20574,11 +20574,15 @@ pub(crate) mod tests {
                 .registry
                 .get("t-orch")
                 .is_some_and(|v| v.current_turn.is_some());
-            if busy {
-                assert!(st.queue_deadline(now).is_some());
+            // Idle with nothing queued: still read now and then (another client may queue
+            // for a thread that can't take it, which starts no turn).
+            let idle = st.queue_deadline(now).unwrap();
+            let poll = if busy {
+                crate::queue::QUEUE_POLL
             } else {
-                assert_eq!(st.queue_deadline(now), None, "idle, nothing queued");
-            }
+                crate::queue::QUEUE_IDLE_POLL
+            };
+            assert!(idle > now && idle <= now + poll + Duration::from_secs(1));
             // A message that queued: read again at once.
             st.apply_result(
                 "say",
@@ -21202,13 +21206,22 @@ pub(crate) mod tests {
             assert_eq!(output, "building\n100%");
             assert!(st.shell_reads_due(now).is_empty(), "read just now");
             assert!(st.shell_deadline(now).is_some());
-            // It ended: one more read, then none.
+            // A read asked while it ran, answered after its end: what the end recorded stays,
+            // and another read follows.
+            let later = Instant::now() + crate::shell::SHELL_POLL + Duration::from_millis(50);
+            assert_eq!(st.shell_reads_due(later), vec!["J4".to_string()]);
             st.apply_event(&thread_item(&job_event(
                 &mut o,
                 end("J4", "make", 2, "x"),
                 false,
             )));
-            let later = now + crate::shell::SHELL_POLL;
+            st.apply_result("job.log", &json!({"job": "J4", "text": "stale"}));
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "x");
+            // It ended: one more read, then none.
             assert_eq!(st.shell_reads_due(later), vec!["J4".to_string()]);
             st.apply_result("job.log", &json!({"job": "J4", "text": "all of it"}));
             assert!(st

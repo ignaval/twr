@@ -20,6 +20,11 @@ use crate::app::{Action, ActionTarget, AppState, Retract, Screen, Withdrawal};
 /// How often the queue is read again while its thread works or messages wait.
 pub const QUEUE_POLL: Duration = Duration::from_secs(2);
 
+/// How often the queue is read while its thread is idle and nothing waits: a message another
+/// client or the orchestrator queues for a thread that can't take it (parked, attached, its
+/// box offline, a crash holding its queue) changes no turn.
+pub const QUEUE_IDLE_POLL: Duration = Duration::from_secs(10);
+
 /// How long after a failed read (an older hub without `thread.queue`, a dropped connection)
 /// the next one waits.
 pub const QUEUE_RETRY: Duration = Duration::from_secs(30);
@@ -123,10 +128,10 @@ impl AppState {
         }
     }
 
-    /// When the queue is to be read next (`None`: not until something changes): at once
-    /// when the main pane shows another thread or something changed, [`QUEUE_POLL`] after
-    /// the last read while the thread works or messages wait, [`QUEUE_RETRY`] after a failed
-    /// one; not while a read is on its way.
+    /// When the queue is to be read next: at once when the main pane shows another thread or
+    /// something changed, [`QUEUE_POLL`] after the last read while the thread works or
+    /// messages wait, else [`QUEUE_IDLE_POLL`], [`QUEUE_RETRY`] after a failed one; not while
+    /// a read is on its way (`None`: no thread on the main pane).
     pub fn queue_deadline(&self, now: Instant) -> Option<Instant> {
         let main = self.main_thread()?;
         let Some(q) = self.queue.as_ref().filter(|q| q.thread == main) else {
@@ -149,7 +154,7 @@ impl AppState {
         if busy || !q.items.is_empty() || q.total > 0 {
             return after(QUEUE_POLL);
         }
-        None
+        after(QUEUE_IDLE_POLL)
     }
 
     /// The thread whose queue to read now, if a read is due ([`AppState::queue_deadline`]);

@@ -218,6 +218,7 @@ impl AppState {
                 continue;
             }
             r.asked = Some(now);
+            r.asked_running = running;
             due.push(job);
         }
         due
@@ -261,6 +262,12 @@ impl AppState {
         let r = self.shell_reads.entry(job.clone()).or_default();
         r.asked = None;
         r.last = Some(now);
+        // Asked while it ran, answered after its end: older than what its end recorded. A
+        // read after the end follows.
+        if r.asked_running && !running {
+            r.asked_running = false;
+            return;
+        }
         if !running {
             r.done = true;
         }
@@ -405,6 +412,8 @@ pub struct Reads {
     pub last: Option<Instant>,
     /// Read after it ended: nothing more to read.
     pub done: bool,
+    /// The read on its way was asked while the command ran.
+    pub asked_running: bool,
 }
 
 #[cfg(test)]
