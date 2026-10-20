@@ -11,7 +11,11 @@ version = 2
 # The RustSec advisory database. A vulnerability fails the check, and so does an unmaintained
 # crate anywhere in the graph or an unsound one a workspace crate depends on directly (the
 # defaults); a yanked version warns. An `ignore` entry needs its reason.
-ignore = []
+ignore = [
+    # webpki-roots 0.26.11 (tokio-tungstenite's) is a shim: its TLS_SERVER_ROOTS are webpki-roots
+    # 1's, locked at 1.0.10, which drops the emSign root.
+    { id = "RUSTSEC-2026-0381", reason = "a 0.26 shim over webpki-roots 1.0.10" },
+]
 
 [licenses]
 version = 2
