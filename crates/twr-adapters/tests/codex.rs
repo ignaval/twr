@@ -2063,6 +2063,9 @@ for line in open(fixture):
         if not got:
             sys.exit(3)
     else:
+        # Codex reports the cwd it runs in, which twr checks: the recording's is replaced,
+        # with the paths under it.
+        body = body.replace('/tmp/sandbox-codex', json.dumps(os.getcwd())[1:-1])
         sys.stdout.write(body + "\n"); sys.stdout.flush()
 while read_command():
     pass

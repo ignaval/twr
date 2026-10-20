@@ -768,9 +768,26 @@ impl Translator {
 
     /// A stdout line longer than the reader's cap was dropped; `head` is its start and `len`
     /// its length. A `turn/completed` still ends the running turn (`turn.ended{error}` with
-    /// `ext.twr.error = "oversized runtime message"`); anything else is only logged.
+    /// `ext.twr.error = "oversized runtime message"`); a `thread/settings/updated` ends the
+    /// session (twr cannot check it); an answer to `config/read` counts as a failed read;
+    /// anything else is only logged.
     pub fn oversized(&mut self, head: &str, len: usize) -> Translated {
         let mut out = Translated::default();
+        // Settings twr cannot read are settings it cannot check.
+        if crate::process::head_has(head, "method", "thread/settings/updated") {
+            out.fatal = Some(format!(
+                "codex thread/settings/updated: a message of {len} bytes, too long to check"
+            ));
+            return out;
+        }
+        // A config/read answer too long to read is a failed read.
+        if let Some(id) = crate::process::head_response_id(head)
+            .filter(|id| matches!(self.requests.get(id), Some(Req::ConfigRead)))
+        {
+            let failed = json!({"id": id, "error": {"message": OVERSIZED_ERROR}});
+            self.on_response(&failed, "", &mut out);
+            return out;
+        }
         if !crate::process::head_has(head, "method", "turn/completed") || self.current.is_none() {
             return out;
         }
@@ -2080,8 +2097,14 @@ impl Translator {
         if method == "thread/settings/updated" {
             let st = &p["threadSettings"];
             let reported = json!({"approvalPolicy": st["approvalPolicy"],
-                "approvalsReviewer": st["approvalsReviewer"], "sandbox": st["sandboxPolicy"]});
-            if let Err(why) = check_policy(&self.open.params, &reported) {
+                "approvalsReviewer": st["approvalsReviewer"], "sandbox": st["sandboxPolicy"],
+                "cwd": st["cwd"]});
+            let cwd_reported = st["cwd"].is_string() || str_at(&self.open.params, "cwd").is_empty();
+            let checked = match cwd_reported {
+                true => check_policy(&self.open.params, &reported),
+                false => Err("the settings report no cwd".to_string()),
+            };
+            if let Err(why) = checked {
                 tracing::error!(%why, "codex: refusing a thread whose settings now allow more than twr asked for");
                 out.fatal = Some(format!("codex thread/settings/updated: {why}"));
             }
@@ -2996,12 +3019,40 @@ pub fn check_policy(params: &Value, result: &Value) -> Result<(), String> {
     // older name for it.
     let asked = str_at(params, "approvalsReviewer");
     match result.get("approvalsReviewer").and_then(Value::as_str) {
-        Some("user") => Ok(()),
-        Some("auto_review" | "guardian_subagent") if asked == "auto_review" => Ok(()),
-        other => Err(format!(
-            "the thread reports approvalsReviewer {:?} where twr asked for {asked:?}; approvals \
-             would not reach the user",
-            other.unwrap_or("(none)")
+        Some("user") => {}
+        Some("auto_review" | "guardian_subagent") if asked == "auto_review" => {}
+        other => {
+            return Err(format!(
+                "the thread reports approvalsReviewer {:?} where twr asked for {asked:?}; \
+                 approvals would not reach the user",
+                other.unwrap_or("(none)")
+            ))
+        }
+    }
+    check_cwd(params, result)
+}
+
+/// Checks the `cwd` a result reports against the request's: a `workspace-write` sandbox lets
+/// commands write their cwd, so it must be the one asked for (the same path, or one that
+/// resolves to the same directory). Not reported (or null): as asked. Nothing asked: no check.
+fn check_cwd(params: &Value, result: &Value) -> Result<(), String> {
+    let asked = str_at(params, "cwd");
+    if asked.is_empty() {
+        return Ok(());
+    }
+    let same = |got: &str| {
+        Path::new(got) == Path::new(asked)
+            || matches!(
+                (Path::new(got).canonicalize(), Path::new(asked).canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    match result.get("cwd") {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::String(got)) if same(got) => Ok(()),
+        Some(other) => Err(format!(
+            "the thread reports cwd {} where twr asked for {asked:?}; commands could write there",
+            compact(other)
         )),
     }
 }
@@ -4003,6 +4054,63 @@ mod tests {
                 "{thread} {approval} {reviewer} accepted: {out:?}"
             );
         }
+        // Too long to read: nothing to check it against, so the session ends.
+        let out = t.oversized(
+            r#"{"method":"thread/settings/updated","params":{"threadId":"th","#,
+            9_000_000,
+        );
+        assert!(out.fatal.unwrap().contains("too long"));
+    }
+
+    /// A workspace-write sandbox lets commands write their cwd: a thread that reports another
+    /// cwd than the one asked for, when it opens or in its settings later (or settings with
+    /// none), is refused.
+    #[test]
+    fn a_thread_must_run_in_the_cwd_twr_asked_for() {
+        let params = json!({"cwd": "/w/wt", "approvalPolicy": "on-request",
+            "approvalsReviewer": "user", "sandbox": "workspace-write"});
+        let result = |cwd: Value| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": "user", "cwd": cwd,
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}})
+        };
+        assert_eq!(check_policy(&params, &result(json!("/w/wt"))), Ok(()));
+        assert_eq!(check_policy(&params, &result(json!("/w/wt/"))), Ok(()));
+        assert_eq!(check_policy(&params, &result(Value::Null)), Ok(()));
+        for bad in [json!("/home/u"), json!("/w"), json!(["/w/wt"])] {
+            let why = check_policy(&params, &result(bad.clone())).unwrap_err();
+            assert!(why.contains("cwd"), "{bad}: {why}");
+        }
+        let mut t = Translator::new(
+            TranslatorOptions::default(),
+            Open {
+                method: "thread/start",
+                params: params.clone(),
+                mode_note: None,
+                added_instructions: None,
+            },
+        );
+        t.start();
+        t.translate(r#"{"id":1,"result":{}}"#);
+        let out = t.translate(
+            &json!({"id": 2, "result": {"thread": {"id": "th"}, "cwd": "/w/wt",
+                "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}}})
+            .to_string(),
+        );
+        assert!(out.fatal.is_none(), "{out:?}");
+        let settings = |cwd: Option<&str>| {
+            let mut st = json!({"approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": false}});
+            if let Some(c) = cwd {
+                st["cwd"] = json!(c);
+            }
+            json!({"method": "thread/settings/updated",
+                "params": {"threadId": "th", "threadSettings": st}})
+            .to_string()
+        };
+        assert!(t.translate(&settings(Some("/w/wt"))).fatal.is_none());
+        assert!(t.translate(&settings(Some("/home/u"))).fatal.is_some());
+        assert!(t.translate(&settings(None)).fatal.is_some());
     }
 
     /// The `auto` sandbox note comes after the developer instructions of the user's Codex
@@ -4058,6 +4166,31 @@ mod tests {
             r#"{"id":ID,"error":{"code":-32000,"message":"no"}}"#,
         );
         assert_eq!(p["developerInstructions"], "twr text");
+        // An answer too long to read is a failed read: the thread opens without the note.
+        let mut t = Translator::new(
+            TranslatorOptions::default(),
+            open(json!({"developerInstructions": "NOTE"})),
+        );
+        t.start();
+        let out = t.translate(r#"{"id":1,"result":{}}"#);
+        let read = out
+            .replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == "config/read")
+            .unwrap();
+        let out = t.oversized(
+            &format!(r#"{{"id":{},"result":{{"config":{{"#, read["id"]),
+            9_000_000,
+        );
+        assert!(out.fatal.is_none(), "{out:?}");
+        let start = out
+            .replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == "thread/start")
+            .expect("thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
     }
 
     /// Relay rule: a form or URL elicitation is never answered for the user. It

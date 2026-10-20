@@ -543,16 +543,19 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 /// The caches and the target dir come from variables, so each is checked and left out
 /// unless:
 /// - `$HOME` is known, and the path, as given, names a directory through no symbolic link;
-/// - it is not and does not hold `$HOME`, `cwd` or the repository's git dir (a
-///   `CARGO_TARGET_DIR` of `~` or of the worktrees' folder would open them all), and does not
-///   lie in the git dir;
+/// - it is not and does not hold `$HOME`, `cwd`, the repository's git dir or any of its
+///   checkouts (a `CARGO_TARGET_DIR` of `~` or of the worktrees' folder would open them all),
+///   and does not lie in the git dir or a checkout;
+/// - it is the owner's, and no other user can replace it or a directory above it
+///   ([`held_by`]);
 /// - it does not lie in anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`, the shared
 ///   memory folder or another root. Codex's sandbox finds its roots again for each command,
 ///   so a root in a folder the agent can write could be swapped for a link to anywhere
 ///   between two commands.
 ///
-/// A directory every user may write to qualifies only with the sticky bit, as `/dev/shm`
-/// and `/tmp` have it.
+/// The shared memory folder qualifies as root's, sticky and writable by all, with no other
+/// user able to replace it, and none of the repository's checkouts in it. (Codex lets every
+/// command write `/tmp` already.)
 ///
 /// `env` looks up variables (empty counts as unset).
 pub fn auto_writable_roots(
@@ -612,14 +615,18 @@ fn writable_roots(
         );
     }
     let shared = shared_memory.canonicalize().ok();
-    // What no root may hold, and where none may lie.
-    let keep_out: Vec<&PathBuf> = [
-        Some(&canonical_cwd),
-        common.as_ref(),
-        canonical_home.as_ref(),
+    // What no root may hold: the worktree, the repository's git dir and its other checkouts,
+    // the home folder.
+    let mut repo_checkouts: Vec<PathBuf> = common.as_deref().map(checkouts).unwrap_or_default();
+    repo_checkouts.extend(repo.and_then(|r| r.canonicalize().ok()));
+    let keep_out: Vec<PathBuf> = [
+        Some(canonical_cwd.clone()),
+        common.clone(),
+        canonical_home.clone(),
     ]
     .into_iter()
     .flatten()
+    .chain(repo_checkouts.iter().cloned())
     .collect();
     let scratch: Vec<PathBuf> = [
         Some(canonical_cwd.clone()),
@@ -630,12 +637,10 @@ fn writable_roots(
     .into_iter()
     .flatten()
     .collect();
+    // The owner's directory, which no other user can replace (nor any directory above it).
     let writable = |r: &Path| {
-        std::fs::metadata(r).is_ok_and(|m| {
-            let own = m.uid() == owner && m.mode() & 0o200 != 0;
-            let shared = m.mode() & 0o1002 == 0o1002;
-            m.is_dir() && (own || shared)
-        })
+        std::fs::metadata(r).is_ok_and(|m| m.is_dir() && m.uid() == owner && m.mode() & 0o200 != 0)
+            && held_by(r, owner)
     };
     let holds_kept_out = |r: &Path| keep_out.iter().any(|k| k.starts_with(r));
     let mut out: Vec<PathBuf> = Vec::new();
@@ -650,7 +655,8 @@ fn writable_roots(
         if r.canonicalize().ok().as_ref() != Some(&r) {
             continue;
         }
-        let lies_in_git = common.as_ref().is_some_and(|c| r.starts_with(c));
+        let lies_in_git = common.as_ref().is_some_and(|c| r.starts_with(c))
+            || repo_checkouts.iter().any(|c| r.starts_with(c));
         let lies_in_scratch = scratch.iter().any(|s| r.starts_with(s));
         if writable(&r)
             && !holds_kept_out(&r)
@@ -669,7 +675,12 @@ fn writable_roots(
             out.push(r);
         }
     }
-    if let Some(shm) = shared.filter(|s| s.as_path() == shared_memory && writable(s)) {
+    // Root's, sticky and writable by all, as `/tmp` is.
+    let shared_dir = |r: &Path| {
+        std::fs::metadata(r).is_ok_and(|m| m.is_dir() && m.mode() & 0o1002 == 0o1002)
+            && held_by(r, owner)
+    };
+    if let Some(shm) = shared.filter(|s| s.as_path() == shared_memory && shared_dir(s)) {
         if !holds_kept_out(&shm) && !out.contains(&shm) {
             out.push(shm);
         }
@@ -680,6 +691,42 @@ fn writable_roots(
 /// The shared memory folder an `auto` sandbox may write ([`auto_writable_roots`]), where it
 /// exists (Linux).
 pub const SHARED_MEMORY: &str = "/dev/shm";
+
+/// Whether no user but `owner` (and root) can replace `path` (canonical) or a directory above
+/// it: each is `owner`'s or root's, and one every user may write to has the sticky bit. A
+/// directory its group may write to passes, as for twr's own directories
+/// (`twr_core::paths`): a umask of `002` makes them, with a group of the user's own.
+fn held_by(path: &Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    path.ancestors().all(|a| {
+        std::fs::symlink_metadata(a).is_ok_and(|m| {
+            (m.uid() == owner || m.uid() == 0) && (m.mode() & 0o002 == 0 || m.mode() & 0o1000 != 0)
+        })
+    })
+}
+
+/// The checkouts of the repository whose git common dir is `common` (canonical): its main
+/// checkout (the folder holding a `.git` directory) and each linked worktree its records name
+/// (a record's `gitdir` names the worktree's `.git` file), as far as they resolve.
+fn checkouts(common: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if common.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        out.extend(common.parent().map(Path::to_path_buf));
+    }
+    let Ok(records) = std::fs::read_dir(common.join("worktrees")) else {
+        return out;
+    };
+    for record in records.flatten() {
+        let Ok(text) = std::fs::read_to_string(record.path().join("gitdir")) else {
+            continue;
+        };
+        let named = record.path().join(text.trim_end_matches(['\n', '\r']));
+        if let Some(worktree) = named.parent().and_then(|w| w.canonicalize().ok()) {
+            out.push(worktree);
+        }
+    }
+    out
+}
 
 /// `(git dir, common dir)` of the linked worktree of `repo` that `cwd` is in (canonical).
 ///
@@ -1963,15 +2010,16 @@ mod tests {
             writable_roots(&cwd, None, env(Some(d.join("target"))), &shm, tmp),
             [d.join("target"), shm.clone()]
         );
-        // The real one, where there is one, is in the list.
+        // The real one is in the list where it qualifies: a directory, named as it is,
+        // root's, sticky and writable by all.
+        use std::os::unix::fs::MetadataExt as _;
         let real = Path::new(SHARED_MEMORY);
         let plain = tempfile::tempdir().unwrap();
-        if real.is_dir() {
-            assert_eq!(
-                auto_writable_roots(plain.path(), None, no_env),
-                [real.canonicalize().unwrap()]
-            );
-        }
+        let qualifies = real.canonicalize().is_ok_and(|c| c == real)
+            && std::fs::metadata(real)
+                .is_ok_and(|m| m.is_dir() && m.uid() == 0 && m.mode() & 0o1002 == 0o1002);
+        let want: Vec<PathBuf> = qualifies.then(|| real.to_path_buf()).into_iter().collect();
+        assert_eq!(auto_writable_roots(plain.path(), None, no_env), want);
     }
 
     /// A root a variable names must be there as named, outside anything the sandbox can
@@ -1996,6 +2044,10 @@ mod tests {
             .map(|x| common.join(x))
             .collect();
         let (shm, tmp) = (d.join("shm"), d.join("tmp"));
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        }
         let roots_with = |target: &Path, home_known: bool| {
             let home = home.clone();
             let target = target.to_path_buf();
@@ -2041,6 +2093,77 @@ mod tests {
         let mut no_home = git.clone();
         no_home.push(shm.clone());
         assert_eq!(roots_with(&d.join("target"), false), no_home);
+    }
+
+    /// What another user could replace is no root: a named folder (or one above it) that
+    /// every user may write to without the sticky bit, or that another user owns, even
+    /// sticky; a shared memory folder that is not sticky, or holds one of the repository's
+    /// checkouts. A worktree of the repository put in `/dev/shm` would otherwise be writable.
+    #[test]
+    fn roots_others_could_replace_or_that_hold_a_checkout_are_left_out() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, common) = worktree(dir.path(), false);
+        let d = dir.path().canonicalize().unwrap();
+        let home = d.join("home");
+        for p in ["home", "open/cache", "sticky/cache", "shm"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        let (shm, tmp) = (d.join("shm"), d.join("tmp"));
+        mode(&shm, 0o1777);
+        let main = d.join("main");
+        let repo = Some(main.as_path());
+        let git: Vec<PathBuf> = ["worktrees/wt", "objects", "refs", "logs"]
+            .iter()
+            .map(|x| common.join(x))
+            .collect();
+        let roots_with = |target: &Path| {
+            let home = home.clone();
+            let target = target.to_path_buf();
+            let env = move |k: &str| match k {
+                "HOME" => Some(home.clone().into_os_string()),
+                "CARGO_TARGET_DIR" => Some(target.clone().into_os_string()),
+                _ => None,
+            };
+            writable_roots(&wt, repo, env, &shm, &tmp)
+        };
+        let mut only_shm = git.clone();
+        only_shm.push(shm.clone());
+        // Writable by all, not sticky: anyone could swap `cache` for a link.
+        mode(&d.join("open"), 0o777);
+        assert_eq!(roots_with(&d.join("open/cache")), only_shm);
+        // Sticky above it is fine: only its owner (the user) can replace `cache`.
+        mode(&d.join("sticky"), 0o1777);
+        let mut want = git.clone();
+        want.push(d.join("sticky/cache"));
+        want.push(shm.clone());
+        assert_eq!(roots_with(&d.join("sticky/cache")), want);
+        // Writable by all itself: still the user's, and sticky, so it passes; without the
+        // sticky bit it does not.
+        mode(&d.join("sticky/cache"), 0o1777);
+        assert_eq!(roots_with(&d.join("sticky/cache")), want);
+        mode(&d.join("sticky/cache"), 0o777);
+        assert_eq!(roots_with(&d.join("sticky/cache")), only_shm);
+        // In another checkout of the repository (the main one).
+        std::fs::create_dir_all(main.join("target")).unwrap();
+        assert_eq!(roots_with(&main.join("target")), only_shm);
+        // A shared memory folder that is not sticky, or that holds a worktree of the
+        // repository (git's record names it), is left out.
+        mode(&shm, 0o777);
+        assert_eq!(roots_with(&d.join("none")), git);
+        mode(&shm, 0o1777);
+        let other = shm.join("other");
+        std::fs::create_dir_all(common.join("worktrees/other")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(
+            common.join("worktrees/other/gitdir"),
+            format!("{}\n", other.join(".git").display()),
+        )
+        .unwrap();
+        assert_eq!(roots_with(&d.join("none")), git);
     }
 
     /// No root may hold the home folder, the worktree or the repository's git dir: a
