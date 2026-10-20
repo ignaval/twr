@@ -146,6 +146,7 @@ fn codex_open() -> codex::Translator {
             method: "thread/start",
             params: json!({"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":"workspace-write"}),
             mode_note: None,
+            added_instructions: None,
         },
     );
     let init: Value = serde_json::from_str(&tr.start()).unwrap();

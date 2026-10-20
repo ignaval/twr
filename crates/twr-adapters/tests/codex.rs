@@ -1396,6 +1396,7 @@ fn thread_params_for_new_and_resumed_threads() {
         method,
         params,
         mode_note,
+        added_instructions,
     } = thread_params(&SpawnConfig {
         model: Some("gpt-6-astra".into()),
         system_append: Some("Be brief.".into()),
@@ -1404,6 +1405,10 @@ fn thread_params_for_new_and_resumed_threads() {
     .unwrap();
     assert_eq!(method, "thread/start");
     assert_eq!(mode_note, None, "manual maps exactly");
+    assert_eq!(
+        added_instructions, None,
+        "the sandbox note is for auto only"
+    );
     assert_eq!(
         params,
         json!({"cwd": FIXTURE_CWD, "approvalPolicy": "untrusted", "approvalsReviewer": "user",
@@ -1570,9 +1575,14 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
     )
     .unwrap();
     let common = common.canonicalize().unwrap();
+    // And the shared memory folder, where there is one (`/dev/shm`): all a folder outside
+    // any repository gets with no home.
+    let shm = twr_adapters::codex::auto_writable_roots(dir.path(), None, |_| None);
     let roots: Vec<String> = ["worktrees/wt", "objects", "refs", "logs"]
         .iter()
-        .map(|d| common.join(d).display().to_string())
+        .map(|d| common.join(d))
+        .chain(shm)
+        .map(|d| d.display().to_string())
         .collect();
     let auto = SpawnConfig {
         cwd: wt.clone(),
@@ -1657,8 +1667,21 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 
     let mut tr = new_translator(&auto, TranslatorOptions::default());
     tr.start();
-    tr.translate(r#"{"id":1,"result":{}}"#);
-    let opened = json!({"id": 2, "result": {"thread": {"id": "th"},
+    // The sandbox note goes after the config's own developer instructions: the config is
+    // read before the thread opens.
+    let id_of = |replies: &[String], method: &str| {
+        replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == method)
+            .map(|v| v["id"].clone())
+            .unwrap_or_else(|| panic!("no {method} in {replies:?}"))
+    };
+    let out = tr.translate(r#"{"id":1,"result":{}}"#);
+    let read = id_of(&out.replies, "config/read");
+    let out = tr.translate(&json!({"id": read, "result": {"config": {}}}).to_string());
+    let open = id_of(&out.replies, "thread/start");
+    let opened = json!({"id": open, "result": {"thread": {"id": "th"},
         "approvalPolicy": "on-request", "approvalsReviewer": "user",
         "sandbox": {"type": "workspaceWrite", "writableRoots": roots, "networkAccess": true,
                     "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}});

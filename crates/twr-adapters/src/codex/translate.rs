@@ -174,6 +174,12 @@ pub struct Open {
     /// Why the Codex policy is not an exact match of the twr mode (`ext.codex.mode_note` on
     /// `thread.started`), see `codex::mode_note`.
     pub mode_note: Option<String>,
+    /// Developer instructions twr adds at the end of `params.developerInstructions` (the
+    /// `auto` sandbox note, `codex::AUTO_SANDBOX_NOTE`). A request's `developerInstructions`
+    /// replaces the Codex config's `developer_instructions`, so the translator reads the
+    /// config first (`config/read`) and puts those before twr's; when the read fails, twr's
+    /// addition is left out instead, so the user's own instructions still apply.
+    pub added_instructions: Option<String>,
 }
 
 impl Open {
@@ -1229,7 +1235,7 @@ impl Translator {
                 None => {
                     out.replies
                         .push(json!({"jsonrpc": "2.0", "method": "initialized"}).to_string());
-                    if self.mcp_allow.is_some() {
+                    if self.mcp_allow.is_some() || self.open.added_instructions.is_some() {
                         let params = json!({"cwd": self.cwd});
                         let l = self.request(Req::ConfigRead, "config/read", params);
                         out.replies.push(l);
@@ -1240,14 +1246,27 @@ impl Translator {
                 }
             },
             Req::ConfigRead => match error_text {
-                Some(e) => {
+                Some(e) if self.mcp_allow.is_some() => {
                     out.fatal = Some(format!(
                         "codex config/read failed, so the MCP servers of the Codex config \
                          cannot be turned off: {e}"
                     ))
                 }
+                Some(e) => {
+                    tracing::warn!(error = %e, "codex: config/read failed; the thread starts without twr's sandbox note");
+                    self.merge_instructions(None);
+                    self.open_thread(out);
+                }
                 None => match self.disable_inherited_mcp(&v["result"]) {
-                    Ok(()) => self.open_thread(out),
+                    Ok(()) => {
+                        let configured = v
+                            .pointer("/result/config/developer_instructions")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string);
+                        self.merge_instructions(Some(configured));
+                        self.open_thread(out);
+                    }
                     Err(why) => out.fatal = Some(why),
                 },
             },
@@ -1973,6 +1992,38 @@ impl Translator {
     /// (a `config/read` answer) that is not in the thread's set (module docs, "MCP
     /// allowlist"). An error (why) when the config defines a server under one of the set's
     /// names: Codex would merge the two.
+    /// Puts the Codex config's own `developer_instructions` (`configured`: `Some(None)` when it
+    /// has none) before twr's [`Open::added_instructions`]; `None` (the config could not be
+    /// read) takes twr's addition out of the request instead, leaving out the whole field
+    /// when nothing else is in it.
+    fn merge_instructions(&mut self, configured: Option<Option<String>>) {
+        let Some(added) = self.open.added_instructions.clone() else {
+            return;
+        };
+        let Some(params) = self.open.params.as_object_mut() else {
+            return;
+        };
+        let current = params
+            .get("developerInstructions")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let merged = match configured {
+            Some(Some(own)) => format!("{own}\n\n{current}"),
+            Some(None) => current,
+            None => current
+                .strip_suffix(&added)
+                .unwrap_or(&current)
+                .trim_end()
+                .to_string(),
+        };
+        if merged.is_empty() {
+            params.remove("developerInstructions");
+        } else {
+            params.insert("developerInstructions".into(), json!(merged));
+        }
+    }
+
     fn disable_inherited_mcp(&mut self, result: &Value) -> Result<(), String> {
         let Some(allow) = &self.mcp_allow else {
             return Ok(());
@@ -2021,6 +2072,25 @@ impl Translator {
     fn on_notification(&mut self, method: &str, p: &Value, line: &str, out: &mut Translated) {
         if method == "mcpServer/startupStatus/updated" {
             self.check_mcp_server(p, out);
+            return;
+        }
+        // What a thread runs with can change during the session: never to more than twr asked
+        // for, the thread's own settings or a child's (a child agent runs with its parent's
+        // policy). Anything wider, or that twr cannot read, ends the session.
+        if method == "thread/settings/updated" {
+            let st = &p["threadSettings"];
+            let reported = json!({"approvalPolicy": st["approvalPolicy"],
+                "approvalsReviewer": st["approvalsReviewer"], "sandbox": st["sandboxPolicy"]});
+            if let Err(why) = check_policy(&self.open.params, &reported) {
+                tracing::error!(%why, "codex: refusing a thread whose settings now allow more than twr asked for");
+                out.fatal = Some(format!("codex thread/settings/updated: {why}"));
+            }
+            return;
+        }
+        // Codex's reviewer agent decides for child agents too: their decisions are the
+        // thread's as much as its own.
+        if method == "item/autoApprovalReview/completed" {
+            self.on_auto_review(p, opt_str(p, "turnId"), line, out);
             return;
         }
         // A child thread's notifications are its background activity, except the withdrawal of
@@ -2110,7 +2180,6 @@ impl Translator {
             }
             "item/started" => self.on_item_started(&p["item"], turn_id, line, out),
             "item/completed" => self.on_item_completed(&p["item"], turn_id, line, out),
-            "item/autoApprovalReview/completed" => self.on_auto_review(p, turn_id, line, out),
             "serverRequest/resolved" => {
                 let rid = &p["requestId"];
                 let Some(pi) = self
@@ -2235,9 +2304,17 @@ impl Translator {
             "" => compact(action),
             command => command.to_string(),
         };
-        let turn = self.turn_of(turn_id.as_deref());
+        let child = opt_str(p, "threadId").filter(|id| Some(id) != self.thread_id.as_ref());
+        // A child's turn ids are not the thread's: its decisions go to the current turn.
+        let turn = match &child {
+            Some(_) => self.turn_of(None),
+            None => self.turn_of(turn_id.as_deref()),
+        };
         let mut codex = Map::new();
         codex.insert("item_type".into(), json!("autoApprovalReview"));
+        if let Some(child) = &child {
+            codex.insert("child_thread".into(), json!(child));
+        }
         for (from, to) in [
             ("targetItemId", "target_item_id"),
             ("decisionSource", "decision_source"),
@@ -2247,22 +2324,23 @@ impl Translator {
             }
         }
         codex.insert("action".into(), action.clone());
+        // The decision first: what a transcript line shows of a tool call is its input.
+        let decision = if status.is_empty() {
+            "no decision"
+        } else {
+            status
+        };
         let call = AgentToolCall {
             call_id: id.clone(),
             tool: "auto_review".into(),
-            input_summary: one_line(&what, INPUT_SUMMARY_MAX),
+            input_summary: one_line(&format!("{decision}: {what}"), INPUT_SUMMARY_MAX),
             input_ref: None,
             risky: approved,
             ext: ext_of(codex),
             ..Default::default()
         };
         self.push(out, EventBody::AgentToolCall(call), turn, Some(line));
-        let mut said = if status.is_empty() {
-            "no decision"
-        } else {
-            status
-        }
-        .to_string();
+        let mut said = decision.to_string();
         let grades: Vec<String> = [
             ("riskLevel", "risk"),
             ("userAuthorization", "authorization"),
@@ -3583,6 +3661,7 @@ mod tests {
                 method: "thread/start",
                 params: json!({}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         let cmd = format!("cargo test --workspace -- {}", "--flag ".repeat(60));
@@ -3613,6 +3692,7 @@ mod tests {
                 method: "thread/start",
                 params: json!({}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         let out = t.translate(r#"{"method":"item/tool/call","id":7,"params":{}}"#);
@@ -3646,6 +3726,7 @@ mod tests {
                 params: json!({"approvalPolicy": "untrusted", "approvalsReviewer": "user",
                     "sandbox": "workspace-write"}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         t.start();
@@ -3670,6 +3751,7 @@ mod tests {
                     params: json!({"threadId": "th", "approvalPolicy": "untrusted",
                         "approvalsReviewer": "user", "sandbox": "read-only"}),
                     mode_note: None,
+                    added_instructions: None,
                 },
             );
             t.start();
@@ -3727,6 +3809,7 @@ mod tests {
                 params: json!({"approvalPolicy": "never", "approvalsReviewer": "user",
                     "sandbox": "workspace-write"}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         t.start();
@@ -3810,7 +3893,10 @@ mod tests {
             };
             assert_eq!(call.tool, "auto_review");
             assert_eq!(call.call_id, format!("auto_review:{id}"));
-            assert_eq!(call.input_summary, "/bin/bash -lc 'git branch -d other'");
+            assert_eq!(
+                call.input_summary,
+                format!("{status}: /bin/bash -lc 'git branch -d other'")
+            );
             assert_eq!(call.risky, ok);
             assert_eq!(
                 call.ext.as_ref().unwrap()["codex"]["target_item_id"],
@@ -3843,9 +3929,135 @@ mod tests {
         else {
             panic!("{:?}", out.events)
         };
+        assert!(
+            c.input_summary.starts_with("timedOut: "),
+            "{}",
+            c.input_summary
+        );
         assert!(c.input_summary.contains("x.dev"), "{}", c.input_summary);
         assert!(!r.ok);
         assert_eq!(r.output_summary, "timedOut");
+        // A child agent's decision is the thread's too, in its current turn, and says whose.
+        let child = json!({"method": "item/autoApprovalReview/completed", "params": {
+            "threadId": "child-1", "turnId": "child-turn", "reviewId": "r4",
+            "review": {"status": "approved"},
+            "action": {"type": "command", "command": "touch /x"}}})
+        .to_string();
+        let out = t.translate(&child);
+        let [Emitted {
+            body: EventBody::AgentToolCall(c),
+            turn: Some(1),
+            ..
+        }, Emitted {
+            body: EventBody::AgentToolResult(r),
+            ..
+        }] = &out.events[..]
+        else {
+            panic!("{:?}", out.events)
+        };
+        assert_eq!(c.input_summary, "approved: touch /x");
+        assert_eq!(c.ext.as_ref().unwrap()["codex"]["child_thread"], "child-1");
+        assert!(r.ok);
+    }
+
+    /// The settings Codex reports during the session are held to what twr asked for, like
+    /// those it reported when the thread opened (the parent's and a child's alike): a wider
+    /// approval policy, sandbox, network or reviewer ends the session.
+    #[test]
+    fn a_thread_whose_settings_widen_mid_session_is_stopped() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let update = |thread: &str, approval: Value, reviewer: Value, sandbox: Value| {
+            json!({"method": "thread/settings/updated", "params": {"threadId": thread,
+                "threadSettings": {"approvalPolicy": approval, "approvalsReviewer": reviewer,
+                    "sandboxPolicy": sandbox, "cwd": "/w", "model": "m", "modelProvider": "p",
+                    "collaborationMode": {"mode": "default", "settings": {}}}}})
+            .to_string()
+        };
+        let ws = json!({"type": "workspaceWrite", "networkAccess": false});
+        let same = update("th", json!("untrusted"), json!("user"), ws.clone());
+        let out = t.translate(&same);
+        assert!(out.fatal.is_none(), "{out:?}");
+        for (thread, approval, reviewer, sandbox) in [
+            ("th", json!("never"), json!("user"), ws.clone()),
+            ("th", json!("untrusted"), json!("auto_review"), ws.clone()),
+            (
+                "th",
+                json!("untrusted"),
+                json!("user"),
+                json!({"type": "dangerFullAccess"}),
+            ),
+            (
+                "th",
+                json!("untrusted"),
+                json!("user"),
+                json!({"type": "workspaceWrite", "networkAccess": true}),
+            ),
+            ("child-1", json!("on-request"), json!("user"), ws.clone()),
+            ("th", json!({"granular": {}}), json!("user"), ws.clone()),
+        ] {
+            let out = t.translate(&update(thread, approval.clone(), reviewer.clone(), sandbox));
+            assert!(
+                out.fatal.is_some(),
+                "{thread} {approval} {reviewer} accepted: {out:?}"
+            );
+        }
+    }
+
+    /// The `auto` sandbox note comes after the developer instructions of the user's Codex
+    /// config, which a request's `developerInstructions` would otherwise replace: the config
+    /// is read first. When it cannot be read, twr's note is left out and the user's
+    /// instructions apply as configured.
+    #[test]
+    fn the_sandbox_note_keeps_the_configured_developer_instructions() {
+        let open = |params: Value| Open {
+            method: "thread/start",
+            params,
+            mode_note: None,
+            added_instructions: Some("NOTE".into()),
+        };
+        let start = |params: Value, config_reply: &str| {
+            let mut t = Translator::new(TranslatorOptions::default(), open(params));
+            t.start();
+            let out = t.translate(r#"{"id":1,"result":{}}"#);
+            let read = out
+                .replies
+                .iter()
+                .find(|l| l.contains("config/read"))
+                .expect("config/read")
+                .clone();
+            let id = serde_json::from_str::<Value>(&read).unwrap()["id"].clone();
+            let reply = config_reply.replace("ID", &id.to_string());
+            let out = t.translate(&reply);
+            let start = out
+                .replies
+                .iter()
+                .find(|l| l.contains("thread/start"))
+                .expect("thread/start")
+                .clone();
+            serde_json::from_str::<Value>(&start).unwrap()["params"].clone()
+        };
+        let p = start(
+            json!({"developerInstructions": "NOTE"}),
+            r#"{"id":ID,"result":{"config":{"developer_instructions":"Mine."}}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "Mine.\n\nNOTE");
+        let p = start(
+            json!({"developerInstructions": "twr text\n\nNOTE"}),
+            r#"{"id":ID,"result":{"config":{}}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "twr text\n\nNOTE");
+        let p = start(
+            json!({"developerInstructions": "NOTE"}),
+            r#"{"id":ID,"error":{"code":-32000,"message":"no"}}"#,
+        );
+        assert!(p.get("developerInstructions").is_none(), "{p}");
+        let p = start(
+            json!({"developerInstructions": "twr text\n\nNOTE"}),
+            r#"{"id":ID,"error":{"code":-32000,"message":"no"}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "twr text");
     }
 
     /// Relay rule: a form or URL elicitation is never answered for the user. It

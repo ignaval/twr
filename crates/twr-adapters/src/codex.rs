@@ -102,8 +102,9 @@
 //! - `sandbox_workspace_write.writable_roots` = [`auto_writable_roots`]: the worktree's git dir
 //!   and the common dir's `objects`, `refs` and `logs` (not its `config` or `hooks`), found
 //!   from the repository the thread was made from ([`SpawnConfig::repo`]) and not from the
-//!   worktree's own pointers, which the agent can rewrite; the cargo, npm and pnpm caches and
-//!   `$CARGO_TARGET_DIR`; and `/dev/shm` (Codex's sandbox otherwise mounts an empty one of its
+//!   worktree's own pointers, which the agent can rewrite; the cargo and npm caches and
+//!   `$CARGO_TARGET_DIR` (each named as it is, outside anything the sandbox can write); and
+//!   `/dev/shm` (Codex's sandbox otherwise mounts an empty one of its
 //!   own). These replace any `writable_roots` of the user's Codex config.
 //! - [`AUTO_SANDBOX_NOTE`] in its developer instructions: git cannot lock the common dir's
 //!   `packed-refs` (deleting a ref prints an error; a rebase still succeeds), which Codex
@@ -401,6 +402,11 @@ pub fn mode_level(mode: &str) -> Option<ModeLevel> {
 /// anywhere, the top of both. Two modes of one level can differ here: `on-request` runs
 /// sandboxed commands without asking where `manual` (`untrusted`) asks, and `auto` has
 /// network and roots that `never` lacks. None for a mode Codex refuses.
+///
+/// `[codex] auto` ([`SpawnConfig::codex_auto`]) is left out: it is the same for every thread
+/// of a project while the hub runs, so it never tells two settings of one thread apart, and
+/// counting its `never` as `auto`'s `on-request` can only make a move to `auto` look like a
+/// narrowing, which stops a thread's background work at once instead of waiting for it.
 pub fn mode_capabilities(mode: &str) -> Option<[u8; 4]> {
     let (approval, sandbox) = policy(mode, None).ok()?;
     let sandbox = translate::sandbox_rank(sandbox)?;
@@ -528,16 +534,25 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 /// - the cargo caches `$CARGO_HOME/registry` and `$CARGO_HOME/git` (`CARGO_HOME` defaulting
 ///   to `~/.cargo`; its `bin` and `config.toml` stay read-only), and `$CARGO_TARGET_DIR`
 ///   when the runtime's environment sets one (`[threads] env`, a project's `env`, the hub's);
-/// - the npm cache, `$npm_config_cache` (or `NPM_CONFIG_CACHE`) else `~/.npm`, and pnpm's
-///   store (`$XDG_DATA_HOME/pnpm/store`, else `~/.local/share/pnpm/store`; `~/Library/pnpm/store`
-///   on macOS). Both are content-addressed and checked against their hashes when read;
+/// - the npm cache, `$npm_config_cache` (or `NPM_CONFIG_CACHE`) else `~/.npm`: npm checks
+///   its files against their hashes when it reads them, and copies them out (pnpm's store is
+///   left out: pnpm hard-links its files into other checkouts' `node_modules`);
 /// - [`SHARED_MEMORY`] (`/dev/shm`), scratch space like `/tmp`: without it the sandbox has
 ///   an empty one of its own, whose files are gone when the command ends.
 ///
-/// None of them may hold `$HOME`, `cwd` or the repository's git dir (a `CARGO_TARGET_DIR` of
-/// `~` or of the worktrees' folder would open them all): such a root is left out. A directory
-/// every user may write to qualifies only with the sticky bit, as `/dev/shm` and `/tmp` have
-/// it.
+/// The caches and the target dir come from variables, so each is checked and left out
+/// unless:
+/// - `$HOME` is known, and the path, as given, names a directory through no symbolic link;
+/// - it is not and does not hold `$HOME`, `cwd` or the repository's git dir (a
+///   `CARGO_TARGET_DIR` of `~` or of the worktrees' folder would open them all), and does not
+///   lie in the git dir;
+/// - it does not lie in anything the sandbox can write: `cwd`, `/tmp`, `$TMPDIR`, the shared
+///   memory folder or another root. Codex's sandbox finds its roots again for each command,
+///   so a root in a folder the agent can write could be swapped for a link to anywhere
+///   between two commands.
+///
+/// A directory every user may write to qualifies only with the sticky bit, as `/dev/shm`
+/// and `/tmp` have it.
 ///
 /// `env` looks up variables (empty counts as unset).
 pub fn auto_writable_roots(
@@ -545,15 +560,16 @@ pub fn auto_writable_roots(
     repo: Option<&Path>,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Vec<PathBuf> {
-    writable_roots(cwd, repo, env, Path::new(SHARED_MEMORY))
+    writable_roots(cwd, repo, env, Path::new(SHARED_MEMORY), Path::new("/tmp"))
 }
 
-/// [`auto_writable_roots`] with `shared_memory` for [`SHARED_MEMORY`].
+/// [`auto_writable_roots`] with `shared_memory` for [`SHARED_MEMORY`] and `tmp` for `/tmp`.
 fn writable_roots(
     cwd: &Path,
     repo: Option<&Path>,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
     shared_memory: &Path,
+    tmp: &Path,
 ) -> Vec<PathBuf> {
     use std::os::unix::fs::MetadataExt as _;
     let var = |k: &str| {
@@ -565,59 +581,97 @@ fn writable_roots(
     let Ok(canonical_cwd) = cwd.canonicalize() else {
         return Vec::new();
     };
-    let mut roots = Vec::new();
-    // What no root may hold: the worktree, the repository's git dir, the home folder.
-    let mut keep_out = vec![canonical_cwd.clone()];
-    if let Some(common) = repo.and_then(|r| common_dir_of(r, &canonical_cwd)) {
-        keep_out.push(common);
-    }
+    let Ok(owner) = std::fs::metadata(cwd).map(|m| m.uid()) else {
+        return Vec::new();
+    };
+    let common = repo.and_then(|r| common_dir_of(r, &canonical_cwd));
+    let home = var("HOME");
+    let canonical_home = home.as_ref().and_then(|h| h.canonicalize().ok());
+    // Roots twr found itself (canonical), and those a variable named.
+    let mut found: Vec<PathBuf> = Vec::new();
     if let Some((git_dir, common)) = repo.and_then(|r| linked_worktree_git_dirs(cwd, r)) {
-        roots.push(git_dir);
+        found.push(git_dir);
         // Each a directory of the common dir itself, not a link out of it.
-        roots.extend(
+        found.extend(
             ["objects", "refs", "logs"]
                 .map(|d| common.join(d))
                 .into_iter()
                 .filter(|p| p.canonicalize().is_ok_and(|c| c == *p)),
         );
     }
-    let home = var("HOME");
-    if let Some(home) = home.as_ref().and_then(|h| h.canonicalize().ok()) {
-        keep_out.push(home);
+    let mut named: Vec<PathBuf> = Vec::new();
+    if canonical_home.is_some() {
+        if let Some(cargo) = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo"))) {
+            named.extend(["registry", "git"].map(|d| cargo.join(d)));
+        }
+        named.extend(var("CARGO_TARGET_DIR"));
+        named.extend(
+            var("npm_config_cache")
+                .or_else(|| var("NPM_CONFIG_CACHE"))
+                .or_else(|| home.as_ref().map(|h| h.join(".npm"))),
+        );
     }
-    if let Some(cargo) = var("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo"))) {
-        roots.extend(["registry", "git"].map(|d| cargo.join(d)));
-    }
-    roots.extend(var("CARGO_TARGET_DIR"));
-    if let Some(npm) = var("npm_config_cache")
-        .or_else(|| var("NPM_CONFIG_CACHE"))
-        .or_else(|| home.as_ref().map(|h| h.join(".npm")))
-    {
-        roots.push(npm);
-    }
-    if let Some(data) =
-        var("XDG_DATA_HOME").or_else(|| home.as_ref().map(|h| h.join(".local/share")))
-    {
-        roots.push(data.join("pnpm/store"));
-    }
-    if cfg!(target_os = "macos") {
-        roots.extend(home.as_ref().map(|h| h.join("Library/pnpm/store")));
-    }
-    roots.push(shared_memory.to_path_buf());
-    let Ok(owner) = std::fs::metadata(cwd).map(|m| m.uid()) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = Vec::new();
-    for r in roots {
-        let Ok(r) = r.canonicalize() else { continue };
-        let writable = std::fs::metadata(&r).is_ok_and(|m| {
+    let shared = shared_memory.canonicalize().ok();
+    // What no root may hold, and where none may lie.
+    let keep_out: Vec<&PathBuf> = [
+        Some(&canonical_cwd),
+        common.as_ref(),
+        canonical_home.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let scratch: Vec<PathBuf> = [
+        Some(canonical_cwd.clone()),
+        tmp.canonicalize().ok(),
+        var("TMPDIR").and_then(|t| t.canonicalize().ok()),
+        shared.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let writable = |r: &Path| {
+        std::fs::metadata(r).is_ok_and(|m| {
             let own = m.uid() == owner && m.mode() & 0o200 != 0;
             let shared = m.mode() & 0o1002 == 0o1002;
             m.is_dir() && (own || shared)
-        });
-        let holds_kept_out = keep_out.iter().any(|k| k.starts_with(&r));
-        if writable && !holds_kept_out && !out.contains(&r) {
+        })
+    };
+    let holds_kept_out = |r: &Path| keep_out.iter().any(|k| k.starts_with(r));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for r in found {
+        if writable(&r) && !holds_kept_out(&r) && !out.contains(&r) {
             out.push(r);
+        }
+    }
+    let mut from_vars: Vec<PathBuf> = Vec::new();
+    for r in named {
+        // As given: a link anywhere on the way leaves it out.
+        if r.canonicalize().ok().as_ref() != Some(&r) {
+            continue;
+        }
+        let lies_in_git = common.as_ref().is_some_and(|c| r.starts_with(c));
+        let lies_in_scratch = scratch.iter().any(|s| r.starts_with(s));
+        if writable(&r)
+            && !holds_kept_out(&r)
+            && !lies_in_git
+            && !lies_in_scratch
+            && !from_vars.contains(&r)
+        {
+            from_vars.push(r);
+        }
+    }
+    // None inside another (`CARGO_TARGET_DIR` inside the npm cache), nor any of twr's own.
+    let all: Vec<PathBuf> = out.iter().chain(&from_vars).cloned().collect();
+    for r in from_vars {
+        let nested = all.iter().any(|o| *o != r && r.starts_with(o));
+        if !nested && !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    if let Some(shm) = shared.filter(|s| s.as_path() == shared_memory && writable(s)) {
+        if !holds_kept_out(&shm) && !out.contains(&shm) {
+            out.push(shm);
         }
     }
     out
@@ -950,6 +1004,7 @@ pub fn thread_params(cfg: &SpawnConfig) -> anyhow::Result<Open> {
         method,
         params: Value::Object(p),
         mode_note,
+        added_instructions: is_auto_sandbox(cfg).then(|| AUTO_SANDBOX_NOTE.to_string()),
     })
 }
 
@@ -1545,7 +1600,13 @@ mod tests {
         repo: Option<&Path>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Vec<PathBuf> {
-        writable_roots(cwd, repo, env, Path::new("/nonexistent/twr-test-shm"))
+        writable_roots(
+            cwd,
+            repo,
+            env,
+            Path::new("/nonexistent/twr-test-shm"),
+            Path::new("/nonexistent/twr-test-tmp"),
+        )
     }
 
     /// The incident behind the `auto` sandbox: a Codex auto thread asked to `git commit`
@@ -1869,53 +1930,38 @@ mod tests {
         assert_eq!(shell["web_search"], "disabled");
     }
 
-    /// What the `auto` sandbox also opens for routine work: `$CARGO_TARGET_DIR`, pnpm's store
-    /// and the shared memory folder (root's, sticky and writable by all, as `/dev/shm` is).
-    /// Codex threads asked to use `/dev/shm`, which the sandbox otherwise replaces with an
-    /// empty one of its own.
+    /// What the `auto` sandbox also opens for routine work: `$CARGO_TARGET_DIR` and the
+    /// shared memory folder (root's, sticky and writable by all, as `/dev/shm` is). Codex
+    /// threads asked to use `/dev/shm`, which the sandbox otherwise replaces with an empty one
+    /// of its own. pnpm's store is not among them: pnpm hard-links it into other checkouts.
     #[test]
-    fn auto_roots_cover_the_target_dir_pnpm_and_shared_memory() {
+    fn auto_roots_cover_the_target_dir_and_shared_memory() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
         let d = dir.path().canonicalize().unwrap();
         let home = d.join("home");
-        for p in [
-            "home/.local/share/pnpm/store",
-            "target",
-            "xdg/pnpm/store",
-            "shm",
-            "cwd",
-        ] {
+        for p in ["home/.local/share/pnpm/store", "target", "shm", "cwd"] {
             std::fs::create_dir_all(d.join(p)).unwrap();
         }
         let shm = d.join("shm");
         std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o1777)).unwrap();
         let cwd = d.join("cwd");
-        let env = |vars: Vec<(&'static str, PathBuf)>| {
+        let tmp = Path::new("/nonexistent/twr-test-tmp");
+        let env = |target: Option<PathBuf>| {
             let home = home.clone();
             move |k: &str| match k {
                 "HOME" => Some(home.clone().into_os_string()),
-                _ => vars
-                    .iter()
-                    .find(|(n, _)| *n == k)
-                    .map(|(_, v)| v.clone().into_os_string()),
+                "CARGO_TARGET_DIR" => target.clone().map(PathBuf::into_os_string),
+                _ => None,
             }
         };
         assert_eq!(
-            writable_roots(&cwd, None, env(vec![]), &shm),
-            [home.join(".local/share/pnpm/store"), shm.clone()]
+            writable_roots(&cwd, None, env(None), &shm, tmp),
+            [shm.clone()]
         );
         assert_eq!(
-            writable_roots(
-                &cwd,
-                None,
-                env(vec![
-                    ("CARGO_TARGET_DIR", d.join("target")),
-                    ("XDG_DATA_HOME", d.join("xdg")),
-                ]),
-                &shm
-            ),
-            [d.join("target"), d.join("xdg/pnpm/store"), shm.clone()]
+            writable_roots(&cwd, None, env(Some(d.join("target"))), &shm, tmp),
+            [d.join("target"), shm.clone()]
         );
         // The real one, where there is one, is in the list.
         let real = Path::new(SHARED_MEMORY);
@@ -1926,6 +1972,75 @@ mod tests {
                 [real.canonicalize().unwrap()]
             );
         }
+    }
+
+    /// A root a variable names must be there as named, outside anything the sandbox can
+    /// write: Codex's sandbox finds its roots again for each command, so one the agent could
+    /// swap for a link (a target dir in the worktree, in `/tmp`, in `/dev/shm`) would let the
+    /// next command write wherever the link points, such as the repository's `.git/hooks`.
+    /// The review's case: `CARGO_TARGET_DIR=<worktree>/target`, replaced by a link to
+    /// `hooks`.
+    #[test]
+    fn named_roots_cannot_be_redirected_by_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, common) = worktree(dir.path(), false);
+        let d = dir.path().canonicalize().unwrap();
+        let home = d.join("home");
+        for p in ["home/.npm/inner", "tmp/t", "shm/t", "target", "elsewhere"] {
+            std::fs::create_dir_all(d.join(p)).unwrap();
+        }
+        let main = d.join("main");
+        let repo = Some(main.as_path());
+        let git: Vec<PathBuf> = ["worktrees/wt", "objects", "refs", "logs"]
+            .iter()
+            .map(|x| common.join(x))
+            .collect();
+        let (shm, tmp) = (d.join("shm"), d.join("tmp"));
+        let roots_with = |target: &Path, home_known: bool| {
+            let home = home.clone();
+            let target = target.to_path_buf();
+            let env = move |k: &str| match k {
+                "HOME" if home_known => Some(home.clone().into_os_string()),
+                "CARGO_TARGET_DIR" => Some(target.clone().into_os_string()),
+                _ => None,
+            };
+            writable_roots(&wt, repo, env, &shm, &tmp)
+        };
+        let base = {
+            let mut b = git.clone();
+            b.push(home.join(".npm"));
+            b.push(shm.clone());
+            b
+        };
+        let with = |extra: PathBuf| {
+            let mut b = git.clone();
+            b.push(extra);
+            b.push(home.join(".npm"));
+            b.push(shm.clone());
+            b
+        };
+        assert_eq!(roots_with(&d.join("target"), true), with(d.join("target")));
+        // A link in the worktree to the git dir's hooks, or one anywhere on the way.
+        std::os::unix::fs::symlink(common.join("hooks"), wt.join("target")).unwrap();
+        assert_eq!(roots_with(&wt.join("target"), true), base);
+        std::os::unix::fs::symlink(d.join("elsewhere"), d.join("link")).unwrap();
+        assert_eq!(roots_with(&d.join("link"), true), base);
+        // In what the sandbox can write, or in the git dir.
+        std::fs::create_dir_all(wt.join("build")).unwrap();
+        for inside in [
+            wt.join("build"),
+            d.join("tmp/t"),
+            d.join("shm/t"),
+            common.join("hooks"),
+            home.join(".npm/inner"),
+        ] {
+            assert_eq!(roots_with(&inside, true), base, "{}", inside.display());
+        }
+        // Not named as it is (`..`), or with no home to check against.
+        assert_eq!(roots_with(&d.join("elsewhere/../target"), true), base);
+        let mut no_home = git.clone();
+        no_home.push(shm.clone());
+        assert_eq!(roots_with(&d.join("target"), false), no_home);
     }
 
     /// No root may hold the home folder, the worktree or the repository's git dir: a
