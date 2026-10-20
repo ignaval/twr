@@ -517,7 +517,7 @@ fn spawn_var(cfg: &SpawnConfig, k: &str) -> Option<std::ffi::OsString> {
 }
 
 /// The directories an `auto` thread in `cwd` may write besides `cwd` and the temp dirs
-/// (canonical, each once, only those that exist as directories the owner of `cwd` can
+/// (canonical, each once, only those that exist as directories the runtime's user can
 /// write: Codex's Linux sandbox fails every command when a writable root is one the user
 /// cannot write):
 ///
