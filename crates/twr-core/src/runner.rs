@@ -64,7 +64,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::adapter::SpawnConfig;
+use crate::adapter::{CodexAuto, SpawnConfig};
 use crate::event::{Answer, EventBody};
 use crate::git::{
     DeleteRefs, RemoveOutcome, RestoreRequest, TrashPurge, TrashRequest, WorktreeCreated,
@@ -1192,6 +1192,11 @@ pub struct WireSpawnConfig {
     /// it (and anchors nothing); a hub from before it sends none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<PathBuf>,
+    /// See [`SpawnConfig::codex_auto`], spelled as the config spells it; absent for the default
+    /// (`ask`). A runner from before it ignores it, and a spelling this build does not know
+    /// is taken as the default: either way the thread asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_auto: Option<String>,
 }
 
 impl From<SpawnConfig> for WireSpawnConfig {
@@ -1213,6 +1218,7 @@ impl From<SpawnConfig> for WireSpawnConfig {
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             repo: c.repo,
+            codex_auto: (c.codex_auto != CodexAuto::Ask).then(|| c.codex_auto.as_str().into()),
         }
     }
 }
@@ -1238,6 +1244,11 @@ impl From<WireSpawnConfig> for SpawnConfig {
             prompt_turn: c.prompt_turn,
             wrap: Vec::new(),
             repo: c.repo,
+            codex_auto: c
+                .codex_auto
+                .as_deref()
+                .and_then(CodexAuto::parse)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1991,6 +2002,32 @@ mod tests {
             assert!(e.contains(kind), "{bad:?}: {e}");
             assert!(!e.contains("s3cret"), "{e}");
         }
+    }
+
+    /// `codex_auto` crosses to a runner by its config spelling, and only when it is not the
+    /// default; a spelling the runner does not know (a newer hub's) is the default, `ask`,
+    /// so the thread asks. A hub that sends none (older) gets `ask` too.
+    #[test]
+    fn codex_auto_crosses_the_wire_by_name() {
+        for v in CodexAuto::ALL {
+            let sc = SpawnConfig {
+                codex_auto: v,
+                ..cfg().into()
+            };
+            let w = WireSpawnConfig::from(sc.clone());
+            let json = serde_json::to_value(&w).unwrap();
+            if v == CodexAuto::Ask {
+                assert!(json.get("codex_auto").is_none(), "{json}");
+            } else {
+                assert_eq!(json["codex_auto"], v.as_str());
+            }
+            let back: WireSpawnConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(SpawnConfig::from(back), sc);
+        }
+        let mut json = serde_json::to_value(cfg()).unwrap();
+        json["codex_auto"] = serde_json::json!("ask_the_moon");
+        let w: WireSpawnConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(SpawnConfig::from(w).codex_auto, CodexAuto::Ask);
     }
 
     #[test]
