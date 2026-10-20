@@ -133,6 +133,26 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
                 .unwrap()
                 .clone()
                 .unwrap_or_else(|| json!({ "id": "T1", "name": "w1", "status": "idle" }))])),
+            // As the hub answers the orchestrator: no `dir` (one here anyway, which MCP drops).
+            "account.list" => Ok(json!({"now": "2026-10-20T12:00:00Z", "runtimes": {
+                "claude-code": {"shown": true, "native": "personal", "accounts": [
+                    {"runtime": "claude-code", "name": "personal", "native": true,
+                     "share": "config", "source": "recorded", "login": "logged_in",
+                     "method": "claude.ai", "note": null, "checked_at": "2026-10-20T11:00:00Z",
+                     "removed": false, "threads": 2},
+                    {"runtime": "claude-code", "name": "work", "native": false,
+                     "dir": "/home/u/.local/share/twr/accounts/claude-code/work",
+                     "share": "config", "source": "config", "login": "logged_in",
+                     "method": "claude.ai", "note": null, "checked_at": null,
+                     "removed": false, "threads": 1},
+                    {"runtime": "claude-code", "name": "old", "native": false,
+                     "share": "none", "source": "recorded", "login": "logged_out",
+                     "method": null, "note": null, "checked_at": null, "removed": true,
+                     "threads": 1}]},
+                "codex": {"shown": false, "native": "default", "accounts": [
+                    {"runtime": "codex", "name": "default", "native": true, "share": "config",
+                     "source": "native", "login": null, "method": null, "note": null,
+                     "checked_at": null, "removed": false, "threads": 0}]}}})),
             "usage.get" => Ok(json!({"now": "2026-10-09T12:00:00Z", "runtimes": [{
                 "runtime": "claude-code", "account": null, "label": "Claude", "plan": "max",
                 "windows": [
@@ -283,10 +303,18 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
                 return;
             }
             // Other methods: echo them so the request shape is visible.
+            // As the hub answers: `accounts` too, which MCP drops, and the orchestrator on
+            // the native account alone (its `account` and `account_shown`, which MCP drops).
+            "hub.info" => Ok(
+                json!({ "ok": true, "method": req.method, "version": "0.1.0",
+                "orchestrator": {"available": true, "runtime": "claude-code", "model": null,
+                    "account": "default", "account_shown": false, "thread": "T0",
+                    "configured": {"runtime": "claude-code", "account": null}},
+                "accounts": {"claude-code": {"shown": true, "accounts": [
+                    {"name": "work", "native": false, "dir": "/home/u/.twr/accounts/w"}]}} }),
+            ),
             "attention.respond" | "attention.annotate" | "context.read" | "context.set"
-            | "thread.delete" | "hub.info" | "config.show" => {
-                Ok(json!({ "ok": true, "method": req.method }))
-            }
+            | "thread.delete" | "config.show" => Ok(json!({ "ok": true, "method": req.method })),
             "project.files" if p["project"] == "big" => Ok(json!({
                 "project": "big", "commit": "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d",
                 "branch_of": null, "path": "",
@@ -440,6 +468,7 @@ const TOOLS: &[&str] = &[
     "delete_thread",
     "list_trash",
     "get_usage",
+    "list_accounts",
     "read_transcript",
     "subscribe_control",
     "write_report",
@@ -515,6 +544,7 @@ async fn hello_and_tool_list() {
     assert_eq!(
         props("spawn_thread"),
         [
+            "account",
             "box",
             "effort",
             "model",
@@ -536,7 +566,12 @@ async fn hello_and_tool_list() {
     assert_eq!(required("annotate_attention"), ["attn_id", "note"]);
     assert_eq!(props("set_mode"), ["mode", "thread"]);
     assert_eq!(required("set_mode"), ["mode", "thread"]);
-    assert_eq!(props("set_model"), ["effort", "model", "runtime", "thread"]);
+    // An account by name; never `outside_pin` (the orchestrator cannot leave a pin).
+    assert_eq!(
+        props("set_model"),
+        ["account", "effort", "model", "runtime", "thread"]
+    );
+    assert!(props("list_accounts").is_empty());
     assert_eq!(required("set_model"), ["thread"]);
     assert_eq!(props("rename_thread"), ["name", "thread"]);
     assert_eq!(required("rename_thread"), ["name", "thread"]);
@@ -942,6 +977,38 @@ async fn each_tool_sends_the_expected_request() {
         ("list_trash", json!({}), vec![("trash.list", json!({}))]),
         ("get_usage", json!({}), vec![("usage.get", json!({}))]),
         (
+            "list_accounts",
+            json!({}),
+            vec![("account.list", json!({}))],
+        ),
+        (
+            "set_model",
+            json!({ "thread": "w1", "account": "work" }),
+            vec![(
+                "thread.set_model",
+                json!({ "thread": "w1", "account": "work" }),
+            )],
+        ),
+        (
+            "set_model",
+            json!({ "thread": "w1", "runtime": "claude-code:work" }),
+            vec![(
+                "thread.set_model",
+                json!({ "thread": "w1", "runtime": "claude-code:work" }),
+            )],
+        ),
+        (
+            "spawn_thread",
+            json!({ "project": "twr", "name": "fix-ci", "account": "max-*",
+                    "operation_id": "op2" }),
+            vec![(
+                "thread.spawn",
+                json!({"operation_id": "op2",
+                       "request": {"project": "twr", "name": "fix-ci", "account": "max-*"},
+                       "prompt": null}),
+            )],
+        ),
+        (
             "watch_thread",
             json!({ "thread": "*", "note": "send each finished branch to integrator",
                     "repeat": true }),
@@ -1150,6 +1217,7 @@ const OTHER_TOOLS: &[&str] = &[
     "delete_thread",
     "list_trash",
     "get_usage",
+    "list_accounts",
     "read_transcript",
     "subscribe_control",
     "read_context",
@@ -2161,4 +2229,211 @@ async fn project_tools_frame_repository_content_as_data() {
     assert!(r.contains("src/a.rs:3: fn parse_config() {"), "{r}");
     assert!(r.contains("[more lines matched"), "{r}");
     assert!(r.contains("are not searched]"), "{r}");
+}
+
+/// `list_accounts`: each runtime's accounts, whether it shows labels (`several`), and only
+/// name, native, source, login, threads (and removed): no directory, method or note.
+#[tokio::test]
+async fn list_accounts_shows_the_accounts_without_directories() {
+    let h = harness().await;
+    let r = h.call("list_accounts", json!({})).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    let out = text(&r);
+    assert_eq!(
+        out,
+        concat!(
+            r#"{"runtimes":[{"runtime":"claude-code","several":true,"accounts":["#,
+            r#"{"name":"personal","native":true,"source":"recorded","login":"logged_in","threads":2},"#,
+            r#"{"name":"work","native":false,"source":"config","login":"logged_in","threads":1},"#,
+            r#"{"name":"old","native":false,"source":"recorded","login":"logged_out","threads":1,"removed":true}]},"#,
+            r#"{"runtime":"codex","several":false,"accounts":["#,
+            r#"{"name":"default","native":true,"source":"native","login":"unknown","threads":0}]}]}"#
+        )
+    );
+    for gone in [
+        "dir",
+        "/home/u",
+        "method",
+        "claude.ai",
+        "checked_at",
+        "share",
+    ] {
+        assert!(!out.contains(gone), "{gone:?} in {out}");
+    }
+}
+
+/// hub_info leaves the accounts out: list_accounts shows them (without their directories).
+/// Its orchestrator on the native account alone names no account (the thread views' rule).
+#[tokio::test]
+async fn hub_info_leaves_the_accounts_to_list_accounts() {
+    let h = harness().await;
+    let r = h.call("hub_info", json!({})).await;
+    assert!(!is_error(&r), "{}", text(&r));
+    let out = text(&r);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        v,
+        json!({ "ok": true, "method": "hub.info", "version": "0.1.0",
+                "orchestrator": {"available": true, "runtime": "claude-code", "model": null,
+                    "thread": "T0", "configured": {"runtime": "claude-code", "account": null}} })
+    );
+    assert!(!out.contains("/home/u"), "{out}");
+    assert!(!out.contains("account_shown"), "{out}");
+    assert!(!out.contains("\"default\""), "{out}");
+}
+
+/// The thread views keep a thread's `account` only while its runtime shows account labels
+/// or the account was removed; `account_shown` never reaches the orchestrator.
+#[tokio::test]
+async fn thread_views_show_the_account_only_when_it_matters() {
+    let h = harness().await;
+    let thread = |account: &str, shown: bool, removed: bool| {
+        let mut t = json!({"id": "T1", "name": "w1", "status": "idle", "runtime": "claude-code",
+                           "account": account, "account_shown": shown});
+        if removed {
+            t["account_removed"] = json!(true);
+        }
+        t
+    };
+    // (thread, what MCP shows of its account: `None` = no account keys).
+    let cases = [
+        (thread("default", false, false), None),
+        (
+            thread("work", true, false),
+            Some(json!({"account": "work"})),
+        ),
+        (
+            thread("old", false, true),
+            Some(json!({"account": "old", "account_removed": true})),
+        ),
+        (
+            thread("old", true, true),
+            Some(json!({"account": "old", "account_removed": true})),
+        ),
+        // An older hub: no account keys at all.
+        (json!({"id": "T1", "name": "w1", "status": "idle"}), None),
+    ];
+    for (t, want) in cases {
+        *h.mock.thread_result.lock().unwrap() = Some(t.clone());
+        let list: Value =
+            serde_json::from_str(&text(&h.call("list_threads", json!({})).await)).unwrap();
+        let got: Value =
+            serde_json::from_str(&text(&h.call("get_thread", json!({"thread": "w1"})).await))
+                .unwrap();
+        for (what, v) in [("list_threads", &list[0]), ("get_thread", &got)] {
+            assert!(v.get("account_shown").is_none(), "{what}: {v}");
+            let keys: serde_json::Map<String, Value> = v
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with("account"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            match &want {
+                None => assert!(keys.is_empty(), "{what} {t}: {v}"),
+                Some(w) => assert_eq!(Value::Object(keys), *w, "{what} {t}"),
+            }
+            // Everything else stays.
+            assert_eq!(v["status"], "idle", "{what}: {v}");
+        }
+        // get_thread keeps its key order: name and id first.
+        assert!(text(&h.call("get_thread", json!({"thread": "w1"})).await)
+            .starts_with(r#"{"thread_name":"w1","thread":"T1","#),);
+    }
+    // A spawned thread is a thread view too.
+    *h.mock.spawn_result.lock().unwrap() = Some(json!({"status": "complete",
+        "thread": {"id": "T9", "name": "fix-ci", "status": "idle", "account": "default",
+                   "account_shown": false}}));
+    let r = h
+        .call("spawn_thread", json!({"project": "twr", "name": "fix-ci"}))
+        .await;
+    let v: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert!(text(&r).starts_with(r#"{"thread_name":"fix-ci","thread":{"#));
+    assert!(v["thread"].get("account").is_none(), "{v}");
+    assert!(v["thread"].get("account_shown").is_none(), "{v}");
+}
+
+/// The orchestrator cannot pass `outside_pin`: the tools have no such parameter, and one given
+/// anyway never reaches the hub.
+#[tokio::test]
+async fn outside_pin_never_reaches_the_hub() {
+    let h = harness().await;
+    h.mock.clear();
+    h.call(
+        "set_model",
+        json!({"thread": "w1", "account": "personal", "outside_pin": true}),
+    )
+    .await;
+    h.call(
+        "spawn_thread",
+        json!({"project": "twr", "name": "x", "account": "personal", "outside_pin": true,
+               "operation_id": "op9"}),
+    )
+    .await;
+    let calls = h.mock.calls();
+    assert!(!calls.is_empty());
+    for (method, params) in calls {
+        assert!(
+            !params.to_string().contains("outside_pin"),
+            "{method}: {params}"
+        );
+    }
+}
+
+/// Account moves, new threads on an account and the account events read as lines.
+#[tokio::test]
+async fn account_events_render_on_the_control_stream() {
+    let h = harness().await;
+    let items = [
+        (
+            "T1",
+            "thread.model_changed",
+            json!({"model": "opus", "effort": "high", "previous_model": "opus",
+                   "previous_effort": "high", "runtime": "claude-code",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "account": "personal", "previous_account": "work", "by": "orchestrator"}),
+        ),
+        (
+            "T1",
+            "thread.created",
+            json!({"name": "api", "project": "twr", "runtime": "claude-code",
+                   "ext": {"twr": {"account": "work", "account_dir": "/secret/work"}}}),
+        ),
+        (
+            "hub",
+            "account.added",
+            json!({"runtime": "claude-code", "account": "work", "dir": "/secret/work",
+                   "share": "config", "by": "user"}),
+        ),
+        (
+            "hub",
+            "account.status",
+            json!({"runtime": "claude-code", "account": "work", "login": "logged_out"}),
+        ),
+        (
+            "hub",
+            "account.removed",
+            json!({"runtime": "claude-code", "account": "work", "by": "user"}),
+        ),
+    ];
+    for (i, (thread, kind, data)) in items.into_iter().enumerate() {
+        let n = i as u64 + 1;
+        h.mock
+            .push_control(control_item(n, event(thread, n, None, kind, data)));
+    }
+    let r = text(
+        &h.call("subscribe_control", json!({"since_seq": 0, "wait_ms": 0}))
+            .await,
+    );
+    for want in [
+        "@1 [T1] account changed by orchestrator: work -> personal; a new session starts with \
+         the next turn, with a handoff",
+        "@2 [T1] thread created: name=api project=twr runtime=claude-code account=work",
+        "@3 [hub] account claude-code:work added",
+        "@4 [hub] account claude-code:work: logged out",
+        "@5 [hub] account claude-code:work removed",
+    ] {
+        assert!(r.contains(want), "{want:?} missing: {r}");
+    }
+    assert!(!r.contains("/secret"), "{r}");
 }

@@ -71,6 +71,9 @@ pub struct SpawnConfig {
     /// `TWR_AGENT=<thread id>:<generation>` so its socket tells the process (and whatever it
     /// starts) from the user.
     pub env: Vec<(String, String)>,
+    /// Environment variables the runtime process must not inherit (stray credentials when it
+    /// runs on a named account), removed after `env` is applied: a name in both is removed.
+    pub env_remove: Vec<String>,
     /// Session to resume instead of starting a new one.
     pub resume_session: Option<String>,
     /// Turn number of the initial `prompt` passed to [`Adapter::spawn`] (default 1).

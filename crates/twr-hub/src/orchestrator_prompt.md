@@ -45,6 +45,12 @@ unless the worker is in plan, read-only or dontAsk mode, since runtimes differ i
 lets through. A running turn finishes first.
 A runtime move keeps the thread, worktree, branch and queue, then starts a new session with
 a handoff on its next prompt. Tell the user that it needs a next message to continue.
+Some runtimes have several accounts (logins, such as a work and a personal subscription):
+list_accounts shows them, and a thread shows `account` only on such a runtime. Pick or change
+a thread's account (spawn_thread or set_model `account`, or a runtime like claude-code:work)
+only when the user asks, never on your own, not even to get past a usage limit. Never move a
+thread off its project's pinned accounts: the hub refuses, and only the user can override it.
+On a runtime with one account, don't bring accounts up.
 rename_thread renames a worker when the user asks, or when its name no longer says what it
 does (a generic name like twr-1, or a task that changed). The worktree and branch keep their
 names. Use the new name from then on, including in thread tags, and tell the user.

@@ -260,6 +260,10 @@ A transcript opens with the thread's last 2000 events, drawn at once when they h
 
 A thread's permission mode is on its card and in the dive header. `/mode <mode>` in a dive sets that thread's mode; in the orchestrator conversation it takes the thread first, `/mode <thread> <mode>`. The hub checks the mode (`thread.set_mode`) and the status bar says how it went, such as `web is now in mode auto`. The transcript records each change as `mode changed from manual to auto (by you)`, or `(by the orchestrator)` when the orchestrator changed it because you asked it to. Setting the mode a thread already has reads `mode kept at manual (by you)`. A runtime that was running restarts on its session in the new mode, and the transcript says `restarting the runtime in its new mode`. [runtimes.md](runtimes.md#permission-modes) lists the modes.
 
+## Accounts
+
+With several logins for one runtime ([accounts.md](accounts.md)), and only then, a thread's card, tile and dive header name its account with the runtime: `claude-code:work · opus-4-1`, `claude-code:work@gpu`. A narrow title drops the runtime before the account, and the account before the box name. The orchestrator's header does the same. A thread on a removed account shows `work (removed)` even when labels are hidden. Labels appear and disappear as accounts log in, log out or are removed. `/account` moves a thread, `/accounts` lists them, and `/new <project> --account <a>` opens a thread on one.
+
 ## Model and reasoning effort
 
 `/model <thread>` shows a thread's model and reasoning effort in the status bar, such as `api: model fable, effort high (runs claude-fable-5-1)`; the part in parentheses is the model the runtime reports when it differs from the one you asked for. `/model <thread> <model>` sets the model, `/model <thread> --effort <effort>` the effort, and `/model <thread> <model> --effort <effort>` both, as `twr model` does ([usage.md](usage.md#change-a-threads-model-and-effort) lists the efforts each runtime takes). `default` returns either one to the runtime's default. The first word is always the thread; in a dive, `/model` and `/model --effort <effort>` are about the thread you dived into. The hub checks the effort (`thread.set_model`) and the status bar says how it went, such as `api now has model claude-fable-5-1, effort high; its runtime restarts with them after the current turn`.
@@ -420,7 +424,7 @@ Unless `[tui] suggest = false` is in the [configuration](configuration.md) (or `
 - Typing types over it; with the line empty again it shows again. `Enter` on the empty line does what it always does: a suggestion is never sent unless you take it and press `Enter`, and then it is your message, from what you have seen when you send it.
 - A new turn of the thread takes it away; it shows only for the thread on the main pane, with nothing typed.
 
-Where it comes from: when a turn ends while the TUI watches and nothing is typed (not a hub notice turn of the orchestrator, which quotes other threads), the TUI asks the hub (`suggest.next`), which runs one small model once, with your own login:
+Where it comes from: when a turn ends while the TUI watches and nothing is typed (not a hub notice turn of the orchestrator, which quotes other threads), the TUI asks the hub (`suggest.next`), which runs one small model once, with your own login (each runtime's native account, whatever account the thread runs on; see [accounts.md](accounts.md#the-environment)):
 
 | runtime | model (`[tui] suggest_model`) | how | tokens a call | cost a call, list price |
 |---|---|---|---|---|
@@ -587,7 +591,7 @@ The start of the status bar's last row shows how much is left in each subscripti
 left: Claude 5h 78% · wk 56% | GPT wk 58% as of 12m ago
 ```
 
-The percentages are the share of the window **left**, calculated as `100 − used` and clamped to 0–100: `5h` is Claude's 5-hour limit, `wk` a weekly one, `mo` a monthly credit period (`GPT` is Codex, `Grok` Grok Build). A window with 25% left or less is yellow, and one with 10% or less red, with its reset time in your local time, such as `5h 8% resets 14:30` (or `Thu 05:00` when it's more than a day away). Data ten minutes old is grey (dimmed, not bold, for a window near its limit) and, where there is room, says how old it is. A runtime shows once one of its sessions has reported something, and a window whose reset time has passed is left out until a session reports it again. With several accounts for one runtime (not available yet), each would show its name, such as `Claude:work`.
+The percentages are the share of the window **left**, calculated as `100 − used` and clamped to 0–100: `5h` is Claude's 5-hour limit, `wk` a weekly one, `mo` a monthly credit period (`GPT` is Codex, `Grok` Grok Build). A window with 25% left or less is yellow, and one with 10% or less red, with its reset time in your local time, such as `5h 8% resets 14:30` (or `Thu 05:00` when it's more than a day away). Data ten minutes old is grey (dimmed, not bold, for a window near its limit) and, where there is room, says how old it is. A runtime shows once one of its sessions has reported something, and a window whose reset time has passed is left out until a session reports it again. While a runtime shows account labels (two or more accounts that aren't removed or logged out, see [Accounts](accounts.md)), each of its accounts shows its name, such as `Claude:work`, the native one under its own name.
 
 The key hints follow the usage segment (and any status notes). On a narrower screen the segment drops the reset times and the age (`left: Claude 5h 78% · wk 56% | GPT wk 58%`), then shortens to `C 78%/56% | G 58%` (Claude's 5-hour then weekly window, Codex's weekly one), and is left out when the hints would keep fewer than 30 columns (or their full width when shorter). It uses the widest form that fits beside all the hints; when none does, it takes up to two fifths of the row and the end of the hints is cut. A question waiting for `y` hides it like the hints. `twr usage` prints the same with the reset times in full ([usage.md](usage.md#subscription-usage)).
 
@@ -659,10 +663,12 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/unsend` | take back the last message you sent, while nothing was done with it yet, as `Esc` twice does ([more](#taking-back-a-message)) |
 | `/mode [thread] <mode>` | set a thread's permission mode; in a dive the thread is optional |
 | `/model <thread> [model] [--effort e] [--runtime r]` | show a thread's model and reasoning effort, set either, or move the thread to another runtime; in a dive, `/model [--effort e] [--runtime r]` is about that thread |
+| `/account [thread] [account] [--outside-pin]` | show a thread's account, or move it to another account of its runtime (a new session with a handoff); in a dive the thread is optional. `/account add <runtime> <name>` shows the `twr account add` command to run in another terminal ([accounts.md](accounts.md)) |
+| `/accounts` | every runtime's accounts and their logins, in the status bar |
 | `/rename [thread] <name>` | rename a worker thread (its worktree and branch keep their names); in a dive the thread is optional |
 | `/clear` | fresh orchestrator session with no handoff; asks `y`; keeps history and workers |
 | `/orch [<runtime> [model]]` | switch the orchestrator; alias `/orchestrator`; asks `y` with the summary, `s` without. Alone, it lists the runtimes to choose from first |
-| `/new <project> [--runtime r] [--name n]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
+| `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
 | `/park [thread]`, `/stop [thread]` | park or stop a thread, the one you dived into or the selected one by default; asks `y` |
 | `/resume [thread]` | resume a parked thread |
 | `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). The hub's offers to compact before a message are turned off for a thread with its card's `Don't ask for <thread>`, and on again with `twr compact <thread> --offers on`. `/compact` is the phone layout |

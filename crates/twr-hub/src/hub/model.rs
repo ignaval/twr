@@ -37,6 +37,13 @@
 //! (with the full handoff) rather than being refused. Until the resumed session starts, a clear
 //! of a setting the runtime keeps is refused as for any session the thread has.
 //!
+//! With an `account` (`twr model --account`, or `--runtime <runtime>:<account>`), the thread
+//! moves to that account (`hub::switch`, `hub::thread_account`), on its runtime or with a new
+//! one: a new session there, with the handoff, like a runtime move. A move between accounts of
+//! one runtime keeps the thread's model and effort unless given. A move back resumes only a
+//! session the thread left on that runtime and that same account, in the directory the
+//! account has now ([`Core::departure`]): never another account's session.
+//!
 //! Unlike a mode change, the orchestrator's change of a model or effort is applied directly,
 //! recorded with `by: orchestrator`: choosing a model is no permission answer (like
 //! `thread.new`'s `model`), so it needs no confirm card. A move to another runtime is
@@ -49,10 +56,11 @@
 //! (`{status: "needs_confirmation"}`; Confirm makes the move as the user's), unless the
 //! thread's mode is a restricted one (plan, read-only, dontAsk) on the new runtime
 //! ([`twr_adapters::mode_level_for`]), which no runtime lets do more than read: that move is
-//! applied directly. The orchestrator may only choose an agent runtime or a configured preset,
-//! never a command line. Refused for the orchestrator itself (`twr orchestrator use <runtime>
-//! --model M` switches it) and, without a new runtime, `pty` threads (their command line is
-//! their own).
+//! applied directly; so is its move between accounts of one runtime (within the pins: the
+//! thread may do the same there). The orchestrator may only choose an agent runtime or a
+//! configured preset, never a command line. Refused for the orchestrator itself (`twr
+//! orchestrator use <runtime> --model M` switches it) and, without a new runtime, `pty` threads
+//! (their command line is their own).
 
 use std::sync::Arc;
 
@@ -60,11 +68,29 @@ use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 
-use super::runtime_spec::RuntimeSpec;
+use super::switch::Switch;
 use super::{
     append_err, box_agents, internal, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub,
     Inner,
 };
+
+/// What `thread.set_model` asks for (see [`Hub::set_thread_model`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelRequest<'a> {
+    /// The runtime to move to (`<runtime>:<account>` picks the account too); `None` or blank:
+    /// the thread's own.
+    pub runtime: Option<&'a str>,
+    /// The account to move to (a name, a glob or a comma-separated list, as `thread.new`
+    /// takes it).
+    pub account: Option<&'a str>,
+    /// Move to `account` although it is outside the thread's or its project's pin (the user
+    /// only).
+    pub outside_pin: bool,
+    /// The model (`default`: the runtime's).
+    pub model: Option<&'a str>,
+    /// The reasoning effort (`default`: the runtime's).
+    pub effort: Option<&'a str>,
+}
 
 /// A checked `thread.set_model` ([`Core::model_change`]).
 pub(super) struct ModelChange {
@@ -74,8 +100,8 @@ pub(super) struct ModelChange {
     pub(super) out: Value,
     /// The `thread.model_changed` to record; `None`: nothing changes.
     pub(super) event: Option<EventBody>,
-    /// The runtime the thread moves to, if another one.
-    pub(super) switch: Option<RuntimeSpec>,
+    /// The runtime or account the thread moves to, if another one.
+    pub(super) switch: Option<Switch>,
 }
 
 impl Hub {
@@ -115,7 +141,8 @@ impl Hub {
     /// The result also has `runtime`, `previous_runtime`, `runtime_changed` and `resumes` (the
     /// session of the new runtime the move resumes, else null); with a move, `message` says
     /// that the new runtime's session starts (or the earlier one resumes) with the next turn,
-    /// with the handoff.
+    /// with the handoff. (The project of a thread its log names none for is not looked up here,
+    /// as [`Hub::set_thread_model`] does: what an earlier lookup found applies.)
     pub fn set_runtime_model(
         &self,
         query: &str,
@@ -124,8 +151,52 @@ impl Hub {
         effort: Option<&str>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
+        let req = ModelRequest {
+            runtime,
+            model,
+            effort,
+            ..Default::default()
+        };
         let mut core = self.inner.core();
-        core.set_model_locked(&self.inner, query, runtime, model, effort, caller)
+        core.set_model_locked(&self.inner, query, &req, caller)
+    }
+
+    /// `thread.set_model {thread, runtime?, account?, outside_pin?, model?, effort?}`:
+    /// [`Hub::set_runtime_model`], also moving the thread to account `account` (or the account
+    /// part of `runtime`, `<runtime>:<account>`) when it is another one, on the same runtime or
+    /// with it (`hub::switch`, `hub::thread_account`). The account is checked like a new
+    /// thread's (one the runtime does not have, a removed or logged-out one, any named account
+    /// on a remote box: refused), and must match the thread's own pin and its project's pin
+    /// and exclusions: outside them, refused for the orchestrator, and for the user unless
+    /// `outside_pin` (recorded as `ext.twr.account_reason: "override"`). A move between
+    /// accounts of one runtime keeps the thread's model and effort unless given.
+    ///
+    /// A move (a runtime or an account given) of a thread made for a repository path whose
+    /// log names no project for its pins (made before they were recorded, or before its
+    /// project was configured) looks the repository's configured project up first, before the
+    /// core is locked ([`Hub::look_up_pins_project`]): its pins apply. The move is then made
+    /// to the thread `query` named before the lookup, whatever it names once the core is
+    /// locked again (another thread renamed meanwhile); `not_found` if that thread is gone.
+    ///
+    /// The result also has `account`, `previous_account` (names: the native account's current
+    /// name for the native one) and `account_changed`.
+    pub async fn set_thread_model(
+        &self,
+        query: &str,
+        req: ModelRequest<'_>,
+        caller: &Caller,
+    ) -> Result<Value, RpcError> {
+        let moves = req.account.is_some() || req.runtime.is_some_and(|r| !r.trim().is_empty());
+        if !moves {
+            let mut core = self.inner.core();
+            return core.set_model_locked(&self.inner, query, &req, caller);
+        }
+        let id = self.inner.core().resolve(query)?;
+        self.look_up_pins_project(&id).await;
+        let mut core = self.inner.core();
+        // The thread looked up, by its id (which resolves to it alone).
+        core.view(&id)?;
+        core.set_model_locked(&self.inner, &id, &req, caller)
     }
 }
 
@@ -137,12 +208,10 @@ impl Core {
         &mut self,
         hub: &Arc<Inner>,
         query: &str,
-        runtime: Option<&str>,
-        model: Option<&str>,
-        effort: Option<&str>,
+        req: &ModelRequest<'_>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
-        let change = self.model_change(hub, query, runtime, model, effort, None, caller)?;
+        let change = self.model_change(hub, query, req, None, caller)?;
         let ModelChange {
             id,
             mut out,
@@ -158,14 +227,23 @@ impl Core {
         let warning = self.registry.get(&id).and_then(|view| {
             let target = switch
                 .as_ref()
-                .map_or(view.runtime.as_str(), |new| new.runtime.as_str());
+                .map_or(view.runtime.as_str(), |new| new.spec.runtime.as_str());
             box_agents::agent_warning(hub, &view.box_name, target)
         });
-        if let Some(new) = switch.as_ref().filter(|_| caller.is_orchestrator()) {
-            if self.move_needs_card(&id, &new.runtime) {
+        // A move between accounts of one runtime keeps what the thread may do: no card.
+        let runtime_move = switch
+            .as_ref()
+            .filter(|s| s.runtime_changed && caller.is_orchestrator());
+        if let Some(new) = runtime_move {
+            if self.move_needs_card(&id, &new.spec.runtime) {
                 self.move_check(&id)?;
-                let spec = runtime.map(str::trim).unwrap_or_default();
-                let mut out = self.propose_move(&id, spec, model, effort);
+                let spec = req.runtime.map(str::trim).unwrap_or_default();
+                // The card's move names the account it was checked with, as `<runtime>:<account>`.
+                let spec = match req.account.map(str::trim).filter(|a| !a.is_empty()) {
+                    Some(a) if new.spec.account.is_none() => format!("{spec}:{a}"),
+                    _ => spec.to_string(),
+                };
+                let mut out = self.propose_move(&id, &spec, req.model, req.effort);
                 if let Some(w) = warning {
                     out["warning"] = json!(w);
                 }
@@ -223,8 +301,14 @@ impl Core {
         caller: &Caller,
         card: &str,
     ) -> Result<(String, String), RpcError> {
-        let change = self.model_change(hub, thread, Some(runtime), model, effort, mode, caller)?;
-        let Some(target) = change.switch.as_ref().map(|s| s.runtime.clone()) else {
+        let req = ModelRequest {
+            runtime: Some(runtime),
+            model,
+            effort,
+            ..Default::default()
+        };
+        let change = self.model_change(hub, thread, &req, mode, caller)?;
+        let Some(target) = change.switch.as_ref().map(|s| s.spec.runtime.clone()) else {
             return Err(rpc(
                 codes::CONFLICT,
                 format!("{} runs on {runtime} already", self.thread_name(&change.id)),
@@ -251,17 +335,21 @@ impl Core {
     /// so far and the `thread.model_changed` to record, if anything changes. `mode`: the mode
     /// the thread is in when the change applies, if not its recorded one (a confirm card that
     /// also sets it).
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn model_change(
         &mut self,
         hub: &Arc<Inner>,
         query: &str,
-        runtime: Option<&str>,
-        model: Option<&str>,
-        effort: Option<&str>,
+        req: &ModelRequest<'_>,
         mode: Option<&str>,
         caller: &Caller,
     ) -> Result<ModelChange, RpcError> {
+        let ModelRequest {
+            runtime,
+            account,
+            outside_pin,
+            model,
+            effort,
+        } = *req;
         if self.shutting_down {
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
         }
@@ -282,13 +370,21 @@ impl Core {
                 ),
             ));
         }
-        let switch = match runtime.map(str::trim).filter(|r| !r.is_empty()) {
-            Some(r) => self.runtime_switch(hub, &view, r, caller)?,
-            None => None,
+        let runtime = runtime.map(str::trim).filter(|r| !r.is_empty());
+        let account = account.map(str::trim);
+        let switch = if runtime.is_some() || account.is_some() {
+            self.runtime_switch(hub, &view, runtime, account, outside_pin, caller)?
+        } else {
+            None
         };
+        // A move between accounts of one runtime keeps the model and effort (left out).
+        let runtime_changed = switch.as_ref().is_some_and(|s| s.runtime_changed);
         let target = switch
             .as_ref()
-            .map_or(view.runtime.clone(), |s| s.runtime.clone());
+            .map_or(view.runtime.clone(), |s| s.spec.runtime.clone());
+        // The account it runs on after this (unchanged: its own).
+        let account_move = switch.as_ref().and_then(|s| s.account.as_ref());
+        let target_account = account_move.map_or(view.account.clone(), |a| a.account.clone());
         if view.runtime == twr_adapters::pty::NAME && switch.is_none() {
             return Err(rpc(
                 codes::BAD_REQUEST,
@@ -299,14 +395,25 @@ impl Core {
                 ),
             ));
         }
-        // A move back to a runtime the thread left a session of resumes that session
-        // (`hub::switch`): found before the settings are checked, which then start from the
-        // session's. Unless the call asks the runtime's default for a setting the runtime keeps
-        // on resume: the session would go on with its own, so the move starts a new one.
+        // A move back to a runtime and account the thread left a session of resumes that
+        // session (`hub::switch`): found before the settings are checked, which then start from
+        // the session's. Only that account's own session, in the directory the account has
+        // now ([`Core::departure`]). Unless the call asks the runtime's default for a setting
+        // the runtime keeps on resume: the session would go on with its own, so the move
+        // starts a new one.
+        let target_dir = match account_move {
+            Some(a) => a.dir.clone(),
+            None => self.account_dir(&view),
+        };
         let mut departure = match &switch {
-            Some(new) if new.acp.is_none() && new.runtime != twr_adapters::pty::NAME => {
-                self.departure(&id, &new.runtime).map_err(internal)?
-            }
+            Some(s) if s.spec.acp.is_none() && s.spec.runtime != twr_adapters::pty::NAME => self
+                .departure(
+                    &id,
+                    &s.spec.runtime,
+                    target_account.as_deref(),
+                    target_dir.as_deref(),
+                )
+                .map_err(internal)?,
             _ => None,
         };
         if let Some(d) = &departure {
@@ -319,8 +426,8 @@ impl Core {
                 departure = None;
             }
         }
-        // Its own runtime named alone: nothing changes (reported below).
-        let named = runtime.is_some_and(|r| !r.trim().is_empty());
+        // Its own runtime (or account) named alone: nothing changes (reported below).
+        let named = runtime.is_some() || account.is_some();
         if model.is_none() && effort.is_none() && switch.is_none() && !named {
             return Err(rpc(
                 codes::BAD_REQUEST,
@@ -331,7 +438,8 @@ impl Core {
         // On another runtime, one left out is the new runtime's default, or the session's
         // when the move resumes one.
         let new_model = match model {
-            None if switch.is_some() => departure.as_ref().and_then(|d| d.model.clone()),
+            None if departure.is_some() => departure.as_ref().and_then(|d| d.model.clone()),
+            None if runtime_changed => None,
             None => view.model.clone(),
             Some(m) if runtime_spec::is_default(m) => None,
             Some(m) => {
@@ -343,7 +451,8 @@ impl Core {
             }
         };
         let new_effort = match effort {
-            None if switch.is_some() => departure.as_ref().and_then(|d| d.effort.clone()),
+            None if departure.is_some() => departure.as_ref().and_then(|d| d.effort.clone()),
+            None if runtime_changed => None,
             None => view.effort.clone(),
             Some(e) => runtime_spec::canonical_effort(e, &target)
                 .map_err(|e| rpc(codes::BAD_REQUEST, e))?,
@@ -353,8 +462,8 @@ impl Core {
         // with the old value while the thread said the default. A session the thread has, or
         // one a live runtime started with a value (or an unknown one) may still report: the
         // settings restart that applies the clear would resume it. A thread moving to another
-        // runtime by this call resumes nothing: its next start is a new session of the new
-        // runtime. Nor does a live runtime the thread moved away from by an earlier call
+        // runtime (or account) by this call resumes nothing: its next start is a new session
+        // there. Nor does a live runtime the thread moved away from by an earlier call
         // count (`RunSettings::is_runtime_of`): it is replaced, never resumed, and its
         // session is not the thread's (`ThreadView::handoff_pending`); a live runtime of the
         // new runtime that has not reported its session yet does.
@@ -389,15 +498,20 @@ impl Core {
         }
         // Only a new effort (or one for a new runtime) is checked against the binary: one the
         // thread has runs already.
-        if new_effort.is_some() && (new_effort != view.effort || switch.is_some()) {
+        if new_effort.is_some() && (new_effort != view.effort || runtime_changed) {
             let local = hub.host(&view.box_name).is_some_and(|h| !h.is_remote());
             // Resolved as the thread's next spawn resolves it (its environment and directory).
-            let spawn = super::spawn_config(hub, &view);
+            let spawn = self.spawn_config(hub, &view);
             if let Some(why) = runtime_spec::effort_refusal(&target, local, &spawn.env, &spawn.cwd)
             {
                 return Err(rpc(codes::BAD_REQUEST, why));
             }
         }
+        // Accounts by name (the native account's current one), as `thread_json` has them.
+        let account_name = |rt: &str, a: &Option<String>| {
+            a.clone().unwrap_or_else(|| self.accounts.native_name(rt))
+        };
+        let label = |rt: &str, a: &Option<String>| format!("{rt}:{}", account_name(rt, a));
         let mut out = json!({
             "thread": id,
             "thread_name": view.name,
@@ -407,20 +521,23 @@ impl Core {
             "previous_effort": view.effort,
             "runtime": target,
             "previous_runtime": view.runtime,
-            "runtime_changed": switch.is_some(),
+            "runtime_changed": runtime_changed,
             "resumes": departure.as_ref().map(|d| &d.session),
+            "account": account_name(&target, &target_account),
+            "previous_account": account_name(&view.runtime, &view.account),
+            "account_changed": account_move.is_some(),
         });
         if switch.is_none() && new_model == view.model && new_effort == view.effort {
             // Nothing changes: nothing is recorded, nothing restarts.
             out["changed"] = json!(false);
+            let on = match (account.is_some(), runtime.is_some()) {
+                (true, _) => format!("on {} ", label(&view.runtime, &view.account)),
+                (false, true) => format!("on {} ", view.runtime),
+                (false, false) => String::new(),
+            };
             out["message"] = json!(format!(
-                "{} already runs {}with {}",
+                "{} already runs {on}with {}",
                 view.name,
-                if named {
-                    format!("on {} ", view.runtime)
-                } else {
-                    String::new()
-                },
                 describe(&new_model, &new_effort)
             ));
             return Ok(ModelChange {
@@ -435,11 +552,29 @@ impl Core {
         } else {
             ChangedBy::User
         };
-        // What the new runtime needs (as `thread.created` records it), the session it replaces
+        // What the new runtime needs (as `thread.created` records it: a move between accounts
+        // of one runtime records no agent, keeping the thread's), the new account's directory
+        // (resolved, and as its runtimes get it) and why it was chosen, the session it replaces
         // (one its runtime confirmed, never a pending move's) and the one it resumes.
         let ext = switch.as_ref().and_then(|s| {
             let mut twr = serde_json::Map::new();
-            s.record(&mut twr);
+            if s.runtime_changed {
+                s.spec.record(&mut twr);
+            }
+            if let Some(a) = &s.account {
+                if let Some(d) = &a.dir {
+                    twr.insert(ACCOUNT_DIR_KEY.into(), json!(d.to_string_lossy()));
+                }
+                // The path its runtimes get, kept while it leads there (as `thread.created`
+                // records it: `Core::account_env_dir`).
+                if let Some(d) = &a.env_dir {
+                    twr.insert(ACCOUNT_ENV_DIR_KEY.into(), json!(d.to_string_lossy()));
+                }
+                // (Absent: the native account nothing else chose.)
+                if !a.reason.is_empty() && a.reason != super::thread_account::REASON_NATIVE {
+                    twr.insert(ACCOUNT_REASON_KEY.into(), json!(a.reason));
+                }
+            }
             twr.insert("previous_session".into(), json!(view.confirmed_session()));
             if let Some(d) = &departure {
                 twr.insert(RESUME_SESSION_KEY.into(), json!(d.session));
@@ -451,25 +586,40 @@ impl Core {
             effort: new_effort,
             previous_model: view.model.clone(),
             previous_effort: view.effort.clone(),
-            runtime: switch.as_ref().map(|s| s.runtime.clone()),
+            runtime: switch.as_ref().map(|s| s.spec.runtime.clone()),
             previous_runtime: switch.as_ref().map(|_| view.runtime.clone()),
+            account_changed: account_move.is_some(),
+            account: account_move.and_then(|a| a.account.clone()),
+            previous_account: account_move.and(view.account.clone()),
             by,
             ext,
             ..Default::default()
         });
         out["changed"] = json!(true);
         if switch.is_some() {
+            // A move of the account names both ends with their accounts.
+            let (from, to) = match account_move {
+                Some(_) => (
+                    label(&view.runtime, &view.account),
+                    label(&target, &target_account),
+                ),
+                None => (view.runtime.clone(), target.clone()),
+            };
             out["message"] = json!(match &departure {
                 Some(d) => format!(
-                    "{} moves from {} back to {target}: its earlier {target} session ({}) \
-                     resumes with its next turn, told what the thread did since it left it",
-                    view.name, view.runtime, d.session
+                    "{} moves from {from} back to {to}: its earlier {to} session ({}) resumes \
+                     with its next turn, told what the thread did since it left it",
+                    view.name, d.session
+                ),
+                None if account_move.is_some() => format!(
+                    "{} moves to {to}; its next turn starts a new session there with a handoff",
+                    view.name
                 ),
                 None => format!(
-                    "{} moves from {} to {target}: a new {target} session starts with its next \
+                    "{} moves from {from} to {to}: a new {to} session starts with its next \
                      turn, given a handoff of what the previous session did (its task, reports, \
                      recent turns, worktree and branch)",
-                    view.name, view.runtime
+                    view.name
                 ),
             });
         }

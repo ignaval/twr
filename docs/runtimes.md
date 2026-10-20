@@ -31,6 +31,10 @@ Context compaction was checked on 2026-10-21 against Claude Code 2.1.304, Codex 
 
 For Grok that covered sessions, permissions, questions, plans, cancel, resume, MCP servers and the orchestrator's tool restriction. Not checked yet: Grok threads on a remote runner box, and Grok's interactive TUI beyond resuming the session. No ACP CLI other than grok has been tried.
 
+## Accounts
+
+A runtime can have several logins, each in its own config directory (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`): two Claude subscriptions, a Codex account per client. A thread runs on a runtime and one of its accounts, `--runtime claude-code:work` or `--account work`. See [accounts.md](accounts.md). `[runtimes]` presets and `pty:` commands take no accounts.
+
 ## Permission modes
 
 Autonomy is each runtime's own permission mode, which you set per thread. A thread's mode is `--mode`, else `[threads] default_mode`, which defaults to `auto`. `twr mode <thread> <mode>` changes it later, or ask the orchestrator; see [usage.md](usage.md#change-a-threads-mode). twr never widens a mode on its own.
@@ -205,7 +209,7 @@ twr needs Claude Code 2.1.110 or newer. Before the first start of a `claude` bin
 
 The first thread to start on a new binary waits for that check, so a refusal shows up as the runtime's exit instead of a start error.
 
-If Claude Code is not signed in, its login expired or its API key is invalid, the turn fails with Claude's message plus "(sign in again: run `claude`, then /login)". twr never retries those turns on its own.
+If Claude Code is not signed in, its login expired or its API key is invalid, the turn fails with Claude's message plus "(sign in again: run `claude`, then /login)", or "(sign in again: twr account login claude-code <account>)" on a named [account](accounts.md). twr never retries those turns on its own.
 
 When a turn fails for another reason, the error card quotes Claude Code's own report, such as "API Error: Repeated 529 Overloaded errors" or "Reached maximum number of turns (1)". A turn you stop is not a failure.
 
@@ -215,7 +219,7 @@ A thread's [activity line](tui.md#the-activity-line) uses what Claude Code says 
 
 `codex app-server` over JSON-RPC, because `codex exec --json` has no approval channel. Command and file-change approvals, MCP tool approvals and questions all become cards. An answer of `allow` accepts; anything else declines.
 
-A turn that fails because Codex is not signed in, or its login expired, says so with "(sign in again: run `codex login`)". Codex reports it as a failed connection with HTTP status 401. twr does not count that as a transient error, so it never retries it on its own.
+A turn that fails because Codex is not signed in, or its login expired, says so with "(sign in again: run `codex login`)", or with `twr account login codex <account>` on a named [account](accounts.md). Codex reports it as a failed connection with HTTP status 401. twr does not count that as a transient error, so it never retries it on its own.
 
 When a turn fails for another reason, the error card quotes Codex's error message, or names the kind of error when Codex gives no message, such as "Server overloaded" or "Http connection failed (HTTP 502)".
 

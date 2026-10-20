@@ -43,8 +43,8 @@ pub fn absolute_cwd(cwd: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Starts `program args` (under `wrap`, [`process::wrapped`]) in `cwd` with `env` added
-/// (twr's secrets removed), stdio piped, in a session of its own ([`process::new_session`]:
+/// Starts `program args` (under `wrap`, [`process::wrapped`]) in `cwd` with `env` added and
+/// `remove` removed (and twr's secrets: [`process::apply_env`]), stdio piped, in a session of its own ([`process::new_session`]:
 /// no controlling terminal, its own process group), killed on drop. `fix`: what
 /// to do when the program is not there ([`process::start_error`]).
 pub fn launch(
@@ -52,19 +52,19 @@ pub fn launch(
     program: &Path,
     args: &[String],
     env: &[(String, String)],
+    remove: &[String],
     cwd: &Path,
     fix: &str,
 ) -> anyhow::Result<Child> {
     let mut cmd = process::wrapped(wrap, program);
     cmd.args(args)
-        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     process::new_session(&mut cmd);
-    process::scrub(&mut cmd);
+    process::apply_env(&mut cmd, env.iter().cloned(), remove);
     process::check_wrapped(wrap, program, env, cwd, fix)?;
     cmd.spawn()
         .map_err(|e| process::start_error(e, program, env, cwd, fix))

@@ -1,10 +1,12 @@
 //! Core types for twr, a control tower for parallel coding agents.
 //!
 //! - [`event`]: the event envelope and every event kind
+//! - [`account`]: a runtime's accounts (logins), pins, and when labels show them
 //! - [`activity`]: what a thread is doing, in a few words (its activity line's phrases)
 //! - [`blob`]: content-addressed blob store trait and the 4 KB payload cap
 //! - [`reduce`]: pure reducers (thread views, registry, attention stack, stack order)
 //! - [`adapter`]: the runtime adapter trait and its channel-based handle
+//! - [`fsread`]: bounded, non-blocking reads of other programs' settings files
 //! - [`git`]: the box git trait (worktrees, snapshots) and the porcelain v2 parser
 //! - [`gitremote`]: git remote URLs: which twr clones, how they are shown and compared
 //! - [`project_lookup`]: a git repository by its folder name under the project roots
@@ -22,6 +24,7 @@
 //! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
 
+pub mod account;
 pub mod activity;
 pub mod adapter;
 pub mod b64;
@@ -31,6 +34,7 @@ pub mod client_state;
 pub mod compact;
 pub mod config;
 pub mod event;
+pub mod fsread;
 pub mod git;
 pub mod gitremote;
 pub mod load;

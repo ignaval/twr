@@ -1182,6 +1182,11 @@ pub struct WireSpawnConfig {
     pub thinking: bool,
     /// See [`SpawnConfig::env`].
     pub env: Vec<(String, String)>,
+    /// See [`SpawnConfig::env_remove`]. Not sent when empty, so a spawn without it is what
+    /// it was before; a runner from before it would ignore it (the hub runs no named account
+    /// on a remote box yet).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_remove: Vec<String>,
     /// See [`SpawnConfig::resume_session`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session: Option<String>,
@@ -1215,6 +1220,7 @@ impl From<SpawnConfig> for WireSpawnConfig {
             settings: c.settings,
             thinking: c.thinking,
             env: c.env,
+            env_remove: c.env_remove,
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             repo: c.repo,
@@ -1240,6 +1246,7 @@ impl From<WireSpawnConfig> for SpawnConfig {
             settings: c.settings,
             thinking: c.thinking,
             env: c.env,
+            env_remove: c.env_remove,
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             wrap: Vec::new(),
@@ -1467,6 +1474,7 @@ mod tests {
             builtin_tools: Some(vec![]),
             thinking: true,
             env: vec![("TWR_THREAD".into(), "t1".into())],
+            env_remove: vec!["ANTHROPIC_API_KEY".into()],
             prompt_turn: Some(2),
             ..Default::default()
         }
@@ -2036,6 +2044,15 @@ mod tests {
         let sc: SpawnConfig = cfg().into();
         assert_eq!(WireSpawnConfig::from(sc.clone()), cfg());
         assert_eq!(SpawnConfig::from(WireSpawnConfig::from(sc.clone())), sc);
+        // A spawn that removes nothing goes over the wire as it did before `env_remove`.
+        let plain = serde_json::to_value(WireSpawnConfig {
+            env_remove: Vec::new(),
+            ..cfg()
+        })
+        .unwrap();
+        assert!(plain.get("env_remove").is_none(), "{plain}");
+        let j = serde_json::to_value(cfg()).unwrap();
+        assert_eq!(j["env_remove"], json!(["ANTHROPIC_API_KEY"]));
         for o in [
             RemoveOutcome::Removed,
             RemoveOutcome::KeptDirty { dirty_files: 3 },

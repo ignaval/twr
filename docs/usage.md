@@ -19,6 +19,8 @@ The project is a name from `[projects]` in the [config](configuration.md), a dir
 twr thread new orbit-webapp
 ```
 
+With several logins for one runtime, `--account work` (or `--runtime claude-code:work`) picks the account; a project can pin one. See [accounts.md](accounts.md).
+
 twr looks in `~/code`, `~/src`, `~/projects`, `~/dev`, `~/Developer`, `~/repos`, `~/git` and `~/workspace`, and one level below each. `project_roots` in the [config](configuration.md#notes-on-some-keys) changes the list. The repository found is used as if you had typed its path, and the hub's answer names it. If two repositories have that name, twr lists both and creates nothing; give the path of the one you mean. If none does, the error says where it looked. The TUI's `/new orbit-webapp` and the orchestrator ("open a new session on my orbit-webapp project") work the same way. On the command line, a directory of that name in the current directory is taken first.
 
 Without `--name`, twr makes one up. Other options:

@@ -2680,7 +2680,7 @@ fn the_memory_guard_hook_keeps_file_tools_in_the_memory_directory() {
     assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
     // The command the hub configures, run by `sh` as Claude Code runs it: 0 lets the call go
     // on, 2 blocks it.
-    let settings = twr_adapters::claude_code::guard::settings(Path::new(TWR));
+    let settings = twr_adapters::claude_code::guard::settings(Path::new(TWR), None);
     let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap()
@@ -2705,6 +2705,33 @@ fn the_memory_guard_hook_keeps_file_tools_in_the_memory_directory() {
     );
     assert_eq!(
         hook(&call(&root.join("src/main.rs"))).status.code(),
+        Some(2)
+    );
+    // With `--memory-dir` (an orchestrator on a named account): exactly that directory, not
+    // the transcript's.
+    let shared = root.join("native/projects/-home-me/memory");
+    let settings = twr_adapters::claude_code::guard::settings(Path::new(TWR), Some(&shared));
+    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let hook = |input: &str| {
+        let mut child = Command::new("sh")
+            .args(["-c", &command])
+            .env("TWR_HOME", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(input.as_bytes()).unwrap();
+        drop(stdin);
+        child.wait_with_output().unwrap()
+    };
+    assert_eq!(hook(&call(&shared.join("a.md"))).status.code(), Some(0));
+    assert_eq!(
+        hook(&call(&project.join("memory/a.md"))).status.code(),
         Some(2)
     );
 }
@@ -3074,4 +3101,2006 @@ fn following_a_thread_deleted_meanwhile_prints_its_deletion() {
     assert_eq!(kinds.last(), Some(&"thread.deleted"), "{kinds:?}");
     let seqs: Vec<u64> = lines.iter().filter_map(|e| e["seq"].as_u64()).collect();
     assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+}
+
+// --- accounts ----------------------------------------------------------------------------------
+
+/// A home for the account tests: `TWR_HOME` `home`, a user's `$HOME` (`home/u`) whose native
+/// Claude Code directory has `settings.json` and `CLAUDE.md`, and a fake `claude` on `PATH`
+/// (`home/bin`) that answers `auth status` as logged in with claude.ai, records each run's
+/// argv, `CLAUDE_CONFIG_DIR` and `ANTHROPIC_API_KEY` in `home/claude.log`, and exits from
+/// `auth login` with `$FAKE_LOGIN_EXIT` (0 by default).
+struct AccountHome {
+    home: std::path::PathBuf,
+    user: std::path::PathBuf,
+    path: String,
+}
+
+impl AccountHome {
+    fn new(home: &Path) -> Self {
+        let user = home.join("u");
+        let native = user.join(".claude");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::write(native.join("settings.json"), "{}\n").unwrap();
+        std::fs::write(native.join("CLAUDE.md"), "be brief\n").unwrap();
+        let bin = home.join("bin");
+        let log = home.join("claude.log");
+        install(
+            &bin.join("claude"),
+            format!(
+                "#!/bin/sh\n\
+                 {{ echo \"argv: $*\"; echo \"CLAUDE_CONFIG_DIR=${{CLAUDE_CONFIG_DIR-unset}}\"; \
+                 echo \"ANTHROPIC_API_KEY=${{ANTHROPIC_API_KEY-unset}}\"; }} >> '{}'\n\
+                 case \"$1 $2\" in\n\
+                 'auth status') echo '{{\"loggedIn\": true, \"authMethod\": \"claude.ai\"}}'; exit 0;;\n\
+                 'auth login') exit ${{FAKE_LOGIN_EXIT:-0}};;\n\
+                 'auth logout') exit ${{FAKE_LOGOUT_EXIT:-0}};;\n\
+                 esac\n\
+                 if [ -e '{hold}' ]; then case \"$*\" in\n\
+                 --version) echo '2.1.300 (Claude Code)'; exit 0;;\n\
+                 *stream-json*) echo '{{\"type\":\"system\",\"subtype\":\"init\",\
+                 \"session_id\":\"s1\"}}'; exec cat >/dev/null;;\n\
+                 esac; fi\n\
+                 [ \"$1\" = --version ] && echo '2.1.0 (Claude Code)'\n\
+                 exit 0\n",
+                log.display(),
+                hold = home.join("hold").display()
+            ),
+        );
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        AccountHome {
+            home: home.to_path_buf(),
+            user,
+            path,
+        }
+    }
+
+    /// `cmd` with this home's environment: its `$HOME` and `PATH`, no account variable of
+    /// the test's own environment, and a stray `ANTHROPIC_API_KEY` a named account must not
+    /// get.
+    fn env<'a>(&self, cmd: &'a mut Command) -> &'a mut Command {
+        cmd.env("TWR_HOME", &self.home)
+            .env("HOME", &self.user)
+            .env("PATH", &self.path)
+            .env("ANTHROPIC_API_KEY", "sk-stray")
+            .env_remove("RUST_LOG")
+            .env_remove("TWR_CLAUDE_BIN")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env_remove("ANTHROPIC_CONFIG_DIR")
+            .env_remove("CODEX_HOME")
+            .env_remove("GROK_HOME")
+    }
+
+    fn run(&self, args: &[&str], extra: &[(&str, &str)]) -> Output {
+        let mut c = twr_cmd();
+        self.env(&mut c)
+            .args(args)
+            .envs(extra.iter().copied())
+            .output()
+            .expect("running twr")
+    }
+
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.run(args, &[]);
+        assert!(
+            out.status.success(),
+            "twr {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// `twr args` failing: its stderr.
+    fn fails(&self, args: &[&str], extra: &[(&str, &str)]) -> String {
+        let out = self.run(args, extra);
+        assert!(
+            !out.status.success(),
+            "twr {args:?} succeeded: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        String::from_utf8(out.stderr).unwrap()
+    }
+
+    fn hub(&self) -> HubProc {
+        self.hub_in(None)
+    }
+
+    /// [`AccountHome::hub`] of `workspace` (`None`: `default`).
+    fn hub_in(&self, workspace: Option<&str>) -> HubProc {
+        self.hub_with(workspace, &[])
+    }
+
+    /// [`AccountHome::hub_in`] with `extra` in the hub's environment too (an account variable
+    /// the CLI's environment does not have, say).
+    fn hub_with(&self, workspace: Option<&str>, extra: &[(&str, &str)]) -> HubProc {
+        let w: Vec<&str> = workspace.map(|w| vec!["-w", w]).unwrap_or_default();
+        let log_name = format!("hub-test-{}.log", workspace.unwrap_or("default"));
+        let log = std::fs::File::create(self.home.join(log_name)).unwrap();
+        let mut c = twr_cmd();
+        let hub = HubProc(
+            self.env(&mut c)
+                .args(&w)
+                .arg("hub")
+                .env("TWR_ENABLE_FAKE", "1")
+                .envs(extra.iter().copied())
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        poll("the hub socket", || {
+            self.run(&[w.as_slice(), &["thread", "list"]].concat(), &[])
+                .status
+                .success()
+                .then_some(())
+        });
+        hub
+    }
+
+    /// What the fake `claude` recorded.
+    fn claude_log(&self) -> String {
+        std::fs::read_to_string(self.home.join("claude.log")).unwrap_or_default()
+    }
+
+    /// `twr account list --json`'s account `name` of `runtime`.
+    fn account(&self, runtime: &str, name: &str) -> Option<Value> {
+        let v: Value = serde_json::from_str(&self.ok(&["account", "list", "--json"])).unwrap();
+        v["runtimes"][runtime]["accounts"]
+            .as_array()?
+            .iter()
+            .find(|a| a["name"] == name)
+            .cloned()
+    }
+}
+
+/// The `auth login` runs the fake `claude` recorded: the environment it ran with.
+fn logins(log: &str) -> Vec<String> {
+    let lines: Vec<&str> = log.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("argv: auth login"))
+        .map(|(i, l)| format!("{l}\n{}\n{}", lines[i + 1], lines[i + 2]))
+        .collect()
+}
+
+/// The RUNTIME cell of thread `name` in `twr thread list`.
+fn runtime_cell(list: &str, name: &str) -> String {
+    let header = list.lines().next().unwrap();
+    let at = header.find("RUNTIME").unwrap();
+    let end = header.find("MODE").unwrap();
+    let row = list
+        .lines()
+        .find(|l| l.starts_with(&format!("{name} ")))
+        .unwrap_or_else(|| panic!("no {name} in {list}"));
+    row[at..end].trim().to_string()
+}
+
+/// `twr account add` makes a private directory, links the native settings into it, runs the
+/// runtime's login there with the account's variable and without the stray credential, and
+/// records it; the labels then show on every surface, `twr model --account` moves a thread,
+/// `twr events --pretty` names the accounts, and `twr account remove` takes it out.
+#[test]
+fn account_add_sets_up_a_named_account_and_labels_follow() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let proj = project.to_str().unwrap();
+
+    // One account: no table, no labels.
+    let out = a.ok(&["account", "list"]);
+    assert!(
+        out.starts_with("no accounts but each runtime's own login"),
+        "{out}"
+    );
+    a.ok(&[
+        "thread",
+        "new",
+        proj,
+        "--runtime",
+        "claude-code",
+        "--name",
+        "api",
+    ]);
+    assert_eq!(
+        runtime_cell(&a.ok(&["thread", "list"]), "api"),
+        "claude-code"
+    );
+    let shown = a.ok(&["model", "api"]);
+    assert!(
+        shown.starts_with("api: runtime claude-code, model "),
+        "{shown}"
+    );
+
+    let out = a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    // The native login is asked about only on a terminal: without one it keeps its name.
+    assert!(
+        out.contains("your current Claude Code login stays usable as account default"),
+        "{out}"
+    );
+    assert!(out.contains("(mode 700)"), "{out}");
+    assert!(
+        out.contains("linked to ~/.claude: settings.json, CLAUDE.md\n"),
+        "{out}"
+    );
+    assert!(out.contains("added claude-code:work ("), "{out}");
+    assert!(out.contains("work: logged in (claude.ai)\n"), "{out}");
+    assert!(
+        out.ends_with(
+            "claude-code now has 2 logged-in accounts (default, work), so its threads show \
+             their account.\n"
+        ),
+        "{out}"
+    );
+    let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    assert_eq!(
+        std::fs::read_link(dir.join("settings.json")).unwrap(),
+        a.user.join(".claude/settings.json")
+    );
+    assert!(dir
+        .join("CLAUDE.md")
+        .symlink_metadata()
+        .unwrap()
+        .is_symlink());
+    assert_eq!(
+        logins(&a.claude_log()),
+        [format!(
+            "argv: auth login\nCLAUDE_CONFIG_DIR={}\nANTHROPIC_API_KEY=unset",
+            dir.display()
+        )]
+    );
+    let work = a.account("claude-code", "work").unwrap();
+    assert_eq!(work["source"], "recorded");
+    assert_eq!(work["dir"], dir.to_str().unwrap());
+
+    // The table and its label line.
+    let out = a.ok(&["account", "list"]);
+    assert!(
+        out.starts_with("RUNTIME      ACCOUNT  SOURCE  STATUS"),
+        "{out}"
+    );
+    assert!(
+        out.contains("claude-code  default  -       never checked (native)"),
+        "{out}"
+    );
+    assert!(out.contains("~/.claude\n"), "{out}");
+    assert!(
+        out.ends_with("claude-code shows account labels (2 accounts logged in)\n"),
+        "{out}"
+    );
+    let status = a.ok(&["account", "status", "claude:work"]);
+    assert!(status.contains("claude-code  work"), "{status}");
+    assert!(!status.contains("default"), "{status}");
+    assert!(
+        status.contains("ANTHROPIC_API_KEY is set here; twr removes it for named accounts"),
+        "{status}"
+    );
+
+    // Every surface labels claude-code threads now.
+    assert_eq!(
+        runtime_cell(&a.ok(&["thread", "list"]), "api"),
+        "claude-code:default"
+    );
+    let shown = a.ok(&["model", "api"]);
+    assert!(
+        shown.starts_with("api: runtime claude-code, account default, model "),
+        "{shown}"
+    );
+    let info = a.ok(&["info"]);
+    assert!(
+        info.contains("accounts:     claude-code 2 (default, work)\n"),
+        "{info}"
+    );
+    assert!(
+        info.contains("orchestrator: runtime claude-code:default "),
+        "{info}"
+    );
+    let orch = a.ok(&["orchestrator", "show"]);
+    assert!(
+        orch.starts_with("orchestrator: claude-code:default"),
+        "{orch}"
+    );
+    let created = a.ok(&[
+        "thread",
+        "new",
+        proj,
+        "--runtime",
+        "claude-code",
+        "--account",
+        "work",
+        "--name",
+        "w",
+    ]);
+    assert!(created.contains(" runtime=claude-code:work "), "{created}");
+    assert_eq!(
+        runtime_cell(&a.ok(&["thread", "list"]), "w"),
+        "claude-code:work"
+    );
+
+    // A move to the other account.
+    let moved = a.ok(&["model", "api", "--account", "work"]);
+    assert!(
+        moved.starts_with(
+            "api moves to claude-code:work; its next turn starts a new session there with a \
+             handoff"
+        ),
+        "{moved}"
+    );
+    assert_eq!(
+        runtime_cell(&a.ok(&["thread", "list"]), "api"),
+        "claude-code:work"
+    );
+    let pretty = a.ok(&["events", "api", "--pretty"]);
+    assert!(
+        pretty.contains("account (native) -> work, model "),
+        "{pretty}"
+    );
+    let pretty = a.ok(&["events", "w", "--pretty"]);
+    assert!(pretty.contains(" account=work"), "{pretty}");
+    let control = a.ok(&["control", "--pretty"]);
+    assert!(
+        control.contains(&format!(
+            "account claude-code:work added (twr) dir={} share=config",
+            dir.display()
+        )),
+        "{control}"
+    );
+
+    // Removal: threads on it need a move or --force; --purge without a terminal needs --yes,
+    // asked before anything is removed.
+    let err = a.fails(&["account", "remove", "claude-code", "work"], &[]);
+    assert!(
+        err.contains("claude-code:work has threads on it: api, w."),
+        "{err}"
+    );
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--force",
+            "--purge",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("without confirmation (no terminal to ask on): pass --yes"),
+        "{err}"
+    );
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    let err = a.fails(
+        &["account", "remove", "claude-code", "default", "--purge"],
+        &[],
+    );
+    assert!(err.contains("twr never logs it out or deletes it"), "{err}");
+    let out = a.ok(&[
+        "account",
+        "remove",
+        "claude-code",
+        "work",
+        "--force",
+        "--purge",
+        "--yes",
+    ]);
+    assert!(
+        out.starts_with(
+            "removed claude-code:work; api, w stay on it and cannot start until they move\n"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("deleted "), "{out}");
+    assert!(!dir.exists());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], true);
+    // One account again: labels hide, but a removed account always shows.
+    let list = a.ok(&["thread", "list"]);
+    assert_eq!(runtime_cell(&list, "api"), "claude-code:work (removed)");
+    let shown = a.ok(&["model", "api"]);
+    assert!(shown.contains(", account work (removed), "), "{shown}");
+    let info = a.ok(&["info"]);
+    assert!(!info.contains("accounts:"), "{info}");
+    assert!(
+        info.contains("orchestrator: runtime claude-code "),
+        "{info}"
+    );
+    let control = a.ok(&["control", "--pretty"]);
+    assert!(
+        control.contains("account claude-code:work removed"),
+        "{control}"
+    );
+}
+
+/// `twr account remove --logout` / `--purge` never run while a thread's runtime still runs on
+/// the login (its turn held): it waits, saying for what, and once the wait is over refuses,
+/// with what to run by hand, the account removed already; once the runtime stops during the
+/// wait, the directory goes.
+#[test]
+fn account_remove_waits_for_the_runtimes_still_on_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let proj = project.to_str().unwrap();
+    let accounts = twr_core::paths::Paths::with_home(&a.home).accounts_dir();
+    // The fake `claude` holds every session's turn from now on.
+    std::fs::write(a.home.join("hold"), "").unwrap();
+    let running = |name: &str, account: &str| {
+        a.ok(&[
+            "account", "add", "claude", account, "--share", "config", "--",
+        ]);
+        a.ok(&[
+            "thread",
+            "new",
+            proj,
+            "--runtime",
+            "claude-code",
+            "--account",
+            account,
+            "--name",
+            name,
+        ]);
+        a.ok(&["send", name, "hi"]);
+        poll("the held turn", || {
+            ndjson(&a.ok(&["events", name]))
+                .iter()
+                .any(|e| e["kind"] == "thread.started")
+                .then_some(())
+        });
+        accounts.join("claude-code").join(account)
+    };
+
+    // The turn goes on past the wait: refused, saying what to run.
+    let dir = running("w", "work");
+    let out = a.run(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--force",
+            "--logout",
+            "--purge",
+            "--yes",
+        ],
+        &[("TWR_TEST_REMOVE_WAIT_MS", "300")],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("waiting for w to finish its turn on claude-code:work\n"),
+        "{stdout}"
+    );
+    // (The logout by hand unsets every credential variable twr's own logout unsets.)
+    let (_, unset) = twr_adapters::account::account_env("claude-code", &dir).unwrap();
+    let unset: String = unset.iter().map(|k| format!("-u {k} ")).collect();
+    assert!(
+        unset.contains("-u CLAUDE_SECURESTORAGE_CONFIG_DIR "),
+        "{unset}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "not logging it out or deleting anything: w still runs on claude-code:work. Once \
+             it stops (twr stop w), log it out with `env {unset}CLAUDE_CONFIG_DIR={d} \
+             ANTHROPIC_CONFIG_DIR={d}/anthropic claude auth logout`, then delete its directory \
+             with `rm -rf {d}` (claude-code:work is removed already)",
+            d = dir.display()
+        )),
+        "{stderr}"
+    );
+    assert!(dir.is_dir(), "nothing deleted");
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], true);
+
+    // The runtime stops during the wait: the directory goes then.
+    let dir = running("s", "side");
+    let mut c = twr_cmd();
+    let remove = a
+        .env(&mut c)
+        .args([
+            "account",
+            "remove",
+            "claude-code",
+            "side",
+            "--force",
+            "--purge",
+            "--yes",
+        ])
+        // (Bounded, should the stop not come.)
+        .env("TWR_TEST_REMOVE_WAIT_MS", "20000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(dir.is_dir(), "not deleted while s runs on it");
+    a.ok(&["stop", "s"]);
+    let out = remove.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("waiting for s to finish its turn on claude-code:side\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("deleted "), "{stdout}");
+    assert!(!dir.exists());
+}
+
+/// A Claude Code login removed with --force while its session runs, its directory then made a
+/// Codex account's: `twr account remove codex ... --purge` waits for the Claude Code runtime
+/// still in that directory (another runtime's), refuses while it runs, and deletes the
+/// directory once it stopped.
+#[test]
+fn account_remove_waits_for_another_runtimes_session_in_the_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("codex")
+        .join("shared");
+    // The fake `claude` holds the turn.
+    std::fs::write(a.home.join("hold"), "").unwrap();
+    a.ok(&[
+        "account",
+        "add",
+        "claude",
+        "work",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--share",
+        "none",
+        "--",
+    ]);
+    a.ok(&[
+        "thread",
+        "new",
+        project.to_str().unwrap(),
+        "--runtime",
+        "claude-code",
+        "--account",
+        "work",
+        "--name",
+        "w",
+    ]);
+    a.ok(&["send", "w", "hi"]);
+    poll("the held turn", || {
+        ndjson(&a.ok(&["events", "w"]))
+            .iter()
+            .any(|e| e["kind"] == "thread.started")
+            .then_some(())
+    });
+    a.ok(&["account", "remove", "claude-code", "work", "--force"]);
+    a.ok(&[
+        "account",
+        "add",
+        "codex",
+        "shared",
+        "--share",
+        "none",
+        "--no-login",
+    ]);
+    assert_eq!(
+        a.account("codex", "shared").unwrap()["dir"],
+        serde_json::json!(dir.to_str().unwrap())
+    );
+    let purge = ["account", "remove", "codex", "shared", "--purge", "--yes"];
+
+    // The Claude Code turn goes on past the wait: refused, nothing deleted.
+    let out = a.run(&purge, &[("TWR_TEST_REMOVE_WAIT_MS", "300")]);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("waiting for w to finish its turn on claude-code:work\n"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(&format!(
+            "not deleting anything: w still runs in {d} (w on claude-code:work, removed). Once \
+             it stops (twr stop w), delete its directory with `rm -rf {d}` (codex:shared is \
+             removed already)",
+            d = dir.display()
+        )),
+        "{stderr}"
+    );
+    assert!(dir.is_dir(), "nothing deleted");
+
+    // Added again and removed while that runtime lives: it waits, and deletes the
+    // directory once the runtime stopped.
+    a.ok(&[
+        "account",
+        "add",
+        "codex",
+        "shared",
+        "--share",
+        "none",
+        "--no-login",
+    ]);
+    let mut c = twr_cmd();
+    let remove = a
+        .env(&mut c)
+        .args(purge)
+        // (Bounded, should the stop not come.)
+        .env("TWR_TEST_REMOVE_WAIT_MS", "20000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(dir.is_dir(), "not deleted while w runs in it");
+    a.ok(&["stop", "w"]);
+    let out = remove.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("waiting for w to finish its turn on claude-code:work\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("deleted "), "{stdout}");
+    assert!(!dir.exists());
+}
+
+/// `twr account remove --logout` checks the directory again right before the logout: the
+/// account added back in it during the wait (its thread's runtime then no longer on a removed
+/// account, which ends the wait) keeps its login.
+#[test]
+fn account_remove_logout_spares_an_account_added_back_during_the_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    // The fake `claude` holds the turn: the removal waits on it.
+    std::fs::write(a.home.join("hold"), "").unwrap();
+    a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    a.ok(&[
+        "thread",
+        "new",
+        project.to_str().unwrap(),
+        "--runtime",
+        "claude-code",
+        "--account",
+        "work",
+        "--name",
+        "w",
+    ]);
+    a.ok(&["send", "w", "hi"]);
+    poll("the held turn", || {
+        ndjson(&a.ok(&["events", "w"]))
+            .iter()
+            .any(|e| e["kind"] == "thread.started")
+            .then_some(())
+    });
+    let mut c = twr_cmd();
+    let remove = a
+        .env(&mut c)
+        .args([
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--force",
+            "--logout",
+        ])
+        // (Bounded, should the wait not end.)
+        .env("TWR_TEST_REMOVE_WAIT_MS", "20000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll("the removal", || {
+        (a.account("claude-code", "work")?["removed"] == true).then_some(())
+    });
+    a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    let out = remove.wait_with_output().unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "not logging it out: claude-code:work was added again in {}",
+            dir.display()
+        )),
+        "{stdout}{stderr}"
+    );
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+}
+
+/// `twr account remove --logout` of an account config.toml declares as well as twr records:
+/// only the record goes, the account stays, and its login is not logged out.
+#[test]
+fn account_remove_logout_leaves_a_config_account_logged_in() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let config = |extra: &str| {
+        std::fs::write(
+            a.home.join("config.toml"),
+            format!(
+                "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n{extra}"
+            ),
+        )
+        .unwrap();
+    };
+    config("");
+    let hub = a.hub();
+    a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    drop(hub);
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    config(&format!(
+        "[accounts.claude-code.work]\ndir = \"{}\"\n",
+        dir.display()
+    ));
+    let _hub = a.hub();
+    assert_eq!(a.account("claude-code", "work").unwrap()["source"], "both");
+    let out = a.run(
+        &["account", "remove", "claude-code", "work", "--logout"],
+        &[],
+    );
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("removed twr's record of claude-code:work; config.toml still declares it"),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains(
+            "not logging it out: config.toml still declares claude-code:work \
+             ([accounts.claude-code.work]), so the account stays"
+        ),
+        "{stderr}"
+    );
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    assert!(dir.is_dir());
+}
+
+/// Account directories are the root's, shared by every workspace: `twr account remove
+/// --purge` / `--logout` refuse, before removing anything, while another workspace has an
+/// account in the directory, and while another workspace's hub isn't running (it can't tell);
+/// once the other workspace removed its account, and its hub answers, the directory goes.
+#[test]
+fn account_purge_spares_a_directory_another_workspace_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    a.ok(&["ws", "new", "other"]);
+    let other = a.hub_in(Some("other"));
+    a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    a.ok(&[
+        "-w",
+        "other",
+        "account",
+        "add",
+        "claude",
+        "work",
+        "--share",
+        "config",
+        "--no-login",
+    ]);
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    let purge = [
+        "account",
+        "remove",
+        "claude-code",
+        "work",
+        "--purge",
+        "--yes",
+    ];
+
+    // The other workspace has an account there.
+    let err = a.fails(&purge, &[]);
+    assert!(
+        err.contains(&format!(
+            "--purge is refused: workspace other has account claude-code:work in {} (remove it \
+             there first: `twr -w other account remove claude-code work`)",
+            dir.display()
+        )),
+        "{err}"
+    );
+    let err = a.fails(
+        &["account", "remove", "claude-code", "work", "--logout"],
+        &[],
+    );
+    assert!(
+        err.contains("--logout is refused: workspace other has account claude-code:work in "),
+        "{err}"
+    );
+    assert!(dir.is_dir());
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+
+    // Removed there, but its hub isn't running: twr can't tell.
+    a.ok(&["-w", "other", "account", "remove", "claude-code", "work"]);
+    drop(other);
+    let err = a.fails(&purge, &[]);
+    assert!(
+        err.contains(&format!(
+            "--purge is refused: workspace other's hub isn't running, so twr can't tell whether \
+             it uses {}: start it (`twr -w other`) and run this again, or remove the account \
+             there",
+            dir.display()
+        )),
+        "{err}"
+    );
+    assert!(dir.is_dir());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+
+    // Its hub answers, and uses the directory no more: it goes.
+    let _other = a.hub_in(Some("other"));
+    let out = a.ok(&purge);
+    assert!(out.contains("deleted "), "{out}");
+    assert!(!dir.exists());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], true);
+}
+
+/// `twr account add` leaves out a native settings file that selects credentials (it would
+/// sign every account in as the native one), says so, and writes nothing into it;
+/// `twr account status` says why it isn't linked.
+#[test]
+fn account_add_leaves_out_settings_that_pick_credentials() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(a.home.join("config.toml"), "default_runtime = \"fake\"\n").unwrap();
+    let _hub = a.hub();
+    let settings = a.user.join(".claude/settings.json");
+    let accounts = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code");
+    for (name, text, keys) in [
+        (
+            "work",
+            r#"{"env": {"ANTHROPIC_API_KEY": "sk-native"}}"#,
+            "env.ANTHROPIC_API_KEY",
+        ),
+        ("side", r#"{"apiKeyHelper": "~/bin/key"}"#, "apiKeyHelper"),
+    ] {
+        std::fs::write(&settings, text).unwrap();
+        let out = a.ok(&[
+            "account",
+            "add",
+            "claude",
+            name,
+            "--share",
+            "config",
+            "--native-name",
+            "personal",
+            "--",
+        ]);
+        assert!(
+            out.contains(&format!(
+                "settings.json sets {keys}, which would sign every account in as the native \
+                 one: left out; copy it without that key if you want it shared\n"
+            )),
+            "{out}"
+        );
+        assert!(out.contains(": CLAUDE.md\n"), "{out}");
+        let dir = accounts.join(name);
+        assert!(dir.join("settings.json").symlink_metadata().is_err());
+        assert!(dir.join("CLAUDE.md").is_symlink());
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), text);
+        let status = a.ok(&["account", "status", &format!("claude:{name}")]);
+        assert!(
+            status.contains(&format!(
+                "{name}: settings.json is not linked: the native one sets {keys}, which would \
+                 sign it in as the native account"
+            )),
+            "{status}"
+        );
+    }
+}
+
+/// `twr account add` with `--native-name` checks the native account's rename and the new
+/// account together, the new one as if the rename were done: the new account may take the
+/// name the rename frees (`default`). Without the rename that name is the native account's,
+/// and the add is refused before anything is made; with it, the native login is renamed and
+/// the account added, in that order.
+#[test]
+fn account_add_may_take_the_name_its_native_rename_frees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(a.home.join("config.toml"), "default_runtime = \"fake\"\n").unwrap();
+    let _hub = a.hub();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code/default");
+    let err = a.fails(&["account", "add", "claude", "default", "--no-login"], &[]);
+    assert!(
+        err.contains("claude-code:default is claude-code's native account"),
+        "{err}"
+    );
+    assert!(!dir.exists(), "nothing made");
+    // A rename the hub refuses (another account's name) refuses the add, nothing made.
+    a.ok(&["account", "add", "claude", "work", "--no-login"]);
+    let err = a.fails(
+        &[
+            "account",
+            "add",
+            "claude",
+            "default",
+            "--native-name",
+            "work",
+            "--no-login",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("claude-code:work is another account of claude-code already"),
+        "{err}"
+    );
+    assert!(!dir.exists(), "nothing made");
+    let out = a.ok(&[
+        "account",
+        "add",
+        "claude",
+        "default",
+        "--native-name",
+        "personal",
+        "--no-login",
+    ]);
+    assert!(
+        out.contains("claude-code's own login (~/.claude) is now named personal"),
+        "{out}"
+    );
+    assert!(out.contains("added claude-code:default ("), "{out}");
+    assert!(dir.is_dir());
+    let native = a.account("claude-code", "personal").unwrap();
+    assert_eq!(native["native"], true, "{native}");
+    let named = a.account("claude-code", "default").unwrap();
+    assert_eq!(
+        (&named["native"], &named["source"]),
+        (&Value::Bool(false), &Value::from("recorded")),
+        "{named}"
+    );
+    let control = ndjson(&a.ok(&["control"]));
+    let added: Vec<(String, bool)> = control
+        .iter()
+        .filter(|i| i["event"]["kind"] == "account.added")
+        .map(|i| {
+            let d = &i["event"]["data"];
+            (
+                d["account"].as_str().unwrap().to_string(),
+                d["native"] == true,
+            )
+        })
+        .collect();
+    assert_eq!(
+        added,
+        [
+            ("work".to_string(), false),
+            ("personal".to_string(), true),
+            ("default".to_string(), false)
+        ]
+    );
+}
+
+/// Another workspace's runtime still on a removed login keeps that login's directory, by the
+/// directory the runtime was started in: removed there with --force and added again in
+/// another directory while the old session lives, the account's name leads elsewhere, and
+/// this workspace's `--purge` of the old directory is still refused.
+#[test]
+fn account_purge_spares_a_directory_a_live_session_of_another_workspace_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    a.ok(&["ws", "new", "other"]);
+    let _other = a.hub_in(Some("other"));
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let proj = project.to_str().unwrap();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    // The other workspace runs a thread on work, in `dir`, its turn held.
+    std::fs::write(a.home.join("hold"), "").unwrap();
+    let other = |args: &[&str]| a.ok(&[&["-w", "other"], args].concat());
+    other(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    other(&[
+        "thread",
+        "new",
+        proj,
+        "--runtime",
+        "claude-code",
+        "--account",
+        "work",
+        "--name",
+        "w",
+    ]);
+    other(&["send", "w", "hi"]);
+    poll("the held turn", || {
+        ndjson(&other(&["events", "w"]))
+            .iter()
+            .any(|e| e["kind"] == "thread.started")
+            .then_some(())
+    });
+    // Removed there with --force, and added again elsewhere: the session lives on in `dir`.
+    other(&["account", "remove", "claude-code", "work", "--force"]);
+    let elsewhere = a.home.join("work-elsewhere");
+    other(&[
+        "account",
+        "add",
+        "claude",
+        "work",
+        "--dir",
+        elsewhere.to_str().unwrap(),
+        "--no-login",
+    ]);
+    // This workspace's own account in `dir`: its purge is refused while that session lives.
+    a.ok(&[
+        "account",
+        "add",
+        "claude",
+        "work",
+        "--share",
+        "none",
+        "--no-login",
+    ]);
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--purge",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains(&format!(
+            "--purge is refused: workspace other's thread w still runs on claude-code:work \
+             (removed), in {}",
+            std::fs::canonicalize(&dir).unwrap().display()
+        )),
+        "{err}"
+    );
+    assert!(dir.is_dir());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+}
+
+/// Another workspace's threads that keep a removed account, with no runtime on it, don't
+/// keep its directory (as this workspace's own `--force --purge` doesn't): while the account
+/// is that workspace's still, `--purge` is refused; once it is removed there with `--force`,
+/// its thread on it left as it is, the directory goes.
+#[test]
+fn account_purge_spares_no_directory_for_another_workspaces_dormant_threads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    a.ok(&["ws", "new", "other"]);
+    let _other = a.hub_in(Some("other"));
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let proj = project.to_str().unwrap();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    let other = |args: &[&str]| a.ok(&[&["-w", "other"], args].concat());
+    other(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    other(&[
+        "thread",
+        "new",
+        proj,
+        "--runtime",
+        "claude-code",
+        "--account",
+        "work",
+        "--name",
+        "w",
+    ]);
+    a.ok(&[
+        "account",
+        "add",
+        "claude",
+        "work",
+        "--share",
+        "none",
+        "--no-login",
+    ]);
+    let purge = [
+        "account",
+        "remove",
+        "claude-code",
+        "work",
+        "--purge",
+        "--yes",
+    ];
+    // In use there: refused.
+    let err = a.fails(&purge, &[]);
+    assert!(
+        err.contains("--purge is refused: workspace other has account claude-code:work in "),
+        "{err}"
+    );
+    assert!(dir.is_dir());
+    // Removed there with --force: its thread keeps the account, with no runtime on it.
+    other(&["account", "remove", "claude-code", "work", "--force"]);
+    let list: Value = serde_json::from_str(&other(&["account", "list", "--json"])).unwrap();
+    let work = list["runtimes"]["claude-code"]["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["name"] == "work")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&work["removed"], &work["threads"]),
+        (&Value::Bool(true), &Value::from(1)),
+        "{work}"
+    );
+    let out = a.ok(&purge);
+    assert!(out.contains("deleted "), "{out}");
+    assert!(!dir.exists());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], true);
+}
+
+/// A logout that fails makes `twr account remove --logout` fail, saying the account was
+/// removed, and `--purge` keeps the directory then.
+#[test]
+fn account_remove_fails_when_the_logout_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    a.ok(&[
+        "account", "add", "claude", "work", "--share", "config", "--",
+    ]);
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("work");
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--logout",
+            "--purge",
+            "--yes",
+        ],
+        &[("FAKE_LOGOUT_EXIT", "1")],
+    );
+    assert!(
+        err.contains(&format!(
+            "the account was removed, but logging it out failed: claude's logout ended with \
+             exit 1 ({} is not deleted)",
+            dir.display()
+        )),
+        "{err}"
+    );
+    assert!(a.claude_log().contains("argv: auth logout"));
+    assert!(dir.is_dir(), "not deleted");
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], true);
+}
+
+/// A recorded native `personal` and a recorded named `default`, then config.toml declares
+/// `personal` named: the native login falls back to `default`, next to the named one. The
+/// name is the named account's: `twr account login claude-code default` logs into its
+/// directory (not the native login), and `twr account status claude:default` shows its row
+/// alone.
+#[test]
+fn account_names_the_native_login_shares_are_the_named_accounts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let base = "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n";
+    std::fs::write(a.home.join("config.toml"), base).unwrap();
+    let hub = a.hub();
+    a.ok(&["account", "name-native", "claude-code", "personal"]);
+    a.ok(&[
+        "account",
+        "add",
+        "claude-code",
+        "default",
+        "--share",
+        "none",
+        "--",
+    ]);
+    drop(hub);
+    let personal = a.home.join("personal");
+    std::fs::create_dir(&personal).unwrap();
+    std::fs::write(
+        a.home.join("config.toml"),
+        format!(
+            "{base}[accounts.claude-code.personal]\ndir = \"{}\"\n",
+            personal.display()
+        ),
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let dir = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code")
+        .join("default");
+    let before = logins(&a.claude_log()).len();
+    a.ok(&["account", "login", "claude-code", "default"]);
+    let all = logins(&a.claude_log());
+    assert_eq!(
+        all[before..],
+        [format!(
+            "argv: auth login\nCLAUDE_CONFIG_DIR={}\nANTHROPIC_API_KEY=unset",
+            dir.display()
+        )]
+    );
+    let out = a.ok(&["account", "status", "claude:default"]);
+    let rows: Vec<&str> = out
+        .lines()
+        .filter(|l| l.split_whitespace().nth(1) == Some("default"))
+        .collect();
+    assert_eq!(rows.len(), 1, "{out}");
+    assert!(rows[0].ends_with(&dir.display().to_string()), "{out}");
+}
+
+/// `twr account login` of an account a thread reaches by another path than the configured
+/// one (config.toml names its directory through a link now) says so, naming the rebind; once
+/// `twr model --account` rebinds it, nothing is said.
+#[test]
+fn account_login_notes_threads_on_another_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let team = a.home.join("team");
+    std::fs::create_dir(&team).unwrap();
+    std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = a.home.join("team-alias");
+    std::os::unix::fs::symlink(&team, &alias).unwrap();
+    let config = |dir: &Path| {
+        std::fs::write(
+            a.home.join("config.toml"),
+            format!(
+                "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n\
+                 [accounts.claude-code.team]\ndir = \"{}\"\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+    };
+    config(&team);
+    let hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    a.ok(&[
+        "thread",
+        "new",
+        project.to_str().unwrap(),
+        "--runtime",
+        "claude-code",
+        "--account",
+        "team",
+        "--name",
+        "api",
+    ]);
+    drop(hub);
+    config(&alias);
+    let _hub = a.hub();
+    let out = a.ok(&["account", "login", "claude-code", "team"]);
+    assert!(
+        out.ends_with(&format!(
+            "note: api reaches claude-code:team by another path, which this login may not sign \
+             in:\n  api ({}): twr model api --account team moves it to the configured path (a \
+             new session)\n",
+            team.display()
+        )),
+        "{out}"
+    );
+    let moved = a.ok(&["model", "api", "--account", "team"]);
+    assert!(
+        moved.starts_with("api moves to claude-code:team"),
+        "{moved}"
+    );
+    let out = a.ok(&["account", "login", "claude-code", "team"]);
+    assert!(!out.contains("note:"), "{out}");
+}
+
+/// An account config.toml declares is set up and logged in in its directory, and twr records
+/// nothing of it (nor can remove it); `--native-name` names the native login; a directory
+/// other users can open, and a login that fails, stop the add with nothing recorded.
+#[test]
+fn account_add_of_a_config_account_records_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let team = a.home.join("team");
+    std::fs::write(
+        a.home.join("config.toml"),
+        format!(
+            "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\naccount = \
+             \"team\"\n[accounts.claude-code.team]\ndir = \"{}\"\n",
+            team.display()
+        ),
+    )
+    .unwrap();
+    let _hub = a.hub();
+
+    let out = a.ok(&[
+        "account",
+        "add",
+        "claude-code",
+        "team",
+        "--native-name",
+        "personal",
+    ]);
+    assert!(
+        out.contains(
+            "claude-code:team is declared in config.toml ([accounts.claude-code.team]): \
+             nothing recorded"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("claude-code's own login (~/.claude) is now named personal"),
+        "{out}"
+    );
+    assert!(team.is_dir());
+    assert_eq!(
+        logins(&a.claude_log()),
+        [format!(
+            "argv: auth login\nCLAUDE_CONFIG_DIR={}\nANTHROPIC_API_KEY=unset",
+            team.display()
+        )]
+    );
+    let control = ndjson(&a.ok(&["control"]));
+    let added: Vec<&Value> = control
+        .iter()
+        .filter(|i| i["event"]["kind"] == "account.added")
+        .collect();
+    assert_eq!(added.len(), 1, "only the native's name: {added:?}");
+    assert_eq!(added[0]["event"]["data"]["native"], true);
+    assert_eq!(
+        a.account("claude-code", "team").unwrap()["source"],
+        "config"
+    );
+    assert_eq!(
+        a.account("claude-code", "personal").unwrap()["native"],
+        true
+    );
+    let orch = a.ok(&["orchestrator", "show"]);
+    assert!(
+        orch.starts_with("orchestrator: claude-code:team "),
+        "{orch}"
+    );
+    assert!(
+        orch.contains("configured:   claude-code (the runtime's default model), account team ("),
+        "{orch}"
+    );
+
+    let err = a.fails(&["account", "remove", "claude-code", "team"], &[]);
+    assert!(
+        err.contains(
+            "claude-code:team is declared in config.toml ([accounts.claude-code.team]); \
+             remove it there and restart the hub"
+        ),
+        "{err}"
+    );
+
+    // `twr account login` checks the directory as `add` does: one other users can write is
+    // refused before the login runs.
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o770)).unwrap();
+    let err = a.fails(&["account", "login", "claude-code", "team"], &[]);
+    assert!(
+        err.contains("is readable by others (mode 770): chmod 700 it"),
+        "{err}"
+    );
+    assert_eq!(logins(&a.claude_log()).len(), 1);
+    std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // A directory other users can open is refused before anything happens.
+    let open = a.home.join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let err = a.fails(
+        &[
+            "account",
+            "add",
+            "claude-code",
+            "side",
+            "--dir",
+            open.to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("is readable by others (mode 755): chmod 700 it"),
+        "{err}"
+    );
+    assert!(a.account("claude-code", "side").is_none());
+
+    // A login that fails keeps the directory, records nothing, and says how to finish.
+    let err = a.fails(
+        &["account", "add", "claude-code", "bad", "--share", "none"],
+        &[("FAKE_LOGIN_EXIT", "3")],
+    );
+    assert!(err.contains("claude's login ended with exit 3"), "{err}");
+    assert!(
+        err.contains("`twr account add claude-code bad --share none` finishes setting"),
+        "{err}"
+    );
+    assert!(a.account("claude-code", "bad").is_none());
+    let bad = twr_core::paths::Paths::with_home(&a.home)
+        .accounts_dir()
+        .join("claude-code/bad");
+    assert!(bad.is_dir());
+    assert!(
+        std::fs::read_dir(&bad).unwrap().next().is_none(),
+        "share none links nothing"
+    );
+    // Running it again finishes it, adopting the directory.
+    let out = a.ok(&[
+        "account",
+        "add",
+        "claude-code",
+        "bad",
+        "--share",
+        "none",
+        "--no-login",
+    ]);
+    assert!(out.contains("added claude-code:bad ("), "{out}");
+    assert!(!out.contains("(mode 700)"), "{out}");
+    // `twr account login` signs it in again.
+    let out = a.ok(&["account", "login", "claude-code", "bad"]);
+    assert!(out.contains("bad: logged in (claude.ai)\n"), "{out}");
+    assert_eq!(logins(&a.claude_log()).len(), 3);
+}
+
+/// What `twr account add` makes, `login` and `--logout` sign in and out of and `--purge`
+/// deletes in the accounts directory is checked once links are followed: with
+/// `<accounts>/claude-code` a link to elsewhere, a purge, a login or a logout of an account
+/// there is refused (the directory it leads to stays, the account too) and so is adding one
+/// there (nothing made). A purge never deletes a directory holding a live account's (nor one
+/// holding a runtime's own: `account_commands_follow_the_hubs_native_directory`).
+#[test]
+fn account_add_and_purge_refuse_links_out_of_the_accounts_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n",
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let root = twr_core::paths::Paths::with_home(&a.home).accounts_dir();
+    a.ok(&["account", "add", "claude-code", "work", "--no-login"]);
+    assert!(root.join("claude-code/work").is_dir());
+    // Nor is one deleted that holds a live account's.
+    let work = root.join("claude-code/work");
+    let nested = work.join("nested");
+    a.ok(&[
+        "account",
+        "add",
+        "claude-code",
+        "inner",
+        "--dir",
+        nested.to_str().unwrap(),
+        "--no-login",
+    ]);
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--purge",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("claude-code:inner's directory (") && err.contains(") is in it"),
+        "{err}"
+    );
+    assert!(nested.is_dir());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    a.ok(&["account", "remove", "claude-code", "inner"]);
+
+    let outside = tmp.path().join("outside");
+    std::fs::rename(root.join("claude-code"), &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("claude-code")).unwrap();
+    // A login or a logout there is refused too, before the runtime runs.
+    let logins_before = logins(&a.claude_log()).len();
+    let err = a.fails(&["account", "login", "claude-code", "work"], &[]);
+    assert!(
+        err.contains("not logging claude-code:work in: ")
+            && err.contains("once links are followed"),
+        "{err}"
+    );
+    let err = a.fails(
+        &["account", "remove", "claude-code", "work", "--logout"],
+        &[],
+    );
+    assert!(
+        err.contains("--logout is refused: ") && err.contains("once links are followed"),
+        "{err}"
+    );
+    assert_eq!(logins(&a.claude_log()).len(), logins_before);
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--purge",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("--purge deletes only account directories in"),
+        "{err}"
+    );
+    assert!(outside.join("work").is_dir());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+
+    let err = a.fails(
+        &["account", "add", "claude-code", "other", "--no-login"],
+        &[],
+    );
+    assert!(
+        err.contains("is not inside") && err.contains("once links are followed"),
+        "{err}"
+    );
+    assert!(!outside.join("other").exists());
+    assert!(a.account("claude-code", "other").is_none());
+}
+
+/// What acts on a runtime's own directory follows the hub's environment, not the CLI's: with
+/// the hub's `CLAUDE_CONFIG_DIR` set and the CLI's not (or set elsewhere), `twr account add`
+/// links from the hub's directory, the native account's login runs with the hub's value (a
+/// note says so), the native row's directory is the hub's, and a purge of a directory holding
+/// the hub's `CODEX_HOME` is refused; with the hub's `CLAUDE_CONFIG_DIR` an account's
+/// directory, its logout is refused. With the hub's unset, the native login runs without it
+/// whatever the CLI's says, and the CLI's own `CLAUDE_CONFIG_DIR` set to an account's
+/// directory refuses nothing.
+#[test]
+fn account_commands_follow_the_hubs_native_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    std::fs::write(
+        a.home.join("config.toml"),
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"none\"\n",
+    )
+    .unwrap();
+    let root = twr_core::paths::Paths::with_home(&a.home).accounts_dir();
+    let work = root.join("claude-code/work");
+    let hub_claude = a.home.join("hub-claude");
+    std::fs::create_dir_all(&hub_claude).unwrap();
+    std::fs::write(hub_claude.join("settings.json"), "{}\n").unwrap();
+    std::fs::write(hub_claude.join("CLAUDE.md"), "the hub's\n").unwrap();
+    let other = a.home.join("other-claude");
+    let nested = work.join("nested");
+    let hub = a.hub_with(
+        None,
+        &[
+            ("CLAUDE_CONFIG_DIR", hub_claude.to_str().unwrap()),
+            ("CODEX_HOME", nested.to_str().unwrap()),
+        ],
+    );
+    let note = format!(
+        "note: the hub's claude-code directory is {} (CLAUDE_CONFIG_DIR set there), not ~/.claude \
+         as here: twr follows the hub\n",
+        hub_claude.display()
+    );
+
+    // The links come from the hub's directory.
+    let out = a.ok(&["account", "add", "claude-code", "work", "--"]);
+    assert!(out.contains(&note), "{out}");
+    assert!(
+        out.contains(&format!(
+            "linked to {}: settings.json, CLAUDE.md\n",
+            hub_claude.display()
+        )),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_link(work.join("CLAUDE.md")).unwrap(),
+        hub_claude.join("CLAUDE.md")
+    );
+    // The native login runs with the hub's value, whatever the CLI's says.
+    for extra in [vec![], vec![("CLAUDE_CONFIG_DIR", other.to_str().unwrap())]] {
+        let before = logins(&a.claude_log()).len();
+        let out = a.run(&["account", "login", "claude-code", "default"], &extra);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains(&format!(
+                "claude auth login with CLAUDE_CONFIG_DIR={} runs in this terminal",
+                hub_claude.display()
+            )),
+            "{stdout}"
+        );
+        if extra.is_empty() {
+            assert!(stdout.starts_with(&note), "{stdout}");
+        } else {
+            assert!(
+                stdout.contains(&format!(
+                    "(CLAUDE_CONFIG_DIR set there), not {} as here",
+                    other.display()
+                )),
+                "{stdout}"
+            );
+        }
+        assert_eq!(
+            logins(&a.claude_log())[before..],
+            [format!(
+                "argv: auth login\nCLAUDE_CONFIG_DIR={}\nANTHROPIC_API_KEY=sk-stray",
+                hub_claude.display()
+            )]
+        );
+    }
+    // The native row's directory is the hub's.
+    let out = a.ok(&["account", "list"]);
+    let row = out
+        .lines()
+        .find(|l| l.starts_with("claude-code  default"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(row.ends_with(&hub_claude.display().to_string()), "{out}");
+    // A purge of a directory holding the hub's `CODEX_HOME`: refused, nothing removed.
+    let err = a.fails(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--purge",
+            "--yes",
+        ],
+        &[],
+    );
+    assert!(
+        err.contains(&format!(
+            "--purge does not delete {}: codex's own directory in the hub's environment ({}) is \
+             in it",
+            work.display(),
+            nested.display()
+        )),
+        "{err}"
+    );
+    assert!(work.is_dir());
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    drop(hub);
+
+    // The hub's `CLAUDE_CONFIG_DIR` the account's directory: no logout there.
+    let hub = a.hub_with(None, &[("CLAUDE_CONFIG_DIR", work.to_str().unwrap())]);
+    let err = a.fails(
+        &["account", "remove", "claude-code", "work", "--logout"],
+        &[],
+    );
+    assert!(
+        err.contains("--logout is refused: ")
+            && err.contains("is claude-code's own directory in the hub's environment"),
+        "{err}"
+    );
+    assert!(!a.claude_log().contains("argv: auth logout"));
+    assert_eq!(a.account("claude-code", "work").unwrap()["removed"], false);
+    drop(hub);
+
+    // The hub's unset: the native login runs without it, whatever the CLI's says.
+    let _hub = a.hub();
+    let before = logins(&a.claude_log()).len();
+    let out = a.run(
+        &["account", "login", "claude-code", "default"],
+        &[("CLAUDE_CONFIG_DIR", other.to_str().unwrap())],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.starts_with(&format!(
+            "note: the hub's claude-code directory is ~/.claude (CLAUDE_CONFIG_DIR unset there), \
+             not {} as here: twr follows the hub\n",
+            other.display()
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        logins(&a.claude_log())[before..],
+        ["argv: auth login\nCLAUDE_CONFIG_DIR=unset\nANTHROPIC_API_KEY=sk-stray".to_string()]
+    );
+    // The CLI's own `CLAUDE_CONFIG_DIR` an account's directory refuses nothing: logged out
+    // there (its own environment) and deleted.
+    let out = a.run(
+        &[
+            "account",
+            "remove",
+            "claude-code",
+            "work",
+            "--logout",
+            "--purge",
+            "--yes",
+        ],
+        &[("CLAUDE_CONFIG_DIR", work.to_str().unwrap())],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        a.claude_log().contains(&format!(
+            "argv: auth logout\nCLAUDE_CONFIG_DIR={}\n",
+            work.display()
+        )),
+        "{}",
+        a.claude_log()
+    );
+    assert!(!work.exists());
+}
+
+/// `twr account add` checks the directory's collisions again once it made it: a directory
+/// given through a link, which another account's (not there yet) is the same as only once it
+/// exists, is refused before anything is linked or logged in, and what was made goes.
+#[test]
+fn account_add_rechecks_collisions_once_the_directory_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let real = tmp.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    std::fs::write(
+        a.home.join("config.toml"),
+        format!(
+            "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n\
+             [accounts.codex.team]\ndir = \"{}\"\n",
+            real.join("team").display()
+        ),
+    )
+    .unwrap();
+    let _hub = a.hub();
+    let err = a.fails(
+        &[
+            "account",
+            "add",
+            "claude-code",
+            "side",
+            "--dir",
+            link.join("team").to_str().unwrap(),
+        ],
+        &[],
+    );
+    assert!(
+        err.contains("not setting claude-code:side up: ")
+            && err.contains("is codex:team's directory already"),
+        "{err}"
+    );
+    assert!(!real.join("team").exists(), "what it made goes");
+    assert!(logins(&a.claude_log()).is_empty());
+    assert!(a.account("claude-code", "side").is_none());
+}
+
+/// A new pseudo-terminal: its master, and its slave opened (not as this process's
+/// controlling terminal).
+fn open_pty() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: plain calls on the descriptor posix_openpt returned; `name` outlives ptsname_r.
+    unsafe {
+        let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+        assert!(
+            master >= 0,
+            "posix_openpt: {}",
+            std::io::Error::last_os_error()
+        );
+        let master = std::fs::File::from_raw_fd(master);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+        assert_eq!(libc::grantpt(fd), 0, "grantpt");
+        assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
+        let mut name = [0 as libc::c_char; 128];
+        assert_eq!(
+            libc::ptsname_r(fd, name.as_mut_ptr(), name.len()),
+            0,
+            "ptsname_r"
+        );
+        let name = std::ffi::CStr::from_ptr(name.as_ptr()).to_str().unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY)
+            .open(name)
+            .unwrap();
+        (master, slave)
+    }
+}
+
+/// `twr model <query> --account` asked on a terminal whether to leave the thread's pin moves
+/// the thread the question named, by its id: another thread taking the query's name while the
+/// question is open is not moved (nor asked about).
+#[test]
+fn model_pin_question_moves_the_thread_it_named() {
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = AccountHome::new(tmp.path());
+    let mut config =
+        "default_runtime = \"fake\"\n[orchestrator]\nruntime = \"claude-code\"\n".to_string();
+    for name in ["work", "team"] {
+        let dir = a.home.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        config.push_str(&format!(
+            "[accounts.claude-code.{name}]\ndir = \"{}\"\n",
+            dir.display()
+        ));
+    }
+    std::fs::write(a.home.join("config.toml"), config).unwrap();
+    let _hub = a.hub();
+    let project = a.home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    // Both pinned to work (their own pin, as created with it).
+    for name in ["api1", "b"] {
+        a.ok(&[
+            "thread",
+            "new",
+            project.to_str().unwrap(),
+            "--runtime",
+            "claude-code",
+            "--account",
+            "work",
+            "--name",
+            name,
+        ]);
+    }
+    let api1 = thread_get(&a.home, "api1");
+    let api1_id = api1["id"].as_str().unwrap().to_string();
+
+    // `api` is a prefix of api1 alone, so far.
+    let (mut master, slave) = open_pty();
+    let mut c = twr_cmd();
+    let mut child = a
+        .env(&mut c)
+        .args(["model", "api", "--account", "team"])
+        .stdin(slave.try_clone().unwrap())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(c);
+    let mut stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let reader = std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf) {
+            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+    let mut said = String::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !said.ends_with("anyway? [y/N] ") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => said.push_str(&String::from_utf8_lossy(&chunk)),
+            Err(_) => {
+                let _ = child.kill();
+                panic!("no pin question: {said:?}");
+            }
+        }
+    }
+    assert!(said.contains("api1 is pinned to account work"), "{said}");
+    let question = format!("move api1 ({api1_id}) anyway? [y/N] ");
+
+    // While the question is open, b takes the name `api`: now the query's exact match.
+    a.ok(&["rename", "b", "api"]);
+    master.write_all(b"y\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    reader.join().unwrap();
+    drop(slave);
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let moved = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        moved.starts_with("api1 moves to claude-code:team"),
+        "{moved}"
+    );
+    let list = a.ok(&["thread", "list"]);
+    assert_eq!(runtime_cell(&list, "api1"), "claude-code:team", "{list}");
+    assert_eq!(runtime_cell(&list, "api"), "claude-code:work", "{list}");
+    // The question named the thread it is about, by name and id.
+    assert!(said.ends_with(&question), "{said}");
 }

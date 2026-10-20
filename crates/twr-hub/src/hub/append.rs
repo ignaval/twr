@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use twr_core::blob::{cap_body, has_capped, hydrate_with, BlobStore, CapError};
 use twr_core::event::*;
 
@@ -145,6 +145,19 @@ pub(super) fn hydrated_whole(conn: &Connection, ev: &Event) -> anyhow::Result<Op
     }
 }
 
+/// A named account's directory as `ext.twr` `twr` records it ([`ACCOUNT_DIR_KEY`]).
+fn recorded_account_dir(twr: Option<&Map<String, Value>>) -> Option<std::path::PathBuf> {
+    recorded_path(twr, ACCOUNT_DIR_KEY)
+}
+
+/// A path `ext.twr` `twr` records under `key`.
+fn recorded_path(twr: Option<&Map<String, Value>>, key: &str) -> Option<std::path::PathBuf> {
+    twr?.get(key)?
+        .as_str()
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
 impl Core {
     /// Bookkeeping that is not part of the reducers.
     fn track(&mut self, ev: &Event) {
@@ -155,21 +168,40 @@ impl Core {
                     .filter(|c| c.is_array())
                     .map(Value::to_string);
                 let acp_env = runtime_spec::acp_env(twr_ext(&p.ext));
+                let account_dir = recorded_account_dir(twr_ext(&p.ext));
+                let account_env_dir = recorded_path(twr_ext(&p.ext), ACCOUNT_ENV_DIR_KEY);
                 let rt = self.rt(&ev.thread);
                 rt.workspace = git::Workspace::from_created(p);
                 rt.pty_command = pty_command;
                 rt.acp_env = acp_env;
+                rt.account_dir = account_dir;
+                rt.account_env_dir = account_env_dir;
             }
-            // Moved to another runtime (`hub::switch`): what that one needs, recorded like
-            // `thread.created`'s (a `pty` thread's command goes; a move is never to `pty`). A
-            // live runtime is the previous one, whatever its name (`hub::restart`).
+            // Moved to another runtime or account (`hub::switch`): what that one needs,
+            // recorded like `thread.created`'s (a `pty` thread's command goes; a move is never
+            // to `pty`). A live runtime is the previous one, whatever its name
+            // (`hub::restart`). A move between accounts of one runtime keeps its agent unless
+            // the event names one (as the reducer keeps `acp_command`).
             EventBody::ThreadModelChanged(p) if p.runtime.is_some() => {
+                let same_runtime = p.previous_runtime == p.runtime;
+                let account_only = p.account_changed && same_runtime;
+                let names_agent = twr_ext(&p.ext).is_some_and(|t| t.contains_key(ACP_COMMAND_KEY));
                 let acp_env = runtime_spec::acp_env(twr_ext(&p.ext));
+                let account_dir = recorded_account_dir(twr_ext(&p.ext));
+                let account_env_dir = recorded_path(twr_ext(&p.ext), ACCOUNT_ENV_DIR_KEY);
                 let rt = self.rt(&ev.thread);
                 rt.pty_command = None;
-                rt.acp_env = acp_env;
+                if !account_only || names_agent {
+                    rt.acp_env = acp_env;
+                }
+                // An account move records the new account's directory (none for the native).
+                if p.account_changed {
+                    rt.account_dir = account_dir;
+                    rt.account_env_dir = account_env_dir;
+                }
                 if let Some(s) = rt.runtime_settings.as_mut() {
                     s.moved = true;
+                    s.account_moved |= account_only;
                 }
                 // The previous session's settings are no session's of the thread now: the new
                 // runtime's first start records its own (an attach meanwhile is refused, the
@@ -382,6 +414,17 @@ impl Core {
         self.attention
             .apply_at(ev, ev.is_control().then_some(self.gseq));
         self.usage.apply(ev);
+        self.accounts.apply(ev);
+        if ev.thread == twr_core::event::HUB_THREAD
+            && matches!(
+                ev.body,
+                EventBody::AccountAdded(_)
+                    | EventBody::AccountRemoved(_)
+                    | EventBody::AccountStatus(_)
+            )
+        {
+            self.account_events.push((self.gseq, ev.clone()));
+        }
         self.track(ev);
     }
 
@@ -473,6 +516,10 @@ impl Core {
         // (`hub::stall`), so no crash can leave it open behind the activity.
         let resolutions = self.stall_resolutions(&events);
         events.extend(resolutions);
+        // An account whose directory the batch changes has its known usage cleared with it
+        // (`hub::usage`).
+        let clears = self.usage_clears(&events);
+        events.extend(clears);
         // Per-thread seqs (and timestamps) as they will be once the earlier events of the batch
         // are in.
         let mut seqs: HashMap<String, u64> = HashMap::new();

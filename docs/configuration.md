@@ -80,6 +80,7 @@ autostart = false                 # start it with the hub instead of on your fir
 project_reads = true              # it may read your projects' committed files (false: never)
 # read_deny = ["*.sqlite", "config/prod/**"]  # more files it may never read, over the built-in secret names
 memory = true                     # it keeps notes across sessions and runtimes (false: no memory tools, nothing loaded)
+# account = "personal"           # the first orchestrator's account; unset = the policy default, else the native one
 
 [threads]
 default_mode = "auto"             # permission mode for new threads; checked when the hub starts
@@ -115,9 +116,22 @@ repo = "/home/me/code/api"        # the repository
 # trim_idle_after = "24h"         # trim the build output of its threads idle this long (90m, 24h, 2d)
 # idle_trim_disposable = ["target/"]  # replaces [threads] idle_trim_disposable for this project
 # codex_auto = "ask"              # overrides [codex] auto for this project's threads
+# account = "work"               # its threads' account on every runtime: a name, a glob, a list (accounts.md)
+# accounts = { codex = "team" }   # per runtime; replaces `account` there
+# exclude_accounts = ["personal"] # never these accounts
 
 [codex]
 auto = "auto_review"              # a Codex thread in `auto` whose sandbox says no: Codex's "auto_review" agent decides (the default), "ask" you, or "never" run it
+
+[accounts.claude-code.work]       # example: an account (accounts.md); `twr account add` can record one instead
+# dir = "~/.claude-work"          # unset = ~/.local/share/twr/accounts/claude-code/work
+# share = "config"                # what `twr account add` links into it from the native directory: config | none
+
+[accounts.claude-code.personal]   # example
+native = true                     # names the native account (the runtime's own directory)
+
+[account_policy.claude-code]      # example
+# default = "personal"            # the account of threads nothing pins; unset = the native one
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
@@ -160,6 +174,7 @@ ssh = "me@gpu-box"                # where; also used by `twr attach` for threads
 [boxes.gpu.projects.api]
 repo = "/srv/code/api"            # where that project lives on the box (`twr box project gpu api` finds and writes it)
 # runtime = "codex"               # runtime for this project's threads on that box
+# account = "work"               # also accounts, exclude_accounts: replace the project's on that box
 
 [boxes.sandbox]                   # example: a container the hub reaches through docker exec
 transport = "command"
@@ -172,6 +187,8 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 ```
 
 ## Notes on some keys
+
+`[accounts.<runtime>.<name>]`, `[account_policy.<runtime>]`, `[orchestrator] account` and a project's `account`, `accounts` and `exclude_accounts` are about several logins per runtime; see [accounts.md](accounts.md). Accounts work for `claude-code`, `codex` and `grok-build`. A pin that names an account the runtime doesn't have refuses the thread. `default_runtime` and a project's `runtime` take a runtime alone: write an account as `accounts.<runtime>` or `[account_policy.<runtime>] default` (only `[orchestrator] runtime` takes `claude-code:work`).
 
 `[orchestrator] project_reads` (default `true`) lets the orchestrator read your projects' committed files, and `read_deny` lists more file names it may never read, as globs: `*` within a path part, `**` across parts, `?` one character. A pattern without `/` matches a file name, `*.sqlite`, and one with `/` a path from the repository's top, `config/prod/**`. They add to the built-in secret names and never remove one. See [Reading your projects](orchestrator.md#reading-your-projects).
 

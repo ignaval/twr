@@ -388,6 +388,7 @@ impl Adapter for GrokBuildAdapter {
             &bin,
             &build_args(&cfg),
             &build_env(&cfg),
+            &cfg.env_remove,
             &cwd,
             &fix,
         )?;
@@ -455,8 +456,8 @@ impl Adapter for GrokBuildAdapter {
         if let Some(e) = cfg.effort.as_deref().filter(|e| !e.trim().is_empty()) {
             cmd.args(["--reasoning-effort", e]);
         }
-        cmd.args(["--resume", session_id]).envs(build_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(["--resume", session_id]);
+        process::apply_env_std(&mut cmd, build_env(cfg), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }

@@ -400,9 +400,10 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
         );
         assert_eq!(
             rt.cfg.settings,
-            Some(twr_adapters::claude_code::guard::settings(Path::new(
-                "/opt/twr/bin/twr"
-            )))
+            Some(twr_adapters::claude_code::guard::settings(
+                Path::new("/opt/twr/bin/twr"),
+                None
+            ))
         );
     } else {
         assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()), "{}", rt.runtime);

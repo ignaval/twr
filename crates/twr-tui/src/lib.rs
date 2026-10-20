@@ -13,6 +13,7 @@
 //! The TUI is only a view: reports, routing and attention all live in the hub, so nothing here is
 //! required for the report path to work without a screen.
 
+pub mod accounts;
 pub mod app;
 #[cfg(test)]
 mod bench;
@@ -178,17 +179,42 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
             let value = |k: &str| result[k].as_str().unwrap_or("default").to_string();
             let now = format!("model {}, effort {}", value("model"), value("effort"));
             if result["changed"].as_bool() == Some(false) {
+                // Asked for an account it is on: the hub's message names it
+                // (`api already runs on claude-code:work with ...`). Asked for the runtime
+                // alone, or the model: what it has, as without accounts.
+                let on_account = match (result["runtime"].as_str(), result["account"].as_str()) {
+                    (Some(rt), Some(a)) => format!("{name} already runs on {rt}:{a} "),
+                    _ => String::new(),
+                };
+                if let Some(m) = result["message"]
+                    .as_str()
+                    .filter(|m| !on_account.is_empty() && m.starts_with(&on_account))
+                {
+                    return Some(m.to_string());
+                }
                 return Some(format!("{name} already has {now}"));
             }
-            // A move to another runtime: the hub's message says when its session starts.
-            if result["runtime_changed"].as_bool() == Some(true) {
+            // A move to another runtime or account: the hub's message says when its session
+            // starts.
+            if result["runtime_changed"].as_bool() == Some(true)
+                || result["account_changed"].as_bool() == Some(true)
+            {
                 let runtime = result["runtime"].as_str().unwrap_or("?");
+                let same_runtime = result["runtime_changed"].as_bool() != Some(true);
+                let to = match result["account"].as_str() {
+                    Some(a) if same_runtime => format!("{runtime}:{a}"),
+                    _ => runtime.to_string(),
+                };
                 let mut msg = result["message"]
                     .as_str()
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("{name} moves to {runtime} with {now}"));
+                    .unwrap_or_else(|| format!("{name} moves to {to} with {now}"));
                 if result["applies"].as_str() == Some("after_turn") {
-                    msg.push_str("; the current turn finishes on the previous runtime first");
+                    msg.push_str(if same_runtime {
+                        "; the current turn finishes on the previous account first"
+                    } else {
+                        "; the current turn finishes on the previous runtime first"
+                    });
                 }
                 if result["stops_background_tasks"].as_bool() == Some(true) {
                     msg.push_str("; its background tasks end with it");
@@ -353,10 +379,13 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                     h["summary_note"].as_str().unwrap_or("skipped")
                 )
             };
-            let mut msg = format!(
-                "the orchestrator is now {} (a new session{handoff})",
-                result["runtime"].as_str().unwrap_or("?")
-            );
+            // With its account while its runtime shows account labels: `claude-code:work`.
+            let rt = result["runtime"].as_str().unwrap_or("?");
+            let runtime = match result["account"].as_str() {
+                Some(a) if result["account_shown"].as_bool() == Some(true) => format!("{rt}:{a}"),
+                _ => rt.to_string(),
+            };
+            let mut msg = format!("the orchestrator is now {runtime} (a new session{handoff})");
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -504,6 +533,18 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             Some(("thread.set_model", p))
         }
+        // `outside_pin` only when set: a hub before accounts takes no such field.
+        Action::SetAccount {
+            thread,
+            account,
+            outside_pin,
+        } => {
+            let mut p = json!({ "thread": thread, "account": account });
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
+            }
+            Some(("thread.set_model", p))
+        }
         Action::Dismiss { attn_id, revision } => {
             let mut p = json!({ "attn_id": attn_id });
             if *revision > 0 {
@@ -552,6 +593,8 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             project,
             runtime,
             name,
+            account,
+            outside_pin,
         } => {
             let mut p = json!({ "project": project_param(project) });
             if let Some(r) = runtime {
@@ -559,6 +602,12 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if let Some(n) = name {
                 p["name"] = json!(n);
+            }
+            if let Some(a) = account {
+                p["account"] = json!(a);
+            }
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
             }
             Some(("thread.new", p))
         }
@@ -1507,15 +1556,17 @@ pub const INFO_EVERY: Duration = Duration::from_secs(10);
 /// How long the tab strip waits for one hub's answer.
 const TAB_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info` and
-/// `orchestrator.show`, the connection for calls, and the control stream with the head its
-/// replay runs up to (and, compacted, how many items the replay has), or the state at that
-/// head (a snapshot) when the hub gave it: the stream then brings what comes after it.
+/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info`,
+/// `orchestrator.show` and `account.list`, the connection for calls, and the control stream
+/// with the head its replay runs up to (and, compacted, how many items the replay has), or the
+/// state at that head (a snapshot) when the hub gave it: the stream then brings what comes
+/// after it.
 struct Session {
     socket: PathBuf,
     calls: Client,
     info: Value,
     show: Value,
+    accounts: Value,
     control: ItemStream,
     head: u64,
     backlog: Option<u64>,
@@ -1569,6 +1620,15 @@ impl Session {
             }
             (None, None) => format!("tui: control subscribed (head {head})"),
         });
+        // The accounts, asked for once subscribed: the answer is as new as the replay's end
+        // (or the snapshot's head) at least, and each `account.*` event after it asks again. A
+        // hub older than accounts has none (null): no labels. Another failure (no answer in
+        // time) is `{failed: true}`: asked for again soon (`AppState::accounts_answered`).
+        let accounts = within(CONNECT_TIMEOUT, "asking for the accounts", async {
+            calls.call("account.list", json!({})).await
+        })
+        .await
+        .unwrap_or_else(|e| accounts_failure(&e));
         let blobs = connect(socket).await?;
         let control = read_ahead(hydrating(
             Box::pin(control.into_stream()),
@@ -1581,6 +1641,7 @@ impl Session {
             calls,
             info,
             show,
+            accounts,
             control,
             head,
             backlog,
@@ -1699,6 +1760,19 @@ fn read_snapshot(ack: &Value) -> anyhow::Result<Option<ClientFold>> {
     );
     let fold = serde_json::from_value(snapshot.clone()).context("reading the snapshot")?;
     Ok(Some(fold))
+}
+
+/// What a failed `account.list` call (`e`) tells the view (`AppState::accounts_answered`):
+/// `null` from a hub older than accounts (its unknown method: no accounts, never asked
+/// again), else `{failed: true}` (asked for again after a wait).
+fn accounts_failure(e: &anyhow::Error) -> Value {
+    match e
+        .downcast_ref::<twr_core::proto::RpcError>()
+        .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND)
+    {
+        true => Value::Null,
+        false => json!({"failed": true}),
+    }
 }
 
 /// Creates workspace `name` when asked, opens its hub and connects to it.
@@ -2179,6 +2253,8 @@ async fn serve_calls(
                     || method == "message.send_now"
                     || method == "job.log"
                     || method == "hub.info"
+                    || method == "account.list"
+                    || method == "orchestrator.show"
                     || method == "trash.list"
                     || (method == "trash.empty" && is_dry_run(&r))
                 {
@@ -2189,7 +2265,8 @@ async fn serve_calls(
             Err(_)
                 if method == "thread.activity"
                     || method == "hub.info"
-                    || method == "thread.queue" =>
+                    || method == "thread.queue"
+                    || method == "orchestrator.show" =>
             {
                 let _ = results.view.send((method, Value::Null));
             }
@@ -2203,6 +2280,11 @@ async fn serve_calls(
                 let _ = results
                     .view
                     .send((method, json!({"failed": true, "job": named_job})));
+            }
+            // Nor a failed `account.list`, which is asked for again after a wait (none from a
+            // hub older than accounts).
+            Err(e) if method == "account.list" => {
+                let _ = results.view.send((method, accounts_failure(&e)));
             }
             Err(e) => {
                 status.send((error_status(method, &format!("{e:#}")), false));
@@ -2543,6 +2625,7 @@ async fn drive(
         calls,
         info,
         show,
+        accounts,
         control,
         head,
         backlog,
@@ -2615,6 +2698,9 @@ async fn drive(
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
     state.view.orch_default = orch_default;
+    state.view.orch_default_account = show["account"].as_str().map(str::to_string);
+    state.view.default_runtime = crate::app::default_runtime(&show);
+    state.accounts_answered(&accounts, std::time::Instant::now());
     state.view.mouse = carried.mouse;
     state.view.animate = ctx.tui.animate;
     state.view.color_mode = ctx.tui.colors;
@@ -2629,7 +2715,7 @@ async fn drive(
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
     state.summary.every = ctx.tui.summary_every();
-    state.view.picker = Picker::from_show(&show);
+    state.view.picker = Picker::from_show(&show, &state.accounts);
     state.workspace = current;
     state.set_tabs(carried.tabs);
     if let Some(view) = carried.view {
@@ -2858,6 +2944,17 @@ async fn drive(
                     }
                 });
             }
+            // An `account.*` event came, or a failed `account.list` is due again: the accounts
+            // again, one call at a time, and the orchestrator the hub would start while there
+            // is none.
+            state.accounts_retry_due(std::time::Instant::now());
+            for method in state.account_calls() {
+                let params = match method {
+                    "account.list" => json!({}),
+                    _ => Value::Null,
+                };
+                let _ = call_tx.send((method, params));
+            }
             for (attn, revision, raise) in state.hydration_due(std::time::Instant::now()) {
                 let (socket, tx) = (socket.clone(), hyd_tx.clone());
                 tokio::spawn(async move {
@@ -2914,6 +3011,9 @@ async fn drive(
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
             let retry = state
                 .next_hydration()
+                .into_iter()
+                .chain(state.accounts_retry)
+                .min()
                 .map(tokio::time::Instant::from_std)
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
@@ -3171,7 +3271,7 @@ async fn drive(
                         }
                     }
                 }
-                // A failed fetch is due again: loop to start it.
+                // A failed fetch (a capped text, the accounts) is due again: loop to start it.
                 _ = tokio::time::sleep_until(retry) => {}
                 // The user's attention to this lapsed, or it is time to say it lasts.
                 _ = sleep_opt(attendance.next_check(notifier)) => {
@@ -3391,9 +3491,10 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
-    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` whose
-    /// params say `fail`), answers `slow` once its oneshot fires, and a `message.withdraw`
-    /// with its params.
+    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` or an
+    /// `account.list` whose params say `fail`; an `account.list` whose params say `old` as a
+    /// hub older than accounts does), answers `slow` once its oneshot fires, and a
+    /// `message.withdraw` with its params.
     struct Recording(
         std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
@@ -3420,6 +3521,16 @@ mod tests {
                     "shell.cd" if params["dir"] == "/missing" => {
                         Err(anyhow::anyhow!("/missing: No such file or directory"))
                     }
+                    "account.list" if params["fail"] == true => {
+                        Err(anyhow::anyhow!("connection lost"))
+                    }
+                    "account.list" if params["old"] == true => {
+                        Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                            twr_core::proto::codes::METHOD_NOT_FOUND,
+                            "unknown method \"account.list\"",
+                        )))
+                    }
+                    "account.list" => Ok(serde_json::json!({"runtimes": {}})),
                     _ => Ok(serde_json::Value::Null),
                 }
             })
@@ -3820,6 +3931,69 @@ mod tests {
         st.apply_result(method, &r);
         assert!(!st.shell_cd_asked);
         assert!(st.shell_cds.is_empty());
+    }
+
+    /// A failed `account.list` reaches the view as `{failed: true}` (asked for again after a
+    /// wait, `AppState::accounts_answered`), an older hub's unknown method as null (never
+    /// asked again), with nothing in the status bar; an answer as it is.
+    #[tokio::test]
+    async fn a_failed_account_list_is_told_apart_from_an_older_hub() {
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        for params in [
+            serde_json::json!({"fail": true}),
+            serde_json::json!({"old": true}),
+            serde_json::json!({}),
+        ] {
+            tx.send(("account.list", params)).unwrap();
+        }
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        let mut answers = Vec::new();
+        while let Ok((method, r)) = view_rx.try_recv() {
+            assert_eq!(method, "account.list");
+            answers.push(r);
+        }
+        assert_eq!(
+            answers,
+            [
+                serde_json::json!({"failed": true}),
+                serde_json::Value::Null,
+                serde_json::json!({"runtimes": {}}),
+            ]
+        );
+        assert!(status_rx.try_recv().is_err(), "nothing in the status bar");
+        // The one on connecting, as `Session::connect` maps it (no answer in time too).
+        let timed_out = super::within(
+            std::time::Duration::from_millis(1),
+            "asking for the accounts",
+            std::future::pending::<anyhow::Result<serde_json::Value>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            super::accounts_failure(&timed_out),
+            serde_json::json!({"failed": true})
+        );
     }
 
     /// A view left by a switch keeps sending its calls (it is not stopped), and the next view
@@ -5297,10 +5471,26 @@ mod tests {
             .as_deref(),
             Some("the orchestrator is now codex (a new session; handed over without a summary (the previous orchestrator was not running))")
         );
+        let on = |shown: bool| {
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "claude-code", "account": "work", "account_shown": shown}),
+            )
+        };
+        assert_eq!(
+            on(true).as_deref(),
+            Some("the orchestrator is now claude-code:work (a new session)")
+        );
+        assert_eq!(
+            on(false).as_deref(),
+            Some("the orchestrator is now claude-code (a new session)")
+        );
         let (m, p) = action_request(&Action::NewThread {
             project: "api".into(),
             runtime: Some("codex".into()),
             name: Some("api2".into()),
+            account: None,
+            outside_pin: false,
         })
         .unwrap();
         assert_eq!(

@@ -2346,7 +2346,7 @@ fn guarded_cfg(dir: &Path, guarded: bool, env: Vec<(String, String)>) -> SpawnCo
         cwd: dir.to_path_buf(),
         env,
         settings: guarded
-            .then(|| twr_adapters::claude_code::guard::settings(Path::new("/opt/twr"))),
+            .then(|| twr_adapters::claude_code::guard::settings(Path::new("/opt/twr"), None)),
         ..Default::default()
     }
 }
@@ -3499,4 +3499,150 @@ async fn driver_ends_a_turn_whose_result_never_comes() {
     assert_eq!(twr["no_run"], json!(true), "{twr}");
     h.stop().unwrap();
     exited(&mut rx).await;
+}
+
+/// A turn that hit a usage or spending limit carries `ext.twr.limit` and is not transient: the
+/// latest `rate_limit_event` of the turn when it was `rejected` (a window type: usage, with
+/// its reset; `overage` or `credits_required`: spend), else a `rate_limit` error whose text
+/// names a limit it hit. A plain 429 or overload stays transient, with no limit.
+#[test]
+fn limits_are_named_on_the_failed_turn() {
+    const RESETS: i64 = 1893456000; // 2030-01-01T00:00:00Z
+    let event = |info: Value| {
+        json!({"type":"rate_limit_event","rate_limit_info":info,"session_id":"s"}).to_string()
+    };
+    let api_error = |error: &str, text: &str| {
+        json!({"type":"assistant","message":{"id":"x","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","content":[{"type":"text","text":text}]},"parent_tool_use_id":null,"session_id":"s","error":error,"is_api_error_message":true}).to_string()
+    };
+    let result = |text: &str, status: Value| {
+        json!({"type":"result","subtype":"success","is_error":true,"api_error_status":status,"num_turns":1,"result":text,"terminal_reason":"api_error","session_id":"s","total_cost_usd":0}).to_string()
+    };
+    let hit = "You've hit your limit · resets 3pm (UTC)";
+    let weekly = "You've hit your weekly limit · resets 5am (UTC)";
+    let usage = |window: Option<&str>, resets: bool, message: &str| {
+        let mut v = json!({"kind": "usage", "message": message});
+        if let Some(w) = window {
+            v["window"] = json!(w);
+        }
+        if resets {
+            v["resets_at"] = json!("2030-01-01T00:00:00Z");
+        }
+        v
+    };
+    let rejected = |kind: &str| {
+        event(json!({"status":"rejected","rateLimitType":kind,"resetsAt":RESETS,"utilization":1.0}))
+    };
+    let cases: Vec<(&str, Vec<String>, Value)> = vec![
+        (
+            "five-hour window",
+            vec![
+                rejected("five_hour"),
+                api_error("rate_limit", hit),
+                result(hit, json!(429)),
+            ],
+            usage(Some("five_hour"), true, hit),
+        ),
+        (
+            "Opus weekly window, an earlier warning replaced",
+            vec![
+                event(
+                    json!({"status":"allowed_warning","rateLimitType":"seven_day","resetsAt":RESETS}),
+                ),
+                rejected("seven_day_opus"),
+                api_error("rate_limit", hit),
+                result(hit, json!(429)),
+            ],
+            usage(Some("seven_day_opus"), true, hit),
+        ),
+        (
+            "overage",
+            vec![
+                rejected("overage"),
+                result("Out of extra usage", json!(429)),
+            ],
+            json!({"kind": "spend", "message": "Out of extra usage"}),
+        ),
+        (
+            "credits required",
+            vec![
+                event(
+                    json!({"status":"rejected","rateLimitType":"seven_day","errorCode":"credits_required"}),
+                ),
+                result("Credits required", json!(429)),
+            ],
+            json!({"kind": "spend", "message": "Credits required"}),
+        ),
+        (
+            "the text alone",
+            vec![api_error("rate_limit", weekly), result(weekly, json!(429))],
+            usage(None, false, weekly),
+        ),
+    ];
+    for (why, lines, want) in cases {
+        let mut tr = Translator::new(TranslatorOptions::default());
+        tr.user_message("x", 1);
+        let mut events = Vec::new();
+        for l in [
+            r#"{"type":"system","subtype":"init","session_id":"s","permissionMode":"default"}"#
+                .to_string(),
+        ]
+        .into_iter()
+        .chain(lines)
+        {
+            events.extend(tr.translate(&l).events);
+        }
+        let e = events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::TurnEnded(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(e.result, TurnResult::Error, "{why}");
+        assert_eq!(ext(&e.ext, "twr")["limit"], want, "{why}");
+        assert_eq!(ext(&e.ext, "claude")["transient"], false, "{why}");
+        assert!(
+            ext(&e.ext, "claude").get("transient_reason").is_none(),
+            "{why}"
+        );
+    }
+
+    // A plain 429 (a rate-limit message that names no limit hit), an overload, and a 429
+    // after a rejected event of a turn already ended: transient, no limit.
+    let mut tr = Translator::new(TranslatorOptions::default());
+    tr.user_message("x", 1);
+    tr.translate(&rejected("five_hour"));
+    tr.translate(r#"{"type":"result","subtype":"success","is_error":false,"stop_reason":"end_turn","session_id":"s"}"#);
+    for (turn, lines) in [
+        (
+            2,
+            vec![
+                api_error("rate_limit", "Rate limit reached"),
+                result("API Error: 429 rate limited", json!(429)),
+            ],
+        ),
+        (
+            3,
+            vec![
+                api_error("overloaded", "Overloaded"),
+                result("API Error: 529 overloaded", json!(529)),
+            ],
+        ),
+    ] {
+        tr.user_message("x", turn);
+        let mut events = Vec::new();
+        for l in lines {
+            events.extend(tr.translate(&l).events);
+        }
+        let e = events
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                EventBody::TurnEnded(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(ext(&e.ext, "claude")["transient"], true, "turn {turn}");
+        assert!(ext(&e.ext, "twr").get("limit").is_none(), "turn {turn}");
+    }
 }

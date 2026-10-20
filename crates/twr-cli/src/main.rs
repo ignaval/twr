@@ -2,6 +2,7 @@
 
 #[macro_use]
 mod term;
+mod accounts;
 mod boxes;
 mod dial_in;
 mod pretty;
@@ -183,7 +184,12 @@ enum Cmd {
     /// directory, and whatever it cannot decide within its deadline (a deny decision on stdout
     /// and exit 2).
     #[command(name = "claude-memory-guard", hide = true)]
-    ClaudeMemoryGuard,
+    ClaudeMemoryGuard {
+        /// The one memory directory to allow (the `autoMemoryDirectory` the hub set), instead
+        /// of the ones derived from the session's transcript and working directory.
+        #[arg(long)]
+        memory_dir: Option<PathBuf>,
+    },
     /// Serve the twr MCP tools on stdin/stdout for the orchestrator's runtime (logs go to
     /// stderr; stdout is the MCP channel). The hub starts it for the orchestrator with
     /// `TWR_ORCH_TOKEN`; it refuses to start without that token.
@@ -297,10 +303,20 @@ enum Cmd {
         effort: Option<String>,
         /// Move the thread to this runtime (`claude-code`, `codex`, `grok-build`, a configured
         /// `[runtimes.<name>]` preset, or `acp:<command>`; not `pty`): the same thread,
-        /// worktree and branch, on a new session (or, back on a runtime it left, on the session
-        /// it left there).
+        /// worktree and branch, on a new session (or, back on a runtime and account it left, on
+        /// the session it left there). `<runtime>:<account>` (`codex:team`) picks the account too.
         #[arg(long)]
         runtime: Option<String>,
+        /// Move the thread to this account of its runtime (`twr account list`; a glob or a
+        /// comma-separated list takes the first usable one): a new session there, given a
+        /// handoff, keeping the model and effort.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        /// Move it although the thread's or its project's pin keeps it off that account
+        /// (`--account`, or `--runtime <runtime>:<account>`; on a terminal, a refused move asks
+        /// instead).
+        #[arg(long)]
+        outside_pin: bool,
     },
     /// Rename a worker thread. The name must be free and work as a git branch name, like
     /// `--name`. Its worktree path and branch keep the name they were made with, and its
@@ -465,6 +481,14 @@ enum Cmd {
     Boxes {
         #[command(subcommand)]
         cmd: boxes::BoxCmd,
+    },
+    /// List, add, log in, check and remove a runtime's accounts: several logins of Claude
+    /// Code, Codex or Grok Build, each a config directory of its own. `twr account add
+    /// claude-code work` makes one and runs the runtime's login in this terminal; a thread
+    /// picks one with `twr thread new --account` and moves with `twr model --account`.
+    Account {
+        #[command(subcommand)]
+        cmd: accounts::AccountCmd,
     },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
     /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>`
@@ -1083,6 +1107,16 @@ enum ThreadCmd {
         /// shell would, without expansion.
         #[arg(long)]
         runtime: Option<String>,
+        /// The runtime's account to run on (`twr account list`): a name, a glob (`max-*`) or
+        /// a comma-separated list, the first usable one taken (default: the project's pin,
+        /// else `[account_policy.<runtime>] default`, else the runtime's own login).
+        /// `--runtime claude-code:work` picks one too.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        /// Open it on its account (`--account`, or `--runtime <runtime>:<account>`) although
+        /// the project's pin keeps it off that account.
+        #[arg(long)]
+        outside_pin: bool,
         /// Box to run on: `local`, or a remote box from `[boxes.<name>]` whose runner is
         /// connected (default: the project's `box`, else `local`).
         #[arg(long = "box", value_name = "BOX")]
@@ -1158,8 +1192,8 @@ fn main() -> ExitCode {
     );
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
-    if matches!(cli.cmd, Some(Cmd::ClaudeMemoryGuard)) {
-        return memory_guard();
+    if let Some(Cmd::ClaudeMemoryGuard { memory_dir }) = &cli.cmd {
+        return memory_guard(memory_dir.clone());
     }
     // The hub sets the agent marker only on what it starts for a thread:
     // a hub started from an agent's shell must not pass that shell's marker on to the rest
@@ -1223,8 +1257,9 @@ fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, background: bool) {
 /// `twr claude-memory-guard`: answers the `PreToolUse` hook input on stdin
 /// (`twr_adapters::claude_code::guard`) within the guard's deadline. A denial (outside the
 /// memory directory, stdin unreadable, a panic, no decision by the deadline) is a JSON decision
-/// on stdout and exit 2, which Claude Code blocks on either way.
-fn memory_guard() -> ExitCode {
+/// on stdout and exit 2, which Claude Code blocks on either way. With `memory_dir`
+/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`).
+fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
     use std::io::Read;
     use twr_adapters::claude_code::guard;
     let read = || {
@@ -1234,7 +1269,7 @@ fn memory_guard() -> ExitCode {
             .read_to_string(&mut input)
             .map(|_| input)
     };
-    match guard::run(read, guard::deadline()) {
+    match guard::run_with(read, guard::deadline(), memory_dir) {
         Some(deny) => {
             outln!("{deny}");
             ExitCode::from(2)
@@ -1684,6 +1719,9 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
+        Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
+            .await
+            .map(|()| ExitCode::SUCCESS),
         cmd => run_simple(cmd, &config, paths, socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -1700,11 +1738,12 @@ async fn run_simple(
         Cmd::Attach { .. }
         | Cmd::Wait { .. }
         | Cmd::Mcp
-        | Cmd::ClaudeMemoryGuard
+        | Cmd::ClaudeMemoryGuard { .. }
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
         | Cmd::TerminalSetup { .. }
+        | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -1792,6 +1831,8 @@ async fn run_simple(
                 ThreadCmd::New {
                     project,
                     runtime,
+                    account,
+                    outside_pin,
                     box_name,
                     name,
                     mode,
@@ -1803,6 +1844,7 @@ async fn run_simple(
                     base,
                 },
         } => {
+            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
             let project = project_param(config, &project, box_name.as_deref())?;
             let mut c = connect(&socket).await?;
             let mut params = json!({ "project": project, "aliases": aliases });
@@ -1812,8 +1854,12 @@ async fn run_simple(
             if worktree {
                 params["worktree"] = json!(true);
             }
+            if outside_pin {
+                params["outside_pin"] = json!(true);
+            }
             for (k, v) in [
                 ("runtime", runtime),
+                ("account", account),
                 ("box", box_name),
                 ("name", name),
                 ("mode", mode),
@@ -1841,7 +1887,7 @@ async fn run_simple(
                 "created {} ({}) runtime={}{command}{model} worktree={}",
                 str_of(&t["name"]),
                 str_of(&t["id"]),
-                str_of(&t["runtime"]),
+                accounts::runtime_label(&t),
                 str_of(&t["worktree"])
             );
             if let Some(repo) = t["project_found"]["repo"].as_str() {
@@ -2026,20 +2072,61 @@ async fn run_simple(
             model,
             effort,
             runtime,
+            account,
+            outside_pin,
         } => {
+            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
             let mut c = connect(&socket).await?;
-            if model.is_none() && effort.is_none() && runtime.is_none() {
-                let t = c.call("thread.get", json!({ "thread": thread })).await?;
+            let t = c.call("thread.get", json!({ "thread": thread })).await?;
+            if model.is_none() && effort.is_none() && runtime.is_none() && account.is_none() {
                 outln!("{}", model_show(&t));
                 return Ok(());
             }
-            let mut params = json!({ "thread": thread });
-            for (k, v) in [("model", model), ("effort", effort), ("runtime", runtime)] {
+            // The thread by its id, not the query: the pin question below is about this
+            // thread, and the retry must move it whatever names change while it is open.
+            let Some(id) = t["id"]
+                .as_str()
+                .filter(|i| !i.is_empty())
+                .map(str::to_string)
+            else {
+                bail!("the hub did not say which thread {thread} is");
+            };
+            let mut params = json!({ "thread": id });
+            for (k, v) in [
+                ("model", model),
+                ("effort", effort),
+                ("runtime", runtime),
+                ("account", account),
+            ] {
                 if let Some(v) = v {
                     params[k] = json!(v);
                 }
             }
-            let r = c.call("thread.set_model", params).await?;
+            if outside_pin {
+                params["outside_pin"] = json!(true);
+            }
+            let r = match c.call("thread.set_model", params.clone()).await {
+                Ok(r) => r,
+                // A pin keeps the thread off that account: a terminal is asked whether to
+                // leave it this once.
+                Err(e)
+                    if !outside_pin
+                        && pin_refusal(&e)
+                        && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+                {
+                    errln!("twr: {}", localize(&format!("{e:#}")));
+                    let answer = ask_on_stderr(&format!(
+                        "move {} ({id}) anyway? [y/N] ",
+                        str_of(&t["name"])
+                    ))?;
+                    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                        bail!("not moved");
+                    }
+                    params["outside_pin"] = json!(true);
+                    c.call("thread.set_model", params).await?
+                }
+                Err(e) => return Err(e),
+            };
             outln!("{}", model_outcome(&thread, &r));
             if let Some(w) = result_warning(&r) {
                 errln!("{w}");
@@ -2570,8 +2657,16 @@ fn model_effort(model: &Value, effort: &Value) -> String {
 /// completes (`handoff_pending`).
 fn model_show(t: &Value) -> String {
     let runtime = str_of(&t["runtime"]);
+    // The account while its runtime shows account labels, or when it was removed.
+    let account = match t["account"].as_str() {
+        Some(a) if t["account_removed"].as_bool() == Some(true) => {
+            format!(", account {a} (removed)")
+        }
+        Some(a) if t["account_shown"].as_bool() == Some(true) => format!(", account {a}"),
+        _ => String::new(),
+    };
     let mut out = format!(
-        "{}: runtime {runtime}, {}",
+        "{}: runtime {runtime}{account}, {}",
         str_of(&t["name"]),
         model_effort(&t["model"], &t["effort"])
     );
@@ -2615,6 +2710,30 @@ fn model_show(t: &Value) -> String {
     out
 }
 
+/// Refuses `--outside-pin` without an account to leave the pin for: `--account <name>`, or
+/// the account part of `--runtime <runtime>:<account>`.
+fn check_outside_pin(
+    outside_pin: bool,
+    account: Option<&str>,
+    runtime: Option<&str>,
+) -> anyhow::Result<()> {
+    let in_runtime = runtime.is_some_and(|r| twr_core::account::split_runtime(r).1.is_some());
+    if outside_pin && account.is_none() && !in_runtime {
+        bail!(
+            "--outside-pin needs the account it is for: --account <name>, or --runtime \
+             <runtime>:<account>"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `e` is the hub refusing a move because a pin keeps the thread off the account
+/// (`thread.set_model` without `outside_pin`), which the user may override.
+fn pin_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>()
+        .is_some_and(|r| r.message.contains("pass outside_pin"))
+}
+
 /// What `twr model` prints for a `thread.set_model` result.
 /// The advisory of a `thread.new` / `thread.set_model` / `thread.set_mode` / `thread.send`
 /// result `r` (its `warning`: the box reports the CLI of the runtime the call starts or
@@ -2633,6 +2752,28 @@ fn model_outcome(thread: &str, r: &Value) -> String {
         return format!("{name} already runs with {now}");
     }
     let before = model_effort(&r["previous_model"], &r["previous_effort"]);
+    // A move to another account (and maybe runtime): the hub's message names both accounts.
+    if r["account_changed"].as_bool() == Some(true) {
+        let from = format!(
+            "{}:{}",
+            str_of(&r["previous_runtime"]),
+            str_of(&r["previous_account"])
+        );
+        let old = match r["applies"].as_str() {
+            Some("now") => format!("its {from} runtime stops now"),
+            Some("after_turn") => format!("its {from} runtime stops once the current turn ends"),
+            _ => format!("no {from} runtime is running"),
+        };
+        let message = match r["message"].as_str() {
+            Some(m) => localize(m),
+            None => format!(
+                "{name} moves to {}:{}",
+                str_of(&r["runtime"]),
+                str_of(&r["account"])
+            ),
+        };
+        return format!("{message} ({before} -> {now}; {old}{})", tasks_end(r));
+    }
     if r["runtime_changed"].as_bool() == Some(true) {
         let (from, to) = (str_of(&r["previous_runtime"]), str_of(&r["runtime"]));
         let old = match r["applies"].as_str() {
@@ -2755,7 +2896,11 @@ async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     // real agent CLIs.
     if probes_own_agents(trusted, std::env::var_os(AGENT_PROBE_ENV).as_deref()) {
         opts.agent_probe = Some(twr_hub::hub::own_agent_probe());
+        // The accounts' logins too (`account.status`), on the same terms.
+        opts.account_probe = Some(twr_hub::hub::own_account_probe());
     }
+    // Named accounts without a `dir` of their own: the home's root's, every workspace's.
+    opts.accounts_root = Some(paths.accounts_dir());
     opts.worktree_namespace = paths.worktree_namespace();
     if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
         opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
@@ -4627,7 +4772,7 @@ async fn info(socket: &Path, raw: bool) -> anyhow::Result<()> {
     let o = &i["orchestrator"];
     outln!(
         "orchestrator: runtime {}{}{}",
-        str_of(&o["runtime"]),
+        orchestrator_runtime(o),
         models_text(&o["model"], &o["model_actual"]),
         if o["available"].as_bool() == Some(true) {
             ""
@@ -4635,6 +4780,9 @@ async fn info(socket: &Path, raw: bool) -> anyhow::Result<()> {
             " (not available)"
         }
     );
+    for line in accounts::info_lines(&i["accounts"]) {
+        outln!("accounts:     {line}");
+    }
     for b in i["boxes"].as_array().into_iter().flatten() {
         outln!("box:          {}", box_info_line(b));
     }
@@ -5974,11 +6122,27 @@ async fn orchestrator_show(socket: &Path, raw: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The orchestrator's runtime as `twr orchestrator show`, `twr info` and `twr orchestrator
+/// use` write it (`o`: an `orchestrator.show` object, `hub.info`'s `orchestrator`, an
+/// `orchestrator.use` answer), as a thread's
+/// ([`accounts::runtime_label`]): `claude-code:work` while its runtime shows account labels,
+/// else the runtime alone; a removed account always shows, `claude-code:work (removed)`. (An
+/// older hub's `runtime` may carry the configured account.)
+fn orchestrator_runtime(o: &Value) -> String {
+    let base = twr_core::account::split_runtime(str_of(&o["runtime"])).0;
+    accounts::runtime_label(&json!({
+        "runtime": base,
+        "account": o["account"],
+        "account_shown": o["account_shown"],
+        "account_removed": o["account_removed"],
+    }))
+}
+
 /// `twr orchestrator show` for an `orchestrator.show` result.
 fn orchestrator_text(o: &Value) -> String {
+    let runtime = orchestrator_runtime(o);
     let mut out = format!(
-        "orchestrator: {}{}{}\n",
-        str_of(&o["runtime"]),
+        "orchestrator: {runtime}{}{}\n",
         models_text(&o["model"], &o["model_actual"]),
         if o["available"].as_bool() == Some(true) {
             ""
@@ -6000,9 +6164,17 @@ fn orchestrator_text(o: &Value) -> String {
         None => out.push_str("thread:       none yet (created with the first message you say)\n"),
     }
     let conf = &o["configured"];
+    // `[orchestrator] account`, or the account part of its runtime (written apart).
+    let (conf_runtime, account) = match conf["account"].as_str() {
+        Some(a) => (
+            twr_core::account::split_runtime(str_of(&conf["runtime"])).0,
+            format!(", account {a}"),
+        ),
+        None => (str_of(&conf["runtime"]), String::new()),
+    };
     out.push_str(&format!(
-        "configured:   {}{} (the first orchestrator's; `twr orchestrator use` switches)\n",
-        str_of(&conf["runtime"]),
+        "configured:   {conf_runtime}{}{account} (the first orchestrator's; `twr orchestrator \
+         use` switches)\n",
         model_text(&conf["model"])
     ));
     let runtimes: Vec<&str> = o["runtimes"]
@@ -6085,7 +6257,7 @@ fn orchestrator_use_text(r: &Value) -> String {
 fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     let mut out = format!(
         "orchestrator is now {}{}: thread {} ({})",
-        str_of(&r["runtime"]),
+        orchestrator_runtime(r),
         model_text(&r["model"]),
         str_of(&r["name"]),
         str_of(&r["thread"])
@@ -6212,7 +6384,7 @@ async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
                         format!("{} ({count} bg)", str_of(&t["status"]))
                     }
                 },
-                str_of(&t["runtime"]).to_string(),
+                accounts::runtime_label(t),
                 mode_cell(t),
                 model_cell(t),
                 str_of(&t["project"]).to_string(),
@@ -8314,8 +8486,14 @@ mod tests {
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
-        // Hidden: the help shows none of them.
+        // Hidden: the help shows none of them (as whole flags: `twr account remove --logout`
+        // is not `--log`).
         let help = cli_help_page().1;
+        let shows = |flag: &str| {
+            help.match_indices(flag).any(|(i, _)| {
+                !help[i + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+            })
+        };
         for flag in [
             "--stdio",
             "--daemon",
@@ -8326,7 +8504,7 @@ mod tests {
             "--lock",
             "--log",
         ] {
-            assert!(!help.contains(flag), "{flag}");
+            assert!(!shows(flag), "{flag}");
         }
     }
 
@@ -8609,7 +8787,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             c.cmd,
-            Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None })
+            Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None, account: None,
+                outside_pin: false })
                 if thread == "web" && model.as_deref() == Some("claude-fable-5-1")
                     && effort.as_deref() == Some("high")
         ));
@@ -8622,6 +8801,85 @@ mod tests {
                 ..
             })
         ));
+        // `--outside-pin` with either account syntax; with neither, refused after parsing.
+        for args in [
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--runtime",
+                "claude-code:personal",
+                "--outside-pin",
+            ][..],
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--account",
+                "personal",
+                "--outside-pin",
+            ],
+            &["twr", "thread", "new", ".", "--outside-pin"],
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--runtime",
+                "acp:x:y",
+                "--outside-pin",
+            ],
+            &[
+                "twr",
+                "model",
+                "web",
+                "--runtime",
+                "codex:team",
+                "--outside-pin",
+            ],
+            &["twr", "model", "web", "--account", "team", "--outside-pin"],
+            &["twr", "model", "web", "--outside-pin"],
+            &["twr", "model", "web", "--runtime", "codex", "--outside-pin"],
+        ] {
+            let c = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let (account, runtime, outside_pin) = match c.cmd {
+                Some(Cmd::Thread {
+                    cmd:
+                        ThreadCmd::New {
+                            account,
+                            runtime,
+                            outside_pin,
+                            ..
+                        },
+                })
+                | Some(Cmd::Model {
+                    account,
+                    runtime,
+                    outside_pin,
+                    ..
+                }) => (account, runtime, outside_pin),
+                other => panic!("{args:?}: {other:?}"),
+            };
+            assert!(outside_pin, "{args:?}");
+            let named = args.contains(&"--account")
+                || args
+                    .iter()
+                    .any(|a| *a == "claude-code:personal" || *a == "codex:team");
+            let checked = check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref());
+            match named {
+                true => checked.unwrap_or_else(|e| panic!("{args:?}: {e}")),
+                false => assert!(
+                    checked
+                        .unwrap_err()
+                        .to_string()
+                        .starts_with("--outside-pin needs the account it is for"),
+                    "{args:?}"
+                ),
+            }
+        }
+        check_outside_pin(false, None, None).unwrap();
         assert!(Cli::try_parse_from(["twr", "respond", "api"]).is_err());
         let c = Cli::try_parse_from(["twr", "park", "api", "--keep", "--force"]).unwrap();
         assert!(matches!(
@@ -8844,6 +9102,86 @@ mod tests {
             "{shown}"
         );
         assert!(shown.contains("retired:      1 earlier"), "{shown}");
+    }
+
+    /// The orchestrator's runtime is labelled with its account only while `account_shown`:
+    /// a configured `claude-code:work` (an older hub's `runtime`) is the runtime alone
+    /// otherwise; the configured line writes the account apart.
+    #[test]
+    fn the_orchestrators_account_is_labelled_only_while_shown() {
+        let o = |runtime: &str, shown: bool| {
+            orchestrator_text(&json!({
+                "available": true, "runtime": runtime, "model": null, "account": "work",
+                "account_shown": shown, "thread": null,
+                "configured": {"runtime": "claude-code:work", "model": null, "account": "work"},
+                "runtimes": [],
+            }))
+        };
+        for runtime in ["claude-code", "claude-code:work"] {
+            let hidden = o(runtime, false);
+            assert!(
+                hidden.starts_with(
+                    "orchestrator: claude-code (the runtime's default model)
+"
+                ),
+                "{hidden}"
+            );
+            assert!(
+                hidden.contains(
+                    "configured:   claude-code (the runtime's default model), account work"
+                ),
+                "{hidden}"
+            );
+            let shown = o(runtime, true);
+            assert!(
+                shown.starts_with(
+                    "orchestrator: claude-code:work (the runtime's default model)
+"
+                ),
+                "{shown}"
+            );
+        }
+        // A removed account always shows, whatever `account_shown` says.
+        for shown in [false, true] {
+            let removed = orchestrator_text(&json!({
+                "available": true, "runtime": "claude-code", "model": null, "account": "work",
+                "account_shown": shown, "account_removed": true, "thread": null,
+                "configured": {"runtime": "claude-code", "model": null}, "runtimes": [],
+            }));
+            assert!(
+                removed.starts_with(
+                    "orchestrator: claude-code:work (removed) (the runtime's default model)\n"
+                ),
+                "{removed}"
+            );
+        }
+        // `twr info`'s and `twr orchestrator use`'s runtime: the same label.
+        let o = |extra: Value| {
+            let mut o = json!({"runtime": "claude-code", "account": "work"});
+            o.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            orchestrator_runtime(&o)
+        };
+        assert_eq!(o(json!({})), "claude-code");
+        assert_eq!(o(json!({"account_shown": false})), "claude-code");
+        assert_eq!(o(json!({"account_shown": true})), "claude-code:work");
+        assert_eq!(
+            o(json!({"account_shown": false, "account_removed": true})),
+            "claude-code:work (removed)"
+        );
+        assert_eq!(
+            orchestrator_runtime(&json!({"runtime": "claude-code:work", "account_shown": false})),
+            "claude-code"
+        );
+        let switched = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "claude-code", "model": null,
+            "account": "work", "account_shown": true, "started": false, "previous": null,
+        }));
+        assert!(
+            switched.starts_with("orchestrator is now claude-code:work (the runtime's default"),
+            "{switched}"
+        );
     }
 
     /// The orchestrator lines and `thread list` say the model the runtime reports next to the

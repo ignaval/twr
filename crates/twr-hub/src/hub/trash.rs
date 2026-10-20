@@ -99,8 +99,8 @@ pub(super) struct Restored {
 /// again on a restore: rebuilt from the events before `thread.deleted` (on replay too) and
 /// put back by `thread.restored`.
 ///
-/// Of [`ThreadRt`]: `workspace`, `pty_command` and `acp_env` (from `thread.created` and
-/// runtime moves) are where and how the thread runs; `session_settings` are what its session
+/// Of [`ThreadRt`]: `workspace`, `pty_command`, `acp_env` and `account_dir` (from
+/// `thread.created` and runtime or account moves) are where and how the thread runs; `session_settings` are what its session
 /// last ran in (an attach that cannot apply the thread's model or effort is refused while they
 /// differ, `hub::attach`); `closed_runtimes` numbers its runtimes, the middle part of their
 /// attention ids (a restored thread's next runtime must not reuse an earlier one's). The rest
@@ -116,6 +116,8 @@ pub(super) struct DeletedRt {
     workspace: Workspace,
     pty_command: Option<String>,
     acp_env: Vec<(String, String)>,
+    account_dir: Option<std::path::PathBuf>,
+    account_env_dir: Option<std::path::PathBuf>,
     session_settings: Option<super::restart::RunSettings>,
     closed_runtimes: u64,
     /// The trash item of its deletion (`thread.deleted` `trash`), if it has one.
@@ -133,6 +135,8 @@ impl DeletedRt {
             workspace: rt.workspace,
             pty_command: rt.pty_command,
             acp_env: rt.acp_env,
+            account_dir: rt.account_dir,
+            account_env_dir: rt.account_env_dir,
             session_settings: rt.session_settings,
             closed_runtimes: rt.closed_runtimes,
             item: None,
@@ -151,6 +155,8 @@ impl DeletedRt {
         };
         rt.pty_command = self.pty_command;
         rt.acp_env = self.acp_env;
+        rt.account_dir = self.account_dir;
+        rt.account_env_dir = self.account_env_dir;
         rt.session_settings = self.session_settings;
         rt.closed_runtimes = self.closed_runtimes;
     }

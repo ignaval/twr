@@ -175,6 +175,12 @@ pub(super) struct JobRt {
     slots: usize,
     cwd: PathBuf,
     env: Vec<(String, String)>,
+    /// The variables its process must not inherit (its thread's account's stray
+    /// credentials, [`twr_core::adapter::SpawnConfig::env_remove`]), removed after `env`.
+    env_remove: Vec<String>,
+    /// The account its environment is for: its thread's when it was asked for
+    /// ([`JobAccount`]). Checked again right before it starts ([`Core::job_at_launch`]).
+    account: JobAccount,
     timeout: Option<Duration>,
     wake: bool,
     log: PathBuf,
@@ -434,7 +440,123 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+/// What a job starts with ([`Core::job_at_launch`]).
+pub(super) struct Launch {
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    env_remove: Vec<String>,
+    log: PathBuf,
+    timeout: Option<Duration>,
+    name: String,
+    /// A `!` command's, not a job's ([`JobRt::shell`]).
+    shell: bool,
+    /// The account `env` is for ([`JobRt::account`]): checked again at its gate ([`release`]).
+    account: JobAccount,
+}
+
+/// The account a job's environment is for: its thread's runtime (an account of another
+/// runtime in the same directory is another environment: `CODEX_HOME`, not
+/// `CLAUDE_CONFIG_DIR`, and that runtime's removals), the named account (`None`: the native
+/// one), that account's directory as the thread recorded it ([`Core::account_dir`]) and the
+/// path the environment gives it by ([`Core::account_env_dir`]: the same account through
+/// another path to that directory, after a move, is another environment, a runtime keying its
+/// login on the path).
+pub(super) type JobAccount = (String, Option<String>, Option<PathBuf>, Option<PathBuf>);
+
 impl Core {
+    /// Thread `view`'s [`JobAccount`] now.
+    fn job_account(&self, view: &twr_core::reduce::ThreadView) -> JobAccount {
+        (
+            view.runtime.clone(),
+            view.account.clone(),
+            self.account_dir(view),
+            self.account_env_dir(view),
+        )
+    }
+
+    /// What job `id` starts with, read right before it starts (it may have waited for its
+    /// slots): its argv, directory, environment and removals, log, timeout, name, and the
+    /// account that environment is for. Its thread's account is checked again as a runtime's
+    /// start is ([`Core::refuse_account`]: one removed meanwhile, or now in another directory,
+    /// refuses it with that message); a thread that moved to another account meanwhile (or
+    /// to another runtime's account of the same name and directory, or to its account through
+    /// another path to its directory) gets that account's environment. `None` for a job that
+    /// is gone.
+    pub(super) fn job_at_launch(
+        &mut self,
+        hub: &Inner,
+        id: &str,
+    ) -> Option<Result<Launch, String>> {
+        let thread = self.jobs.jobs.get(id)?.thread.clone();
+        if let Some(view) = self.registry.get(&thread).cloned() {
+            if let Err(e) = self.refuse_account(&view) {
+                return Some(Err(e.message));
+            }
+            let now = self.job_account(&view);
+            if self.jobs.jobs.get(id)?.account != now {
+                let cfg = self.spawn_config(hub, &view);
+                let j = self.jobs.jobs.get_mut(id)?;
+                // Its own variables (the thread's and its marker) first, as when it was asked.
+                let mut env: Vec<(String, String)> = j
+                    .env
+                    .iter()
+                    .filter(|(k, _)| k == super::THREAD_ENV || k == super::AGENT_ENV)
+                    .cloned()
+                    .collect();
+                env.extend(cfg.env);
+                j.env = env;
+                j.env_remove = cfg.env_remove;
+                j.account = now;
+            }
+        }
+        let j = self.jobs.jobs.get(id)?;
+        Some(Ok(Launch {
+            argv: j.argv.clone(),
+            cwd: j.cwd.clone(),
+            env: j.env.clone(),
+            env_remove: j.env_remove.clone(),
+            log: j.log.clone(),
+            timeout: j.timeout,
+            name: j.name.clone(),
+            shell: j.shell.is_some(),
+            account: j.account.clone(),
+        }))
+    }
+
+    /// Why job `id`'s command, whose environment is for `account` ([`Launch::account`]), must
+    /// not run now that its gate opens ([`release`]): its thread's account refused
+    /// ([`Core::refuse_account`]: removed or unusable while the job was starting), or the
+    /// thread moved to another account (or runtime, or directory) meanwhile, so its
+    /// environment is another account's (said `<thread> moved to <runtime>:<account> while the
+    /// job started; run it again`), or to its account through another path to its directory
+    /// (said `<thread> moved to <runtime>:<account> through <path> while the job started; run
+    /// it again`). `None`: it may run.
+    fn refuse_job_account(&self, thread: &str, account: &JobAccount) -> Option<String> {
+        let view = self.registry.get(thread)?;
+        if let Err(e) = self.refuse_account(view) {
+            return Some(e.message);
+        }
+        let now = self.job_account(view);
+        if now == *account {
+            return None;
+        }
+        // Named as the labels name it (`AccountsView::label`).
+        let label = self.accounts.label(&view.runtime, view.account.as_deref());
+        let through = match (&now, account) {
+            ((r, a, d, Some(path)), (was_r, was_a, was_d, _))
+                if (r, a, d) == (was_r, was_a, was_d) =>
+            {
+                format!(" through {}", path.display())
+            }
+            _ => String::new(),
+        };
+        Some(format!(
+            "{} moved to {label}{through} while the job started; run it again",
+            view.name
+        ))
+    }
+
     /// The jobs directory (`<data>/jobs`).
     fn jobs_dir(hub: &Inner) -> PathBuf {
         hub.db_path
@@ -573,7 +695,9 @@ impl Core {
                 format!("{name} has {mine} jobs queued or running already"),
             ));
         }
-        let mut cfg = super::spawn_config(hub, &view);
+        // Not on an account that cannot run it (`hub::thread_account`).
+        self.refuse_account(&view)?;
+        let mut cfg = self.spawn_config(hub, &view);
         // The orchestrator view's folder, which the user picked (`!cd`): it is no worktree.
         let own_dir = shell.as_ref().and_then(|s| s.cwd.clone());
         if let Some(dir) = &own_dir {
@@ -652,6 +776,8 @@ impl Core {
                 slots,
                 cwd: cfg.cwd.clone(),
                 env,
+                env_remove: cfg.env_remove.clone(),
+                account: self.job_account(&view),
                 timeout,
                 wake,
                 log: log.clone(),
@@ -919,7 +1045,7 @@ impl Core {
                 continue;
             }
             let hold = self.registry.get(&thread).cloned().and_then(|view| {
-                let cwd = super::spawn_config(hub, &view).cwd;
+                let cwd = self.spawn_config(hub, &view).cwd;
                 let host = hub.host(&view.box_name)?;
                 host.use_workdir(&cwd, &thread).ok().flatten()
             });
@@ -1235,21 +1361,21 @@ async fn run_job(hub: Arc<Inner>, id: String) {
 
 /// Starts job `id`'s process and waits for its end, renewing its task meanwhile.
 async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Instant) -> Outcome {
-    let Some((argv, cwd, env, log, timeout, name, shell)) = ({
-        let core = hub.core();
-        core.jobs.jobs.get(id).map(|j| {
-            (
-                j.argv.clone(),
-                j.cwd.clone(),
-                j.env.clone(),
-                j.log.clone(),
-                j.timeout,
-                j.name.clone(),
-                j.shell.is_some(),
-            )
-        })
-    }) else {
-        return Outcome::Cancelled("gone".into());
+    let launch = hub.core().job_at_launch(hub, id);
+    let Launch {
+        argv,
+        cwd,
+        env,
+        env_remove,
+        log,
+        timeout,
+        name,
+        shell,
+        account,
+    } = match launch {
+        None => return Outcome::Cancelled("gone".into()),
+        Some(Err(why)) => return Outcome::FailedToStart(why),
+        Some(Ok(j)) => j,
     };
     let out = match open_log(&log) {
         Ok(f) => f,
@@ -1262,12 +1388,16 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
         Err(e) => return Outcome::FailedToStart(format!("cannot open its log: {e}")),
     };
     // Its whole environment, as its thread's runtime gets it: the hub's, with the job's
-    // variables over it, without what is scrubbed from a runtime's. A hub started in a thread
-    // has its runtime's generation: a job of its own must not match that runtime's cleanup.
+    // variables over it, without its account's stray credentials (`env_remove`) and what is
+    // scrubbed from a runtime's. A hub started in a thread has its runtime's generation: a
+    // job of its own must not match that runtime's cleanup.
     let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
         std::env::vars_os().collect();
     for (k, v) in &env {
         vars.insert(k.into(), v.into());
+    }
+    for k in &env_remove {
+        vars.remove(std::ffi::OsStr::new(k));
     }
     for k in twr_adapters::process::SCRUBBED_ENV
         .iter()
@@ -1318,7 +1448,18 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
             j.started = Some(started);
         }
     }
-    let spawned = gated_spawn(hub, id, &name, &cwd, &vars, &command, (out, err), cancel).await;
+    let spawned = gated_spawn(
+        hub,
+        id,
+        &name,
+        &account,
+        &cwd,
+        &vars,
+        &command,
+        (out, err),
+        cancel,
+    )
+    .await;
     let mut child = match spawned {
         Ok(c) => c,
         Err(o) => return o,
@@ -1443,6 +1584,7 @@ async fn gated_spawn(
     hub: &Arc<Inner>,
     id: &str,
     name: &str,
+    account: &JobAccount,
     cwd: &Path,
     vars: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     command: &[std::ffi::OsString],
@@ -1503,7 +1645,7 @@ async fn gated_spawn(
         None => None,
     };
     let opened = match start_time {
-        Some(t) => release(hub, id, name, pid, t, cancel, &sock),
+        Some(t) => release(hub, id, name, account, (pid, t), cancel, &sock),
         None => Err(Outcome::FailedToStart(format!(
             "the start time of its process (pid {pid}) cannot be read: a later hub could not \
              tell what is left of it, so it does not run"
@@ -1528,18 +1670,21 @@ async fn gated_spawn(
 }
 
 /// Lets job `id`'s child, waiting at its gate ([`gated_spawn`]), run its command, under the
-/// hub's lock (the one a cancel and a mode change take), in this order: the job is still there
-/// and not cancelled; an agent's job's thread still is in a mode that may run commands; its
+/// hub's lock (the one a cancel, a mode change, an account's removal and a move take), in this
+/// order: the job is still there and not cancelled; an agent's job's thread still is in a mode
+/// that may run commands; its thread's account can still run it and is still `account`, the
+/// one its environment was built for ([`Core::refuse_job_account`]: removed, unusable or moved
+/// to while the gate was waited for, it fails to start, never having run its command); its
 /// process group, led by `pid` started at `start_time`, is recorded (its task's `running`
 /// update says `ext.twr.job.pgid` and `start_time`); the gate's line is written to `go`. A
-/// cancel or a mode change that comes after it finds the command running, and ends it as any
-/// running job's.
+/// cancel, a mode change or a move that comes after it finds the command running, and ends it
+/// (or not) as any running job's.
 fn release(
     hub: &Arc<Inner>,
     id: &str,
     name: &str,
-    pid: u32,
-    start_time: u64,
+    account: &JobAccount,
+    (pid, start_time): (u32, u64),
     cancel: &Cancel,
     mut go: &std::os::unix::net::UnixStream,
 ) -> Result<(), Outcome> {
@@ -1556,6 +1701,9 @@ fn release(
         if let Some(Err(e)) = core.registry.get(&thread).map(refuse_agent_job_mode) {
             return Err(Outcome::FailedToStart(e.message));
         }
+    }
+    if let Some(why) = core.refuse_job_account(&thread, account) {
+        return Err(Outcome::FailedToStart(why));
     }
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),

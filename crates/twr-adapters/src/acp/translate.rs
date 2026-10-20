@@ -148,6 +148,7 @@ use crate::claude_code::translate::{
     error_line, is_destructive, mark_visible, one_line, render_command, FULL_INPUT_KEY,
 };
 use crate::codex::translate::question_answer;
+use crate::usage::{Limit, LimitKind};
 
 /// ACP protocol version twr speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -316,6 +317,13 @@ pub trait Dialect: std::fmt::Debug + Send + 'static {
     /// Appended to an error that says authentication is required.
     fn auth_hint(&self) -> &str {
         " (sign in with the agent's own CLI first)"
+    }
+
+    /// The kind of limit a prompt error's text (`error_text`) says the account hit, if it says
+    /// one: the turn then carries `ext.twr.limit` and is not transient. None (the default):
+    /// the standard dialect knows no agent's wording.
+    fn limit_kind(&self, _text: &str) -> Option<LimitKind> {
+        None
     }
 
     /// The text of the first prompt of a new session, when the dialect changes it (the
@@ -1922,14 +1930,27 @@ impl<D: Dialect> Translator<D> {
         let stop = r.get("stopReason").and_then(Value::as_str).unwrap_or("");
         // Every failed turn says why (`ext.twr.error`, what the hub quotes).
         let mut why = None;
+        let mut limit = None;
         let result = match error {
             Some(e) => {
-                why = Some(self.with_auth_hint(&error_text(e)));
+                let text = error_text(e);
+                why = Some(self.with_auth_hint(&text));
                 ours.insert("error".into(), e.clone());
-                let reason = transient_reason(e);
-                ours.insert("transient".into(), json!(reason.is_some()));
-                if let Some(r) = reason {
-                    ours.insert("transient_reason".into(), json!(r));
+                if let Some(kind) = self.dialect.limit_kind(&text) {
+                    // Retrying before the reset cannot help.
+                    ours.insert("transient".into(), json!(false));
+                    limit = Some(Limit {
+                        kind,
+                        window: None,
+                        resets_at: None,
+                        message: text,
+                    });
+                } else {
+                    let reason = transient_reason(e);
+                    ours.insert("transient".into(), json!(reason.is_some()));
+                    if let Some(r) = reason {
+                        ours.insert("transient_reason".into(), json!(r));
+                    }
                 }
                 TurnResult::Error
             }
@@ -1988,6 +2009,9 @@ impl<D: Dialect> Translator<D> {
         if let Some(why) = why {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": error_line(&why) }));
+        }
+        if let Some(l) = limit {
+            twr_core::event::set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
         }
         self.compact_turns.remove(&turn);
         self.compacting = None;

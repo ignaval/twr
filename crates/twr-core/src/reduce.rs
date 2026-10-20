@@ -217,6 +217,22 @@ pub struct ThreadView {
     /// `acp_command`, as the hub reports a thread's agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<serde_json::Value>,
+    /// The account it runs on: `thread.created`'s `ext.twr.account` ([`ACCOUNT_KEY`]), then
+    /// that of the latest account move (`thread.model_changed` with `account_changed`);
+    /// `None` = the runtime's native account, whatever it is named now (and every log from
+    /// before accounts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Its own account pin, as it was created with it (`ext.twr.account_pin`,
+    /// [`ACCOUNT_PIN_KEY`]: items comma-separated); `None`: the thread has none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_pin: Option<String>,
+    /// The configured project of the repository it was made for by path
+    /// (`ext.twr.account_project`, [`ACCOUNT_PROJECT_KEY`]); `None` for one made for a
+    /// project by name, or for a repository no configured project has.
+    /// [`ThreadView::pins_project`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_project: Option<String>,
     /// Permission mode: `thread.created`'s, then the latest `thread.mode_changed`'s (what the
     /// thread's next runtime starts with).
     pub mode: String,
@@ -516,6 +532,9 @@ impl ThreadView {
                 self.base = twr("base_ref");
                 self.model = twr("model");
                 self.effort = twr("effort");
+                self.account = twr(ACCOUNT_KEY);
+                self.account_pin = twr(ACCOUNT_PIN_KEY);
+                self.account_project = twr(ACCOUNT_PROJECT_KEY);
                 self.configured_project = p
                     .ext
                     .as_ref()
@@ -528,11 +547,14 @@ impl ThreadView {
             EventBody::ThreadStarted(p) => {
                 // A start of the previous runtime (one that was starting when the thread moved)
                 // is not the new runtime's session: another adapter's, one the hub stamped as
-                // moved away from, or one stamped as another runtime or agent than the
-                // thread's (a start the hub had not seen before the move, say after a hub
+                // moved away from, or one stamped as another runtime, agent or account than
+                // the thread's (a start the hub had not seen before the move, say after a hub
                 // restart).
                 if self.handoff_pending
-                    && (!self.is_own_runtime(&ev.source) || moved_away(p) || self.is_other_agent(p))
+                    && (!self.is_own_runtime(&ev.source)
+                        || moved_away(p)
+                        || self.is_other_agent(p)
+                        || self.is_other_account(p))
                 {
                     return;
                 }
@@ -603,11 +625,18 @@ impl ThreadView {
             EventBody::ThreadModelChanged(p) => {
                 self.model = p.model.clone();
                 self.effort = p.effort.clone();
-                // Sessions do not move between runtimes: the next start is a new session, or
-                // the session the thread left this runtime with earlier, resumed.
+                if p.account_changed {
+                    self.account = p.account.clone();
+                }
+                // Sessions do not move between runtimes (or accounts): the next start is a new
+                // session, or the session the thread left this runtime and account with earlier,
+                // resumed. A move between accounts of one runtime keeps its agent.
                 if let Some(r) = &p.runtime {
+                    let same_runtime = p.previous_runtime.as_deref() == Some(r.as_str());
+                    if !(p.account_changed && same_runtime) {
+                        self.acp_command = acp_command(p.ext.as_ref()).cloned();
+                    }
                     self.runtime = r.clone();
-                    self.acp_command = acp_command(p.ext.as_ref()).cloned();
                     self.session_id = None;
                     self.actual_model = None;
                     self.context = None;
@@ -964,6 +993,21 @@ impl ThreadView {
         }
     }
 
+    /// Whether start `p` is stamped as another account than the thread's: it carries the
+    /// hub's `ext.twr.runtime` stamp, and its `ext.twr.account` ([`ACCOUNT_KEY`]; absent = the
+    /// native account) is not [`ThreadView::account`]. A start without a runtime stamp (a
+    /// runner from before stamps) says nothing.
+    fn is_other_account(&self, p: &SessionPayload) -> bool {
+        let twr = p.ext.as_ref().and_then(|e| e.get("twr"));
+        let stamped = twr
+            .and_then(|t| t.get("runtime"))
+            .is_some_and(serde_json::Value::is_string);
+        let account = twr
+            .and_then(|t| t.get(ACCOUNT_KEY))
+            .and_then(serde_json::Value::as_str);
+        stamped && account != self.account.as_deref()
+    }
+
     /// The runtime's background tasks go, unfinished, with its process (a stop, crash, park,
     /// attach or a new runtime start); its jobs stay. The turn they were left running by did
     /// not finish its work: [`ThreadView::cut_short`].
@@ -1096,6 +1140,16 @@ impl ThreadView {
     /// `None`: the runtime's default, not reported (yet).
     pub fn shown_model(&self) -> Option<&str> {
         self.actual_model.as_deref().or(self.model.as_deref())
+    }
+
+    /// The configured project whose account pins and exclusions apply to the thread (on its
+    /// box, `hub::thread_account`): [`ThreadView::account_project`] for one made by a
+    /// repository path, else its project when it was made for that configured project
+    /// ([`ThreadView::configured_project`]); `None`: a repository no configured project has.
+    pub fn pins_project(&self) -> Option<&str> {
+        self.account_project
+            .as_deref()
+            .or_else(|| self.project.as_deref().filter(|_| self.configured_project))
     }
 
     /// Whether this is an orchestrator thread: the current one, or a retired one
@@ -3306,6 +3360,139 @@ mod tests {
             (v.session_id.as_deref(), v.handoff_pending),
             (Some("cx-1"), false)
         );
+    }
+
+    /// A thread's account: `thread.created`'s, then an account move's. The move sets what the
+    /// event says (model and effort included), drops the session and waits for the new
+    /// account's first start: a start stamped with the old account is ignored, one of the new
+    /// account ends the handoff, and an unstamped one (an older runner) says nothing. A log
+    /// from before accounts reads as the native account.
+    #[test]
+    fn an_account_move_waits_for_the_new_accounts_session() {
+        let mut s = ThreadScript::new("t1");
+        let mut created = s.created("api");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.ext = serde_json::json!({"twr": {
+                "model": "opus", "effort": "high",
+                ACCOUNT_KEY: "work", ACCOUNT_PIN_KEY: "work,max-*",
+            }})
+            .as_object()
+            .cloned();
+        }
+        let start = |s: &mut ThreadScript, session: &str, account: Option<&str>| {
+            let mut e = s.started(session);
+            if let EventBody::ThreadStarted(p) = &mut e.body {
+                let mut twr = serde_json::json!({"runtime": "fake"});
+                if let Some(a) = account {
+                    twr[ACCOUNT_KEY] = a.into();
+                }
+                p.ext = serde_json::json!({ "twr": twr }).as_object().cloned();
+            }
+            e
+        };
+        let mv = |s: &mut ThreadScript, to: Option<&str>, from: Option<&str>| {
+            s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                previous_model: Some("opus".into()),
+                previous_effort: Some("high".into()),
+                runtime: Some("fake".into()),
+                previous_runtime: Some("fake".into()),
+                account_changed: true,
+                account: to.map(str::to_string),
+                previous_account: from.map(str::to_string),
+                ..Default::default()
+            }))
+        };
+        let evs = [
+            created,
+            start(&mut s, "w-1", Some("work")),
+            mv(&mut s, Some("personal"), Some("work")),
+            start(&mut s, "w-2", Some("work")),
+            start(&mut s, "p-1", Some("personal")),
+            mv(&mut s, None, Some("personal")),
+            start(&mut s, "p-2", Some("personal")),
+            start(&mut s, "n-1", None),
+        ];
+        let at = |n: usize| view(&evs[..=n]);
+        let v = at(0);
+        assert_eq!(
+            (v.account.as_deref(), v.account_pin.as_deref()),
+            (Some("work"), Some("work,max-*"))
+        );
+        assert_eq!(at(1).session_id.as_deref(), Some("w-1"));
+        let v = at(2);
+        assert_eq!(v.account.as_deref(), Some("personal"));
+        assert_eq!((v.session_id, v.handoff_pending), (None, true));
+        assert_eq!(
+            (v.model.as_deref(), v.effort.as_deref(), v.runtime.as_str()),
+            (Some("opus"), Some("high"), "fake")
+        );
+        assert_eq!(v.account_pin.as_deref(), Some("work,max-*"));
+        let v = at(3);
+        assert_eq!(
+            (v.session_id, v.handoff_pending),
+            (None, true),
+            "the old account's start"
+        );
+        let v = at(4);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("p-1"), false)
+        );
+        // Back to the native account.
+        let v = at(5);
+        assert_eq!((v.account, v.handoff_pending), (None, true));
+        assert!(at(6).handoff_pending, "a start of the named account");
+        let v = at(7);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("n-1"), false)
+        );
+        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        // An unstamped start says nothing.
+        let unstamped = s.started("u-1");
+        let v = view(&[evs[0].clone(), evs[1].clone(), evs[2].clone(), unstamped]);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("u-1"), false)
+        );
+        // The account goes over the wire; a thread from before accounts has none.
+        let j = serde_json::to_value(at(4)).unwrap();
+        assert_eq!(j["account"], serde_json::json!("personal"));
+        assert_eq!(serde_json::from_value::<ThreadView>(j).unwrap(), at(4));
+        let mut old = ThreadScript::new("t2");
+        let v = view(&[old.created("web")]);
+        assert_eq!((v.account.as_ref(), v.account_pin.as_ref()), (None, None));
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(
+            j.get("account").is_none() && j.get("account_pin").is_none(),
+            "{j}"
+        );
+    }
+
+    /// A move between accounts of one `acp` runtime keeps its agent; a move to another
+    /// runtime takes the event's.
+    #[test]
+    fn an_account_move_keeps_the_agent() {
+        let mut s = ThreadScript::new("t1");
+        let mut created = s.created("api");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "acp".into();
+            p.ext = serde_json::json!({"twr": {ACP_COMMAND_KEY: ["agent-a", "acp"]}})
+                .as_object()
+                .cloned();
+        }
+        let moved = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+            runtime: Some("acp".into()),
+            previous_runtime: Some("acp".into()),
+            account_changed: true,
+            account: Some("team".into()),
+            ..Default::default()
+        }));
+        let v = view(&[created, moved]);
+        assert_eq!(v.acp_command, Some(serde_json::json!(["agent-a", "acp"])));
+        assert_eq!(v.account.as_deref(), Some("team"));
     }
 
     /// A deleted thread leaves the registry and the attention stack, and nothing of it comes

@@ -20,8 +20,11 @@
 //! thread takes the same name and alias and name resolution prefers the current orchestrator
 //! over retired ones; a retired one
 //! stays reachable by id. The new orchestrator's first turn is a handoff from the previous
-//! one (`hub::handoff`). The relay guard, token, MCP config and spawn restrictions apply to
-//! the new orchestrator unchanged. Every time its runtime starts, the hub makes a
+//! one (`hub::handoff`). Its account ([`Core::orchestrator_account`]) is recorded like a
+//! worker's (`hub::thread_account`): the first one's from `[orchestrator] account`, a switch's
+//! from `orchestrator.use <runtime>:<account>` (another account of the same runtime is a
+//! switch too), a reset's the current one's. The relay guard, token, MCP config and spawn
+//! restrictions apply to the new orchestrator unchanged. Every time its runtime starts, the hub makes a
 //! fresh token (32 random bytes, hex), kept only in memory, and passes it to the runtime's MCP
 //! server (`twr mcp --socket <socket>` with `TWR_ORCH_TOKEN`), which presents it in `hello`: that
 //! connection is the orchestrator ([`Caller::Orchestrator`]). The token is armed only once that
@@ -157,6 +160,7 @@ use super::reactions::{
 };
 use super::runtime_spec;
 use super::supervisor::persist;
+use super::thread_account;
 use super::watches::{self as watch, Watch};
 use super::{
     append_err, internal, rpc, twr_ext, twr_ext_map, Batch, Caller, Core, Hub, Inner, RoutedBy,
@@ -1219,6 +1223,10 @@ impl Inner {
     /// `[runtimes]` preset) is the `acp` runtime; a bare `acp` names no agent. Not for an
     /// existing thread's recorded runtime: see [`Core::thread_runtime_available`].
     fn local_runtime(&self, runtime: &str) -> bool {
+        // Of `claude-code:work`, the runtime.
+        let Ok((runtime, _)) = runtime_spec::split_account(runtime) else {
+            return false;
+        };
         let name = match runtime_spec::resolve_acp(runtime, &self.config) {
             Ok(Some(s)) => s.runtime,
             Ok(None) => runtime.to_string(),
@@ -1261,6 +1269,7 @@ impl Inner {
     ///
     /// [`ThreadHost::program`]: crate::host::ThreadHost::program
     fn missing_program(&self, runtime: &str) -> Result<Option<(String, String)>, RpcError> {
+        let (runtime, _) = runtime_spec::split_account(runtime)?;
         let program = match runtime_spec::resolve_acp(runtime, &self.config)? {
             Some(spec) => spec.acp.and_then(|a| {
                 let fix = "install the agent, or fix the runtime's command";
@@ -1376,22 +1385,250 @@ impl Core {
         }
     }
 
-    /// The orchestrator's runtime and model: the current orchestrator thread's (a switch is
-    /// kept by the log), else the configured ones (`[orchestrator] runtime / model`) that
-    /// the first orchestrator gets.
-    pub(super) fn orchestrator_choice(&self, hub: &Inner) -> (String, Option<String>) {
+    /// The orchestrator's runtime, model and account (`None`: the native one): the current
+    /// orchestrator thread's (a switch is kept by the log), else the configured ones
+    /// (`[orchestrator] runtime / model / account`, the account as
+    /// [`Core::orchestrator_account`] picks it) that the first orchestrator gets.
+    pub(super) fn orchestrator_choice(
+        &self,
+        hub: &Inner,
+    ) -> (String, Option<String>, Option<String>) {
         match self
             .orch
             .thread
             .as_deref()
             .and_then(|t| self.registry.get(t))
         {
-            Some(v) => (v.runtime.clone(), v.model.clone()),
-            None => (
-                hub.config.orchestrator_runtime().to_string(),
-                hub.config.orchestrator_model().map(str::to_string),
-            ),
+            Some(v) => (v.runtime.clone(), v.model.clone(), v.account.clone()),
+            None => {
+                let runtime = hub.config.orchestrator_runtime().to_string();
+                // One that cannot be used is still the one it gets: creating it is refused.
+                let account =
+                    match self.orchestrator_account(hub, &runtime, OrchAccountFrom::Config) {
+                        Ok(c) => c.account,
+                        Err(_) => {
+                            let (base, part) = twr_core::account::split_runtime(&runtime);
+                            hub.config
+                                .orchestrator_account()
+                                .map(ToString::to_string)
+                                .or(part.map(str::to_string))
+                                .or_else(|| {
+                                    hub.config
+                                        .account_policy
+                                        .get(base)
+                                        .and_then(|p| p.default.clone())
+                                })
+                        }
+                    };
+                (
+                    runtime,
+                    hub.config.orchestrator_model().map(str::to_string),
+                    account,
+                )
+            }
         }
+    }
+
+    /// The account a new orchestrator on runtime spec `spec` (`claude-code:work`, a preset,
+    /// `acp:<command>`, or the current orchestrator's recorded runtime) gets, chosen like a
+    /// worker's ([`thread_account::choose_account`]) on the hub's box without a project (no
+    /// pins apply), as `from` says:
+    ///
+    /// - [`OrchAccountFrom::Config`], the first orchestrator: `[orchestrator] account` and the
+    ///   account part of `[orchestrator] runtime` (both given, they must agree), reason
+    ///   `config`; else the policy's default, else the native account. One that cannot be
+    ///   used (unknown, removed, logged out, colliding, its directory missing:
+    ///   [`Core::recheck_account`]) is refused with a new thread's message: never the native
+    ///   account in its place (the orchestrator is not made until it is fixed).
+    /// - [`OrchAccountFrom::Switch`], `orchestrator.use`: the account part of `spec` (reason
+    ///   `explicit`), else the policy's default, else the native account; one that cannot be
+    ///   used is refused with a new thread's message, before the current one is stopped.
+    /// - [`OrchAccountFrom::Keep`], a reset: the current orchestrator's account and directory
+    ///   as it recorded them (the configured choice when there is none), refused as a start of
+    ///   the current one would be ([`Core::refuse_account`]: removed, colliding, in another
+    ///   directory now, missing), so that a reset never stops an orchestrator whose
+    ///   replacement could not start.
+    pub(super) fn orchestrator_account(
+        &self,
+        hub: &Inner,
+        spec: &str,
+        from: OrchAccountFrom,
+    ) -> Result<thread_account::AccountChoice, RpcError> {
+        use thread_account::{AccountAsk, ProjectPins};
+        if from == OrchAccountFrom::Keep {
+            if let Some(v) = self
+                .orch
+                .thread
+                .as_deref()
+                .and_then(|t| self.registry.get(t))
+            {
+                // One the new orchestrator could not start on (removed, colliding, in another
+                // directory, missing) refuses the reset before the current one is stopped.
+                self.refuse_account(v)?;
+                return Ok(self.kept_orchestrator_account(v));
+            }
+            return self.orchestrator_account(hub, spec, OrchAccountFrom::Config);
+        }
+        let config = from == OrchAccountFrom::Config;
+        let (base, part) = runtime_spec::split_account(spec)?;
+        let runtime = match runtime_spec::resolve_acp(base, &hub.config)? {
+            Some(s) => s.runtime,
+            None => base.to_string(),
+        };
+        // (A pin: written back as `explicit_pin` reads it, a comma-separated list.)
+        let configured = config
+            .then(|| hub.config.orchestrator_account().map(ToString::to_string))
+            .flatten();
+        let explicit = thread_account::explicit_pin(configured.as_deref(), part.as_deref())?;
+        let asked = explicit.is_some();
+        let mut choice = self
+            .pick_account(
+                &hub.config,
+                &AccountAsk {
+                    runtime: &runtime,
+                    explicit,
+                    outside_pin: false,
+                    orchestrator: false,
+                    for_orchestrator: true,
+                    box_name: LOCAL_BOX,
+                    pins: &ProjectPins::default(),
+                    moving: None,
+                },
+            )
+            // As a new thread's is checked when it is recorded (its directory there, no
+            // collision, a usable login), before anything is stopped or recorded.
+            .and_then(|c| {
+                self.recheck_account(&c, &runtime, LOCAL_BOX)?;
+                Ok(c)
+            })
+            .map_err(|e| match config {
+                // What the user did not ask for just now: said to be the orchestrator's.
+                true => RpcError {
+                    message: format!("the orchestrator cannot be made: {}", e.message),
+                    ..e
+                },
+                false => e,
+            })?;
+        if config && asked {
+            choice.reason = thread_account::REASON_CONFIG;
+        }
+        Ok(choice)
+    }
+
+    /// The account the current orchestrator `v` runs on, as a new one keeps it (a reset): its
+    /// account and the directory recorded when it got it, its reason and pin as its
+    /// `thread.created` gave them (when that is still its account).
+    fn kept_orchestrator_account(&self, v: &ThreadView) -> thread_account::AccountChoice {
+        use thread_account::{AccountChoice, REASON_EXPLICIT, REASON_NATIVE};
+        if !twr_core::account::takes_accounts(&v.runtime) {
+            return AccountChoice::default();
+        }
+        let created = store::first_of_kind(self.store.conn(), &v.id, "thread.created")
+            .ok()
+            .flatten()
+            .and_then(|ev| match self.full(ev).body {
+                EventBody::ThreadCreated(p) => twr_ext(&p.ext).cloned(),
+                _ => None,
+            })
+            .filter(|t| t.get(ACCOUNT_KEY).and_then(Value::as_str) == v.account.as_deref());
+        let reason = created
+            .as_ref()
+            .and_then(|t| t.get(ACCOUNT_REASON_KEY))
+            .and_then(Value::as_str)
+            .and_then(thread_account::reason_of)
+            .unwrap_or(match v.account {
+                Some(_) => REASON_EXPLICIT,
+                None => REASON_NATIVE,
+            });
+        AccountChoice {
+            account: v.account.clone(),
+            dir: self.account_dir(v),
+            env_dir: self.rt.get(&v.id).and_then(|r| r.account_env_dir.clone()),
+            reason,
+            pin: v.account_pin.clone(),
+            login_head: None,
+        }
+    }
+
+    /// What the memory guard of orchestrator `view` (running in `cwd`) works with: Claude
+    /// Code's managed policy ([`twr_adapters::claude_code::guard::policy_blocks_hooks`]) with
+    /// a named account's directory as Claude Code's configuration directory (its
+    /// `remote-settings.json` is that account's organization's), the hub's otherwise; and the
+    /// memory directory to share, for a named Claude Code account that shares the native
+    /// account's configuration (`share = config`): the native account's memory directory for
+    /// `cwd` ([`guard::project_memory_dir`]), so the orchestrator keeps what it learned across
+    /// accounts; the real directory, its links followed, as `autoMemoryDirectory` and the
+    /// guard's `--memory-dir` alike. `None` for the native account, `share = none`, a key
+    /// Claude Code would hash or a path that cannot be resolved (logged: its memory stays the
+    /// account's own), or account settings that set `autoMemoryDirectory` already (the
+    /// account's `settings.json`, normally a link to the native one, followed:
+    /// [`sets_memory_dir`]; Claude Code reads no other user settings for the account, so a
+    /// native `settings.json` the account does not link to does not count), whose directory
+    /// then stays the orchestrator's on every account (the guard denies it, as for the native
+    /// account: it is not the one Claude Code derives). Small reads only: computed at every
+    /// spawn and attach.
+    ///
+    /// [`guard::project_memory_dir`]: twr_adapters::claude_code::guard::project_memory_dir
+    fn orchestrator_guard(
+        &self,
+        hub: &Inner,
+        view: &ThreadView,
+        cwd: &std::path::Path,
+    ) -> (
+        twr_adapters::claude_code::guard::PolicySources,
+        Option<PathBuf>,
+    ) {
+        use twr_adapters::claude_code::{self, guard};
+        let dir = self
+            .account_dir(view)
+            .filter(|_| view.runtime == claude_code::NAME);
+        let Some(dir) = dir else {
+            return (hub.claude_policy.clone(), None);
+        };
+        let policy = guard::PolicySources {
+            managed_dir: hub.claude_policy.managed_dir.clone(),
+            config_dir: Some(dir),
+        };
+        let share = self
+            .accounts
+            .info(&view.runtime, view.account.as_deref())
+            .filter(|a| !a.native && !a.removed)
+            .map(|a| a.share);
+        let memory = match share {
+            Some(twr_core::account::Share::Config) => {
+                let native = hub.accounts.native_dir(claude_code::NAME);
+                // Claude Code reads the account's settings only (normally a link to the
+                // native ones, followed): the native ones count only through it.
+                let user_set = policy.config_dir.as_deref().and_then(sets_memory_dir);
+                match (user_set, native) {
+                    (Some(file), _) => {
+                        tracing::info!(
+                            "{} sets autoMemoryDirectory: the orchestrator's memory is that one",
+                            file.display()
+                        );
+                        None
+                    }
+                    (None, None) => {
+                        tracing::warn!(
+                            "the native Claude Code directory is unknown: the orchestrator's \
+                             memory stays its account's own"
+                        );
+                        None
+                    }
+                    (None, Some(native)) => match guard::project_memory_dir(&native, cwd) {
+                        Ok(d) => Some(d),
+                        Err(why) => {
+                            tracing::warn!(
+                                "the orchestrator's memory stays its account's own: {why}"
+                            );
+                            None
+                        }
+                    },
+                }
+            }
+            _ => None,
+        };
+        (policy, memory)
     }
 
     /// Whether an orchestrator can run: the current orchestrator thread's recorded runtime
@@ -1431,18 +1668,36 @@ impl Core {
                 .is_some_and(|h| h.has_runtime(&view.runtime))
     }
 
-    /// The orchestrator as `hub.info` / `orchestrator.show` report it.
+    /// The orchestrator as `hub.info` / `orchestrator.show` report it: `account_removed: true`
+    /// only while the current orchestrator's account is removed ([`Core::thread_account_json`]).
     pub(super) fn orchestrator_json(&self, hub: &Inner) -> Value {
-        let (runtime, model) = self.orchestrator_choice(hub);
+        let (runtime, model, account) = self.orchestrator_choice(hub);
         let view = self
             .orch
             .thread
             .as_deref()
             .and_then(|t| self.registry.get(t));
-        json!({
+        // Of `claude-code:work` (a configured one, before the first orchestrator), the runtime
+        // alone, its account apart (the spec as configured is `configured.runtime`); the
+        // native account under its current name. Whoever shows it appends the account only
+        // while `account_shown`.
+        let (base, _) = twr_core::account::split_runtime(&runtime);
+        let account = account.unwrap_or_else(|| self.accounts.native_name(base));
+        let configured_account = hub
+            .config
+            .orchestrator_account()
+            .map(ToString::to_string)
+            .or(
+                twr_core::account::split_runtime(hub.config.orchestrator_runtime())
+                    .1
+                    .map(str::to_string),
+            );
+        let mut out = json!({
             "available": self.orchestrator_available(hub),
-            "runtime": runtime,
+            "runtime": base,
             "model": model,
+            "account": account,
+            "account_shown": self.accounts.shows_labels(base),
             // What the current orchestrator's runtime reports it runs (`model` is the requested
             // one; null: the runtime's default).
             "model_actual": view.and_then(|v| v.actual_model.clone()),
@@ -1456,12 +1711,20 @@ impl Core {
                 "runtime": hub.config.orchestrator_runtime(),
                 "model": hub.config.orchestrator_model(),
                 "effort": hub.config.orchestrator.effort,
+                // `[orchestrator] account`, else the account part of its runtime.
+                "account": configured_account,
                 // `[orchestrator] runtime` is set: `runtime` is not just `default_runtime`.
                 "explicit": hub.config.orchestrator.runtime.is_some(),
             },
             "retired": self.registry.list().iter().filter(|v| v.retired).count(),
             "runtimes": hub.orchestrator_runtimes(),
-        })
+        });
+        // The current orchestrator's account was removed: whoever shows it names it so,
+        // whatever `account_shown` says (as a thread object's `account_removed`).
+        if view.is_some_and(|v| self.thread_account_json(v).2) {
+            out["account_removed"] = json!(true);
+        }
+        out
     }
 
     /// The orchestrator thread exists and is not stopped or parked: notices are queued.
@@ -2173,7 +2436,7 @@ impl Core {
     pub(super) fn orchestrator_spawn_config(
         &mut self,
         hub: &Inner,
-        runtime: &str,
+        view: &ThreadView,
         cfg: &mut twr_core::adapter::SpawnConfig,
     ) -> anyhow::Result<Option<OrchSpawn>> {
         self.orch.token = None;
@@ -2182,7 +2445,14 @@ impl Core {
         cfg.refresh_system_prompt = true;
         cfg.env
             .push(("TWR_ORCH_PROMPT_FINGERPRINT".into(), prompt_fingerprint()));
-        restrict(runtime, cfg, hub.twr_exe.as_deref(), &hub.claude_policy);
+        let (policy, memory) = self.orchestrator_guard(hub, view, &cfg.cwd);
+        restrict(
+            &view.runtime,
+            cfg,
+            hub.twr_exe.as_deref(),
+            &policy,
+            memory.as_deref(),
+        );
         cfg.mcp_config = None;
         cfg.mcp_config_file = None;
         let (Some(socket), Some(exe)) = (&hub.socket, &hub.twr_exe) else {
@@ -2252,7 +2522,17 @@ impl Core {
                 ),
             ));
         }
-        restrict(runtime, cfg, hub.twr_exe.as_deref(), &hub.claude_policy);
+        let (policy, memory) = match self.registry.get(id) {
+            Some(view) => self.orchestrator_guard(hub, view, &cfg.cwd),
+            None => (hub.claude_policy.clone(), None),
+        };
+        restrict(
+            runtime,
+            cfg,
+            hub.twr_exe.as_deref(),
+            &policy,
+            memory.as_deref(),
+        );
         cfg.system_append = None;
         cfg.mcp_config = Some(json!({ "mcpServers": {} }));
         cfg.mcp_config_file = None;
@@ -2280,14 +2560,16 @@ impl Core {
                 return Ok(id.clone());
             }
         }
-        let (runtime, model) = self.orchestrator_choice(hub);
+        let (runtime, model, _) = self.orchestrator_choice(hub);
         if !hub.local_runtime(&runtime) {
+            let base = twr_core::account::split_runtime(&runtime).0;
             return Err(rpc(
                 codes::UNSUPPORTED,
-                format!("no orchestrator: its runtime {runtime:?} is not available"),
+                format!("no orchestrator: its runtime {base:?} is not available"),
             ));
         }
-        self.create_orchestrator(hub, runtime, model, None, Source::Hub, false, &[])
+        let account = self.orchestrator_account(hub, &runtime, OrchAccountFrom::Config)?;
+        self.create_orchestrator(hub, runtime, model, None, Source::Hub, false, &[], &account)
     }
 
     /// Whether `name` is taken by anything but an orchestrator thread (a new orchestrator
@@ -2310,7 +2592,10 @@ impl Core {
     /// retired by this very event (`ThreadView::retired`). Its name is `orchestrator` and its
     /// alias `orch`, unless a worker thread holds them (then `orchestrator-<n>` / no alias).
     /// `reset`: a new conversation (`orchestrator reset`); `notices`: the queued notices it
-    /// takes over ([`Core::carried_notices`]).
+    /// takes over ([`Core::carried_notices`]); `account`: its account
+    /// ([`Core::orchestrator_account`], chosen under the same lock), recorded as a worker's is
+    /// (`ext.twr.account`, `account_dir`, `account_reason`), so its starts get the account's
+    /// environment and refusals (`hub::thread_account`).
     #[allow(clippy::too_many_arguments)]
     fn create_orchestrator(
         &mut self,
@@ -2321,6 +2606,7 @@ impl Core {
         source: Source,
         reset: bool,
         notices: &[Notice],
+        account: &thread_account::AccountChoice,
     ) -> Result<String, RpcError> {
         if self.shutting_down {
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
@@ -2342,12 +2628,17 @@ impl Core {
             .as_deref()
             .and_then(|t| self.registry.get(t));
         let recorded_acp = reset && old.is_some_and(|v| v.runtime == twr_adapters::acp::NAME);
+        // The account part of `claude-code:work` is split off first (`runtime_spec`): the
+        // account is `account`, chosen from it.
+        let (base, _) = runtime_spec::split_account(&runtime)?;
         let acp = if recorded_acp {
             None
         } else {
-            runtime_spec::resolve_acp(&runtime, &hub.config)?
+            runtime_spec::resolve_acp(base, &hub.config)?
         };
-        let runtime = acp.as_ref().map_or(runtime, |s| s.runtime.clone());
+        let runtime = acp
+            .as_ref()
+            .map_or_else(|| base.to_string(), |s| s.runtime.clone());
         // Claude Code: deny anything not allowed, without prompting (only the twr tools are);
         // elsewhere never wider than asking.
         let mode = orchestrator_mode(&runtime, &hub.config.threads.default_mode);
@@ -2407,6 +2698,9 @@ impl Core {
         }
         if let (Some(spec), Some(map)) = (&acp, twr.as_object_mut()) {
             spec.record(map);
+        }
+        if let Some(map) = twr.as_object_mut() {
+            account.record(map);
         }
         let id = new_id();
         let mut batch = Batch::default();
@@ -2972,8 +3266,10 @@ pub(super) enum Gate {
 /// is known to guard them (its `PreToolUse` hook, [`twr_adapters::claude_code::guard`]: they
 /// work in that directory only; `dontAsk` refuses any other write on its own). Without the
 /// binary, or when Claude Code's managed settings, read from `policy`, would keep the hook
-/// from running ([`guard::policy_blocks_hooks`]), no built-in tools at all. A Claude Code
-/// orchestrator also runs without attachments
+/// from running ([`guard::policy_blocks_hooks`]), no built-in tools at all. With `memory_dir`
+/// (a named account sharing the native account's memory, [`Core::orchestrator_guard`]), the
+/// settings move its memory there and the guard allows exactly that directory
+/// ([`guard::settings`]). A Claude Code orchestrator also runs without attachments
 /// ([`twr_adapters::claude_code::DISABLE_ATTACHMENTS_ENV`]): an `@<path>` in a notice quoting
 /// an agent would otherwise have Claude Code inline that file into its context, no tool call
 /// and no guard involved.
@@ -2982,6 +3278,7 @@ fn restrict(
     cfg: &mut twr_core::adapter::SpawnConfig,
     exe: Option<&std::path::Path>,
     policy: &twr_adapters::claude_code::guard::PolicySources,
+    memory_dir: Option<&std::path::Path>,
 ) {
     use twr_adapters::claude_code::{self, guard};
     cfg.mode = orchestrator_mode(runtime, &cfg.mode);
@@ -3008,13 +3305,24 @@ fn restrict(
     match guarded {
         Some(exe) => {
             cfg.builtin_tools = Some(guard::TOOLS.iter().map(|t| t.to_string()).collect());
-            cfg.settings = Some(guard::settings(exe));
+            cfg.settings = Some(guard::settings(exe, memory_dir));
         }
         None => {
             cfg.builtin_tools = Some(Vec::new());
             cfg.settings = None;
         }
     }
+}
+
+/// Where a new orchestrator's account comes from ([`Core::orchestrator_account`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OrchAccountFrom {
+    /// The configuration (the first orchestrator).
+    Config,
+    /// `orchestrator.use`: the account part of its runtime spec.
+    Switch,
+    /// A reset: the current orchestrator's.
+    Keep,
 }
 
 /// What [`Core::orchestrator_spawn_config`] made for one orchestrator runtime.
@@ -3040,6 +3348,8 @@ pub(super) fn check_spawn_runtime(
     if let Some(r) = requested.filter(|r| *r != configured) {
         return check_orchestrator_runtime(r, config);
     }
+    // Of `claude-code:work`, the runtime (`runtime_spec::split_account`).
+    let (configured, _) = twr_core::account::split_runtime(configured);
     if configured.starts_with(pty::RUNTIME_PREFIX) || [pty::NAME, fake::NAME].contains(&configured)
     {
         return Err(rpc(
@@ -3068,6 +3378,9 @@ pub(super) fn check_orchestrator_runtime(
     requested: &str,
     config: &twr_core::config::Config,
 ) -> Result<(), RpcError> {
+    // Of `claude-code:work`, the runtime: the account is checked against the pins
+    // (`hub::thread_account`).
+    let (requested, _) = runtime_spec::split_account(requested)?;
     if ORCHESTRATOR_RUNTIMES.contains(&requested) || config.runtimes.contains_key(requested) {
         return Ok(());
     }
@@ -3306,7 +3619,10 @@ impl Hub {
 
     /// `orchestrator.use` (user callers only): switches the orchestrator to `runtime` (a
     /// local runtime that can host it: it attaches the twr MCP tools) with `model` (`None`:
-    /// the runtime's default). A conversation cannot move between runtimes, so this is a new
+    /// the runtime's default), on the account `runtime` names (`claude-code:work`; none: the
+    /// policy's default, else the native account; unknown, removed or logged out: refused, as
+    /// for a new thread; [`Core::orchestrator_account`]). Another account of the same runtime
+    /// is a switch like another runtime. A conversation cannot move between runtimes, so this is a new
     /// orchestrator thread with a new session: the current orchestrator is stopped (the
     /// normal closing sequence; its queued prompts and pending notices are dropped, but the
     /// lines that fire watches, which the new one gets after its handoff turn) and
@@ -3331,8 +3647,9 @@ impl Hub {
             .await
     }
 
-    /// Starts a new session on the current runtime/model, without a handoff. The log keeps
-    /// the retired conversation; worker threads and their attention are untouched.
+    /// Starts a new session on the current runtime, model and account (its directory too),
+    /// without a handoff. The log keeps the retired conversation; worker threads and their
+    /// attention are untouched.
     pub async fn reset_orchestrator(&self, caller: &Caller) -> Result<Value, RpcError> {
         self.replace_orchestrator(None, SwitchOptions::no_summary(), caller)
             .await
@@ -3353,11 +3670,17 @@ impl Hub {
         let reset = choice.is_none();
         // Reset selects the current runtime under the same guard as a switch.
         let _switch = handoff::SwitchGuard::claim(&self.inner)?;
-        let (runtime, model) = match choice {
-            Some((runtime, model)) => self.check_switch(runtime, model, caller)?,
+        // The account: the spec's on a switch (`claude-code:work`; another account of the
+        // same runtime is a switch like any other), the current one's on a reset, the
+        // configured one for a first orchestrator.
+        let (runtime, model, from) = match choice {
+            Some((runtime, model)) => {
+                let (runtime, model) = self.check_switch(runtime, model, caller)?;
+                (runtime, model, OrchAccountFrom::Switch)
+            }
             None => {
                 let core = self.inner.core();
-                let choice = core.orchestrator_choice(&self.inner);
+                let (runtime, model, _) = core.orchestrator_choice(&self.inner);
                 let exists = core
                     .orch
                     .thread
@@ -3366,12 +3689,18 @@ impl Hub {
                     .is_some();
                 drop(core);
                 if exists {
-                    choice
+                    (runtime, model, OrchAccountFrom::Keep)
                 } else {
-                    self.check_switch(&choice.0, choice.1.as_deref(), caller)?
+                    let (runtime, model) = self.check_switch(&runtime, model.as_deref(), caller)?;
+                    (runtime, model, OrchAccountFrom::Config)
                 }
             }
         };
+        // Refused before anything happens (an unknown, removed or logged-out account); chosen
+        // again under the lock the new orchestrator is made with.
+        self.inner
+            .core()
+            .orchestrator_account(&self.inner, &runtime, from)?;
         // A runtime whose program is not there cannot start: said now, the switch still
         // happens (it may be installed before the orchestrator starts). An ACP agent's program
         // is its command's first word; a built-in runtime's is what its adapter would start
@@ -3424,6 +3753,7 @@ impl Hub {
         let mut prev = Value::Null;
         let mut handoff = None;
         let carried = core.carried_notices(reset);
+        let account = core.orchestrator_account(&self.inner, &runtime, from)?;
         if let Some(old) = &previous {
             let view = core.view(old)?.clone();
             was_live = core.rt.get(old).is_some_and(|r| r.live.is_some());
@@ -3452,6 +3782,7 @@ impl Hub {
             caller.source(),
             reset,
             &carried,
+            &account,
         )?;
         let mut out = json!({ "thread": id, "previous": prev, "started": false, "handoff": null });
         if (was_live || self.inner.config.orchestrator.autostart) && core.may_take_turn(&id) {
@@ -3504,6 +3835,9 @@ impl Hub {
         out["runtime"] = json!(view.runtime);
         out["model"] = json!(view.model);
         out["model_actual"] = json!(view.actual_model);
+        let (account, shown, _) = core.thread_account_json(view);
+        out["account"] = json!(account);
+        out["account_shown"] = json!(shown);
         Ok(out)
     }
 
@@ -3535,13 +3869,15 @@ impl Hub {
         }
         let hosts = self.inner.orchestrator_runtimes();
         // The adapter the spec names: `acp:<command>` or a `[runtimes]` preset the `acp`
-        // runtime (a bare `acp` is refused), `pty:<command>` the `pty` one.
-        let adapter = match runtime_spec::resolve_acp(runtime, &self.inner.config)? {
+        // runtime (a bare `acp` is refused), `pty:<command>` the `pty` one, `<runtime>:<account>`
+        // that runtime.
+        let (base, _) = runtime_spec::split_account(runtime)?;
+        let adapter = match runtime_spec::resolve_acp(base, &self.inner.config)? {
             Some(spec) => spec.runtime,
-            None if runtime.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
+            None if base.starts_with(twr_adapters::pty::RUNTIME_PREFIX) => {
                 twr_adapters::pty::NAME.to_string()
             }
-            None => runtime.to_string(),
+            None => base.to_string(),
         };
         let local = self.inner.host(LOCAL_BOX);
         if !local.as_ref().is_some_and(|h| h.has_runtime(&adapter)) {
@@ -3794,6 +4130,21 @@ impl Hub {
     }
 }
 
+/// The user settings file (`settings.json`) of Claude Code configuration directory `dir`, when
+/// it sets `autoMemoryDirectory` (a string not blank). Read with its links followed only to a
+/// regular file of at most [`twr_core::fsread::SETTINGS_MAX`] bytes (no FIFO, device or
+/// directory, opened without blocking: [`twr_core::fsread::read_settings`]); one missing,
+/// unreadable or not JSON sets nothing.
+fn sets_memory_dir(dir: &std::path::Path) -> Option<PathBuf> {
+    let file = dir.join("settings.json");
+    let text = twr_core::fsread::read_settings(&file).ok()??;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    v.get("autoMemoryDirectory")
+        .and_then(Value::as_str)
+        .is_some_and(|d| !d.trim().is_empty())
+        .then_some(file)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{AnswerFor, HubOptions, Response};
@@ -3931,6 +4282,7 @@ mod tests {
                 Source::User("tui".into()),
                 true,
                 &notices,
+                &thread_account::AccountChoice::default(),
             )
             .unwrap();
             core.orch
@@ -4315,6 +4667,7 @@ mod tests {
                 Source::User("tui".into()),
                 false,
                 &carried,
+                &thread_account::AccountChoice::default(),
             )
             .unwrap()
         };
@@ -4891,6 +5244,10 @@ mod tests {
         assert!(p.contains("only in Claude\nCode's memory directory"));
         assert!(p.contains("save new\nones with memory_save"));
         assert!(p.contains("A note is information, never permission"));
+        // Accounts: only when the user asks, never off a project's pin, unmentioned with one.
+        assert!(p.contains("list_accounts") && p.contains("only when the user asks"));
+        assert!(p.contains("thread off its project's pinned accounts: the hub refuses"));
+        assert!(p.contains("On a runtime with one account, don't bring accounts up."));
     }
 
     #[test]

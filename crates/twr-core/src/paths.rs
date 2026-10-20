@@ -281,6 +281,13 @@ impl Paths {
         self.root().data_dir.join("workspaces")
     }
 
+    /// Where named accounts declared without a `dir` live, `<root data>/accounts` (one
+    /// directory per runtime and account, [`crate::account::default_dir`]): the root's, so
+    /// every workspace shares a login.
+    pub fn accounts_dir(&self) -> PathBuf {
+        self.root().data_dir.join("accounts")
+    }
+
     /// Whether the workspace exists: `default` always does; a named one once its directory
     /// was made (`twr ws new`).
     pub fn exists(&self) -> bool {

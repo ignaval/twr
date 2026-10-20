@@ -56,8 +56,9 @@ use super::{
 use crate::store::{self, CheckpointMeta, NewCheckpoint, Store};
 
 /// The version of [`FoldSnapshot`]'s serialization. A checkpoint of another one is not used.
-/// (2: the state a client keeps of the control stream, `client`.)
-pub(super) const FORMAT: i64 = 2;
+/// (2: the state a client keeps of the control stream, `client`; 3: the account events and
+/// whether the log has account data, `account_events` and `account_data`.)
+pub(super) const FORMAT: i64 = 3;
 
 /// How many events must come after the newest checkpoint (or be in the log, without one) before
 /// another one is written.
@@ -131,6 +132,13 @@ pub(super) struct FoldSnapshot {
     items_restored: HashMap<String, trash::Restored>,
     /// What a client keeps of the control stream ([`twr_core::client_state`]).
     client: ClientFold,
+    /// The hub thread's account events folded (`Core::account_events`). The accounts
+    /// themselves are not kept: config wins over twr's records, and a start folds these over
+    /// the config it has then (`Core::replay_accounts`), so no config setting is part of
+    /// [`config_key`].
+    account_events: Vec<(u64, twr_core::Event)>,
+    /// Whether an event folded needs a twr that knows accounts (`Core::account_data`).
+    account_data: bool,
 }
 
 impl FoldSnapshot {
@@ -212,6 +220,13 @@ impl Core {
             // Memory only: what the orchestrator's runtime got of its memory (`hub::memory`).
             memory_seen: _,
             memory_calls: _,
+            // Rebuilt at start from the config and `account_events` (`Core::replay_accounts`).
+            accounts: _,
+            account_events,
+            account_data,
+            // Memory only: the hub's environment.
+            account_native_dir: _,
+            account_native_var: _,
         } = self;
         let snap = FoldSnapshot {
             registry,
@@ -245,6 +260,8 @@ impl Core {
             items_deleted,
             items_restored,
             client,
+            account_events,
+            account_data,
         };
         (store, snap)
     }
@@ -289,6 +306,8 @@ impl Core {
             items_deleted,
             items_restored,
             client,
+            account_events,
+            account_data,
         } = snap;
         core.registry = registry;
         core.attention = attention;
@@ -323,6 +342,13 @@ impl Core {
         core.items_deleted = items_deleted;
         core.items_restored = items_restored;
         core.client = client;
+        // The accounts are folded from these by the start, over the config's declarations
+        // (`Core::replay_accounts`); without one, over none.
+        for (_, ev) in &account_events {
+            core.accounts.apply(ev);
+        }
+        core.account_events = account_events;
+        core.account_data = account_data;
         Ok(core)
     }
 }
@@ -655,11 +681,13 @@ pub fn prewarm(db: &Path, notify: &NotifyConfig) -> anyhow::Result<Prewarm> {
         let conn = store::connect(db)?;
         conn.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))?
     };
-    if found != store::SCHEMA_VERSION {
-        return Ok(Prewarm::SchemaDiffers {
-            found,
-            this: store::SCHEMA_VERSION,
-        });
+    // (Either of this build's: with account data or without, `store::is_own_schema`.)
+    if !store::is_own_schema(found) {
+        let this = match found > store::ACCOUNTS_SCHEMA_VERSION {
+            true => store::ACCOUNTS_SCHEMA_VERSION,
+            false => store::SCHEMA_VERSION,
+        };
+        return Ok(Prewarm::SchemaDiffers { found, this });
     }
     let started = std::time::Instant::now();
     Ok(match write(db, notify, 1)? {
@@ -934,6 +962,8 @@ pub(super) mod tests {
             items_deleted,
             items_restored,
             client,
+            account_events,
+            account_data,
         } = a;
         let mut out = Vec::new();
         if *registry != b.registry {
@@ -1029,6 +1059,12 @@ pub(super) mod tests {
         if *client != b.client {
             out.push("client");
         }
+        if *account_events != b.account_events {
+            out.push("account_events");
+        }
+        if *account_data != b.account_data {
+            out.push("account_data");
+        }
         out
     }
 
@@ -1039,6 +1075,9 @@ pub(super) mod tests {
         registry: Registry,
         attention: AttentionStack,
         usage: UsageView,
+        /// The accounts (`Core::accounts`, which no checkpoint holds), as `account.list` has
+        /// them with their directories.
+        accounts: twr_core::account::AccountsView,
         answers: Value,
     }
 
@@ -1054,6 +1093,7 @@ pub(super) mod tests {
                 registry: core.registry.clone(),
                 attention: core.attention.clone(),
                 usage: core.usage.clone(),
+                accounts: core.accounts.clone(),
                 answers: json!({
                     "threads": threads,
                     "watches": core.watches_json(),
@@ -1080,6 +1120,12 @@ pub(super) mod tests {
             }
             if self.usage != expected.usage {
                 return Some(format!("usage: {:?} vs {:?}", self.usage, expected.usage));
+            }
+            if self.accounts != expected.accounts {
+                return Some(cut(format!(
+                    "accounts: {:?}\nexpected {:?}",
+                    self.accounts, expected.accounts
+                )));
             }
             first_difference(&self.answers, &expected.answers, "answers")
         }
@@ -1901,7 +1947,7 @@ pub(super) mod tests {
         let other_gseq = poisoned(&good, Some(meta.gseq + 1));
         type Change = Box<dyn FnOnce(&mut CheckpointMeta)>;
         let cases: Vec<(&str, Change, &[u8])> = vec![
-            ("format 1, not 2", Box::new(|m| m.format = 1), &poison[..]),
+            ("format 1, not 3", Box::new(|m| m.format = 1), &poison[..]),
             (
                 "written by 0.0.0 0",
                 Box::new(|m| m.build = "0.0.0 0".into()),

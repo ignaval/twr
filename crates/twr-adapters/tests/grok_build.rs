@@ -1083,6 +1083,35 @@ fn prompt_errors_end_the_turn_with_an_error() {
     assert_eq!(e.result, TurnResult::Error);
     assert_eq!(grok_ext(&e.ext)["error"]["message"], "Rate limit exceeded");
     assert_eq!(grok_ext(&e.ext)["transient"], true);
+    assert!(e.ext.as_ref().unwrap()["twr"].get("limit").is_none());
+}
+
+/// A prompt error naming grok's usage limit or spending cap carries `ext.twr.limit` (no reset
+/// time) and is not transient; a rate limit stays transient.
+#[test]
+fn usage_limits_and_spending_caps_are_limits() {
+    for (message, kind) in [
+        ("You've reached your free Grok Build usage limit", "usage"),
+        ("UsagePoolExhausted: no credits left in the pool", "usage"),
+        ("Your team hit its monthly spending cap", "spend"),
+    ] {
+        let mut tr = ready();
+        tr.send("x", 1);
+        let out = tr.translate(
+            &json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32603, "message": message}})
+                .to_string(),
+        );
+        let e = ended(&out.events)[0];
+        assert_eq!(e.result, TurnResult::Error);
+        assert_eq!(
+            e.ext.as_ref().unwrap()["twr"]["limit"],
+            json!({"kind": kind, "message": message}),
+            "{message}"
+        );
+        assert_eq!(e.ext.as_ref().unwrap()["twr"]["error"], message);
+        assert_eq!(grok_ext(&e.ext)["transient"], false, "{message}");
+        assert!(grok_ext(&e.ext).get("transient_reason").is_none());
+    }
 }
 
 #[test]

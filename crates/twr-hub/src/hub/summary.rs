@@ -432,7 +432,9 @@ impl Hub {
         let probe = Probe {
             agents: &agents,
             at: hub.local_agents.probed_at(),
-            codex_home: suggest::codex_home(hub.suggest_codex_home.as_deref()),
+            codex_home: suggest::codex_home(hub.suggest_codex_home.as_deref(), || {
+                hub.accounts.native_dir(twr_adapters::codex::NAME)
+            }),
         };
         let reply = |summary, ran, cached, reason: Option<String>, next_after| Reply {
             thread: &id,

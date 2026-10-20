@@ -220,7 +220,7 @@ pub async fn probe_with(
         let (runtime, ..) = BUILTIN_AGENTS[i];
         let program = resolve::runtime_program(runtime, &var).unwrap_or_default();
         let r = resolve::resolve(&program, env, None, Path::new(""));
-        probe_one(runtime, r, limit)
+        probe_one(runtime, r, &[], &[], limit)
     };
     let (a, b, c) = tokio::join!(one(0), one(1), one(2));
     vec![a, b, c]
@@ -229,8 +229,32 @@ pub async fn probe_with(
 // `probe_with` probes each of them.
 const _: () = assert!(BUILTIN_AGENTS.len() == 3);
 
-/// One agent: its version and login state, both at once.
-async fn probe_one(runtime: &str, r: Resolved, limit: Duration) -> AgentInfo {
+/// One account of built-in agent runtime `runtime`: [`probe_with`]'s probe of that runtime
+/// alone (its program resolved the same way, on `env`'s `PATH` else the runner's), its
+/// commands run with `env` set and then `remove` removed (the account's variables and the
+/// stray credentials of [`crate::account::account_env`]). Grok Build stays unknown (no status
+/// command).
+pub async fn probe_account(
+    runtime: &str,
+    env: &[(String, String)],
+    remove: &[String],
+    var: impl Fn(&str) -> Option<OsString>,
+    limit: Duration,
+) -> AgentInfo {
+    let program = resolve::runtime_program(runtime, &var).unwrap_or_default();
+    let r = resolve::resolve(&program, env, None, Path::new(""));
+    probe_one(runtime, r, env, remove, limit).await
+}
+
+/// One agent: its version and login state, both at once, each command with `extra` set and
+/// `remove` removed.
+async fn probe_one(
+    runtime: &str,
+    r: Resolved,
+    extra: &[(String, String)],
+    remove: &[String],
+    limit: Duration,
+) -> AgentInfo {
     let mut info = AgentInfo {
         runtime: runtime.to_string(),
         ..Default::default()
@@ -247,9 +271,12 @@ async fn probe_one(runtime: &str, r: Resolved, limit: Duration) -> AgentInfo {
     info.path = Some(printable(&found.to_string_lossy(), MAX_PATH));
     let command = |args: &[&str]| {
         let mut cmd = tokio::process::Command::new(&found);
-        cmd.args(args);
+        cmd.args(args).envs(extra.iter().cloned());
         if let Some(p) = &r.path {
             cmd.env("PATH", p);
+        }
+        for k in remove {
+            cmd.env_remove(k);
         }
         cmd
     };

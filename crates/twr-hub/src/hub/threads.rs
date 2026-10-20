@@ -2,7 +2,7 @@
 //! thread's workspace before `thread.created`), `thread.list` / `thread.get`, `thread.send` and
 //! `thread.stop`.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,8 +15,8 @@ use twr_core::proto::{codes, RpcError};
 use super::lifecycle::data_dir_of;
 use super::{
     append_err, box_agents, find_project, git, internal, orch, project_read, rpc, runtime_spec,
-    twr_ext_map, Batch, BatchPrompt, Caller, Core, Exit, Hub, Inner, NewThread, Planned,
-    SendOutcome, LOCAL_BOX, MAX_ALIASES,
+    thread_account, twr_ext_map, Batch, BatchPrompt, Caller, Core, Exit, Hub, Inner, NewThread,
+    Planned, SendOutcome, LOCAL_BOX, MAX_ALIASES,
 };
 use crate::host::ThreadHost;
 use crate::remote::BoxOp;
@@ -222,11 +222,22 @@ impl Hub {
     /// name that is none of these is looked up under `project_roots` ([`find_project`]); the
     /// repository found is then the project's absolute path, and the result says so
     /// (`project_found`).
+    ///
+    /// The account it runs on is chosen right after its runtime (`hub::thread_account`): one
+    /// it cannot have refuses it before its workspace is made, and an explicit account on
+    /// another box than the hub's own before that box is asked; an account removed while the
+    /// workspace was made refuses it under the lock it would be recorded with.
     pub async fn new_thread_by(&self, req: NewThread, caller: &Caller) -> Result<Value, RpcError> {
         let cfg = &self.inner.config;
         if let Some(p) = &req.first_prompt {
             super::compact::refuse_compact_command(p, caller.from())?;
         }
+        // An account on another box: refused before the box is asked (`hub::thread_account`).
+        thread_account::refuse_remote_explicit(
+            &thread_box_name(&req, cfg),
+            req.account.as_deref(),
+            req.runtime.as_deref(),
+        )?;
         // Held until the thread is recorded (or refused): its box is not switched meanwhile.
         let (box_name, host, remote, mut op) = self.thread_box(&req)?;
         let found = self.find_project(&req, remote).await?;
@@ -243,6 +254,19 @@ impl Hub {
         let no_worktree = req.no_worktree
             || !(req.worktree || req.base.is_some() || cfg.project_worktree(&req.project));
         let spec = self.thread_runtime(&req, caller, target.runtime.as_deref(), &host)?;
+        // The configured project whose account pins apply: the one named, else the one of the
+        // repository the path is in, however it names it (looked up only when a pin could
+        // apply: the runtime takes accounts and some project pins or excludes accounts).
+        let pins_project = match target.configured {
+            true => Some(target.project.clone()),
+            false if self.pins_could_apply(&box_name) => {
+                self.pins_project(&host, &box_name, remote, &target.repo)
+                    .await
+            }
+            false => None,
+        };
+        let account =
+            self.thread_account(&req, caller, &spec, pins_project.as_deref(), &box_name)?;
         let runtime = spec.runtime.clone();
         let mode = self.thread_mode(&req, caller, &runtime)?;
         let model = thread_model(&req, cfg)?;
@@ -288,6 +312,8 @@ impl Hub {
                     false => Ok(()),
                 }
             })
+            // The account, as the registry has it now and as a start would check it.
+            .and_then(|()| core.recheck_account(&account, &runtime, &box_name))
             .and_then(|()| {
                 // The effort against the `claude` the thread's spawn will run: resolved with
                 // its environment in its directory, as the spawn resolves it.
@@ -317,6 +343,7 @@ impl Hub {
             twr.insert("effort".into(), json!(e));
         }
         spec.record(&mut twr);
+        account.record(&mut twr);
         // The worktree is made before `thread.created` and removed again if that append
         // fails. They cannot be one transaction (git is not in the log). A hub that dies in
         // between leaves an unused worktree (and its branch) but no thread: nothing was
@@ -329,6 +356,8 @@ impl Hub {
         }
         if target.configured {
             twr.insert("configured_project".into(), json!(true));
+        } else if let Some(p) = &pins_project {
+            twr.insert(ACCOUNT_PROJECT_KEY.into(), json!(p));
         }
         if let Some(path) = &found {
             twr.insert(
@@ -452,6 +481,139 @@ impl Hub {
         }
     }
 
+    /// Whether a project's account pins could apply to a thread on box `box_name`: some
+    /// configured project (`[projects]`, or the box's `[boxes.<box>.projects]`) has an
+    /// `account`, `accounts` or `exclude_accounts`. Otherwise there is nothing for
+    /// [`Hub::pins_project`] to find, and its git queries (a round trip to a remote box) are
+    /// not made. Whatever the runtime: a pin refuses a runtime that takes no accounts too, as
+    /// it does for a thread opened by the project's name.
+    fn pins_could_apply(&self, box_name: &str) -> bool {
+        let cfg = &self.inner.config;
+        let projects = cfg
+            .projects
+            .values()
+            .any(|p| p.account.is_some() || !p.accounts.is_empty() || p.exclude_accounts.is_some());
+        let box_projects = [
+            self.inner.box_config(box_name),
+            cfg.boxes.get(box_name).cloned(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|b| b.projects.into_values())
+        .any(|p| p.account.is_some() || !p.accounts.is_empty() || p.exclude_accounts.is_some());
+        projects || box_projects
+    }
+
+    /// For a move of thread `id` whose log names no
+    /// project for its pins (`ThreadView::pins_project`: made for a repository path before
+    /// they were recorded, or before its project was configured): the configured project of
+    /// its repository ([`Hub::pins_project`] on its repository, else its worktree), looked up
+    /// now, before the core is locked, and kept as `ThreadRt::looked_up_project` for the move
+    /// to apply its pins (`Core::account_move`). Nothing when the log names one, or no pin
+    /// could apply ([`Hub::pins_could_apply`]).
+    pub(super) async fn look_up_pins_project(&self, id: &str) {
+        if let Some(hook) = &self.inner.pins_lookup_hook {
+            hook(id).await;
+        }
+        let (view, host) = {
+            let core = self.inner.core();
+            let Some(view) = core.registry.get(id).cloned() else {
+                return;
+            };
+            let Some(host) = self.inner.host(&view.box_name) else {
+                return;
+            };
+            (view, host)
+        };
+        if view.pins_project().is_some() {
+            return;
+        }
+        let project = match (&view.repo, &view.worktree) {
+            _ if !self.pins_could_apply(&view.box_name) => None,
+            (Some(dir), _) | (None, Some(dir)) => {
+                self.pins_project(&host, &view.box_name, host.is_remote(), Path::new(dir))
+                    .await
+            }
+            (None, None) => None,
+        };
+        let mut core = self.inner.core();
+        if let Some(rt) = core.rt.get_mut(id) {
+            rt.looked_up_project = project;
+        }
+    }
+
+    /// The configured project whose account pins and exclusions apply to a new thread made
+    /// for repository path `dir` on box `box_name` (`remote`: another box than the hub's;
+    /// `hub::thread_account`): the one whose repository is the same repository, however `dir`
+    /// names it (a symlink, a subdirectory, another worktree of it), that is whose git common
+    /// directory is `dir`'s, as the box's git resolves both (symlinks followed); and one whose
+    /// directory is `dir` or holds it (on the hub's box with symlinks followed: a project
+    /// folder outside git, or a repository `dir` is nested in). The box's projects are its
+    /// `[boxes.<box>.projects]` over the hub's `[projects]` (whose `repo` is a path on that
+    /// box, as for a new thread). Of several, the one whose directory holds `dir` most
+    /// closely, else the first by name (any of them could have been named instead). `None`:
+    /// none is.
+    async fn pins_project(
+        &self,
+        host: &Arc<dyn ThreadHost>,
+        box_name: &str,
+        remote: bool,
+        dir: &Path,
+    ) -> Option<String> {
+        let cfg = &self.inner.config;
+        let mut repos: BTreeMap<String, PathBuf> = cfg
+            .projects
+            .iter()
+            .map(|(n, p)| (n.clone(), p.repo.clone()))
+            .collect();
+        if remote {
+            let configured = self
+                .inner
+                .box_config(box_name)
+                .or_else(|| cfg.boxes.get(box_name).cloned());
+            for (n, p) in configured.map(|b| b.projects).unwrap_or_default() {
+                repos.insert(n, p.repo);
+            }
+        }
+        if repos.is_empty() {
+            return None;
+        }
+        // (A remote box's paths are not the hub's to resolve.)
+        let real = |p: &Path| match remote {
+            true => p.to_path_buf(),
+            false => std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()),
+        };
+        let dir = real(dir);
+        let git = host.git();
+        let matching: Vec<(String, PathBuf)> = match git.git_common_dir(dir.clone()).await {
+            Ok(common) => {
+                let commons = futures::future::join_all(
+                    repos.values().map(|r| git.git_common_dir(r.clone())),
+                )
+                .await;
+                repos
+                    .into_iter()
+                    .zip(commons)
+                    .filter(|((_, r), c)| {
+                        c.as_ref().is_ok_and(|c| *c == common) || dir.starts_with(real(r))
+                    })
+                    .map(|(r, _)| r)
+                    .collect()
+            }
+            Err(_) => repos
+                .into_iter()
+                .filter(|(_, r)| dir.starts_with(real(r)))
+                .collect(),
+        };
+        // The closest one holding `dir` (the first by name of equals), else the first.
+        let closest = matching
+            .iter()
+            .rev()
+            .filter(|(_, r)| dir.starts_with(real(r)))
+            .max_by_key(|(_, r)| real(r).components().count());
+        closest.or(matching.first()).map(|(n, _)| n.clone())
+    }
+
     /// The repository a plain project name stands for on the hub's own box: `None` unless
     /// `project` is a plain folder name ([`find_project::is_plain_name`]) that is not a
     /// configured project, the thread is local, and `project_roots` is not empty. Exactly one
@@ -552,15 +714,7 @@ impl Hub {
         req: &NewThread,
     ) -> Result<(String, Arc<dyn ThreadHost>, bool, Option<BoxOp>), RpcError> {
         let cfg = &self.inner.config;
-        let box_name = req
-            .box_name
-            .clone()
-            .or_else(|| {
-                cfg.projects
-                    .get(&req.project)
-                    .and_then(|p| p.box_name.clone())
-            })
-            .unwrap_or_else(|| LOCAL_BOX.into());
+        let box_name = thread_box_name(req, cfg);
         let Some(host) = self.inner.host(&box_name) else {
             return Err(rpc(
                 codes::BOX_OFFLINE,
@@ -707,6 +861,39 @@ impl Hub {
             ));
         }
         Ok(spec)
+    }
+
+    /// The account of a new thread on `spec`'s runtime for `caller`, under the pins of
+    /// configured project `project` (the thread's, or its repository's: [`Hub::pins_project`];
+    /// `None`: a repository no configured project has) on box `box_name`
+    /// ([`thread_account::choose_account`]): `account`, else `spec`'s account part, else the
+    /// project's pin, else the runtime's `[account_policy] default`, else the native account.
+    fn thread_account(
+        &self,
+        req: &NewThread,
+        caller: &Caller,
+        spec: &runtime_spec::RuntimeSpec,
+        project: Option<&str>,
+        box_name: &str,
+    ) -> Result<thread_account::AccountChoice, RpcError> {
+        let explicit =
+            thread_account::explicit_pin(req.account.as_deref(), spec.account.as_deref())?;
+        // The box's configuration is read before the core is locked.
+        let pins = thread_account::project_pins(&self.inner, project, box_name, &spec.runtime);
+        let core = self.inner.core();
+        core.pick_account(
+            &self.inner.config,
+            &thread_account::AccountAsk {
+                runtime: &spec.runtime,
+                explicit,
+                outside_pin: req.outside_pin,
+                orchestrator: caller.is_orchestrator(),
+                for_orchestrator: false,
+                box_name,
+                pins: &pins,
+                moving: None,
+            },
+        )
     }
 
     /// The permission mode of a new thread on `runtime`, in its canonical spelling: `mode`,
@@ -940,6 +1127,18 @@ struct ThreadProject {
     /// A configured project on the hub's own box: its context root is recorded
     /// (`hub::context`).
     configured_local: bool,
+}
+
+/// The box of a new thread: `box`, else the project's `box`, else `local`.
+fn thread_box_name(req: &NewThread, cfg: &Config) -> String {
+    req.box_name
+        .clone()
+        .or_else(|| {
+            cfg.projects
+                .get(&req.project)
+                .and_then(|p| p.box_name.clone())
+        })
+        .unwrap_or_else(|| LOCAL_BOX.into())
 }
 
 /// The model of a new thread: `model`, else `threads.model` (blank: the runtime's default).

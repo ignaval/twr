@@ -169,7 +169,7 @@ impl Core {
                     format!(
                         "no orchestrator is configured to start a new thread (runtime {:?} is \
                          not available); answer with a thread, or use `new <project>: ...`",
-                        self.orchestrator_choice(hub).0
+                        twr_core::account::split_runtime(&self.orchestrator_choice(hub).0).0
                     ),
                 ));
             }
@@ -666,7 +666,7 @@ impl Hub {
                     "no orchestrator is available (runtime {:?} is not available): nothing was \
                      sent; say it without `to` to route it, or switch the orchestrator with \
                      `twr orchestrator use <runtime>`",
-                    core.orchestrator_choice(&self.inner).0
+                    twr_core::account::split_runtime(&core.orchestrator_choice(&self.inner).0).0
                 ),
             ));
         }

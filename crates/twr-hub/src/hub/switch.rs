@@ -67,8 +67,32 @@
 //!    is not due (the failed turn was a retry itself, the runtime is not signed in) or fails
 //!    too raises the `error` item as usual.
 //!
+//! **Accounts.** A session cannot move between accounts either, so a move to another account
+//! (`thread.set_model {account}`, or `runtime` `<runtime>:<account>`) is the same move, on the
+//! same runtime or with it: the identity compared is (runtime, agent, account and the
+//! directory the session began in, [`Core::account_move`]), so `--account work` on a thread
+//! whose `work` directory changed since is a move too. The account is chosen and checked like
+//! a new thread's (`hub::thread_account`), within the thread's own pin and its project's. The
+//! event says `account_changed`, `account` and `previous_account` (and `runtime` and
+//! `previous_runtime`, equal for an account-only move), with `ext.twr.account_dir`,
+//! `account_env_dir` and `account_reason`; the old runtime stops with `account_change` (`runtime_change` when the
+//! runtime changes too). An account-only move keeps the thread's model and effort, needs no
+//! confirm card from the orchestrator (what the thread may do is the same), and its handoff
+//! names both accounts.
+//!
+//! A move back resumes a session only on the account it ran on ([`Core::departure`]): the
+//! move that left it was away from the same runtime and the same account (the native account
+//! whatever it is called now; a named one by name, not removed), the runtime start that ran it
+//! recorded the directory the account has now (`ext.twr.account_dir`, links followed), and
+//! the account was not removed since that start. So a move back to the account a thread left
+//! resumes its session there, and a move to another account of the runtime, to its account in
+//! another directory, or to an account removed and added again starts a new session with the
+//! full handoff. No session moves between accounts (nor between organizations of one).
+//!
 //! The previous runtime is not asked for a summary (unlike an orchestrator switch,
 //! `hub::handoff`): a worker's reports already summarize its turns, and the log has the rest.
+
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use twr_core::event::*;
@@ -78,6 +102,7 @@ use twr_core::reduce::ThreadView;
 use super::handoff::defuse;
 use super::orch::{self, cut};
 use super::runtime_spec::{self, RuntimeSpec};
+use super::thread_account::AccountChoice;
 use super::{rpc, twr_ext, Caller, Core, Inner};
 use crate::store;
 
@@ -92,6 +117,10 @@ const ENTRY_MAX: usize = 4 * 1024;
 
 /// Most runtime moves read back for the session a thread left ([`Core::departure`]).
 const MOVES_MAX: usize = 100;
+
+/// Most runtime starts of each kind read back for the one that ran a session a move left
+/// ([`Core::departure`]).
+const STARTS_MAX: usize = 200;
 
 /// Most reports listed, and the longest one quoted, in bytes.
 const REPORTS_MAX: usize = 10;
@@ -122,22 +151,46 @@ fn settings(model: &Option<String>, effort: &Option<String>) -> String {
     )
 }
 
+/// A checked move of a thread ([`Core::runtime_switch`]).
+pub(super) struct Switch {
+    /// The runtime it moves to: its own for a move between accounts of one runtime.
+    pub(super) spec: RuntimeSpec,
+    /// The runtime, or its agent, changes: the thread's model and effort go back to the new
+    /// runtime's defaults unless given.
+    pub(super) runtime_changed: bool,
+    /// The account it moves to, when that changes (also its account in another directory:
+    /// [`Core::account_move`]).
+    pub(super) account: Option<AccountChoice>,
+}
+
 impl Core {
-    /// The runtime thread `view` moves to with `spec` (`thread.set_model` `runtime`), checked
-    /// (see the module docs); `None` when it is the thread's runtime already (no move).
+    /// The move of thread `view` that `thread.set_model` asks for with `spec` (its `runtime`;
+    /// `None`: the thread's own) and `account`, checked (see the module docs); `None` when the
+    /// thread runs on that runtime and account already (no move).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn runtime_switch(
         &self,
         hub: &Inner,
         view: &ThreadView,
-        spec: &str,
+        spec: Option<&str>,
+        account: Option<&str>,
+        outside_pin: bool,
         caller: &Caller,
-    ) -> Result<Option<RuntimeSpec>, RpcError> {
+    ) -> Result<Option<Switch>, RpcError> {
         let name = &view.name;
-        if caller.is_orchestrator() {
-            orch::check_orchestrator_runtime(spec, &hub.config)?;
-        }
-        let new = runtime_spec::resolve(spec, &hub.config)?;
-        if new.runtime == twr_adapters::pty::NAME {
+        let new = match spec {
+            Some(spec) => {
+                if caller.is_orchestrator() {
+                    orch::check_orchestrator_runtime(spec, &hub.config)?;
+                }
+                runtime_spec::resolve(spec, &hub.config)?
+            }
+            None => RuntimeSpec {
+                runtime: view.runtime.clone(),
+                ..Default::default()
+            },
+        };
+        if new.runtime == twr_adapters::pty::NAME && spec.is_some() {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!(
@@ -159,7 +212,10 @@ impl Core {
                 })
             }
         };
-        if new.runtime == view.runtime && same_agent {
+        let runtime_changed = new.runtime != view.runtime || !same_agent;
+        // The same agent on the same account (in the same directory): no move.
+        let account = self.account_move(hub, view, &new, account, outside_pin, caller)?;
+        if !runtime_changed && account.is_none() {
             return Ok(None);
         }
         if !hub
@@ -183,7 +239,7 @@ impl Core {
                 codes::CONFLICT,
                 format!(
                     "{name} is attached by {c}: its session is open in the runtime's own CLI; \
-                     detach first, then change its runtime"
+                     detach first, then move it"
                 ),
             ));
         }
@@ -197,28 +253,153 @@ impl Core {
                 ),
             )
         })?;
-        Ok(Some(new))
+        Ok(Some(Switch {
+            spec: new,
+            runtime_changed,
+            account,
+        }))
     }
 
-    /// The move that left thread `thread`'s latest session of `runtime` that a move back
-    /// resumes (see the module docs): of its latest [`MOVES_MAX`] moves, the newest away from
-    /// `runtime` that recorded the session it left (`ext.twr.previous_session`: only a session
-    /// the runtime had confirmed, never one a pending move only asked for).
+    /// The move that left thread `thread`'s latest session of `runtime` on account `account`
+    /// (`None`: the native one) that a move back there resumes (see the module docs): of its
+    /// latest [`MOVES_MAX`] moves, the newest away from `runtime` and that same account
+    /// ([`Core::account_identity`]: the native account whatever its name is now, a named one
+    /// that is not removed) that recorded the session it left (`ext.twr.previous_session`:
+    /// only a session the runtime had confirmed, never one a pending move only asked for).
+    /// `None` too when that session began in another directory than `dir` (the account's
+    /// now, links followed; `None` for the native account) or the account was removed since
+    /// it began ([`Core::session_in`]): the session lives in the directory it began in, and
+    /// another login there is not the one it ran on. Another account's session is never
+    /// resumed.
     pub(super) fn departure(
         &self,
         thread: &str,
         runtime: &str,
+        account: Option<&str>,
+        dir: Option<&Path>,
     ) -> anyhow::Result<Option<Departure>> {
-        Ok(self.moves(thread)?.into_iter().find_map(|(_, m)| {
-            if m.previous_runtime.as_deref() != Some(runtime) {
+        let Some(target) = self.account_identity(runtime, account) else {
+            return Ok(None);
+        };
+        let found = self.moves(thread)?.into_iter().find_map(|(seq, m)| {
+            if m.previous_runtime.as_deref() != Some(runtime)
+                || self.account_identity(runtime, left_account(&m)).as_ref() != Some(&target)
+            {
                 return None;
             }
-            Some(Departure {
-                session: left_session(&m)?.to_string(),
-                model: m.previous_model,
-                effort: m.previous_effort,
-            })
+            let session = left_session(&m)?.to_string();
+            Some((seq, session, m))
+        });
+        let Some((seq, session, m)) = found else {
+            return Ok(None);
+        };
+        if !self.session_in(thread, seq, &session, runtime, left_account(&m), dir)? {
+            return Ok(None);
+        }
+        Ok(Some(Departure {
+            session,
+            model: m.previous_model,
+            effort: m.previous_effort,
         }))
+    }
+
+    /// Which account `account` of `runtime` is now (`None`: the native one): `Some(None)` the
+    /// native account, whatever it is called (a renamed native account is still it, and so is
+    /// a name that stands for it now: `AccountsView::resolve`), `Some(Some(name))` a named
+    /// account that is not removed, `None` a removed or unknown one (which no move resumes on).
+    fn account_identity(&self, runtime: &str, account: Option<&str>) -> Option<Option<String>> {
+        match account {
+            None => self
+                .accounts
+                .info(runtime, None)
+                .filter(|a| !a.removed)
+                .map(|_| None),
+            Some(name) => self.accounts.resolve(runtime, name),
+        }
+    }
+
+    /// Whether session `session` of thread `thread`, which the move at `seq` left on account
+    /// `account` of `runtime` (`None`: the native one), ran in directory `dir` (the account's
+    /// now; `None` for the native account), and the account was not removed since: the
+    /// runtime start that ran it (the newest `thread.started` / `thread.resumed` before the
+    /// move that names that session or none) recorded that directory (`ext.twr.account_dir`,
+    /// stamped by the hub; absent for the native account), and no `account.removed` of the
+    /// account (but a `record_only` one: the account stayed) came after that start. A start
+    /// the log does not have counts as one in no directory, from the log's beginning.
+    fn session_in(
+        &self,
+        thread: &str,
+        seq: u64,
+        session: &str,
+        runtime: &str,
+        account: Option<&str>,
+        dir: Option<&Path>,
+    ) -> anyhow::Result<bool> {
+        let conn = self.store.conn();
+        let mut start: Option<Event> = None;
+        for kind in ["thread.started", "thread.resumed"] {
+            let found = store::latest_of_kind(conn, thread, kind, STARTS_MAX)?
+                .into_iter()
+                .map(|e| self.full(e))
+                .find(|e| {
+                    e.seq < seq
+                        && match &e.body {
+                            EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
+                                p.session_id.as_deref().is_none_or(|s| s == session)
+                            }
+                            _ => false,
+                        }
+                });
+            if let Some(e) = found {
+                if start.as_ref().is_none_or(|s| s.seq < e.seq) {
+                    start = Some(e);
+                }
+            }
+        }
+        let (began_in, since) = match &start {
+            Some(e) => {
+                let twr = match &e.body {
+                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => twr_ext(&p.ext),
+                    _ => None,
+                };
+                let began_in = twr
+                    .and_then(|t| t.get(ACCOUNT_DIR_KEY))
+                    .and_then(Value::as_str)
+                    .filter(|d| !d.is_empty())
+                    .map(PathBuf::from);
+                let since = store::event_position(conn, &e.id)?
+                    .and_then(|(_, g)| g)
+                    .unwrap_or(0);
+                (began_in, since)
+            }
+            None => (None, 0),
+        };
+        let same = match (began_in.as_deref(), dir) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a == b || super::accounts::same_dir(a, b),
+            _ => false,
+        };
+        Ok(same && !self.account_removed_since(runtime, account, since))
+    }
+
+    /// Whether account `account` of `runtime` (`None`: the native one) was removed after
+    /// control position `since` (`account.removed`, but a `record_only` one: only twr's record
+    /// of an account config declares went, the account stayed).
+    fn account_removed_since(&self, runtime: &str, account: Option<&str>, since: u64) -> bool {
+        self.account_events.iter().any(|(g, ev)| {
+            *g > since
+                && match &ev.body {
+                    EventBody::AccountRemoved(p) => {
+                        p.runtime == runtime
+                            && !p.record_only
+                            && match account {
+                                None => p.native,
+                                Some(name) => !p.native && p.account == name,
+                            }
+                    }
+                    _ => false,
+                }
+        })
     }
 
     /// The latest [`MOVES_MAX`] runtime moves of `thread` (`thread.model_changed` with a
@@ -261,6 +442,19 @@ impl Core {
             Some(i) => moves.into_iter().nth(i),
             None => moves.into_iter().last(),
         };
+        // A move that changed the account names the accounts (`claude-code:work`); one between
+        // accounts of one runtime says so.
+        let account_move = moved.as_ref().filter(|m| m.account_changed);
+        let account_only = account_move.is_some_and(|m| m.previous_runtime == m.runtime);
+        let with_account = |rt: &str, account: &Option<String>| match account_move {
+            Some(_) => format!(
+                "{rt}:{}",
+                account
+                    .clone()
+                    .unwrap_or_else(|| self.accounts.native_name(rt))
+            ),
+            None => rt.to_string(),
+        };
         let previous = moved.as_ref().map_or_else(
             || "its previous runtime".to_string(),
             |(_, m)| {
@@ -269,7 +463,10 @@ impl Core {
                     .unwrap_or_default();
                 format!(
                     "{} ({}{session})",
-                    m.previous_runtime.as_deref().unwrap_or("?"),
+                    with_account(
+                        m.previous_runtime.as_deref().unwrap_or("?"),
+                        &m.previous_account
+                    ),
                     settings(&m.previous_model, &m.previous_effort)
                 )
             },
@@ -278,10 +475,22 @@ impl Core {
 
         body.push_str("## Thread\n");
         body.push_str(&format!(
-            "- name: {} (project {})\n- previous runtime: {previous}\n- now: {} ({})\n",
+            "- name: {} (project {})\n- previous runtime: {previous}\n",
             view.name,
             view.project.as_deref().unwrap_or("-"),
-            view.runtime,
+        ));
+        if let Some(m) = account_move.filter(|_| account_only) {
+            let rt = m.previous_runtime.as_deref().unwrap_or("?");
+            body.push_str(&format!(
+                "- previous account: {} ({rt})\n",
+                m.previous_account
+                    .clone()
+                    .unwrap_or_else(|| self.accounts.native_name(rt))
+            ));
+        }
+        body.push_str(&format!(
+            "- now: {} ({})\n",
+            with_account(&view.runtime, &view.account),
             settings(&view.model, &view.effort)
         ));
 
@@ -314,9 +523,11 @@ impl Core {
                 view.runtime, view.name, view.runtime
             ),
             None => format!(
-                "This thread ({}) moved to another runtime: you are a new {} session taking over \
-                 its work",
-                view.name, view.runtime
+                "This thread ({}) moved to another {}: you are a new {} session taking over its \
+                 work",
+                view.name,
+                if account_only { "account" } else { "runtime" },
+                view.runtime
             ),
         };
         Ok(format!(
@@ -348,17 +559,28 @@ impl Core {
             );
         };
         let since = moves[left].0;
-        // The runtimes the thread moved to from then on, but the one it comes back to.
-        let mut ran_on: Vec<&str> = Vec::new();
+        // The runtimes the thread moved to from then on, but the one it comes back to; with
+        // their accounts once one of those moves changed the account (`claude-code:work`), so
+        // that a session resumed on its own account hears of the thread's turns on another.
+        let accounts_moved = moves[..=left].iter().any(|(_, m)| m.account_changed);
+        let named = |rt: &str, account: Option<&str>| match accounts_moved {
+            true => format!(
+                "{rt}:{}",
+                account.map_or_else(|| self.accounts.native_name(rt), str::to_string)
+            ),
+            false => rt.to_string(),
+        };
+        let here = named(&view.runtime, view.account.as_deref());
+        let mut ran_on: Vec<String> = Vec::new();
         for (_, m) in moves[..=left].iter().rev() {
-            if let Some(r) = m
-                .runtime
-                .as_deref()
-                .filter(|r| *r != view.runtime && !ran_on.contains(r))
-            {
-                ran_on.push(r);
+            if let Some(r) = m.runtime.as_deref() {
+                let to = named(r, moved_to_account(m));
+                if to != here && !ran_on.contains(&to) {
+                    ran_on.push(to);
+                }
             }
         }
+        let ran_on: Vec<&str> = ran_on.iter().map(String::as_str).collect();
         let starts = store::work_turn_seqs_after(conn, thread, since)?;
         let Some(&oldest) = starts.last() else {
             return Ok(None);
@@ -385,7 +607,7 @@ impl Core {
              handoff.\n\
              {OPEN_TAG}\n{}{CLOSE_TAG}\n\n",
             view.name,
-            view.runtime,
+            here,
             and_list(&ran_on),
             if n == 1 { "" } else { "s" },
             defuse(&body)
@@ -582,6 +804,19 @@ impl Core {
             })
         })
     }
+}
+
+/// The account a move left (`None`: the native one): its `previous_account` when it changed
+/// the account; else the native one (a move to another runtime off a named account always
+/// changes the account, `Core::account_move`).
+fn left_account(m: &ThreadModelChanged) -> Option<&str> {
+    m.previous_account.as_deref().filter(|_| m.account_changed)
+}
+
+/// The account a move went to (`None`: the native one), as [`left_account`] reads the one it
+/// left.
+fn moved_to_account(m: &ThreadModelChanged) -> Option<&str> {
+    m.account.as_deref().filter(|_| m.account_changed)
 }
 
 /// The session a move left, if it recorded one (`ext.twr.previous_session`).

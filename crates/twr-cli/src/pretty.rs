@@ -57,6 +57,14 @@ pub fn summary(ev: &Event) -> String {
             {
                 s.push_str(&format!(" effort={}", twr("effort")));
             }
+            // The account it was opened on, whatever the labels show now: this is history.
+            if let Some(a) = p
+                .ext
+                .as_ref()
+                .and_then(|e| e.get("twr")?.get(twr_core::event::ACCOUNT_KEY)?.as_str())
+            {
+                s.push_str(&format!(" account={a}"));
+            }
             s
         }
         EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
@@ -64,6 +72,14 @@ pub fn summary(ev: &Event) -> String {
             // The model the runtime reports it runs.
             if let Some(m) = reported_model(p.ext.as_ref()) {
                 s.push_str(&format!(" model={m}"));
+            }
+            // The account the session ran on, as the hub stamped it (history).
+            if let Some(a) = p
+                .ext
+                .as_ref()
+                .and_then(|e| e.get("twr")?.get(twr_core::event::ACCOUNT_KEY)?.as_str())
+            {
+                s.push_str(&format!(" account={a}"));
             }
             s
         }
@@ -76,6 +92,9 @@ pub fn summary(ev: &Event) -> String {
             // A runtime change stops this runtime for good: the next turn starts the new one.
             if reason == Some(twr_core::event::RUNTIME_RESTART_REASON) {
                 return format!("session={session} (replaced by its new runtime)");
+            }
+            if reason == Some(twr_core::event::ACCOUNT_RESTART_REASON) {
+                return format!("session={session} (replaced by a session on its new account)");
             }
             if reason == Some(twr_core::event::TRIM_RESTART_REASON) {
                 return format!(
@@ -120,7 +139,23 @@ pub fn summary(ev: &Event) -> String {
             let by = serde_json::to_value(p.by).unwrap_or_default();
             let by = by.as_str().unwrap_or("?");
             let shown = |v: &Option<String>| v.clone().unwrap_or_else(|| "(default)".into());
+            // An account move names both accounts (`(native)`: the runtime's own login,
+            // whatever it is named); with a runtime move, as `runtime:account`.
+            let account = |a: &Option<String>| a.clone().unwrap_or_else(|| "(native)".into());
             let runtime = match &p.runtime {
+                Some(r) if p.account_changed && p.previous_runtime.as_deref() == Some(r) => {
+                    format!(
+                        "account {} -> {}, ",
+                        account(&p.previous_account),
+                        account(&p.account)
+                    )
+                }
+                Some(r) if p.account_changed => format!(
+                    "runtime {}:{} -> {r}:{}, ",
+                    shown(&p.previous_runtime),
+                    account(&p.previous_account),
+                    account(&p.account)
+                ),
                 Some(r) => format!("runtime {} -> {r}, ", shown(&p.previous_runtime)),
                 None => String::new(),
             };
@@ -298,11 +333,46 @@ pub fn summary(ev: &Event) -> String {
                 .iter()
                 .map(|w| format!("{} {}%", w.label(), w.left_pct()))
                 .collect();
-            format!(
-                "{label}{account}: {} left ({})",
-                windows.join(" · "),
-                p.source
-            )
+            if windows.is_empty() {
+                // What the hub records when the account's directory changed.
+                format!("{label}{account}: nothing known (its directory changed)")
+            } else {
+                format!(
+                    "{label}{account}: {} left ({})",
+                    windows.join(" · "),
+                    p.source
+                )
+            }
+        }
+        EventBody::AccountAdded(p) => {
+            let mut s = format!("account {}:{} added (twr", p.runtime, p.account);
+            if p.native {
+                s.push_str(", the runtime's own login)");
+            } else {
+                s.push(')');
+                if let Some(d) = &p.dir {
+                    s.push_str(&format!(" dir={d}"));
+                }
+                let share = serde_json::to_value(p.share).unwrap_or_default();
+                s.push_str(&format!(" share={}", share.as_str().unwrap_or("?")));
+            }
+            s
+        }
+        EventBody::AccountRemoved(p) => format!("account {}:{} removed", p.runtime, p.account),
+        EventBody::AccountStatus(p) => {
+            use twr_core::account::Login;
+            let login = match (p.login, &p.method) {
+                (Login::LoggedIn, Some(m)) => format!("logged in ({m})"),
+                (Login::LoggedIn, None) => "logged in".to_string(),
+                (Login::LoggedOut, _) => "logged out".to_string(),
+                (Login::Missing, _) => "missing".to_string(),
+                (Login::Unknown, _) => "unknown".to_string(),
+            };
+            let note = p
+                .note
+                .as_deref()
+                .map_or(String::new(), |n| format!(" ({})", short(n)));
+            format!("account {}:{} {login}{note}", p.runtime, p.account)
         }
         EventBody::ContextCompacted(p) => p.line(),
         EventBody::ProjectRead(p) => p.line(),
@@ -487,6 +557,22 @@ mod tests {
             }),
         );
         assert_eq!(summary(&ev), "Claude: 5h 78% · wk 56% left (read)");
+        // The record that clears an account whose directory changed.
+        let cleared = Event::new(
+            twr_core::HUB_THREAD,
+            2,
+            None,
+            Source::Hub,
+            EventBody::AccountUsage(twr_core::event::AccountUsage {
+                runtime: "claude-code".into(),
+                account: Some("work".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(
+            summary(&cleared),
+            "Claude:work: nothing known (its directory changed)"
+        );
     }
 
     /// What the orchestrator read and kept in its memory read as lines, not JSON.
@@ -580,6 +666,124 @@ mod tests {
         assert_eq!(
             summary(&queued),
             "ref=8 taken back before it ran: deploy now"
+        );
+    }
+
+    /// A recorded account always shows (history), account moves name both accounts, and the
+    /// registry's events read as sentences.
+    #[test]
+    fn account_lines() {
+        use twr_core::event::{
+            AccountAdded, AccountRemoved, AccountStatus, SessionPayload, ThreadCreated,
+            ThreadModelChanged,
+        };
+        let ev = |body| Event::new("t1", 1, None, Source::Hub, body);
+        let created = ThreadCreated {
+            name: "api".into(),
+            runtime: "claude-code".into(),
+            box_name: "local".into(),
+            mode: "manual".into(),
+            ext: serde_json::json!({"twr": {"account": "work"}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        assert!(
+            summary(&ev(EventBody::ThreadCreated(created))).ends_with(" account=work"),
+            "the account is printed"
+        );
+        // A session start or resume stamped with its account names it; an older one stays.
+        let stamped = SessionPayload {
+            session_id: Some("s1".into()),
+            ext: serde_json::json!({"twr": {"account": "work"}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&ev(EventBody::ThreadStarted(stamped.clone()))),
+            "session=s1 account=work"
+        );
+        assert_eq!(
+            summary(&ev(EventBody::ThreadResumed(stamped))),
+            "session=s1 account=work"
+        );
+        let old = SessionPayload {
+            session_id: Some("s0".into()),
+            ..Default::default()
+        };
+        assert_eq!(summary(&ev(EventBody::ThreadStarted(old))), "session=s0");
+        let moved = ThreadModelChanged {
+            runtime: Some("claude-code".into()),
+            previous_runtime: Some("claude-code".into()),
+            account_changed: true,
+            account: Some("personal".into()),
+            previous_account: Some("work".into()),
+            ..Default::default()
+        };
+        let s = summary(&ev(EventBody::ThreadModelChanged(moved)));
+        assert!(s.starts_with("account work -> personal, model "), "{s}");
+        let both = ThreadModelChanged {
+            runtime: Some("claude-code".into()),
+            previous_runtime: Some("codex".into()),
+            account_changed: true,
+            account: Some("work".into()),
+            previous_account: Some("team".into()),
+            ..Default::default()
+        };
+        let s = summary(&ev(EventBody::ThreadModelChanged(both)));
+        assert!(
+            s.starts_with("runtime codex:team -> claude-code:work, model "),
+            "{s}"
+        );
+        let to_native = ThreadModelChanged {
+            runtime: Some("codex".into()),
+            previous_runtime: Some("codex".into()),
+            account_changed: true,
+            previous_account: Some("team".into()),
+            ..Default::default()
+        };
+        let s = summary(&ev(EventBody::ThreadModelChanged(to_native)));
+        assert!(s.starts_with("account team -> (native), "), "{s}");
+        let added = AccountAdded {
+            runtime: "claude-code".into(),
+            account: "work".into(),
+            dir: Some("/a/work".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&ev(EventBody::AccountAdded(added))),
+            "account claude-code:work added (twr) dir=/a/work share=config"
+        );
+        let named = AccountAdded {
+            runtime: "codex".into(),
+            account: "personal".into(),
+            native: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&ev(EventBody::AccountAdded(named))),
+            "account codex:personal added (twr, the runtime's own login)"
+        );
+        let removed = AccountRemoved {
+            runtime: "claude-code".into(),
+            account: "work".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&ev(EventBody::AccountRemoved(removed))),
+            "account claude-code:work removed"
+        );
+        let status = AccountStatus {
+            runtime: "claude-code".into(),
+            account: "work".into(),
+            login: twr_core::account::Login::LoggedIn,
+            method: Some("claude.ai".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            summary(&ev(EventBody::AccountStatus(status))),
+            "account claude-code:work logged in (claude.ai)"
         );
     }
 

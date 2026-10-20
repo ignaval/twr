@@ -39,7 +39,9 @@
 //! (and a remote box's `stop` command), the runtime's own graceful stop, and its exit's
 //! closing sequence, a `thread.stopped` with `ext.twr.reason` = `mode_change` when the
 //! permission mode differs ([`MODE_RESTART_REASON`]), `runtime_change` when the runtime does
-//! ([`RUNTIME_RESTART_REASON`]), else `model_change` ([`MODEL_RESTART_REASON`]); either way
+//! ([`RUNTIME_RESTART_REASON`]), `account_change` when only the account does
+//! ([`ACCOUNT_RESTART_REASON`]: a move between accounts of one runtime, `hub::switch`), else
+//! `model_change` ([`MODEL_RESTART_REASON`]); either way
 //! the thread does not count as stopped. Then the queue dispatches (the next prompt resumes
 //! the session in the new settings, or, after a runtime change, starts the new runtime's first
 //! session with the handoff) and, if nothing did, the runtime starts again on its session
@@ -67,6 +69,11 @@
 //! previous agent: it is no session of the new one (`ThreadView::handoff_pending`), and it is
 //! replaced like a marked one. A stamp without an agent (a runner from before agent stamps)
 //! is taken for the thread's agent.
+//!
+//! The account is part of them too ([`RunSettings::account`], stamped as `ext.twr.account` by
+//! the hub, absent for the native account): a start of the account the thread moved away from
+//! is no session of the new one (`ThreadView::handoff_pending`), and is replaced
+//! (`account_change`).
 //!
 //! A stamp without `ext.twr.mode` (a runner from before stamping) is recorded as unknown
 //! settings ([`RunSettings::unknown`]); one with a mode but without the model or the effort
@@ -109,6 +116,21 @@ pub(super) struct RunSettings {
     /// `ext.twr.acp_command`). `None`: no agent, or not known (a runner from before agent
     /// stamps), which [`RunSettings::runs_in`] takes for any agent.
     pub(super) agent: Option<Value>,
+    /// The account (`ThreadView::account`; `None`: the runtime's native account). Stamped as
+    /// `ext.twr.account` (absent for the native account).
+    pub(super) account: Option<String>,
+    /// The thread moved to another account of the same runtime after this one started
+    /// (`thread.model_changed` with `account_changed`; also a move to the same account in
+    /// another directory): with [`RunSettings::moved`], its restart is an account change. Not
+    /// stamped: a start recorded after such a move restarts as a runtime change.
+    pub(super) account_moved: bool,
+    /// The named account's directory (links followed) the process was started with: the
+    /// thread's when it started (`ThreadRt::account_dir`). Stamped as `ext.twr.account_dir`
+    /// (absent for the native account). What the session reports (usage, limits, sign-in
+    /// failures) is that directory's: one the account's name no longer leads to (removed and
+    /// added again elsewhere) is not the account's now (`hub::usage`, `hub::retry`). `None`
+    /// also when not known (a start from before the stamp). Not a setting: no restart.
+    pub(super) account_dir: Option<std::path::PathBuf>,
 }
 
 impl RunSettings {
@@ -121,6 +143,9 @@ impl RunSettings {
             effort: view.effort.clone(),
             moved: false,
             agent: view.acp_command.clone(),
+            account: view.account.clone(),
+            account_moved: false,
+            account_dir: None,
         }
     }
 
@@ -133,6 +158,9 @@ impl RunSettings {
             effort: Some(UNKNOWN.into()),
             moved: false,
             agent: None,
+            account: None,
+            account_moved: false,
+            account_dir: None,
         }
     }
 
@@ -146,16 +174,18 @@ impl RunSettings {
             && self.effort == to.effort
             && self.moved == to.moved
             && self.same_agent(to)
+            && self.account == to.account
     }
 
     /// Whether a runtime started with these settings is thread `view`'s current runtime, so
     /// that a settings restart would resume its session: not one the thread moved away from
-    /// ([`RunSettings::moved`], another runtime or agent). A runtime not known (a runner from
-    /// before stamps) is taken to be it.
+    /// ([`RunSettings::moved`], another runtime, agent or account). A runtime not known (a
+    /// runner from before stamps) is taken to be it.
     pub(super) fn is_runtime_of(&self, view: &ThreadView) -> bool {
         let to = RunSettings::of(view);
         !self.moved
-            && (self.runtime == to.runtime || self.runtime == UNKNOWN)
+            && ((self.runtime == to.runtime && self.account == to.account)
+                || self.runtime == UNKNOWN)
             && self.same_agent(&to)
     }
 
@@ -178,12 +208,19 @@ impl RunSettings {
 
     /// The `ext.twr.reason` of the stop that restarts a runtime started with these settings
     /// in `to`: [`RUNTIME_RESTART_REASON`] when the runtime (a known one) or its agent changes
-    /// (or the thread moved away from this one), [`MODE_RESTART_REASON`] when the permission mode
-    /// does, else [`MODEL_RESTART_REASON`].
-    fn restart_reason(&self, to: &RunSettings) -> &'static str {
+    /// (or the thread moved away from this one), [`ACCOUNT_RESTART_REASON`] when only the
+    /// account does (or the thread moved to another account of the runtime, or to its account
+    /// in another directory), [`MODE_RESTART_REASON`] when the permission mode does, else
+    /// [`MODEL_RESTART_REASON`].
+    pub(super) fn restart_reason(&self, to: &RunSettings) -> &'static str {
         // A runtime not known (a runner from before stamps) is no move.
         let other_runtime = self.runtime != to.runtime && self.runtime != UNKNOWN;
-        if self.moved || other_runtime || !self.same_agent(to) {
+        let other_account = self.account != to.account && self.runtime != UNKNOWN;
+        if other_runtime || !self.same_agent(to) {
+            RUNTIME_RESTART_REASON
+        } else if other_account || (self.moved && self.account_moved) {
+            ACCOUNT_RESTART_REASON
+        } else if self.moved {
             RUNTIME_RESTART_REASON
         } else if self.mode != to.mode {
             MODE_RESTART_REASON
@@ -196,7 +233,9 @@ impl RunSettings {
 /// The settings a start event's `ext.twr` stamp records, if it has a mode (see the module
 /// docs: a missing model or effort key is unknown, `null` is the runtime's default, a missing
 /// runtime is the one of `source`, the event's; `runtime_moved` is [`RunSettings::moved`];
-/// `acp_command` is [`RunSettings::agent`], missing when not known).
+/// `acp_command` is [`RunSettings::agent`], missing when not known; `account` is
+/// [`RunSettings::account`], missing for the native account; `account_dir` is
+/// [`RunSettings::account_dir`]).
 pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings> {
     let twr = p.ext.as_ref()?.get("twr")?;
     let mode = twr.get("mode")?.as_str()?.to_string();
@@ -216,6 +255,16 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
         effort: value("effort"),
         moved: twr.get(RUNTIME_MOVED_KEY) == Some(&Value::Bool(true)),
         agent: acp_command(p.ext.as_ref()).cloned(),
+        account: twr
+            .get(ACCOUNT_KEY)
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        account_moved: false,
+        account_dir: twr
+            .get(ACCOUNT_DIR_KEY)
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from),
     })
 }
 
@@ -223,7 +272,9 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
 /// `thread.started` / `thread.resumed`: what the hub (or, for a runtime it took over, its
 /// runner: `twr_runner::lbox`) started it with; `null` for a model or effort left to the
 /// runtime. `ext.twr.runtime_moved` (true) when the thread moved away from it meanwhile;
-/// `ext.twr.acp_command`, an `acp` runtime's agent, when known (else a runner's stays).
+/// `ext.twr.acp_command`, an `acp` runtime's agent, when known (else a runner's stays);
+/// `ext.twr.account`, the named account it runs on (absent: the native account), and
+/// `ext.twr.account_dir`, its directory ([`RunSettings::account_dir`], when known).
 pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
     let ext = p.ext.get_or_insert_with(JsonMap::new);
     let twr = ext
@@ -242,6 +293,14 @@ pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
         if let Some(agent) = &s.agent {
             twr.insert(ACP_COMMAND_KEY.into(), agent.clone());
         }
+        match &s.account {
+            Some(a) => twr.insert(ACCOUNT_KEY.into(), json!(a)),
+            None => twr.remove(ACCOUNT_KEY),
+        };
+        match s.account_dir.as_ref().filter(|_| s.account.is_some()) {
+            Some(d) => twr.insert(ACCOUNT_DIR_KEY.into(), json!(d.to_string_lossy())),
+            None => twr.remove(ACCOUNT_DIR_KEY),
+        };
     }
 }
 
@@ -492,6 +551,9 @@ mod tests {
                 effort: None,
                 moved,
                 agent: Some(json!([cmd])),
+                account: None,
+                account_moved: false,
+                account_dir: None,
             };
             stamp(&mut p, &s);
             EventBody::ThreadStarted(p)
@@ -652,6 +714,129 @@ mod tests {
         hub.shutdown().await;
     }
 
+    /// A move between accounts of one runtime: the live runtime's settings are marked (an
+    /// account change), and a start of the previous account recorded after the move (stamped
+    /// `ext.twr.account`, as the hub stamps it) is no session of the new account, on replay
+    /// too; its settings differ, so it is replaced (`account_change`). The new account's start
+    /// ends the handoff.
+    #[tokio::test]
+    async fn a_start_of_the_previous_account_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = Hub::open(HubOptions::new(&db, Config::default()))
+            .await
+            .unwrap();
+        let user = || Source::User("test".into());
+        hub.append(
+            "t1",
+            None,
+            user(),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "api".into(),
+                box_name: "local".into(),
+                runtime: "claude-code".into(),
+                mode: "manual".into(),
+                ext: twr_ext_map(json!({ACCOUNT_KEY: "work", ACCOUNT_DIR_KEY: "/acc/work"})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let start = |session: &str, account: Option<&str>| {
+            let mut p = SessionPayload {
+                session_id: Some(session.into()),
+                ..Default::default()
+            };
+            let s = RunSettings {
+                runtime: "claude-code".into(),
+                mode: "manual".into(),
+                model: None,
+                effort: None,
+                moved: false,
+                agent: None,
+                account: account.map(str::to_string),
+                account_moved: false,
+                account_dir: None,
+            };
+            stamp(&mut p, &s);
+            assert_eq!(stamped(&p, &Source::Hub), Some(s));
+            EventBody::ThreadStarted(p)
+        };
+        let source = Source::Adapter("claude-code".into());
+        hub.append("t1", None, source.clone(), start("w-1", Some("work")), None)
+            .unwrap();
+        hub.append(
+            "t1",
+            None,
+            user(),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                runtime: Some("claude-code".into()),
+                previous_runtime: Some("claude-code".into()),
+                account_changed: true,
+                account: Some("work2".into()),
+                previous_account: Some("work".into()),
+                ext: twr_ext_map(json!({ACCOUNT_DIR_KEY: "/acc/work2"})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        {
+            let core = hub.inner.core();
+            let s = core.rt.get("t1").and_then(|r| r.runtime_settings.clone());
+            let s = s.expect("the previous account's settings");
+            let view = core.registry.get("t1").unwrap();
+            assert!(s.moved && s.account_moved);
+            assert_eq!(
+                s.restart_reason(&RunSettings::of(view)),
+                ACCOUNT_RESTART_REASON
+            );
+            assert_eq!(
+                core.rt.get("t1").and_then(|r| r.account_dir.clone()),
+                Some("/acc/work2".into())
+            );
+        }
+        // The previous account's start, recorded after the move.
+        hub.append("t1", None, source.clone(), start("w-2", Some("work")), None)
+            .unwrap();
+        let check = |core: &Core| {
+            let view = core.registry.get("t1").unwrap();
+            assert_eq!(view.account.as_deref(), Some("work2"));
+            assert_eq!(
+                (view.session_id.as_deref(), view.handoff_pending),
+                (None, true),
+                "the previous account's start is no session of the new one"
+            );
+            let s = core.rt.get("t1").and_then(|r| r.runtime_settings.clone());
+            let s = s.expect("the previous account's settings");
+            assert_eq!(s.account.as_deref(), Some("work"));
+            assert!(!s.runs_in(&RunSettings::of(view)));
+            assert!(!s.is_runtime_of(view));
+            assert_eq!(
+                s.restart_reason(&RunSettings::of(view)),
+                ACCOUNT_RESTART_REASON
+            );
+        };
+        check(&hub.inner.core());
+        let (replayed, _) = Core::replay(&db).unwrap();
+        check(&replayed);
+        drop(replayed);
+        // The new account's start: its session.
+        hub.append("t1", None, source, start("w2-1", Some("work2")), None)
+            .unwrap();
+        {
+            let core = hub.inner.core();
+            let view = core.registry.get("t1").unwrap();
+            assert_eq!(
+                (view.session_id.as_deref(), view.handoff_pending),
+                (Some("w2-1"), false)
+            );
+            let s = core.rt.get("t1").and_then(|r| r.runtime_settings.clone());
+            assert!(s.unwrap().runs_in(&RunSettings::of(view)));
+        }
+        hub.shutdown().await;
+    }
+
     /// A restart begun for a new model whose thread then moved to another runtime (before the
     /// runtime exited) is that move's: its stop says `runtime_change`, and a clear for the new
     /// runtime is not refused because of the runtime being replaced.
@@ -688,6 +873,9 @@ mod tests {
             effort: None,
             moved: false,
             agent: None,
+            account: None,
+            account_moved: false,
+            account_dir: None,
         };
         stamp(&mut p, &started);
         hub.append(
@@ -751,6 +939,9 @@ mod tests {
             effort: None,
             moved: false,
             agent: None,
+            account: None,
+            account_moved: false,
+            account_dir: None,
         };
         assert!(s("claude-code", "auto").narrows_to(&s("claude-code", "plan")));
         assert!(!s("claude-code", "plan").narrows_to(&s("claude-code", "auto")));
@@ -777,6 +968,9 @@ mod tests {
             effort: None,
             moved: false,
             agent,
+            account: None,
+            account_moved: false,
+            account_dir: None,
         };
         let a = || Some(json!(["agent-a"]));
         assert!(s(a()).runs_in(&s(a())));
