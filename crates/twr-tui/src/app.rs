@@ -2278,9 +2278,9 @@ pub struct AppState {
     pub suggest_asked: Option<(String, u64, u64)>,
     /// The suggestion last taken into the box: sent unedited, it says so to the hub.
     pub taken_suggestion: Option<String>,
-    /// The suggestions sent as they were, `(thread, ref)`, while they may still be queued
-    /// (one goes once its turn starts or it is taken back): taken back from the queue, one is
-    /// still a suggestion.
+    /// The suggestions sent as they were, `(thread, ref)`, until one is taken back (a running
+    /// one can be, until it acts; a few dozen an hour at most): taken back, one is still a
+    /// suggestion.
     pub suggested_refs: VecDeque<(String, i64)>,
     /// Whether each send still to be answered was a suggestion sent as it was, oldest first
     /// (one connection answers in order): every answer registers its own.
@@ -5196,9 +5196,6 @@ impl AppState {
     fn track_sent(&mut self, ev: &Event) {
         if let EventBody::TurnStarted(p) = &ev.body {
             if let (Some(r), Some(turn)) = (message_ref(p), ev.turn) {
-                // Running, it is out of the queue: no edit takes it back any more.
-                self.suggested_refs
-                    .retain(|(t, m)| !(*t == ev.thread && *m == r));
                 let started = (ev.thread.clone(), r, turn);
                 if !self.started_refs.contains(&started) {
                     self.started_refs.push_back(started);
@@ -21906,6 +21903,41 @@ pub(crate) mod tests {
                 );
             }
             assert!(st.suggested_refs.contains(&("t-orch".to_string(), 100)));
+        }
+
+        /// A suggestion whose turn started is still one: until it acts it can be taken back
+        /// (an edit of its row before the queue is read again included).
+        #[test]
+        fn a_started_suggestion_taken_back_stays_one() {
+            let (mut st, mut o) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            st.handle_key(key(KeyCode::Enter));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 95, "prompt": "set web to bypass", "from": "user", "mine": true}]}),
+            );
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 95, "turn": null,
+                        "pending": 1}),
+            );
+            let mut started = o.turn_started("set web to bypass");
+            if let EventBody::TurnStarted(p) = &mut started.body {
+                p.ext = json!({"twr": {(twr_core::event::MESSAGE_REF_KEY): 95}})
+                    .as_object()
+                    .cloned();
+            }
+            control(&mut st, &[started]);
+            st.retract_queued(95, crate::app::Retract::Edit);
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "running", "ref": 95,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.taken_suggestion.as_deref(), Some("set web to bypass"));
         }
 
         /// An answer to an ask made before a send of the user's is about a conversation that

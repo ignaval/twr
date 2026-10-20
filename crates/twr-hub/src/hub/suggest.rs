@@ -320,6 +320,8 @@ async fn ask(
     }
     cmd.env_remove(twr_runner::reap::RUNTIME_GEN_ENV);
     cmd.env(super::AGENT_ENV, marker);
+    // An `@/path` in the agent's reply inlines nothing: no file of the machine's goes along.
+    cmd.env(twr_adapters::claude_code::DISABLE_ATTACHMENTS_ENV, "1");
     twr_adapters::process::new_session(&mut cmd);
     let mut child = cmd
         .spawn()

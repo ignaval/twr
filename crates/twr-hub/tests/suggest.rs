@@ -195,6 +195,12 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
     assert!(!env.contains("TWR_ORCH_TOKEN="));
     assert!(!env.contains("TWR_RUNNER_TOKEN="));
     assert!(!env.contains("ANTHROPIC_"), "{env}");
+    // An `@/path` in the reply inlines no file.
+    assert!(
+        env.lines()
+            .any(|l| l == "CLAUDE_CODE_DISABLE_ATTACHMENTS=1"),
+        "{env}"
+    );
     let left: i32 = std::fs::read_to_string(cli.join("left"))
         .unwrap()
         .trim()
