@@ -132,6 +132,11 @@ pub struct Confirm {
     /// A second choice: its key, what it runs and its pending status (the orchestrator
     /// switch's `s`: without the summary).
     pub alt: Option<(char, Action, String)>,
+    /// An offer the TUI makes by itself, not a command the user gave
+    /// ([`crate::firstrun`]): `y` (or the alternative's key) answers it only once it has been
+    /// on screen [`CARD_SETTLE`] with nothing typed, and any other key goes where it would
+    /// without it, which leaves the offer for this run ([`AppState::offer_key`]).
+    pub offer: bool,
 }
 
 /// Client-local view state. Nothing here is an event; pins in particular never leave the client.
@@ -292,8 +297,8 @@ pub struct ViewState {
     pub compact_width: u16,
     /// Next-message suggestions on (`[tui] suggest`, `/suggest`; [`crate::suggest`]).
     pub suggest: bool,
-    /// The model they come from (`[tui] suggest_model`).
-    pub suggest_model: String,
+    /// The small model they come from, per runtime (`[tui] suggest_model`).
+    pub suggest_model: twr_core::config::SuggestModels,
     /// `/compact on|off`: the compact layout on or off whatever the width; `None`: by the
     /// width.
     pub compact: Option<bool>,
@@ -950,6 +955,10 @@ pub enum Action {
     },
     /// Take the mouse (`true`: the TUI selects text) or leave it to the terminal (`/mouse`).
     Mouse(bool),
+    /// The answer to the Shift-Enter offer ([`AppState::terminal_offer`]): `yes` sets the
+    /// terminal up (the IO loop edits its settings file), `no` leaves it; either is
+    /// remembered.
+    TerminalSetup { yes: bool },
     /// Switch to workspace `name` (a tab, `/ws`): the IO loop opens its hub (starting it when
     /// needed) and shows it in place of this one.
     Workspace {
@@ -2287,6 +2296,22 @@ pub struct AppState {
     pub sends_suggested: VecDeque<bool>,
     /// The second Ctrl-C while a `!` command's stop is on its way: the third quits.
     pub shell_quit_armed: bool,
+    /// What the TUI has told the user across runs ([`crate::firstrun`]), and whether this
+    /// run told more that is not saved yet.
+    pub seen: crate::firstrun::Seen,
+    pub seen_dirty: bool,
+    /// A notice told once ([`AppState::show_once`]), until a frame has shown it.
+    pub once: Option<(crate::firstrun::Once, String)>,
+    /// Why suggestions stopped in this run: the hub can't run them
+    /// ([`AppState::suggest_unavailable`]); the notice saying so waits for a free status bar.
+    pub suggest_off_why: Option<String>,
+    /// The user turned suggestions on in this run (`/suggest on`): `hub.info` no longer
+    /// turns them off, only a call's answer does.
+    pub suggest_turned_on: bool,
+    /// The next ask says the user turned suggestions on ([`crate::suggest::Ask::retry`]).
+    pub suggest_retry: bool,
+    /// The Shift-Enter offer on screen, until it is answered ([`Action::TerminalSetup`]).
+    pub terminal_offer: Option<crate::firstrun::TerminalOffer>,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
     /// came while a view kept for it is being restored: applied once it is
     /// ([`AppState::finish_restore`]), into the view as it was left.
@@ -2862,6 +2887,7 @@ impl AppState {
                         .collect();
                 }
                 self.apply_boxes(result);
+                self.apply_suggest_info(result);
             }
             // A failed call arrives as null: only the next poll is let go.
             "thread.activity" => {
@@ -2940,6 +2966,7 @@ impl AppState {
             ),
             pending,
             alt: None,
+            offer: false,
         });
     }
 
@@ -3748,6 +3775,21 @@ impl AppState {
     /// orchestrator's banner in a dive or the grid, a card scrolled away, a card too short for
     /// its options, anything under an overlay) is never answered.
     pub fn note_drawn(&mut self, now: Instant) {
+        // A notice told once, drawn whole in the status bar (not cut, not under an overlay):
+        // told.
+        if let Some((what, text)) = &self.once {
+            let drawn = self
+                .view
+                .panes
+                .status
+                .as_ref()
+                .is_some_and(|(t, _)| t == text);
+            if drawn && self.view.status.as_deref() == Some(text) {
+                self.seen.told(what);
+                self.seen_dirty = true;
+                self.once = None;
+            }
+        }
         // The suggested message on screen: since when (Tab or → takes it only once read).
         if self.shown_suggestion().is_some() {
             if let Some(s) = self.suggestion.as_mut().filter(|s| s.shown.is_none()) {
@@ -4072,6 +4114,7 @@ impl AppState {
             prompt: format!("{verb} {name}? y to confirm, any other key cancels"),
             pending: format!("{verb} {name}: waiting for the hub"),
             alt: None,
+            offer: false,
         });
     }
 
@@ -4104,6 +4147,7 @@ impl AppState {
                     "switching the orchestrator to {runtime} (no summary): waiting for the hub"
                 ),
             )),
+            offer: false,
             action: Action::UseOrchestrator {
                 runtime,
                 model,
@@ -4259,6 +4303,7 @@ impl AppState {
                     prompt: "Clear the orchestrator conversation? History stays in the log; workers stay. [y/N]".into(),
                     pending: "clearing the orchestrator conversation...".into(),
                     alt: None,
+                    offer: false,
                 });
             }
             Slash::Orch { runtime, model } => self.confirm_switch(runtime, model),
@@ -4331,6 +4376,7 @@ impl AppState {
                     prompt: format!("stop {name}? y to confirm, any other key cancels"),
                     pending: format!("stop {name}: waiting for the hub"),
                     alt: None,
+                    offer: false,
                 });
             }
             Slash::Delete(qs) => {
@@ -4602,6 +4648,13 @@ impl AppState {
                 self.view.trash = None;
             }
             return Vec::new();
+        }
+        // An offer the TUI made by itself answers only its own keys, once read; any other key
+        // goes where it would.
+        if self.view.confirm.as_ref().is_some_and(|c| c.offer) {
+            if let Some(actions) = self.offer_key(key) {
+                return actions;
+            }
         }
         // A pending confirmation eats the next key: `y` runs it (or its alternative's key
         // its alternative), anything else cancels.
@@ -6941,6 +6994,9 @@ impl AppState {
                 }
             }
             Target::Yes => return self.tap_yes(),
+            Target::No if self.view.confirm.as_ref().is_some_and(|c| c.offer) => {
+                return self.tap_offer_no();
+            }
             Target::No => {
                 if self.view.confirm.take().is_some() {
                     self.view.status = Some("cancelled".into());
@@ -6981,15 +7037,7 @@ impl AppState {
     /// has been on screen for [`CARD_SETTLE`] ([`ViewState::confirm_seen`]); before that it
     /// says so, and the question stays.
     fn tap_yes(&mut self) -> Vec<Action> {
-        let Some(c) = &self.view.confirm else {
-            return Vec::new();
-        };
-        let read = self
-            .view
-            .confirm_seen
-            .as_ref()
-            .is_some_and(|(prompt, since)| *prompt == c.prompt && since.elapsed() >= CARD_SETTLE);
-        if !read {
+        if !self.confirm_read() {
             return Vec::new();
         }
         let Some(c) = self.view.confirm.take() else {
@@ -6997,6 +7045,113 @@ impl AppState {
         };
         self.view.status = Some(c.pending);
         vec![c.action]
+    }
+
+    /// Whether the question waiting for `y` had been on screen, with its `yes`, for
+    /// [`CARD_SETTLE`] ([`ViewState::confirm_seen`]) when the input being handled was read
+    /// ([`AppState::input_at`]; now, without one): a key read earlier and handled late was
+    /// meant for what was there then.
+    fn confirm_read(&self) -> bool {
+        let Some(c) = &self.view.confirm else {
+            return false;
+        };
+        let at = self.input_at.unwrap_or_else(Instant::now);
+        self.view
+            .confirm_seen
+            .as_ref()
+            .is_some_and(|(prompt, since)| {
+                *prompt == c.prompt
+                    && at
+                        .checked_duration_since(*since)
+                        .is_some_and(|d| d >= CARD_SETTLE)
+            })
+    }
+
+    /// A key while an offer the TUI made by itself is on screen ([`Confirm::offer`]): `y`
+    /// (or the alternative's key), unmodified, on an empty input line and once the offer has
+    /// been read, answers it. Any other key leaves the offer for this run and goes where it
+    /// would without it (`None`): an offer never takes a key that was meant for typing.
+    fn offer_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        let answerable = plain && self.view.input.is_empty() && self.confirm_read();
+        let c = self.view.confirm.take()?;
+        if answerable {
+            if let KeyCode::Char(got) = key.code {
+                if got.eq_ignore_ascii_case(&'y') {
+                    self.view.status = Some(c.pending);
+                    return Some(vec![c.action]);
+                }
+                if let Some((k, action, pending)) = c.alt {
+                    if got.eq_ignore_ascii_case(&k) {
+                        self.view.status = Some(pending);
+                        return Some(vec![action]);
+                    }
+                }
+            }
+        }
+        // Left for this run: it comes back at the next start until answered (a few times).
+        self.terminal_offer = None;
+        None
+    }
+
+    /// A tap on `no` of an offer the TUI made by itself: its alternative (don't ask again),
+    /// once the offer has been read; before that nothing.
+    fn tap_offer_no(&mut self) -> Vec<Action> {
+        if !self.confirm_read() {
+            return Vec::new();
+        }
+        let Some((_, action, pending)) = self.view.confirm.take().and_then(|c| c.alt) else {
+            return Vec::new();
+        };
+        self.view.status = Some(pending);
+        vec![action]
+    }
+
+    /// Shows `text` in the status bar, to be told once: [`AppState::note_drawn`] records it as
+    /// told ([`AppState::seen`]) once a frame showed it there.
+    pub fn show_once(&mut self, what: crate::firstrun::Once, text: String) {
+        self.view.status = Some(text.clone());
+        self.once = Some((what, text));
+    }
+
+    /// Puts the Shift-Enter offer on screen at startup ([`crate::firstrun::terminal_offer`]):
+    /// a question for `y` or `n` ([`Confirm::offer`], counted as made by
+    /// [`crate::firstrun::reserve_offer`]), or a notice told once.
+    pub fn offer_terminal(&mut self, offer: crate::firstrun::TerminalOffer) {
+        use crate::firstrun::{Once, TerminalOffer};
+        match &offer {
+            TerminalOffer::Notice { key, text } => {
+                self.show_once(Once::Terminal(key.clone()), text.clone());
+            }
+            TerminalOffer::Edit { .. } => {
+                self.view.confirm = Some(Confirm {
+                    prompt: offer.question().unwrap_or_default(),
+                    pending: "setting Shift-Enter up…".into(),
+                    alt: Some((
+                        'n',
+                        Action::TerminalSetup { yes: false },
+                        "Shift-Enter left as it is: twr won't ask again (`twr terminal-setup` \
+                         sets it up any time; Ctrl-J starts a new line)"
+                            .into(),
+                    )),
+                    offer: true,
+                    action: Action::TerminalSetup { yes: true },
+                });
+                self.terminal_offer = Some(offer);
+            }
+        }
+    }
+
+    /// The Shift-Enter offer was answered (`yes`): remembered for its place; the offer, for
+    /// the IO loop to set the terminal up with when `yes`.
+    pub fn answer_terminal_offer(&mut self, yes: bool) -> Option<crate::firstrun::TerminalOffer> {
+        let offer = self.terminal_offer.take()?;
+        self.seen
+            .terminal
+            .entry(offer.key().to_string())
+            .or_insert_with(|| if yes { "yes" } else { "no" }.into());
+        self.seen_dirty = true;
+        yes.then_some(offer)
     }
 
     /// Whether the input box offers to take back the last message ([`Target::TakeBack`]):
@@ -7346,7 +7501,10 @@ impl AppState {
         if std::mem::take(&mut self.view.help) {
             return;
         }
-        if self.view.confirm.take().is_some() {
+        // An offer the TUI made by itself goes for this run; the paste goes where it would.
+        if self.view.confirm.as_ref().is_some_and(|c| c.offer) {
+            self.view.confirm = None;
+        } else if self.view.confirm.take().is_some() {
             self.view.status = Some("cancelled".into());
             return;
         }
@@ -15281,6 +15439,7 @@ pub(crate) mod tests {
             prompt: "stop api? y to confirm, any other key cancels".into(),
             pending: "stop api: waiting for the hub".into(),
             alt: None,
+            offer: false,
         };
         st.view.confirm = Some(stop.clone());
         st.apply_result("trash.empty", &chosen);
@@ -21675,16 +21834,158 @@ pub(crate) mod tests {
         }
     }
 
+    /// The Shift-Enter offer at startup ([`crate::firstrun`]).
+    mod terminal_offer {
+        use super::*;
+        use crate::firstrun::{Once, TerminalOffer};
+        use crate::terminal_setup::{Place, Terminal};
+
+        fn edit() -> TerminalOffer {
+            TerminalOffer::Edit {
+                key: "local:alacritty".into(),
+                place: Place::default(),
+                terminal: Terminal::Alacritty,
+                file: "/home/me/.config/alacritty/alacritty.toml".into(),
+            }
+        }
+
+        /// The offer on screen for [`CARD_SETTLE`] already.
+        fn offered() -> AppState {
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+            st.view.confirm_seen = Some((prompt, Instant::now() - CARD_SETTLE));
+            st
+        }
+
+        /// `y` sets the terminal up and `n` declines, once the offer has been read and nothing
+        /// is typed; the answer is remembered for the place, and the offer counted as made.
+        #[test]
+        fn y_and_n_answer_the_offer_once_read() {
+            for (k, yes) in [('y', true), ('Y', true), ('n', false)] {
+                let mut st = offered();
+                let shift = if k.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                let out = st.handle_key(KeyEvent::new(KeyCode::Char(k), shift));
+                assert_eq!(out, vec![Action::TerminalSetup { yes }], "{k}");
+                assert!(st.view.confirm.is_none());
+                assert!(st.view.input.is_empty(), "the key typed nothing");
+                let offer = st.answer_terminal_offer(yes);
+                assert_eq!(offer.is_some(), yes);
+                assert_eq!(
+                    st.seen.terminal["local:alacritty"],
+                    if yes { "yes" } else { "no" }
+                );
+                assert!(st.seen_dirty);
+                assert_eq!(st.answer_terminal_offer(yes), None, "answered once");
+            }
+        }
+
+        /// An offer the user didn't ask for never takes a key meant for typing: a `y` before
+        /// it was read, a `y` with text typed, or any other key goes where it would, and the
+        /// offer goes for this run (unanswered: it comes back next start).
+        #[test]
+        fn other_keys_go_where_they_would() {
+            // Read in time, but the key was read before: typed, however late it is handled.
+            let mut st = offered();
+            let since = st.view.confirm_seen.as_ref().unwrap().1;
+            st.input_at = Some(since + CARD_SETTLE / 2);
+            assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "y");
+            assert!(st.view.confirm.is_none());
+            // Just shown: the `y` is typed.
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "y");
+            assert!(st.view.confirm.is_none() && st.terminal_offer.is_none());
+            assert!(st.seen.terminal.is_empty(), "not answered");
+            // Read, but another key: typed.
+            let mut st = offered();
+            assert!(st.handle_key(key(KeyCode::Char('h'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "h");
+            assert!(st.view.confirm.is_none());
+            // Ctrl-Y is no answer.
+            let mut st = offered();
+            let out = st.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+            assert!(
+                !out.contains(&Action::TerminalSetup { yes: true }),
+                "{out:?}"
+            );
+            assert!(st.view.confirm.is_none());
+            // A paste goes in, the offer goes.
+            let mut st = offered();
+            st.handle_paste("yes please");
+            assert_eq!(st.view.input.as_str(), "yes please");
+            assert!(st.view.confirm.is_none());
+            // Taps: `no` declines once read, not before.
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            assert!(st.tap_offer_no().is_empty());
+            assert!(st.view.confirm.is_some());
+            let mut st = offered();
+            assert_eq!(
+                st.tap_offer_no(),
+                vec![Action::TerminalSetup { yes: false }]
+            );
+        }
+
+        /// A notice instead of the question (twr can't edit here): told once a frame showed
+        /// it, then never again for that place.
+        #[test]
+        fn a_notice_is_told_once_shown() {
+            let mut st = with_orch();
+            st.offer_terminal(TerminalOffer::Notice {
+                key: "mosh".into(),
+                text: crate::keys::MOSH_NOTICE.into(),
+            });
+            assert!(st.view.confirm.is_none());
+            assert_eq!(st.view.status.as_deref(), Some(crate::keys::MOSH_NOTICE));
+            assert!(st.seen.terminal.is_empty());
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert_eq!(st.seen.terminal["mosh"], "shown");
+            assert!(st.once.is_none());
+            // Replaced before it was drawn: not told.
+            let mut st = with_orch();
+            st.show_once(Once::Terminal("ssh".into()), "over ssh".into());
+            st.view.status = Some("other".into());
+            st.note_drawn(Instant::now());
+            assert!(st.seen.terminal.is_empty());
+        }
+
+        /// The question is drawn with its `yes` and `no`, the file it would change named.
+        #[test]
+        fn the_offer_is_drawn_as_a_question() {
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            let screen = screen_text(&draw(&mut st, 200, 40));
+            assert!(
+                screen.contains("Shift-Enter sends Enter in Alacritty"),
+                "{screen}"
+            );
+            assert!(screen.contains("don't ask again"), "{screen}");
+            assert!(screen.contains("yes") && screen.contains("no"), "{screen}");
+            st.note_drawn(Instant::now());
+            assert!(st.view.confirm_seen.is_some(), "its yes was drawn");
+        }
+    }
+
     /// Next-message suggestions ([`crate::suggest`]).
     mod suggestions {
         use super::*;
         use serde_json::json;
 
-        /// The orchestrator conversation after its turn 1 ended live.
+        /// The orchestrator conversation after its turn 1 ended live (the notice that
+        /// suggestions are on told in an earlier run).
         fn ended(on: bool) -> (AppState, ThreadScript) {
             let mut st = with_orch();
+            st.seen.suggest_notice = true;
             st.view.suggest = on;
-            st.view.suggest_model = "haiku".into();
+            st.view.suggest_model = Default::default();
             let mut o = ThreadScript::new("t-orch");
             o.at(200);
             let started = o.turn_started("fix it");
@@ -21718,7 +22019,8 @@ pub(crate) mod tests {
                 Some(crate::suggest::Ask {
                     thread: "t-orch".into(),
                     turn: 1,
-                    model: "haiku".into()
+                    models: twr_core::config::SuggestModels::default(),
+                    retry: false,
                 })
             );
             assert_eq!(st.take_suggest_due(), None, "asked once");
@@ -21727,6 +22029,129 @@ pub(crate) mod tests {
             let ended = o.turn_ended(TurnResult::Completed);
             control(&mut st, &[started, ended]);
             assert_eq!(st.take_suggest_due(), None, "typing: not asked");
+        }
+
+        /// The first suggestion ever waits for the notice of what suggestions send, and how
+        /// to turn them off, to be on screen: it is asked for only after a frame showed it,
+        /// and the notice is told for good.
+        #[test]
+        fn the_first_suggestion_waits_for_its_notice() {
+            let (mut st, _) = ended(true);
+            st.seen.suggest_notice = false;
+            assert_eq!(st.take_suggest_due(), None, "not before the notice");
+            let notice = crate::firstrun::suggest_notice(&st.view.suggest_model);
+            let notice = notice.as_str();
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+            for says in [
+                "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "$0.0002",
+                "Claude Code",
+                "/suggest off",
+                "suggest = false",
+                "2 KB",
+            ] {
+                assert!(notice.contains(says), "{says}");
+            }
+            assert_eq!(st.take_suggest_due(), None, "still not drawn");
+            // Replaced before a frame showed it: shown again.
+            st.view.status = Some("something else".into());
+            assert_eq!(st.take_suggest_due(), None);
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+            // Under the help (or cut), it is not on screen: not told.
+            st.view.help = true;
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "under the help");
+            assert_eq!(st.take_suggest_due(), None);
+            st.view.help = false;
+            draw(&mut st, 60, 12);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "cut short");
+            // A terminal of one row has no room for the status bar at all.
+            draw(&mut st, 1000, 1);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "no status bar");
+            assert_eq!(st.take_suggest_due(), None);
+            let screen = screen_text(&draw(&mut st, 400, 40));
+            assert!(screen.contains("suggestions are on"), "{screen}");
+            st.note_drawn(Instant::now());
+            assert!(st.seen.suggest_notice && st.seen_dirty);
+            assert!(st.take_suggest_due().is_some(), "asked once shown");
+            // `/suggest off` and back on tells nothing: the notice still comes first.
+            let (mut st, _) = ended(true);
+            st.seen.suggest_notice = false;
+            st.toggle_suggest(Some(false));
+            assert_eq!(st.take_suggest_due(), None);
+            assert!(!st.seen.suggest_notice);
+            st.toggle_suggest(Some(true));
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert_eq!(st.take_suggest_due(), None);
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+        }
+
+        /// Where the hub can't run suggestions (no Claude Code CLI, or none signed in) they
+        /// stop for the run without another call, and the status bar says so once ever; a
+        /// call's answer and `hub.info` alike. After `/suggest on`, `hub.info` no longer
+        /// turns them off.
+        #[test]
+        fn unavailable_suggestions_stop_quietly() {
+            let unavailable = |st: &mut AppState| {
+                st.take_suggest_due();
+                st.apply_result(
+                    "suggest.next",
+                    &json!({"thread": "t-orch", "turn": 1, "model": "haiku", "suggestion": null,
+                            "reason": "unavailable: Claude Code is not signed in",
+                            "cached": false, "stats": {"calls": 1, "failures": 1}}),
+                );
+            };
+            let (mut st, mut o) = ended(true);
+            unavailable(&mut st);
+            assert!(!st.view.suggest);
+            let status = st.view.status.clone().unwrap();
+            assert!(status.contains("Claude Code is not signed in"), "{status}");
+            assert!(status.contains("suggest = false"), "{status}");
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert!(st.seen.suggest_unavailable);
+            let started = o.turn_started("more");
+            let ended_ = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended_]);
+            assert_eq!(st.take_suggest_due(), None, "no more calls");
+            // Told before: silent.
+            let (mut st, _) = ended(true);
+            st.seen.suggest_unavailable = true;
+            unavailable(&mut st);
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status, None);
+            // `hub.info` says so before any call: silent but for the one notice, which waits
+            // for a free status bar.
+            let info = json!({"suggest": {"unavailable": "unavailable: Claude Code's CLI (claude) is not installed"}});
+            let (mut st, _) = ended(true);
+            st.view.status = Some("busy".into());
+            st.apply_result("hub.info", &info);
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status.as_deref(), Some("busy"));
+            assert_eq!(st.take_suggest_due(), None);
+            st.view.status = None;
+            st.apply_result("hub.info", &info);
+            assert!(st.view.status.as_deref().unwrap().contains("not installed"));
+            // Turned on by the user: `hub.info` leaves them on, and the next ask says so, for
+            // the hub to try again what its calls found.
+            st.toggle_suggest(Some(true));
+            st.apply_result("hub.info", &info);
+            assert!(st.view.suggest);
+            st.seen.suggest_notice = true;
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(st.take_suggest_due().unwrap().retry);
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(!st.take_suggest_due().unwrap().retry, "once");
+            // Nothing in `hub.info`: nothing changes.
+            let (mut st, _) = ended(true);
+            st.apply_result("hub.info", &json!({"suggest": {"unavailable": null}}));
+            assert!(st.view.suggest);
         }
 
         /// The answer shows as ghost text in the empty box; Enter there sends nothing; Tab or →
@@ -22065,12 +22490,10 @@ pub(crate) mod tests {
             assert_eq!(st.view.status.as_deref(), Some("suggestions off"));
             type_line(&mut st, "/suggest");
             assert!(st.view.suggest);
-            assert!(st
-                .view
-                .status
-                .as_deref()
-                .unwrap()
-                .contains("go to Anthropic"));
+            let said = st.view.status.as_deref().unwrap();
+            for says in ["claude-haiku-5-5", "Anthropic", "gpt-6-luna", "OpenAI"] {
+                assert!(said.contains(says), "{said}");
+            }
         }
     }
 }

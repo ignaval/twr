@@ -133,6 +133,12 @@ impl Hub {
                     .filter(|b| !b.is_empty())
                     .map_or_else(|| PathBuf::from("claude"), PathBuf::from)
             }),
+            suggest_codex_home: opts.suggest_codex_home,
+            suggest_codex_bin: opts.suggest_codex_bin.unwrap_or_else(|| {
+                std::env::var_os(twr_adapters::codex::BIN_ENV)
+                    .filter(|b| !b.is_empty())
+                    .map_or_else(|| PathBuf::from("codex"), PathBuf::from)
+            }),
             suggestions: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,

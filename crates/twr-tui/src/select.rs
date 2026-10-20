@@ -249,6 +249,10 @@ pub struct DrawnItem {
 pub struct Panes {
     /// The text panes, in drawing order.
     pub panes: Vec<Pane>,
+    /// The status bar's message ([`crate::app::ViewState::status`]) and the bar's area, when
+    /// the draw showed it in full, not cut and not under an overlay: a notice told once
+    /// counts as told only then ([`crate::app::AppState::note_drawn`]).
+    pub status: Option<(String, Rect)>,
     /// The attention items drawn in full ([`DrawnItem`]), none hidden under an overlay.
     pub items: Vec<DrawnItem>,
     /// The cells of the moving working icons drawn (their cursors), none hidden under an
@@ -365,6 +369,9 @@ impl Panes {
     pub fn cover(&mut self, area: Option<Rect>) {
         match area {
             Some(a) => {
+                if self.status.as_ref().is_some_and(|(_, r)| r.intersects(a)) {
+                    self.status = None;
+                }
                 self.items.retain(|i| !i.area.intersects(a));
                 self.moving.retain(|c| !c.intersects(a));
                 self.targets.retain(|(r, _)| !r.intersects(a));
@@ -373,6 +380,7 @@ impl Panes {
                 }
             }
             None => {
+                self.status = None;
                 self.items.clear();
                 self.moving.clear();
                 self.targets.clear();

@@ -27,6 +27,11 @@ pub struct Keys {
     pub shift_enter: bool,
     /// What the status bar says once, at startup, about breaking lines here.
     pub notice: Option<&'static str>,
+    /// tmux was asked to pass Shift-Enter on ([`TmuxPlan::Request`]): whether it does is
+    /// known only once one arrives.
+    pub tmux_asked: bool,
+    /// mosh runs between the TUI and the terminal ([`under_mosh`]).
+    pub mosh: bool,
 }
 
 /// Asks tmux to pass modified keys on as extended keys (xterm's modifyOtherKeys, mode 1):
@@ -38,8 +43,8 @@ pub const MODIFY_OTHER_KEYS_OFF: &str = "\x1b[>4;0m";
 
 /// The startup notice over mosh.
 pub const MOSH_NOTICE: &str = "over mosh, Shift-Enter starts a new line once your terminal \
-     sends it as Alt-Enter (twr terminal-setup); Ctrl-J always does · mosh --predict-overwrite \
-     stops the input box's border jumping as you type";
+     sends it as Alt-Enter (run `twr terminal-setup` where your terminal runs); Ctrl-J always \
+     does · mosh --predict-overwrite stops the input box's border jumping as you type";
 /// The startup notice inside a tmux that would send Shift-Enter in a form twr cannot read.
 pub const TMUX_NOTICE: &str = "tmux sends Shift-Enter in a form twr can't read: `set -s \
      extended-keys-format csi-u` fixes it · Ctrl-J starts a new line";

@@ -404,6 +404,8 @@ pub struct Translator {
     usage: crate::usage::Reads,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
+    /// Reviewer decisions too long to read so far, naming those without a readable id.
+    unread_reviews: u64,
 }
 
 impl Translator {
@@ -442,6 +444,7 @@ impl Translator {
             used_attn_ids: Recent::new(ATTN_IDS_KEPT),
             usage: crate::usage::Reads::default(),
             clock: Utc::now,
+            unread_reviews: 0,
         }
     }
 
@@ -769,8 +772,9 @@ impl Translator {
     /// A stdout line longer than the reader's cap was dropped; `head` is its start and `len`
     /// its length. A `turn/completed` still ends the running turn (`turn.ended{error}` with
     /// `ext.twr.error = "oversized runtime message"`); a `thread/settings/updated` ends the
-    /// session (twr cannot check it); an answer to `config/read` counts as a failed read;
-    /// anything else is only logged.
+    /// session (twr cannot check it); an answer to `config/read` counts as a failed read; a
+    /// decision of Codex's reviewer agent is still in the transcript, as one twr could not
+    /// read; anything else is only logged.
     pub fn oversized(&mut self, head: &str, len: usize) -> Translated {
         let mut out = Translated::default();
         // Settings twr cannot read are settings it cannot check.
@@ -778,6 +782,12 @@ impl Translator {
             out.fatal = Some(format!(
                 "codex thread/settings/updated: a message of {len} bytes, too long to check"
             ));
+            return out;
+        }
+        // Every decision of the reviewer is in the transcript: what it approved may have run
+        // outside the sandbox, whatever twr could read of it.
+        if crate::process::head_has(head, "method", "item/autoApprovalReview/completed") {
+            self.on_unread_auto_review(head, len, &mut out);
             return out;
         }
         // A config/read answer too long to read is a failed read.
@@ -2386,6 +2396,45 @@ impl Translator {
         self.push(out, EventBody::AgentToolResult(result), turn, None);
     }
 
+    /// [`Translator::on_auto_review`] for a decision whose message was too long to read
+    /// (`len` bytes, `head` its start): an `auto_review` call and result that say so, in the
+    /// current turn, `risky` and not `ok` (it may have been approved).
+    fn on_unread_auto_review(&mut self, head: &str, len: usize, out: &mut Translated) {
+        let id = format!(
+            "auto_review:{}",
+            head_string(head, "reviewId")
+                .unwrap_or_else(|| format!("unread-{}", self.unread_reviews))
+        );
+        self.unread_reviews += 1;
+        let what = format!("a decision of {len} bytes, too long to read");
+        let mut codex = Map::new();
+        codex.insert("item_type".into(), json!("autoApprovalReview"));
+        codex.insert("oversized_len".into(), json!(len));
+        let turn = self.turn_of(None);
+        let call = AgentToolCall {
+            call_id: id.clone(),
+            tool: "auto_review".into(),
+            input_summary: format!("unread: {what}"),
+            input_ref: None,
+            risky: true,
+            ext: ext_of(codex.clone()),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolCall(call), turn, None);
+        let result = AgentToolResult {
+            call_id: id,
+            ok: false,
+            output_summary: format!(
+                "unread: Codex's reviewer decided, and twr could not read the decision ({what}); \
+                 what it approved ran outside the sandbox"
+            ),
+            output_ref: None,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolResult(result), turn, None);
+    }
+
     fn on_item_completed(
         &mut self,
         item: &Value,
@@ -2815,6 +2864,17 @@ fn id_text(id: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// The string value of the first `"key"` in `head`, the start of a JSON message too long to
+/// parse: only a plain one (no escapes), as an id is.
+fn head_string(head: &str, key: &str) -> Option<String> {
+    let at = head.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = head[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty() && !value.contains('\\') && value.len() <= 128).then(|| value.to_string())
 }
 
 fn ext_of(codex: Map<String, Value>) -> Option<JsonMap> {
@@ -4011,6 +4071,61 @@ mod tests {
         assert_eq!(c.input_summary, "approved: touch /x");
         assert_eq!(c.ext.as_ref().unwrap()["codex"]["child_thread"], "child-1");
         assert!(r.ok);
+    }
+
+    /// A reviewer decision too long to read is still in the transcript, in the running turn:
+    /// an `auto_review` call and result that say so, `risky` and not `ok`, under its review id
+    /// when the start of the message names one.
+    #[test]
+    fn an_auto_review_decision_too_long_to_read_is_recorded() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let heads = [
+            (
+                r#"{"method":"item/autoApprovalReview/completed","params":{"threadId":"th","turnId":"tu1","reviewId":"r9","action":{"type":"command","command":"echo aaaa"#,
+                "auto_review:r9",
+            ),
+            (
+                r#"{"method": "item/autoApprovalReview/completed", "params": {"action": {"command": "x"#,
+                "auto_review:unread-1",
+            ),
+        ];
+        for (head, id) in heads {
+            let out = t.oversized(head, 40 << 20);
+            assert!(out.fatal.is_none());
+            let [Emitted {
+                body: EventBody::AgentToolCall(c),
+                turn: Some(1),
+                ..
+            }, Emitted {
+                body: EventBody::AgentToolResult(r),
+                turn: Some(1),
+                ..
+            }] = &out.events[..]
+            else {
+                panic!("{:?}", out.events)
+            };
+            assert_eq!(c.tool, "auto_review");
+            assert_eq!(c.call_id, id);
+            assert_eq!(r.call_id, id);
+            assert!(c.risky && !r.ok);
+            assert!(
+                c.input_summary.starts_with("unread: "),
+                "{}",
+                c.input_summary
+            );
+            assert!(
+                r.output_summary.contains("could not read"),
+                "{}",
+                r.output_summary
+            );
+        }
+        assert_eq!(head_string(r#"{"reviewId":"a\"b"}"#, "reviewId"), None);
+        assert_eq!(
+            head_string(r#"{"reviewId" : "ok-1"}"#, "reviewId").as_deref(),
+            Some("ok-1")
+        );
     }
 
     /// The settings Codex reports during the session are held to what twr asked for, like

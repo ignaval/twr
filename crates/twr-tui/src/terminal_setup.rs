@@ -369,22 +369,66 @@ pub enum Outcome {
     Manual,
 }
 
+/// What [`edit`] would do, found without writing anything ([`prepare`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prepared {
+    /// Nothing to write: what [`edit`] reports.
+    Done(Outcome),
+    /// `file` (its text `old`, `None`: it doesn't exist) would become `new`.
+    Write {
+        file: PathBuf,
+        old: Option<String>,
+        new: String,
+    },
+}
+
 /// Adds the Shift-Enter binding for `t` to its settings file in `place` (backed up first),
 /// unless one is there. Edits nothing for a terminal without a file twr edits.
 pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
+    let (file, old, new) = match prepare(place, t)? {
+        Prepared::Done(outcome) => return Ok(outcome),
+        Prepared::Write { file, old, new } => (file, old, new),
+    };
+    let backup = match old {
+        Some(old) => {
+            let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
+            let mut name = file.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".twr-backup-{stamp}"));
+            let backup = file.with_file_name(name);
+            create_private(&backup, &old).with_context(|| {
+                format!("backing up {} to {}", file.display(), backup.display())
+            })?;
+            Some(backup)
+        }
+        None => {
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("creating {}", dir.display()))?;
+            }
+            None
+        }
+    };
+    write_replacing(&file, &new)?;
+    Ok(Outcome::Added { file, backup })
+}
+
+/// What [`edit`] would do for `t` in `place`, reading its settings file but writing nothing:
+/// the TUI offers to set Shift-Enter up only when there is something to write.
+pub fn prepare(place: &Place, t: Terminal) -> anyhow::Result<Prepared> {
+    let done = |o| Ok(Prepared::Done(o));
     let Some(file) = place.file(t) else {
-        return Ok(Outcome::Manual);
+        return done(Outcome::Manual);
     };
     // A link (a dotfiles manager's) or anything but a regular file: not replaced, by hand.
     match std::fs::symlink_metadata(&file) {
         Ok(m) if m.file_type().is_symlink() => {
-            return Ok(Outcome::Unsafe {
+            return done(Outcome::Unsafe {
                 file,
                 why: "it is a link (to a dotfiles folder?); twr won't replace it".into(),
             })
         }
         Ok(m) if !m.is_file() => {
-            return Ok(Outcome::Unsafe {
+            return done(Outcome::Unsafe {
                 file,
                 why: "it is not a regular file".into(),
             })
@@ -419,35 +463,14 @@ pub fn edit(place: &Place, t: Terminal) -> anyhow::Result<Outcome> {
             |l| l.contains("\\x1b\\r") || l.contains("\\e\\r"),
             "map shift+enter send_text all \\x1b\\r",
         ),
-        Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => return Ok(Outcome::Manual),
+        Terminal::ITerm2 | Terminal::AppleApp | Terminal::WezTerm => return done(Outcome::Manual),
     };
-    let new = match change {
-        Change::Already => return Ok(Outcome::Already { file }),
-        Change::Other => return Ok(Outcome::Other { file }),
-        Change::Unsafe(why) => return Ok(Outcome::Unsafe { file, why }),
-        Change::Write(new) => new,
-    };
-    let backup = match old {
-        Some(_) => {
-            let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
-            let mut name = file.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".twr-backup-{stamp}"));
-            let backup = file.with_file_name(name);
-            create_private(&backup, old.as_deref().unwrap_or_default()).with_context(|| {
-                format!("backing up {} to {}", file.display(), backup.display())
-            })?;
-            Some(backup)
-        }
-        None => {
-            if let Some(dir) = file.parent() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-            }
-            None
-        }
-    };
-    write_replacing(&file, &new)?;
-    Ok(Outcome::Added { file, backup })
+    match change {
+        Change::Already => done(Outcome::Already { file }),
+        Change::Other => done(Outcome::Other { file }),
+        Change::Unsafe(why) => done(Outcome::Unsafe { file, why }),
+        Change::Write(new) => Ok(Prepared::Write { file, old, new }),
+    }
 }
 
 /// Writes `text` to `file` through a temporary file beside it, renamed over it, keeping the

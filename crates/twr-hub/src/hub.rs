@@ -152,6 +152,7 @@ mod spawn;
 mod stall;
 mod subscribe;
 mod suggest;
+pub use suggest::SuggestAsk;
 mod supervisor;
 mod switch;
 mod threads;
@@ -300,6 +301,13 @@ pub struct HubOptions {
     /// The Claude Code CLI that answers next-message suggestions (`hub::suggest`): `None`
     /// uses `TWR_CLAUDE_BIN`, else `claude` on the hub's `PATH`. Tests give a script.
     pub suggest_bin: Option<PathBuf>,
+    /// The Codex CLI that answers them for Codex threads, or when Claude Code can't
+    /// (`hub::suggest`): `None` uses `TWR_CODEX_BIN`, else `codex` on the hub's `PATH`. Tests
+    /// give a script, or a path that doesn't exist.
+    pub suggest_codex_bin: Option<PathBuf>,
+    /// The Codex home whose global instructions keep Codex from answering suggestions
+    /// (`hub::suggest`): `None` uses `$CODEX_HOME`, else `~/.codex`. Tests give a folder.
+    pub suggest_codex_home: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
     /// give their own).
@@ -453,6 +461,8 @@ impl HubOptions {
             twr_exe: std::env::current_exe().ok(),
             job_gate_exe: std::env::current_exe().ok(),
             suggest_bin: None,
+            suggest_codex_bin: None,
+            suggest_codex_home: None,
             claude_policy: twr_adapters::claude_code::guard::PolicySources::system(),
             stall_after: None,
             wake_after: None,
@@ -730,6 +740,10 @@ struct Inner {
     job_gate_exe: Option<PathBuf>,
     /// [`HubOptions::suggest_bin`], resolved.
     suggest_bin: PathBuf,
+    /// [`HubOptions::suggest_codex_bin`], resolved.
+    suggest_codex_bin: PathBuf,
+    /// [`HubOptions::suggest_codex_home`] (`None`: read from the environment when needed).
+    suggest_codex_home: Option<PathBuf>,
     /// Next-message suggestions asked and answered (`hub::suggest`).
     suggestions: Mutex<suggest::Suggestions>,
     /// [`HubOptions::claude_policy`].
@@ -2291,6 +2305,8 @@ impl Hub {
             .map(|b| box_agents::project_box(b, view))
             .collect();
         let agents = self.local_agents_json(view);
+        // Whether next-message suggestions can run here (`hub::suggest`).
+        let suggest_unavailable = self.suggest_unavailable();
         // (Read once, on the first call: not under the core lock.)
         let build = twr_core::build_id();
         let core = self.inner.core();
@@ -2323,6 +2339,7 @@ impl Hub {
             "notify_hook": !self.inner.config.notify.command.is_empty(),
             "worker_limits": self.inner.limits.by(),
             "warnings": self.inner.warnings(),
+            "suggest": {"unavailable": suggest_unavailable},
         })
     }
 

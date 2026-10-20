@@ -71,9 +71,11 @@ fn line_break_bytes_from_the_terminal_break_the_line() {
     let home = home.path();
     let tokens = tempfile::tempdir().unwrap();
     let token = test_token(tokens.path());
+    // No suggestions: the hub would run the real `claude`, with the real `HOME`'s login, on
+    // this test's turn.
     std::fs::write(
         home.join("config.toml"),
-        "[orchestrator]\nruntime = \"fake\"\n",
+        "[orchestrator]\nruntime = \"fake\"\n[tui]\nsuggest = false\n",
     )
     .unwrap();
     let log = std::fs::File::create(home.join("hub-test.log")).unwrap();

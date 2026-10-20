@@ -69,6 +69,17 @@ fn runs(dir: &Path) -> usize {
 }
 
 async fn hub(dir: &Path, bin: PathBuf) -> Hub {
+    hub_probing(dir, bin, None).await
+}
+
+/// [`hub`] whose own agent probe finds the agents `probe` lists (`None`: it probes none).
+/// Its Codex is `codex` in `dir`'s `codex-cli` when there is one there ([`fake_codex`]),
+/// else a path that doesn't exist: no test runs the real one.
+async fn hub_probing(
+    dir: &Path,
+    bin: PathBuf,
+    probe: Option<Vec<twr_core::runner::AgentInfo>>,
+) -> Hub {
     let config = Config {
         default_runtime: "fake".into(),
         ..Default::default()
@@ -83,6 +94,18 @@ async fn hub(dir: &Path, bin: PathBuf) -> Hub {
     o.socket = Some(dir.join("hub.sock"));
     o.stop_timeout = Duration::from_secs(5);
     o.suggest_bin = Some(bin);
+    o.suggest_codex_bin = Some(dir.join("codex-cli").join("codex"));
+    // Not the developer's own Codex home: its global instructions would keep Codex out.
+    o.suggest_codex_home = Some(dir.join("codex-home"));
+    if let Some(probe) = probe {
+        o.agent_probe = Some(Arc::new(move || {
+            let probe = probe.clone();
+            futures::FutureExt::boxed(async move { probe })
+        }));
+    }
+    if let Some(probe) = PROBE.with(|p| p.borrow_mut().take()) {
+        o.agent_probe = Some(probe);
+    }
     // A `!!` command runs through the job gate, which this test binary isn't.
     o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
     Hub::open(o).await.unwrap()
@@ -90,6 +113,19 @@ async fn hub(dir: &Path, bin: PathBuf) -> Hub {
 
 fn tui() -> Caller {
     Caller::user("tui")
+}
+
+thread_local! {
+    /// A probe for the next [`hub_probing`] on this thread to use instead of a fixed list.
+    static PROBE: std::cell::RefCell<Option<twr_hub::hub::AgentProbe>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The models a TUI asks with: `claude` for Claude Code, Codex's default.
+fn m(claude: &str) -> twr_core::config::SuggestModels {
+    twr_core::config::SuggestModels {
+        claude_code: claude.into(),
+        ..Default::default()
+    }
 }
 
 /// A thread `api` that ran turn 1 on `prompt` to its end.
@@ -151,7 +187,10 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
         "fix the login bug\nI fixed the login bug.",
     )
     .await;
-    let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(r["suggestion"], "Now run the integration tests", "{r}");
     assert_eq!(r["cached"], false);
     assert_eq!(r["stats"]["calls"], 1);
@@ -219,7 +258,10 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
         "what the CLI left running ({left}) outlived the call"
     );
     // Asked again (another TUI): the same answer, no second run.
-    let again = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+    let again = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(
         (again["suggestion"].as_str(), again["cached"].as_bool()),
         (Some("Now run the integration tests"), Some(true))
@@ -247,50 +289,59 @@ async fn answers_none_running_turns_and_callers_are_refused() {
     answer(&cli, "allow both", false);
     let hub = hub(dir.path(), bin).await;
     turn_ended(&hub, dir.path(), "check it").await;
-    let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(
         (r["suggestion"].is_null(), r["reason"].as_str()),
         (true, Some("none")),
         "{r}"
     );
     let e = hub
-        .suggest_next("api", 1, "--dangerously-skip-permissions", &tui())
+        .suggest_next("api", 1, &m("--dangerously-skip-permissions"), &tui())
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST);
     let e = hub
-        .suggest_next("api", 1, "haiku", &Caller::Orchestrator)
+        .suggest_next("api", 1, &m("haiku"), &Caller::Orchestrator)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::UNAUTHORIZED);
     let e = hub
-        .suggest_next("api", 9, "haiku", &tui())
+        .suggest_next("api", 9, &m("haiku"), &tui())
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::NOT_FOUND);
     // A running turn.
     hub.send_by("api", "!sleep 5000", &tui()).unwrap();
-    let r = hub.suggest_next("api", 2, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next("api", 2, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(r["reason"], "running", "{r}");
     assert_eq!(runs(&cli), 1);
     hub.stop_thread("api", "test").unwrap();
     hub.shutdown().await;
 }
 
-/// A failed call (not signed in, a usage limit) says why, and none follows for a while.
+/// A failed call (a usage limit) says why, and none follows for a while.
 #[tokio::test]
 async fn a_failure_holds_suggestions_back() {
     let dir = tempfile::tempdir().unwrap();
     let cli = dir.path().join("cli");
     std::fs::create_dir_all(&cli).unwrap();
     let bin = fake_claude(&cli);
-    answer(&cli, "Invalid API key · Please run /login", true);
+    answer(&cli, "You've hit your limit · resets 3pm", true);
     let hub = hub(dir.path(), bin).await;
     let api = turn_ended(&hub, dir.path(), "one").await;
-    let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(
         r["reason"].as_str(),
-        Some("failed: Invalid API key · Please run /login"),
+        Some("failed: You've hit your limit · resets 3pm"),
         "{r}"
     );
     assert_eq!(r["stats"]["failures"], 1);
@@ -298,7 +349,10 @@ async fn a_failure_holds_suggestions_back() {
     hub.send_by(&api, "two", &tui()).unwrap();
     until_ended(&mut sub, &api, 2).await;
     answer(&cli, "fine now", false);
-    let r = hub.suggest_next("api", 2, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next("api", 2, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(r["reason"], "backoff", "{r}");
     assert_eq!(runs(&cli), 1);
     hub.shutdown().await;
@@ -346,7 +400,10 @@ async fn a_notice_turn_gets_no_suggestion() {
                 .is_ok_and(|d| d["ext"]["twr"]["notice"] == true)
     });
     assert!(notice, "turn 2 is a notice");
-    let r = hub.suggest_next(&orch, 2, "haiku", &tui()).await.unwrap();
+    let r = hub
+        .suggest_next(&orch, 2, &m("haiku"), &tui())
+        .await
+        .unwrap();
     assert_eq!(
         (r["suggestion"].is_null(), r["reason"].as_str()),
         (true, Some("notice")),
@@ -367,9 +424,10 @@ async fn asks_at_once_share_one_call() {
     let hub = hub(dir.path(), bin).await;
     turn_ended(&hub, dir.path(), "build it").await;
     let (one, two) = (tui(), Caller::user("tui2"));
+    let models = m("haiku");
     let (a, b) = tokio::join!(
-        hub.suggest_next("api", 1, "haiku", &one),
-        hub.suggest_next("api", 1, "haiku", &two)
+        hub.suggest_next("api", 1, &models, &one),
+        hub.suggest_next("api", 1, &models, &two)
     );
     let (a, b) = (a.unwrap(), b.unwrap());
     assert_eq!(a["suggestion"], "deploy it", "{a}");
@@ -393,7 +451,10 @@ async fn a_suggestion_that_reads_as_a_command_is_dropped() {
         answer(&cli, text, false);
         let hub = hub(dir.path(), bin).await;
         turn_ended(&hub, dir.path(), "go").await;
-        let r = hub.suggest_next("api", 1, "haiku", &tui()).await.unwrap();
+        let r = hub
+            .suggest_next("api", 1, &m("haiku"), &tui())
+            .await
+            .unwrap();
         assert_eq!(
             (r["suggestion"].is_null(), r["reason"].as_str()),
             (true, Some("none")),
@@ -443,7 +504,7 @@ async fn a_turn_the_user_did_not_start_gets_no_suggestion() {
     until_ended(&mut sub, &api, 2).await;
     for turn in [1, 2] {
         let r = hub
-            .suggest_next("api", turn, "haiku", &tui())
+            .suggest_next("api", turn, &m("haiku"), &tui())
             .await
             .unwrap();
         assert_eq!(
@@ -453,5 +514,669 @@ async fn a_turn_the_user_did_not_start_gets_no_suggestion() {
         );
     }
     assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// No Claude Code to ask: a CLI that isn't there, or that says it has no login (as Claude
+/// Code 2.1.304 does without one, or with a refused key). One call per ask: that ask gets
+/// nothing (`retry: ...`), Codex may answer the next; with no Codex either, `unavailable:
+/// ...` with both reasons, for the TUI to stop asking, and `hub.info` says so. Turned on
+/// again (`retry`), what the calls found is tried again.
+#[tokio::test]
+async fn a_missing_or_signed_out_cli_is_unavailable() {
+    for (case, want) in [
+        ("missing", "Claude Code's CLI ("),
+        (
+            "Not logged in · Please run /login",
+            "Claude Code is not signed in",
+        ),
+        (
+            "Invalid API key · Please run /login",
+            "Claude Code is not signed in",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let bin = if case == "missing" {
+            cli.join("no-such-claude")
+        } else {
+            let bin = fake_claude(&cli);
+            answer(&cli, case, true);
+            bin
+        };
+        let hub = hub(dir.path(), bin).await;
+        assert!(hub.info()["suggest"]["unavailable"].is_null());
+        let api = turn_ended(&hub, dir.path(), "one").await;
+        let r = hub
+            .suggest_next("api", 1, &m("haiku"), &tui())
+            .await
+            .unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(reason.starts_with(&format!("retry: {want}")), "{case}: {r}");
+        assert!(r["suggestion"].is_null(), "{r}");
+        assert_eq!(r["stats"]["failures"], 1, "{r}");
+        assert!(hub.info()["suggest"]["unavailable"].is_null());
+        // The next: Codex, missing here too. Then none can, and `hub.info` says so.
+        let mut sub = hub.subscribe_control(0);
+        hub.send_by(&api, "two", &tui()).unwrap();
+        until_ended(&mut sub, &api, 2).await;
+        // Calls at least 3 seconds apart (`hub::suggest::MIN_GAP`).
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        let r = hub
+            .suggest_next("api", 2, &m("haiku"), &tui())
+            .await
+            .unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with(&format!("unavailable: {want}")),
+            "{case}: {r}"
+        );
+        assert!(reason.contains("; Codex's CLI ("), "{case}: {r}");
+        let info = hub.info()["suggest"]["unavailable"]
+            .as_str()
+            .map(str::to_string);
+        assert_eq!(info.as_deref(), Some(reason), "{case}");
+        let claude_runs = usize::from(case != "missing");
+        assert_eq!(runs(&cli), claude_runs);
+        // Turned on again: tried again.
+        let ask = twr_hub::SuggestAsk {
+            models: m("haiku"),
+            claude_only: false,
+            retry: true,
+        };
+        tokio::time::sleep(Duration::from_millis(3100)).await;
+        let r = hub.suggest_ask("api", 2, &ask, &tui()).await.unwrap();
+        let reason = r["reason"].as_str().unwrap_or_default();
+        assert!(reason.starts_with("retry: "), "{case}: {r}");
+        assert_eq!(runs(&cli), 2 * claude_runs);
+        hub.shutdown().await;
+    }
+}
+
+/// The stand-in Codex CLI in `dir`'s `codex-cli` ([`hub_probing`]): each run appends to
+/// `runs`, writes `argv`, `stdin`, `cwd` and `env`, then prints `answer.jsonl`.
+fn fake_codex(dir: &Path) -> PathBuf {
+    let cli = dir.join("codex-cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = cli.join("codex");
+    std::fs::write(
+        &bin,
+        r#"#!/bin/sh
+here=$(dirname "$0")
+echo run >> "$here/runs"
+: > "$here/argv"
+for a in "$@"; do printf '%s\n' "$a" >> "$here/argv"; done
+cat > "$here/stdin"
+pwd > "$here/cwd"
+env > "$here/env"
+cat "$here/answer.jsonl"
+"#,
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    cli
+}
+
+/// What `codex exec --json` prints for a turn whose last message is `text`.
+fn codex_answer(cli: &Path, lines: &[serde_json::Value]) {
+    let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    std::fs::write(cli.join("answer.jsonl"), text.join("\n") + "\n").unwrap();
+}
+
+fn codex_said(text: &str) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    vec![
+        json!({"type": "thread.started", "thread_id": "t"}),
+        json!({"type": "turn.started"}),
+        json!({"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": text}}),
+        json!({"type": "turn.completed", "usage": {"input_tokens": 5153, "cached_input_tokens": 3456, "output_tokens": 5}}),
+    ]
+}
+
+fn probe(
+    runtime: &str,
+    found: bool,
+    login: twr_core::runner::AgentLogin,
+) -> twr_core::runner::AgentInfo {
+    twr_core::runner::AgentInfo {
+        runtime: runtime.into(),
+        found,
+        login,
+        ..Default::default()
+    }
+}
+
+/// Codex answers when it is the one that can run: `codex exec` once, with no session, none of
+/// the user's config, rules or project docs, a read-only sandbox that asks nothing, every tool
+/// feature off, twr's prompt as the instructions and the small model asked for, in the
+/// private folder, with the user's login only (no `OPENAI_*` from the hub's environment).
+#[tokio::test]
+async fn codex_answers_with_its_small_model_and_nothing_of_the_users() {
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("Now run the integration tests"));
+    std::env::set_var("OPENAI_API_KEY", "sk-sentinel");
+    let hub = hub_probing(
+        dir.path(),
+        dir.path().join("no-claude"),
+        Some(vec![
+            probe("claude-code", false, AgentLogin::Unknown),
+            probe("codex", true, AgentLogin::LoggedIn),
+        ]),
+    )
+    .await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(hub.info()["suggest"]["unavailable"].is_null());
+    let api = turn_ended(&hub, dir.path(), "fix the login bug").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(r["suggestion"], "Now run the integration tests", "{r}");
+    assert_eq!(
+        (r["runtime"].as_str(), r["model"].as_str()),
+        (Some("codex"), Some("gpt-6-luna"))
+    );
+    // GPT-6-Luna at list price: 1,697 input, 3,456 cached, 5 output.
+    let cost = r["stats"]["cost_usd"].as_f64().unwrap();
+    assert!((cost - 0.000_206_76).abs() < 1e-12, "{cost}");
+    let argv: Vec<String> = std::fs::read_to_string(cli.join("argv"))
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let has = |a: &str| argv.iter().any(|x| x == a);
+    let after = |flag: &str| {
+        let at = argv
+            .iter()
+            .position(|a| a == flag)
+            .unwrap_or_else(|| panic!("no {flag}"));
+        argv[at + 1].clone()
+    };
+    assert_eq!(argv[0], "exec");
+    for flag in [
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--skip-git-repo-check",
+        "--json",
+    ] {
+        assert!(has(flag), "{flag} in {argv:?}");
+    }
+    assert_eq!(after("-s"), "read-only");
+    assert_eq!(after("-m"), "gpt-6-luna");
+    for c in [
+        "model_reasoning_effort=\"low\"",
+        "approval_policy=\"never\"",
+        "web_search=\"disabled\"",
+        "project_doc_max_bytes=0",
+        "features.shell_tool=false",
+        "features.unified_exec=false",
+        "features.multi_agent=false",
+        "features.plugins=false",
+        "skills.include_instructions=false",
+    ] {
+        assert!(has(c), "{c} in {argv:?}");
+    }
+    let instructions = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("model_instructions_file="))
+        .unwrap();
+    let file: String = serde_json::from_str(instructions).unwrap();
+    // Absolute: Codex reads a relative one from the folder it runs in.
+    assert!(Path::new(&file).is_absolute(), "{file}");
+    assert!(std::fs::read_to_string(&file)
+        .unwrap()
+        .contains("reply exactly NONE"));
+    assert_eq!(argv.last().map(String::as_str), Some("-"));
+    let stdin = std::fs::read_to_string(cli.join("stdin")).unwrap();
+    assert!(
+        stdin.contains("<user_message>\nfix the login bug\n</user_message>"),
+        "{stdin}"
+    );
+    let cwd = std::fs::read_to_string(cli.join("cwd")).unwrap();
+    assert!(cwd.trim_end().ends_with("data/suggest"), "{cwd}");
+    let env = std::fs::read_to_string(cli.join("env")).unwrap();
+    assert!(!env.contains("OPENAI_API_KEY"), "{env}");
+    // The Codex home whose global instructions the hub checked is the one Codex reads.
+    let home = dir.path().join("codex-home");
+    assert!(
+        env.lines()
+            .any(|l| l == format!("CODEX_HOME={}", home.display())),
+        "{env}"
+    );
+    assert!(
+        env.lines().any(|l| l == format!("TWR_AGENT={api}:suggest")),
+        "{env}"
+    );
+    hub.shutdown().await;
+}
+
+/// A call in which the model reaches for any tool is stopped at once: no suggestion, and the
+/// runtime is held back as after any failure.
+#[tokio::test]
+async fn a_codex_call_that_uses_a_tool_is_stopped() {
+    use serde_json::json;
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(
+        &cli,
+        &[
+            json!({"type": "turn.started"}),
+            json!({"type": "item.started", "item": {"id": "i", "type": "command_execution", "command": "cat ~/.ssh/id_ed25519"}}),
+            json!({"type": "item.completed", "item": {"id": "j", "type": "agent_message", "text": "a key"}}),
+            json!({"type": "turn.completed", "usage": {}}),
+        ],
+    );
+    let hub = hub_probing(
+        dir.path(),
+        dir.path().join("no-claude"),
+        Some(vec![
+            probe("claude-code", false, AgentLogin::Unknown),
+            probe("codex", true, AgentLogin::LoggedIn),
+        ]),
+    )
+    .await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert!(r["suggestion"].is_null(), "{r}");
+    let reason = r["reason"].as_str().unwrap();
+    assert!(
+        reason.starts_with("failed: the model tried to use a tool (command_execution)"),
+        "{r}"
+    );
+    hub.shutdown().await;
+}
+
+/// Claude Code first for a thread of another runtime; when its call says it has no login,
+/// that ask gets nothing (`retry: ...`), and Codex answers the next one: never in the same
+/// ask, which the user may have turned off meanwhile. Codex without a login (a 401) is
+/// `unavailable` too.
+#[tokio::test]
+async fn codex_stands_in_when_claude_code_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = dir.path().join("cli");
+    std::fs::create_dir_all(&claude).unwrap();
+    let bin = fake_claude(&claude);
+    answer(&claude, "Not logged in · Please run /login", true);
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let hub = hub(dir.path(), bin).await;
+    let api = turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(r["reason"], "retry: Claude Code is not signed in", "{r}");
+    assert_eq!((runs(&claude), runs(&cli)), (1, 0));
+    let mut sub = hub.subscribe_control(0);
+    hub.send_by(&api, "two", &tui()).unwrap();
+    until_ended(&mut sub, &api, 2).await;
+    // Calls at least 3 seconds apart (`hub::suggest::MIN_GAP`).
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let r = hub
+        .suggest_next("api", 2, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(r["suggestion"], "and the docs", "{r}");
+    assert_eq!(r["runtime"], "codex");
+    assert_eq!((runs(&claude), runs(&cli)), (1, 1));
+    // Codex signs out too.
+    codex_answer(
+        &cli,
+        &[
+            serde_json::json!({"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header"}}),
+        ],
+    );
+    hub.send_by(&api, "three", &tui()).unwrap();
+    until_ended(&mut sub, &api, 3).await;
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let r = hub
+        .suggest_next("api", 3, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(runs(&claude), 1, "Claude Code left out");
+    assert_eq!(
+        r["reason"].as_str(),
+        Some("unavailable: Claude Code is not signed in; Codex is not signed in"),
+        "{r}"
+    );
+    hub.shutdown().await;
+}
+
+/// A client from before Codex answered suggestions (`model` alone) told its user of
+/// Anthropic only: Claude Code alone answers it, and without it nothing goes to OpenAI.
+#[tokio::test]
+async fn a_claude_only_ask_never_reaches_codex() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let hub = hub(dir.path(), dir.path().join("no-claude")).await;
+    turn_ended(&hub, dir.path(), "one").await;
+    let ask = twr_hub::SuggestAsk {
+        models: m("haiku"),
+        claude_only: true,
+        retry: false,
+    };
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    let reason = r["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("unavailable: Claude Code's CLI ("),
+        "{r}"
+    );
+    assert!(!reason.contains("Codex"), "{r}");
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// Codex sends the user's global `AGENTS.md` with every request, and has no setting to leave
+/// it out: while there is one, Codex answers no suggestion.
+#[tokio::test]
+async fn codex_with_global_instructions_answers_none() {
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let home = dir.path().join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("AGENTS.md"), "my private rules").unwrap();
+    let hub = hub_probing(
+        dir.path(),
+        dir.path().join("no-claude"),
+        Some(vec![
+            probe("claude-code", false, AgentLogin::Unknown),
+            probe("codex", true, AgentLogin::LoggedIn),
+        ]),
+    )
+    .await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert_eq!(
+        r["reason"].as_str(),
+        Some("unavailable: Claude Code's CLI is not installed; Codex would send your global AGENTS.md along"),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    hub.shutdown().await;
+}
+
+/// Only small models answer: one that looks large is never asked, and no other runtime
+/// answers instead (no other provider stands in for a setting); the reason says why.
+#[tokio::test]
+async fn large_models_are_never_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = dir.path().join("cli");
+    std::fs::create_dir_all(&claude).unwrap();
+    let bin = fake_claude(&claude);
+    answer(&claude, "run the tests", false);
+    let cli = fake_codex(dir.path());
+    codex_answer(&cli, &codex_said("and the docs"));
+    let hub = hub(dir.path(), bin).await;
+    turn_ended(&hub, dir.path(), "one").await;
+    let both = twr_core::config::SuggestModels {
+        claude_code: "claude-opus-5-5".into(),
+        codex: "gpt-6.1-sol".into(),
+    };
+    for models in [both, m("sonnet")] {
+        let r = hub.suggest_next("api", 1, &models, &tui()).await.unwrap();
+        let reason = r["reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with("failed: ") && reason.contains("large model"),
+            "{r}"
+        );
+        assert!(reason.contains(&format!("{:?}", models.claude_code)), "{r}");
+        assert_eq!((runs(&claude), runs(&cli)), (0, 0));
+    }
+    hub.shutdown().await;
+}
+
+/// The hub's own agent probe decides before any call: no runtime that can run, nothing is run
+/// at all, and `hub.info` says so (`suggest.unavailable`) for a TUI to stay quiet without
+/// asking. One that can (or nothing probed): `hub.info` says nothing.
+#[tokio::test]
+async fn the_probe_says_when_suggestions_cannot_run() {
+    use twr_core::runner::AgentLogin::{LoggedIn, LoggedOut, Unknown};
+    let cases = [
+        (
+            vec![
+                probe("claude-code", false, Unknown),
+                probe("codex", false, Unknown),
+            ],
+            Some("unavailable: Claude Code's CLI is not installed; Codex's CLI is not installed"),
+        ),
+        (
+            vec![
+                probe("claude-code", true, LoggedOut),
+                probe("codex", true, LoggedOut),
+            ],
+            Some("unavailable: Claude Code is not signed in; Codex is not signed in"),
+        ),
+        (
+            vec![
+                probe("claude-code", true, LoggedIn),
+                probe("codex", false, Unknown),
+            ],
+            None,
+        ),
+    ];
+    for (agents, want) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let bin = fake_claude(&cli);
+        answer(&cli, "run the tests", false);
+        let hub = hub_probing(dir.path(), bin, Some(agents)).await;
+        // The probe runs in the background once the hub is open.
+        timeout(WAIT, async {
+            while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(hub.info()["suggest"]["unavailable"].as_str(), want);
+        turn_ended(&hub, dir.path(), "one").await;
+        let r = hub
+            .suggest_next("api", 1, &m("haiku"), &tui())
+            .await
+            .unwrap();
+        match want {
+            Some(why) => {
+                assert_eq!(r["reason"].as_str(), Some(why), "{r}");
+                assert_eq!(runs(&cli), 0, "nothing runs");
+            }
+            None => {
+                assert_eq!(r["suggestion"], "run the tests", "{r}");
+                assert_eq!(runs(&cli), 1);
+            }
+        }
+        hub.shutdown().await;
+    }
+    // Without a probe (and in tests), nothing is known: `hub.info` says nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let hub = hub(dir.path(), dir.path().join("claude")).await;
+    assert!(hub.info()["suggest"]["unavailable"].is_null());
+    hub.shutdown().await;
+}
+
+/// Signed in after the probe found nothing signed in, the user turns suggestions on: that
+/// ask probes the agents afresh, and Claude Code answers, not the minutes-old probe.
+#[tokio::test]
+async fn turning_suggestions_on_probes_afresh() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "run the tests", false);
+    let signed_in = Arc::new(AtomicBool::new(false));
+    let now = Arc::clone(&signed_in);
+    PROBE.with(|p| {
+        *p.borrow_mut() = Some(Arc::new(move || {
+            let login = if now.load(Ordering::SeqCst) {
+                AgentLogin::LoggedIn
+            } else {
+                AgentLogin::LoggedOut
+            };
+            let agents = vec![
+                probe("claude-code", true, login),
+                probe("codex", false, AgentLogin::Unknown),
+            ];
+            futures::FutureExt::boxed(async move { agents })
+        }));
+    });
+    let hub = hub_probing(dir.path(), bin, None).await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    turn_ended(&hub, dir.path(), "one").await;
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    signed_in.store(true, Ordering::SeqCst);
+    // Without a retry, the last probe stands.
+    let r = hub
+        .suggest_next("api", 1, &m("haiku"), &tui())
+        .await
+        .unwrap();
+    assert!(
+        r["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("unavailable: "),
+        "{r}"
+    );
+    assert_eq!(runs(&cli), 0);
+    let ask = twr_hub::SuggestAsk {
+        models: m("haiku"),
+        claude_only: false,
+        retry: true,
+    };
+    let r = hub.suggest_ask("api", 1, &ask, &tui()).await.unwrap();
+    assert_eq!(r["suggestion"], "run the tests", "{r}");
+    assert_eq!(runs(&cli), 1);
+    hub.shutdown().await;
+}
+
+/// Suggestions turned off while an ask waits (here, on the fresh probe of `/suggest on`): the
+/// TUI drops the ask's connection, and the hub drops the ask with it, before any model is
+/// asked.
+#[tokio::test]
+async fn an_ask_whose_client_hangs_up_asks_no_model() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use twr_core::runner::AgentLogin;
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "run the tests", false);
+    let hold = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (h, entered, out) = (Arc::clone(&hold), Arc::clone(&held), Arc::clone(&release));
+    PROBE.with(|p| {
+        *p.borrow_mut() = Some(Arc::new(move || {
+            let (h, entered, out) = (Arc::clone(&h), Arc::clone(&entered), Arc::clone(&out));
+            futures::FutureExt::boxed(async move {
+                if h.load(Ordering::SeqCst) {
+                    entered.notify_one();
+                    out.notified().await;
+                }
+                vec![
+                    probe("claude-code", true, AgentLogin::LoggedIn),
+                    probe("codex", false, AgentLogin::Unknown),
+                ]
+            })
+        }));
+    });
+    let hub = hub_probing(dir.path(), bin, None).await;
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let socket = dir.path().join("serve.sock");
+    let listener = twr_hub::server::bind(&socket).await.unwrap();
+    let serving = tokio::spawn(twr_hub::server::serve(
+        hub.clone(),
+        listener,
+        socket.clone(),
+        false,
+    ));
+    turn_ended(&hub, dir.path(), "one").await;
+    hold.store(true, Ordering::SeqCst);
+    let s = socket.clone();
+    let ask = tokio::spawn(async move {
+        let mut c = twr_core::client::Client::connect(&s).await.unwrap();
+        c.hello(serde_json::json!({"client": "tui"})).await.unwrap();
+        c.call(
+            "suggest.next",
+            serde_json::json!({"thread": "api", "turn": 1, "retry": true,
+                "models": {"claude-code": "claude-haiku-5-5", "codex": "gpt-6-luna"}}),
+        )
+        .await
+    });
+    timeout(WAIT, held.notified()).await.unwrap();
+    // Off: the ask's connection goes.
+    ask.abort();
+    let _ = ask.await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(runs(&cli), 0, "a model was asked after the client hung up");
+    serving.abort();
     hub.shutdown().await;
 }

@@ -3041,11 +3041,13 @@ dependencies = [
  "chrono",
  "crossterm",
  "futures",
+ "libc",
  "pulldown-cmark",
  "ratatui",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
  "twr-core",
 ]
 
