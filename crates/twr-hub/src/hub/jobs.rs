@@ -363,14 +363,22 @@ pub(super) fn tail(path: &Path, lines: usize) -> std::io::Result<String> {
     let mut buf = Vec::new();
     f.take(TAIL_BYTES).read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    // A cut first line is no line.
-    let text = if from > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        &text
+    // A cut first line is no line; but when the cut falls inside the last line, a long one,
+    // its end is the output, marked as cut.
+    let (text, cut) = match text.split_once('\n') {
+        Some((_, rest)) if from > 0 && !rest.trim().is_empty() => (rest.to_string(), false),
+        _ if from > 0 => (text.into_owned(), true),
+        _ => (text.into_owned(), false),
     };
     let all: Vec<&str> = text.lines().collect();
     let text = all[all.len().saturating_sub(lines)..].join("\n");
+    if cut {
+        let mark = "…";
+        return Ok(format!(
+            "{mark}{}",
+            keep_end(text, TAIL_BYTES as usize - mark.len())
+        ));
+    }
     Ok(keep_end(text, TAIL_BYTES as usize))
 }
 
@@ -1858,6 +1866,12 @@ mod tests {
         assert_eq!(t, "line 9997\nline 9998\nline 9999");
         std::fs::write(&p, "only\n").unwrap();
         assert_eq!(tail(&p, 40).unwrap(), "only");
+        // One line longer than the tail: its end, marked as cut, never nothing.
+        let long = format!("start{}end\n", "x".repeat(2 * TAIL_BYTES as usize));
+        std::fs::write(&p, long).unwrap();
+        let t = tail(&p, 40).unwrap();
+        assert!(t.starts_with('…') && t.ends_with("xend"), "{}", &t[..20]);
+        assert!(t.len() <= TAIL_BYTES as usize);
     }
 
     /// Output that is not UTF-8 reads as U+FFFD (three bytes for each byte): the text is cut
