@@ -1178,10 +1178,11 @@ pub struct Transcript {
     /// `thread.model_changed` that moved it): what a handoff marker names. `None` until one
     /// did (the transcript replays only the latest events).
     pub runtime: Option<String>,
-    /// The start of the latest final reply (a final `agent.text`) applied, up to
-    /// [`LAST_REPLY_CHARS`]: what the workspace sidebar shows of the orchestrator's last reply.
-    /// A text a stop or crash cut short is never one.
-    pub last_reply: Option<String>,
+    /// The seq and start of the latest final reply (a final `agent.text`) applied, up to
+    /// [`LAST_REPLY_CHARS`]: what the workspace sidebar shows of the orchestrator's last reply
+    /// (the seq says whether the hub's is newer). A text a stop or crash cut short is never
+    /// one.
+    pub last_reply: Option<(u64, String)>,
 }
 
 impl Transcript {
@@ -1290,7 +1291,8 @@ impl Transcript {
                 }
                 if p.is_final && !p.text.trim().is_empty() {
                     // Its start only: a card shows two rows of it.
-                    self.last_reply = Some(p.text.chars().take(LAST_REPLY_CHARS).collect());
+                    let start = p.text.chars().take(LAST_REPLY_CHARS).collect();
+                    self.last_reply = Some((ev.seq, start));
                 }
                 if capped && p.is_final {
                     self.notice(

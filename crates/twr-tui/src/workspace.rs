@@ -58,8 +58,13 @@ pub struct Glance {
 }
 
 /// A workspace's orchestrator, as its hub said it ([`Glance`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct OrchGlance {
+    /// Its thread id (`None` from a hub that did not say).
+    pub id: Option<String>,
+    /// The seq of the reply [`OrchGlance::preview`] starts (`None`: unknown): which of two
+    /// replies of the same orchestrator is newer.
+    pub preview_seq: Option<u64>,
     /// Its status.
     pub status: ThreadStatus,
     /// The start of its latest reply (up to 300 characters, as the hub cut it); `None` before
@@ -70,12 +75,18 @@ pub struct OrchGlance {
 impl Glance {
     /// A `hub.glance` result.
     pub fn from_json(v: &serde_json::Value) -> Glance {
-        let orch = v["orchestrator"].as_object().map(|o| OrchGlance {
-            status: status_of(&o["status"]),
-            preview: o["preview"]
-                .as_str()
-                .filter(|p| !p.trim().is_empty())
-                .map(str::to_string),
+        // (Indexed as a value: a key the hub left out is null, never a panic.)
+        let orch = v["orchestrator"].is_object().then(|| {
+            let o = &v["orchestrator"];
+            OrchGlance {
+                id: o["id"].as_str().map(str::to_string),
+                preview_seq: o["preview_seq"].as_u64(),
+                status: status_of(&o["status"]),
+                preview: o["preview"]
+                    .as_str()
+                    .filter(|p| !p.trim().is_empty())
+                    .map(str::to_string),
+            }
         });
         Glance {
             active: v["active"] == true,
@@ -91,8 +102,9 @@ impl Glance {
             .iter()
             .find(|t| t["role"] == "orchestrator" && t["retired"] != true)
             .map(|t| OrchGlance {
+                id: t["id"].as_str().map(str::to_string),
                 status: status_of(&t["status"]),
-                preview: None,
+                ..Default::default()
             });
         // A retired orchestrator runs nothing; the rest by their status.
         let active = list.iter().any(|t| {
@@ -982,11 +994,17 @@ impl AppState {
             let mut g = tab.glance.clone().unwrap_or_default();
             g.active = false;
             if let Some(o) = self.orchestrator() {
-                let preview = self
-                    .latest_reply(&o.id)
-                    .or_else(|| g.orch.as_ref().and_then(|p| p.preview.clone()));
-                let status = g.orch.as_ref().map_or(o.status(), |p| p.status);
-                g.orch = Some(OrchGlance { status, preview });
+                let polled = g.orch.clone();
+                let preview = self.newest_reply(&o.id, polled.as_ref(), true);
+                g.orch = Some(match polled {
+                    Some(p) => OrchGlance { preview, ..p },
+                    None => OrchGlance {
+                        id: Some(o.id.clone()),
+                        status: o.status(),
+                        preview,
+                        ..Default::default()
+                    },
+                });
             }
             return Some(g);
         }
@@ -998,17 +1016,48 @@ impl AppState {
         });
         let polled = tab.glance.as_ref().and_then(|g| g.orch.as_ref());
         let orch = self.orchestrator().map(|o| OrchGlance {
+            id: Some(o.id.clone()),
+            preview_seq: None,
             status: o.status(),
-            preview: self
-                .latest_reply(&o.id)
-                .or_else(|| polled.and_then(|p| p.preview.clone())),
+            preview: self.newest_reply(&o.id, polled, false),
         });
         Some(Glance { active, orch })
     }
 
+    /// The newest reply known of orchestrator `id`: the conversation's ([`Transcript::last_reply`],
+    /// while the main pane follows it) or the hub's (`polled`), whichever came later. A poll
+    /// about another orchestrator is about the hub's current one when the view's is no longer
+    /// news (`polled_is_current`: its control stream ended), else about one the view has
+    /// moved on from.
+    fn newest_reply(
+        &self,
+        id: &str,
+        polled: Option<&OrchGlance>,
+        polled_is_current: bool,
+    ) -> Option<String> {
+        let live = self.latest_reply(id);
+        let Some(p) = polled else {
+            return live.map(|(_, text)| text);
+        };
+        if p.id.as_deref().is_some_and(|pid| pid != id) {
+            return if polled_is_current {
+                p.preview.clone()
+            } else {
+                live.map(|(_, text)| text)
+            };
+        }
+        match live {
+            Some((seq, _)) if p.preview.is_some() && p.preview_seq.is_some_and(|s| s > seq) => {
+                p.preview.clone()
+            }
+            Some((_, text)) => Some(text),
+            None => p.preview.clone(),
+        }
+    }
+
     /// The latest finished reply in thread `id`'s conversation, while the main pane shows it
     /// (and follows it live).
-    fn latest_reply(&self, id: &str) -> Option<String> {
+    fn latest_reply(&self, id: &str) -> Option<(u64, String)> {
         // Only the one the main pane follows: one kept from before gets no more events, and
         // the hub's newer reply would be shadowed by it.
         let transcript = self
@@ -1384,6 +1433,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status: ThreadStatus::Idle,
                 preview: Some("done".into()),
+                ..Default::default()
             }),
         };
         let running = TabHub::Running {
@@ -1445,6 +1495,7 @@ mod tests {
                 orch: Some(OrchGlance {
                     status: ThreadStatus::Idle,
                     preview: Some("polled".into()),
+                    ..Default::default()
                 }),
             }),
         }]);

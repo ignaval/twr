@@ -502,6 +502,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status,
                 preview: preview.map(str::to_string),
+                ..Default::default()
             }),
         };
         st.set_tabs(vec![
@@ -1146,6 +1147,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status: ThreadStatus::Idle,
                 preview: Some("new reply".into()),
+                ..Default::default()
             }),
         });
         let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
@@ -1358,6 +1360,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status: ThreadStatus::Idle,
                 preview: Some("last words".into()),
+                ..Default::default()
             }),
         });
         st.set_tabs(tabs);
@@ -1388,6 +1391,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status: ThreadStatus::Running,
                 preview: Some("reply A".into()),
+                ..Default::default()
             }),
         });
         st.set_tabs(tabs);
@@ -1410,6 +1414,7 @@ mod tests {
             orch: Some(OrchGlance {
                 status: ThreadStatus::Idle,
                 preview: Some("reply C".into()),
+                ..Default::default()
             }),
         });
         st.set_tabs(tabs);
@@ -1433,6 +1438,51 @@ mod tests {
             "{:?}",
             st.view.panes.moving
         );
+    }
+
+    /// Of the conversation's reply and the hub's, the card shows the later one, by their
+    /// seqs: a reply the hub had after the conversation stopped following (its subscription
+    /// failed, or the hub restarted and was stopped again) is not hidden by an older one.
+    #[test]
+    fn the_newest_reply_wins() {
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = crate::app::Transcript::new(orch.clone());
+        t.settle();
+        let mut o = twr_core::testkit::ThreadScript::new(orch.clone());
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("reply B"));
+        let b = t.last_reply.as_ref().unwrap().0;
+        st.transcript = Some(t);
+        let polled = |seq: u64, text: &str| Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                id: Some(orch.clone()),
+                preview_seq: Some(seq),
+                status: ThreadStatus::Idle,
+                preview: Some(text.into()),
+            }),
+        };
+        let preview = |st: &AppState| {
+            st.tab_glance(&st.tabs[0].clone())
+                .unwrap()
+                .orch
+                .unwrap()
+                .preview
+                .unwrap()
+        };
+        // Live: the hub's later reply wins, its earlier one does not.
+        st.tabs[0].glance = Some(polled(b + 5, "reply C"));
+        assert_eq!(preview(&st), "reply C");
+        st.tabs[0].glance = Some(polled(b - 1, "reply A"));
+        assert_eq!(preview(&st), "reply B");
+        // Lost, then stopped: the later of the two still.
+        st.control_ended();
+        st.tabs[0].hub = TabHub::Stopped;
+        st.tabs[0].glance = Some(polled(b + 5, "reply C"));
+        assert_eq!(preview(&st), "reply C");
+        st.tabs[0].glance = Some(polled(b - 1, "reply A"));
+        assert_eq!(preview(&st), "reply B");
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
@@ -1506,7 +1556,10 @@ mod tests {
             ..Default::default()
         })));
         t.apply(&o.stopped());
-        assert_eq!(t.last_reply.as_deref(), Some("the whole answer"));
+        assert_eq!(
+            t.last_reply.map(|(_, r)| r).as_deref(),
+            Some("the whole answer")
+        );
     }
 
     /// A reply runs together on its rows, without its Markdown marks or thread tags, cut
