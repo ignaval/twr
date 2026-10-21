@@ -1043,15 +1043,15 @@ impl AppState {
             return;
         };
         let tab = self.tabs[at].clone();
-        if let Some(mut g) = self.tab_glance(&tab) {
-            // Nothing works there for all a card left alone can tell.
-            g.active = false;
+        // (Whether something works stays as it was: the next poll says more, and a card
+        // whose hub stopped shows nothing working whatever it holds.)
+        if let Some(g) = self.tab_glance(&tab) {
             self.tabs[at].glance = Some(g);
         }
     }
 
-    /// The newest reply known of orchestrator `id`, with its seq: the conversation's ([`Transcript::last_reply`],
-    /// while the main pane follows it) or the hub's (`polled`), whichever came later. A poll
+    /// The newest reply known of orchestrator `id`, with its seq: the conversation's
+    /// ([`Transcript::last_reply`]) or the hub's (`polled`), whichever came later. A poll
     /// about another orchestrator is about the hub's current one when the view's is no longer
     /// news (`polled_is_current`: its control stream ended), else about one the view has
     /// moved on from.
@@ -1086,16 +1086,18 @@ impl AppState {
         }
     }
 
-    /// The latest finished reply in thread `id`'s conversation, while the main pane shows it
-    /// (and follows it live).
+    /// The latest finished reply, with its seq, in thread `id`'s conversation as the view
+    /// holds it.
     fn latest_reply(&self, id: &str) -> Option<(u64, String)> {
-        // Only the one the main pane follows: one kept from before gets no more events, and
-        // the hub's newer reply would be shadowed by it.
-        let transcript = self
-            .transcript
-            .as_ref()
-            .filter(|t| t.thread == id && !t.catching_up())?;
-        transcript.last_reply.clone()
+        // The one the main pane shows, or one kept from before (a dive moved it aside): a kept
+        // one gets no more events, but its reply is compared by seq with the hub's, so it never
+        // hides a newer one.
+        self.transcript
+            .iter()
+            .chain(self.transcripts.iter())
+            .filter(|t| t.thread == id && !t.catching_up())
+            .filter_map(|t| t.last_reply.clone())
+            .max_by_key(|(seq, _)| *seq)
     }
 
     /// Switches to workspace `name` (`/ws <name>`, a click on its tab): one that exists is

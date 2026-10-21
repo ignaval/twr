@@ -232,7 +232,7 @@ pub fn render_list(
 
 /// Whether workspace `name`'s card shows that something there works (its icon moves): its
 /// hub runs, as [`card_lines`] has it.
-fn tab_active(state: &AppState, name: &str) -> bool {
+pub(crate) fn tab_active(state: &AppState, name: &str) -> bool {
     state.tabs.iter().find(|t| t.name == name).is_some_and(|t| {
         matches!(state.tab_hub(t), TabHub::Running { .. })
             && state.tab_glance(t).is_some_and(|g| g.active)
@@ -1518,7 +1518,44 @@ mod tests {
             (o.preview.as_deref(), o.preview_seq),
             (Some("reply B"), Some(b))
         );
-        assert!(!g.active);
+        // Its hub stopped: nothing shows working, whatever was kept.
+        assert!(!crate::sidebar::tab_active(&next, "default"));
+    }
+
+    /// A dive moves the orchestrator's conversation aside: its reply, newer than the last
+    /// poll's, stays on the card, and once that hub stops.
+    #[test]
+    fn a_live_reply_stays_on_the_card_during_a_dive() {
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = crate::app::Transcript::new(orch.clone());
+        t.settle();
+        let mut o = twr_core::testkit::ThreadScript::new(orch.clone());
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("reply B"));
+        let b = t.last_reply.as_ref().unwrap().0;
+        st.transcripts.push(t);
+        st.tabs[0].glance = Some(Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                id: Some(orch),
+                preview_seq: Some(b - 1),
+                status: ThreadStatus::Idle,
+                preview: Some("reply A".into()),
+            }),
+        });
+        let preview = |st: &AppState| {
+            st.tab_glance(&st.tabs[0].clone())
+                .unwrap()
+                .orch
+                .unwrap()
+                .preview
+                .unwrap()
+        };
+        assert_eq!(preview(&st), "reply B");
+        st.control_ended();
+        st.tabs[0].hub = TabHub::Stopped;
+        assert_eq!(preview(&st), "reply B");
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
