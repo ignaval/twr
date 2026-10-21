@@ -1476,6 +1476,11 @@ pub struct Switching {
 /// ([`workspace::PollClock`]).
 const TABS_EVERY: Duration = workspace::POLL_RUNNING;
 
+/// `TWR_TUI_HIDE_LOAD=1`: the TUI never reads this machine's load, so its status bar never
+/// says the machine is busy. Only `docs/tools/make-screenshots.sh` and `make-demo.sh` set it:
+/// the images must not depend on the load of the machine they are made on.
+pub const HIDE_LOAD_ENV: &str = "TWR_TUI_HIDE_LOAD";
+
 /// How often the TUI reads this machine's load for its status bar ([`twr_core::load`]).
 pub const LOAD_EVERY: Duration = Duration::from_secs(5);
 
@@ -2505,6 +2510,9 @@ async fn drive(
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tabs_pending = false;
     // This machine's load: read now, then every [`LOAD_EVERY`].
+    // Never read for the screenshots: they must not show the load of the machine they are
+    // made on ([`HIDE_LOAD_ENV`]).
+    let hide_load = std::env::var_os(HIDE_LOAD_ENV).is_some_and(|v| v == "1");
     let mut load_poll = tokio::time::interval(LOAD_EVERY);
     load_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_pending = false;
@@ -2974,7 +2982,7 @@ async fn drive(
                     }
                 }
                 // Read off the loop: a few small files, but a `sysctl` on macOS.
-                _ = load_poll.tick(), if !load_pending => {
+                _ = load_poll.tick(), if !load_pending && !hide_load => {
                     load_pending = true;
                     let tx = load_tx.clone();
                     tokio::task::spawn_blocking(move || {

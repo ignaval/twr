@@ -304,7 +304,7 @@ first_frame() {
 # orchestrator's answer.
 tui_say() {
     tmux -L "$tmux_name" -f /dev/null new-session -d -x 160 -y 42 \
-        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
+        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_TUI_HIDE_LOAD=1 TWR_HOME='$TWR_HOME' '$twr'"
     first_frame
     # What is typed goes to the orchestrator.
     tmux -L "$tmux_name" send-keys -l "$1"
@@ -420,7 +420,7 @@ capture() {
     name=$1 cols=$2 rows=$3
     shift 3
     tmux -L "$tmux_name" -f /dev/null new-session -d -x "$cols" -y "$rows" \
-        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
+        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_TUI_HIDE_LOAD=1 TWR_HOME='$TWR_HOME' '$twr'"
     first_frame
     # A pause after each key, as a person presses them.
     for k in "$@"; do

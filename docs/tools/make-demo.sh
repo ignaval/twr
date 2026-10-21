@@ -206,7 +206,7 @@ select_thread() {
 # it drops what is typed before that, and right after it.
 tui() {
     tmux -L "$tmux_name" -f /dev/null new-session -d -x "$cols" -y "$rows" \
-        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
+        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_TUI_HIDE_LOAD=1 TWR_HOME='$TWR_HOME' '$twr'"
     i=0
     until tmux -L "$tmux_name" capture-pane -p | grep -q "Enter sends"; do
         i=$((i + 1))
