@@ -311,7 +311,7 @@ pub struct ViewState {
     /// and across the workspaces shown.
     pub ws_sidebar_hidden: bool,
     /// The workspace list is open as a drawer over the view's left (Ctrl-T where the sidebar
-    /// is not docked, the tab strip's `☰`); Esc, a click outside it or its `✕` closes it.
+    /// is not docked, the tab strip's `≡`); Esc, a click outside it or its `✕` closes it.
     pub ws_drawer: bool,
     /// The row of the workspace list the keys select in its drawer and on the compact
     /// layout's Workspaces screen (`None`: the current workspace's card).

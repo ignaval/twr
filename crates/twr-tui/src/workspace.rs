@@ -446,7 +446,7 @@ impl AppState {
         self.view.ws_scroll = 0;
     }
 
-    /// Ctrl-T, `/spaces`, a tap on the tab strip's `☰` or the sidebar's `‹`: in the compact
+    /// Ctrl-T, `/spaces`, a tap on the tab strip's `≡` or the sidebar's `‹`: in the compact
     /// layout, the Workspaces screen (or back to the conversation from it); where the sidebar
     /// docks, shows or hides it (kept across runs); on a narrower screen, opens or closes the
     /// drawer.
@@ -1265,6 +1265,166 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// A running hub is asked every [`POLL_RUNNING`], one stopped or not answering every
+    /// [`POLL_IDLE`], one never asked at once; one asked and not back yet is not asked again
+    /// before [`POLL_IDLE`]; a workspace gone is forgotten; `soon` asks one at the next tick.
+    #[test]
+    fn the_poll_clock_limits_how_often_each_hub_is_asked() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut clock = PollClock::default();
+        assert_eq!(clock.take_due(&names, at(0)), names);
+        // Not back yet: nothing is due at the next tick.
+        assert!(clock.take_due(&names, at(5_000)).is_empty());
+        let running = TabHub::Running {
+            threads: 0,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        clock.answered("a", &running, at(0));
+        clock.answered("b", &TabHub::Stopped, at(0));
+        clock.answered("c", &TabHub::Busy, at(0));
+        // The next tick, a little early or late, asks the running one only.
+        assert_eq!(clock.take_due(&names, at(4_900)), ["a"]);
+        clock.answered("a", &running, at(4_900));
+        assert!(clock.take_due(&names, at(9_000)).is_empty());
+        assert_eq!(clock.take_due(&names, at(10_000)), ["a"]);
+        clock.answered("a", &running, at(10_000));
+        assert_eq!(clock.take_due(&names, at(15_000)), ["a", "b", "c"]);
+        // Asked once each per due time, however often the clock is looked at.
+        assert!(clock.take_due(&names, at(15_001)).is_empty());
+        clock.soon("b");
+        assert_eq!(clock.take_due(&names, at(15_002)), ["b"]);
+        // A workspace removed is forgotten: made again, it is asked at once.
+        let fewer: Vec<String> = vec!["a".into()];
+        clock.take_due(&fewer, at(16_000));
+        assert_eq!(clock.take_due(&names, at(16_001)), ["b", "c"]);
+    }
+
+    /// A poll's answers replace what the tabs said of the hubs asked; a hub that stopped
+    /// keeps its orchestrator's last reply on its card; a workspace not asked keeps its tab,
+    /// a new one gets one, a removed one goes; and a poll that could not list the workspaces
+    /// changes only the hubs it asked.
+    #[test]
+    fn a_poll_updates_the_tabs_and_keeps_the_last_reply() {
+        let mut st = AppState::new();
+        st.workspace = Some("a".into());
+        let replied = Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Idle,
+                preview: Some("done".into()),
+            }),
+        };
+        let running = TabHub::Running {
+            threads: 1,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        let names = |n: &[&str]| Some(n.iter().map(|s| s.to_string()).collect());
+        st.merge_poll(
+            names(&["a", "b", "c"]),
+            vec![Polled {
+                name: "b".into(),
+                hub: running,
+                glance: Some(replied.clone()),
+            }],
+        );
+        assert_eq!(st.tabs.len(), 3);
+        assert_eq!(st.tabs[1].glance.as_ref(), Some(&replied));
+        st.merge_poll(
+            names(&["a", "b", "d"]),
+            vec![Polled {
+                name: "b".into(),
+                hub: TabHub::Stopped,
+                glance: None,
+            }],
+        );
+        let tab_names: Vec<&str> = st.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tab_names, ["a", "b", "d"]);
+        assert_eq!(st.tabs[1].hub, TabHub::Stopped);
+        assert_eq!(
+            st.tabs[1].glance.as_ref(),
+            Some(&replied),
+            "the last reply stays"
+        );
+        st.merge_poll(
+            None,
+            vec![Polled {
+                name: "d".into(),
+                hub: running,
+                glance: None,
+            }],
+        );
+        assert_eq!(st.tabs.len(), 3);
+        assert_eq!(st.tabs[2].hub, running);
+    }
+
+    /// The current workspace's card comes from the view itself: its orchestrator's status,
+    /// what works, and its latest reply once its conversation is loaded (else the hub's).
+    #[test]
+    fn the_current_workspace_card_comes_from_the_view() {
+        let mut st = crate::app::tests::with_orch();
+        st.workspace = Some("a".into());
+        st.set_tabs(vec![Tab {
+            name: "a".into(),
+            hub: TabHub::Unknown,
+            glance: Some(Glance {
+                active: false,
+                orch: Some(OrchGlance {
+                    status: ThreadStatus::Idle,
+                    preview: Some("polled".into()),
+                }),
+            }),
+        }]);
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert!(g.active, "its workers run");
+        assert_eq!(g.orch.as_ref().unwrap().preview.as_deref(), Some("polled"));
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = Transcript::new(orch);
+        t.settle();
+        t.entries.push(crate::app::Entry::Text {
+            seq: 1,
+            text: "first".into(),
+            open: false,
+        });
+        t.entries.push(crate::app::Entry::Text {
+            seq: 2,
+            text: "still streaming".into(),
+            open: true,
+        });
+        st.transcript = Some(t);
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("first"));
+    }
+
+    /// What an older hub's `thread.list` says: the current orchestrator (not a retired one),
+    /// whether a thread runs; and `hub.glance`'s fields.
+    #[test]
+    fn glances_read_both_hubs() {
+        let g = Glance::from_threads(&serde_json::json!([
+            {"role": "orchestrator", "status": "running", "retired": true},
+            {"role": "orchestrator", "status": "error"},
+            {"status": "idle"},
+        ]));
+        assert!(!g.active);
+        assert_eq!(g.orch.unwrap().status, ThreadStatus::Error);
+        let g = Glance::from_json(&serde_json::json!({
+            "active": true,
+            "orchestrator": {"status": "background", "preview": "  "},
+        }));
+        assert!(g.active);
+        let o = g.orch.unwrap();
+        assert_eq!((o.status, o.preview), (ThreadStatus::Background, None));
+        assert_eq!(
+            Glance::from_json(&serde_json::json!({"orchestrator": null})).orch,
+            None
+        );
+    }
+
     fn tabs(names: &[&str]) -> Vec<Tab> {
         names
             .iter()
@@ -2010,6 +2170,8 @@ mod tests {
         let mut st = in_workspaces("a", &["default", "a"]);
         control(&mut st, &evs);
         st.attach_via = attach_via(None, Some("a"), None);
+        // The cards as wide as without the workspace sidebar.
+        st.view.ws_sidebar_hidden = true;
         let screen = crate::app::tests::draw(&mut st, 160, 40);
         let text: String = (0..40)
             .map(|y| {

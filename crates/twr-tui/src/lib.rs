@@ -3755,6 +3755,186 @@ mod tests {
         drop(tx1);
     }
 
+    /// How a fake hub of [`fake_hub`] answers.
+    #[derive(Clone)]
+    enum Fake {
+        /// `hub.glance` with this.
+        Glance(Value),
+        /// An older hub: no `hub.glance`, `thread.list` and `attention.list` with these.
+        Old(Value, Value),
+        /// Takes the connection and never answers.
+        Silent,
+    }
+
+    /// A fake hub of workspace `name` on `<dir>/<name>.sock`, answering as `fake` says; the
+    /// methods it was asked, in order.
+    fn fake_hub(
+        dir: &std::path::Path,
+        name: &str,
+        fake: Fake,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let sock = dir.join(format!("{name}.sock"));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, name) = (std::sync::Arc::clone(&asked), name.to_string());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (log, fake, name) = (std::sync::Arc::clone(&log), fake.clone(), name.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default().to_string();
+                        log.lock().unwrap().push(method.clone());
+                        if matches!(fake, Fake::Silent) {
+                            continue;
+                        }
+                        let answer = match (method.as_str(), &fake) {
+                            ("hello", _) => json!({"result": {"workspace": name}}),
+                            ("hub.glance", Fake::Glance(g)) => json!({"result": g}),
+                            ("thread.list", Fake::Old(t, _)) => json!({"result": t}),
+                            ("attention.list", Fake::Old(_, a)) => json!({"result": a}),
+                            _ => json!({"error": {"code": "method_not_found", "message": method}}),
+                        };
+                        let mut frame = answer;
+                        frame["id"] = req["id"].clone();
+                        let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (sock, asked)
+    }
+
+    /// The workspaces of a poll test: their sockets by name.
+    struct Fakes(std::collections::HashMap<String, std::path::PathBuf>);
+
+    impl super::Workspaces for Fakes {
+        fn names(&self) -> anyhow::Result<Vec<String>> {
+            let mut names: Vec<String> = self.0.keys().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
+        fn socket(&self, name: &str) -> anyhow::Result<std::path::PathBuf> {
+            self.0
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no {name}"))
+        }
+        fn open(
+            &self,
+            _: &str,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<std::path::PathBuf>> {
+            unreachable!("a poll never opens a hub")
+        }
+        fn create(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// A poll asks each running hub one `hub.glance` (after `hello`), an older hub
+    /// `thread.list` and `attention.list` instead; a stopped hub is not started (nothing is
+    /// opened: [`Fakes::open`] panics), and one that never answers is busy within the
+    /// timeout. The answers become the tabs' counts and the sidebar's cards.
+    #[tokio::test]
+    async fn a_poll_glances_at_each_hub_once_and_starts_none() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let glance = json!({
+            "workspace": "new", "threads": 3, "running": 1, "permissions": 2, "questions": 1,
+            "active": true,
+            "orchestrator": {"id": "o", "name": "orch", "status": "waiting",
+                             "preview": "Approve the deploy?", "preview_seq": 9},
+        });
+        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance));
+        let threads = json!([
+            {"role": "orchestrator", "status": "running"},
+            {"role": "orchestrator", "status": "idle", "retired": true},
+            {"status": "idle"},
+        ]);
+        let items = json!([{"reason": "question"}, {"reason": "error"}]);
+        let (old_sock, old_asked) = fake_hub(dir.path(), "old", Fake::Old(threads, items));
+        let (silent_sock, _) = fake_hub(dir.path(), "silent", Fake::Silent);
+        let ws = Fakes(
+            [
+                ("new", new_sock),
+                ("old", old_sock),
+                ("silent", silent_sock),
+                ("stopped", dir.path().join("stopped.sock")),
+            ]
+            .into_iter()
+            .map(|(n, p)| (n.to_string(), p))
+            .collect(),
+        );
+        let started = std::time::Instant::now();
+        let mut polled = poll_tabs(&ws, ws.names().unwrap()).await;
+        polled.sort_by(|a, b| a.name.cmp(&b.name));
+        // The silent hub held nobody up: they were asked together.
+        assert!(started.elapsed() < 2 * TAB_TIMEOUT + Duration::from_millis(500));
+        let by = |n: &str| polled.iter().find(|p| p.name == n).unwrap().clone();
+        let new = by("new");
+        assert_eq!(
+            new.hub,
+            TabHub::Running {
+                threads: 3,
+                running: 1,
+                permissions: 2,
+                questions: 1
+            }
+        );
+        let g = new.glance.unwrap();
+        assert!(g.active);
+        let o = g.orch.unwrap();
+        assert_eq!(o.status, twr_core::reduce::ThreadStatus::Waiting);
+        assert_eq!(o.preview.as_deref(), Some("Approve the deploy?"));
+        assert_eq!(*new_asked.lock().unwrap(), ["hello", "hub.glance"]);
+        let old = by("old");
+        assert_eq!(
+            old.hub,
+            TabHub::Running {
+                threads: 1,
+                running: 0,
+                permissions: 0,
+                questions: 1
+            }
+        );
+        let g = old.glance.unwrap();
+        assert!(g.active, "its orchestrator runs");
+        assert_eq!(
+            g.orch.unwrap().status,
+            twr_core::reduce::ThreadStatus::Running
+        );
+        assert_eq!(
+            *old_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list", "attention.list"]
+        );
+        assert_eq!(
+            by("silent"),
+            Polled {
+                name: "silent".into(),
+                hub: TabHub::Busy,
+                glance: None
+            }
+        );
+        assert_eq!(by("stopped").hub, TabHub::Stopped);
+        assert!(
+            !dir.path().join("stopped.sock").exists(),
+            "nothing started it"
+        );
+        // Only the hubs due are asked.
+        let polled = poll_tabs(&ws, vec!["new".into()]).await;
+        assert_eq!(polled.len(), 1);
+        assert_eq!(new_asked.lock().unwrap().len(), 4);
+    }
+
     /// Every connection to a workspace's socket checks the hub serves that workspace.
     #[tokio::test]
     async fn every_connection_checks_its_workspace() {

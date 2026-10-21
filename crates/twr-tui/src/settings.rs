@@ -422,6 +422,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
             .unwrap_or(u16::MAX)
             .saturating_add(2),
     );
+    // Taller than the screen (a phone), it scrolls to keep the selected row in view.
+    let fit = usize::from(rect.height.saturating_sub(2));
+    let mut scroll = 0;
+    if let Some((_, span)) = spans.get(s.selected) {
+        if span.end > fit {
+            scroll = (span.end - fit).min(span.start);
+        }
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -433,15 +441,21 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
     for (key, span) in spans {
+        // Its rows on screen, under the scroll.
+        let (start, end) = (span.start.max(scroll), span.end.min(scroll + fit));
+        if start >= end {
+            continue;
+        }
         let y = inner
             .y
-            .saturating_add(u16::try_from(span.start).unwrap_or(u16::MAX));
-        let h = u16::try_from(span.len()).unwrap_or(u16::MAX);
+            .saturating_add(u16::try_from(start - scroll).unwrap_or(u16::MAX));
+        let h = u16::try_from(end - start).unwrap_or(u16::MAX);
         let cells = Rect::new(inner.x, y, inner.width, h).intersection(inner);
         panes.target(cells, Target::Setting(key));
     }
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).block(block), rect);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), rect);
 }
 
 /// `path` as shown: under the home directory, with `~`.

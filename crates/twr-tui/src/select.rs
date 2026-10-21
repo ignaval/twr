@@ -101,7 +101,7 @@ pub enum Target {
     NewWorkspace,
     /// `⚙ Settings` under the workspaces (the whole row): opens the settings, as `/settings`.
     Settings,
-    /// The workspace sidebar's header (`‹`, the whole row) hides it, and the tab strip's `☰`
+    /// The workspace sidebar's header (`‹`, the whole row) hides it, and the tab strip's `≡`
     /// shows it (or, where it does not fit, opens it as a drawer), as Ctrl-T does.
     WsSidebar,
     /// A row of the settings, by what it sets: selects it, and a tap on the selected one

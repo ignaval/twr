@@ -1145,6 +1145,17 @@ mod tests {
         assert_eq!(parse("/parked on"), Ok(Slash::Parked(Some(true))));
         assert_eq!(parse("/parked off"), Ok(Slash::Parked(Some(false))));
         assert_eq!(parse("/sidebar"), Ok(Slash::Sidebar(None)));
+        assert_eq!(parse("/spaces"), Ok(Slash::Spaces(None)));
+        assert_eq!(parse("/spaces off"), Ok(Slash::Spaces(Some(false))));
+        assert_eq!(parse("/settings"), Ok(Slash::Settings));
+        assert!(parse("/settings x").is_err());
+        assert_eq!(parse("/ws new"), Ok(Slash::WsNew(None)));
+        assert_eq!(parse("/ws new api"), Ok(Slash::WsNew(Some("api".into()))));
+        assert_eq!(parse("/ws api"), Ok(Slash::Ws(Some("api".into()))));
+        assert_eq!(
+            parse("/w"),
+            Ok(Slash::Pane(crate::app::CompactPane::Workspaces))
+        );
         assert_eq!(parse("/sidebar on"), Ok(Slash::Sidebar(Some(true))));
         assert_eq!(parse("/sidebar off"), Ok(Slash::Sidebar(Some(false))));
         assert_eq!(parse("/focus"), Ok(Slash::Focus(None)));
@@ -1328,10 +1339,10 @@ mod tests {
             ]
         );
         assert_eq!(names("/orchestr", &pools), ["/orch"]);
-        assert_eq!(names("/se", &pools), ["/unsend", "/mouse"]);
+        assert_eq!(names("/se", &pools), ["/settings", "/unsend", "/mouse"]);
         assert_eq!(
             names("/P", &pools),
-            ["/park", "/pin", "/parked", "/open", "/stop", "/compact", "/ws", "/help"]
+            ["/park", "/pin", "/parked", "/open", "/stop", "/spaces", "/compact", "/ws", "/help"]
         );
         // Taking arguments or not.
         let help = &suggest("/he", &pools).items[0];

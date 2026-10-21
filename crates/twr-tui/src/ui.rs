@@ -144,9 +144,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
 }
 
 /// The tab strip's control of the workspace sidebar.
-const MENU: &str = " ☰ ";
+const MENU: &str = " ≡ ";
 
-/// The workspaces' tab strip ([`crate::workspace`]), after the `☰` that shows the workspace
+/// The workspaces' tab strip ([`crate::workspace`]), after the `≡` that shows the workspace
 /// sidebar (or its drawer): each tab's name with its badges (`⚠n`
 /// items waiting on the user, `●n` threads running, `○` a stopped hub, `…` one that did not
 /// answer), the current one highlighted. A click on a tab switches to it
@@ -178,7 +178,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             (t.name.clone(), badges, waiting, current)
         })
         .collect();
-    // The `☰` before them.
+    // The `≡` before them.
     let width = width.saturating_sub(crate::edit::width(MENU));
     let cells = |(name, badges, waiting, _): &(String, String, Option<String>, bool)| {
         crate::edit::width(name)
@@ -485,7 +485,7 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     (
         "controls",
         "a workspace's card in the sidebar switches to it, + New workspace asks for a name, \
-         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ☰ shows \
+         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ≡ shows \
          it; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
@@ -8904,13 +8904,15 @@ mod tests {
                 ("c", TabHub::Busy),
             ],
         );
+        // (Wide enough, the workspace sidebar lists them instead: hidden here.)
+        st.view.ws_sidebar_hidden = true;
         for (w, h) in [(160, 42), (80, 24)] {
             for view in [Screen::Stack, Screen::Grid, Screen::Decisions] {
                 st.view.screen = view;
                 let lines = draw(&st, w, h);
                 let strip = lines[0].trim_end();
                 assert!(
-                    strip.starts_with(" default ⚠2 ●1 │ a"),
+                    strip.starts_with(" ≡  default ⚠2 ●1 │ a"),
                     "{view:?} {w}: {strip}"
                 );
                 assert!(strip.ends_with("│ b ○ │ c …"), "{view:?} {w}: {strip}");
@@ -9028,7 +9030,7 @@ mod tests {
         );
         st.view.help = true;
         let lines = draw(&st, 80, 10);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
         st.view.help = false;
         st.view.picker = Some(crate::app::Picker {
@@ -9039,7 +9041,7 @@ mod tests {
             switch: false,
         });
         let lines = draw(&st, 80, 6);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
     }
 
@@ -9059,14 +9061,14 @@ mod tests {
         let mut st = crate::app::tests::with_orch();
         with_tabs(&mut st, "workspace-06", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with("‹ "), "{strip}");
+        assert!(strip.starts_with(" ≡ ‹ "), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
         assert!(strip.contains("workspace-06"), "{strip}");
         assert!(!strip.contains("workspace-01"), "{strip}");
         // At the start, only the right one.
         with_tabs(&mut st, "workspace-01", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with(" workspace-01"), "{strip}");
+        assert!(strip.starts_with(" ≡  workspace-01"), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
     }
 

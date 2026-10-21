@@ -7,7 +7,7 @@
 //! Where it goes ([`AppState::ws_docked`]): a column left of the views (stack, grid and the
 //! decision table) in the full layout from [`DOCK_MIN_WIDTH`] columns, unless hidden (Ctrl-T,
 //! `/spaces`, its header's `‹`, kept across runs). Narrower, the same list opens as a drawer
-//! over the left of the view (Ctrl-T, `/spaces`, the tab strip's `☰`), and in the compact
+//! over the left of the view (Ctrl-T, `/spaces`, the tab strip's `≡`), and in the compact
 //! layout it is the Workspaces screen. The tab strip is drawn only where the column is not,
 //! so the workspaces never show twice.
 
@@ -403,7 +403,7 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
         rows.push(row);
     }
     if cut {
-        if let Some(last) = rows.last_mut() {
+        if let Some(last) = rows.last_mut().filter(|l| !l.ends_with('…')) {
             let keep = width.saturating_sub(1);
             let mut s = crate::ui::truncate_cells(last, keep);
             // (`truncate` ends what it cut with `…` itself.)
@@ -474,6 +474,623 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workspace::{OrchGlance, Tab};
+
+    /// The rows `st` draws at `w` x `h`, as the IO loop draws them (its panes kept).
+    pub(crate) fn rows(st: &mut AppState, w: u16, h: u16) -> Vec<String> {
+        let buf = crate::app::tests::draw(st, w, h);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// A TUI on workspace `current` of `default`, `client-x` (running, its orchestrator
+    /// waiting on the user, a reply), `scratch` (stopped, a reply seen before) and `idle`
+    /// (running, nothing said yet).
+    pub(crate) fn in_workspaces(current: &str) -> AppState {
+        let mut st = crate::app::tests::with_orch();
+        st.workspace = Some(current.into());
+        st.instance_name = Some(current.into());
+        st.view.compact_width = 60;
+        let glance = |status, preview: Option<&str>, active| Glance {
+            active,
+            orch: Some(OrchGlance {
+                status,
+                preview: preview.map(str::to_string),
+            }),
+        };
+        st.set_tabs(vec![
+            Tab {
+                name: "default".into(),
+                hub: TabHub::Unknown,
+                glance: None,
+            },
+            Tab {
+                name: "client-x".into(),
+                hub: TabHub::Running {
+                    threads: 2,
+                    running: 1,
+                    permissions: 1,
+                    questions: 1,
+                },
+                glance: Some(glance(
+                    ThreadStatus::Waiting,
+                    Some("I need you to approve the deploy of the billing service to staging before I go on."),
+                    true,
+                )),
+            },
+            Tab {
+                name: "scratch".into(),
+                hub: TabHub::Stopped,
+                glance: Some(glance(
+                    ThreadStatus::Idle,
+                    Some("Done: the parser handles the new format."),
+                    false,
+                )),
+            },
+            Tab {
+                name: "docs".into(),
+                hub: TabHub::Running {
+                    threads: 0,
+                    running: 0,
+                    permissions: 0,
+                    questions: 0,
+                },
+                glance: Some(glance(ThreadStatus::Idle, None, false)),
+            },
+        ]);
+        st
+    }
+
+    /// The cell `x`, `y` of the last frame was a tap on: down and up there, a frame drawn
+    /// before each, as the IO loop draws. Returns the actions.
+    fn tap_at(st: &mut AppState, w: u16, h: u16, x: u16, y: u16) -> Vec<crate::app::Action> {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind| MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let screen = crate::app::tests::draw(st, w, h);
+        let mut out = st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left)), &screen);
+        let screen = crate::app::tests::draw(st, w, h);
+        out.extend(st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen));
+        out
+    }
+
+    /// Every cell of control `t` as a `w` x `h` frame draws it.
+    fn cells(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<Rect> {
+        crate::app::tests::draw(st, w, h);
+        st.view
+            .panes
+            .targets
+            .iter()
+            .filter(|(_, x)| x == t)
+            .map(|(r, _)| *r)
+            .collect()
+    }
+
+    /// A tap on control `t` (at its last cell) as a `w` x `h` frame draws it.
+    fn tap(st: &mut AppState, w: u16, h: u16, t: &Target) -> Vec<crate::app::Action> {
+        let r = *cells(st, w, h, t)
+            .last()
+            .unwrap_or_else(|| panic!("no {t:?} in {:?}", st.view.panes.targets));
+        tap_at(st, w, h, r.x + r.width - 1, r.y + r.height - 1)
+    }
+
+    fn workspace_action(actions: &[crate::app::Action]) -> Option<(String, bool)> {
+        actions.iter().find_map(|a| match a {
+            crate::app::Action::Workspace { name, create } => Some((name.clone(), *create)),
+            _ => None,
+        })
+    }
+
+    /// From 120 columns the sidebar is docked left of the stack and the grid: a card per
+    /// workspace with its orchestrator's status and reply, `○` for a stopped hub with the reply
+    /// it last gave, the buttons under them; the tab strip is not drawn then (nor the
+    /// instance label), so the workspaces show once.
+    #[test]
+    fn the_docked_sidebar_lists_every_workspace_once() {
+        for screen in [crate::app::Screen::Stack, crate::app::Screen::Grid] {
+            let mut st = in_workspaces("default");
+            st.view.screen = screen;
+            let r = rows(&mut st, 160, 40);
+            let text = r.join("\n");
+            assert!(st.ws_docked() && !st.tabs_shown(), "{text}");
+            let col = |y: usize| {
+                r[y].chars()
+                    .take(usize::from(DOCK_WIDTH))
+                    .collect::<String>()
+            };
+            assert!(
+                col(0).contains("WORKSPACES") && col(0).contains('‹'),
+                "{text}"
+            );
+            let left: Vec<String> = (0..40).map(col).collect();
+            let left = left.join("\n");
+            for want in [
+                "default",
+                "client-x        ⚠2 ●1",
+                "waiting on you",
+                "I need you to approve",
+                "the deploy of the…",
+                "○ scratch",
+                "hub not running",
+                "Done: the parser",
+                "docs",
+                "+ New workspace",
+                "⚙ Settings",
+            ] {
+                assert!(left.contains(want), "{want:?} in\n{left}");
+            }
+            assert!(!text.contains("[default]"), "{text}");
+            assert!(!text.contains("≡"), "{text}");
+            // Each workspace once.
+            assert_eq!(text.matches("client-x").count(), 1, "{text}");
+            // Every row of a card is its target; the buttons' rows theirs.
+            let card = cells(&mut st, 160, 40, &Target::Workspace("client-x".into()));
+            assert_eq!(card.len(), CARD_ROWS, "{card:?}");
+            assert!(card.iter().all(|c| c.width == DOCK_WIDTH - 1));
+            assert_eq!(cells(&mut st, 160, 40, &Target::NewWorkspace).len(), 1);
+            assert_eq!(cells(&mut st, 160, 40, &Target::Settings).len(), 1);
+        }
+    }
+
+    /// The current workspace's card is highlighted: its name row reversed, as its tab was,
+    /// the rest marked at the left.
+    #[test]
+    fn the_current_workspace_is_highlighted() {
+        let mut st = in_workspaces("client-x");
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        let row = (0..40)
+            .find(|&y| {
+                (0..DOCK_WIDTH)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("client-x")
+            })
+            .unwrap();
+        let x = (0..DOCK_WIDTH)
+            .find(|&x| buf[(x, row)].symbol() == "c")
+            .unwrap();
+        assert!(buf[(x, row)].modifier.contains(Modifier::REVERSED));
+        assert_eq!(buf[(0, row + 1)].symbol(), "▌");
+        let other = (0..40)
+            .find(|&y| {
+                (0..DOCK_WIDTH)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("scratch")
+            })
+            .unwrap();
+        let x = (0..DOCK_WIDTH)
+            .find(|&x| buf[(x, other)].symbol() == "s")
+            .unwrap();
+        assert!(!buf[(x, other)].modifier.contains(Modifier::REVERSED));
+    }
+
+    /// Narrower than 120 columns the sidebar does not dock: the tab strip is drawn, with its
+    /// `≡`, and Ctrl-T, `/spaces` or a tap on `≡` open the list as a drawer, whose cards and
+    /// buttons are tapped as the docked ones; Esc or a click outside it closes it.
+    #[test]
+    fn a_narrower_screen_opens_the_workspaces_in_a_drawer() {
+        let mut st = in_workspaces("default");
+        let r = rows(&mut st, 110, 30);
+        assert!(!st.ws_docked() && st.tabs_shown(), "{}", r.join("\n"));
+        assert!(r[0].starts_with(" ≡  default"), "{}", r[0]);
+        // The ≡ opens the drawer.
+        assert!(tap(&mut st, 110, 30, &Target::WsSidebar).is_empty());
+        assert!(st.ws_drawer_open());
+        let r = rows(&mut st, 110, 30);
+        assert!(
+            r[1].contains("workspaces") && r[1].contains('✕'),
+            "{}",
+            r.join("\n")
+        );
+        assert!(!st.view.ws_sidebar_hidden, "the drawer is no hiding");
+        // ↓ selects the next card, Enter switches to it, and the drawer closes.
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+        assert_eq!(st.ws_selected(), Some(WsRow::Workspace("client-x".into())));
+        let a = st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
+        assert!(!st.ws_drawer_open());
+        // Ctrl-T opens it again, Esc closes it.
+        st.switching = None;
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert!(st.ws_drawer_open());
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Esc));
+        assert!(!st.ws_drawer_open());
+        // A click outside it closes it and does nothing else.
+        st.handle_key(crate::app::tests::ctrl('t'));
+        rows(&mut st, 110, 30);
+        assert!(tap_at(&mut st, 110, 30, 80, 15).is_empty());
+        assert!(!st.ws_drawer_open());
+        // A key it does not take closes it and goes on: typing is not lost.
+        st.handle_key(crate::app::tests::ctrl('t'));
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Char('h')));
+        assert!(!st.ws_drawer_open());
+        assert_eq!(st.view.input.as_str(), "h");
+    }
+
+    /// In the compact layout the workspaces are a fourth screen, `Workspaces` (`Spaces` on a
+    /// phone, with what waits in the others); the tab strip is gone. ↑↓ on an empty line
+    /// select a row, Enter switches; a tap on a card switches too.
+    #[test]
+    fn the_compact_layout_has_a_workspaces_screen() {
+        let mut st = in_workspaces("default");
+        let r = rows(&mut st, 40, 20);
+        assert!(st.compact() && !st.tabs_shown());
+        assert!(r[0].contains("Spaces ⚠2"), "{}", r.join("\n"));
+        assert!(!r.join("\n").contains("≡"));
+        // Its tab, its whole share of the bar.
+        let tab = cells(
+            &mut st,
+            40,
+            20,
+            &Target::Screen(crate::app::CompactPane::Workspaces),
+        );
+        assert_eq!(tab.len(), 1);
+        assert_eq!((tab[0].x, tab[0].width), (30, 10));
+        tap(
+            &mut st,
+            40,
+            20,
+            &Target::Screen(crate::app::CompactPane::Workspaces),
+        );
+        assert!(st.ws_screen());
+        let r = rows(&mut st, 40, 20).join("\n");
+        assert!(
+            r.contains("client-x") && r.contains("+ New workspace"),
+            "{r}"
+        );
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+        assert_eq!(st.ws_selected(), Some(WsRow::Workspace("scratch".into())));
+        let a = st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+        // A tap on a card switches.
+        st.switching = None;
+        let a = tap(&mut st, 40, 20, &Target::Workspace("client-x".into()));
+        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
+        // Ctrl-T and /w show it too, and Ctrl-T on it goes back to the conversation.
+        let mut st = in_workspaces("default");
+        rows(&mut st, 40, 20);
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert!(st.ws_screen());
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert_eq!(st.view.compact_pane, crate::app::CompactPane::Chat);
+        st.view.input.set("/w");
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
+        assert!(st.ws_screen());
+    }
+
+    /// A tap on a card switches to that workspace, as its tab does; on the current one it
+    /// says so and switches nothing.
+    #[test]
+    fn a_tap_on_a_card_switches() {
+        let mut st = in_workspaces("default");
+        let a = tap(&mut st, 160, 40, &Target::Workspace("scratch".into()));
+        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+        assert_eq!(st.switching.as_deref(), Some("scratch"));
+        let mut st = in_workspaces("default");
+        let a = tap(&mut st, 160, 40, &Target::Workspace("default".into()));
+        assert!(workspace_action(&a).is_none());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("already in workspace default")
+        );
+        // Alt-2 switches whatever shows the workspaces, the docked sidebar too.
+        let mut st = in_workspaces("default");
+        rows(&mut st, 160, 40);
+        let alt = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('2'),
+            crossterm::event::KeyModifiers::ALT,
+        );
+        assert_eq!(
+            workspace_action(&st.handle_key(alt)),
+            Some(("client-x".into(), false))
+        );
+    }
+
+    /// Ctrl-T hides the docked sidebar (the IO loop remembers it: `Action::WsSidebar`), the
+    /// tab strip and its `≡` come back, and a tap on `≡` or the sidebar's `‹` toggles it
+    /// as Ctrl-T does; `/spaces on|off` sets it.
+    #[test]
+    fn hiding_the_sidebar_brings_the_strip_back_and_is_remembered() {
+        use crate::app::Action;
+        let mut st = in_workspaces("default");
+        rows(&mut st, 160, 40);
+        let a = st.handle_key(crate::app::tests::ctrl('t'));
+        assert_eq!(a, vec![Action::WsSidebar(false)]);
+        assert!(st.view.ws_sidebar_hidden && !st.ws_docked() && st.tabs_shown());
+        let r = rows(&mut st, 160, 40);
+        assert!(r[0].starts_with(" ≡  default"), "{}", r[0]);
+        let a = tap(&mut st, 160, 40, &Target::WsSidebar);
+        assert_eq!(a, vec![Action::WsSidebar(true)]);
+        assert!(st.ws_docked());
+        let a = tap(&mut st, 160, 40, &Target::WsSidebar);
+        assert_eq!(a, vec![Action::WsSidebar(false)]);
+        st.view.input.set("/spaces on");
+        let a = st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
+        assert_eq!(a, vec![Action::WsSidebar(true)]);
+        assert!(st.ws_docked());
+        // With one workspace, the docked sidebar still shows (its buttons), and hidden, no
+        // strip is drawn: there is nothing to switch to.
+        let mut st = crate::app::tests::with_orch();
+        st.workspace = Some("default".into());
+        st.set_tabs(vec![Tab::new("default")]);
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(r.contains("+ New workspace"), "{r}");
+        st.handle_key(crate::app::tests::ctrl('t'));
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(!r.contains("WORKSPACES") && !r.contains('≡'), "{r}");
+        // A TUI opened on a socket has none.
+        let mut st = crate::app::tests::with_orch();
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(!r.contains("WORKSPACES"), "{r}");
+        assert!(st.handle_key(crate::app::tests::ctrl('t')).is_empty());
+    }
+
+    /// The sidebar's state is kept in `tui-state.json`, written only when it is set: another
+    /// TUI's save of what it was told keeps it as it is.
+    #[test]
+    fn the_sidebar_state_is_kept_across_runs() {
+        use crate::firstrun;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tui-state.json");
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, None);
+        firstrun::set_workspaces_sidebar(&file, false).unwrap();
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, Some(false));
+        // A TUI started before, which saw it shown, saves what it told: the file's stays.
+        let stale = firstrun::Seen {
+            suggest_notice: true,
+            workspaces_sidebar: Some(true),
+            ..Default::default()
+        };
+        firstrun::save(&file, &stale).unwrap();
+        let now = firstrun::load(&file);
+        assert_eq!(now.workspaces_sidebar, Some(false));
+        assert!(now.suggest_notice);
+        firstrun::set_workspaces_sidebar(&file, true).unwrap();
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, Some(true));
+    }
+
+    /// `+ New workspace` asks for a name: what `twr ws new` refuses (and `default`, and one
+    /// that exists) is said under it and Enter does nothing; a good one is created and
+    /// switched to. Esc cancels. `/ws new` asks too, `/ws new <name>` creates at once.
+    #[test]
+    fn a_new_workspace_is_named_checked_and_created() {
+        use crossterm::event::KeyCode;
+        let mut st = in_workspaces("default");
+        assert!(tap(&mut st, 160, 40, &Target::NewWorkspace).is_empty());
+        assert_eq!(st.view.new_ws.as_deref(), Some(""));
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(
+            r.contains("new workspace") && r.contains("Enter creates it"),
+            "{r}"
+        );
+        let type_in = |st: &mut AppState, text: &str| {
+            for c in text.chars() {
+                st.handle_key(crate::app::tests::key(KeyCode::Char(c)));
+            }
+        };
+        for (bad, why) in [
+            ("Bad_Name", "invalid workspace name"),
+            ("client-x", "already exists"),
+            ("default", "always exists"),
+            ("-x", "invalid workspace name"),
+        ] {
+            st.handle_key(crate::app::tests::ctrl('u'));
+            type_in(&mut st, bad);
+            let r = rows(&mut st, 160, 40).join("\n");
+            assert!(r.contains(why), "{bad}: {r}");
+            let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+            assert!(a.is_empty(), "{bad}");
+            assert!(st.view.new_ws.is_some(), "{bad}: the dialog stays");
+        }
+        // Keys go to the dialog only: Ctrl-T, `/`, digits type nothing else.
+        st.handle_key(crate::app::tests::ctrl('u'));
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert!(st.ws_docked());
+        type_in(&mut st, "web-2");
+        assert_eq!(st.view.input.as_str(), "");
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some(("web-2".into(), true)));
+        assert!(st.view.new_ws.is_none());
+        // Esc cancels; ✕ too.
+        let mut st = in_workspaces("default");
+        st.open_new_ws(None);
+        st.handle_key(crate::app::tests::key(KeyCode::Esc));
+        assert!(st.view.new_ws.is_none());
+        st.open_new_ws(None);
+        tap(&mut st, 160, 40, &Target::Close);
+        assert!(st.view.new_ws.is_none());
+        // The commands.
+        st.view.input.set("/ws new");
+        st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(st.view.new_ws.as_deref(), Some(""));
+        let mut st = in_workspaces("default");
+        st.view.input.set("/ws new api");
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some(("api".into(), true)));
+        let mut st = in_workspaces("default");
+        st.view.input.set("/ws new Nope");
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert!(workspace_action(&a).is_none());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("invalid workspace name"));
+    }
+
+    /// A TUI an agent runs creates no workspace: the button, `/ws new` and `/ws <new name>`
+    /// say so and ask nothing (the CLI refuses an agent's workspace as well).
+    #[test]
+    fn an_agent_cannot_create_a_workspace() {
+        use crossterm::event::KeyCode;
+        let agent = || {
+            let mut st = in_workspaces("default");
+            st.agent = Some("thread web's agent (pid 42)".into());
+            st
+        };
+        let mut st = agent();
+        assert!(tap(&mut st, 160, 40, &Target::NewWorkspace).is_empty());
+        assert!(st.view.new_ws.is_none());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("agents cannot create workspaces"));
+        for line in ["/ws new", "/ws new api", "/ws api"] {
+            let mut st = agent();
+            st.view.input.set(line);
+            let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+            assert!(workspace_action(&a).is_none(), "{line}");
+            assert!(
+                st.view.new_ws.is_none() && st.view.confirm.is_none(),
+                "{line}"
+            );
+            let status = st.view.status.clone().unwrap_or_default();
+            assert!(
+                status.contains("agents cannot create workspaces"),
+                "{line}: {status}"
+            );
+            // Switching to one that exists still works.
+            let a = st.switch_workspace("client-x");
+            assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
+        }
+    }
+
+    /// `⚙ Settings` opens the settings, asks the hub for its own, and shows each value in
+    /// effect with where it is kept; Enter changes the selected one at once (the IO loop
+    /// writes it), the hub's and the models are shown only, and a TUI an agent runs changes
+    /// nothing.
+    #[test]
+    fn the_settings_show_and_change_what_users_toggle() {
+        use crate::app::Action;
+        use crate::settings::{Change, Key};
+        use crossterm::event::KeyCode;
+        let mut st = in_workspaces("default");
+        st.view.suggest = true;
+        let a = tap(&mut st, 160, 40, &Target::Settings);
+        assert_eq!(a, vec![Action::ConfigShow]);
+        st.apply_result(
+            "config.show",
+            &serde_json::json!({"codex": {"auto": "ask"}, "wake_after_secs": 45}),
+        );
+        let r = rows(&mut st, 160, 40).join("\n");
+        for want in [
+            "settings",
+            "Suggestions",
+            "[tui] suggest",
+            "Card order",
+            "stable",
+            "Notifications",
+            "[tui.notify] terminal",
+            "Compact below",
+            "60 columns",
+            "Workspace sidebar",
+            "shown",
+            "Codex auto",
+            "ask",
+            "restart the hub",
+            "Wake after",
+            "45 s",
+        ] {
+            assert!(r.contains(want), "{want:?} in {r}");
+        }
+        // Enter on the first row turns suggestions off, at once.
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(a, vec![Action::Setting(Change::Suggest(false))]);
+        assert!(!st.view.suggest);
+        // A tap selects a row, a tap on the selected one changes it.
+        assert!(tap(&mut st, 160, 40, &Target::Setting(Key::CardOrder)).is_empty());
+        let a = tap(&mut st, 160, 40, &Target::Setting(Key::CardOrder));
+        assert_eq!(
+            a,
+            vec![Action::Setting(Change::CardOrder(
+                twr_core::config::CardOrder::Attention
+            ))]
+        );
+        // Notifications and the compact width step through their values, ← back.
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Right));
+        assert_eq!(
+            a,
+            vec![Action::Setting(Change::Notify(
+                twr_core::config::TerminalAlert::Bell
+            ))]
+        );
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Right));
+        assert_eq!(a, vec![Action::Setting(Change::CompactWidth(80))]);
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Left));
+        assert_eq!(a, vec![Action::Setting(Change::CompactWidth(60))]);
+        // The sidebar, kept as Ctrl-T keeps it.
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(a, vec![Action::WsSidebar(false)]);
+        assert!(st.view.settings.is_some(), "it stays open");
+        // The hub's rows change nothing.
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        assert!(st
+            .handle_key(crate::app::tests::key(KeyCode::Enter))
+            .is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("restart the hub"));
+        // Esc closes.
+        st.handle_key(crate::app::tests::key(KeyCode::Esc));
+        assert!(st.view.settings.is_none());
+        // `/settings` opens them too; an agent's TUI shows them read-only.
+        let mut st = in_workspaces("default");
+        st.agent = Some("thread web's agent".into());
+        st.view.input.set("/settings");
+        assert_eq!(
+            st.handle_key(crate::app::tests::key(KeyCode::Enter)),
+            vec![Action::ConfigShow]
+        );
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(r.contains("read-only"), "{r}");
+        assert!(st
+            .handle_key(crate::app::tests::key(KeyCode::Enter))
+            .is_empty());
+        assert!(st.view.suggest || !st.view.suggest);
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("changes no setting"));
+    }
+
+    /// The settings fit a phone: the selected row stays on screen as ↑↓ move.
+    #[test]
+    fn the_settings_scroll_on_a_phone() {
+        use crossterm::event::KeyCode;
+        let mut st = in_workspaces("default");
+        rows(&mut st, 40, 20);
+        st.open_settings();
+        for _ in 0..crate::settings::KEYS.len() {
+            st.handle_key(crate::app::tests::key(KeyCode::Down));
+        }
+        let r = rows(&mut st, 40, 20).join("\n");
+        assert!(r.contains("Wake after"), "{r}");
+        assert!(!cells(
+            &mut st,
+            40,
+            20,
+            &Target::Setting(crate::settings::Key::WakeAfter)
+        )
+        .is_empty());
+    }
 
     /// A reply runs together on its rows, without its Markdown marks or thread tags, cut
     /// with `…` when there is more.
@@ -482,7 +1099,7 @@ mod tests {
         let text = "## Done\n\n<thread name=\"api\">\n- merged **api** into `dev`\n</thread>\nAll tests pass and the branch is pushed for review.";
         assert_eq!(
             preview_rows(text, 20, 2),
-            vec!["Done merged api into", "dev All tests pass …"]
+            vec!["Done merged api into", "dev All tests pass…"]
         );
         assert_eq!(preview_rows("short", 20, 2), vec!["short"]);
         assert_eq!(preview_rows("", 20, 2), Vec::<String>::new());
