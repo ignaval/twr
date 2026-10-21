@@ -1216,6 +1216,113 @@ mod tests {
         assert!(!st.view.help);
     }
 
+    /// With the settings or the new-workspace dialog open, a tap on a tab of the strip
+    /// switches, but a press in the dialog released on a tab does not.
+    #[test]
+    fn a_drag_onto_a_tab_from_a_dialog_switches_nothing() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        st.open_settings();
+        rows(&mut st, 110, 30);
+        let tab = st
+            .view
+            .panes
+            .panes
+            .iter()
+            .find(|p| p.id == PaneId::Tab("scratch".into()))
+            .unwrap()
+            .area;
+        let ev = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let screen = crate::app::tests::draw(&mut st, 110, 30);
+        st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left), 55, 15), &screen);
+        let a = st.handle_mouse(
+            ev(MouseEventKind::Up(MouseButton::Left), tab.x + 1, tab.y),
+            &screen,
+        );
+        assert!(workspace_action(&a).is_none());
+        let a = tap_at(&mut st, 110, 30, tab.x + 1, tab.y);
+        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+    }
+
+    /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
+    #[test]
+    fn ctrl_t_leaves_the_compact_decisions_for_the_workspaces() {
+        let mut st = in_workspaces("default");
+        rows(&mut st, 40, 20);
+        st.toggle_decisions();
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert!(st.ws_screen());
+        let r = rows(&mut st, 40, 20).join("\n");
+        assert!(r.contains("+ New workspace"), "{r}");
+    }
+
+    /// A drawer opened on a narrower screen does not come back once the docked sidebar,
+    /// after a resize, is hidden.
+    #[test]
+    fn a_drawer_does_not_come_back_with_the_dock_hidden() {
+        let mut st = in_workspaces("default");
+        rows(&mut st, 110, 30);
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert!(st.ws_drawer_open());
+        rows(&mut st, 160, 40);
+        assert!(st.ws_docked() && !st.ws_drawer_open());
+        st.handle_key(crate::app::tests::ctrl('t'));
+        rows(&mut st, 110, 30);
+        assert!(!st.ws_drawer_open());
+    }
+
+    /// Under the settings, the wheel over the docked workspace list scrolls it, and changes
+    /// no setting's selection.
+    #[test]
+    fn the_wheel_scrolls_the_dock_under_the_settings() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        for i in 0..8 {
+            tabs.push(Tab::new(format!("more-{i}")));
+        }
+        st.set_tabs(tabs);
+        st.open_settings();
+        rows(&mut st, 160, 30);
+        let screen = crate::app::tests::draw(&mut st, 160, 30);
+        st.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &screen,
+        );
+        assert_eq!(st.view.ws_scroll, 1);
+        assert_eq!(st.view.settings.as_ref().unwrap().selected, 0);
+    }
+
+    /// A reply a stop cut short is not the orchestrator's latest reply: the card keeps the
+    /// last final one.
+    #[test]
+    fn a_reply_cut_short_is_not_the_latest() {
+        use twr_core::event::{AgentText, EventBody};
+        let mut o = twr_core::testkit::ThreadScript::new("o");
+        let mut t = crate::app::Transcript::new("o");
+        t.settle();
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("the whole answer"));
+        t.apply(&o.turn_started("more"));
+        t.apply(&o.event(EventBody::AgentText(AgentText {
+            text: "half an ans".into(),
+            is_final: false,
+            ..Default::default()
+        })));
+        t.apply(&o.stopped());
+        assert_eq!(t.last_reply.as_deref(), Some("the whole answer"));
+    }
+
     /// A reply runs together on its rows, without its Markdown marks or thread tags, cut
     /// with `…` when there is more.
     #[test]

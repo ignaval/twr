@@ -690,7 +690,7 @@ fn save_seen(state: &mut AppState, file: Option<&Path>) {
 
 /// Writes setting `change` to the config file the environment names, where the settings
 /// keep it ([`settings::Change::config_key`]): `Ok` with the file's path as shown, else why it
-/// was left alone. A small local file: written on the loop, at the user's own key.
+/// was left alone. On the settings writer's thread ([`spawn_settings_writer`]).
 fn save_setting(change: &settings::Change) -> Result<String, String> {
     let Some((table, key, value)) = change.config_key() else {
         return Err("not a setting of the config file".into());
@@ -1804,6 +1804,45 @@ fn spawn_history_writer(
     (tx, writer)
 }
 
+/// A setting to keep, for the settings writer ([`spawn_settings_writer`]).
+enum Save {
+    /// The workspace sidebar shown or not, in `tui-state.json` at this path.
+    WsSidebar(PathBuf, bool),
+    /// A setting of the config file ([`save_setting`]).
+    Setting(settings::Change),
+}
+
+/// What became of a [`Save`]: `Ok` with where it was kept, as shown, or why it was not.
+type Saved = (Save, Result<String, String>);
+
+/// Starts the thread that keeps the settings changed in the TUI, one after another in the
+/// order they were changed: a later change never lands before an earlier one, and the IO loop
+/// never waits on a file or its lock (another TUI may hold it). Each outcome comes back on
+/// `done`. Its sender closed, the thread ends once it kept what it has.
+fn spawn_settings_writer(
+    done: mpsc::UnboundedSender<Saved>,
+) -> (
+    std::sync::mpsc::Sender<Save>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Save>();
+    let writer = std::thread::Builder::new()
+        .name("twr-settings".into())
+        .spawn(move || {
+            for save in rx {
+                let r = match &save {
+                    Save::WsSidebar(file, on) => firstrun::set_workspaces_sidebar(file, *on)
+                        .map(|()| String::new())
+                        .map_err(|e| e.to_string()),
+                    Save::Setting(change) => save_setting(change),
+                };
+                let _ = done.send((save, r));
+            }
+        })
+        .ok();
+    (tx, writer)
+}
+
 /// `msg` for the next view's status bar (`late`: its sender and the workspace `msg` came
 /// from), unless it is transient (news only for a moment) or empty.
 fn forward_late(
@@ -2054,6 +2093,10 @@ struct Shared {
     /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
     /// no setting.
     agent: Option<String>,
+    /// The settings writer ([`spawn_settings_writer`]), and what it kept; taken (closed) as
+    /// the TUI quits.
+    saves: Option<std::sync::mpsc::Sender<Save>>,
+    saved_rx: mpsc::UnboundedReceiver<Saved>,
     /// What the TUI has told the user across runs, and where it keeps that
     /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
     seen: firstrun::Seen,
@@ -2186,6 +2229,8 @@ pub async fn run_with(
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
+    let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
+    let (saves, settings_writer) = spawn_settings_writer(saved_tx);
     let mut ctx = Shared {
         callers: std::collections::HashMap::new(),
         all_callers: Vec::new(),
@@ -2203,6 +2248,8 @@ pub async fn run_with(
         suggest: None,
         ws_sidebar_hidden: seen.workspaces_sidebar == Some(false),
         agent,
+        saves: Some(saves),
+        saved_rx,
         seen,
         seen_file,
         offer,
@@ -2275,12 +2322,15 @@ pub async fn run_with(
     // The terminal is the user's again before anything else waits.
     drop(guard);
     // The lines sent last are written before the TUI exits, unless another TUI holds the
-    // file's lock past [`HISTORY_FLUSH`].
+    // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
     flush_history(history_writer);
+    drop(ctx.saves.take());
+    flush_history(settings_writer);
     result
 }
 
-/// Waits for the history writer to finish, at most [`HISTORY_FLUSH`].
+/// Waits for the history writer (or the settings writer) to finish, at most
+/// [`HISTORY_FLUSH`].
 fn flush_history(writer: Option<std::thread::JoinHandle<()>>) {
     if let Some(w) = writer {
         let until = std::time::Instant::now() + HISTORY_FLUSH;
@@ -2701,16 +2751,11 @@ async fn drive(
                                 continue;
                             }
                             // Kept for the next runs (and the next workspaces shown).
-                            // Written here, in order (a small file, at the user's key): a
-                            // later toggle never lands before an earlier one.
+                            // Kept by the settings writer, in order.
                             Action::WsSidebar(on) => {
                                 ctx.ws_sidebar_hidden = !on;
-                                if let Some(file) = ctx.seen_file.as_deref() {
-                                    if let Err(e) = firstrun::set_workspaces_sidebar(file, on) {
-                                        state.view.status = Some(format!(
-                                            "workspace sidebar: not remembered for the next runs: {e}"
-                                        ));
-                                    }
+                                if let (Some(file), Some(saves)) = (&ctx.seen_file, &ctx.saves) {
+                                    let _ = saves.send(Save::WsSidebar(file.clone(), on));
                                 }
                                 continue;
                             }
@@ -2721,8 +2766,9 @@ async fn drive(
                                 if let settings::Change::Notify(alert) = change {
                                     notifier.set_alert(alert);
                                 }
-                                let saved = save_setting(&change);
-                                state.setting_saved(&change, saved);
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::Setting(change));
+                                }
                                 continue;
                             }
                             // The workspace's hub is opened (started when needed) and
@@ -2954,6 +3000,17 @@ async fn drive(
                         }
                     }
                 }
+                // What the settings writer kept, or why not.
+                Some((save, r)) = ctx.saved_rx.recv() => match save {
+                    Save::WsSidebar(..) => {
+                        if let Err(e) = r {
+                            state.view.status = Some(format!(
+                                "workspace sidebar: not remembered for the next runs: {e}"
+                            ));
+                        }
+                    }
+                    Save::Setting(change) => state.setting_saved(&change, r),
+                },
                 // An error of a call the workspace left had asked for.
                 Some((msg, transient)) = ctx.late_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
@@ -3754,6 +3811,36 @@ mod tests {
         assert!(first_handle.is_finished(), "the predecessor too");
         assert!(second.is_finished() && background.is_finished());
         drop(tx1);
+    }
+
+    /// The settings writer keeps the changes in the order they were made, each outcome
+    /// coming back in that order; closed, it ends once it kept them all.
+    #[tokio::test]
+    async fn the_settings_writer_keeps_changes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tui-state.json");
+        let (done, mut outcomes) = mpsc::unbounded_channel();
+        let (saves, writer) = super::spawn_settings_writer(done);
+        for i in 0..20 {
+            saves
+                .send(super::Save::WsSidebar(file.clone(), i % 2 == 0))
+                .unwrap();
+        }
+        saves
+            .send(super::Save::WsSidebar(file.clone(), false))
+            .unwrap();
+        drop(saves);
+        writer.unwrap().join().unwrap();
+        let mut n = 0;
+        while let Ok((save, r)) = outcomes.try_recv() {
+            assert!(r.is_ok());
+            if let super::Save::WsSidebar(_, on) = save {
+                assert_eq!(on, n < 20 && n % 2 == 0, "{n}");
+            }
+            n += 1;
+        }
+        assert_eq!(n, 21);
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, Some(false));
     }
 
     /// How a fake hub of [`fake_hub`] answers.

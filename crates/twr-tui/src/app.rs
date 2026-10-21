@@ -1168,6 +1168,10 @@ pub struct Transcript {
     /// `thread.model_changed` that moved it): what a handoff marker names. `None` until one
     /// did (the transcript replays only the latest events).
     pub runtime: Option<String>,
+    /// The text of the latest final reply (a final `agent.text`) applied: what the workspace
+    /// sidebar shows of the orchestrator's last reply. A text a stop or crash cut short is
+    /// never one.
+    pub last_reply: Option<String>,
 }
 
 impl Transcript {
@@ -1273,6 +1277,9 @@ impl Transcript {
                         text: p.text.clone(),
                         open: !is_final,
                     }),
+                }
+                if p.is_final && !p.text.trim().is_empty() {
+                    self.last_reply = Some(p.text.clone());
                 }
                 if capped && p.is_final {
                     self.notice(
@@ -3613,7 +3620,7 @@ impl AppState {
     /// `/decisions`: opens the decisions overlay over the current screen, or closes it, back
     /// to the screen it was opened from. What that screen had selected, and a dive, stay as
     /// they were.
-    fn toggle_decisions(&mut self) {
+    pub(crate) fn toggle_decisions(&mut self) {
         self.view.action = None;
         self.view.card_scroll = None;
         if self.view.screen == Screen::Decisions {
@@ -6784,7 +6791,9 @@ impl AppState {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.press(x, y),
                 MouseEventKind::Up(MouseButton::Left) => {
-                    match self.tapped(x, y) {
+                    let pressed = self.view.press.as_ref().map(|p| (p.0, p.1));
+                    let (click, target) = self.tapped(x, y);
+                    match (click, target) {
                         // A workspace's card in the docked sidebar, which it does not cover,
                         // switches as a tab does; the sidebar's other controls wait.
                         (_, Some(Target::Workspace(name))) => {
@@ -6794,10 +6803,25 @@ impl AppState {
                         (_, Some(t)) => return self.tap(t),
                         (_, None) => {}
                     }
-                    if let Some(PaneId::Tab(name)) = self.view.panes.at(x, y).map(|p| p.id.clone())
+                    // A tab, tapped: pressed and released on it as drawn.
+                    let tab = |at: Option<(u16, u16)>| {
+                        at.and_then(|(x, y)| self.view.panes.at(x, y))
+                            .and_then(|p| match &p.id {
+                                PaneId::Tab(name) => Some(name.clone()),
+                                _ => None,
+                            })
+                    };
+                    if let Some(name) =
+                        tab(Some((x, y))).filter(|n| click && tab(pressed).as_ref() == Some(n))
                     {
                         return self.switch_workspace(&name);
                     }
+                }
+                // Over the docked workspace list, the wheel scrolls it; elsewhere it picks.
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) =>
+                {
+                    self.ws_wheel(ev.kind == MouseEventKind::ScrollUp);
                 }
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                     let code = if ev.kind == MouseEventKind::ScrollUp {

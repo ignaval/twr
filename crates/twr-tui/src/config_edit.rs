@@ -533,8 +533,10 @@ fn replace(
     let dir = dir_of(file);
     let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, perm)?;
     before_swap(file);
-    let (now, _) = read_plain(file)?;
-    if now != old {
+    // Its bytes, owner, group and mode as read before: a file tightened meanwhile (made
+    // 0600, say) is not loosened back by the copy.
+    let (now, perm_now) = read_plain(file)?;
+    if now != old || perm_now.mode != perm.mode || perm_now.owner != perm.owner {
         return Err("config.toml changed meanwhile: try again".into());
     }
     std::fs::rename(&temp.path, file).map_err(|e| format!("writing config.toml: {e}"))?;
@@ -910,6 +912,20 @@ terminal = \"bell\"
         let err = write_key(&dangling, &["tui"], "mouse", &Scalar::Bool(false)).unwrap_err();
         assert_eq!(err, "config.toml is a link to nothing: fix it by hand");
         assert!(!dir.path().join("gone").exists());
+    }
+
+    /// A file tightened meanwhile (its bytes the same) is not loosened back by the copy.
+    #[test]
+    fn a_mode_changed_meanwhile_is_not_overwritten() {
+        let (_dir, file) = dir_with(SAMPLE);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let err = write_key_with(&file, &["tui"], "mouse", &Scalar::Bool(false), |f| {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, "config.toml changed meanwhile: try again");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), SAMPLE);
+        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
     }
 
     #[test]

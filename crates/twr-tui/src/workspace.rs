@@ -472,7 +472,11 @@ impl AppState {
             return Vec::new();
         }
         if self.compact() {
-            let pane = if self.view.compact_pane == crate::app::CompactPane::Workspaces {
+            // From the decisions overlay, which hides every screen: to the Workspaces one.
+            let pane = if self.view.screen == Screen::Decisions {
+                self.toggle_decisions();
+                crate::app::CompactPane::Workspaces
+            } else if self.view.compact_pane == crate::app::CompactPane::Workspaces {
                 crate::app::CompactPane::Chat
             } else {
                 crate::app::CompactPane::Workspaces
@@ -500,7 +504,10 @@ impl AppState {
         }
         let actions = self.set_ws_sidebar(on);
         if self.compact() {
-            let shown = self.view.compact_pane == crate::app::CompactPane::Workspaces;
+            if on && self.view.screen == Screen::Decisions {
+                self.toggle_decisions();
+            }
+            let shown = self.ws_screen();
             if on != shown {
                 self.show_pane(if on {
                     crate::app::CompactPane::Workspaces
@@ -518,6 +525,8 @@ impl AppState {
     /// ([`Action::WsSidebar`]).
     pub fn set_ws_sidebar(&mut self, on: bool) -> Vec<Action> {
         self.view.ws_sidebar_hidden = !on;
+        // A drawer opened on a narrower screen is not to come back with it.
+        self.view.ws_drawer = false;
         self.view.status = Some(if on {
             "workspace sidebar shown (Ctrl-T hides it)".into()
         } else {
@@ -978,12 +987,7 @@ impl AppState {
             .transcript
             .as_ref()
             .filter(|t| t.thread == id && !t.catching_up())?;
-        transcript.visible().0.iter().rev().find_map(|e| match e {
-            crate::app::Entry::Text {
-                text, open: false, ..
-            } if !text.trim().is_empty() => Some(text.clone()),
-            _ => None,
-        })
+        transcript.last_reply.clone()
     }
 
     /// Switches to workspace `name` (`/ws <name>`, a click on its tab): one that exists is
@@ -1422,16 +1426,9 @@ mod tests {
         let orch = st.orchestrator().unwrap().id.clone();
         let mut t = Transcript::new(orch);
         t.settle();
-        t.entries.push(crate::app::Entry::Text {
-            seq: 1,
-            text: "first".into(),
-            open: false,
-        });
-        t.entries.push(crate::app::Entry::Text {
-            seq: 2,
-            text: "still streaming".into(),
-            open: true,
-        });
+        let mut o = twr_core::testkit::ThreadScript::new(t.thread.clone());
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("first"));
         st.transcript = Some(t);
         let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
         assert_eq!(g.orch.unwrap().preview.as_deref(), Some("first"));
