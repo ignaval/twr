@@ -2405,21 +2405,18 @@ fn card_rows_counted(
         attn,
         git,
     } = body;
-    // No blank row inside a card: a text's paragraph breaks (a report's, an item's) are left
-    // out here (the detail views, which show the whole text, keep them).
-    // An item's are found when its rows are wrapped ([`AttnRows::card_core`]), and only the
-    // rows drawn are copied.
+    // No blank row from the status section or the last report: their paragraph breaks are
+    // left out here (the detail views, which show the whole text, keep them). An item keeps
+    // every row, blank or only spaces: they are its content (spaces inside a quoted argument
+    // wrapped over rows), and a card that draws it whole must draw all of it ([`DrawnItem`]).
+    // Only the rows drawn are copied.
     section.retain(|l| !blank_line(l));
-    let (core, extra): (&[usize], &[usize]) = match &attn {
-        Some(a) => (&a.card_core, &a.card_extra),
+    let (core, extra): (&[Line<'static>], &[Line<'static>]) = match &attn {
+        Some(a) => (&a.core, &a.extra),
         None => (&[], &[]),
     };
-    let copy = |from: fn(&AttnRows) -> &[Line<'static>], at: &[usize]| -> Vec<Line<'static>> {
-        let Some(a) = &attn else {
-            return Vec::new();
-        };
-        at.iter().map(|&i| copied_row(&from(a)[i])).collect()
-    };
+    let copy =
+        |rows: &[Line<'static>]| -> Vec<Line<'static>> { rows.iter().map(copied_row).collect() };
     let first = section.len().min(1).min(height);
     let mut room = height - first;
     let cut_to = |section: &mut Vec<Line<'static>>, n: usize| {
@@ -2437,7 +2434,7 @@ fn card_rows_counted(
     };
     if core.len() > room {
         cut_to(&mut section, first);
-        section.extend(copy(|a| &a.core, &core[..room]));
+        section.extend(copy(&core[..room]));
         return (section, None, first);
     }
     room -= core.len();
@@ -2453,8 +2450,8 @@ fn card_rows_counted(
     let section_n = first + second + rest;
     cut_to(&mut section, section_n);
     let mut rows = section;
-    rows.extend(copy(|a| &a.core, core));
-    rows.extend(copy(|a| &a.extra, &extra[..extra_n]));
+    rows.extend(copy(core));
+    rows.extend(copy(&extra[..extra_n]));
     // The git line last, right under the rest: a card taller than its text (one waiting to
     // shrink, [`crate::order::Fit`]) leaves its spare rows under it, none inside.
     if let Some(git) = git.filter(|_| git_on) {
@@ -3107,12 +3104,6 @@ struct AttnRows {
     /// ([`crate::app::Incomplete`]), which is drawn marked as cut short and never counts as
     /// drawn in full.
     complete: bool,
-    /// The rows of `core` a card, tile or banner shows, by index: all but the blank ones
-    /// ([`blank_line`]; the action popup keeps them). Found once, when the rows are wrapped,
-    /// so a frame copies only the rows it draws ([`card_rows`]): an item may have many.
-    card_core: Vec<usize>,
-    /// The same of `extra`.
-    card_extra: Vec<usize>,
 }
 
 impl AttnRows {
@@ -3123,12 +3114,7 @@ impl AttnRows {
         exact: bool,
         complete: bool,
     ) -> Self {
-        let shown = |rows: &[Line<'static>]| -> Vec<usize> {
-            (0..rows.len()).filter(|&i| !blank_line(&rows[i])).collect()
-        };
         Self {
-            card_core: shown(&core),
-            card_extra: shown(&extra),
             item,
             core,
             extra,
@@ -3137,9 +3123,10 @@ impl AttnRows {
         }
     }
 
-    /// How many rows a card, tile or banner shows of it: its rows but the blank ones.
+    /// How many rows a card, tile or banner shows of it: all of them, blank ones too (they are
+    /// its content).
     fn card_len(&self) -> usize {
-        self.card_core.len() + self.card_extra.len()
+        self.core.len() + self.extra.len()
     }
 }
 
@@ -6845,7 +6832,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     if dive.is_none() {
         if let Some(o) = state.orch_banner() {
             let width = usize::from(inner.width.saturating_sub(2));
-            // As many rows as the banner shows ([`card_rows`]: no blank one).
+            // As many rows as the banner shows ([`card_rows`]).
             let n = attention_rows(state, &o, width, false).map_or(0, |a| a.card_len());
             let n = u16::try_from(n).unwrap_or(u16::MAX);
             // A confirm card too long for the banner takes the whole pane, and scrolls.
@@ -11807,25 +11794,56 @@ mod tests {
             .area
     }
 
-    /// The cards (or tiles) of `ids` drawn with a blank row inside them, as drawn (`lines`),
-    /// each with its text; and how many were drawn.
-    fn blank_rows(st: &AppState, lines: &[String], ids: &[String]) -> (Vec<String>, usize) {
-        let mut blank = Vec::new();
-        let mut drawn = 0;
-        for id in ids {
-            let Some(p) = st.view.panes.get(&card(id)) else {
-                continue;
-            };
-            drawn += 1;
-            let a = p.area;
-            let row = |y: u16| -> String {
+    /// The rows of card (or tile) `id`'s inside as drawn (`lines`).
+    fn card_lines(st: &AppState, lines: &[String], id: &str) -> Vec<String> {
+        let a = card_at(st, id);
+        (a.y..a.bottom())
+            .map(|y| {
                 lines[usize::from(y)]
                     .chars()
                     .skip(usize::from(a.x))
                     .take(usize::from(a.width))
                     .collect()
-            };
-            if (a.y..a.bottom()).any(|y| row(y).trim().is_empty()) {
+            })
+            .collect()
+    }
+
+    /// The cards (or tiles) of `ids` drawn with a blank row inside them, as drawn (`lines`),
+    /// each with its text; and how many were drawn. A blank row of the card's item is its
+    /// content, not a blank row of the card ([`card_rows`]): the rows showing the item's rows
+    /// in order ([`attention_rows`], a card's or a tile's) are not checked.
+    fn blank_rows(st: &AppState, lines: &[String], ids: &[String]) -> (Vec<String>, usize) {
+        let mut blank = Vec::new();
+        let mut drawn = 0;
+        for id in ids {
+            if st.view.panes.get(&card(id)).is_none() {
+                continue;
+            }
+            drawn += 1;
+            let rows = card_lines(st, lines, id);
+            let width = usize::from(card_at(st, id).width);
+            let mut item = vec![false; rows.len()];
+            for tile in [false, true] {
+                let Some(a) = attention_rows(st, id, width, tile) else {
+                    continue;
+                };
+                let want: Vec<String> = a.core.iter().chain(&a.extra).map(line_text).collect();
+                let same = |r: &String, w: &String| r.trim_end() == w.trim_end();
+                let Some(at) = rows.iter().position(|r| same(r, &want[0])) else {
+                    continue;
+                };
+                for (k, w) in want.iter().enumerate() {
+                    match rows.get(at + k) {
+                        Some(r) if same(r, w) => item[at + k] = true,
+                        _ => break,
+                    }
+                }
+            }
+            if rows
+                .iter()
+                .zip(&item)
+                .any(|(r, &of_item)| !of_item && r.trim().is_empty())
+            {
                 blank.push(pane_text(st, lines, &card(id)));
             }
         }
@@ -11901,7 +11919,8 @@ mod tests {
     /// state, an activity line, a parked thread), in the column at every width, the row of
     /// cards above a narrow conversation, the grid, and the compact Threads screen. In the
     /// row, each card is as tall as its own text from the top of the row, and the row as
-    /// tall as its tallest card.
+    /// tall as its tallest card. An item's own blank rows are its content: drawn, between
+    /// its paragraphs.
     #[test]
     fn no_card_has_a_blank_row_inside() {
         for (w, h) in [(100, 60), (120, 60), (160, 60), (80, 60)] {
@@ -11911,6 +11930,13 @@ mod tests {
             let (blank, drawn) = blank_rows(&st, &lines, &order);
             assert!(blank.is_empty(), "{w}x{h}:\n{}", blank.join("\n"));
             assert!(drawn >= 2, "{w}x{h}:\n{}", screen(&lines));
+            if st.view.panes.items.iter().any(|d| d.attn_id == "q1") {
+                let rows = card_lines(&st, &lines, "t-gamma");
+                let at = rows.iter().position(|r| r.contains("Which port?"));
+                let at = at.unwrap_or_else(|| panic!("{w}x{h}: {rows:?}"));
+                assert!(rows[at + 1].trim().is_empty(), "{w}x{h}: {rows:?}");
+                assert!(rows[at + 2].contains("The tests need one."), "{rows:?}");
+            }
             let mut st = five_saying_things();
             let lines = draw_panes(&mut st, w, h);
             let order = st.order();
@@ -11985,7 +12011,8 @@ mod tests {
             };
             let (rows, _) = card_rows(body, 9, 40);
             assert_eq!(rows.len(), 9);
-            assert!(rows.iter().all(|r| !blank_line(r)), "{rows:?}");
+            // The item's blank rows are drawn with it: its content.
+            assert!(rows.iter().any(|r| blank_line(r)), "{rows:?}");
             assert!(copies() - before <= 8, "{}", copies() - before);
         }
         // A frame: gamma (and the orchestrator) ask in 3000 paragraphs.
@@ -12030,6 +12057,85 @@ mod tests {
         st.view.compact_width = 60;
         st.view.compact_pane = crate::app::CompactPane::Threads;
         frame(&mut st, 40, 20, "compact");
+    }
+
+    /// An attention item's rows are all its content, a whitespace-only one too (a run of
+    /// spaces inside a quoted argument, wrapped over rows): a card draws every one of them,
+    /// and the item counts as drawn whole ([`DrawnItem`]) only when every row shows. A card
+    /// too short for them cuts the item: not drawn whole, and `seen_gseq` stays below it, though
+    /// its rows but the whitespace ones would have fit. On the grid, where only the tile
+    /// draws it (the conversation would show the request too).
+    #[test]
+    fn an_items_whitespace_rows_are_drawn_and_count_for_drawn_whole() {
+        use crate::app::tests::control;
+        let asking = |spaces: usize| {
+            let mut st = AppState::new();
+            let mut w = ThreadScript::new("t-w");
+            let mut p = w.raise("p1", AttentionReason::Permission);
+            if let EventBody::AttentionRaised(a) = &mut p.body {
+                a.summary = format!("echo \"a{}b\"", " ".repeat(spaces));
+            }
+            control(&mut st, &[w.created("w"), p]);
+            st.view.screen = Screen::Grid;
+            st
+        };
+        let (w, h) = (120, 40);
+        let mut st = asking(1);
+        draw_panes(&mut st, w, h);
+        let width = usize::from(card_at(&st, "t-w").width);
+        // Two rows' worth of spaces: a row of only spaces inside the command.
+        let mut st = asking(2 * width);
+        let lines = draw_panes(&mut st, w, h);
+        let a = attention_rows(&st, "t-w", width, true).unwrap();
+        let space_row = |l: &Line| blank_line(l) && l.width() > 0;
+        assert!(a.core.iter().any(space_row), "{:?}", a.core);
+        // Drawn: every row of the item, the row of spaces among them, in order.
+        let rows = card_lines(&st, &lines, "t-w");
+        let want: Vec<String> = a.core.iter().chain(&a.extra).map(line_text).collect();
+        let at = rows.iter().position(|r| r.trim_end() == want[0].trim_end());
+        let at = at.unwrap_or_else(|| panic!("{rows:?}"));
+        for (k, row) in want.iter().enumerate() {
+            assert_eq!(rows[at + k].trim_end(), row.trim_end(), "{k}: {rows:?}");
+        }
+        let item = st.attention.get("p1").unwrap().clone();
+        assert!(
+            st.view.panes.items.iter().any(|d| d.attn_id == "p1"),
+            "drawn whole:\n{}",
+            screen(&lines)
+        );
+        assert_eq!(st.seen_gseq(), st.last_gseq);
+        // The seam: a card one row short of the item beside its section's row cuts it.
+        let body = |a: &Arc<AttnRows>| CardBody {
+            section: vec![Line::from("waiting")],
+            one: None,
+            attn: Some(a.clone()),
+            git: None,
+        };
+        let all = u16::try_from(1 + a.core.len()).unwrap();
+        let (rows, drawn) = card_rows(body(&a), all, 40);
+        assert_eq!(drawn, Some(("p1".to_string(), item.revision)));
+        assert!(rows.iter().any(space_row), "{rows:?}");
+        let (rows, drawn) = card_rows(body(&a), all - 1, 40);
+        assert_eq!(drawn, None, "cut: {rows:?}");
+        // A command whose rows of spaces are more than any card has: never drawn whole, and
+        // `seen_gseq` stays below its raise, though its other rows fit.
+        let mut st = asking(40 * width);
+        let lines = draw_panes(&mut st, w, h);
+        let a = attention_rows(&st, "t-w", width, true).unwrap();
+        let shown = a.core.iter().filter(|l| !blank_line(l)).count();
+        assert!(shown + a.extra.len() < 10, "{:?}", a.core);
+        assert!(
+            !st.view.panes.items.iter().any(|d| d.attn_id == "p1"),
+            "cut, not drawn whole:\n{}",
+            screen(&lines)
+        );
+        let item = st.attention.get("p1").unwrap();
+        assert_eq!(
+            st.seen_gseq(),
+            item.first_revision.min(item.revision) - 1,
+            "{}",
+            screen(&lines)
+        );
     }
 
     /// A card grows with its text at once, in the frame that has the text: a report too long
