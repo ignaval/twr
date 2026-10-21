@@ -380,7 +380,7 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
     let mut rows: Vec<String> = Vec::new();
     let mut row = String::new();
     let mut cut = false;
-    while let Some(word) = words.next() {
+    for word in words.by_ref() {
         let w = crate::edit::width(&word);
         if row.is_empty() {
             row = crate::ui::truncate_cells(&word, width);

@@ -3049,9 +3049,10 @@ async fn drive(
                 }
                 // What the settings writer kept, or why not, and what it read.
                 Some(saved) = ctx.saved_rx.recv() => match saved {
-                    Saved::WsSidebar(_, Err(e)) => {
+                    Saved::WsSidebar(on, Err(e)) => {
+                        let how = if on { "shown" } else { "hidden" };
                         state.view.status = Some(format!(
-                            "workspace sidebar: not remembered for the next runs: {e}"
+                            "workspace sidebar {how}, but not remembered for the next runs: {e}"
                         ));
                     }
                     Saved::WsSidebar(_, Ok(())) => {}
