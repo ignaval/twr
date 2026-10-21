@@ -118,6 +118,30 @@ use crate::adapter::CodexAuto;
 use crate::notify::NotifyEvent;
 use crate::paths::Paths;
 
+/// How long a read of the config file waits for a writer's lock ([`read_locked`]).
+pub const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The text of the file at `path`, read under a shared lock (`flock`): the TUI's settings
+/// write the config file in place under an exclusive one, so a reader never sees it half
+/// written. A writer holding it longer than `wait`, or a file system without locks, does not
+/// stop the read: it reads as it is then.
+pub fn read_locked(path: &Path, wait: std::time::Duration) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock_shared() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            _ => break,
+        }
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1462,7 +1486,8 @@ impl Config {
 
     /// Loads `path` (missing file = defaults).
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        match std::fs::read_to_string(path) {
+        // Under a shared lock: never a file the TUI's settings are writing ([`read_locked`]).
+        match read_locked(path, CONFIG_LOCK_WAIT) {
             Ok(s) => Self::from_toml_str(&s).with_context(|| format!("in {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),

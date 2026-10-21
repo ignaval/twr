@@ -7571,16 +7571,17 @@ impl AppState {
                 at.saturating_add(step).min(max)
             };
         };
+        // The docked workspace list stays beside the overlays: it scrolls under the pointer.
+        if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) {
+            self.ws_wheel(up);
+            return;
+        }
         if self.view.help {
             wheel(&mut self.view.help_scroll, self.view.panes.help_max);
             return;
         }
         if self.view.trash.is_some() {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
-            return;
-        }
-        if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) {
-            self.ws_wheel(up);
             return;
         }
         let arrow = KeyEvent::new(

@@ -398,11 +398,23 @@ fn write_key_with(
     rewrite(&file, table, key, value, before_write)
 }
 
-/// The bytes of `file`, read without following a link or waiting on a FIFO put in its place.
+/// The bytes of `file`, read without following a link or waiting on a FIFO put in its place,
+/// under a shared lock (another TUI's [`rewrite`] is never seen half done; one holding it past
+/// [`READ_WAIT`] does not hold up the view, which reads as it is then).
 fn read_plain(file: &Path) -> Result<Vec<u8>, String> {
     let mut f = open_plain(file, false)?;
+    let until = std::time::Instant::now() + READ_WAIT;
+    while let Err(std::fs::TryLockError::WouldBlock) = f.try_lock_shared() {
+        if std::time::Instant::now() >= until {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     read_all(&mut f)
 }
+
+/// How long [`read_key`] waits for a writer: it runs where the TUI draws.
+const READ_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// `file` opened (for writing too, with `write`), never through a link nor waiting on a FIFO
 /// put in its place; only a regular file.
@@ -457,9 +469,24 @@ fn rewrite(
     if new == text {
         return Ok(());
     }
-    let backup = Temp::write(dir_of(file), file.file_name().unwrap_or_default(), &text)?;
+    let dir = dir_of(file);
+    let backup = Temp::write(dir, file.file_name().unwrap_or_default(), &text)?;
+    // The copy's name on disk too, before the file is touched: a crash must not take both.
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .map_err(|e| format!("writing a copy of config.toml beside it: {e}"))?;
     before_write(file);
-    if read_all(&mut f)? != old {
+    // Still the file that was read: an editor that saves by renaming a new file over it left
+    // the descriptor on the old one, which nobody reads any more.
+    let same = |a: &std::fs::Metadata, b: &std::fs::Metadata| {
+        use std::os::unix::fs::MetadataExt;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    };
+    let replaced = match (std::fs::symlink_metadata(file), f.metadata()) {
+        (Ok(now), Ok(ours)) => !same(&now, &ours),
+        _ => true,
+    };
+    if replaced || read_all(&mut f)? != old {
         return Err("config.toml changed meanwhile: try again".into());
     }
     let len = u64::try_from(new.len()).unwrap_or(u64::MAX);
@@ -935,6 +962,38 @@ terminal = \"bell\"
             vec!["config.toml", "hard"],
             "no copy left"
         );
+    }
+
+    /// A file an editor replaced (a new file renamed over it) meanwhile is not written: the
+    /// descriptor would be the old file's, which nobody reads any more.
+    #[test]
+    fn a_file_renamed_over_meanwhile_is_left_alone() {
+        let (dir, file) = dir_with(SAMPLE);
+        let theirs = format!("{SAMPLE}# saved by an editor\n");
+        let err = write_key_with(&file, &["tui"], "mouse", &Scalar::Bool(false), |f| {
+            let tmp = dir.path().join("editor.tmp");
+            std::fs::write(&tmp, &theirs).unwrap();
+            std::fs::rename(&tmp, f).unwrap();
+        })
+        .unwrap_err();
+        assert_eq!(err, "config.toml changed meanwhile: try again");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), theirs);
+    }
+
+    /// A read waits for an edit in progress: it never sees the file half written.
+    #[test]
+    fn a_read_waits_for_the_edit_in_progress() {
+        let (_dir, file) = dir_with("[tui]\ncompact_width = 120\n");
+        let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        writer.lock().unwrap();
+        let reader = {
+            let file = file.clone();
+            std::thread::spawn(move || read_key(&file, &["tui"], "compact_width"))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&file, "[tui]\ncompact_width = 0\n").unwrap();
+        writer.unlock().unwrap();
+        assert_eq!(reader.join().unwrap(), Some(toml::Value::Integer(0)));
     }
 
     /// Two TUIs editing at once both land: the lock makes the second read the first's result.

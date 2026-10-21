@@ -417,6 +417,9 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
     rows
 }
 
+/// What the new-workspace dialog's name follows.
+const NAME_LABEL: &str = " name: ";
+
 /// The new-workspace dialog, centered over `area`: the name typed so far, with the cursor
 /// after it, and what is wrong with it (`twr ws new`'s rule, a workspace that exists) or how
 /// to go on. Its top border closes it.
@@ -427,12 +430,13 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     let width = area.width.min(56);
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
     let dim = Style::default().fg(Color::DarkGray);
+    // Its end in view, the cursor after it, where the box is narrower than the name.
+    let room = inner_w.saturating_sub(NAME_LABEL.len() + 1);
+    let skip = name.chars().count().saturating_sub(room);
+    let shown: String = name.chars().skip(skip).collect();
     let mut lines = vec![Line::from(vec![
-        Span::raw(" name: "),
-        Span::styled(
-            name.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
+        Span::raw(NAME_LABEL),
+        Span::styled(shown.clone(), Style::default().add_modifier(Modifier::BOLD)),
     ])];
     let (note, style) = match state.new_ws_error(name) {
         Some(why) if !name.is_empty() => (why, Style::default().fg(Color::Red)),
@@ -466,7 +470,8 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
     // The cursor after the name, on its row.
-    let x = inner.x + 7 + u16::try_from(crate::edit::width(name)).unwrap_or(u16::MAX);
+    let label = u16::try_from(NAME_LABEL.len()).unwrap_or(u16::MAX);
+    let x = inner.x + label + u16::try_from(crate::edit::width(&shown)).unwrap_or(u16::MAX);
     if inner.height > 0 && x < inner.x + inner.width {
         frame.set_cursor_position((x, inner.y));
     }
@@ -1287,6 +1292,59 @@ mod tests {
         );
         let a = st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen);
         assert!(workspace_action(&a).is_none());
+    }
+
+    /// With the help or the trash open, the wheel over the docked workspace list scrolls the
+    /// list, not the overlay.
+    #[test]
+    fn the_wheel_scrolls_the_dock_beside_the_help() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        for i in 0..8 {
+            tabs.push(Tab::new(format!("more-{i}")));
+        }
+        st.set_tabs(tabs);
+        st.view.help = true;
+        rows(&mut st, 160, 30);
+        let screen = crate::app::tests::draw(&mut st, 160, 30);
+        st.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            },
+            &screen,
+        );
+        assert_eq!((st.view.ws_scroll, st.view.help_scroll), (1, 0));
+        assert!(st.view.help);
+    }
+
+    /// On a phone the new workspace's name keeps its end and the cursor in view, however
+    /// long it gets.
+    #[test]
+    fn a_long_name_keeps_its_end_in_view() {
+        use crossterm::event::KeyCode;
+        let mut st = in_workspaces("default");
+        st.open_new_ws(None);
+        let name = "abcdefghijklmnopqrstuvwxyz012345";
+        assert_eq!(name.len(), twr_core::paths::MAX_WORKSPACE_NAME);
+        for c in name.chars() {
+            st.handle_key(crate::app::tests::key(KeyCode::Char(c)));
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        (st.view.width, st.view.height) = (40, 20);
+        term.draw(|f| {
+            crate::ui::render(f, &st);
+        })
+        .unwrap();
+        let r = rows(&mut st, 40, 20).join("\n");
+        assert!(r.contains("012345"), "{r}");
+        let cursor = term.get_cursor_position().unwrap();
+        assert!(cursor.x < 39, "{cursor:?}");
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some((name.into(), true)));
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
