@@ -2298,6 +2298,10 @@ pub struct AppState {
     /// The control stream ended ([`AppState::control_ended`]): what the view holds of its hub
     /// is no longer news (its workspace's card goes by the polls then).
     pub control_lost: bool,
+    /// The current orchestrator's newest reply the view saw (its thread, the seq, its start),
+    /// kept apart from its transcript, which the cache of conversations may drop: what the
+    /// workspace's card shows of it ([`AppState::tab_glance`]).
+    pub orch_reply: Option<(String, u64, String)>,
     /// The workspace being opened, until it is shown or fails.
     pub switching: Option<String>,
     /// What of a view kept for this workspace waits until the replay is applied
@@ -2443,6 +2447,21 @@ impl AppState {
                 self.track_sent(&item.event);
                 if let Some(t) = &mut self.transcript {
                     t.apply(&item.event);
+                    // The orchestrator's newest reply outlives its transcript, which the
+                    // cache of conversations may drop.
+                    if let Some((seq, text)) = &t.last_reply {
+                        let orch = self
+                            .registry
+                            .get(&t.thread)
+                            .is_some_and(|v| v.is_current_orchestrator());
+                        let newer = self
+                            .orch_reply
+                            .as_ref()
+                            .is_none_or(|(id, s, _)| id != &t.thread || s < seq);
+                        if orch && newer {
+                            self.orch_reply = Some((t.thread.clone(), *seq, text.clone()));
+                        }
+                    }
                 }
             }
         }

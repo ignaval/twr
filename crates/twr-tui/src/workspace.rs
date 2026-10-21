@@ -1089,14 +1089,21 @@ impl AppState {
     /// The latest finished reply, with its seq, in thread `id`'s conversation as the view
     /// holds it.
     fn latest_reply(&self, id: &str) -> Option<(u64, String)> {
-        // The one the main pane shows, or one kept from before (a dive moved it aside): a kept
+        // The one the main pane shows, or one kept from before (a dive moved it aside), or the
+        // newest the view saw even once its transcript went ([`AppState::orch_reply`]): a kept
         // one gets no more events, but its reply is compared by seq with the hub's, so it never
         // hides a newer one.
+        let kept = self
+            .orch_reply
+            .as_ref()
+            .filter(|(thread, ..)| thread == id)
+            .map(|(_, seq, text)| (*seq, text.clone()));
         self.transcript
             .iter()
             .chain(self.transcripts.iter())
             .filter(|t| t.thread == id && !t.catching_up())
             .filter_map(|t| t.last_reply.clone())
+            .chain(kept)
             .max_by_key(|(seq, _)| *seq)
     }
 

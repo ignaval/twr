@@ -1558,6 +1558,45 @@ mod tests {
         assert_eq!(preview(&st), "reply B");
     }
 
+    /// The orchestrator's newest reply stays on the card after its transcript left the cache
+    /// of conversations (many dives since), and once its hub stopped.
+    #[test]
+    fn a_live_reply_outlives_its_transcript() {
+        use twr_core::proto::{StreamItem, StreamKind};
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        st.transcript = Some({
+            let mut t = crate::app::Transcript::new(orch.clone());
+            t.settle();
+            t
+        });
+        let mut o = twr_core::testkit::ThreadScript::new(orch.clone());
+        o.at(1000);
+        for ev in [o.turn_started("hi"), o.text("reply B")] {
+            st.apply_event(&StreamItem {
+                stream: StreamKind::Thread,
+                gseq: None,
+                event: ev,
+            });
+        }
+        let b = st.orch_reply.as_ref().unwrap().1;
+        st.transcript = None;
+        st.transcripts.clear();
+        st.tabs[0].glance = Some(Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                id: Some(orch),
+                preview_seq: Some(b - 1),
+                status: ThreadStatus::Idle,
+                preview: Some("reply A".into()),
+            }),
+        });
+        st.control_ended();
+        st.tabs[0].hub = TabHub::Stopped;
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("reply B"));
+    }
+
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
     #[test]
     fn ctrl_t_leaves_the_compact_decisions_for_the_workspaces() {
