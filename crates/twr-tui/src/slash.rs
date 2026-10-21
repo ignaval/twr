@@ -109,6 +109,9 @@ pub enum Slash {
     Mouse(Option<bool>),
     /// `/suggest [on|off]`: next-message suggestions for this TUI ([`crate::suggest`]).
     Suggest(Option<bool>),
+    /// `/summaries [on|off]`: summaries of the threads' routine updates for this TUI
+    /// ([`crate::summary`]).
+    Summaries(Option<bool>),
     /// `/ws [name]` (alias `/workspace`): list the workspaces, or switch to one (a new name
     /// asks to create it).
     Ws(Option<String>),
@@ -337,6 +340,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/suggest",
         "/suggest [on|off]",
         "suggest your next message after a turn (a small model; Tab takes it)",
+        &[ArgKind::OnOff],
+    ),
+    (
+        "/summaries",
+        "/summaries [on|off]",
+        "a line on where a thread stands in its folded routine updates (a small model)",
         &[ArgKind::OnOff],
     ),
     (
@@ -598,7 +607,8 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
             _ => one(args).map(Slash::Ws),
         },
-        "/parked" | "/sidebar" | "/spaces" | "/focus" | "/mouse" | "/compact" | "/suggest" => {
+        "/parked" | "/sidebar" | "/spaces" | "/focus" | "/mouse" | "/compact" | "/suggest"
+        | "/summaries" => {
             let on = match one(args)?.as_deref() {
                 None => None,
                 Some("on") => Some(true),
@@ -612,6 +622,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                 "/focus" => Slash::Focus(on),
                 "/compact" => Slash::Compact(on),
                 "/suggest" => Slash::Suggest(on),
+                "/summaries" => Slash::Summaries(on),
                 _ => Slash::Mouse(on),
             })
         }
@@ -965,6 +976,10 @@ mod tests {
 
     #[test]
     fn commands_parse() {
+        assert_eq!(parse("/summaries"), Ok(Slash::Summaries(None)));
+        assert_eq!(parse("/summaries off"), Ok(Slash::Summaries(Some(false))));
+        assert_eq!(parse("/summaries on"), Ok(Slash::Summaries(Some(true))));
+        assert!(parse("/summaries soon").is_err());
         assert_eq!(
             parse("/orch codex o5"),
             Ok(Slash::Orch {

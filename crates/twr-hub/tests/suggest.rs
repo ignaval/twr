@@ -19,7 +19,8 @@ use twr_hub::{Caller, Hub, HubOptions, NewThread, ShellRun};
 const WAIT: Duration = Duration::from_secs(10);
 
 /// The stand-in CLI in `dir`: each run appends a line to `runs`, writes `argv` (one per
-/// line), `stdin`, `cwd` and `env`, then prints `answer.json`.
+/// line), `stdin`, `cwd` and `env`, then prints `answer.json`; with a `slow` file there, it
+/// writes its pid to `pid` and waits first, until the file goes (30 s at most).
 fn fake_claude(dir: &Path) -> PathBuf {
     let bin = dir.join("claude");
     std::fs::write(
@@ -35,6 +36,11 @@ env > "$here/env"
 if [ -f "$here/leave" ]; then
   sleep 300 > /dev/null 2>&1 < /dev/null &
   echo $! > "$here/left"
+fi
+if [ -f "$here/slow" ]; then
+  echo $$ > "$here/pid"
+  n=0
+  while [ -f "$here/slow" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n + 1)); done
 fi
 cat "$here/answer.json"
 "#,
@@ -1177,6 +1183,60 @@ async fn an_ask_whose_client_hangs_up_asks_no_model() {
     release.notify_one();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     assert_eq!(runs(&cli), 0, "a model was asked after the client hung up");
+    serving.abort();
+    hub.shutdown().await;
+}
+
+/// An ask that waits on another's call whose client hangs up (or turned suggestions off) is
+/// not left with nothing: it takes the call over, and gets the suggestion.
+#[tokio::test]
+async fn an_ask_waiting_on_a_call_whose_client_hangs_up_takes_it_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("cli");
+    std::fs::create_dir_all(&cli).unwrap();
+    let bin = fake_claude(&cli);
+    answer(&cli, "deploy it", false);
+    let hub = hub(dir.path(), bin).await;
+    let socket = dir.path().join("serve.sock");
+    let listener = twr_hub::server::bind(&socket).await.unwrap();
+    let serving = tokio::spawn(twr_hub::server::serve(
+        hub.clone(),
+        listener,
+        socket.clone(),
+        false,
+    ));
+    turn_ended(&hub, dir.path(), "build it").await;
+    let models = m("claude-haiku-5-5");
+    std::fs::write(cli.join("slow"), "").unwrap();
+    let (s, wire) = (socket.clone(), serde_json::to_value(&models).unwrap());
+    let owner = tokio::spawn(async move {
+        let mut c = twr_core::client::Client::connect(&s).await.unwrap();
+        c.hello(serde_json::json!({"client": "tui"})).await.unwrap();
+        c.call(
+            "suggest.next",
+            serde_json::json!({"thread": "api", "turn": 1, "models": wire}),
+        )
+        .await
+    });
+    timeout(WAIT, async {
+        while !cli.join("pid").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let (h, ms) = (hub.clone(), models.clone());
+    let waiter =
+        tokio::spawn(async move { h.suggest_next("api", 1, &ms, &Caller::user("tui2")).await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    owner.abort();
+    let _ = owner.await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::remove_file(cli.join("slow")).unwrap();
+    let r = timeout(WAIT, waiter).await.unwrap().unwrap().unwrap();
+    assert_eq!(r["suggestion"], "deploy it", "{r}");
+    assert!(r.get("reason").is_none(), "{r}");
+    assert_eq!(runs(&cli), 2, "the call taken over runs again");
     serving.abort();
     hub.shutdown().await;
 }

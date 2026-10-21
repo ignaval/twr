@@ -334,6 +334,15 @@ impl Client {
         serde_json::from_value(v).with_context(|| format!("decoding {method} result"))
     }
 
+    /// `summary.thread`: a one-line summary of where a worker thread stands (users only).
+    pub async fn summary_thread(
+        &mut self,
+        params: &crate::proto::SummaryThreadParams,
+    ) -> anyhow::Result<crate::proto::SummaryThreadResult> {
+        self.call_as("summary.thread", serde_json::to_value(params)?)
+            .await
+    }
+
     /// Fetches a whole blob with chunked `blob.get` calls (each at most [`BLOB_CHUNK_MAX`]
     /// bytes). `Ok(None)` when the hub has no such blob.
     pub async fn blob_get(&mut self, blob_ref: &str) -> anyhow::Result<Option<Vec<u8>>> {

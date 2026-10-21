@@ -28,6 +28,7 @@
 //! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
 //! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
 //! | `suggest.next`      | `{thread, turn, model}` (users only)                | `{thread, turn, model, suggestion, reason?, cached, stats}`: a likely next message of the user's after turn `turn` ended, from `claude -p` with the user's login (`hub::suggest`) |
+//! | `summary.thread`    | `{thread, models?, every_secs}` (users only)        | `{thread, summary, basis, runtime, model, cached, reason?, next_after_secs?, stats}`: one line on where a worker thread stands, from its state, activity and routine updates, by the small model a suggestion uses (`hub::summary`, `twr_core::proto::SummaryThreadResult`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -674,6 +675,7 @@ pub const METHODS: &[&str] = &[
     "shell.run",
     "shell.cd",
     "suggest.next",
+    "summary.thread",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -1056,11 +1058,11 @@ async fn connection(
                     break;
                 }
             }
-            // A suggestion asked for is the client's only while it waits for it: its client
-            // gone (the user turned suggestions off), the ask goes too, before any model is
-            // asked, or with the CLI it started (`hub::suggest`).
+            // A suggestion or summary asked for is the client's only while it waits for it:
+            // its client gone (the user turned them off, or quit), the ask goes too, before
+            // any model is asked, or with the CLI it started (`hub::suggest`, `hub::summary`).
             // (Dispatched by `call_async`: its own arm there is the method's.)
-            method @ "suggest.next" => {
+            method @ ("suggest.next" | "summary.thread") => {
                 let result = tokio::select! {
                     r = call_async(&hub, &caller, method, req.params) => r,
                     () = hung_up(&mut reader) => break,
@@ -1918,6 +1920,10 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "suggest.next" => {
             let (thread, turn, ask) = suggest_params(p)?;
             hub.suggest_ask(&thread, turn, &ask, caller).await
+        }
+        "summary.thread" => {
+            let p: twr_core::proto::SummaryThreadParams = params(p)?;
+            hub.summary_thread(&p, caller).await
         }
         "usage.threads" => {
             #[derive(Default, Deserialize)]

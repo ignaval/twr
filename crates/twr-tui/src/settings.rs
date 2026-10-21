@@ -2,17 +2,17 @@
 //! change most, as they are in effect, each with where it is kept.
 //!
 //! The TUI's own settings change at once and are written back where they are kept:
-//! suggestions, the card order, terminal notifications and the compact width to the config
-//! file's `[tui]` table (`[tui.notify]` for notifications), by [`crate::config_edit`], which
+//! suggestions, summaries, the card order, the colors, terminal notifications and the compact
+//! width to the config file's `[tui]` table (`[tui.notify]` for notifications), by [`crate::config_edit`], which
 //! changes that one key and nothing else of the file (its comments, its layout, its other
 //! tables and their secrets stay byte for byte as they were) or, when it can't be sure of
 //! that, leaves the file alone and says so: the change then holds for this session only. The
 //! workspace sidebar is the TUI's own state, kept with what it remembers across runs
 //! (`tui-state.json`, [`crate::firstrun`]), as Ctrl-T keeps it.
 //!
-//! The suggestion models (a table or a string in the file), `[codex] auto` and
-//! `wake_after_secs` are shown, not changed: the models are free text with a size check of
-//! their own, and the last two are the hub's, read when it starts (as `config.show` reports
+//! The suggestion models (a table or a string in the file), `[tui] summary_every`,
+//! `[codex] auto` and `wake_after_secs` are shown, not changed: the models are free text with
+//! a size check of their own, the summaries' pace a span the file spells, and the last two are the hub's, read when it starts (as `config.show` reports
 //! them): a change needs the file edited and the hub restarted, and `[codex] auto` decides what
 //! Codex threads run without asking, which no stray tap should change. A TUI an agent runs
 //! changes nothing.
@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use serde_json::Value;
-use twr_core::config::{CardOrder, TerminalAlert};
+use twr_core::config::{CardOrder, ColorMode, TerminalAlert};
 
 use crate::app::AppState;
 use crate::select::{PaneId, Panes, Target};
@@ -35,6 +35,10 @@ pub enum Key {
     Suggest,
     /// `[tui] suggest_model` (shown only).
     SuggestModel,
+    /// `[tui] summaries`.
+    Summaries,
+    /// `[tui] summary_every` (shown only).
+    SummaryEvery,
     /// `[tui] card_order`.
     CardOrder,
     /// `[tui.notify] terminal`.
@@ -43,6 +47,8 @@ pub enum Key {
     CompactWidth,
     /// The workspace sidebar (`tui-state.json`).
     WsSidebar,
+    /// `[tui] colors`.
+    Colors,
     /// `[codex] auto`, the hub's (shown only).
     CodexAuto,
     /// `wake_after_secs`, the hub's (shown only).
@@ -50,19 +56,30 @@ pub enum Key {
 }
 
 /// The rows, in order.
-pub const KEYS: [Key; 8] = [
+pub const KEYS: [Key; 11] = [
     Key::Suggest,
     Key::SuggestModel,
+    Key::Summaries,
+    Key::SummaryEvery,
     Key::CardOrder,
     Key::Notify,
     Key::CompactWidth,
     Key::WsSidebar,
+    Key::Colors,
     Key::CodexAuto,
     Key::WakeAfter,
 ];
 
 /// The compact widths a change steps through (0: never compact).
 pub const COMPACT_WIDTHS: [u16; 7] = [0, 40, 50, 60, 80, 100, 120];
+
+/// The color modes a change steps through.
+const COLOR_MODES: [ColorMode; 4] = [
+    ColorMode::Auto,
+    ColorMode::Full,
+    ColorMode::Basic,
+    ColorMode::None,
+];
 
 /// The terminal alerts a change steps through.
 const ALERTS: [TerminalAlert; 4] = [
@@ -78,6 +95,10 @@ const ALERTS: [TerminalAlert; 4] = [
 pub enum Change {
     /// Suggestions on or off.
     Suggest(bool),
+    /// Summaries on or off.
+    Summaries(bool),
+    /// The colors the TUI draws with.
+    Colors(ColorMode),
     /// The card order.
     CardOrder(CardOrder),
     /// How the terminal is alerted.
@@ -103,6 +124,8 @@ impl Change {
         const NOTIFY: &[&str] = &["tui", "notify"];
         Some(match self {
             Change::Suggest(on) => (TUI, "suggest", Scalar::Bool(*on)),
+            Change::Summaries(on) => (TUI, "summaries", Scalar::Bool(*on)),
+            Change::Colors(m) => (TUI, "colors", Scalar::Str(color_mode_str(*m).into())),
             Change::CardOrder(o) => (TUI, "card_order", Scalar::Str(card_order_str(*o).into())),
             Change::Notify(a) => (NOTIFY, "terminal", Scalar::Str(alert_str(*a).into())),
             Change::CompactWidth(w) => (TUI, "compact_width", Scalar::Int(i64::from(*w))),
@@ -159,6 +182,30 @@ fn card_order_str(o: CardOrder) -> &'static str {
     }
 }
 
+/// `[tui] colors` as the file writes it.
+fn color_mode_str(m: ColorMode) -> &'static str {
+    match m {
+        ColorMode::Auto => "auto",
+        ColorMode::Full => "256",
+        ColorMode::Basic => "16",
+        ColorMode::None => "none",
+    }
+}
+
+/// The colors drawn with, as shown: the mode, and for `auto` what the environment made of it.
+fn colors_text(m: ColorMode, depth: crate::color::Depth) -> String {
+    use crate::color::Depth;
+    let depth = match depth {
+        Depth::Full => "256 colors",
+        Depth::Basic => "16 colors",
+        Depth::None => "no color",
+    };
+    match m {
+        ColorMode::Auto => format!("auto ({depth})"),
+        _ => depth.into(),
+    }
+}
+
 /// `[tui.notify] terminal` as the file writes it.
 fn alert_str(a: TerminalAlert) -> &'static str {
     match a {
@@ -191,6 +238,8 @@ pub fn read_file(path: &std::path::Path) -> Vec<(Key, Option<String>)> {
     };
     vec![
         (Key::Suggest, read(&["tui"], "suggest")),
+        (Key::Summaries, read(&["tui"], "summaries")),
+        (Key::Colors, read(&["tui"], "colors")),
         (Key::CardOrder, read(&["tui"], "card_order")),
         (Key::Notify, read(&["tui", "notify"], "terminal")),
         (Key::CompactWidth, read(&["tui"], "compact_width")),
@@ -238,6 +287,36 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
                 kept: "[tui] suggest_model · edit the file to change it".into(),
                 editable: false,
             },
+            Key::Summaries => {
+                let now = if state.summary.on { "true" } else { "false" };
+                Row {
+                    key,
+                    label: "Summaries",
+                    value: if state.summary.on { "on" } else { "off" }.into(),
+                    kept: format!("[tui] summaries{}", differs(key, now)),
+                    editable: !agent,
+                }
+            }
+            Key::SummaryEvery => Row {
+                key,
+                label: "Summary pace",
+                value: format!(
+                    "at most once per {} a thread",
+                    crate::summary::every_words(state.summary.every())
+                ),
+                kept: "[tui] summary_every · edit the file to change it".into(),
+                editable: false,
+            },
+            Key::Colors => {
+                let now = color_mode_str(v.color_mode);
+                Row {
+                    key,
+                    label: "Colors",
+                    value: colors_text(v.color_mode, v.colors),
+                    kept: format!("[tui] colors{}", differs(key, now)),
+                    editable: !agent,
+                }
+            }
             Key::CardOrder => {
                 let now = card_order_str(v.card_order);
                 Row {
@@ -323,6 +402,14 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
     };
     Some(match key {
         Key::Suggest => Change::Suggest(!v.suggest),
+        Key::Summaries => Change::Summaries(!state.summary.on),
+        Key::Colors => {
+            let at = COLOR_MODES
+                .iter()
+                .position(|m| *m == v.color_mode)
+                .unwrap_or(0);
+            Change::Colors(COLOR_MODES[cycle(COLOR_MODES.len(), at)])
+        }
         Key::CardOrder => Change::CardOrder(match v.card_order {
             CardOrder::Stable => CardOrder::Attention,
             CardOrder::Attention => CardOrder::Stable,
@@ -349,7 +436,7 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             Change::CompactWidth(next)
         }
         Key::WsSidebar => Change::WsSidebar(v.ws_sidebar_hidden),
-        Key::SuggestModel | Key::CodexAuto | Key::WakeAfter => return None,
+        Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter => return None,
     })
 }
 
@@ -466,5 +553,33 @@ pub fn shown_path(path: &std::path::Path) -> String {
     match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
         Some(rest) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The summaries and the colors are written as the config file spells them: read back,
+    /// the file says what was set.
+    #[test]
+    fn summaries_and_colors_are_written_as_the_file_spells_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# mine\n[tui]\nsuggest = true\n").unwrap();
+        let load = || twr_core::config::Config::load(&path).unwrap().tui;
+        let write = |c: Change| {
+            let (table, key, value) = c.config_key().unwrap();
+            crate::config_edit::write_key(&path, table, key, &value).unwrap();
+        };
+        write(Change::Summaries(false));
+        assert!(!load().summaries);
+        for m in COLOR_MODES {
+            write(Change::Colors(m));
+            assert_eq!(load().colors, m);
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\n[tui]\n"), "{text}");
+        assert!(text.contains("\nsuggest = true\n"), "{text}");
     }
 }

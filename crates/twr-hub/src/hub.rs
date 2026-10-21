@@ -154,6 +154,8 @@ mod stall;
 mod subscribe;
 mod suggest;
 pub use suggest::SuggestAsk;
+mod summary;
+pub use summary::HOURLY_MAX as SUMMARY_HOURLY_MAX;
 mod supervisor;
 mod switch;
 mod threads;
@@ -747,6 +749,8 @@ struct Inner {
     suggest_codex_home: Option<PathBuf>,
     /// Next-message suggestions asked and answered (`hub::suggest`).
     suggestions: Mutex<suggest::Suggestions>,
+    /// Thread summaries asked and answered (`hub::summary`).
+    summaries: Mutex<summary::Summaries>,
     /// [`HubOptions::claude_policy`].
     claude_policy: twr_adapters::claude_code::guard::PolicySources,
     /// Wakes the notifier task ([`orch::notifier`]).
@@ -1320,6 +1324,8 @@ struct Core {
     wake: wake::WakeState,
     /// Hung-turn cards (`hub::stall`).
     hung: stall::HungState,
+    /// The stalls each thread went on from (`hub::stall`): what a summary's basis reads past.
+    went_on: stall::WentOn,
     /// What each thread is doing now (`hub::activity`).
     activity: HashMap<String, activity::Activity>,
     /// Thread names being created (their worktree is being made, `hub::git`) or restored

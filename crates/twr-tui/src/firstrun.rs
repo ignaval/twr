@@ -7,6 +7,11 @@
 //! - **Suggestions can't run here** (the hub has no Claude Code CLI, or one not signed in):
 //!   they stop for the session without a word, but for one notice, ever
 //!   ([`suggest_unavailable_notice`]).
+//! - **Summaries are on** ([`summary_notice`]): the first time a summary of a thread's routine
+//!   updates is due, the status bar says what it sends, to whom and how to turn them off, and
+//!   none is asked for before a frame showed that ([`crate::summary`]).
+//! - **Summaries can't run here**: as for suggestions, one notice ever
+//!   ([`summary_unavailable_notice`]).
 //! - **Shift-Enter** ([`terminal_offer`]): when the terminal can't tell Shift-Enter from Enter
 //!   (no kitty keyboard protocol, and no tmux asked to pass it on), the TUI offers to set the
 //!   terminal up as `twr terminal-setup` does: a yes/no question in the status bar
@@ -19,6 +24,12 @@
 //! It also keeps what the user set in the TUI that is no setting of the config file: whether
 //! the workspace sidebar shows (Ctrl-T, [`crate::sidebar`]), written only when it is changed
 //! ([`set_workspaces_sidebar`]), so another TUI's older idea of it never overwrites it.
+//!
+//! The two notices that must be drawn whole before what they tell of happens have a short
+//! form ([`suggest_notice_short`], [`summary_notice_short`]) that the status bar draws when it
+//! has no room for the whole one (a compact terminal); either drawn whole tells it. While the
+//! status bar shows one, told or not, its notes give way to it, and the bar grows for its
+//! short form past its third of the screen, up to two thirds (`crate::ui::status_height`).
 //!
 //! A notice counts as told once a frame has shown it ([`crate::app::AppState::note_drawn`]);
 //! the file only ever gains what was told (several TUIs merge into it, [`save`]). Without a
@@ -39,6 +50,10 @@ pub struct Seen {
     pub suggest_notice: bool,
     /// The notice that suggestions can't run here was shown.
     pub suggest_unavailable: bool,
+    /// The summaries notice ([`summary_notice`]) was shown.
+    pub summary_notice: bool,
+    /// The notice that summaries can't run here was shown.
+    pub summary_unavailable: bool,
     /// The Shift-Enter offer's answer (`yes`, `no`) or `shown` for its notice, by place
     /// ([`place_key`]).
     pub terminal: BTreeMap<String, String>,
@@ -56,6 +71,10 @@ pub enum Once {
     SuggestNotice,
     /// [`suggest_unavailable_notice`].
     SuggestUnavailable,
+    /// [`summary_notice`].
+    SummaryNotice,
+    /// [`summary_unavailable_notice`].
+    SummaryUnavailable,
     /// A Shift-Enter notice ([`TerminalOffer::Notice`]) for this place.
     Terminal(String),
 }
@@ -71,6 +90,8 @@ impl Seen {
         Seen {
             suggest_notice: v["suggest_notice"] == true,
             suggest_unavailable: v["suggest_unavailable"] == true,
+            summary_notice: v["summary_notice"] == true,
+            summary_unavailable: v["summary_unavailable"] == true,
             terminal: map("terminal")
                 .into_iter()
                 .filter_map(|(k, v)| Some((k, v.as_str()?.to_string())))
@@ -88,6 +109,8 @@ impl Seen {
         json!({
             "suggest_notice": self.suggest_notice,
             "suggest_unavailable": self.suggest_unavailable,
+            "summary_notice": self.summary_notice,
+            "summary_unavailable": self.summary_unavailable,
             "terminal": self.terminal,
             "terminal_offers": self.terminal_offers,
             "prefs": { "workspaces_sidebar": self.workspaces_sidebar },
@@ -101,6 +124,8 @@ impl Seen {
         self.workspaces_sidebar = self.workspaces_sidebar.or(other.workspaces_sidebar);
         self.suggest_notice |= other.suggest_notice;
         self.suggest_unavailable |= other.suggest_unavailable;
+        self.summary_notice |= other.summary_notice;
+        self.summary_unavailable |= other.summary_unavailable;
         for (k, v) in &other.terminal {
             self.terminal.entry(k.clone()).or_insert_with(|| v.clone());
         }
@@ -115,6 +140,8 @@ impl Seen {
         match what {
             Once::SuggestNotice => self.suggest_notice = true,
             Once::SuggestUnavailable => self.suggest_unavailable = true,
+            Once::SummaryNotice => self.summary_notice = true,
+            Once::SummaryUnavailable => self.summary_unavailable = true,
             Once::Terminal(key) => {
                 self.terminal
                     .entry(key.clone())
@@ -210,12 +237,66 @@ pub fn suggest_notice(models: &twr_core::config::SuggestModels) -> String {
     )
 }
 
+/// [`suggest_notice`] said short, for a status bar with no room for it whole (a compact
+/// terminal): still what is sent, to whom, what it costs and how to turn them off.
+pub fn suggest_notice_short(models: &twr_core::config::SuggestModels) -> String {
+    format!(
+        "suggestions on: a turn's prompt and reply end (8 KB) go to {} (Claude Code, \
+         Anthropic) or {} (Codex, OpenAI) with your login, ~$0.0002 each · /suggest off",
+        models.claude_code, models.codex
+    )
+}
+
 /// The one notice that suggestions can't run here, `why` being the hub's reason.
 pub fn suggest_unavailable_notice(why: &str) -> String {
     format!(
         "suggestions are off: {why} on the hub's machine, so nothing is sent · they work once \
          Claude Code is installed and signed in (/suggest on); [tui] suggest = false keeps \
          them off"
+    )
+}
+
+/// The status bar's notice the first time a summary is due ([`Once::SummaryNotice`]),
+/// naming the models `models` names and the pace `every` (`[tui] summary_every`).
+pub fn summary_notice(
+    models: &twr_core::config::SuggestModels,
+    every: std::time::Duration,
+) -> String {
+    format!(
+        "thread summaries are on: for a thread whose routine updates fold into one row, its \
+         name, state, what it is doing (300 B) and those updates (3 KB), never an item or a \
+         message of yours, go to a small model with your own login, {} through Claude Code (to \
+         Anthropic) or {} through Codex (to OpenAI), the thread's own runtime first, at most \
+         once per {} a thread: about $0.0002 each at list price, counting toward your plan's \
+         usage · /summaries off, or [tui] summaries = false, turns them off",
+        models.claude_code,
+        models.codex,
+        crate::summary::every_words(every)
+    )
+}
+
+/// [`summary_notice`] said short, for a status bar with no room for it whole (a compact
+/// terminal): still what is sent, to whom, how often, what it costs and how to turn them off.
+pub fn summary_notice_short(
+    models: &twr_core::config::SuggestModels,
+    every: std::time::Duration,
+) -> String {
+    format!(
+        "summaries on: a thread's name, state, activity and routine updates (3 KB), no items, \
+         go to {} (Claude Code, Anthropic) or {} (Codex, OpenAI) with your login, ≤1 per {} a \
+         thread, ~$0.0002 each · /summaries off",
+        models.claude_code,
+        models.codex,
+        crate::summary::every_words(every)
+    )
+}
+
+/// The one notice that summaries can't run here, `why` being the hub's reason.
+pub fn summary_unavailable_notice(why: &str) -> String {
+    format!(
+        "thread summaries are off: {why}, so nothing is sent and routine updates fold into \
+         rows of their own words · they work once Claude Code or Codex is installed and signed \
+         in on the hub's machine (/summaries on); [tui] summaries = false keeps them off"
     )
 }
 
@@ -431,6 +512,7 @@ mod tests {
     fn the_state_keeps_what_was_told() {
         let mut a = Seen::default();
         a.told(&Once::SuggestNotice);
+        a.told(&Once::SummaryNotice);
         a.told(&Once::Terminal("mosh".into()));
         a.terminal.insert("local:alacritty".into(), "no".into());
         a.terminal_offers.insert("local:alacritty".into(), 2);
@@ -443,11 +525,13 @@ mod tests {
         assert_eq!(got.terminal_offers, BTreeMap::from([("y".into(), 2)]));
         let mut b = Seen::default();
         b.told(&Once::SuggestUnavailable);
+        b.told(&Once::SummaryUnavailable);
         b.terminal.insert("local:alacritty".into(), "yes".into());
         b.terminal.insert("ssh".into(), "shown".into());
         b.terminal_offers.insert("local:alacritty".into(), 3);
         b.merge(&a);
         assert!(b.suggest_notice && b.suggest_unavailable);
+        assert!(b.summary_notice && b.summary_unavailable);
         assert_eq!(b.terminal["local:alacritty"], "yes");
         assert_eq!(b.terminal["mosh"], "shown");
         assert_eq!(b.terminal_offers["local:alacritty"], 3);
