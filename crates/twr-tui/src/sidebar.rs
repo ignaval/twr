@@ -131,12 +131,14 @@ pub fn render_list(
     let fit = usize::from(cards_area.height);
     let max = rows.len().saturating_sub(fit);
     let mut start = state.view.ws_scroll.min(max);
-    // The card the keys select, else the current one when nothing was scrolled, stays in view.
+    // The card the keys select, else the current one when nothing was scrolled, stays in view;
+    // not once the wheel scrolled the list.
     let keep = selected
         .clone()
+        .filter(|_| !state.view.ws_wheeled)
         .filter(|r| matches!(r, WsRow::Workspace(_)))
         .or_else(|| {
-            (state.view.ws_scroll == 0)
+            (state.view.ws_scroll == 0 && !state.view.ws_wheeled)
                 .then(|| state.workspace.clone().map(WsRow::Workspace))
                 .flatten()
         });
@@ -1090,6 +1092,128 @@ mod tests {
             &Target::Setting(crate::settings::Key::WakeAfter)
         )
         .is_empty());
+    }
+
+    /// The views get the columns the docked sidebar leaves: what depends on their width (a
+    /// dive hiding the cards below 100 columns, the grid's columns) counts those.
+    #[test]
+    fn the_views_count_the_columns_the_dock_leaves() {
+        let mut st = in_workspaces("default");
+        rows(&mut st, 122, 30);
+        assert!(st.ws_docked());
+        assert_eq!(st.content_width(), 122 - DOCK_WIDTH);
+        st.dive("t-gamma");
+        assert!(st.dive_hides_cards(), "96 columns are left for the stack");
+        st.view.ws_sidebar_hidden = true;
+        assert!(!st.dive_hides_cards());
+    }
+
+    /// A paste goes into the new-workspace dialog (its first line), never into the message
+    /// being typed under it; with the settings open it goes nowhere.
+    #[test]
+    fn a_paste_goes_to_the_dialog() {
+        let mut st = in_workspaces("default");
+        st.view.input.set("draft");
+        st.open_new_ws(None);
+        st.handle_paste("web-3\nsecond line");
+        assert_eq!(st.view.new_ws.as_deref(), Some("web-3"));
+        assert_eq!(st.view.input.as_str(), "draft");
+        st.view.new_ws = None;
+        st.open_settings();
+        st.handle_paste("x");
+        assert_eq!(st.view.input.as_str(), "draft");
+    }
+
+    /// A conversation kept from before (the main pane shows a dive now) gets no more events:
+    /// the card shows the hub's reply, not the kept one's.
+    #[test]
+    fn a_kept_conversation_does_not_shadow_newer_replies() {
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = crate::app::Transcript::new(orch);
+        t.settle();
+        t.entries.push(crate::app::Entry::Text {
+            seq: 1,
+            text: "old reply".into(),
+            open: false,
+        });
+        st.transcripts.push(t);
+        st.tabs[0].glance = Some(Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Idle,
+                preview: Some("new reply".into()),
+            }),
+        });
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("new reply"));
+    }
+
+    /// The wheel scrolls the list away from the selected card, and it stays there until a
+    /// key moves the selection.
+    #[test]
+    fn the_wheel_scrolls_past_the_selection() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        for i in 0..8 {
+            tabs.push(Tab::new(format!("more-{i}")));
+        }
+        st.set_tabs(tabs);
+        rows(&mut st, 40, 20);
+        st.handle_key(crate::app::tests::ctrl('t'));
+        let first = rows(&mut st, 40, 20).join("\n");
+        assert!(
+            first.contains("default") && !first.contains("more-7"),
+            "{first}"
+        );
+        let list = st.view.panes.get(&PaneId::Workspaces).unwrap().area;
+        let screen = crate::app::tests::draw(&mut st, 40, 20);
+        for _ in 0..60 {
+            st.handle_mouse(
+                MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: list.x + 1,
+                    row: list.y + 1,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &screen,
+            );
+            rows(&mut st, 40, 20);
+        }
+        let end = rows(&mut st, 40, 20).join("\n");
+        assert!(end.contains("more-7") && !end.contains("▌"), "{end}");
+        // A key brings the selection back into view.
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+        let back = rows(&mut st, 40, 20).join("\n");
+        assert!(back.contains("client-x"), "{back}");
+    }
+
+    /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:
+    /// a tap on a workspace's card switches, as a tab did; its buttons wait.
+    #[test]
+    fn a_card_switches_from_under_the_picker_and_the_help() {
+        let picker = || crate::app::Picker {
+            runtimes: vec![("claude-code".into(), Some(true))],
+            selected: 0,
+            default: "claude-code".into(),
+            model: None,
+            switch: false,
+        };
+        let mut st = in_workspaces("default");
+        st.view.picker = Some(picker());
+        assert!(st.picker_open());
+        let a = tap(&mut st, 160, 40, &Target::Workspace("client-x".into()));
+        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
+        let mut st = in_workspaces("default");
+        st.view.picker = Some(picker());
+        assert!(tap(&mut st, 160, 40, &Target::Settings).is_empty());
+        assert!(st.view.settings.is_none());
+        let mut st = in_workspaces("default");
+        st.view.help = true;
+        let a = tap(&mut st, 160, 40, &Target::Workspace("scratch".into()));
+        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+        assert!(!st.view.help);
     }
 
     /// A reply runs together on its rows, without its Markdown marks or thread tags, cut

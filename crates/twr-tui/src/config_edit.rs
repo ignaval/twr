@@ -394,19 +394,26 @@ fn write_key_with(
         }
         Err(e) => return Err(format!("reading config.toml: {e}")),
     };
-    let (old, mode) = read_plain(&file)?;
+    let (old, perm) = read_plain(&file)?;
     let text = String::from_utf8(old.clone())
         .map_err(|_| "config.toml is not utf-8: edit it by hand".to_string())?;
     let new = set_key(&text, table, key, value)?;
     if new == text {
         return Ok(());
     }
-    replace(&file, &old, &new, mode, before_swap)
+    replace(&file, &old, &new, perm, before_swap)
 }
 
-/// The bytes of `file` and its permission bits, read without following a link or waiting on a
-/// FIFO put in its place.
-fn read_plain(file: &Path) -> Result<(Vec<u8>, u32), String> {
+/// Who may read a file: its permission bits and, for one that exists, its owner and group.
+#[derive(Debug, Clone, Copy)]
+struct Perm {
+    mode: u32,
+    owner: Option<(u32, u32)>,
+}
+
+/// The bytes of `file`, its permission bits, owner and group, read without following a link or
+/// waiting on a FIFO put in its place.
+fn read_plain(file: &Path) -> Result<(Vec<u8>, Perm), String> {
     let mut f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -421,7 +428,14 @@ fn read_plain(file: &Path) -> Result<(Vec<u8>, u32), String> {
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes)
         .map_err(|e| format!("reading config.toml: {e}"))?;
-    Ok((bytes, meta.permissions().mode() & 0o7777))
+    use std::os::unix::fs::MetadataExt;
+    Ok((
+        bytes,
+        Perm {
+            mode: meta.permissions().mode() & 0o7777,
+            owner: Some((meta.uid(), meta.gid())),
+        },
+    ))
 }
 
 /// A temporary file beside the config, removed when dropped unless [`Temp::keep`] said it was
@@ -433,8 +447,10 @@ struct Temp {
 
 impl Temp {
     /// Creates a new temporary file in `dir` (never through a link, never over a file that is
-    /// there) with mode `mode`, holding `text`, flushed to disk.
-    fn write(dir: &Path, name: &std::ffi::OsStr, text: &str, mode: u32) -> Result<Temp, String> {
+    /// there) with the owner, group and mode of `perm`, holding `text`, flushed to disk. A new
+    /// file gets the process's group (or the directory's): one whose group or owner can't be
+    /// made the old file's is refused, as its mode alone would then let other people read it.
+    fn write(dir: &Path, name: &std::ffi::OsStr, text: &str, perm: Perm) -> Result<Temp, String> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -450,9 +466,23 @@ impl Temp {
             .open(&path)
             .map_err(|e| format!("writing config.toml: {e}"))?;
         let temp = Temp { path, keep: false };
+        if let Some((uid, gid)) = perm.owner {
+            use std::os::unix::fs::MetadataExt;
+            let meta = f
+                .metadata()
+                .map_err(|e| format!("writing config.toml: {e}"))?;
+            if (meta.uid(), meta.gid()) != (uid, gid)
+                && std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).is_err()
+            {
+                return Err(
+                    "config.toml's owner or group can't be kept on a new copy: edit it by hand"
+                        .into(),
+                );
+            }
+        }
         let written = (|| {
             // Set on the descriptor, whatever the umask took off at creation.
-            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            f.set_permissions(std::fs::Permissions::from_mode(perm.mode))?;
             f.write_all(text.as_bytes())?;
             f.sync_all()
         })();
@@ -490,17 +520,18 @@ fn sync_dir(dir: &Path) {
     }
 }
 
-/// Replaces `file`, which held `old` with permission bits `mode`, by `new`: a temporary file
-/// beside it, renamed over it once `file` is seen to still hold exactly `old`.
+/// Replaces `file`, which held `old` with the owner, group and permission bits `perm`, by
+/// `new`: a temporary file beside it, renamed over it once `file` is seen to still hold exactly
+/// `old`.
 fn replace(
     file: &Path,
     old: &[u8],
     new: &str,
-    mode: u32,
+    perm: Perm,
     before_swap: impl FnOnce(&Path),
 ) -> Result<(), String> {
     let dir = dir_of(file);
-    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, mode)?;
+    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, perm)?;
     before_swap(file);
     let (now, _) = read_plain(file)?;
     if now != old {
@@ -516,7 +547,11 @@ fn replace(
 /// linked into place (which fails, rather than replaces, when a file appeared there meanwhile).
 fn create(file: &Path, new: &str, before_swap: impl FnOnce(&Path)) -> Result<(), String> {
     let dir = dir_of(file);
-    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, 0o600)?;
+    let perm = Perm {
+        mode: 0o600,
+        owner: None,
+    };
+    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, perm)?;
     before_swap(file);
     match std::fs::hard_link(&temp.path, file) {
         Ok(()) => {}
@@ -795,6 +830,28 @@ terminal = \"bell\"
             .collect();
         v.sort();
         v
+    }
+
+    /// The file's owner, group and mode stay: a copy readable by another group is never made.
+    #[test]
+    fn write_key_keeps_the_files_group() {
+        // A group of the user's other than the one new files get, if there is one.
+        let mut groups = vec![0 as libc::gid_t; 64];
+        let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+        let primary = unsafe { libc::getegid() };
+        let Some(other) = groups[..usize::try_from(n).unwrap_or(0)]
+            .iter()
+            .copied()
+            .find(|g| *g != primary)
+        else {
+            return;
+        };
+        let (_dir, file) = dir_with(SAMPLE);
+        std::os::unix::fs::chown(&file, None, Some(other)).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+        write_key(&file, &["tui"], "animate", &Scalar::Bool(false)).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!((meta.gid(), meta.mode() & 0o7777), (other, 0o640));
     }
 
     #[test]

@@ -318,6 +318,9 @@ pub struct ViewState {
     pub ws_sel: Option<WsRow>,
     /// Rows the workspace list is scrolled by the wheel.
     pub ws_scroll: usize,
+    /// The wheel scrolled the workspace list last: it stays where the wheel left it, rather
+    /// than showing the selected card, until a key moves the selection.
+    pub ws_wheeled: bool,
     /// The new-workspace dialog, while open: the name typed so far.
     pub new_ws: Option<String>,
     /// The settings overlay, while open ([`crate::settings`]).
@@ -3330,6 +3333,7 @@ impl AppState {
             // Its selection starts on the current workspace.
             self.view.ws_sel = None;
             self.view.ws_scroll = 0;
+            self.view.ws_wheeled = false;
         }
         self.view.compact_pane = pane;
         self.view.action = None;
@@ -4021,7 +4025,7 @@ impl AppState {
         self.view.dive.is_some()
             && self.view.screen == Screen::Stack
             && !self.view.sidebar_hidden
-            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.view.width)
+            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.content_width())
     }
 
     /// Whether the main pane is selected ([`ViewState::main_focus`]): only in the stack view,
@@ -4098,7 +4102,9 @@ impl AppState {
             .focused()
             .and_then(|f| order.iter().position(|id| id == f))
         {
-            Some(cur) => grid_step_vertical(cur, order.len(), grid_columns(self.view.width), down),
+            Some(cur) => {
+                grid_step_vertical(cur, order.len(), grid_columns(self.content_width()), down)
+            }
             None if down => 0,
             None => order.len() - 1,
         };
@@ -6138,7 +6144,7 @@ impl AppState {
     /// terminal width, [`crate::ui::input_box_width`]).
     pub(crate) fn input_cols(&self) -> usize {
         usize::from(self.view.panes.get(&PaneId::Input).map_or_else(
-            || crate::ui::input_box_width(self, self.view.width).saturating_sub(2),
+            || crate::ui::input_box_width(self, self.content_width()).saturating_sub(2),
             |p| p.area.width,
         ))
     }
@@ -6778,8 +6784,15 @@ impl AppState {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.press(x, y),
                 MouseEventKind::Up(MouseButton::Left) => {
-                    if let (_, Some(t)) = self.tapped(x, y) {
-                        return self.tap(t);
+                    match self.tapped(x, y) {
+                        // A workspace's card in the docked sidebar, which it does not cover,
+                        // switches as a tab does; the sidebar's other controls wait.
+                        (_, Some(Target::Workspace(name))) => {
+                            return self.ws_activate(WsRow::Workspace(name));
+                        }
+                        (_, Some(Target::NewWorkspace | Target::Settings | Target::WsSidebar)) => {}
+                        (_, Some(t)) => return self.tap(t),
+                        (_, None) => {}
                     }
                     if let Some(PaneId::Tab(name)) = self.view.panes.at(x, y).map(|p| p.id.clone())
                     {
@@ -6810,14 +6823,17 @@ impl AppState {
                 let pane = self.view.panes.at(x, y).cloned();
                 let id = pane.as_ref().map(|p| p.id.clone());
                 // Like a key, a click outside the help (or the trash: its `✕` is outside its
-                // text too) closes it, and does nothing else; one on a tab of the strip, which
-                // they leave on screen, goes on to switch.
+                // text too) closes it, and does nothing else; one on a tab of the strip or a
+                // card of the docked workspace sidebar, which they leave on screen, goes on to
+                // switch.
+                let workspace_card =
+                    matches!(self.view.panes.target_at(x, y), Some(Target::Workspace(_)));
                 if (self.view.help || self.view.trash.is_some()) && id != Some(PaneId::Help) {
                     if !std::mem::take(&mut self.view.help) {
                         self.view.trash = None;
                     }
                     self.view.press = None;
-                    if !matches!(id, Some(PaneId::Tab(_))) {
+                    if !matches!(id, Some(PaneId::Tab(_))) && !workspace_card {
                         return Vec::new();
                     }
                 }
@@ -7611,10 +7627,19 @@ impl AppState {
     /// answers nothing, a pasted line break sends nothing. The decisions overlay has no input
     /// box: a paste there does nothing.
     pub fn handle_paste(&mut self, text: &str) {
-        if self.picker_open() {
+        if self.picker_open() || self.view.settings.is_some() {
             return;
         }
         self.view.selection = None;
+        // The new-workspace dialog takes it as typed (its first line), never the input line.
+        if self.view.new_ws.is_some() {
+            self.paste_new_ws(text);
+            return;
+        }
+        // The drawer closes, and the paste goes where it would.
+        if self.ws_drawer_open() {
+            self.view.ws_drawer = false;
+        }
         // Like a key, a paste closes the help or cancels a confirmation, and does nothing else.
         if std::mem::take(&mut self.view.help) {
             return;

@@ -2701,15 +2701,16 @@ async fn drive(
                                 continue;
                             }
                             // Kept for the next runs (and the next workspaces shown).
+                            // Written here, in order (a small file, at the user's key): a
+                            // later toggle never lands before an earlier one.
                             Action::WsSidebar(on) => {
                                 ctx.ws_sidebar_hidden = !on;
-                                if let Some(file) = ctx.seen_file.clone() {
-                                    let out = status.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        if let Err(e) = firstrun::set_workspaces_sidebar(&file, on) {
-                                            out.send((format!("workspace sidebar: not remembered for the next runs: {e}"), false));
-                                        }
-                                    });
+                                if let Some(file) = ctx.seen_file.as_deref() {
+                                    if let Err(e) = firstrun::set_workspaces_sidebar(file, on) {
+                                        state.view.status = Some(format!(
+                                            "workspace sidebar: not remembered for the next runs: {e}"
+                                        ));
+                                    }
                                 }
                                 continue;
                             }

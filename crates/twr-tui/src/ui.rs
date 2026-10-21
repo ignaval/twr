@@ -93,17 +93,18 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else {
         area
     };
-    // The workspace sidebar, docked left of every view: the strip is not drawn then.
-    let body = if state.ws_docked() {
+    // The workspace sidebar, docked left of every view: the strip is not drawn then. It is
+    // drawn after the overlays, which stay right of it: its cards stay on screen and
+    // tappable, as the strip's tabs do.
+    let (dock, body) = if state.ws_docked() {
         let [dock, rest] = Layout::horizontal([
             Constraint::Length(crate::sidebar::DOCK_WIDTH),
             Constraint::Min(0),
         ])
         .areas(body);
-        crate::sidebar::render_docked(frame, dock, state, &mut panes);
-        rest
+        (Some(dock), rest)
     } else {
-        body
+        (None, body)
     };
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
@@ -131,6 +132,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else if render_action_popup(frame, body, state, &mut panes).is_some() {
     } else {
         render_popup(frame, body, state, &mut panes);
+    }
+    if let Some(dock) = dock {
+        crate::sidebar::render_docked(frame, dock, state, &mut panes);
     }
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());

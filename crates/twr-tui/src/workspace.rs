@@ -108,6 +108,10 @@ fn status_of(v: &serde_json::Value) -> ThreadStatus {
     serde_json::from_value(v.clone()).unwrap_or_default()
 }
 
+/// The longest name the new-workspace dialog takes: longer than any valid one is never
+/// needed (it says why such a name is refused).
+const NEW_WS_MAX: usize = twr_core::paths::MAX_WORKSPACE_NAME + 8;
+
 /// How often a running hub is asked how it is ([`PollClock`]).
 pub const POLL_RUNNING: Duration = Duration::from_secs(5);
 /// How often a hub that is stopped, or did not answer, is asked again ([`PollClock`]).
@@ -384,6 +388,15 @@ impl AppState {
             && self.view.width >= crate::sidebar::DOCK_MIN_WIDTH
     }
 
+    /// The columns the views get: the terminal's, less the docked workspace sidebar's.
+    pub fn content_width(&self) -> u16 {
+        if self.ws_docked() {
+            self.view.width.saturating_sub(crate::sidebar::DOCK_WIDTH)
+        } else {
+            self.view.width
+        }
+    }
+
     /// Whether the workspace list is open as a drawer: opened, and not docked or in the
     /// compact layout (a resize may have made room for it since).
     pub fn ws_drawer_open(&self) -> bool {
@@ -433,8 +446,10 @@ impl AppState {
         rows
     }
 
-    /// Moves the keys' selection in the workspace list by `delta` rows, stopping at its ends.
+    /// Moves the keys' selection in the workspace list by `delta` rows, stopping at its ends;
+    /// the list follows it again.
     fn step_ws_sel(&mut self, delta: isize) {
+        self.view.ws_wheeled = false;
         let rows = self.ws_rows();
         let at = self
             .ws_selected()
@@ -516,6 +531,7 @@ impl AppState {
         self.view.ws_drawer = open;
         self.view.ws_sel = None;
         self.view.ws_scroll = 0;
+        self.view.ws_wheeled = false;
         if open {
             // What it opens over is about something else now.
             self.view.action = None;
@@ -530,8 +546,14 @@ impl AppState {
         match key.code {
             KeyCode::Up if plain => self.step_ws_sel(-1),
             KeyCode::Down if plain => self.step_ws_sel(1),
-            KeyCode::Home if plain => self.view.ws_sel = self.ws_rows().first().cloned(),
-            KeyCode::End if plain => self.view.ws_sel = self.ws_rows().last().cloned(),
+            KeyCode::Home if plain => {
+                self.view.ws_wheeled = false;
+                self.view.ws_sel = self.ws_rows().first().cloned();
+            }
+            KeyCode::End if plain => {
+                self.view.ws_wheeled = false;
+                self.view.ws_sel = self.ws_rows().last().cloned();
+            }
             KeyCode::Enter if plain => {
                 let row = self.ws_selected()?;
                 return Some(self.ws_activate(row));
@@ -587,6 +609,8 @@ impl AppState {
 
     /// The wheel over the workspace list: a row up or down, from where it showed.
     pub(crate) fn ws_wheel(&mut self, up: bool) {
+        // Where the wheel leaves it, until a key moves the selection.
+        self.view.ws_wheeled = true;
         let at = self.view.panes.ws_start.min(self.view.panes.ws_max);
         self.view.ws_scroll = if up {
             at.saturating_sub(1)
@@ -687,18 +711,29 @@ impl AppState {
             KeyCode::Char('h') if ctrl => {
                 name.pop();
             }
-            // Longer than any valid name is never needed.
             KeyCode::Char(c)
-                if !ctrl
-                    && !alt
-                    && !c.is_control()
-                    && name.chars().count() < twr_core::paths::MAX_WORKSPACE_NAME + 8 =>
+                if !ctrl && !alt && !c.is_control() && name.chars().count() < NEW_WS_MAX =>
             {
                 name.push(c);
             }
             _ => {}
         }
         Vec::new()
+    }
+
+    /// A paste into the new-workspace dialog: its first line, its control characters left out,
+    /// up to the dialog's length, as if typed.
+    pub(crate) fn paste_new_ws(&mut self, text: &str) {
+        let Some(name) = self.view.new_ws.as_mut() else {
+            return;
+        };
+        let line = text.lines().next().unwrap_or_default().trim();
+        for c in line.chars().filter(|c| !c.is_control()) {
+            if name.chars().count() >= NEW_WS_MAX {
+                break;
+            }
+            name.push(c);
+        }
     }
 
     /// `⚙ Settings`, `/settings`: opens the settings overlay ([`crate::settings`]), reading
@@ -912,8 +947,8 @@ impl AppState {
 
     /// What workspace `tab`'s card says of its orchestrator and its work: the current
     /// workspace's from the state itself (its orchestrator's latest reply from its
-    /// conversation when that is loaded, else as its hub last said it), the others' as their
-    /// hubs last said.
+    /// conversation while the main pane shows it, else as its hub last said it), the others'
+    /// as their hubs last said.
     pub fn tab_glance(&self, tab: &Tab) -> Option<Glance> {
         if self.workspace.as_deref() != Some(tab.name.as_str()) {
             return tab.glance.clone();
@@ -934,14 +969,15 @@ impl AppState {
         Some(Glance { active, orch })
     }
 
-    /// The latest finished reply in thread `id`'s conversation, when the view has it loaded
-    /// (shown, or kept from before).
+    /// The latest finished reply in thread `id`'s conversation, while the main pane shows it
+    /// (and follows it live).
     fn latest_reply(&self, id: &str) -> Option<String> {
+        // Only the one the main pane follows: one kept from before gets no more events, and
+        // the hub's newer reply would be shadowed by it.
         let transcript = self
             .transcript
-            .iter()
-            .chain(self.transcripts.iter())
-            .find(|t| t.thread == id && !t.catching_up())?;
+            .as_ref()
+            .filter(|t| t.thread == id && !t.catching_up())?;
         transcript.visible().0.iter().rev().find_map(|e| match e {
             crate::app::Entry::Text {
                 text, open: false, ..
