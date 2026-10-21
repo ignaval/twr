@@ -64,9 +64,12 @@
 //! notice (up to [`NOTICE_QUEUE_URGENT_MAX`]) and the newest [`NOTICE_QUEUE_MAX`] others; a
 //! notice about an item is dropped as soon as the item is resolved, and the notices about a
 //! thread when it is deleted (one line then says it was deleted). Worker permissions and
-//! questions appear directly in the conversation; they never queue a model notice. Urgent ones
-//! (review, error) go out at once as a notice turn when the orchestrator
-//! is idle; the rest wait [`NOTICE_COALESCE`] to be batched. A busy orchestrator gets everything
+//! questions appear directly in the conversation; they never queue a model notice; nor do the
+//! routine updates (an interim report, background work finishing, the hub's wake of a worker:
+//! `hub::updates`). Urgent ones (review, error, a hung turn) go out at once as a notice turn
+//! when the orchestrator is idle; the rest wait [`NOTICE_COALESCE`] to be batched, and a plain
+//! stall's line [`STALL_NOTICE_HOLD`] (dropped when its item closes first: a stall that
+//! resolved itself costs no turn). A busy orchestrator gets everything
 //! queued as one notice turn after its turn ends (a user prompt queued for it goes first). A
 //! notice turn holds at most [`NOTICE_MAX_LINES`] lines; the rest wait for the next one, which
 //! follows its end. A notice turn is `turn.started{from: orchestrator}` with source `hub` and
@@ -171,6 +174,11 @@ pub const ORCHESTRATOR_ALIAS: &str = "orch";
 /// How long non-urgent notices wait to be batched.
 pub const NOTICE_COALESCE: Duration = Duration::from_millis(300);
 
+/// How long a plain stall's notice line waits before it may start a notice turn (log time):
+/// dropped when its item closes first (the thread's activity resumed), so a stall that
+/// resolved itself costs the orchestrator no turn. A hung-turn card goes at once.
+pub const STALL_NOTICE_HOLD: chrono::Duration = chrono::Duration::seconds(90);
+
 /// Most notice lines in one notice turn (the rest wait for the next one).
 const NOTICE_MAX_LINES: usize = 40;
 
@@ -182,8 +190,10 @@ const PENDING_NOTICES_KEY: &str = "pending_worker_notices";
 /// next notice turn (past [`NOTICE_MAX_LINES`]); every other line due then went with it.
 pub(super) const NOTICES_LEFT_KEY: &str = "notices_left";
 /// Notice `turn.started` `ext.twr` key: the keys of the lines still held when it chose
-/// (a worker gone idle, its line due later); they stay queued, live and on replay alike,
-/// whatever the replay makes of their due time (it depends on the hub's settings).
+/// (a worker gone idle, a plain stall, its line due later); they stay queued, live and on
+/// replay alike, whatever the replay makes of their due time (it depends on the hub's
+/// settings and version); a line it does not list went with it (or was left,
+/// [`NOTICES_LEFT_KEY`]).
 pub(super) const NOTICES_HELD_KEY: &str = "notices_held";
 
 /// Most non-urgent notices queued (the newest are kept).
@@ -373,12 +383,21 @@ pub(super) struct Notice {
     /// that went idle after an interim report may be about to start its follow-up.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     idle: Option<DateTime<Utc>>,
+    /// Held until then (log time): a plain stall ([`STALL_NOTICE_HOLD`]), which goes with its
+    /// item when that closes first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hold: Option<DateTime<Utc>>,
 }
 
 impl Notice {
     /// Whether it is held at `now`.
     fn held(&self, now: DateTime<Utc>) -> bool {
-        self.idle.is_some_and(|due| due > now)
+        self.due().is_some_and(|due| due > now)
+    }
+
+    /// When it is held until, if it is.
+    fn due(&self) -> Option<DateTime<Utc>> {
+        self.idle.max(self.hold)
     }
 
     /// The line as the orchestrator reads it, firing `watches` (its own, but those an earlier
@@ -937,6 +956,7 @@ impl OrchState {
             watches: Vec::new(),
             for_watches: false,
             idle: None,
+            hold: None,
         });
         self.wake = true;
     }
@@ -960,6 +980,7 @@ impl OrchState {
             watches,
             for_watches: true,
             idle: Some(due),
+            hold: None,
         });
         self.wake = true;
     }
@@ -994,7 +1015,7 @@ impl OrchState {
 
     /// When the earliest held notice comes due.
     pub(super) fn next_due(&self) -> Option<DateTime<Utc>> {
-        self.notices.iter().filter_map(|n| n.idle).min()
+        self.notices.iter().filter_map(Notice::due).min()
     }
 
     /// Thread `id` (named `name`) was deleted (event `key`): its queued notices go (they name
@@ -1479,9 +1500,18 @@ impl Core {
                     let has = |l: Option<&Vec<Value>>, key: &str| {
                         l.is_some_and(|l| l.iter().any(|k| k.as_str() == Some(key)))
                     };
-                    self.orch
-                        .notices
-                        .retain(|n| n.held(cutoff) || has(left, &n.key) || has(held, &n.key));
+                    // What the turn recorded decides, not what this hub's rules make of the
+                    // line now: a hub before the stall hold delivered a stall at once, and a
+                    // turn that lists nothing held held nothing. Only a turn of a hub from
+                    // before the held lines were recorded is judged by its cutoff, for the one
+                    // hold such hubs had (a worker gone idle).
+                    self.orch.notices.retain(|n| {
+                        has(left, &n.key)
+                            || match held {
+                                Some(_) => has(held, &n.key),
+                                None => n.idle.is_some_and(|due| due > cutoff),
+                            }
+                    });
                     self.orch.notices_dropped = 0;
                     if let Some(fired) = twr_ext(&p.ext)
                         .and_then(|t| t.get(watch::WATCHES_FIRED_KEY))
@@ -1765,9 +1795,10 @@ impl Core {
                         .and_then(|v| v.as_str().map(str::to_string))
                         .unwrap_or_default()
                 };
+                let urgent = hung || p.reason != AttentionReason::Stalled;
                 Notice {
                     key: ev.id.clone(),
-                    urgent: hung || p.reason != AttentionReason::Stalled,
+                    urgent,
                     attn_id: Some(p.attn_id.clone()),
                     thread: Some(ev.thread.clone()),
                     watches: Vec::new(),
@@ -1781,6 +1812,9 @@ impl Core {
                         quoted(&cut(&p.summary, NOTICE_SUMMARY_MAX)),
                         ev.thread
                     ),
+                    // A plain stall waits: one that resolves itself (its activity resumed)
+                    // meanwhile costs no turn.
+                    hold: (!urgent).then(|| ev.ts + STALL_NOTICE_HOLD),
                 }
             }
             EventBody::ReportReady(p) => {
@@ -1843,6 +1877,7 @@ impl Core {
                     for_watches: p.grade == Grade::Success,
                     watches: hits,
                     idle: None,
+                    hold: None,
                 }
             }
             _ => return,
@@ -4312,6 +4347,212 @@ mod tests {
         drop(hub);
     }
 
+    /// The updates that tell of work going on (an interim report, background work finishing,
+    /// the hub's wake of the worker) reach the orchestrator's conversation marked routine, and
+    /// none queues a notice line or starts a notice turn, live or on replay.
+    #[tokio::test]
+    async fn routine_updates_start_no_notice_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        worker_turn(
+            &hub,
+            "api",
+            1,
+            TurnFrom::User,
+            TurnResult::Completed,
+            Grade::Success,
+            &["tests"],
+        );
+        hub.append("api", None, Source::Hub, task_updated("tests", false), None)
+            .unwrap();
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::ConversationUpdate(ConversationUpdate {
+                text: "api's background work finished: twr woke it".into(),
+                about_thread: Some("api".into()),
+                ext: twr_ext_map(json!({"auto_wake": {"turn": 1, "tasks": []}})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let (_, log) = hub.thread_events("o1", 0, 1000).unwrap();
+        let routine: Vec<String> = log
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ConversationUpdate(p) => routine_of(&p.ext).map(str::to_string),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            routine,
+            [ROUTINE_INTERIM, ROUTINE_BACKGROUND_DONE, ROUTINE_AUTO_WAKE],
+            "{log:?}"
+        );
+        // The interim report's own marks stay beside it.
+        let interim = log
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::ConversationUpdate(p) if routine_of(&p.ext) == Some(ROUTINE_INTERIM) => {
+                    twr_ext(&p.ext).cloned()
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            interim[report::BACKGROUND_TASKS_KEY],
+            json!(1),
+            "{interim:?}"
+        );
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), Vec::new()));
+        assert!(notice_now(&hub).is_none());
+        // A final report is no routine update.
+        finish(&hub, "api", 2, Grade::NeedsVerification);
+        let (_, log) = hub.thread_events("o1", 0, 1000).unwrap();
+        let last = log
+            .iter()
+            .rev()
+            .find_map(|e| match &e.body {
+                EventBody::ConversationUpdate(p) => Some(p.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(last.text.contains("api finished"), "{last:?}");
+        assert_eq!(routine_of(&last.ext), None);
+        drop(hub);
+    }
+
+    /// A worker's plain stall waits [`STALL_NOTICE_HOLD`] (log time) before it may start a
+    /// notice turn, stays queued past one that goes meanwhile, and goes without one when its
+    /// item closes first; a hung turn or an error goes at once. Replay agrees.
+    #[tokio::test]
+    async fn a_stall_waits_and_goes_when_it_resolves_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api", "web"]).await;
+        let raise = |thread: &str, id: &str, reason, ext: Value| {
+            hub.append(
+                thread,
+                None,
+                Source::Hub,
+                EventBody::AttentionRaised(AttentionRaised {
+                    attn_id: id.into(),
+                    reason,
+                    summary: "No activity for 10 min".into(),
+                    ext: twr_ext_map(ext),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap()
+        };
+        let stall = raise("api", "api:s1", AttentionReason::Stalled, json!({}));
+        let due = stall.ts + STALL_NOTICE_HOLD;
+        assert_eq!(hub.inner.core().orch.next_due(), Some(due));
+        assert!(hub.inner.core().notice_turn(Utc::now()).is_none());
+        let (late, _) = hub
+            .inner
+            .core()
+            .notice_turn(due + chrono::Duration::seconds(1))
+            .unwrap();
+        assert!(late.contains("reason=stalled attn_id=api:s1"), "{late}");
+        // Another notice goes meanwhile: the stall stays held, live and on replay.
+        finish(&hub, "web", 1, Grade::NeedsVerification);
+        let (text, ext) = notice_now(&hub).unwrap();
+        assert!(!text.contains("api:s1"), "{text}");
+        assert_eq!(ext[NOTICES_HELD_KEY], json!([stall.id]));
+        let q = replayed_queue(&hub, &db);
+        assert_eq!(q.0.len(), 1, "{q:?}");
+        assert!(lines_of(&q)[0].contains("attn_id=api:s1"), "{q:?}");
+        // Its activity resumed: the item closes, and its line goes with it.
+        hub.append(
+            "api",
+            None,
+            Source::Hub,
+            EventBody::AttentionResolved(AttentionResolved {
+                attn_id: "api:s1".into(),
+                by: ResolvedBy::Timeout,
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), Vec::new()));
+        let later = due + chrono::Duration::seconds(60);
+        assert!(hub.inner.core().notice_turn(later).is_none());
+        // A hung turn and an error are urgent: due at once.
+        raise(
+            "api",
+            "api:h1",
+            AttentionReason::Stalled,
+            json!({ HUNG_KEY: {"turn": 1, "waiting": "a message"} }),
+        );
+        raise("web", "web:e1", AttentionReason::Error, json!({}));
+        let core = hub.inner.core();
+        assert!(core
+            .orch
+            .notices
+            .iter()
+            .all(|n| n.urgent && !n.held(Utc::now())));
+        let (text, _) = core.notice_turn(Utc::now()).unwrap();
+        assert!(text.contains("reason=hung attn_id=api:h1"), "{text}");
+        assert!(text.contains("reason=error attn_id=web:e1"), "{text}");
+        drop(core);
+        drop(hub);
+    }
+
+    /// A stall a hub before the hold delivered at once (its notice turn lists nothing held)
+    /// went with that turn: neither this hub nor its replay holds it again, so its item, still
+    /// open, starts no second notice turn once the hold would have passed.
+    #[tokio::test]
+    async fn a_stall_delivered_before_the_hold_is_not_held_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let hub = queue_hub(&db, &["api"]).await;
+        let stall = hub
+            .append(
+                "api",
+                None,
+                Source::Hub,
+                EventBody::AttentionRaised(AttentionRaised {
+                    attn_id: "api:s1".into(),
+                    reason: AttentionReason::Stalled,
+                    summary: "No activity for 10 min".into(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        // The older hub's notice turn, a moment after the raise: the stall's line in it, and
+        // no held lines recorded (it held none).
+        let turn = hub.inner.core().view("o1").unwrap().turns + 1;
+        for body in [
+            EventBody::TurnStarted(TurnStarted {
+                prompt: "- thread=api reason=stalled attn_id=api:s1".into(),
+                from: TurnFrom::Orchestrator,
+                ext: twr_ext_map(json!({"notice": true})),
+                ..Default::default()
+            }),
+            EventBody::TurnEnded(TurnEnded::default()),
+        ] {
+            hub.append("o1", Some(turn), Source::Hub, body, None)
+                .unwrap();
+        }
+        assert_eq!(replayed_queue(&hub, &db), (Vec::new(), Vec::new()));
+        let due = stall.ts + STALL_NOTICE_HOLD + chrono::Duration::seconds(1);
+        assert!(hub.inner.core().notice_turn(due).is_none());
+        let (replayed, _) = Core::replay(&db).unwrap();
+        assert!(replayed.notice_turn(due).is_none());
+        assert!(
+            hub.inner.core().attention.get("api:s1").is_some(),
+            "still open"
+        );
+        drop(hub);
+    }
+
     /// A rewrite says what the hub's report says of the turn, not what the report it replaces
     /// says: interim while the turn's tasks run (the worker going idle then still fires its
     /// watch), final after; a follow-up turn's rewrite is a follow-up's.
@@ -4533,6 +4774,7 @@ mod tests {
             watches: Vec::new(),
             for_watches: false,
             idle: None,
+            hold: None,
         }
     }
 

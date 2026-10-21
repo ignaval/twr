@@ -1,20 +1,28 @@
 //! Workspaces (`twr ws`): separate hubs on this machine, which the TUI switches between, one
-//! connected at a time. The tab strip ([`crate::ui`]) lists them once there is more than
-//! `default`; Alt-1..9, Ctrl-PgUp/PgDn, a click on a tab and `/ws <name>` switch. A switch
-//! keeps the view of the workspace left ([`SavedView`]) and restores it on coming back.
+//! connected at a time. The workspace sidebar ([`crate::ui`]) lists them all, each with its
+//! orchestrator's status and last reply ([`Glance`]); where it is not drawn, the tab strip lists
+//! them once there is more than `default`. Alt-1..9, Ctrl-PgUp/PgDn, a click on a sidebar card or
+//! a tab and `/ws <name>` switch. A switch keeps the view of the workspace left ([`SavedView`])
+//! and restores it on coming back.
+//!
+//! The other workspaces' hubs are asked how they are on a clock of their own ([`PollClock`]):
+//! one `hub.glance` each, a running hub every [`POLL_RUNNING`], one stopped or not answering
+//! every [`POLL_IDLE`], and a hub is never started to be asked.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use twr_core::paths::workspace_name_error;
 use twr_core::reduce::ThreadStatus;
 
-use crate::app::{Action, AppState, Confirm, DecisionFilter, Screen, Transcript};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::app::{Action, AppState, Confirm, DecisionFilter, Screen, Transcript, WsRow};
 use crate::edit::LineInput;
 use crate::notify::{Notifier, WorkspaceAlert};
 use crate::select::Anchor;
 
-/// A workspace in the tab strip.
+/// A workspace in the tab strip and the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
     /// Its name.
@@ -22,6 +30,161 @@ pub struct Tab {
     /// What its hub said when last asked (the current workspace's comes from the state
     /// itself, [`AppState::tab_hub`]).
     pub hub: TabHub,
+    /// What its hub last said of its orchestrator and its work ([`Glance`]): kept while the
+    /// hub is stopped or does not answer, as what it said last. `None` before it ever said.
+    pub glance: Option<Glance>,
+}
+
+impl Tab {
+    /// Workspace `name`, its hub not asked yet.
+    pub fn new(name: impl Into<String>) -> Tab {
+        Tab {
+            name: name.into(),
+            hub: TabHub::Unknown,
+            glance: None,
+        }
+    }
+}
+
+/// What a workspace's hub says of its orchestrator and its work, for its card in the sidebar
+/// (`hub.glance`; from an older hub, `thread.list`, without the reply).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Glance {
+    /// Its orchestrator or one of its threads works: a turn runs that waits on no one, or
+    /// background work of its own (a runtime's task, a job).
+    pub active: bool,
+    /// Its orchestrator; `None` when it has none.
+    pub orch: Option<OrchGlance>,
+}
+
+/// A workspace's orchestrator, as its hub said it ([`Glance`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OrchGlance {
+    /// Its thread id (`None` from a hub that did not say).
+    pub id: Option<String>,
+    /// The seq of the reply [`OrchGlance::preview`] starts (`None`: unknown): which of two
+    /// replies of the same orchestrator is newer.
+    pub preview_seq: Option<u64>,
+    /// Its status.
+    pub status: ThreadStatus,
+    /// The start of its latest reply (up to 300 characters, as the hub cut it); `None` before
+    /// it replied, or from a hub too old to say.
+    pub preview: Option<String>,
+}
+
+impl Glance {
+    /// A `hub.glance` result.
+    pub fn from_json(v: &serde_json::Value) -> Glance {
+        // (Indexed as a value: a key the hub left out is null, never a panic.)
+        let orch = v["orchestrator"].is_object().then(|| {
+            let o = &v["orchestrator"];
+            OrchGlance {
+                id: o["id"].as_str().map(str::to_string),
+                preview_seq: o["preview_seq"].as_u64(),
+                status: status_of(&o["status"]),
+                preview: o["preview"]
+                    .as_str()
+                    .filter(|p| !p.trim().is_empty())
+                    .map(str::to_string),
+            }
+        });
+        Glance {
+            active: v["active"] == true,
+            orch,
+        }
+    }
+
+    /// What an older hub's `thread.list` says (no `hub.glance`): the current orchestrator's
+    /// status, without its reply, and whether a thread works.
+    pub fn from_threads(threads: &serde_json::Value) -> Glance {
+        let list = threads.as_array().map(Vec::as_slice).unwrap_or_default();
+        let orch = list
+            .iter()
+            .find(|t| t["role"] == "orchestrator" && t["retired"] != true)
+            .map(|t| OrchGlance {
+                id: t["id"].as_str().map(str::to_string),
+                status: status_of(&t["status"]),
+                ..Default::default()
+            });
+        // A retired orchestrator runs nothing; the rest by their status.
+        let active = list.iter().any(|t| {
+            !(t["role"] == "orchestrator" && t["retired"] == true)
+                && matches!(t["status"].as_str(), Some("running" | "background"))
+        });
+        Glance { active, orch }
+    }
+}
+
+/// A thread status as the hub serializes it; `idle` for one it does not know.
+fn status_of(v: &serde_json::Value) -> ThreadStatus {
+    serde_json::from_value(v.clone()).unwrap_or_default()
+}
+
+/// The longest name the new-workspace dialog takes: longer than any valid one is never
+/// needed (it says why such a name is refused).
+const NEW_WS_MAX: usize = twr_core::paths::MAX_WORKSPACE_NAME + 8;
+
+/// How often a running hub is asked how it is ([`PollClock`]).
+pub const POLL_RUNNING: Duration = Duration::from_secs(5);
+/// How often a hub that is stopped, or did not answer, is asked again ([`PollClock`]).
+pub const POLL_IDLE: Duration = Duration::from_secs(15);
+/// A hub asked this much before its time is due ([`PollClock::due`]): the poll's own clock
+/// ticks every [`POLL_RUNNING`], and a hub asked a tick ago is due again at the next one.
+const POLL_SLACK: Duration = Duration::from_millis(500);
+
+/// When each workspace's hub is asked next: a running one [`POLL_RUNNING`] after it was last
+/// asked, one stopped or not answering [`POLL_IDLE`] after, one never asked at once. It lasts
+/// across the workspaces shown.
+#[derive(Debug, Clone, Default)]
+pub struct PollClock {
+    next: HashMap<String, Instant>,
+}
+
+impl PollClock {
+    /// Whether workspace `name`'s hub is due to be asked at `now`.
+    pub fn due(&self, name: &str, now: Instant) -> bool {
+        self.next
+            .get(name)
+            .is_none_or(|next| now + POLL_SLACK >= *next)
+    }
+
+    /// Of `names`, those due at `now`, each marked as asked then (as not answering, until
+    /// [`PollClock::answered`] says how it was): a poll that never comes back does not make
+    /// it asked again before [`POLL_IDLE`].
+    pub fn take_due(&mut self, names: &[String], now: Instant) -> Vec<String> {
+        let due: Vec<String> = names.iter().filter(|n| self.due(n, now)).cloned().collect();
+        for name in &due {
+            self.next.insert(name.clone(), now + POLL_IDLE);
+        }
+        self.next.retain(|n, _| names.contains(n));
+        due
+    }
+
+    /// Workspace `name`'s hub, asked at `asked`, was `hub`: it is next asked
+    /// [`POLL_RUNNING`] after that when it ran, else [`POLL_IDLE`].
+    pub fn answered(&mut self, name: &str, hub: &TabHub, asked: Instant) {
+        let every = match hub {
+            TabHub::Running { .. } => POLL_RUNNING,
+            _ => POLL_IDLE,
+        };
+        self.next.insert(name.to_string(), asked + every);
+    }
+
+    /// Workspace `name`'s hub is asked at the next tick: it was just started or switched to.
+    pub fn soon(&mut self, name: &str) {
+        self.next.remove(name);
+    }
+}
+
+/// One workspace's hub as a poll found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Polled {
+    /// The workspace.
+    pub name: String,
+    /// How its hub was.
+    pub hub: TabHub,
+    /// What it said of its orchestrator and its work, when it answered.
+    pub glance: Option<Glance>,
 }
 
 /// A workspace's hub, as the tab strip shows it.
@@ -103,6 +266,8 @@ pub struct SavedView {
     suggested_refs: std::collections::VecDeque<(String, i64)>,
     /// Which of its sends still to be answered were suggestions ([`AppState::sends_suggested`]).
     sends_suggested: std::collections::VecDeque<bool>,
+    /// Its threads' summaries, their pace and the hub's counts ([`crate::summary::Saved`]).
+    summary: crate::summary::Saved,
 }
 
 /// What of a [`SavedView`] waits until the replay is applied ([`AppState::finish_restore`]):
@@ -213,25 +378,535 @@ pub fn waiting_alerts(
 }
 
 impl AppState {
-    /// Whether the tab strip is drawn: switching is possible and there is more than one
-    /// workspace.
-    pub fn tabs_shown(&self) -> bool {
+    /// Whether there are workspaces to switch to: the TUI opened on a workspace (not a
+    /// socket) and there is more than one. Alt-1..9 and Ctrl-PgUp/PgDn switch then, whatever
+    /// shows them.
+    pub fn switchable(&self) -> bool {
         self.workspace.is_some() && self.tabs.len() > 1
     }
 
-    /// The instance label the views draw (`[name]`): none while the tab strip names it.
+    /// Whether the tab strip is drawn: there are workspaces to switch to, and nothing else
+    /// lists them: the workspace sidebar is not docked, and the compact layout, whose
+    /// Workspaces screen lists them, is not on.
+    pub fn tabs_shown(&self) -> bool {
+        self.switchable() && !self.ws_docked() && !self.compact()
+    }
+
+    /// Whether the workspace sidebar is docked left of the views ([`crate::sidebar`]): the
+    /// TUI opened on a workspace, the sidebar is not hidden, the layout is the full one and
+    /// the screen is [`crate::sidebar::DOCK_MIN_WIDTH`] columns wide or more.
+    pub fn ws_docked(&self) -> bool {
+        self.workspace.is_some()
+            && !self.view.ws_sidebar_hidden
+            && !self.compact()
+            && self.view.width >= crate::sidebar::DOCK_MIN_WIDTH
+    }
+
+    /// The columns the views get: the terminal's, less the docked workspace sidebar's.
+    pub fn content_width(&self) -> u16 {
+        if self.ws_docked() {
+            self.view.width.saturating_sub(crate::sidebar::DOCK_WIDTH)
+        } else {
+            self.view.width
+        }
+    }
+
+    /// Whether the workspace list is open as a drawer: opened, and not docked or in the
+    /// compact layout (a resize may have made room for it since).
+    pub fn ws_drawer_open(&self) -> bool {
+        self.view.ws_drawer && self.workspace.is_some() && !self.compact() && !self.ws_docked()
+    }
+
+    /// Whether the compact layout's Workspaces screen shows.
+    pub fn ws_screen(&self) -> bool {
+        self.compact()
+            && self.view.compact_pane == crate::app::CompactPane::Workspaces
+            && self.view.screen != Screen::Decisions
+    }
+
+    /// The instance label the views draw (`[name]`): none while the tab strip or the
+    /// workspace sidebar names it.
     pub fn instance_label(&self) -> Option<&str> {
-        if self.tabs_shown() {
+        if self.tabs_shown() || self.ws_docked() {
             None
         } else {
             self.instance_name.as_deref()
         }
     }
 
+    /// The row of the workspace list the keys select: the one chosen, while it is still
+    /// listed, else the current workspace's card.
+    pub fn ws_selected(&self) -> Option<WsRow> {
+        let listed = |r: &WsRow| match r {
+            WsRow::Workspace(name) => self.tabs.iter().any(|t| &t.name == name),
+            WsRow::New | WsRow::Settings => true,
+        };
+        self.view
+            .ws_sel
+            .clone()
+            .filter(listed)
+            .or_else(|| self.workspace.clone().map(WsRow::Workspace))
+    }
+
+    /// The rows of the workspace list, in order: the workspaces, then the buttons.
+    fn ws_rows(&self) -> Vec<WsRow> {
+        let mut rows: Vec<WsRow> = self
+            .tabs
+            .iter()
+            .map(|t| WsRow::Workspace(t.name.clone()))
+            .collect();
+        rows.push(WsRow::New);
+        rows.push(WsRow::Settings);
+        rows
+    }
+
+    /// Moves the keys' selection in the workspace list by `delta` rows, stopping at its ends;
+    /// the list follows it again.
+    fn step_ws_sel(&mut self, delta: isize) {
+        self.view.ws_wheeled = false;
+        let rows = self.ws_rows();
+        let at = self
+            .ws_selected()
+            .and_then(|s| rows.iter().position(|r| *r == s))
+            .unwrap_or(0);
+        let to = at.saturating_add_signed(delta).min(rows.len() - 1);
+        self.view.ws_sel = rows.get(to).cloned();
+        // The list follows the selection, not where the wheel left it.
+        self.view.ws_scroll = 0;
+    }
+
+    /// Ctrl-T, `/spaces`, a tap on the tab strip's `≡` or the sidebar's `‹`: in the compact
+    /// layout, the Workspaces screen (or back to the conversation from it); where the sidebar
+    /// docks, shows or hides it (kept across runs); on a narrower screen, opens or closes the
+    /// drawer.
+    pub fn toggle_workspaces(&mut self) -> Vec<Action> {
+        if self.workspace.is_none() {
+            self.view.status =
+                Some("workspaces: not here (this TUI was opened on a socket)".into());
+            return Vec::new();
+        }
+        if self.compact() {
+            // From the decisions overlay, which hides every screen: to the Workspaces one.
+            let pane = if self.view.screen == Screen::Decisions {
+                self.toggle_decisions();
+                crate::app::CompactPane::Workspaces
+            } else if self.view.compact_pane == crate::app::CompactPane::Workspaces {
+                crate::app::CompactPane::Chat
+            } else {
+                crate::app::CompactPane::Workspaces
+            };
+            self.show_pane(pane);
+            return Vec::new();
+        }
+        if self.view.width >= crate::sidebar::DOCK_MIN_WIDTH {
+            return self.set_ws_sidebar(self.view.ws_sidebar_hidden);
+        }
+        self.set_ws_drawer(!self.view.ws_drawer);
+        Vec::new()
+    }
+
+    /// `/spaces on|off`: the workspace sidebar shown or hidden (kept across runs), and where it
+    /// does not dock, its drawer (or the compact Workspaces screen) opened or closed with it.
+    pub fn spaces(&mut self, on: Option<bool>) -> Vec<Action> {
+        let Some(on) = on else {
+            return self.toggle_workspaces();
+        };
+        if self.workspace.is_none() {
+            self.view.status =
+                Some("workspaces: not here (this TUI was opened on a socket)".into());
+            return Vec::new();
+        }
+        let actions = self.set_ws_sidebar(on);
+        if self.compact() {
+            if on && self.view.screen == Screen::Decisions {
+                self.toggle_decisions();
+            }
+            let shown = self.ws_screen();
+            if on != shown {
+                self.show_pane(if on {
+                    crate::app::CompactPane::Workspaces
+                } else {
+                    crate::app::CompactPane::Chat
+                });
+            }
+        } else if self.view.width < crate::sidebar::DOCK_MIN_WIDTH {
+            self.set_ws_drawer(on);
+        }
+        actions
+    }
+
+    /// Shows (`on`) or hides the docked workspace sidebar; the IO loop keeps it
+    /// ([`Action::WsSidebar`]).
+    pub fn set_ws_sidebar(&mut self, on: bool) -> Vec<Action> {
+        self.view.ws_sidebar_hidden = !on;
+        // A drawer opened on a narrower screen is not to come back with it.
+        self.view.ws_drawer = false;
+        self.view.status = Some(if on {
+            "workspace sidebar shown (Ctrl-T hides it)".into()
+        } else {
+            "workspace sidebar hidden (Ctrl-T shows it)".into()
+        });
+        vec![Action::WsSidebar(on)]
+    }
+
+    /// Opens (`open`) or closes the workspace drawer, its selection on the current workspace.
+    fn set_ws_drawer(&mut self, open: bool) {
+        self.view.ws_drawer = open;
+        self.view.ws_sel = None;
+        self.view.ws_scroll = 0;
+        self.view.ws_wheeled = false;
+        if open {
+            // What it opens over is about something else now.
+            self.view.action = None;
+        }
+    }
+
+    /// The keys of the drawer while it is open: ↑↓ (Home, End) select a row, Enter acts on
+    /// it, Esc and Ctrl-T close it. `None` for any other key, which closes it and goes where
+    /// it would.
+    pub(crate) fn ws_drawer_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Up if plain => self.step_ws_sel(-1),
+            KeyCode::Down if plain => self.step_ws_sel(1),
+            KeyCode::Home if plain => {
+                self.view.ws_wheeled = false;
+                self.view.ws_sel = self.ws_rows().first().cloned();
+            }
+            KeyCode::End if plain => {
+                self.view.ws_wheeled = false;
+                self.view.ws_sel = self.ws_rows().last().cloned();
+            }
+            KeyCode::Enter if plain => {
+                let row = self.ws_selected()?;
+                return Some(self.ws_activate(row));
+            }
+            KeyCode::Esc => self.set_ws_drawer(false),
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.set_ws_drawer(false)
+            }
+            _ => {
+                self.set_ws_drawer(false);
+                return None;
+            }
+        }
+        Some(Vec::new())
+    }
+
+    /// The compact layout's Workspaces screen's keys, on an empty line: ↑↓ select a row,
+    /// Enter acts on it. `None` for the rest.
+    pub(crate) fn ws_screen_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if !self.ws_screen() || !self.view.input.is_empty() {
+            return None;
+        }
+        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Up if plain => self.step_ws_sel(-1),
+            KeyCode::Down if plain => self.step_ws_sel(1),
+            KeyCode::Enter if key.modifiers.is_empty() => {
+                let row = self.ws_selected()?;
+                return Some(self.ws_activate(row));
+            }
+            _ => return None,
+        }
+        Some(Vec::new())
+    }
+
+    /// Enter on a row of the workspace list, or a tap on it: a workspace's card switches to
+    /// it (the drawer closes), `+ New workspace` asks for a name, `⚙ Settings` opens them.
+    pub(crate) fn ws_activate(&mut self, row: WsRow) -> Vec<Action> {
+        self.view.ws_sel = Some(row.clone());
+        match row {
+            WsRow::Workspace(name) => {
+                self.set_ws_drawer(false);
+                if self.workspace.as_deref() == Some(name.as_str()) {
+                    self.view.status = Some(format!("already in workspace {name}"));
+                    return Vec::new();
+                }
+                self.switch_workspace(&name)
+            }
+            WsRow::New => self.open_new_ws(None),
+            WsRow::Settings => self.open_settings(),
+        }
+    }
+
+    /// The wheel over the workspace list: a row up or down, from where it showed.
+    pub(crate) fn ws_wheel(&mut self, up: bool) {
+        // Where the wheel leaves it, until a key moves the selection.
+        self.view.ws_wheeled = true;
+        let at = self.view.panes.ws_start.min(self.view.panes.ws_max);
+        self.view.ws_scroll = if up {
+            at.saturating_sub(1)
+        } else {
+            (at + 1).min(self.view.panes.ws_max)
+        };
+    }
+
+    /// Why `name` can't be a new workspace (`twr ws new`'s rule, `default`, one that exists),
+    /// or `None` when it can.
+    pub fn new_ws_error(&self, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return Some("type the new workspace's name".into());
+        }
+        if name == twr_core::paths::DEFAULT_WORKSPACE {
+            return Some("the default workspace always exists".into());
+        }
+        if let Some(why) = workspace_name_error(name) {
+            return Some(why);
+        }
+        if self.tabs.iter().any(|t| t.name == name) {
+            return Some(format!(
+                "workspace {name} already exists (/ws {name} switches)"
+            ));
+        }
+        None
+    }
+
+    /// `+ New workspace`, `/ws new [name]`: asks for the new workspace's name (with `name`,
+    /// creates it as Enter in the dialog would). Never in a TUI an agent runs: only the user
+    /// makes workspaces (the CLI refuses an agent's too).
+    pub fn open_new_ws(&mut self, name: Option<&str>) -> Vec<Action> {
+        if self.workspace.is_none() {
+            self.view.status =
+                Some("workspaces: not here (this TUI was opened on a socket)".into());
+            return Vec::new();
+        }
+        if let Some(agent) = &self.agent {
+            self.view.status = Some(format!(
+                "this TUI runs for {agent}: agents cannot create workspaces, only you can, \
+                 from your own terminal"
+            ));
+            return Vec::new();
+        }
+        self.set_ws_drawer(false);
+        match name {
+            Some(name) => self.create_ws(name),
+            None => {
+                self.view.new_ws = Some(String::new());
+                self.view.action = None;
+                Vec::new()
+            }
+        }
+    }
+
+    /// Creates workspace `name` and switches to it, once it passes [`AppState::new_ws_error`];
+    /// otherwise the status bar says why.
+    fn create_ws(&mut self, name: &str) -> Vec<Action> {
+        if let Some(why) = self.new_ws_error(name) {
+            self.view.status = Some(why);
+            return Vec::new();
+        }
+        if let Some(to) = &self.switching {
+            self.view.status = Some(format!("already opening workspace {to}"));
+            return Vec::new();
+        }
+        self.view.new_ws = None;
+        self.view.confirm = None;
+        self.view.status = Some(format!("creating workspace {name}..."));
+        vec![Action::Workspace {
+            name: name.to_string(),
+            create: true,
+        }]
+    }
+
+    /// The new-workspace dialog's keys: a name's characters and its editing keys, Enter
+    /// creates it (when it is one, [`AppState::new_ws_error`]), Esc cancels. It takes every
+    /// key.
+    pub(crate) fn new_ws_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let Some(name) = self.view.new_ws.as_mut() else {
+            return Vec::new();
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.view.new_ws = None;
+                self.view.status = Some("cancelled".into());
+            }
+            KeyCode::Enter if !ctrl && !alt => {
+                let name = name.clone();
+                return self.create_ws(&name);
+            }
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Char('u' | 'w') if ctrl => name.clear(),
+            KeyCode::Char('h') if ctrl => {
+                name.pop();
+            }
+            KeyCode::Char(c)
+                if !ctrl && !alt && !c.is_control() && name.chars().count() < NEW_WS_MAX =>
+            {
+                name.push(c);
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// A paste into the new-workspace dialog: its first line, its control characters left out,
+    /// up to the dialog's length, as if typed.
+    pub(crate) fn paste_new_ws(&mut self, text: &str) {
+        let Some(name) = self.view.new_ws.as_mut() else {
+            return;
+        };
+        let line = text.lines().next().unwrap_or_default().trim();
+        for c in line.chars().filter(|c| !c.is_control()) {
+            if name.chars().count() >= NEW_WS_MAX {
+                break;
+            }
+            name.push(c);
+        }
+    }
+
+    /// `⚙ Settings`, `/settings`: opens the settings overlay ([`crate::settings`]), reading
+    /// what the config file says now, and asks the hub for its own.
+    pub fn open_settings(&mut self) -> Vec<Action> {
+        self.set_ws_drawer(false);
+        self.view.action = None;
+        let file = twr_core::paths::Paths::from_env()
+            .ok()
+            .map(|p| p.config_file);
+        self.view.settings = Some(crate::settings::Settings {
+            selected: 0,
+            hub: None,
+            file: Vec::new(),
+            path: file.as_deref().map(crate::settings::shown_path),
+        });
+        vec![Action::ConfigShow, Action::SettingsFile]
+    }
+
+    /// The settings overlay's keys: ↑↓ select a row, Enter, Space or → change it, ← back, Esc
+    /// (or q) closes. It takes every key.
+    pub(crate) fn settings_key(&mut self, key: KeyEvent) -> Vec<Action> {
+        let Some(s) = self.view.settings.as_mut() else {
+            return Vec::new();
+        };
+        let n = crate::settings::KEYS.len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.view.settings = None,
+            KeyCode::Up => s.selected = s.selected.saturating_sub(1),
+            KeyCode::Down => s.selected = (s.selected + 1).min(n - 1),
+            KeyCode::Home => s.selected = 0,
+            KeyCode::End => s.selected = n - 1,
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                let k = s.key();
+                return self.change_setting(k, true);
+            }
+            KeyCode::Left => {
+                let k = s.key();
+                return self.change_setting(k, false);
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    /// A tap on settings row `key`: selects it, and a tap on the selected one changes it.
+    pub(crate) fn tap_setting(&mut self, key: crate::settings::Key) -> Vec<Action> {
+        let Some(s) = self.view.settings.as_mut() else {
+            return Vec::new();
+        };
+        let Some(i) = crate::settings::KEYS.iter().position(|k| *k == key) else {
+            return Vec::new();
+        };
+        if s.selected != i {
+            s.selected = i;
+            return Vec::new();
+        }
+        self.change_setting(key, true)
+    }
+
+    /// Steps setting `key` (`forward` or back), applies it to this view at once, and has the
+    /// IO loop keep it ([`Action::Setting`], [`Action::WsSidebar`]). A row shown only, or a
+    /// TUI an agent runs, changes nothing and says why.
+    fn change_setting(&mut self, key: crate::settings::Key, forward: bool) -> Vec<Action> {
+        use crate::settings::{Change, Key};
+        if let Some(agent) = &self.agent {
+            self.view.status = Some(format!("this TUI runs for {agent}: it changes no setting"));
+            return Vec::new();
+        }
+        let Some(change) = crate::settings::step(self, key, forward) else {
+            self.view.status = Some(match key {
+                Key::SuggestModel => "the suggestion models are set in the config file: \
+                                      [tui] suggest_model"
+                    .into(),
+                Key::SummaryEvery => "the summaries' pace is set in the config file: \
+                                      [tui] summary_every"
+                    .into(),
+                _ => "a hub setting: edit the config file, then restart the hub \
+                      (twr hub stop, then twr)"
+                    .into(),
+            });
+            return Vec::new();
+        };
+        match &change {
+            Change::Suggest(on) => self.toggle_suggest(Some(*on)),
+            Change::Summaries(on) => self.toggle_summaries(Some(*on)),
+            Change::Colors(mode) => {
+                self.view.color_mode = *mode;
+                self.view.colors = crate::color::resolve_env(*mode);
+            }
+            Change::CardOrder(order) => {
+                self.view.card_order = *order;
+                self.view.shown_cards = None;
+                self.view.shown = None;
+            }
+            Change::Notify(alert) => self.view.notify_terminal = *alert,
+            Change::CompactWidth(w) => self.view.compact_width = *w,
+            Change::WsSidebar(on) => {
+                let actions = self.set_ws_sidebar(*on);
+                // The overlay stays open over it.
+                return actions;
+            }
+        }
+        self.view.status = Some("saving the setting…".into());
+        vec![Action::Setting(change)]
+    }
+
+    /// Setting `change` was written to the config file (`Ok`: its path as shown) or left
+    /// alone (why): the status bar says which (the file's values come after it,
+    /// [`AppState::settings_file`]).
+    pub fn setting_saved(
+        &mut self,
+        change: &crate::settings::Change,
+        saved: Result<String, String>,
+    ) {
+        let what = match change.config_key() {
+            Some((table, key, value)) => format!(
+                "[{}] {key} = {}",
+                table.join("."),
+                crate::settings::scalar_text(&value)
+            ),
+            None => return,
+        };
+        self.view.status = Some(match saved {
+            Ok(path) => format!("{what}: saved in {path}"),
+            Err(why) => {
+                format!("{what}: for this session only, the config file was left alone: {why}")
+            }
+        });
+    }
+
+    /// What the config file says of the TUI's keys, as the settings writer read it, for the
+    /// overlay while it is open.
+    pub fn settings_file(&mut self, file: Vec<(crate::settings::Key, Option<String>)>) {
+        if let Some(s) = self.view.settings.as_mut() {
+            s.file = file;
+        }
+    }
+
+    /// The hub's `config.show`, for the settings overlay while it is open.
+    pub(crate) fn settings_hub(&mut self, result: &serde_json::Value) {
+        if let Some(s) = self.view.settings.as_mut() {
+            s.hub = Some(result.clone());
+        }
+    }
+
     /// What tab `tab` shows: the current workspace's hub as the state has it now, the
     /// others as last asked.
     pub fn tab_hub(&self, tab: &Tab) -> TabHub {
-        if self.workspace.as_deref() != Some(tab.name.as_str()) {
+        if !self.shows_live(tab) {
             return tab.hub;
         }
         let workers: Vec<_> = self
@@ -259,13 +934,187 @@ impl AppState {
     pub fn set_tabs(&mut self, mut tabs: Vec<Tab>) {
         if let Some(current) = &self.workspace {
             if !tabs.iter().any(|t| &t.name == current) {
-                tabs.push(Tab {
-                    name: current.clone(),
-                    hub: TabHub::Unknown,
-                });
+                tabs.push(Tab::new(current.clone()));
             }
         }
         self.tabs = tabs;
+    }
+
+    /// The tabs after a poll: the workspaces `names` lists (`None`: it could not list them,
+    /// and they stay as they are), in its order, each as `polled` found its hub, or as it was
+    /// when it was not asked this time. A hub that did not answer keeps what it last said of
+    /// its orchestrator ([`Tab::glance`]).
+    pub fn merge_poll(&mut self, names: Option<Vec<String>>, polled: Vec<Polled>) {
+        let Some(names) = names else {
+            for p in polled {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.name == p.name) {
+                    tab.hub = p.hub;
+                    tab.glance = p.glance.or(tab.glance.take());
+                }
+            }
+            return;
+        };
+        let mut before: HashMap<String, Tab> = std::mem::take(&mut self.tabs)
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
+        let mut polled: HashMap<String, Polled> =
+            polled.into_iter().map(|p| (p.name.clone(), p)).collect();
+        let tabs = names
+            .into_iter()
+            .map(|name| {
+                let was = before.remove(&name);
+                match polled.remove(&name) {
+                    Some(p) => Tab {
+                        glance: p.glance.or(was.and_then(|w| w.glance)),
+                        hub: p.hub,
+                        name,
+                    },
+                    None => was.unwrap_or_else(|| Tab::new(name)),
+                }
+            })
+            .collect();
+        self.set_tabs(tabs);
+    }
+
+    /// Whether workspace `tab`'s card comes from the view itself: the current workspace while
+    /// its control stream runs and no poll found its hub gone. Otherwise what the view holds
+    /// of it is no longer news (its hub stopped, or restarted under it).
+    fn shows_live(&self, tab: &Tab) -> bool {
+        self.workspace.as_deref() == Some(tab.name.as_str())
+            && !self.control_lost
+            && tab.hub != TabHub::Stopped
+    }
+
+    /// What workspace `tab`'s card says of its orchestrator and its work: the current
+    /// workspace's from the state itself (its orchestrator's latest reply from its
+    /// conversation while the main pane shows it, else as its hub last said it), the others'
+    /// as their hubs last said.
+    pub fn tab_glance(&self, tab: &Tab) -> Option<Glance> {
+        if self.workspace.as_deref() != Some(tab.name.as_str()) {
+            return tab.glance.clone();
+        }
+        if !self.shows_live(tab) {
+            // A hub that answers (restarted since) says what is current; one that does not
+            // leaves the newest reply known, which the conversation may have had after the
+            // last poll, and nothing working.
+            if matches!(tab.hub, TabHub::Running { .. }) {
+                return tab.glance.clone();
+            }
+            let mut g = tab.glance.clone().unwrap_or_default();
+            g.active = false;
+            if let Some(o) = self.orchestrator() {
+                let polled = g.orch.clone();
+                let (preview, preview_seq) = self.newest_reply(&o.id, polled.as_ref(), true);
+                g.orch = Some(match polled {
+                    Some(p) => OrchGlance {
+                        preview,
+                        preview_seq,
+                        ..p
+                    },
+                    None => OrchGlance {
+                        id: Some(o.id.clone()),
+                        status: o.status(),
+                        preview,
+                        preview_seq,
+                    },
+                });
+            }
+            return Some(g);
+        }
+        let threads = self.registry.list();
+        let active = threads.iter().any(|t| {
+            !t.parked
+                && !(t.is_orchestrator() && t.retired)
+                && ((t.current_turn.is_some() && !t.is_blocked()) || t.own_background())
+        });
+        let polled = tab.glance.as_ref().and_then(|g| g.orch.as_ref());
+        let orch = self.orchestrator().map(|o| {
+            let (preview, preview_seq) = self.newest_reply(&o.id, polled, false);
+            OrchGlance {
+                id: Some(o.id.clone()),
+                preview_seq,
+                status: o.status(),
+                preview,
+            }
+        });
+        Some(Glance { active, orch })
+    }
+
+    /// Keeps what the current workspace's card shows ([`AppState::tab_glance`]) as its tab's
+    /// last glance, as this view is left: a reply the conversation showed after the last poll
+    /// stays on its card from another workspace, and once its hub stops.
+    pub fn keep_live_glance(&mut self) {
+        let Some(at) = self
+            .tabs
+            .iter()
+            .position(|t| self.workspace.as_deref() == Some(t.name.as_str()))
+        else {
+            return;
+        };
+        let tab = self.tabs[at].clone();
+        // (Whether something works stays as it was: the next poll says more, and a card
+        // whose hub stopped shows nothing working whatever it holds.)
+        if let Some(g) = self.tab_glance(&tab) {
+            self.tabs[at].glance = Some(g);
+        }
+    }
+
+    /// The newest reply known of orchestrator `id`, with its seq: the conversation's
+    /// ([`Transcript::last_reply`]) or the hub's (`polled`), whichever came later. A poll
+    /// about another orchestrator is about the hub's current one when the view's is no longer
+    /// news (`polled_is_current`: its control stream ended), else about one the view has
+    /// moved on from.
+    fn newest_reply(
+        &self,
+        id: &str,
+        polled: Option<&OrchGlance>,
+        polled_is_current: bool,
+    ) -> (Option<String>, Option<u64>) {
+        let live = self
+            .latest_reply(id)
+            .map(|(seq, text)| (Some(text), Some(seq)));
+        let Some(p) = polled else {
+            return live.unwrap_or_default();
+        };
+        let hubs = (p.preview.clone(), p.preview_seq);
+        if p.id.as_deref().is_some_and(|pid| pid != id) {
+            return if polled_is_current {
+                hubs
+            } else {
+                live.unwrap_or_default()
+            };
+        }
+        match live {
+            Some((_, Some(seq)))
+                if p.preview.is_some() && p.preview_seq.is_some_and(|s| s > seq) =>
+            {
+                hubs
+            }
+            Some(live) => live,
+            None => hubs,
+        }
+    }
+
+    /// The latest finished reply, with its seq, in thread `id`'s conversation as the view
+    /// holds it.
+    fn latest_reply(&self, id: &str) -> Option<(u64, String)> {
+        // The one the main pane shows, or one kept from before (a dive moved it aside), or the
+        // newest the view saw even once its transcript went ([`AppState::orch_reply`]): a kept
+        // one gets no more events, but its reply is compared by seq with the hub's, so it never
+        // hides a newer one.
+        let kept = self
+            .orch_reply
+            .as_ref()
+            .filter(|(thread, ..)| thread == id)
+            .map(|(_, seq, text)| (*seq, text.clone()));
+        self.transcript
+            .iter()
+            .chain(self.transcripts.iter())
+            .filter(|t| t.thread == id && !t.catching_up())
+            .filter_map(|t| t.last_reply.clone())
+            .chain(kept)
+            .max_by_key(|(seq, _)| *seq)
     }
 
     /// Switches to workspace `name` (`/ws <name>`, a click on its tab): one that exists is
@@ -297,6 +1146,13 @@ impl AppState {
         }
         if let Some(why) = workspace_name_error(name) {
             self.view.status = Some(why);
+            return Vec::new();
+        }
+        if let Some(agent) = &self.agent {
+            self.view.status = Some(format!(
+                "no workspace {name}, and this TUI runs for {agent}: agents cannot create \
+                 workspaces, only you can, from your own terminal"
+            ));
             return Vec::new();
         }
         self.view.confirm = Some(Confirm {
@@ -352,14 +1208,14 @@ impl AppState {
     /// Switches to the tab at `index` (Alt-1 is 0); nothing when there is none.
     pub fn switch_tab(&mut self, index: usize) -> Vec<Action> {
         match self.tabs.get(index).map(|t| t.name.clone()) {
-            Some(name) if self.tabs_shown() => self.switch_workspace(&name),
+            Some(name) if self.switchable() => self.switch_workspace(&name),
             _ => Vec::new(),
         }
     }
 
     /// Switches to the next tab (`forward`) or the previous one, around the ends.
     pub fn step_tab(&mut self, forward: bool) -> Vec<Action> {
-        if !self.tabs_shown() {
+        if !self.switchable() {
             return Vec::new();
         }
         let n = self.tabs.len();
@@ -383,6 +1239,7 @@ impl AppState {
         let taken_suggestion = self.taken_suggestion.take();
         let suggested_refs = std::mem::take(&mut self.suggested_refs);
         let sends_suggested = std::mem::take(&mut self.sends_suggested);
+        let summary = self.take_summaries();
         let v = &self.view;
         // Up on the input line shows a history entry (unedited): what the user had typed is
         // the line to keep.
@@ -420,6 +1277,7 @@ impl AppState {
             taken_suggestion,
             suggested_refs,
             sends_suggested,
+            summary,
             session_history: v
                 .history
                 .iter()
@@ -474,6 +1332,7 @@ impl AppState {
         self.taken_suggestion = saved.taken_suggestion;
         self.suggested_refs = saved.suggested_refs;
         self.sends_suggested = saved.sends_suggested;
+        self.restore_summaries(saved.summary);
         // The file's history goes before them as it is read ([`AppState::load_history`]).
         self.view.history = saved.session_history;
         self.restoring = Some(saved.restoring);
@@ -576,12 +1435,168 @@ mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+    /// A running hub is asked every [`POLL_RUNNING`], one stopped or not answering every
+    /// [`POLL_IDLE`], one never asked at once; one asked and not back yet is not asked again
+    /// before [`POLL_IDLE`]; a workspace gone is forgotten; `soon` asks one at the next tick.
+    #[test]
+    fn the_poll_clock_limits_how_often_each_hub_is_asked() {
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut clock = PollClock::default();
+        assert_eq!(clock.take_due(&names, at(0)), names);
+        // Not back yet: nothing is due at the next tick.
+        assert!(clock.take_due(&names, at(5_000)).is_empty());
+        let running = TabHub::Running {
+            threads: 0,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        clock.answered("a", &running, at(0));
+        clock.answered("b", &TabHub::Stopped, at(0));
+        clock.answered("c", &TabHub::Busy, at(0));
+        // The next tick, a little early or late, asks the running one only.
+        assert_eq!(clock.take_due(&names, at(4_900)), ["a"]);
+        clock.answered("a", &running, at(4_900));
+        assert!(clock.take_due(&names, at(9_000)).is_empty());
+        assert_eq!(clock.take_due(&names, at(10_000)), ["a"]);
+        clock.answered("a", &running, at(10_000));
+        assert_eq!(clock.take_due(&names, at(15_000)), ["a", "b", "c"]);
+        // Asked once each per due time, however often the clock is looked at.
+        assert!(clock.take_due(&names, at(15_001)).is_empty());
+        clock.soon("b");
+        assert_eq!(clock.take_due(&names, at(15_002)), ["b"]);
+        // A workspace removed is forgotten: made again, it is asked at once.
+        let fewer: Vec<String> = vec!["a".into()];
+        clock.take_due(&fewer, at(16_000));
+        assert_eq!(clock.take_due(&names, at(16_001)), ["b", "c"]);
+    }
+
+    /// A poll's answers replace what the tabs said of the hubs asked; a hub that stopped
+    /// keeps its orchestrator's last reply on its card; a workspace not asked keeps its tab,
+    /// a new one gets one, a removed one goes; and a poll that could not list the workspaces
+    /// changes only the hubs it asked.
+    #[test]
+    fn a_poll_updates_the_tabs_and_keeps_the_last_reply() {
+        let mut st = AppState::new();
+        st.workspace = Some("a".into());
+        let replied = Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Idle,
+                preview: Some("done".into()),
+                ..Default::default()
+            }),
+        };
+        let running = TabHub::Running {
+            threads: 1,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        let names = |n: &[&str]| Some(n.iter().map(|s| s.to_string()).collect());
+        st.merge_poll(
+            names(&["a", "b", "c"]),
+            vec![Polled {
+                name: "b".into(),
+                hub: running,
+                glance: Some(replied.clone()),
+            }],
+        );
+        assert_eq!(st.tabs.len(), 3);
+        assert_eq!(st.tabs[1].glance.as_ref(), Some(&replied));
+        st.merge_poll(
+            names(&["a", "b", "d"]),
+            vec![Polled {
+                name: "b".into(),
+                hub: TabHub::Stopped,
+                glance: None,
+            }],
+        );
+        let tab_names: Vec<&str> = st.tabs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(tab_names, ["a", "b", "d"]);
+        assert_eq!(st.tabs[1].hub, TabHub::Stopped);
+        assert_eq!(
+            st.tabs[1].glance.as_ref(),
+            Some(&replied),
+            "the last reply stays"
+        );
+        st.merge_poll(
+            None,
+            vec![Polled {
+                name: "d".into(),
+                hub: running,
+                glance: None,
+            }],
+        );
+        assert_eq!(st.tabs.len(), 3);
+        assert_eq!(st.tabs[2].hub, running);
+    }
+
+    /// The current workspace's card comes from the view itself: its orchestrator's status,
+    /// what works, and its latest reply once its conversation is loaded (else the hub's).
+    #[test]
+    fn the_current_workspace_card_comes_from_the_view() {
+        let mut st = crate::app::tests::with_orch();
+        st.workspace = Some("a".into());
+        st.set_tabs(vec![Tab {
+            name: "a".into(),
+            hub: TabHub::Unknown,
+            glance: Some(Glance {
+                active: false,
+                orch: Some(OrchGlance {
+                    status: ThreadStatus::Idle,
+                    preview: Some("polled".into()),
+                    ..Default::default()
+                }),
+            }),
+        }]);
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert!(g.active, "its workers run");
+        assert_eq!(g.orch.as_ref().unwrap().preview.as_deref(), Some("polled"));
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = Transcript::new(orch);
+        t.settle();
+        let mut o = twr_core::testkit::ThreadScript::new(t.thread.clone());
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("first"));
+        st.transcript = Some(t);
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("first"));
+    }
+
+    /// What an older hub's `thread.list` says: the current orchestrator (not a retired one),
+    /// whether a thread runs; and `hub.glance`'s fields.
+    #[test]
+    fn glances_read_both_hubs() {
+        let g = Glance::from_threads(&serde_json::json!([
+            {"role": "orchestrator", "status": "running", "retired": true},
+            {"role": "orchestrator", "status": "error"},
+            {"status": "idle"},
+        ]));
+        assert!(!g.active);
+        assert_eq!(g.orch.unwrap().status, ThreadStatus::Error);
+        let g = Glance::from_json(&serde_json::json!({
+            "active": true,
+            "orchestrator": {"status": "background", "preview": "  "},
+        }));
+        assert!(g.active);
+        let o = g.orch.unwrap();
+        assert_eq!((o.status, o.preview), (ThreadStatus::Background, None));
+        assert_eq!(
+            Glance::from_json(&serde_json::json!({"orchestrator": null})).orch,
+            None
+        );
+    }
+
     fn tabs(names: &[&str]) -> Vec<Tab> {
         names
             .iter()
             .map(|n| Tab {
                 name: n.to_string(),
                 hub: TabHub::Stopped,
+                glance: None,
             })
             .collect()
     }
@@ -955,6 +1970,7 @@ mod tests {
                 permissions: waiting,
                 questions: 0,
             },
+            glance: None,
         };
         let t0 = Instant::now();
         let at = |s: u64| t0 + std::time::Duration::from_secs(s);
@@ -992,6 +2008,7 @@ mod tests {
                 permissions,
                 questions,
             },
+            glance: None,
         };
         for (events, quiet, loud) in [
             (vec![NotifyEvent::Permission], tab(0, 1), tab(1, 0)),
@@ -1318,6 +2335,8 @@ mod tests {
         let mut st = in_workspaces("a", &["default", "a"]);
         control(&mut st, &evs);
         st.attach_via = attach_via(None, Some("a"), None);
+        // The cards as wide as without the workspace sidebar.
+        st.view.ws_sidebar_hidden = true;
         let screen = crate::app::tests::draw(&mut st, 160, 40);
         let text: String = (0..40)
             .map(|y| {

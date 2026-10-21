@@ -1143,6 +1143,17 @@ async fn silent_background_work_stalls_once_and_a_heartbeat_does_not_resolve_it(
         .open_attention
         .values()
         .any(|r| *r == AttentionReason::Stalled));
+    // Its background work went on (a task ended): the resolution says so.
+    let (_, evs) = hub.thread_events(&id, 0, 1000).unwrap();
+    let closed = evs
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::AttentionResolved(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(closed.by, ResolvedBy::Timeout);
+    assert!(went_on(&closed.ext), "{closed:?}");
     hub.stop_thread(&id, "test").unwrap();
     wait(&hub, &id, |e| e.kind() == "thread.stopped").await;
     hub.shutdown().await;

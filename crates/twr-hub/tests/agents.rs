@@ -609,8 +609,8 @@ fn assert_refused_by_marker(resp: &Value, thread: &str, peer: u32) {
 }
 
 /// A `pty` worker's shell runs a client: it reads (hello, hub.info, thread.list, thread.get,
-/// attention.list, control.read, trash.list, thread.transcript, thread.activity, box.agents;
-/// of the boxes' agents only whether each is found and signed in) but every other request (the
+/// attention.list, control.read, trash.list, thread.transcript, thread.activity, box.agents,
+/// hub.glance; of the boxes' agents only whether each is found and signed in) but every other request (the
 /// durable spawn's two methods included) is refused with the thread's name and its runtime's
 /// pid; a fresh probe of a box's agents is the user's (`unauthorized`). The user's own connection (this test process, which descends from no runtime) does
 /// the same requests and gets through. Once the runtime has stopped, nothing is restricted by
@@ -675,6 +675,7 @@ async fn a_workers_shell_only_reads() {
         json!({"id": 8, "method": "thread.transcript", "params": {"thread": "t2"}}),
         json!({"id": 9, "method": "thread.activity"}),
         json!({"id": 30, "method": "box.agents", "params": {"box": "local"}}),
+        json!({"id": 32, "method": "hub.glance"}),
     ];
     let writes = [
         json!({"id": 10, "method": "attention.respond", "params": {"attn_id": "x", "answer": "allow"}}),
@@ -717,6 +718,9 @@ async fn a_workers_shell_only_reads() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"w1") && names.contains(&"t2"), "{names:?}");
+    // Both threads are workers: the glance counts them.
+    assert_eq!(resps[10]["result"]["threads"], 2, "{}", resps[10]);
+    assert_eq!(resps[10]["result"]["workspace"], "default", "{}", resps[10]);
     for resp in &resps[reads.len()..] {
         assert_refused(resp, "w1", pid);
     }

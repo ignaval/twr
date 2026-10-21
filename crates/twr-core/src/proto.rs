@@ -265,6 +265,103 @@ where
     read_line_max(r, MAX_FRAME, ServerMessage::from_line).await
 }
 
+/// `summary.thread`'s parameters (users only; `twr-hub` `hub::summary`): a one-line summary of
+/// where worker `thread` stands, from the small model `models` names for the runtime that
+/// answers (each runtime's default when left out), at most one per `every_secs` (60 at least,
+/// ten years at most: more is `bad_request`); `retry` after the user turned summaries on again.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryThreadParams {
+    /// The thread, by id, name or alias.
+    pub thread: String,
+    /// The model for each runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<crate::config::SuggestModels>,
+    /// The shortest time between two summaries of the thread, in seconds (`[tui]
+    /// summary_every`).
+    pub every_secs: u64,
+    /// The user turned summaries on again (`/summaries on`): the hub probes the agents' CLIs
+    /// afresh and tries again what calls (of summaries or suggestions) found unable to run,
+    /// as `suggest.next`'s `retry` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
+}
+
+/// `summary.thread`'s result. `summary` is the thread's summary (`None`: none, `reason` says
+/// why); `basis` names what this ask read of the thread (a hash: the same basis gets the same
+/// summary); `covers` is the routine update the summary is of (the newest it read: `seq`
+/// `covers` of the orchestrator's thread `covers_in`; an unchanged basis, this ask's newest);
+/// `runtime` and `model` answered it; `cached`: no model was asked for this one; `next_after_secs`: ask
+/// again no sooner than this.
+///
+/// `reason` (absent with a fresh or cached summary): `none` (the model had nothing to say),
+/// `interval` (the last summary is younger than `every_secs`: `summary` is that one, made
+/// from an earlier basis, of the updates up to `covers`; also the answer to an ask that waited
+/// on a call made of another basis),
+/// `not_worker` (the orchestrator), `limit` (the hub's hourly cap), `backoff` (a call failed a
+/// moment ago), `failed: ...`, `unavailable: ...` (no runtime can run it here: no CLI, or none
+/// signed in; [`SummaryThreadResult::unavailable`]), `retry: ...` (this runtime can't run, another
+/// may for the next ask).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummaryThreadResult {
+    /// The thread's id.
+    pub thread: String,
+    /// The summary: one plain line.
+    pub summary: Option<String>,
+    /// What this ask read of the thread, as a hash (with `interval`, the summary was made from
+    /// an earlier one).
+    pub basis: String,
+    /// The `seq` (in the orchestrator's thread, `covers_in`) of the newest routine update the
+    /// summary read: the run of updates it is of. `None`: it read none, or there is no summary
+    /// (and from a hub before it was given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covers: Option<u64>,
+    /// The orchestrator's conversation (its thread's id) the summary read the updates in:
+    /// `covers` is a `seq` of that thread's. A reset or a switch of the orchestrator is a new
+    /// thread whose seqs start again, so an update is told by both. `None`: there was no
+    /// conversation to read, or no summary was made or kept to answer with (the hub held off,
+    /// a call failed), and from a hub before it was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covers_in: Option<String>,
+    /// The runtime that answered (`claude-code`, `codex`).
+    pub runtime: Option<String>,
+    /// The model that answered.
+    pub model: Option<String>,
+    /// Kept from before: no model was asked.
+    pub cached: bool,
+    /// Why there is no fresh summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Asking again sooner gets the same answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_secs: Option<u64>,
+    /// The hub's summary calls since it started.
+    pub stats: SummaryStats,
+}
+
+impl SummaryThreadResult {
+    /// Whether no runtime can run summaries here (no CLI, or none signed in): asking again
+    /// gets the same.
+    pub fn unavailable(&self) -> bool {
+        self.reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("unavailable: "))
+    }
+}
+
+/// The hub's summary calls since it started (`summary.thread` `stats`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummaryStats {
+    /// Calls made.
+    pub calls: u64,
+    /// Calls that failed.
+    pub failures: u64,
+    /// What they cost at list price, in US dollars.
+    pub cost_usd: f64,
+}
+
 /// Serializes `msg` as one NDJSON line (with the trailing newline).
 pub fn encode_line<T: Serialize>(msg: &T) -> serde_json::Result<String> {
     let mut s = serde_json::to_string(msg)?;
@@ -409,6 +506,28 @@ mod tests {
             r#"{"id":3,"error":{"code":"not_found","message":"no thread x"}}"#
         );
         assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), err);
+    }
+
+    /// `covers_in` is new: an older hub's answer (no `covers_in`) reads as `None`, an answer
+    /// without it is written without it, and one with it goes both ways.
+    #[test]
+    fn a_summary_result_carries_the_conversation_its_covers_is_in() {
+        let old: SummaryThreadResult =
+            serde_json::from_str(r#"{"thread":"api","summary":"ok","basis":"b","covers":7}"#)
+                .unwrap();
+        assert_eq!((old.covers, old.covers_in.as_deref()), (Some(7), None));
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("covers_in").is_none(), "{v}");
+        let new = SummaryThreadResult {
+            covers_in: Some("o2".into()),
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!((&v["covers"], &v["covers_in"]), (&json!(7), &json!("o2")));
+        assert_eq!(
+            serde_json::from_value::<SummaryThreadResult>(v).unwrap(),
+            new
+        );
     }
 
     #[test]

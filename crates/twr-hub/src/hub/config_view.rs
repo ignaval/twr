@@ -93,6 +93,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         notify,
         suggest,
         suggest_model,
+        summaries,
+        summary_every_span,
+        colors,
     } = tui;
     let TuiNotifyConfig {
         terminal,
@@ -231,6 +234,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "notify": { "terminal": terminal, "when": when, "events": events },
             "suggest": suggest,
             "suggest_model": suggest_model,
+            "summaries": summaries,
+            "summary_every": summary_every_span,
+            "colors": colors,
         },
     })
 }

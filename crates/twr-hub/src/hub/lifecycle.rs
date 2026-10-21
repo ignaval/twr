@@ -140,6 +140,7 @@ impl Hub {
                     .map_or_else(|| PathBuf::from("codex"), PathBuf::from)
             }),
             suggestions: Mutex::default(),
+            summaries: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,
             stall_after: opts.stall_after.unwrap_or(Duration::from_secs(stall_secs)),
@@ -520,6 +521,7 @@ impl Core {
             stalled: HashMap::new(),
             wake: Default::default(),
             hung: Default::default(),
+            went_on: Default::default(),
             activity: HashMap::new(),
             reserved_names: HashSet::new(),
             trash: Default::default(),

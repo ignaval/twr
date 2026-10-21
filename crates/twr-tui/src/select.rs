@@ -30,6 +30,9 @@ pub enum PaneId {
     Help,
     /// A workspace's tab in the strip ([`crate::workspace`]): a click switches to it.
     Tab(String),
+    /// The workspace sidebar, its drawer or the compact layout's Workspaces screen
+    /// ([`crate::sidebar`]): the wheel scrolls it.
+    Workspaces,
     /// Any other text: the status bar, headers, the first-run picker.
     Text,
 }
@@ -91,6 +94,19 @@ pub enum Target {
     /// A queued message listed above the input box, by its ref: selects it, and a tap on the
     /// selected one opens its action popup (Enter).
     Queued(i64),
+    /// A workspace's card in the workspace sidebar, its drawer or the compact layout's
+    /// Workspaces screen (every row of the card): switches to it, as its tab does.
+    Workspace(String),
+    /// `+ New workspace` under the workspaces (the whole row): asks for the new one's name.
+    NewWorkspace,
+    /// `⚙ Settings` under the workspaces (the whole row): opens the settings, as `/settings`.
+    Settings,
+    /// The workspace sidebar's header (`‹`, the whole row) hides it, and the tab strip's `≡`
+    /// shows it (or, where it does not fit, opens it as a drawer), as Ctrl-T does.
+    WsSidebar,
+    /// A row of the settings, by what it sets: selects it, and a tap on the selected one
+    /// changes it (Enter).
+    Setting(crate::settings::Key),
 }
 
 /// How a drawn row continues the row above it in the copied text.
@@ -268,11 +284,21 @@ pub struct Panes {
     pub trash_max: u16,
     /// The help overlay's furthest scroll as drawn (its rows past its height).
     pub help_max: u16,
+    /// The workspace list's furthest scroll as drawn (its rows past its height), and the row
+    /// it showed first ([`crate::sidebar::render_list`]): the wheel scrolls from there.
+    pub ws_max: usize,
+    pub ws_start: usize,
+    /// Where the workspace drawer was drawn: a click outside it closes it.
+    pub drawer: Option<Rect>,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the
     /// list keeps showing it first rather than the card now at its index.
     pub list_first: Option<String>,
+    /// The cards (and tiles) the draw measured, on each list it drew: the heights their text
+    /// takes there, from which [`crate::app::ViewState::card_fit`] keeps how tall each is
+    /// ([`crate::order::note`]).
+    pub fits: Vec<crate::order::Measure>,
     /// The action popup's rows the draw showed, whole, and what it was open on: Enter runs
     /// only one of them ([`crate::app::AppState`]'s `action_key`).
     pub popup_rows: Option<(crate::app::ActionTarget, Vec<crate::app::ActionKind>)>,
@@ -286,6 +312,9 @@ pub struct Panes {
     pub long_item: Option<String>,
     /// The controls drawn to be tapped ([`Target`]), in drawing order, none under an overlay.
     pub targets: Vec<(Rect, Target)>,
+    /// The folded rows of routine updates drawn in the orchestrator conversation, none under
+    /// an overlay: what a summary may be asked for ([`crate::summary`]).
+    pub routine: Vec<crate::summary::DrawnRun>,
 }
 
 /// The list of cards (a column, a row) or the grid of tiles as drawn: where it is and which
@@ -305,7 +334,7 @@ pub struct ListWindow {
 }
 
 /// Which list of cards: a first card (row) of one means nothing in another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListLayout {
     /// The column of cards beside the main pane.
     Column,
@@ -375,6 +404,7 @@ impl Panes {
                 self.items.retain(|i| !i.area.intersects(a));
                 self.moving.retain(|c| !c.intersects(a));
                 self.targets.retain(|(r, _)| !r.intersects(a));
+                self.routine.retain(|r| !r.area.intersects(a));
                 if self.card.as_ref().is_some_and(|c| c.area.intersects(a)) {
                     self.card = None;
                 }
@@ -384,6 +414,7 @@ impl Panes {
                 self.items.clear();
                 self.moving.clear();
                 self.targets.clear();
+                self.routine.clear();
                 self.card = None;
             }
         }

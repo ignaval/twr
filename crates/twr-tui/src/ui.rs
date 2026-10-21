@@ -28,17 +28,19 @@ use crate::select::{
     Anchor, DrawnItem, Join, ListLayout, ListWindow, Pane, PaneId, Panes, RequestCard, Target,
 };
 
-/// Height of a card with an attention item (and of the card row), borders included.
+/// The most rows a card with an attention item gets (and any card in the row of cards above
+/// a narrow conversation), borders included: a card is as tall as its text up to it
+/// ([`card_height`]).
 pub const CARD_HEIGHT: u16 = 11;
-/// Height of a card without an attention item in the side column, borders included (its
-/// title is its top border): 4 rows of its status section and its git row.
+/// The most rows a card without an attention item gets in the side column, borders included
+/// (its title is its top border): 4 rows of its status section and its git row.
 pub const COMPACT_CARD_HEIGHT: u16 = 7;
 /// Narrowest a card may get before cards start scrolling horizontally.
 pub const CARD_MIN_WIDTH: u16 = 30;
 /// Narrowest terminal whose cards go in a side column next to the main pane; narrower ones
 /// get a row of cards above it.
 pub const SIDE_MIN_WIDTH: u16 = 100;
-/// Height of a grid tile, borders included.
+/// The most rows a grid tile gets, borders included.
 pub const TILE_HEIGHT: u16 = 9;
 /// Rows of text the input box grows to at most (fewer on a short screen, [`input_cap`]).
 pub const INPUT_MAX_ROWS: usize = 6;
@@ -79,6 +81,7 @@ pub fn render_loading(frame: &mut Frame, state: &AppState) {
         .alignment(Alignment::Center),
         row,
     );
+    crate::color::degrade(frame.buffer_mut(), state.view.colors);
 }
 
 pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
@@ -93,6 +96,19 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else {
         area
     };
+    // The workspace sidebar, docked left of every view: the strip is not drawn then. It is
+    // drawn after the overlays, which stay right of it: its cards stay on screen and
+    // tappable, as the strip's tabs do.
+    let (dock, body) = if state.ws_docked() {
+        let [dock, rest] = Layout::horizontal([
+            Constraint::Length(crate::sidebar::DOCK_WIDTH),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        (Some(dock), rest)
+    } else {
+        (None, body)
+    };
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
         // A phone: one screen at a time.
@@ -106,17 +122,28 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     // clickable.
     if state.picker_open() {
         render_picker(frame, body, state, &mut panes);
+    } else if state.view.new_ws.is_some() {
+        crate::sidebar::render_new(frame, body, state, &mut panes);
+    } else if state.view.settings.is_some() {
+        crate::settings::render(frame, body, state, &mut panes);
     } else if state.view.help {
         render_help(frame, body, state.view.help_scroll, &mut panes);
     } else if let Some(trash) = &state.view.trash {
         render_trash(frame, body, trash, state.view.trash_scroll, &mut panes);
+    } else if state.ws_drawer_open() {
+        crate::sidebar::render_drawer(frame, body, state, &mut panes);
     } else if render_action_popup(frame, body, state, &mut panes).is_some() {
     } else {
         render_popup(frame, body, state, &mut panes);
     }
+    if let Some(dock) = dock {
+        crate::sidebar::render_docked(frame, dock, state, &mut panes);
+    }
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
     }
+    // Drawn in full color, then brought down to the colors the terminal has (`[tui] colors`).
+    crate::color::degrade(frame.buffer_mut(), state.view.colors);
     // The clock ticks only for a moving cell still on screen once the overlays are drawn
     // (never one off the buffer).
     let screen = frame.area();
@@ -125,7 +152,11 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes
 }
 
-/// The workspaces' tab strip ([`crate::workspace`]): each tab's name with its badges (`⚠n`
+/// The tab strip's control of the workspace sidebar.
+const MENU: &str = " ≡ ";
+
+/// The workspaces' tab strip ([`crate::workspace`]), after the `≡` that shows the workspace
+/// sidebar (or its drawer): each tab's name with its badges (`⚠n`
 /// items waiting on the user, `●n` threads running, `○` a stopped hub, `…` one that did not
 /// answer), the current one highlighted. A click on a tab switches to it
 /// ([`PaneId::Tab`]). When they don't all fit, the tabs around the current one show, with
@@ -156,6 +187,8 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             (t.name.clone(), badges, waiting, current)
         })
         .collect();
+    // The `≡` before them.
+    let width = width.saturating_sub(crate::edit::width(MENU));
     let cells = |(name, badges, waiting, _): &(String, String, Option<String>, bool)| {
         crate::edit::width(name)
             + crate::edit::width(badges)
@@ -193,6 +226,14 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         spans.push(Span::styled(text, style));
         w
     };
+    // The workspace sidebar's control: shows it, or opens it as a drawer where it does not
+    // fit ([`crate::sidebar`]).
+    let menu = x;
+    x += push(&mut spans, MENU.into(), Style::default().fg(Color::Cyan));
+    panes.target(
+        Rect::new(menu, area.y, x - menu, 1).intersection(area),
+        Target::WsSidebar,
+    );
     if first > 0 {
         x += push(&mut spans, "‹ ".into(), dim);
     }
@@ -228,13 +269,13 @@ fn on(area: Rect, cell: Rect) -> bool {
 
 /// The `✕` an overlay's top border ends in: the whole border row is its control
 /// ([`close_row`]).
-fn close_title() -> Line<'static> {
+pub(crate) fn close_title() -> Line<'static> {
     Line::from(" ✕ ").right_aligned()
 }
 
 /// Records the top border row of an overlay drawn over `rect` as control `target` (its `✕`,
 /// [`close_title`]): a row wide, for a finger.
-fn close_row(panes: &mut Panes, rect: Rect, target: Target) {
+pub(crate) fn close_row(panes: &mut Panes, rect: Rect, target: Target) {
     panes.target(
         Rect::new(rect.x, rect.y, rect.width, rect.height.min(1)),
         target,
@@ -364,6 +405,11 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-B", "show or hide the thread sidebar (/sidebar)"),
     (
+        "Ctrl-T",
+        "show or hide the workspace sidebar (/spaces); on a narrower screen open it as a \
+         drawer (↑↓ Enter, Esc closes), in the compact layout the Workspaces screen",
+    ),
+    (
         "Ctrl-F",
         "Focus mode: working threads and anything needing you (/focus)",
     ),
@@ -447,7 +493,10 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     ),
     (
         "controls",
-        "the Chat, Needs you and Threads tabs switch screens (a whole third of the bar each); \
+        "a workspace's card in the sidebar switches to it, + New workspace asks for a name, \
+         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ≡ shows \
+         it; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
+         the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
          [ no ] answer a question; a tap on a notice clears it, on a note does what its key \
@@ -488,8 +537,9 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread) and Threads (the cards), switched with /c, /n and /t or \
-         a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter opens it, its \
+         Needs you (a line per thread), Threads (the cards) and Workspaces, switched with /c, \
+         /n, /t and /w or a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter \
+         opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
     (
@@ -605,7 +655,7 @@ fn help_entry(
 }
 
 /// A `width` x `height` rect centered in `area` (clipped to it).
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let (width, height) = (area.width.min(width), area.height.min(height));
     Rect {
         x: area.x + (area.width - width) / 2,
@@ -958,14 +1008,11 @@ fn render_stack(
         render_main(frame, top, state, panes);
         false
     } else {
-        let row = if state.order().is_empty() {
-            3
-        } else {
-            CARD_HEIGHT
-        };
+        // As tall as its tallest card shown.
+        let row = card_row(state, top.width, panes);
         let [cards, main] =
-            Layout::vertical([Constraint::Length(row), Constraint::Min(3)]).areas(top);
-        let noted = render_cards(frame, cards, state, panes);
+            Layout::vertical([Constraint::Length(row.height()), Constraint::Min(3)]).areas(top);
+        let noted = render_cards(frame, cards, state, panes, row);
         render_main(frame, main, state, panes);
         noted
     };
@@ -1002,6 +1049,8 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
+    } else if pane == CompactPane::Workspaces {
+        crate::sidebar::render_screen(frame, list, state, panes);
     } else {
         render_compact_cards(frame, list, state, panes);
     }
@@ -1028,16 +1077,18 @@ pub const TAB_BAR_TALL_FROM: u16 = 24;
 /// From this many rows (and up to [`TAB_BAR_TALL_FROM`]) it is 2 rows tall.
 pub const TAB_BAR_SHORT_FROM: u16 = 14;
 
-/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2` and `Threads`, each a filled
-/// tab a third of the width wide and the bar's height tall, its name centered (`Needs 2`, then
-/// cut, where it does not fit), the current one reversed and bold, `Needs you` yellow while
-/// something waits. A tap anywhere in a tab's third (the gap after it included) shows its
-/// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
+/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2`, `Threads` and, when the TUI
+/// can switch workspaces, `Workspaces` (`⚠2`: what waits on the user in the others), each a
+/// filled tab an equal share of the width wide and the bar's height tall, its name centered
+/// (`Needs 2`, `Spaces`, then cut, where it does not fit), the current one reversed and bold,
+/// `Needs you` and `Workspaces` yellow while something waits. A tap anywhere in a tab's share
+/// (the gap after it included) shows its screen, as `/c`, `/n`, `/t` and `/w` do: the whole bar
+/// is tappable.
 fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let pane = state.view.compact_pane;
     let needs = state.needs_count();
-    let names = [
+    let mut names = vec![
         (CompactPane::Chat, "Chat".to_string(), "Chat".to_string()),
         if needs > 0 {
             (
@@ -1050,13 +1101,37 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         },
         (CompactPane::Threads, "Threads".into(), "Threads".into()),
     ];
+    // The workspaces, with what waits on the user in the others (a TUI opened on a socket
+    // has none to show).
+    let elsewhere = other_waiting(state);
+    if state.workspace.is_some() {
+        names.push(if elsewhere > 0 {
+            (
+                CompactPane::Workspaces,
+                format!("Workspaces ⚠{elsewhere}"),
+                format!("Spaces ⚠{elsewhere}"),
+            )
+        } else {
+            (
+                CompactPane::Workspaces,
+                "Workspaces".into(),
+                "Spaces".into(),
+            )
+        });
+    }
     panes.add(PaneId::Text, bar);
     // Fixed 256-color values, like the header band's ([`target_fill`]): legible on dark and
-    // light terminals alike.
-    let off = Style::default()
-        .fg(Color::Indexed(252))
-        .bg(Color::Indexed(238));
-    let shares = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
+    // light terminals alike. Without colors, unfilled: a fill is drawn reversed then
+    // ([`crate::color::degrade`]), and only the current tab is.
+    let off = if state.view.colors == crate::color::Depth::None {
+        Style::default()
+    } else {
+        Style::default()
+            .fg(Color::Indexed(252))
+            .bg(Color::Indexed(238))
+    };
+    let n = u32::try_from(names.len()).unwrap_or(3);
+    let shares = Layout::horizontal(vec![Constraint::Ratio(1, n); names.len()]).split(bar);
     for (k, ((p, long, short), share)) in names.iter().zip(shares.iter()).enumerate() {
         panes.target(*share, Target::Screen(*p));
         // A column apart from the next tab.
@@ -1070,7 +1145,9 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         };
         let style = if *p == pane {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if *p == CompactPane::Needs && needs > 0 {
+        } else if (*p == CompactPane::Needs && needs > 0)
+            || (*p == CompactPane::Workspaces && elsewhere > 0)
+        {
             off.fg(Color::Indexed(220)).add_modifier(Modifier::BOLD)
         } else {
             off
@@ -1092,6 +1169,17 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
             tab,
         );
     }
+}
+
+/// The items waiting on the user (permissions and questions) in the workspaces other than the
+/// one shown, as their hubs last said.
+fn other_waiting(state: &AppState) -> usize {
+    state
+        .tabs
+        .iter()
+        .filter(|t| state.workspace.as_deref() != Some(t.name.as_str()))
+        .map(|t| t.hub.waiting())
+        .sum()
 }
 
 /// The compact layout's Threads screen: the threads' cards, as the stack view draws them, in a
@@ -1116,8 +1204,8 @@ fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: 
 type CompactRows = Vec<(String, Line<'static>)>;
 
 /// "Needs you": one line per card that waits on the user, its most urgent item,
-/// `api · permission · Bash: git push`, and `(+2 more)` when it has more (answering one shows
-/// the next), most urgent first.
+/// `api · permission · Bash: git push` (the name in its card's color, [`card_color`]), and
+/// `(+2 more)` when it has more (answering one shows the next), most urgent first.
 fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
     use twr_core::event::AttentionReason;
     let mut rows = Vec::new();
@@ -1148,8 +1236,17 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
+        // The hub's card (`twr asks`) in its card's yellow.
+        let named = if id == twr_core::event::HUB_THREAD {
+            Style::default().fg(Color::Yellow)
+        } else {
+            state
+                .registry
+                .get(&id)
+                .map_or(Style::default(), |t| Style::default().fg(card_color(t)))
+        };
         let mut spans = vec![
-            Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(name, named.add_modifier(Modifier::BOLD)),
             Span::raw(" · "),
             Span::styled(kind, Style::default().fg(color)),
         ];
@@ -1473,35 +1570,104 @@ fn record(panes: &mut Panes, thread: &str, drawn: Option<(String, u64)>, inner: 
     }
 }
 
-/// The worker cards in a row (narrow terminals), as many as fit at [`CARD_MIN_WIDTH`].
-/// Returns whether the note on hidden parked threads ([`parked_note`]) is drawn: only the
-/// empty pane has room for it.
-fn render_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) -> bool {
+/// The row of cards above a narrow conversation, before it is drawn: the cards listed, the
+/// first shown, how many show, the furthest it scrolls, and the height each shown card is drawn
+/// at ([`card_height`]).
+struct CardRow {
+    order: Vec<String>,
+    start: usize,
+    count: usize,
+    max: usize,
+    heights: Vec<u16>,
+}
+
+impl CardRow {
+    /// Rows it takes: its tallest card's, or the empty pane's 3.
+    fn height(&self) -> u16 {
+        self.heights.iter().copied().max().unwrap_or(3)
+    }
+}
+
+/// The row of cards `width` columns wide ([`CardRow`]): as many cards as fit at
+/// [`CARD_MIN_WIDTH`], keeping the selected one in view unless the wheel scrolled them
+/// ([`list_start`]), each as tall as its text.
+fn card_row(state: &AppState, width: u16, panes: &mut Panes) -> CardRow {
     let order = state.order();
     if order.is_empty() {
-        return render_empty(frame, area, state, panes);
+        return CardRow {
+            order,
+            start: 0,
+            count: 0,
+            max: 0,
+            heights: Vec::new(),
+        };
     }
     let focus_idx = kept_in_view(state).and_then(|f| order.iter().position(|id| id == f));
-    let (fresh, count) = visible_window(order.len(), focus_idx, area.width);
+    let (fresh, count) = visible_window(order.len(), focus_idx, width);
     let max = order.len() - count;
     let layout = ListLayout::Row;
     let start = list_start(state, layout, &order, 1, focus_idx, fresh, max, |_| count);
+    let slots = row_slots(Rect::new(0, 0, width, 1), count);
+    let heights = slots
+        .iter()
+        .zip(&order[start..start + count])
+        .map(|(slot, id)| card_height(state, panes, id, layout, slot.width))
+        .collect();
+    CardRow {
+        order,
+        start,
+        count,
+        max,
+        heights,
+    }
+}
+
+/// `count` slots side by side over `area`, as wide as one another.
+fn row_slots(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
+    Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(area)
+}
+
+/// The worker cards in a row over `area` (narrow terminals), as [`card_row`] laid them out,
+/// each at its own height from the top of the row. Returns whether the note on hidden parked
+/// threads ([`parked_note`]) is drawn: only the empty pane has room for it.
+fn render_cards(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    panes: &mut Panes,
+    row: CardRow,
+) -> bool {
+    let CardRow {
+        order,
+        start,
+        count,
+        max,
+        heights,
+    } = row;
+    if order.is_empty() {
+        return render_empty(frame, area, state, panes);
+    }
     panes.list_first = order.get(start).cloned();
     panes.list = Some(ListWindow {
-        layout,
+        layout: ListLayout::Row,
         area,
         start,
         max,
     });
-    let slots = Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(area);
-    for (slot, (i, id)) in slots
+    let slots = row_slots(area, count);
+    for ((slot, height), (i, id)) in slots
         .iter()
+        .zip(heights)
         .zip(order.iter().enumerate().skip(start).take(count))
     {
         let left = (i == start && start > 0).then(|| format!("< {start} more"));
         let right = (i + 1 == start + count && start + count < order.len())
             .then(|| format!("{} more >", order.len() - i - 1));
-        draw_card(frame, *slot, state, id, (left, right), panes);
+        let slot = Rect {
+            height: height.min(slot.height),
+            ..*slot
+        };
+        draw_card(frame, slot, state, id, (left, right), panes);
     }
     false
 }
@@ -1512,17 +1678,70 @@ fn kept_in_view(state: &AppState) -> Option<&str> {
     state.focused().or(state.view.dive.as_deref())
 }
 
-/// Height of `id`'s card in a side column: [`CARD_HEIGHT`] for the hub's card and a card
-/// with an item (or shown as needing you until the order is next applied,
-/// [`AppState::card_tall`]), else [`COMPACT_CARD_HEIGHT`]. Fixed whatever its text says, so
-/// that text changing (its activity, its report, an item's options) never moves the cards
-/// below it; what does not fit is cut ([`card_rows`]).
-fn card_height(state: &AppState, id: &str) -> u16 {
-    if id == HUB_THREAD || state.card_tall(id) {
-        CARD_HEIGHT
-    } else {
-        COMPACT_CARD_HEIGHT
+/// The most rows card `id` gets on list `layout`, borders included: in the row of cards above
+/// a narrow conversation [`CARD_HEIGHT`], in the grid [`TILE_HEIGHT`], in a column (and on the
+/// compact Threads screen) [`CARD_HEIGHT`] for the hub's card and a card with an item open,
+/// else [`COMPACT_CARD_HEIGHT`]. What does not fit is cut ([`card_rows`]).
+fn card_cap(state: &AppState, id: &str, layout: ListLayout) -> u16 {
+    match layout {
+        ListLayout::Row => CARD_HEIGHT,
+        ListLayout::Grid(_) => TILE_HEIGHT,
+        ListLayout::Column | ListLayout::Compact(_) => {
+            if id == HUB_THREAD || state.top_attention(id).is_some() {
+                CARD_HEIGHT
+            } else {
+                COMPACT_CARD_HEIGHT
+            }
+        }
     }
+}
+
+/// How tall card `id` is drawn on list `layout`, `width` cells wide: as tall as its text
+/// there (its rows, [`card_rows`], within the list's most, [`card_cap`], and its borders; at
+/// least 3), or taller while it waits to shrink ([`crate::order::drawn_height`]). What it
+/// measured is recorded for the next frame ([`Panes::fits`]).
+fn card_height(
+    state: &AppState,
+    panes: &mut Panes,
+    id: &str,
+    layout: ListLayout,
+    width: u16,
+) -> u16 {
+    let cap = card_cap(state, id, layout);
+    let inner = width.saturating_sub(2);
+    let room = cap.saturating_sub(2);
+    let (rows, section) = if id == HUB_THREAD {
+        let (head, attn) = hub_card_parts(state, usize::from(inner));
+        let body = CardBody {
+            section: Vec::new(),
+            one: None,
+            attn,
+            git: None,
+        };
+        let n = card_rows(body, room, inner).0.len();
+        (n + head.len().min(usize::from(room).saturating_sub(n)), 0)
+    } else if let Some(t) = state.registry.get(id) {
+        let body = match layout {
+            ListLayout::Grid(_) => tile_body(state, t, inner),
+            _ => card_body(state, t, usize::from(inner), None),
+        };
+        let (rows, _, section) = card_rows_counted(body, room, inner);
+        (rows.len(), section)
+    } else {
+        (0, 0)
+    };
+    let natural = u16::try_from(rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(2)
+        .clamp(3, cap.max(3));
+    panes.fits.push(crate::order::Measure {
+        layout,
+        id: id.to_string(),
+        natural,
+        section: u16::try_from(section).unwrap_or(u16::MAX),
+        width,
+    });
+    crate::order::drawn_height(&state.view.card_fit, layout, id, natural, width)
 }
 
 /// The worker cards in a column beside the main pane, as many as fit, keeping the selected one
@@ -1584,7 +1803,10 @@ fn render_column(
     focus: Option<usize>,
     layout: ListLayout,
 ) {
-    let heights: Vec<u16> = order.iter().map(|id| card_height(state, id)).collect();
+    let heights: Vec<u16> = order
+        .iter()
+        .map(|id| card_height(state, panes, id, layout, area.width))
+        .collect();
     let (fresh, _) = column_window(&heights, focus, area.height);
     let max = column_max(&heights, area.height);
     let fits = |start: usize| column_count(&heights, start, u32::from(area.height));
@@ -1620,8 +1842,9 @@ fn one_row(s: &str) -> String {
 /// The card or tile drawn selected: the selected one, unless the main pane is
 /// ([`AppState::main_focused`]) or the selection is only the one a narrow dive puts on its
 /// hidden card ([`AppState::forced_focus`]). Typing goes on whatever is drawn selected: where
-/// the line goes is drawn in its own color ([`target_color`]: the main pane's thick border, the
-/// card of the thread dived into, [`Look::Target`]).
+/// the line goes is drawn in its own color ([`target_color`]: the main pane's header band and
+/// the input box), and the card of the thread dived into with a double border
+/// ([`Look::Target`]).
 fn highlighted(state: &AppState) -> Option<&str> {
     if state.main_focused() || state.forced_focus() {
         None
@@ -1631,8 +1854,8 @@ fn highlighted(state: &AppState) -> Option<&str> {
 }
 
 /// How a card or tile is drawn: selected (a thick yellow border), the thread dived into, where
-/// typed lines go (a thin border in the dive's color: told apart from the selection by both),
-/// or neither.
+/// typed lines go (a double border in its color: told apart from the selection by both, and
+/// from a plain card by its shape), or neither (a thin border in its color).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Look {
     Plain,
@@ -1651,19 +1874,22 @@ fn look(state: &AppState, id: &str) -> Look {
     }
 }
 
-/// `block` with the border of a card or tile drawn `look`, `plain` its border otherwise.
-fn card_border(block: Block<'static>, look: Look, plain: Style) -> Block<'static> {
+/// `block` with the border of a card or tile drawn `look`, in `color` (its thread's) unless it
+/// is selected: thick and yellow selected, double dived into, thin otherwise.
+fn card_border(block: Block<'static>, look: Look, color: Color) -> Block<'static> {
     match look {
         Look::Selected => block
             .border_type(BorderType::Thick)
             .border_style(Style::default().fg(Color::Yellow)),
-        Look::Target => block.border_style(Style::default().fg(target_color(true))),
-        Look::Plain => block.border_style(plain),
+        Look::Target => block
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(color)),
+        Look::Plain => block.border_style(Style::default().fg(color)),
     }
 }
 
 /// The title of a card or tile `width` columns wide: at its left its project, dim, then its
-/// name (`twr · scroll-follow`) and `[pin]`; at its right who runs it ([`who_fit`]:
+/// name in its color, bold (`twr · scroll-follow`, [`card_color`]) and `[pin]`; at its right who runs it ([`who_fit`]:
 /// `claude-code · sonnet-4-5`, with the box token of a remote box) and its permission mode,
 /// apart (`─ auto`). Where they do not all fit, the project gives way first: cut with `…` to
 /// the room the rest leaves ([`title_project`]), then left out; then who runs it shortens
@@ -1682,7 +1908,9 @@ fn card_block(
     let width = usize::from(width);
     let mut name = vec![Span::styled(
         format!(" {} ", t.name),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(card_color(t))
+            .add_modifier(Modifier::BOLD),
     )];
     if pinned {
         name.push(Span::styled("[pin] ", Style::default().fg(Color::Cyan)));
@@ -1815,7 +2043,7 @@ fn render_card(
 ) -> Option<(String, u64)> {
     let pinned = state.view.pins.contains(&t.id);
     let (block, unsaid) = card_block(state, t, pinned, area.width);
-    let block = card_border(block, look, Style::default().fg(Color::DarkGray));
+    let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
     let block = card_bottom(block, area.width, (more_left, more_right), token);
 
@@ -2144,7 +2372,8 @@ fn card_status(t: &ThreadView) -> String {
 }
 
 /// The rows a card or tile `height` rows tall and `width` wide shows of `body`, in its order
-/// (the section, the item, the git line at the bottom), and the item it shows in full (id and
+/// (the section, the item, the git line last), as many as it has up to `height` (never a blank
+/// row of padding), and the item it shows in full (id and
 /// revision), if any. When they do not all fit, they are kept in this order: the section's
 /// first row, the item's core (its badge, summary and options), the git line, the section's
 /// second row, the item's note and how many more wait, then the rest of the section, which
@@ -2159,6 +2388,16 @@ fn card_rows(
     height: u16,
     width: u16,
 ) -> (Vec<Line<'static>>, Option<(String, u64)>) {
+    let (rows, drawn, _) = card_rows_counted(body, height, width);
+    (rows, drawn)
+}
+
+/// [`card_rows`], and how many of the rows are the status section's.
+fn card_rows_counted(
+    body: CardBody,
+    height: u16,
+    width: u16,
+) -> (Vec<Line<'static>>, Option<(String, u64)>, usize) {
     let height = usize::from(height);
     let CardBody {
         mut section,
@@ -2166,10 +2405,18 @@ fn card_rows(
         attn,
         git,
     } = body;
+    // No blank row from the status section or the last report: their paragraph breaks are
+    // left out here (the detail views, which show the whole text, keep them). An item keeps
+    // every row, blank or only spaces: they are its content (spaces inside a quoted argument
+    // wrapped over rows), and a card that draws it whole must draw all of it ([`DrawnItem`]).
+    // Only the rows drawn are copied.
+    section.retain(|l| !blank_line(l));
     let (core, extra): (&[Line<'static>], &[Line<'static>]) = match &attn {
         Some(a) => (&a.core, &a.extra),
         None => (&[], &[]),
     };
+    let copy =
+        |rows: &[Line<'static>]| -> Vec<Line<'static>> { rows.iter().map(copied_row).collect() };
     let first = section.len().min(1).min(height);
     let mut room = height - first;
     let cut_to = |section: &mut Vec<Line<'static>>, n: usize| {
@@ -2187,8 +2434,8 @@ fn card_rows(
     };
     if core.len() > room {
         cut_to(&mut section, first);
-        section.extend_from_slice(&core[..room]);
-        return (section, None);
+        section.extend(copy(&core[..room]));
+        return (section, None, first);
     }
     room -= core.len();
     let mut grab = |want: usize| {
@@ -2200,25 +2447,45 @@ fn card_rows(
     let second = grab(section.len().saturating_sub(first).min(1));
     let extra_n = grab(extra.len());
     let rest = grab(section.len() - first - second);
-    cut_to(&mut section, first + second + rest);
+    let section_n = first + second + rest;
+    cut_to(&mut section, section_n);
     let mut rows = section;
-    rows.extend_from_slice(core);
-    rows.extend_from_slice(&extra[..extra_n]);
-    // The git line at the bottom of the card, the rows it leaves blank above it.
+    rows.extend(copy(core));
+    rows.extend(copy(&extra[..extra_n]));
+    // The git line last, right under the rest: a card taller than its text (one waiting to
+    // shrink, [`crate::order::Fit`]) leaves its spare rows under it, none inside.
     if let Some(git) = git.filter(|_| git_on) {
-        let blank = height.saturating_sub(rows.len() + 1);
-        rows.extend(std::iter::repeat_n(Line::default(), blank));
         rows.push(git);
     }
     let drawn = attn
         .as_ref()
         .filter(|a| a.exact && a.complete)
         .map(|a| a.item.clone());
-    (rows, drawn)
+    (rows, drawn, section_n)
+}
+
+/// Whether `line` shows nothing: no text, or only spaces.
+fn blank_line(line: &Line) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// Row `line` of an item's kept rows ([`AttnRows`]), copied into a card, tile or banner
+/// ([`card_rows`]). Counted in tests ([`CARD_ROW_COPIES`]): a frame copies only the rows it
+/// draws, however many the item has.
+fn copied_row(line: &Line<'static>) -> Line<'static> {
+    #[cfg(test)]
+    CARD_ROW_COPIES.with(|n| n.set(n.get() + 1));
+    line.clone()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many rows [`copied_row`] copied on this thread.
+    static CARD_ROW_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// `line` ending in `…`, within `width` cells: what comes after it was cut.
-fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
+pub(crate) fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
     let style = line.spans.last().map(|s| s.style).unwrap_or_default();
     let mut spans = line.spans;
     spans.push(Span::styled("…", style));
@@ -2232,7 +2499,7 @@ fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
 /// grapheme clusters, never inside one: a joined emoji stays whole). Drawn without
 /// wrapping, each row shows in full (but for a character wider than a row: see
 /// [`AttnRows::exact`]).
-fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     wrap_joined(line, width)
         .into_iter()
         .map(|(l, _)| l)
@@ -2839,6 +3106,30 @@ struct AttnRows {
     complete: bool,
 }
 
+impl AttnRows {
+    fn new(
+        item: (String, u64),
+        core: Vec<Line<'static>>,
+        extra: Vec<Line<'static>>,
+        exact: bool,
+        complete: bool,
+    ) -> Self {
+        Self {
+            item,
+            core,
+            extra,
+            exact,
+            complete,
+        }
+    }
+
+    /// How many rows a card, tile or banner shows of it: all of them, blank ones too (they are
+    /// its content).
+    fn card_len(&self) -> usize {
+        self.core.len() + self.extra.len()
+    }
+}
+
 /// A confirm card's detail view in rows ([`card_detail_rows`]).
 struct DetailRows {
     /// Every row: its badge and the head of its summary, each action, a blank row, its
@@ -3148,13 +3439,13 @@ fn attention_rows_of(
         }
     }
     let exact = core.iter().all(|l| l.width() <= width.max(1));
-    AttnRows {
-        item: (top.attn_id.clone(), top.revision),
+    AttnRows::new(
+        (top.attn_id.clone(), top.revision),
         core,
         extra,
         exact,
-        complete: cut.is_none(),
-    }
+        cut.is_none(),
+    )
 }
 
 /// A request's context ([`RequestContext`]) in rows `width` cells wide: each
@@ -3266,7 +3557,7 @@ fn render_hub_card(
             " twr asks ",
             Style::default().add_modifier(Modifier::BOLD),
         )));
-    let mut block = card_border(block, look, Style::default().fg(Color::Yellow));
+    let mut block = card_border(block, look, Color::Yellow);
     if let Some(l) = more_left {
         block = block.title_bottom(Line::from(l).left_aligned());
     }
@@ -3302,13 +3593,10 @@ fn render_grid_view(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut
     render_status(frame, status, state, panes, parked);
 }
 
-/// First visible grid row so that `focus_row` shows when `fit` rows fit.
-pub fn grid_first_row(focus_row: usize, fit: usize) -> usize {
-    (focus_row + 1).saturating_sub(fit.max(1))
-}
-
-/// The grid of tiles under a header; returns whether the hidden parked threads are noted (the
-/// header's `(N hidden, /parked shows)`, or the empty pane's [`parked_note`]).
+/// The grid of tiles under a header, each tile as tall as its text ([`card_height`]) from the
+/// top of its row, each row as tall as its tallest tile, as many rows as fit; returns whether
+/// the hidden parked threads are noted (the header's `(N hidden, /parked shows)`, or the empty
+/// pane's [`parked_note`]).
 fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) -> bool {
     let order = state.grid_order();
     let [header, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
@@ -3327,15 +3615,26 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     }
     let cols = grid_columns(area.width);
     let rows = order.len().div_ceil(cols);
-    let fit = usize::from(body.height / TILE_HEIGHT).max(1);
+    let layout = ListLayout::Grid(cols);
+    let slots = row_slots(body, cols);
+    // Each tile as tall as its text, each row of tiles as its tallest.
+    let tiles: Vec<u16> = order
+        .iter()
+        .enumerate()
+        .map(|(i, id)| card_height(state, panes, id, layout, slots[i % cols].width))
+        .collect();
+    let row_heights: Vec<u16> = tiles
+        .chunks(cols)
+        .map(|r| r.iter().copied().max().unwrap_or(3))
+        .collect();
     let focus_idx = state
         .focused()
         .and_then(|f| order.iter().position(|id| id == f));
-    let max = rows.saturating_sub(fit);
-    let layout = ListLayout::Grid(cols);
     let focus_row = focus_idx.map(|i| i / cols);
-    let fresh = grid_first_row(focus_row.unwrap_or(0), fit);
-    let first = list_start(state, layout, &order, cols, focus_row, fresh, max, |_| fit);
+    let (fresh, _) = column_window(&row_heights, focus_row, body.height);
+    let max = column_max(&row_heights, body.height);
+    let fits = |start: usize| column_count(&row_heights, start, u32::from(body.height));
+    let first = list_start(state, layout, &order, cols, focus_row, fresh, max, fits);
     panes.list_first = order.get(first * cols).cloned();
     panes.list = Some(ListWindow {
         layout,
@@ -3343,7 +3642,7 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         start: first,
         max,
     });
-    let last = (first + fit).min(rows);
+    let last = (first + fits(first)).min(rows);
 
     let threads = order.iter().filter(|id| *id != HUB_THREAD).count();
     let parked = order
@@ -3412,11 +3711,10 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         panes.target(cells, Target::Parked);
     }
 
-    let slots = Layout::horizontal(vec![Constraint::Ratio(1, cols as u32); cols]).split(body);
-    for row in first..last {
-        let y = body.y + (row - first) as u16 * TILE_HEIGHT;
-        let height = TILE_HEIGHT.min(body.bottom().saturating_sub(y));
-        if height == 0 {
+    let mut y = body.y;
+    for (row, row_height) in row_heights.iter().enumerate().take(last).skip(first) {
+        let room = body.bottom().saturating_sub(y);
+        if room == 0 {
             break;
         }
         for (col, slot) in slots.iter().enumerate() {
@@ -3424,7 +3722,7 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             let Some(id) = order.get(i) else {
                 break;
             };
-            let tile = Rect::new(slot.x, y, slot.width, height);
+            let tile = Rect::new(slot.x, y, slot.width, tiles[i].min(room));
             let look = look(state, id);
             let inner = Block::default().borders(Borders::ALL).inner(tile);
             panes.add(PaneId::Thread(id.clone()), inner);
@@ -3437,6 +3735,7 @@ fn render_grid(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             };
             record(panes, id, drawn, inner);
         }
+        y = y.saturating_add(*row_height);
     }
     noted
 }
@@ -3453,23 +3752,12 @@ fn render_tile(
     look: Look,
     panes: &mut Panes,
 ) -> Option<(String, u64)> {
-    let dim = Style::default().fg(Color::DarkGray);
     let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
-    let block = card_border(block, look, dim);
+    let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
     let block = card_bottom(block, area.width, (None, None), token);
     let inner = block.inner(area);
-    let turns = match t.turns {
-        1 => " · 1 turn".to_string(),
-        n => format!(" · {n} turns"),
-    };
-    // What the turns spent follows them.
-    let spent = t
-        .spent
-        .short()
-        .map(|spent| format!(" · {spent}"))
-        .unwrap_or_default();
-    let body = card_body(state, t, usize::from(inner.width), Some((&turns, &spent)));
+    let body = tile_body(state, t, inner.width);
     let status_row = body
         .section
         .first()
@@ -3485,6 +3773,22 @@ fn render_tile(
         area,
     );
     drawn
+}
+
+/// A grid tile's text `width` cells wide inside: its card's ([`card_body`]), with its turns
+/// and what they spent after its git state.
+fn tile_body(state: &AppState, t: &ThreadView, width: u16) -> CardBody {
+    let turns = match t.turns {
+        1 => " · 1 turn".to_string(),
+        n => format!(" · {n} turns"),
+    };
+    // What the turns spent follows them.
+    let spent = t
+        .spent
+        .short()
+        .map(|spent| format!(" · {spent}"))
+        .unwrap_or_default();
+    card_body(state, t, usize::from(width), Some((&turns, &spent)))
 }
 
 fn status_color(s: ThreadStatus) -> Color {
@@ -3626,41 +3930,31 @@ pub struct Threads<'a> {
 }
 
 impl<'a> Threads<'a> {
-    /// The thread `name` names exactly: its name, id or an alias, or a name it had before it
-    /// was renamed (a box written before the rename). No prefix match: a box names one thread
-    /// or none.
+    /// The thread `name` names exactly ([`AppState::thread_named`]): its name, id or an alias,
+    /// or a name it had before it was renamed (a box written before the rename), a deleted
+    /// thread's too (what was said of it keeps its name and color). No prefix match: a box
+    /// names one thread or none.
     fn get(&self, name: &str) -> Option<&'a ThreadView> {
-        let t = self.state?.registry.resolve(name).ok()?;
-        (t.name == name
-            || t.id == name
-            || t.aliases.iter().any(|a| a == name)
-            || t.former_names.iter().any(|n| n == name))
-        .then_some(t)
+        self.state?.thread_named(name)
+    }
+
+    /// Whether `t` is a live thread, not a deleted one [`Threads::get`] found (which has no
+    /// status any more).
+    fn live(&self, t: &ThreadView) -> bool {
+        self.state.is_some_and(|s| !s.registry.is_deleted(&t.id))
     }
 }
 
-/// The colors of thread boxes and of thread names on folded lines: fixed 256-color values (a
-/// blue, a green, a violet, a tan, a mauve and a grey teal), none of them the orchestrator's
-/// cyan (80), a dive's magenta (176), the working cursor's orange (173) or a confirm card's
-/// yellow.
-pub const THREAD_COLORS: [Color; 6] = [
-    Color::Indexed(75),
-    Color::Indexed(114),
-    Color::Indexed(141),
-    Color::Indexed(180),
-    Color::Indexed(139),
-    Color::Indexed(109),
-];
+pub use crate::color::{thread_color, THREAD_COLORS};
 
-/// Thread `id`'s color, one of [`THREAD_COLORS`]: the same for the same id on every frame
-/// and every run (FNV-1a of its bytes).
-pub fn thread_color(id: &str) -> Color {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in id.bytes() {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
+/// The color of `t`'s card or tile (its border and name) and of its name in a compact list:
+/// its own ([`thread_color`]), the orchestrator's cyan for the orchestrator's.
+fn card_color(t: &ThreadView) -> Color {
+    if t.is_orchestrator() {
+        target_color(None)
+    } else {
+        thread_color(&t.id)
     }
-    THREAD_COLORS[h as usize % THREAD_COLORS.len()]
 }
 
 /// A part of the orchestrator's reply ([`thread_sections`]).
@@ -3894,12 +4188,24 @@ fn long_rows(
             }
         }
     }
+    // Selected, it shows without colors too: a box's frame thick, as a selected card's; the
+    // footer of a block without one bold.
+    let frame = if selected && !boxed {
+        frame.add_modifier(Modifier::BOLD)
+    } else {
+        frame
+    };
     rows.push((
         Line::from(Span::styled(footer, frame)),
         join,
         Some(format!("toggle:{key}")),
         Edge::Bottom,
     ));
+    if selected && boxed {
+        for row in &mut rows {
+            thicken(row);
+        }
+    }
     rows
 }
 
@@ -3913,12 +4219,13 @@ fn limit_block(v: &mut View, start: usize, key: String, threads: &Threads) {
 /// The rows of the thread section `name` with `text`, `width` cells wide (the pane's): a
 /// rounded box in the thread's color ([`thread_color`]), dim grey for a name that matches no
 /// thread, its top border titled with the thread's name and status (`╭─ web · running ──╮`,
-/// the status dropped first when the title doesn't fit), the text wrapped inside, and its
-/// bottom border once `closed` (a section still streaming in is open at the bottom). Title
-/// and text are measured in display cells ([`wrap_rows`], [`truncate_cells`]), so every
-/// framed row is exactly `width` cells, wide characters and combining marks included. Its
-/// frame is marked ([`Edge`]) so a copy leaves it out. The box is the orchestrator's own
-/// text: rounded and in a thread's color, it never looks like a card.
+/// the status dropped first when the title doesn't fit; a deleted thread's name alone), the
+/// text wrapped inside, and its bottom border once `closed` (a section still streaming in is
+/// open at the bottom). Title and text are measured in display cells ([`wrap_rows`],
+/// [`truncate_cells`]), so every framed row is exactly `width` cells, wide characters and
+/// combining marks included. Its frame is marked ([`Edge`]) so a copy leaves it out. The box
+/// is the orchestrator's own text: rounded and in a thread's color, it never looks like a
+/// card.
 fn thread_box(
     name: &str,
     text: &str,
@@ -3951,6 +4258,7 @@ fn thread_box(
     )];
     let label_w = crate::edit::width(label);
     if let Some((s, text)) = thread
+        .filter(|t| threads.live(t))
         .map(|t| (t.status(), t.status_label()))
         .filter(|(_, text)| label_w + 3 + text.len() <= room)
     {
@@ -4118,7 +4426,9 @@ fn notice_thread(prompt: &str) -> Option<&str> {
 /// after `✻`, and a blank row between blocks. With `threads.boxes`, each thread section of the
 /// agent's text is a box ([`thread_box`]); a folded line whose calls or updates are all about
 /// one thread names it. The hub's updates are one row each (a request and how it ended on one
-/// row), and a run of answered requests folds into one.
+/// row), a run of answered requests folds into one, and in the orchestrator's conversation
+/// (`threads.boxes`) a thread's run of routine updates draws as one row at the place of its
+/// newest ([`crate::summary`], [`routine_row`]).
 pub fn transcript_view(
     entries: &[Entry],
     width: u16,
@@ -4139,6 +4449,9 @@ pub struct Spans {
     /// its text after one): a place is counted from its section's first row ([`Anchor`]),
     /// so a long block collapsed or expanded moves no place in the entry's other sections.
     pub sections: Vec<usize>,
+    /// The folded rows of routine updates ([`crate::summary`]), each with its row (its
+    /// `area` left empty: the pane that draws it says where).
+    pub runs: Vec<(usize, crate::summary::DrawnRun)>,
 }
 
 /// [`transcript_view`] and the rows each entry drew ([`Spans`]).
@@ -4150,6 +4463,7 @@ pub fn transcript_view_spans(
 ) -> (Vec<TranscriptRow>, Spans) {
     let mut spans = Vec::with_capacity(entries.len());
     let mut sections = Vec::new();
+    let mut folded_runs = Vec::new();
     let width = usize::from(width.max(1));
     let mut v = View {
         out: Vec::new(),
@@ -4185,10 +4499,44 @@ pub fn transcript_view_spans(
         v.out
             .extend(request_rows(threads.state.unwrap(), item, width as u16));
     }
+    // A thread's routine updates: one row, at the place of its newest. Their seqs are those of
+    // the conversation the main pane shows (the entries are its transcript's).
+    let conv = threads
+        .state
+        .and_then(|s| s.transcript.as_ref())
+        .map_or("", |t| t.thread.as_str());
+    let runs =
+        (collapse.on && threads.boxes).then(|| crate::summary::runs(entries, threads.state, conv));
     let mut i = 0;
     while i < entries.len() {
         let start = v.out.len();
         match &entries[i] {
+            Entry::HubUpdate { .. } if runs.as_ref().and_then(|r| r.of(i)).is_some() => {
+                let run = runs.as_ref().and_then(|r| r.of(i)).unwrap();
+                if !collapse.folded(&run.key) {
+                    v.block(Kind::Compact);
+                    hub_update_rows(&mut v, &entries[i], threads);
+                    limit_block(&mut v, start, block_key(&entries[i], i, threads), threads);
+                } else if run.newest() == i {
+                    v.block(Kind::Compact);
+                    let at = v.out.len();
+                    let row = routine_row(run, entries, threads, width);
+                    v.out
+                        .push((row, Join::Newline, Some(run.key.clone()), Edge::Gutter(2)));
+                    folded_runs.push((
+                        at,
+                        crate::summary::DrawnRun {
+                            thread: run.thread.clone(),
+                            conv: run.conv.clone(),
+                            key: run.key.clone(),
+                            newest_seq: run.newest_seq,
+                            live: run.live,
+                            area: Rect::default(),
+                        },
+                    ));
+                }
+                // (Its other updates draw nothing.)
+            }
             Entry::HubUpdate {
                 attn_id: Some(id),
                 outcome: None,
@@ -4343,6 +4691,7 @@ pub fn transcript_view_spans(
     let spans = Spans {
         entries: spans,
         sections,
+        runs: folded_runs,
     };
     (v.out, spans)
 }
@@ -4415,22 +4764,42 @@ impl View {
         &mut self,
         at: usize,
         mark: (&str, Style),
-        lead: Vec<(String, Style)>,
+        mut lead: Vec<(String, Style)>,
         text: &str,
         style: Style,
     ) {
+        lead.push((text.to_string(), style));
+        self.marked_spans(at, mark, lead);
+    }
+
+    /// [`View::marked`] for a text in several styles (`spans`): each of its lines (a `\n` in
+    /// any span breaks one) wrapped under the mark; an empty line after the first is left out.
+    fn marked_spans(&mut self, at: usize, mark: (&str, Style), spans: Vec<(String, Style)>) {
         let hang = (at + crate::edit::width(mark.0)).min(self.width / 2);
         let at = at.min(self.width / 2);
-        for (k, line) in text.split('\n').enumerate() {
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let mut spans = Vec::new();
-            if k == 0 {
-                spans.push((mark.0.to_string(), mark.1));
-                spans.extend(lead.iter().cloned());
+        // A line's `\r` before its break (or at the end) is no text.
+        let strip_cr = |line: &mut Vec<(String, Style)>| {
+            if let Some(last) = line.last_mut().filter(|(t, _)| t.ends_with('\r')) {
+                last.0.pop();
+                if last.0.is_empty() {
+                    line.pop();
+                }
             }
-            if !line.is_empty() {
-                spans.push((line.to_string(), style));
+        };
+        let mut lines: Vec<Vec<(String, Style)>> = vec![vec![(mark.0.to_string(), mark.1)]];
+        for (text, style) in spans {
+            for (k, piece) in text.split('\n').enumerate() {
+                if k > 0 {
+                    strip_cr(lines.last_mut().unwrap());
+                    lines.push(Vec::new());
+                }
+                if !piece.is_empty() {
+                    lines.last_mut().unwrap().push((piece.to_string(), style));
+                }
             }
+        }
+        strip_cr(lines.last_mut().unwrap());
+        for (k, spans) in lines.into_iter().enumerate() {
             if spans.is_empty() {
                 continue;
             }
@@ -4923,6 +5292,35 @@ fn about_spans(about: Option<&str>, threads: &Threads) -> Vec<Span<'static>> {
     ]
 }
 
+/// The row of a thread's folded run of routine updates ([`crate::summary`]): `◦ api · <its
+/// summary> (ctrl+o to expand)`, the thread's name in its color, the summary when there is one
+/// ([`AppState::summary_text`]), else what its newest update says and how many there are
+/// ([`crate::summary::Run::plain`]); cut to `width`, the hint shortened first.
+fn routine_row(
+    run: &crate::summary::Run,
+    entries: &[Entry],
+    threads: &Threads,
+    width: usize,
+) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let text = threads
+        .state
+        .and_then(|s| s.summary_text(run))
+        .map_or_else(|| run.plain(entries, threads.state), str::to_string);
+    let mut spans = vec![Span::styled("◦ ", dim)];
+    spans.extend(about_spans(Some(&run.thread), threads));
+    let head: usize = spans.iter().map(|s| crate::edit::width(&s.content)).sum();
+    let text_w = crate::edit::width(&text);
+    let hint = [" (ctrl+o to expand)", " (ctrl+o)"]
+        .into_iter()
+        .find(|h| head + text_w + crate::edit::width(h) <= width)
+        .unwrap_or(" (ctrl+o)");
+    spans.push(Span::styled(text, Style::default().fg(MUTED)));
+    let mut line = cut_spans(spans, width.saturating_sub(crate::edit::width(hint)));
+    line.push(Span::styled(hint, dim));
+    Line::from(cut_spans(line, width))
+}
+
 /// The row of a folded hub notice turn: `· hub update`, after the thread it is about.
 fn marker_row(marker: &str, about: Option<&str>, threads: &Threads, width: usize) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
@@ -4945,11 +5343,14 @@ enum UpdateShape<'a> {
         what: &'a str,
         summary: &'a str,
     },
-    /// `<name> finished (<grade>): <summary>`: a report.
+    /// `<name> finished (<grade>): <summary>`: a report; `follow_up` for one of a turn the
+    /// thread started after its background work (`<name> finished, in a follow-up turn it
+    /// started after background work (<grade>): <summary>`).
     Finished {
         name: &'a str,
         grade: &'a str,
         summary: &'a str,
+        follow_up: bool,
     },
     /// Anything else, as it is.
     Other(&'a str),
@@ -4957,14 +5358,23 @@ enum UpdateShape<'a> {
 
 impl<'a> UpdateShape<'a> {
     fn of(text: &'a str) -> Self {
-        if let Some((name, rest)) = text.split_once(" finished (") {
-            if let Some((grade, summary)) = rest.split_once("): ") {
-                if !name.contains(' ') {
-                    return UpdateShape::Finished {
-                        name,
-                        grade,
-                        summary,
-                    };
+        for (finished, follow_up) in [
+            (" finished (", false),
+            (
+                " finished, in a follow-up turn it started after background work (",
+                true,
+            ),
+        ] {
+            if let Some((name, rest)) = text.split_once(finished) {
+                if let Some((grade, summary)) = rest.split_once("): ") {
+                    if !name.contains(' ') {
+                        return UpdateShape::Finished {
+                            name,
+                            grade,
+                            summary,
+                            follow_up,
+                        };
+                    }
                 }
             }
         }
@@ -4974,6 +5384,7 @@ impl<'a> UpdateShape<'a> {
             "failed",
             "needs review",
             "is stalled",
+            "seems hung",
         ] {
             if let Some((name, summary)) = text.split_once(&format!(" {what}: ")) {
                 if !name.contains(' ') {
@@ -5081,6 +5492,7 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
                 name,
                 grade,
                 summary,
+                follow_up,
             },
             _,
         ) => {
@@ -5095,7 +5507,14 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
                 ("● ", Style::default().fg(gc)),
                 vec![
                     (name.to_string(), color(name).add_modifier(Modifier::BOLD)),
-                    (format!(" finished · {grade}"), dim),
+                    (
+                        if follow_up {
+                            format!(" finished in a follow-up turn · {grade}")
+                        } else {
+                            format!(" finished · {grade}")
+                        },
+                        dim,
+                    ),
                 ],
                 "",
                 dim,
@@ -5105,16 +5524,179 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
         }
         (UpdateShape::Other(text), Some(outcome)) => {
             let (words, mark, mc) = outcome_words("", outcome);
-            v.marked(
-                0,
-                (&format!("{mark} "), Style::default().fg(mc)),
-                Vec::new(),
-                &format!("{text} ({words})"),
-                dim,
-            );
+            let mut spans = named_spans(text, about.as_deref(), threads, dim);
+            spans.push((format!(" ({words})"), dim));
+            v.marked_spans(0, (&format!("{mark} "), Style::default().fg(mc)), spans);
         }
-        (UpdateShape::Other(text), None) => v.marked(0, ("· ", dim), Vec::new(), text, dim),
+        (UpdateShape::Other(text), None) => {
+            let spans = named_spans(text, about.as_deref(), threads, dim);
+            v.marked_spans(0, ("· ", dim), spans);
+        }
     }
+}
+
+/// An update of no other shape in `style`, each thread it names in the thread's color:
+/// - with `about` (the thread the hub says it is about, an id), every word that is one of that
+///   thread's names (`Watching api: …`, `Stopped watching api (w1).`, `api's background work
+///   finished …`, `api request p1 closed.`);
+/// - without, a thread's name it starts with (`api background work finished.`, an older
+///   hub's);
+/// - in either, the threads the hub lists where it names several or none is the update's
+///   ([`hub_lists`]: `Stopped watching api, web (w1, w2).`, `Queued until api finishes: …`,
+///   `Applied: api: allow; web → plan mode.`, `Confirmed. Applied: allow api. …`, `Disk card
+///   for b: trimmed api (1 MB).`).
+///
+/// A word is a run of the characters a name has (`[A-Za-z0-9._-]`), without the dots that end
+/// a sentence: `api` in `api.` and `api's`, never in `api-v2`.
+fn named_spans(
+    text: &str,
+    about: Option<&str>,
+    threads: &Threads,
+    style: Style,
+) -> Vec<(String, Style)> {
+    let mut named: Vec<(Range<usize>, Color)> = Vec::new();
+    match about {
+        Some(id) => {
+            if let Some(t) = threads.get(id).filter(|t| t.id == id) {
+                let color = thread_color(&t.id);
+                for (at, w) in name_words(text) {
+                    if w == t.name || t.aliases.iter().chain(&t.former_names).any(|n| n == w) {
+                        named.push((at..at + w.len(), color));
+                    }
+                }
+            }
+        }
+        None => {
+            let word = text.split([' ', '\n']).next().unwrap_or_default();
+            let name = word.strip_suffix("'s").unwrap_or(word);
+            if let Some(t) = threads.get(name).filter(|_| !name.is_empty()) {
+                named.push((0..name.len(), thread_color(&t.id)));
+            }
+        }
+    }
+    for at in hub_lists(text) {
+        let w = &text[at.clone()];
+        if let Some(t) = threads.get(w).filter(|_| !w.is_empty()) {
+            named.push((at, thread_color(&t.id)));
+        }
+    }
+    named.sort_by_key(|(r, _)| r.start);
+    let mut spans = Vec::new();
+    let mut from = 0;
+    for (r, color) in named {
+        if r.start < from {
+            continue;
+        }
+        if r.start > from {
+            spans.push((text[from..r.start].to_string(), style));
+        }
+        spans.push((text[r.clone()].to_string(), style.fg(color)));
+        from = r.end;
+    }
+    if from < text.len() || spans.is_empty() {
+        spans.push((text[from..].to_string(), style));
+    }
+    spans
+}
+
+/// The words of `text` that could be thread names, with where each starts ([`named_spans`]).
+fn name_words(text: &str) -> Vec<(usize, &str)> {
+    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.');
+    let mut out = Vec::new();
+    let mut start = None;
+    for (i, c) in text.char_indices().chain([(text.len(), ' ')]) {
+        match (start, part(c)) {
+            (None, true) => start = Some(i),
+            (Some(s), false) => {
+                let run = &text[s..i];
+                let word = run.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+                if !word.is_empty() {
+                    let lead = run.len()
+                        - run
+                            .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+                            .len();
+                    out.push((s + lead, word));
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Where the hub lists threads by name in an update ([`named_spans`]), each name's place:
+/// - `Stopped watching api, web (w1, w2).` (`hub::watches`, several watches);
+/// - `Queued until api, web finish: …` and `Sent the prompt queued until api finished.`
+///   (`hub::after`; not the prompt after the `:`);
+/// - `Applied: api: allow; web → plan mode.` (`hub::commands`);
+/// - `Confirmed. Applied: allow api, set web → auto. Skipped: …` (`hub::updates`, the
+///   actions of `hub::proposal`: the word after `allow`, `deny`, `answer`, `set`, `move`);
+/// - `Disk card for b: trimmed api (1 MB), web (2 MB). Not trimmed: db (why).` (`hub::disk`).
+///
+/// Each candidate is checked as a thread's name by the caller: a word that names none (`every
+/// worker`) stays as it is.
+fn hub_lists(text: &str) -> Vec<Range<usize>> {
+    // The first word of each item of the list `text[from..to]` split by `sep`.
+    let items = |from: usize, to: usize, sep: &str| -> Vec<Range<usize>> {
+        let mut out = Vec::new();
+        let mut at = from;
+        for item in text[from..to].split(sep) {
+            let end = item.find([' ', ':', '(', ',']).unwrap_or(item.len());
+            let word = item[..end].trim_end_matches('.');
+            out.push(at..at + word.len());
+            at += item.len() + sep.len();
+        }
+        out
+    };
+    let after = |prefix: &str| text.strip_prefix(prefix).map(|_| prefix.len());
+    if let Some(from) = after("Stopped watching ") {
+        let to = text[from..].find(" (").map_or(text.len(), |i| from + i);
+        return items(from, to, ", ");
+    }
+    if let Some(from) = after("Queued until ") {
+        let to = text[from..].find(" finish").map_or(from, |i| from + i);
+        return items(from, to, ", ");
+    }
+    if let Some(from) = after("Sent the prompt queued until ") {
+        let to = text[from..].find(" finished").map_or(from, |i| from + i);
+        return items(from, to, ", ");
+    }
+    if let Some(from) = after("Applied: ") {
+        return items(from, text.len(), "; ");
+    }
+    if text.starts_with("Confirmed. Applied: ") {
+        let mut out = Vec::new();
+        for verb in ["allow ", "deny ", "answer ", "set ", "move "] {
+            for (i, _) in text.match_indices(verb) {
+                if text[..i].ends_with(": ") || text[..i].ends_with(", ") {
+                    let from = i + verb.len();
+                    let end = text[from..]
+                        .find([' ', ':', '(', ','])
+                        .map_or(text.len(), |e| from + e);
+                    let word = text[from..end].trim_end_matches('.');
+                    out.push(from..from + word.len());
+                }
+            }
+        }
+        return out;
+    }
+    if let Some(from) = after("Disk card for ").and_then(|f| text[f..].find(": ").map(|i| f + i)) {
+        let mut out = Vec::new();
+        if let Some(i) = text[from..].find(" trimmed ") {
+            let start = from + i + " trimmed ".len();
+            let to = text[start..]
+                .find(". Not trimmed: ")
+                .map_or(text.len(), |e| start + e);
+            out.extend(items(start, to, ", "));
+        }
+        if let Some(i) = text.find(" Not trimmed: ") {
+            let start = i + " Not trimmed: ".len();
+            out.extend(items(start, text.len(), "; "));
+        }
+        return out;
+    }
+    Vec::new()
 }
 
 /// The row a folded run of ended requests shows, saying how they ended: `✓ 8 requests · 7
@@ -5239,26 +5821,32 @@ fn wrap_rows(text: &str, width: usize) -> Vec<(String, Join)> {
     out
 }
 
-/// The color of where a typed line goes, for the main pane's border and the input box's
-/// border and title text: cyan for the orchestrator, magenta for a dive into a worker (the
-/// terminal's own, which its theme keeps legible on its background).
-pub fn target_color(dive: bool) -> Color {
-    if dive {
-        Color::Magenta
-    } else {
-        Color::Cyan
+/// The color of where a typed line goes, for the input box's border and title text: the
+/// terminal's own cyan for the orchestrator (`dive` `None`), the color of the thread dived
+/// into ([`thread_color`]), magenta for one that has none of its own (the hub, the
+/// orchestrator).
+pub fn target_color(dive: Option<&ThreadView>) -> Color {
+    match dive {
+        None => Color::Cyan,
+        Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Magenta,
+        Some(t) => thread_color(&t.id),
     }
 }
 
-/// The fill of where a typed line goes, for the main pane's header band and the input box's
-/// label: black on a light cyan (orchestrator) or a light magenta (dive). Fixed 256-color
-/// values, not the terminal's own: some themes make their cyan or black dark enough that
-/// black on cyan would not read; these keep the same contrast (over 8:1) on dark and light
+/// The fill of where a typed line goes (`dive` as for [`target_color`]), for the main pane's
+/// header band and the input box's label: black on a light cyan for the orchestrator, the
+/// thread's color in a dive with black or white text, whichever reads better on it (over
+/// 4.5:1, [`crate::color::text_on`]), black on a light magenta for a thread without a color.
+/// Fixed 256-color values, not the terminal's own: some themes make their cyan or black dark
+/// enough that black on cyan would not read; these keep the same contrast on dark and light
 /// terminals alike.
-pub fn target_fill(dive: bool) -> Style {
-    Style::default()
-        .fg(Color::Indexed(16))
-        .bg(Color::Indexed(if dive { 176 } else { 80 }))
+pub fn target_fill(dive: Option<&ThreadView>) -> Style {
+    let bg = match dive {
+        None => Color::Indexed(80),
+        Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Indexed(176),
+        Some(t) => thread_color(&t.id),
+    };
+    Style::default().fg(crate::color::text_on(bg)).bg(bg)
 }
 
 /// The main pane's header for `width` columns: its label, `ORCHESTRATOR` or, in a dive,
@@ -5310,7 +5898,8 @@ fn dive_title(state: &AppState, t: &ThreadView, width: usize) -> (String, String
 
 /// [`main_title`] with its details as spans on the header's style `band`
 /// ([`render_band`]): in a dive, the box token's state word keeps its color
-/// ([`box_word_style`]: red, yellow, dim yellow), as on the cards and tiles.
+/// ([`box_word_style`]: red, yellow, dim yellow), as on the cards and tiles, on the
+/// terminal's own background (red or yellow would not read on every thread's color).
 fn main_title_spans(state: &AppState, width: usize, band: Style) -> (String, Vec<Span<'static>>) {
     let Some(t) = state.dived() else {
         let (label, detail) = main_title(state, width);
@@ -5323,11 +5912,15 @@ fn main_title_spans(state: &AppState, width: usize, band: Style) -> (String, Vec
         return (h.label, vec![Span::styled(h.detail, band)]);
     };
     let mut spans = vec![Span::styled(h.detail[..at].to_string(), band)];
-    spans.extend(
-        h.token
-            .into_iter()
-            .map(|s| Span::styled(s.content, band.patch(s.style))),
-    );
+    spans.extend(h.token.into_iter().map(|s| {
+        let style = band.patch(s.style);
+        let style = if s.style.fg.is_some() {
+            style.bg(Color::Reset)
+        } else {
+            style
+        };
+        Span::styled(s.content, style)
+    }));
     spans.push(Span::styled(h.detail[at + token.len()..].to_string(), band));
     spans.retain(|s| !s.content.is_empty());
     (h.label, spans)
@@ -5802,7 +6395,7 @@ fn render_band(
     let band = if selected {
         selected_fill()
     } else {
-        target_fill(state.dived().is_some())
+        target_fill(state.dived())
     };
     let width = usize::from(area.width);
     let mut spans = vec![Span::styled(" ", band)];
@@ -5982,6 +6575,10 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
     for (line, ..) in &mut rows {
         for span in &mut line.spans {
             span.style = span.style.fg(color);
+            // Too narrow for a box, its title alone: reversed, selected.
+            if selected && !boxed {
+                span.style = span.style.add_modifier(Modifier::REVERSED);
+            }
         }
     }
     for (line, join) in detail.rows.iter().zip(&detail.joins) {
@@ -6007,10 +6604,49 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
             Edge::Bottom,
         ));
     }
+    // Selected: thick, as a selected card is, so it shows without colors too.
+    if selected {
+        for row in &mut rows {
+            thicken(row);
+        }
+    }
     for row in &mut rows {
         row.2 = Some(format!("request:{}", item.attn_id));
     }
     rows
+}
+
+/// Box row `row`'s frame ([`Edge`]: a top border's ends, a text row's bars, a bottom border)
+/// drawn thick (`┏━ … ━┓`, `┃`, `┗━━┛`): a selected box's, as a selected card's border is, which
+/// shows without colors. Its text and title are left as they are.
+fn thicken(row: &mut TranscriptRow) {
+    let thick = |s: &str| -> String {
+        s.chars()
+            .map(|c| match c {
+                '╭' => '┏',
+                '╮' => '┓',
+                '╰' => '┗',
+                '╯' => '┛',
+                '─' => '━',
+                '│' => '┃',
+                c => c,
+            })
+            .collect()
+    };
+    let spans = &mut row.0.spans;
+    let n = spans.len();
+    let ends: Vec<usize> = match row.3 {
+        Edge::Top(_) | Edge::Bars | Edge::BarsIndent(_) => [0, n.saturating_sub(1)]
+            .into_iter()
+            .filter(|i| *i < n)
+            .collect(),
+        Edge::Bottom => (0..n).collect(),
+        Edge::None | Edge::Gutter(_) => Vec::new(),
+    };
+    for i in ends {
+        let span = &mut spans[i];
+        span.content = thick(&span.content).into();
+    }
 }
 
 fn request_tail(state: &AppState, id: &str, width: u16) -> usize {
@@ -6196,8 +6832,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     if dive.is_none() {
         if let Some(o) = state.orch_banner() {
             let width = usize::from(inner.width.saturating_sub(2));
-            let n =
-                attention_rows(state, &o, width, false).map_or(0, |a| a.core.len() + a.extra.len());
+            // As many rows as the banner shows ([`card_rows`]).
+            let n = attention_rows(state, &o, width, false).map_or(0, |a| a.card_len());
             let n = u16::try_from(n).unwrap_or(u16::MAX);
             // A confirm card too long for the banner takes the whole pane, and scrolls.
             let proposal = state.top_attention(&o).is_some_and(|i| i.proposal);
@@ -6351,6 +6987,18 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
                 ),
             });
         }
+    }
+    // The folded routine rows on screen: what a summary may be asked for.
+    for (row, run) in spans
+        .runs
+        .iter()
+        .filter(|(row, _)| (start..end).contains(row))
+    {
+        let y = inner.y + u16::try_from(row - start).unwrap_or(u16::MAX);
+        panes.routine.push(crate::summary::DrawnRun {
+            area: Rect::new(inner.x, y, inner.width, 1),
+            ..run.clone()
+        });
     }
     let mut lines = Vec::with_capacity(end - start);
     for (y, (line, join, link, edge)) in (inner.y..).zip(rows[start..end].iter().cloned()) {
@@ -6678,7 +7326,7 @@ fn render_below(frame: &mut Frame, row: Rect, below: usize, state: &AppState) {
     let text = below_text(below, end_key, usize::from(row.width - 1));
     let w = u16::try_from(crate::edit::width(&text)).unwrap_or(0);
     let area = Rect::new(row.right() - 1 - w, row.y, w, 1);
-    let style = target_fill(state.dived().is_some()).add_modifier(Modifier::BOLD);
+    let style = target_fill(state.dived()).add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(Span::styled(text, style)), area);
 }
 
@@ -6861,16 +7509,17 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
 }
 
 /// The input box: the line being typed, wrapped at its width and scrolled to the cursor's row
-/// ([`LineInput::view`]), under a title that says where it goes in that target's color and
-/// label (`→ orchestrator`, `→ <thread>` in a dive), filled like the main pane's header.
+/// ([`LineInput::view`]), its border and hint in the color of where it goes (the orchestrator's
+/// cyan, the dived thread's own, [`target_color`]) under a label that names it (`→
+/// orchestrator`, `→ <thread>` in a dive), filled like the main pane's header.
 fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     let dive = state.dived();
-    let color = target_color(dive.is_some());
+    let color = target_color(dive);
     let to = match dive {
         Some(t) => format!(" → {} ", t.name),
         None => " → orchestrator ".to_string(),
     };
-    let label = target_fill(dive.is_some()).add_modifier(Modifier::BOLD);
+    let label = target_fill(dive).add_modifier(Modifier::BOLD);
     // In a dive, what the next Esc does ([`esc_words`]).
     let back = match (state.view.dive.is_some(), state.esc_does()) {
         (false, _) => "",
@@ -7718,7 +8367,7 @@ fn decision_filter_line(state: &AppState) -> Line<'static> {
 /// `s` cut to `width` cells of display width ([`crate::edit::width`]), ending in `…` when
 /// cut: a wide character with no room before the `…` is left out whole, so the result may be
 /// a cell narrower than `width`.
-fn truncate_cells(s: &str, width: usize) -> String {
+pub(crate) fn truncate_cells(s: &str, width: usize) -> String {
     if crate::edit::width(s) <= width {
         return s.to_string();
     }
@@ -7891,7 +8540,8 @@ fn render_status(
 ) {
     panes.add(PaneId::Text, area);
     let width = usize::from(area.width);
-    let mut rows = status_head(state, width, parked.clone());
+    let (msg, notes) = status_msg(state, width, usize::from(area.height), parked.clone());
+    let mut rows = status_head(state, msg.as_deref(), notes, width, parked.clone());
     // The head's rows as wrapped, for where its notice and notes landed, and how far the
     // usage segment pushes the last one's in.
     let head_rows: Vec<String> = rows.iter().map(line_text).collect();
@@ -7927,8 +8577,13 @@ fn render_status(
     let fit = usize::from(area.height).max(1);
     // The message is on screen whole only when the bar has room (a bar of no rows draws
     // nothing) and nothing of it is cut, nor covered by an overlay later ([`Panes::cover`]).
-    let room = area.width > 0 && rows.len() <= usize::from(area.height);
-    if let (None, Some(msg), true) = (&state.view.confirm, &state.view.status, room) {
+    // It leads the head, so the rows it wraps into alone are the head's first: whatever
+    // follows it may be cut.
+    let msg_rows = msg
+        .as_ref()
+        .map_or(0, |m| wrap_line(Line::from(m.clone()), width.max(1)).len());
+    let room = area.width > 0 && msg_rows <= usize::from(area.height);
+    if let (None, Some(msg), true) = (&state.view.confirm, &msg, room) {
         panes.status = Some((msg.clone(), area));
     }
     if rows.len() > fit {
@@ -7951,7 +8606,7 @@ fn render_status(
         return;
     }
     // The head's text before it was wrapped: the notice first, the notes last.
-    let text: String = status_head_spans(state, parked.clone())
+    let text: String = status_head_spans(state, msg.as_deref(), notes, parked.clone())
         .iter()
         .map(|s| s.content.as_ref())
         .collect();
@@ -7963,10 +8618,14 @@ fn render_status(
             panes.target(cells, target.clone());
         }
     };
-    if let Some(msg) = &state.view.status {
+    if let Some(msg) = &msg {
         place(0..msg.len() + 1, Target::Notice);
     }
-    let parts = status_note_parts(state, parked);
+    let parts = if notes {
+        status_note_parts(state, parked)
+    } else {
+        Vec::new()
+    };
     if !parts.is_empty() {
         // Each note and the separator after it.
         let sep = " · ".len();
@@ -8032,7 +8691,9 @@ const HINTS_MIN: usize = 30;
 /// widest that fits in two fifths of the row while the hints keep at least [`HINTS_MIN`]
 /// cells; none when even the compact one does not, or nothing is known. A window with 25%
 /// left or less is yellow, one with 10% or less red and bold; data ten minutes old is grey,
-/// or dimmed (not bold) when it is near a limit.
+/// or dimmed (not bold) when it is near a limit. After the windows, once the hub made
+/// summary calls ([`crate::summary`]), what they came to: `summaries 4 · $0.0008`, then
+/// `summaries 4`, which give way first, before the windows' form narrows.
 fn usage_spans<Tz: chrono::TimeZone>(
     state: &AppState,
     avail: usize,
@@ -8045,15 +8706,44 @@ where
 {
     use twr_core::usage::{segment, Form, Level, Part};
     let shown = state.usage.shown(now);
-    if shown.is_empty() {
+    let calls = state.summary.stats.calls;
+    let summaries = if calls > 0 {
+        vec![
+            format!(
+                "summaries {calls} · {}",
+                crate::summary::cost_words(state.summary.stats.cost_usd)
+            ),
+            format!("summaries {calls}"),
+        ]
+    } else {
+        Vec::new()
+    };
+    if shown.is_empty() && summaries.is_empty() {
         return None;
     }
-    // The widest form in `room` cells that leaves the hints `keep` cells (and a gap).
+    // What may be said, widest first: the windows' widest form with each form of the
+    // summaries, then without them, each form of the windows.
+    let forms: Vec<Vec<(String, Part)>> = Form::ALL
+        .iter()
+        .map(|&form| segment(&shown, form, now, tz))
+        .filter(|parts| !parts.is_empty())
+        .collect();
+    let mut choices: Vec<Vec<(String, Part)>> = Vec::new();
+    let first = forms.first().cloned().unwrap_or_default();
+    for said in &summaries {
+        let mut parts = first.clone();
+        if !parts.is_empty() {
+            parts.push((" | ".to_string(), Part::Plain));
+        }
+        parts.push((said.clone(), Part::Plain));
+        choices.push(parts);
+    }
+    choices.extend(forms);
+    // The widest in `room` cells that leaves the hints `keep` cells (and a gap).
     let widest = |room: usize, keep: usize| {
-        Form::ALL.iter().find_map(|&form| {
-            let parts = segment(&shown, form, now, tz);
+        choices.iter().find_map(|parts| {
             let w: usize = parts.iter().map(|(t, _)| crate::edit::width(t)).sum();
-            (w <= room && w + 1 + keep <= avail).then_some(parts)
+            (w <= room && w + 1 + keep <= avail).then(|| parts.clone())
         })
     };
     let beside = avail.saturating_sub(hints + 1);
@@ -8152,15 +8842,69 @@ pub const CONFIRM_YES: &str = "[\u{a0}yes\u{a0}]";
 /// Its `no` ([`Target::No`]).
 pub const CONFIRM_NO: &str = "[\u{a0}no\u{a0}]";
 
+/// The notice that must be drawn whole before what it tells of happens
+/// ([`AppState::wait_for_notice`]: a suggestion or summary asked for), while the status bar
+/// shows it and no question, whether it has been told yet or not (so it stays as it was drawn
+/// when told until it is dismissed or replaced): its text and its short form.
+fn gating_notice(state: &AppState) -> Option<(&str, &str)> {
+    let (text, short) = state.once_short.as_ref()?;
+    (state.view.confirm.is_none() && state.view.status.as_deref() == Some(text.as_str()))
+        .then_some((text.as_str(), short.as_str()))
+}
+
+/// What the status bar says when it is `width` wide and has `rows` rows: the notice, the last
+/// status ([`ViewState::status`]), and whether the notes after it ([`status_notes`], the
+/// machine's load, low disks) follow. A notice that must be drawn whole ([`gating_notice`])
+/// comes before the notes, before it is told and after, while the bar shows it: said whole
+/// with them where they fit in `rows`, else said short with them, else said short alone, the
+/// notes giving way; with no room for even that, said short with the notes, cut.
+fn status_msg(
+    state: &AppState,
+    width: usize,
+    rows: usize,
+    parked: Option<String>,
+) -> (Option<String>, bool) {
+    let Some((text, short)) = gating_notice(state) else {
+        return (state.view.status.clone(), true);
+    };
+    let fits = |msg: &str, notes: bool| {
+        status_head(state, Some(msg), notes, width, parked.clone()).len() <= rows
+    };
+    let said = if fits(text, true) {
+        (text, true)
+    } else if fits(short, true) {
+        (short, true)
+    } else if fits(short, false) {
+        (short, false)
+    } else {
+        (short, true)
+    };
+    (Some(said.0.to_string()), said.1)
+}
+
 /// The status bar but its hints, wrapped at `width`: the question waiting for `y` (all it
-/// says then), else the last notice and the notes ([`status_notes`]), each in full. The hints
-/// follow on the last row ([`render_status`]).
-fn status_head(state: &AppState, width: usize, parked: Option<String>) -> Vec<Line<'static>> {
-    wrap_line(Line::from(status_head_spans(state, parked)), width.max(1))
+/// says then), else the notice `msg` ([`status_msg`]) and, with `notes`, the notes
+/// ([`status_notes`]), each in full. The hints follow on the last row ([`render_status`]).
+fn status_head(
+    state: &AppState,
+    msg: Option<&str>,
+    notes: bool,
+    width: usize,
+    parked: Option<String>,
+) -> Vec<Line<'static>> {
+    wrap_line(
+        Line::from(status_head_spans(state, msg, notes, parked)),
+        width.max(1),
+    )
 }
 
 /// [`status_head`] before it is wrapped.
-fn status_head_spans(state: &AppState, parked: Option<String>) -> Vec<Span<'static>> {
+fn status_head_spans(
+    state: &AppState,
+    msg: Option<&str>,
+    notes: bool,
+    parked: Option<String>,
+) -> Vec<Span<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut spans = Vec::new();
     if let Some(c) = &state.view.confirm {
@@ -8179,12 +8923,15 @@ fn status_head_spans(state: &AppState, parked: Option<String>) -> Vec<Span<'stat
         spans.push(Span::styled(CONFIRM_NO, button));
         return spans;
     }
-    if let Some(msg) = &state.view.status {
+    if let Some(msg) = msg {
         spans.push(Span::styled(
             format!("{msg} "),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled("| ", dim));
+    }
+    if !notes {
+        return spans;
     }
     spans.extend(load_spans(state));
     if !state.disk_low.is_empty() {
@@ -8230,11 +8977,26 @@ fn load_spans(state: &AppState) -> Vec<Span<'static>> {
 
 /// Height of the status bar on a screen `area`: the rows its question or notice and notes
 /// wrap into ([`status_head`], counting the note on hidden parked threads wherever it is
-/// drawn), at most a third of the screen, at least one.
+/// drawn), at most a third of the screen, at least one. A notice that must be drawn whole
+/// ([`gating_notice`]) with no room in that third even said short and alone
+/// ([`status_msg`]) takes the rows its short form needs, up to two thirds of the screen, as
+/// long as the bar shows it (told or not); dismissed or replaced, the bar is as before.
 fn status_height(state: &AppState, area: Rect) -> u16 {
-    let rows = status_head(state, usize::from(area.width), parked_note(state)).len();
     let cap = usize::from(area.height / 3).max(1);
-    u16::try_from(rows.clamp(1, cap)).unwrap_or(1)
+    let (width, parked) = (usize::from(area.width), parked_note(state));
+    let (msg, notes) = status_msg(state, width, cap, parked.clone());
+    let mut rows = status_head(state, msg.as_deref(), notes, width, parked).len();
+    if rows > cap {
+        let most = usize::from(area.height - area.height / 3);
+        if let Some((_, short)) = gating_notice(state) {
+            let alone = status_head(state, Some(short), false, width, None).len();
+            if alone <= most {
+                return u16::try_from(alone).unwrap_or(1);
+            }
+        }
+        rows = cap;
+    }
+    u16::try_from(rows.max(1)).unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -8271,6 +9033,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
+    use std::time::Instant;
     use twr_core::event::{AgentText, AgentToolCall, AgentToolResult, DecisionProvider, EventBody};
     use twr_core::testkit::ThreadScript;
 
@@ -8399,7 +9162,7 @@ mod tests {
             }
             let (text, fills, _) = band(&mut st, w);
             assert!(!text.contains("selected"), "{w}: {text}");
-            assert!(fills.iter().all(|f| *f == target_fill(false).bg), "{w}");
+            assert!(fills.iter().all(|f| *f == target_fill(None).bg), "{w}");
             st.handle_key(shift(KeyCode::Left));
             let lines = draw_panes(&mut st, w, 30);
             let s = screen(&lines);
@@ -8797,6 +9560,7 @@ mod tests {
                 .map(|(name, hub)| crate::workspace::Tab {
                     name: name.to_string(),
                     hub: *hub,
+                    glance: None,
                 })
                 .collect(),
         );
@@ -8826,13 +9590,15 @@ mod tests {
                 ("c", TabHub::Busy),
             ],
         );
+        // (Wide enough, the workspace sidebar lists them instead: hidden here.)
+        st.view.ws_sidebar_hidden = true;
         for (w, h) in [(160, 42), (80, 24)] {
             for view in [Screen::Stack, Screen::Grid, Screen::Decisions] {
                 st.view.screen = view;
                 let lines = draw(&st, w, h);
                 let strip = lines[0].trim_end();
                 assert!(
-                    strip.starts_with(" default ⚠2 ●1 │ a"),
+                    strip.starts_with(" ≡  default ⚠2 ●1 │ a"),
                     "{view:?} {w}: {strip}"
                 );
                 assert!(strip.ends_with("│ b ○ │ c …"), "{view:?} {w}: {strip}");
@@ -8950,7 +9716,7 @@ mod tests {
         );
         st.view.help = true;
         let lines = draw(&st, 80, 10);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
         st.view.help = false;
         st.view.picker = Some(crate::app::Picker {
@@ -8961,7 +9727,7 @@ mod tests {
             switch: false,
         });
         let lines = draw(&st, 80, 6);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
     }
 
@@ -8981,14 +9747,14 @@ mod tests {
         let mut st = crate::app::tests::with_orch();
         with_tabs(&mut st, "workspace-06", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with("‹ "), "{strip}");
+        assert!(strip.starts_with(" ≡ ‹ "), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
         assert!(strip.contains("workspace-06"), "{strip}");
         assert!(!strip.contains("workspace-01"), "{strip}");
         // At the start, only the right one.
         with_tabs(&mut st, "workspace-01", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with(" workspace-01"), "{strip}");
+        assert!(strip.starts_with(" ≡  workspace-01"), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
     }
 
@@ -9147,13 +9913,10 @@ mod tests {
             120 - side_width(120) + 1,
             "the cards are on the right"
         );
-        // Fixed heights: a card with an item, one without (however little it says).
-        assert_eq!(
-            gamma.height + 2,
-            COMPACT_CARD_HEIGHT,
-            "no attention: compact"
-        );
-        assert_eq!(at("t-beta").height + 2, CARD_HEIGHT);
+        // As tall as their text: gamma, running with nothing open and no git state, its
+        // state alone; beta its state and its permission (summary, options, note).
+        assert_eq!(gamma.height, 1, "no attention: one row");
+        assert_eq!(at("t-beta").height, 4);
 
         let beta_card = pane_text(&st, &lines, &card("t-beta"));
         assert!(beta_card.contains("│waiting "), "{beta_card}");
@@ -9243,9 +10006,9 @@ mod tests {
         );
     }
 
-    /// The icon never costs a card a row: it leads the status section, which wraps after it
-    /// within the rows the card has, the card keeping its height and its footer (who runs
-    /// it), in the column and in the row of cards.
+    /// The icon never costs a card a row: it leads the status section, which wraps after it,
+    /// the card as tall as that text and its title saying who runs it, in the column and in
+    /// the row of cards.
     #[test]
     fn the_icon_never_adds_a_row() {
         let mut st = three_threads();
@@ -9255,11 +10018,13 @@ mod tests {
             &serde_json::json!({"t-gamma": {"activity": "implementing scroll anchoring \
                                                          and running the whole test suite"}}),
         );
-        for (w, height) in [(120, COMPACT_CARD_HEIGHT), (99, CARD_HEIGHT)] {
+        for w in [120, 99] {
             let lines = draw_panes(&mut st, w, 40);
             let text = pane_text(&st, &lines, &card("t-gamma"));
             let rows: Vec<&str> = text.lines().collect();
-            assert_eq!(rows.len(), usize::from(height), "{w}:\n{text}");
+            // Its title, the 3 rows the section wraps over, its bottom border.
+            assert_eq!(rows.len(), 5, "{w}:\n{text}");
+            assert!(rows[3].contains("test suite"), "{w}:\n{text}");
             assert!(rows[0].contains("┌ gamma "), "{w}:\n{text}");
             assert!(
                 rows[1].starts_with("│_ running · implementing"),
@@ -9949,12 +10714,13 @@ mod tests {
         assert_eq!(column_window(&[], None, 5), (0, 0));
         let mut st = crate::app::tests::five_threads();
         st.set_focus(Some("t-alpha".into()));
-        // 17 rows: 16 for the column; beta (7) and alpha (6) fit, then 3 more.
-        let s = screen(&draw_panes(&mut st, 160, 17));
+        // 12 rows: 11 for the column; beta (6: its state and its item, 3 rows) and alpha (5)
+        // fit, then 3 more.
+        let s = screen(&draw_panes(&mut st, 160, 12));
         assert!(s.contains("↓ 3 more┛"), "{s}");
         assert!(!s.contains(" more┐") && !s.contains("↑ 3"), "{s}");
         st.set_focus(Some("t-eps".into()));
-        let s = screen(&draw_panes(&mut st, 160, 17));
+        let s = screen(&draw_panes(&mut st, 160, 12));
         assert!(s.contains("┏ proj · eps "), "{s}");
         assert!(s.contains("↑ 3 more"), "{s}");
     }
@@ -10306,6 +11072,54 @@ mod tests {
         assert!(usage_spans(&st, 22, 4, chrono::Utc::now(), &chrono::Utc).is_some());
     }
 
+    /// Once the hub made summary calls, the usage line says what they came to after the
+    /// windows; on a narrower row that is shortened, then dropped, before the windows' form
+    /// narrows; with no window known it stands alone.
+    #[test]
+    fn the_usage_line_counts_summaries_and_gives_them_up_first() {
+        let now = chrono::Utc::now();
+        let text = |st: &AppState, avail: usize, hints: usize| {
+            usage_spans(st, avail, hints, now, &chrono::Utc).map(|parts| {
+                parts
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+        };
+        let mut st = with_usage(three_threads(), 22.0, 44.0);
+        let full = "left: Claude 5h 78% · wk 56% | GPT wk 58% as of 12m ago";
+        assert_eq!(
+            text(&st, 200, 30).as_deref(),
+            Some(full),
+            "none made: not said"
+        );
+        st.summary.stats = twr_core::proto::SummaryStats {
+            calls: 4,
+            failures: 0,
+            cost_usd: 0.0008,
+        };
+        let w = |s: &str| crate::edit::width(s);
+        let with_cost = format!("{full} | summaries 4 · $0.0008");
+        let count = format!("{full} | summaries 4");
+        // Beside 30 cells of hints and a gap.
+        let beside = |s: &str| w(s) + 31;
+        assert_eq!(text(&st, beside(&with_cost), 30), Some(with_cost.clone()));
+        assert_eq!(text(&st, beside(&with_cost) - 1, 30), Some(count.clone()));
+        assert_eq!(text(&st, beside(&count) - 1, 30).as_deref(), Some(full));
+        let brief = text(&st, beside(full) - 1, 30).unwrap();
+        assert!(
+            !brief.contains("summaries") && brief.starts_with("left: "),
+            "{brief}"
+        );
+        // No window known: the summaries alone.
+        let mut st = three_threads();
+        st.summary.stats.calls = 2;
+        st.summary.stats.cost_usd = 0.0004;
+        assert_eq!(text(&st, 200, 30).as_deref(), Some("summaries 2 · $0.0004"));
+        let last = draw(&st, 160, 24).pop().unwrap();
+        assert!(last.starts_with("summaries 2 · $0.0004 "), "{last}");
+    }
+
     /// A window with 25% left or less is yellow and one with 10% or less red and bold, with
     /// its reset time in the full form; data ten minutes old is grey; a question waiting for
     /// `y` hides the usage like the hints.
@@ -10417,37 +11231,45 @@ mod tests {
     #[test]
     fn grid_fits_tiles_per_row_to_the_width() {
         let st = grid_state();
-        // Row 0 is the header; tile rows start at 1, 1 + TILE_HEIGHT, ...; the input box and
-        // the status bar take the last 4 rows.
-        let r = |n: u16| usize::from(1 + n * TILE_HEIGHT);
+        // Row 0 is the header; each row of tiles starts right under the one before it, as
+        // tall as its tallest tile; the input box and the status bar take the last 4 rows.
+        // The rows tiles start on, and how many start on each.
+        let tile_rows = |lines: &[String]| -> Vec<(usize, usize)> {
+            lines[..lines.len() - 4]
+                .iter()
+                .enumerate()
+                .map(|(y, l)| (y, tiles_on(l)))
+                .filter(|(_, n)| *n > 0)
+                .collect()
+        };
         let lines = draw(&st, 100, 33);
         assert!(
             lines[0].contains("grid · 5 threads · 1 parked"),
             "{}",
             lines[0]
         );
+        let rows = tile_rows(&lines);
         assert_eq!(
-            [
-                tiles_on(&lines[r(0)]),
-                tiles_on(&lines[r(1)]),
-                tiles_on(&lines[r(2)])
-            ],
+            rows.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
             [2, 2, 1],
             "{}",
             screen(&lines)
         );
+        assert_eq!(rows[0].0, 1, "under the header");
         let lines = draw(&st, 180, 30);
+        let rows = tile_rows(&lines);
         assert_eq!(
-            [tiles_on(&lines[r(0)]), tiles_on(&lines[r(1)])],
+            rows.iter().map(|(_, n)| *n).collect::<Vec<_>>(),
             [4, 1],
             "{}",
             screen(&lines)
         );
         // Tile order is grid order: beta, alpha, gamma, eps on the first row, parked delta last.
-        let top = &lines[r(0)];
+        let top = &lines[rows[0].0];
         let at = |n: &str| col(top, &format!(" {n} ")).unwrap();
         assert!(at("beta") < at("alpha") && at("alpha") < at("gamma") && at("gamma") < at("eps"));
-        assert!(lines[r(1)].starts_with("┌ delta "), "{}", lines[r(1)]);
+        let second = &lines[rows[1].0];
+        assert!(second.starts_with("┌ delta "), "{second}");
         // No transcript in the grid; the input box and the status bar stay.
         let s = screen(&lines);
         assert!(!s.contains("transcript"));
@@ -10954,12 +11776,378 @@ mod tests {
         assert!(!popup.contains("last report"), "{popup}");
     }
 
-    /// Cards (and tiles) have a fixed height: a card's activity, report or git state changing
-    /// never moves the cards after it, in the column at any width, the row of cards above a
-    /// narrow conversation, and the grid; a report too long for its card ends in `…`.
+    /// [`draw_panes`] at `now` ([`crate::app::tests::draw_at`]): the cards' order and heights
+    /// settled then.
+    fn draw_panes_at(state: &mut AppState, w: u16, h: u16, now: Instant) -> Vec<String> {
+        let buf = crate::app::tests::draw_at(state, w, h, now);
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect()
+    }
+
+    /// Where card `id`'s inside is as last drawn.
+    fn card_at(st: &AppState, id: &str) -> Rect {
+        st.view
+            .panes
+            .get(&card(id))
+            .unwrap_or_else(|| panic!("{id}"))
+            .area
+    }
+
+    /// The rows of card (or tile) `id`'s inside as drawn (`lines`).
+    fn card_lines(st: &AppState, lines: &[String], id: &str) -> Vec<String> {
+        let a = card_at(st, id);
+        (a.y..a.bottom())
+            .map(|y| {
+                lines[usize::from(y)]
+                    .chars()
+                    .skip(usize::from(a.x))
+                    .take(usize::from(a.width))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The cards (or tiles) of `ids` drawn with a blank row inside them, as drawn (`lines`),
+    /// each with its text; and how many were drawn. A blank row of the card's item is its
+    /// content, not a blank row of the card ([`card_rows`]): the rows showing the item's rows
+    /// in order ([`attention_rows`], a card's or a tile's) are not checked.
+    fn blank_rows(st: &AppState, lines: &[String], ids: &[String]) -> (Vec<String>, usize) {
+        let mut blank = Vec::new();
+        let mut drawn = 0;
+        for id in ids {
+            if st.view.panes.get(&card(id)).is_none() {
+                continue;
+            }
+            drawn += 1;
+            let rows = card_lines(st, lines, id);
+            let width = usize::from(card_at(st, id).width);
+            let mut item = vec![false; rows.len()];
+            for tile in [false, true] {
+                let Some(a) = attention_rows(st, id, width, tile) else {
+                    continue;
+                };
+                let want: Vec<String> = a.core.iter().chain(&a.extra).map(line_text).collect();
+                let same = |r: &String, w: &String| r.trim_end() == w.trim_end();
+                let Some(at) = rows.iter().position(|r| same(r, &want[0])) else {
+                    continue;
+                };
+                for (k, w) in want.iter().enumerate() {
+                    match rows.get(at + k) {
+                        Some(r) if same(r, w) => item[at + k] = true,
+                        _ => break,
+                    }
+                }
+            }
+            if rows
+                .iter()
+                .zip(&item)
+                .any(|(r, &of_item)| !of_item && r.trim().is_empty())
+            {
+                blank.push(pane_text(st, lines, &card(id)));
+            }
+        }
+        (blank, drawn)
+    }
+
+    /// [`crate::app::tests::five_threads`], gamma saying what it does at length.
+    fn five_saying_things() -> AppState {
+        let mut st = crate::app::tests::five_threads();
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({
+                "t-gamma": {"activity": "implementing scroll anchoring · running tests"},
+                "t-alpha": {"activity": "thinking"},
+            }),
+        );
+        st
+    }
+
+    /// The compact "Needs you" list names each card in its card's color: a thread's in its
+    /// own, the hub's (`twr asks`) in its yellow.
     #[test]
-    fn cards_keep_their_height_when_their_text_changes() {
+    fn the_compact_needs_rows_name_each_card_in_its_color() {
+        use twr_core::event::HUB_THREAD;
+        let mut st = AppState::new();
+        let mut w = ThreadScript::new("t-w");
+        let mut h = ThreadScript::new(HUB_THREAD);
+        h.at(5);
+        crate::app::tests::control(
+            &mut st,
+            &[
+                w.created("w"),
+                w.raise("p1", AttentionReason::Permission),
+                h.raise("hq1", AttentionReason::Question),
+            ],
+        );
+        let rows = compact_needs_rows(&st, 60);
+        let name = |id: &str| {
+            rows.iter()
+                .find(|(i, _)| i == id)
+                .map(|(_, l)| l.spans[0].clone())
+                .unwrap()
+        };
+        assert_eq!(name(HUB_THREAD).content, "twr");
+        assert_eq!(name(HUB_THREAD).style.fg, Some(Color::Yellow));
+        assert_eq!(name("t-w").style.fg, Some(thread_color("t-w")));
+    }
+
+    /// [`five_saying_things`], its texts in paragraphs: eps's report and a question of
+    /// gamma's have a blank line inside.
+    fn five_saying_paragraphs() -> AppState {
+        use twr_core::event::Grade;
+        let mut st = five_saying_things();
+        let mut e = ThreadScript::new("t-eps");
+        e.at(40);
+        let mut report = e.report(Some(1), Grade::Success);
+        if let EventBody::ReportReady(p) = &mut report.body {
+            p.summary = "Rewrote the README quick start.\n\nLinks checked.".into();
+        }
+        let mut g = ThreadScript::new("t-gamma");
+        g.at(40);
+        let mut q = g.raise("q1", AttentionReason::Question);
+        if let EventBody::AttentionRaised(p) = &mut q.body {
+            p.summary = "Which port?\n\nThe tests need one.".into();
+            p.options = vec!["8080".into(), "9090".into()];
+        }
+        crate::app::tests::control(&mut st, &[report, q]);
+        st
+    }
+
+    /// A card (or tile) is as tall as its text: no blank row inside it, whatever it says
+    /// (a permission, a question or a report in paragraphs, a review, a report with its git
+    /// state, an activity line, a parked thread), in the column at every width, the row of
+    /// cards above a narrow conversation, the grid, and the compact Threads screen. In the
+    /// row, each card is as tall as its own text from the top of the row, and the row as
+    /// tall as its tallest card. An item's own blank rows are its content: drawn, between
+    /// its paragraphs.
+    #[test]
+    fn no_card_has_a_blank_row_inside() {
+        for (w, h) in [(100, 60), (120, 60), (160, 60), (80, 60)] {
+            let mut st = five_saying_paragraphs();
+            let lines = draw_panes(&mut st, w, h);
+            let order = st.order();
+            let (blank, drawn) = blank_rows(&st, &lines, &order);
+            assert!(blank.is_empty(), "{w}x{h}:\n{}", blank.join("\n"));
+            assert!(drawn >= 2, "{w}x{h}:\n{}", screen(&lines));
+            if st.view.panes.items.iter().any(|d| d.attn_id == "q1") {
+                let rows = card_lines(&st, &lines, "t-gamma");
+                let at = rows.iter().position(|r| r.contains("Which port?"));
+                let at = at.unwrap_or_else(|| panic!("{w}x{h}: {rows:?}"));
+                assert!(rows[at + 1].trim().is_empty(), "{w}x{h}: {rows:?}");
+                assert!(rows[at + 2].contains("The tests need one."), "{rows:?}");
+            }
+            let mut st = five_saying_things();
+            let lines = draw_panes(&mut st, w, h);
+            let order = st.order();
+            let (blank, drawn) = blank_rows(&st, &lines, &order);
+            assert!(blank.is_empty(), "{w}x{h}:\n{}", blank.join("\n"));
+            assert!(drawn >= 2, "{w}x{h}:\n{}", screen(&lines));
+            if w < SIDE_MIN_WIDTH {
+                let shown: Vec<Rect> = order
+                    .iter()
+                    .filter_map(|id| st.view.panes.get(&card(id)).map(|p| p.area))
+                    .collect();
+                assert!(shown.iter().all(|a| a.y == 1), "top-aligned: {shown:?}");
+                assert!(
+                    shown.iter().any(|a| a.height != shown[0].height),
+                    "{shown:?}"
+                );
+                let row = shown.iter().map(|a| a.bottom() + 1).max().unwrap();
+                let band = lines[usize::from(row)].clone();
+                assert!(
+                    band.contains("ORCHESTRATOR"),
+                    "right under the row:\n{band}"
+                );
+            }
+        }
+        for (w, h) in [(100, 60), (130, 60), (180, 60)] {
+            for mut st in [five_saying_things(), five_saying_paragraphs()] {
+                st.view.screen = Screen::Grid;
+                let lines = draw_panes(&mut st, w, h);
+                let (blank, drawn) = blank_rows(&st, &lines, &st.grid_order());
+                assert!(blank.is_empty(), "grid {w}x{h}:\n{}", blank.join("\n"));
+                assert_eq!(drawn, 5, "grid {w}x{h}:\n{}", screen(&lines));
+            }
+        }
+        for mut st in [five_saying_things(), five_saying_paragraphs()] {
+            st.view.compact_width = 60;
+            st.view.compact_pane = crate::app::CompactPane::Threads;
+            let lines = draw_panes(&mut st, 40, 20);
+            let (blank, drawn) = blank_rows(&st, &lines, &st.compact_threads());
+            assert!(blank.is_empty(), "compact:\n{}", blank.join("\n"));
+            assert!(drawn >= 2, "compact:\n{}", screen(&lines));
+        }
+        // The full texts, in their detail view, keep their paragraphs.
+        let mut st = five_saying_paragraphs();
+        st.set_focus(Some("t-gamma".into()));
+        let rows = popup_item_rows(&st, "t-gamma", st.attention.get("q1").unwrap(), 60).0;
+        assert!(rows.iter().any(|l| blank_line(l)), "{rows:?}");
+    }
+
+    /// A card, tile or banner copies only the rows it draws of its item's kept rows
+    /// ([`copied_row`]), not every row the item has: an item of thousands of rows, paragraphs
+    /// among them, costs a frame about as many copies as the screen has rows, however often
+    /// the frame measures its card, in the column, the grid, the compact Threads screen and the
+    /// orchestrator's banner.
+    #[test]
+    fn a_frame_copies_only_the_item_rows_it_draws() {
+        let copies = || CARD_ROW_COPIES.with(std::cell::Cell::get);
+        // The seam: rows wrapped once, a card 9 rows tall.
+        let l = |s: String| Line::from(s);
+        let many = |n: usize| -> Vec<Line<'static>> {
+            (0..n)
+                .flat_map(|i| [l(format!("row {i}")), Line::default()])
+                .collect()
+        };
+        for (core, extra) in [(many(3000), Vec::new()), (many(1), many(3000))] {
+            let a = Arc::new(AttnRows::new(("a".into(), 1), core, extra, true, true));
+            let before = copies();
+            let body = CardBody {
+                section: vec![l("waiting".into())],
+                one: None,
+                attn: Some(a),
+                git: None,
+            };
+            let (rows, _) = card_rows(body, 9, 40);
+            assert_eq!(rows.len(), 9);
+            // The item's blank rows are drawn with it: its content.
+            assert!(rows.iter().any(|r| blank_line(r)), "{rows:?}");
+            assert!(copies() - before <= 8, "{}", copies() - before);
+        }
+        // A frame: gamma (and the orchestrator) ask in 3000 paragraphs.
+        let paragraphs: String = (0..3000).map(|i| format!("Part {i} of it.\n\n")).collect();
+        let asks = |st: &mut AppState| {
+            let mut o = ThreadScript::new("t-orch");
+            o.at(45);
+            let mut evs = crate::app::tests::orch_events(&mut o, "t-orch");
+            for (thread, id) in [("t-gamma", "q-long"), ("t-orch", "o-long")] {
+                let mut s = ThreadScript::new(thread);
+                s.at(50);
+                let mut q = s.raise(id, AttentionReason::Question);
+                if let EventBody::AttentionRaised(p) = &mut q.body {
+                    p.summary = paragraphs.clone();
+                }
+                evs.push(q);
+            }
+            crate::app::tests::control(st, &evs);
+        };
+        let frame = |st: &mut AppState, w: u16, h: u16, what: &str| {
+            draw_panes(st, w, h);
+            let before = copies();
+            let lines = draw_panes(st, w, h);
+            let n = copies() - before;
+            assert!(
+                n <= 4 * usize::from(h),
+                "{what} {w}x{h}: {n} rows copied\n{}",
+                screen(&lines)
+            );
+        };
+        for (w, h) in [(100, 40), (160, 40), (80, 40)] {
+            let mut st = five_saying_things();
+            asks(&mut st);
+            frame(&mut st, w, h, "column");
+            let mut st = five_saying_things();
+            asks(&mut st);
+            st.view.screen = Screen::Grid;
+            frame(&mut st, w, h, "grid");
+        }
+        let mut st = five_saying_things();
+        asks(&mut st);
+        st.view.compact_width = 60;
+        st.view.compact_pane = crate::app::CompactPane::Threads;
+        frame(&mut st, 40, 20, "compact");
+    }
+
+    /// An attention item's rows are all its content, a whitespace-only one too (a run of
+    /// spaces inside a quoted argument, wrapped over rows): a card draws every one of them,
+    /// and the item counts as drawn whole ([`DrawnItem`]) only when every row shows. A card
+    /// too short for them cuts the item: not drawn whole, and `seen_gseq` stays below it, though
+    /// its rows but the whitespace ones would have fit. On the grid, where only the tile
+    /// draws it (the conversation would show the request too).
+    #[test]
+    fn an_items_whitespace_rows_are_drawn_and_count_for_drawn_whole() {
         use crate::app::tests::control;
+        let asking = |spaces: usize| {
+            let mut st = AppState::new();
+            let mut w = ThreadScript::new("t-w");
+            let mut p = w.raise("p1", AttentionReason::Permission);
+            if let EventBody::AttentionRaised(a) = &mut p.body {
+                a.summary = format!("echo \"a{}b\"", " ".repeat(spaces));
+            }
+            control(&mut st, &[w.created("w"), p]);
+            st.view.screen = Screen::Grid;
+            st
+        };
+        let (w, h) = (120, 40);
+        let mut st = asking(1);
+        draw_panes(&mut st, w, h);
+        let width = usize::from(card_at(&st, "t-w").width);
+        // Two rows' worth of spaces: a row of only spaces inside the command.
+        let mut st = asking(2 * width);
+        let lines = draw_panes(&mut st, w, h);
+        let a = attention_rows(&st, "t-w", width, true).unwrap();
+        let space_row = |l: &Line| blank_line(l) && l.width() > 0;
+        assert!(a.core.iter().any(space_row), "{:?}", a.core);
+        // Drawn: every row of the item, the row of spaces among them, in order.
+        let rows = card_lines(&st, &lines, "t-w");
+        let want: Vec<String> = a.core.iter().chain(&a.extra).map(line_text).collect();
+        let at = rows.iter().position(|r| r.trim_end() == want[0].trim_end());
+        let at = at.unwrap_or_else(|| panic!("{rows:?}"));
+        for (k, row) in want.iter().enumerate() {
+            assert_eq!(rows[at + k].trim_end(), row.trim_end(), "{k}: {rows:?}");
+        }
+        let item = st.attention.get("p1").unwrap().clone();
+        assert!(
+            st.view.panes.items.iter().any(|d| d.attn_id == "p1"),
+            "drawn whole:\n{}",
+            screen(&lines)
+        );
+        assert_eq!(st.seen_gseq(), st.last_gseq);
+        // The seam: a card one row short of the item beside its section's row cuts it.
+        let body = |a: &Arc<AttnRows>| CardBody {
+            section: vec![Line::from("waiting")],
+            one: None,
+            attn: Some(a.clone()),
+            git: None,
+        };
+        let all = u16::try_from(1 + a.core.len()).unwrap();
+        let (rows, drawn) = card_rows(body(&a), all, 40);
+        assert_eq!(drawn, Some(("p1".to_string(), item.revision)));
+        assert!(rows.iter().any(space_row), "{rows:?}");
+        let (rows, drawn) = card_rows(body(&a), all - 1, 40);
+        assert_eq!(drawn, None, "cut: {rows:?}");
+        // A command whose rows of spaces are more than any card has: never drawn whole, and
+        // `seen_gseq` stays below its raise, though its other rows fit.
+        let mut st = asking(40 * width);
+        let lines = draw_panes(&mut st, w, h);
+        let a = attention_rows(&st, "t-w", width, true).unwrap();
+        let shown = a.core.iter().filter(|l| !blank_line(l)).count();
+        assert!(shown + a.extra.len() < 10, "{:?}", a.core);
+        assert!(
+            !st.view.panes.items.iter().any(|d| d.attn_id == "p1"),
+            "cut, not drawn whole:\n{}",
+            screen(&lines)
+        );
+        let item = st.attention.get("p1").unwrap();
+        assert_eq!(
+            st.seen_gseq(),
+            item.first_revision.min(item.revision) - 1,
+            "{}",
+            screen(&lines)
+        );
+    }
+
+    /// A card grows with its text at once, in the frame that has the text: a report too long
+    /// for it is shown up to the most a card gets there and ends in `…`, and a git line it
+    /// did not have shows; the cards after it move then. Text that gets shorter does not move
+    /// them at once: the card keeps its height until the shorter text has held for the delay.
+    /// So in the column at every width, the row of cards and the grid.
+    #[test]
+    fn cards_grow_with_their_text_at_once_and_shrink_after_the_delay() {
+        use crate::app::tests::control;
+        use crate::order::ORDER_DELAY;
+        use std::time::Duration;
         use twr_core::event::Grade;
         let report = |s: &mut ThreadScript, turn, text: &str| {
             let mut ev = s.report(Some(turn), Grade::Success);
@@ -10988,47 +12176,201 @@ mod tests {
             (90, 40, true),
             (160, 40, true),
         ] {
+            let at = format!("{w}x{h}{}", if grid { " grid" } else { "" });
             let mut st = AppState::new();
             let mut s: Vec<ThreadScript> = ["a", "b", "c", "d"]
                 .iter()
                 .map(|n| ThreadScript::new(format!("t-{n}")))
                 .collect();
+            // All done, in the order they were made: a first.
             for (i, n) in ["a", "b", "c", "d"].iter().enumerate() {
-                let evs = [s[i].at(i as i64).created(n), s[i].turn_started("go")];
+                let evs = [
+                    s[i].at(i as i64).created(n),
+                    s[i].turn_started("go"),
+                    s[i].turn_ended(TurnResult::Completed),
+                    report(&mut s[i], 1, "Short."),
+                ];
                 control(&mut st, &evs);
             }
-            let evs = [
-                s[3].turn_ended(TurnResult::Completed),
-                report(&mut s[3], 1, "Short."),
-            ];
-            control(&mut st, &evs);
             if grid {
                 st.view.screen = Screen::Grid;
             }
-            st.settle_order(std::time::Instant::now());
-            draw_panes(&mut st, w, h);
-            let before = areas(&st);
-            assert!(!before.is_empty(), "{w}x{h}");
+            let t0 = Instant::now();
+            draw_panes_at(&mut st, w, h, t0);
+            let short = card_at(&st, "t-a");
             let long = "Rewrote the parser, the lexer and the error messages, ran every \
                         test twice and pushed the branch after a rebase onto main. "
                 .repeat(3);
             let evs = [
-                s[0].text("Now let me run the whole test suite again."),
                 s[1].git("twr/a-much-longer-branch-name-than-before", 7),
-                report(&mut s[3], 1, &long),
+                report(&mut s[0], 1, &long),
             ];
             control(&mut st, &evs);
-            st.settle_order(std::time::Instant::now());
-            let lines = draw_panes(&mut st, w, h);
-            assert_eq!(areas(&st), before, "{w}x{h}:\n{}", screen(&lines));
+            let t1 = t0 + Duration::from_secs(1);
+            let lines = draw_panes_at(&mut st, w, h, t1);
+            let a = pane_text(&st, &lines, &card("t-a"));
+            assert!(a.contains("Rewrote the parser"), "{at}:\n{a}");
+            assert!(a.contains('…'), "{at}: the report is cut:\n{a}");
+            let tall = card_at(&st, "t-a");
+            assert!(tall.height > short.height, "{at}:\n{a}");
             if !grid && w >= SIDE_MIN_WIDTH {
-                let d = pane_text(&st, &lines, &card("t-d"));
-                assert!(d.contains("Rewrote the parser"), "{w}x{h}:\n{d}");
-                assert!(d.contains('…'), "the report is cut:\n{d}");
-                let rows = d.lines().count() as u16;
-                assert_eq!(rows, COMPACT_CARD_HEIGHT, "{w}x{h}:\n{d}");
+                assert_eq!(tall.height + 2, COMPACT_CARD_HEIGHT, "{at}:\n{a}");
             }
+            let b = pane_text(&st, &lines, &card("t-b"));
+            assert!(b.contains("twr/a-much-l"), "{at}:\n{b}");
+            let grown = areas(&st);
+            // The report gets short again: nothing moves until the delay is over.
+            control(&mut st, &[report(&mut s[0], 1, "Short again.")]);
+            let t2 = t1 + Duration::from_secs(1);
+            let lines = draw_panes_at(&mut st, w, h, t2);
+            assert_eq!(areas(&st), grown, "{at}:\n{}", screen(&lines));
+            let a = pane_text(&st, &lines, &card("t-a"));
+            assert!(a.contains("Short again."), "{at}:\n{a}");
+            assert_eq!(st.order_deadline(t2), Some(t2 + ORDER_DELAY), "{at}");
+            draw_panes_at(&mut st, w, h, t2 + ORDER_DELAY - Duration::from_millis(1));
+            assert_eq!(areas(&st), grown, "{at}");
+            let lines = draw_panes_at(&mut st, w, h, t2 + ORDER_DELAY);
+            assert_eq!(card_at(&st, "t-a").height, short.height, "{at}");
+            assert_eq!(st.order_deadline(t2 + ORDER_DELAY), None, "{at}");
+            let (blank, _) = blank_rows(&st, &lines, &st.order());
+            assert!(blank.is_empty(), "{at}:\n{}", blank.join("\n"));
         }
+    }
+
+    /// A working thread's activity line comes and goes over one row and three, every second:
+    /// its card grows once, the first time it needs three rows, and keeps that height while
+    /// the thread works, so the card under it never moves again. Its turn over, the card
+    /// shrinks once nothing holds the cards and the delay is over: not while a card is
+    /// selected or the mouse is over the cards (the wait starts again when they are let go),
+    /// and at once at another width.
+    #[test]
+    fn a_working_card_does_not_flicker_as_its_activity_changes() {
+        use crate::app::tests::control;
+        use crate::order::{HOVER_HOLD, ORDER_DELAY};
+        use std::time::Duration;
+        let mut st = AppState::new();
+        let mut s: Vec<ThreadScript> = ["a", "b"]
+            .iter()
+            .map(|n| ThreadScript::new(format!("t-{n}")))
+            .collect();
+        for (i, n) in ["a", "b"].iter().enumerate() {
+            let evs = [s[i].at(i as i64).created(n), s[i].turn_started("go")];
+            control(&mut st, &evs);
+        }
+        let say = |st: &mut AppState, long: bool| {
+            let text = if long {
+                "running the whole test suite again with the slow tests included, then \
+                 the doc tests, then clippy over every target"
+            } else {
+                "reading"
+            };
+            st.apply_result(
+                "thread.activity",
+                &serde_json::json!({"t-a": {"activity": text}}),
+            );
+        };
+        let (w, h) = (160, 40);
+        let t0 = Instant::now();
+        let sec = |k: u64| t0 + Duration::from_secs(k);
+        say(&mut st, false);
+        draw_panes_at(&mut st, w, h, t0);
+        let (a0, b0) = (card_at(&st, "t-a"), card_at(&st, "t-b"));
+        assert_eq!(a0.height, 1);
+        say(&mut st, true);
+        let lines = draw_panes_at(&mut st, w, h, sec(1));
+        let a1 = card_at(&st, "t-a");
+        assert_eq!(a1.height, 3, "grown at once:\n{}", screen(&lines));
+        assert!(
+            card_words(&pane_text(&st, &lines, &card("t-a"))).contains("clippy over every"),
+            "the new text shows in the frame it grows in"
+        );
+        let b1 = card_at(&st, "t-b");
+        assert_eq!(b1.y, b0.y + 2);
+        for k in 2..30 {
+            say(&mut st, k % 2 == 1);
+            draw_panes_at(&mut st, w, h, sec(k));
+            assert_eq!(card_at(&st, "t-a"), a1, "{k}");
+            assert_eq!(card_at(&st, "t-b"), b1, "{k}: the card under it stays");
+            assert_eq!(st.order_deadline(sec(k)), None, "{k}: nothing to wait for");
+        }
+        // The turn ends with the short line on: the card waits, then shrinks.
+        say(&mut st, false);
+        control(&mut st, &[s[0].turn_ended(TurnResult::Completed)]);
+        let end = sec(30);
+        draw_panes_at(&mut st, w, h, end);
+        let tall = card_at(&st, "t-a").height;
+        assert_eq!(tall, 3, "kept");
+        assert_eq!(st.order_deadline(end), Some(end + ORDER_DELAY));
+        // Selected meanwhile: held, whatever the time; no timer.
+        st.set_focus(Some("t-b".into()));
+        draw_panes_at(&mut st, w, h, end + ORDER_DELAY * 3);
+        assert_eq!(card_at(&st, "t-a").height, tall, "held by the selection");
+        assert_eq!(st.order_deadline(end + ORDER_DELAY * 3), None);
+        // Let go: the wait starts again then.
+        st.set_focus(None);
+        let free = end + ORDER_DELAY * 4;
+        draw_panes_at(&mut st, w, h, free);
+        assert_eq!(card_at(&st, "t-a").height, tall, "the wait starts again");
+        // The pointer over the cards holds them too, until its hold ends.
+        let list = st.view.panes.list.unwrap();
+        st.view.pointer = Some((list.area.x + 1, list.area.y + 1, free));
+        assert_eq!(st.order_deadline(free), Some(free + HOVER_HOLD));
+        draw_panes_at(&mut st, w, h, free + ORDER_DELAY * 2);
+        assert_eq!(card_at(&st, "t-a").height, tall, "held by the pointer");
+        // The pointer leaves: the wait starts again, and the card shrinks after it.
+        st.view.pointer = Some((1, 5, free + ORDER_DELAY * 2));
+        let left = free + ORDER_DELAY * 3;
+        draw_panes_at(&mut st, w, h, left);
+        assert_eq!(card_at(&st, "t-a").height, tall);
+        assert_eq!(st.order_deadline(left), Some(left + ORDER_DELAY));
+        draw_panes_at(&mut st, w, h, left + ORDER_DELAY);
+        assert!(card_at(&st, "t-a").height < tall, "shrunk");
+        // Tall again, then another width: the height its text takes there, at once.
+        say(&mut st, true);
+        control(&mut st, &[s[0].turn_started("more")]);
+        let later = left + ORDER_DELAY * 2;
+        draw_panes_at(&mut st, w, h, later);
+        assert_eq!(card_at(&st, "t-a").height, 3);
+        say(&mut st, false);
+        draw_panes_at(&mut st, w, h, later);
+        assert_eq!(card_at(&st, "t-a").height, 3, "working: kept");
+        draw_panes_at(&mut st, 140, h, later);
+        assert_eq!(card_at(&st, "t-a").height, 1, "another width");
+    }
+
+    /// A card with an item is as tall as the item needs; answered, the card keeps that
+    /// height until the delay is over (with nothing holding the cards), then takes its text's.
+    /// Its thread at work, it gives back the rows the item took, not those its activity took.
+    #[test]
+    fn a_card_whose_item_closed_shrinks_after_the_delay() {
+        use crate::app::tests::control;
+        use crate::order::ORDER_DELAY;
+        use twr_core::event::AttentionReason;
+        let mut st = AppState::new();
+        let mut a = ThreadScript::new("t-a");
+        let mut b = ThreadScript::new("t-b");
+        let evs = [
+            a.created("a"),
+            a.turn_started("go"),
+            a.turn_ended(TurnResult::Completed),
+            a.raise("e1", AttentionReason::Error),
+            b.at(1).created("b"),
+            b.turn_started("go"),
+            b.raise("r1", AttentionReason::Review),
+        ];
+        control(&mut st, &evs);
+        let t0 = Instant::now();
+        let lines = draw_panes_at(&mut st, 160, 50, t0);
+        let (a0, b0) = (card_at(&st, "t-a"), card_at(&st, "t-b"));
+        assert!(a0.height > 1 && b0.height > 1, "{}", screen(&lines));
+        control(&mut st, &[a.resolve("e1"), b.resolve("r1")]);
+        draw_panes_at(&mut st, 160, 50, t0);
+        assert_eq!(card_at(&st, "t-a").height, a0.height, "kept");
+        assert_eq!(card_at(&st, "t-b").height, b0.height, "kept");
+        assert_eq!(st.order_deadline(t0), Some(t0 + ORDER_DELAY));
+        let lines = draw_panes_at(&mut st, 160, 50, t0 + ORDER_DELAY);
+        assert_eq!(card_at(&st, "t-a").height, 1, "{}", screen(&lines));
+        assert_eq!(card_at(&st, "t-b").height, 1, "{}", screen(&lines));
     }
 
     /// [`three_threads`] plus `rep`, done, whose report the hub wrote when reports ended with
@@ -11192,9 +12534,12 @@ mod tests {
     fn parked_threads_are_dimmed_in_both_views() {
         let st = grid_state();
         let buf = draw_buf(&st, 100, 33);
-        // delta is alone on the third tile row (y = 1 + 2 * TILE_HEIGHT), name at x = 9, after
-        // its project (`proj · `).
-        let y = 1 + 2 * TILE_HEIGHT;
+        // delta is alone on the third tile row, name at x = 9, after its project (`proj · `).
+        let y = (0..33)
+            .find(|&y| {
+                (0..15).map(|x| buf[(x, y)].symbol()).collect::<String>() == "┌ proj · delta "
+            })
+            .expect("delta's tile");
         assert_eq!(buf[(9, y)].symbol(), "d");
         assert!(buf[(9, y)].modifier.contains(Modifier::DIM));
         assert_eq!(buf[(2, y)].symbol(), "p");
@@ -11655,12 +13000,12 @@ mod tests {
     #[test]
     fn grid_scrolls_to_keep_the_focused_tile_visible() {
         let mut st = grid_state();
-        // 17 rows: 16 for the grid, 15 below the header: one tile row fits.
-        let lines = draw(&st, 100, 17);
+        // 14 rows: one row of tiles fits (the first is 6 rows tall, the second 7).
+        let lines = draw(&st, 100, 14);
         assert!(lines[1].contains(" beta ") && !screen(&lines).contains(" delta "));
         assert!(lines[0].contains("↓ 2 more rows"), "{}", lines[0]);
         st.set_focus(Some("t-delta".into()));
-        let lines = draw(&st, 100, 17);
+        let lines = draw(&st, 100, 14);
         assert!(
             lines[1].starts_with("┏ proj · delta "),
             "{}",
@@ -11668,9 +13013,6 @@ mod tests {
         );
         assert!(lines[0].contains("↑ 2 more rows"), "{}", lines[0]);
         assert!(!lines[0].contains('↓'));
-        assert_eq!(grid_first_row(2, 1), 2);
-        assert_eq!(grid_first_row(1, 3), 0);
-        assert_eq!(grid_first_row(4, 0), 4);
     }
 
     #[test]
@@ -12893,11 +14235,11 @@ mod tests {
 
     /// The dive header colors its box token's state word as the cards and tiles do (red for
     /// offline, error, needs install and a mismatch; yellow for switching and reconnecting;
-    /// dim yellow for an update pending) on the header's background, whole or with its box's
-    /// name cut, while the rest of the header keeps the header's own colors.
+    /// dim yellow for an update pending) on the terminal's own background (not the dived
+    /// thread's color, which red or yellow might not read on), whole or with its box's name
+    /// cut, while the rest of the header keeps the header's own colors.
     #[test]
     fn the_dive_header_colors_the_box_state() {
-        let band = target_fill(true);
         for (entry, word) in box_cases().into_iter().filter(|(_, w)| !w.is_empty()) {
             let (fg, dim) = match word {
                 " switching" | " reconnecting" => (Color::Yellow, false),
@@ -12909,6 +14251,7 @@ mod tests {
                 entry["name"] = name.into();
                 let mut st = on_box("job", name, entry, |_| Vec::new());
                 st.dive("t-job");
+                let band = target_fill(st.dived());
                 let buf = draw_buf(&st, width, 20);
                 let (y, row) = (0..20u16)
                     .map(|y| {
@@ -12931,7 +14274,7 @@ mod tests {
                 for x in col(from)..col(to) {
                     let c = &buf[(x, y)];
                     assert_eq!(c.fg, fg, "{what} {x}");
-                    assert_eq!(c.bg, band.bg.unwrap(), "{what} {x}");
+                    assert_eq!(c.bg, Color::Reset, "{what} {x}");
                     assert_eq!(c.modifier.contains(Modifier::DIM), dim, "{what} {x}");
                     assert!(!c.modifier.contains(Modifier::BOLD), "{what} {x}");
                 }
@@ -13616,13 +14959,13 @@ mod tests {
         // section's second row, the note, and the rest of the section.
         let l = |s: &str| Line::from(s.to_string());
         let attn = |core: &[&str], extra: &[&str]| {
-            Some(Arc::new(AttnRows {
-                item: ("a".into(), 1),
-                core: core.iter().map(|s| l(s)).collect(),
-                extra: extra.iter().map(|s| l(s)).collect(),
-                exact: true,
-                complete: true,
-            }))
+            Some(Arc::new(AttnRows::new(
+                ("a".into(), 1),
+                core.iter().map(|s| l(s)).collect(),
+                extra.iter().map(|s| l(s)).collect(),
+                true,
+                true,
+            )))
         };
         let body = || CardBody {
             section: vec![l("running · one"), l("two"), l("three")],
@@ -13630,20 +14973,12 @@ mod tests {
             attn: attn(&["Q", "1 a"], &["note"]),
             git: Some(l("twr/q")),
         };
+        // Taller than all of it: the git line right under the rest, no blank row between.
         let (rows, drawn) = card_rows(body(), 8, 40);
         assert_eq!(drawn, Some(("a".to_string(), 1)));
         assert_eq!(
             text(&rows),
-            [
-                "running · one",
-                "two",
-                "three",
-                "Q",
-                "1 a",
-                "note",
-                "",
-                "twr/q"
-            ]
+            ["running · one", "two", "three", "Q", "1 a", "note", "twr/q"]
         );
         for (h, want) in [
             (
@@ -13770,8 +15105,8 @@ mod tests {
 
     /// The selected card is drawn selected (thick, yellow) while typing goes on, told apart
     /// from where the line goes: the main pane's header band in the orchestrator's fill, and
-    /// in a dive the thread's card, thin, in the dive's color. Nothing selected, no card is
-    /// drawn so; selected, the dive's card is drawn selected.
+    /// in a dive the thread's card, double, in its color, the band filled with it. Nothing
+    /// selected, no card is drawn so; selected, the dive's card is drawn selected.
     #[test]
     fn the_selection_is_drawn_apart_from_where_the_line_goes() {
         // A title drawn thick (`┏`) or thin (`┌`) for `name`, its project before it or not.
@@ -13789,7 +15124,7 @@ mod tests {
         let s = screen(&buffer_lines(&buf));
         assert!(titled(&s, '┏', "gamma"), "{s}");
         // Where the line goes: the header band's fill (the pane has no border).
-        assert_eq!(buf[(0, 0)].bg, target_fill(false).bg.unwrap(), "{s}");
+        assert_eq!(buf[(0, 0)].bg, target_fill(None).bg.unwrap(), "{s}");
         st.set_focus(None);
         let s = screen(&draw(&st, 160, 40));
         assert!(!s.contains('┏'), "nothing selected: {s}");
@@ -13804,17 +15139,19 @@ mod tests {
         let lines = buffer_lines(&buf);
         let s = screen(&lines);
         assert!(!s.contains('┏'), "the dive selects nothing: {s}");
-        let row = lines.iter().position(|l| titled(l, '┌', "beta")).unwrap();
+        let row = lines.iter().position(|l| titled(l, '╔', "beta")).unwrap();
         // (The corner of the card whose title names beta.)
-        let x = col(&lines[row], "┌ beta ")
-            .or_else(|| col(&lines[row], "┌ proj · beta "))
+        let x = col(&lines[row], "╔ beta ")
+            .or_else(|| col(&lines[row], "╔ proj · beta "))
             .unwrap() as u16;
-        assert_eq!(buf[(x, row as u16)].fg, target_color(true), "{s}");
+        assert_eq!(buf[(x, row as u16)].fg, thread_color("t-beta"), "{s}");
         assert_eq!(
             buf[(0, 0)].bg,
-            target_fill(true).bg.unwrap(),
+            target_fill(st.dived()).bg.unwrap(),
             "the band: {s}"
         );
+        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"), "the band: {s}");
+        assert_eq!(s.matches('╔').count(), 1, "only the dive's card: {s}");
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
         assert!(titled(&s, '┏', "beta"), "selected, the dive's card: {s}");
@@ -14012,15 +15349,17 @@ mod tests {
                 assert_eq!(buf[(main_w, y)].bg, Color::Reset, "the gap: {y}");
             }
         };
-        check(&mut st, target_fill(false), Color::Cyan, " ORCHESTRATOR  ");
+        check(&mut st, target_fill(None), Color::Cyan, " ORCHESTRATOR  ");
         st.dive("t-beta");
+        let fill = target_fill(st.dived());
         check(
             &mut st,
-            target_fill(true),
-            Color::Magenta,
+            fill,
+            thread_color("t-beta"),
             " ‹ back  talking to beta  ",
         );
-        assert_ne!(target_fill(false), target_fill(true));
+        assert_ne!(target_fill(None), fill);
+        assert_eq!(fill.bg, Some(thread_color("t-beta")));
         // A working thread's icon leads the band, on the terminal's own background.
         st.dive("t-gamma");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
@@ -14030,17 +15369,17 @@ mod tests {
             (icon::ACCENT, Color::Reset)
         );
         assert_eq!(buf[(3, 0)].symbol(), "‹");
-        assert_eq!(buf[(3, 0)].bg, target_fill(true).bg.unwrap());
+        assert_eq!(buf[(3, 0)].bg, target_fill(st.dived()).bg.unwrap());
         // With a draft and a card selected, the input's border keeps the color; its label the
         // fill.
         st.set_focus(Some("t-beta".into()));
         st.view.input.set("draft");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
         let input = st.view.panes.get(&PaneId::Input).unwrap().area;
-        assert_eq!(buf[(input.x - 1, input.y)].fg, Color::Magenta);
+        assert_eq!(buf[(input.x - 1, input.y)].fg, thread_color("t-gamma"));
         assert_eq!(
             buf[(input.x + 1, input.y - 1)].bg,
-            target_fill(true).bg.unwrap()
+            target_fill(st.dived()).bg.unwrap()
         );
     }
 
@@ -14292,6 +15631,463 @@ mod tests {
         }
     }
 
+    /// The corner and the first cell of the name of each card or tile drawn of `st`'s threads
+    /// in `buf`, and its id: the cell up and left of its pane, and the name's in its top row.
+    fn card_corners<'b>(
+        st: &AppState,
+        buf: &'b Buffer,
+    ) -> Vec<(String, &'b ratatui::buffer::Cell, &'b ratatui::buffer::Cell)> {
+        let mut out = Vec::new();
+        for t in st.registry.list() {
+            let Some(p) = st.view.panes.get(&card(&t.id)) else {
+                continue;
+            };
+            let (x, y) = (p.area.x - 1, p.area.y - 1);
+            let row: String = (x..p.area.right()).map(|x| buf[(x, y)].symbol()).collect();
+            let Some(at) = col(&row, &format!(" {} ", t.name)) else {
+                continue;
+            };
+            out.push((t.id.clone(), &buf[(x, y)], &buf[(x + at as u16 + 1, y)]));
+        }
+        out
+    }
+
+    /// Every card is framed in its thread's color, thin, with its name in that color and
+    /// bold: in the side column, the row above a narrow main pane, the grid's tiles and the
+    /// compact layout's Threads. Selected, it is thick and yellow; dived into, double in its
+    /// color. The hub's card stays yellow.
+    #[test]
+    fn a_card_is_framed_and_named_in_its_threads_color() {
+        let check = |st: &mut AppState, w: u16, h: u16, what: &str| {
+            let buf = crate::app::tests::draw(st, w, h);
+            let s = screen(&buffer_lines(&buf));
+            let cards = card_corners(st, &buf);
+            assert!(!cards.is_empty(), "{what}: {s}");
+            for (id, corner, name) in cards {
+                let color = thread_color(&id);
+                let (shape, fg) = match look(st, &id) {
+                    Look::Selected => ("┏", Color::Yellow),
+                    Look::Target => ("╔", color),
+                    Look::Plain => ("┌", color),
+                };
+                assert_eq!(corner.symbol(), shape, "{what} {id}: {s}");
+                assert_eq!(corner.fg, fg, "{what} {id}: {s}");
+                assert_eq!(name.fg, color, "{what} {id}: the name");
+                assert!(name.modifier.contains(Modifier::BOLD), "{what} {id}");
+            }
+        };
+        let mut st = three_threads();
+        st.set_focus(None);
+        check(&mut st, 160, 40, "column");
+        check(&mut st, 80, 40, "row");
+        st.set_focus(Some("t-gamma".into()));
+        check(&mut st, 160, 40, "column, gamma selected");
+        st.view.screen = Screen::Grid;
+        check(&mut st, 160, 40, "grid");
+        st.view.screen = Screen::Stack;
+        st.set_focus(None);
+        st.dive("t-beta");
+        check(&mut st, 160, 40, "column, beta dived into");
+        let mut st = three_threads();
+        st.view.compact_width = 60;
+        st.view.compact_pane = crate::app::CompactPane::Threads;
+        for id in ["t-alpha", "t-beta", "t-gamma"] {
+            st.set_focus(Some(id.into()));
+            check(&mut st, 40, 30, "compact");
+        }
+        // The three threads have colors apart: told apart by them.
+        let colors: HashSet<String> = ["t-alpha", "t-beta", "t-gamma"]
+            .iter()
+            .map(|id| format!("{:?}", thread_color(id)))
+            .collect();
+        assert_eq!(colors.len(), 3);
+    }
+
+    /// A parked thread's card keeps its dim look, in its color.
+    #[test]
+    fn a_parked_card_is_dim_in_its_color() {
+        let mut st = three_threads();
+        let mut a = ThreadScript::new("t-alpha");
+        crate::app::tests::control(
+            &mut st,
+            &[a.event(EventBody::ThreadParked(Default::default()))],
+        );
+        st.view.show_parked = true;
+        st.set_focus(None);
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        let cards = card_corners(&st, &buf);
+        let (_, corner, name) = cards.iter().find(|(id, ..)| id == "t-alpha").unwrap();
+        assert_eq!(corner.fg, thread_color("t-alpha"));
+        assert!(corner.modifier.contains(Modifier::DIM));
+        assert!(name.modifier.contains(Modifier::DIM | Modifier::BOLD));
+        let (_, corner, _) = cards.iter().find(|(id, ..)| id == "t-beta").unwrap();
+        assert!(!corner.modifier.contains(Modifier::DIM));
+    }
+
+    /// A compact "Needs you" row names its thread in its color.
+    #[test]
+    fn a_needs_you_row_names_its_thread_in_its_color() {
+        let st = three_threads();
+        let rows = compact_needs_rows(&st, 60);
+        assert!(!rows.is_empty());
+        for (id, line) in rows {
+            let name = &line.spans[0];
+            assert_eq!(name.content, st.registry.get(&id).unwrap().name);
+            assert_eq!(name.style.fg, Some(thread_color(&id)), "{id}");
+        }
+    }
+
+    /// A report in the orchestrator's conversation names its thread in its color.
+    #[test]
+    fn a_report_names_its_thread_in_its_color() {
+        let st = three_threads();
+        let e = Entry::HubUpdate {
+            text: "alpha finished (success): the refactor is done".into(),
+            user_message: None,
+            attn_id: None,
+            about: Some("t-alpha".into()),
+            outcome: None,
+            seq: 1,
+            resolution: false,
+            routine: None,
+        };
+        let threads = Threads {
+            boxes: true,
+            state: Some(&st),
+        };
+        let rows = transcript_view(&[e], 80, &Collapse::default(), &threads);
+        let span = rows
+            .iter()
+            .flat_map(|r| r.0.spans.iter())
+            .find(|s| s.content == "alpha")
+            .unwrap();
+        assert_eq!(span.style.fg, Some(thread_color("t-alpha")));
+        assert!(span.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// A hub update names each thread it is about, and each the hub lists, in the thread's
+    /// color wherever the name is: a watch and its end, an older hub's lead, several watches
+    /// ended, a queued prompt (not the prompt), a direct command, a confirm card's actions, a
+    /// disk card's trims. A word that names no thread, or is part of a longer word, keeps the
+    /// update's grey.
+    #[test]
+    fn an_update_names_its_threads_in_their_colors() {
+        let st = three_threads();
+        let threads = Threads {
+            boxes: true,
+            state: Some(&st),
+        };
+        // (The view draws beta's open permission too: only words are read.)
+        let colored = |text: &str, about: Option<&str>| -> Vec<(String, Color)> {
+            let e = Entry::HubUpdate {
+                text: text.into(),
+                user_message: None,
+                attn_id: None,
+                about: about.map(str::to_string),
+                outcome: None,
+                seq: 1,
+                resolution: false,
+                routine: None,
+            };
+            transcript_view(&[e], 200, &Collapse::default(), &threads)
+                .iter()
+                .flat_map(|r| r.0.spans.iter())
+                .filter_map(|s| match s.style.fg {
+                    Some(c)
+                        if c != Color::DarkGray
+                            && s.content.chars().all(|c| c.is_ascii_alphabetic()) =>
+                    {
+                        Some((s.content.to_string(), c))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let (a, b, g) = (
+            ("alpha".to_string(), thread_color("t-alpha")),
+            ("beta".to_string(), thread_color("t-beta")),
+            ("gamma".to_string(), thread_color("t-gamma")),
+        );
+        for (text, about, want) in [
+            (
+                "Watching alpha: the orchestrator is woken the next time it finishes (w1). \
+                 Note: check alpha's tests",
+                Some("t-alpha"),
+                vec![a.clone(), a.clone()],
+            ),
+            (
+                "Stopped watching alpha (w1).",
+                Some("t-alpha"),
+                vec![a.clone()],
+            ),
+            (
+                "alpha's background work finished and no turn started after it: twr woke it",
+                Some("t-alpha"),
+                vec![a.clone()],
+            ),
+            ("alpha request p1 closed.", Some("t-alpha"), vec![a.clone()]),
+            (
+                "alpha-v2 and alphabet are not alpha.",
+                Some("t-alpha"),
+                vec![a.clone()],
+            ),
+            ("alpha background work finished.", None, vec![a.clone()]),
+            (
+                "Stopped watching alpha, beta (w1, w2).",
+                None,
+                vec![a.clone(), b.clone()],
+            ),
+            (
+                "Stopped watching every worker, gamma (w1, w2).",
+                None,
+                vec![g.clone()],
+            ),
+            (
+                "Queued until alpha, gamma finish: tell beta to stop",
+                None,
+                vec![a.clone(), g.clone()],
+            ),
+            (
+                "Sent the prompt queued until beta finished.",
+                None,
+                vec![b.clone()],
+            ),
+            (
+                "Applied: alpha: allow; beta → plan mode.",
+                None,
+                vec![a.clone(), b.clone()],
+            ),
+            (
+                "Confirmed. Applied: allow alpha, set beta → auto. Skipped: answer gamma: \"yes\" \
+                 (gone).",
+                None,
+                vec![a.clone(), b.clone(), g.clone()],
+            ),
+            (
+                "Disk card for local: trimmed alpha (1.0 MB), beta (2.0 MB). Not trimmed: gamma \
+                 (it runs).",
+                None,
+                vec![a.clone(), b.clone(), g.clone()],
+            ),
+            (
+                "Watching every worker: the orchestrator is woken each time it finishes (w3). \
+                 Note: alpha",
+                None,
+                vec![],
+            ),
+        ] {
+            assert_eq!(colored(text, about), want, "{text}");
+        }
+    }
+
+    /// In a dive, the header band is filled with the thread's color, its text black or white
+    /// as reads better on it; the input box's border and hint are in that color, its label
+    /// filled like the band. The orchestrator keeps its cyan; a thread without a color of its
+    /// own (the orchestrator's, the hub's) gets the old magenta.
+    #[test]
+    fn a_dive_is_drawn_in_the_threads_color() {
+        let mut st = three_threads();
+        for id in ["t-alpha", "t-beta", "t-gamma"] {
+            st.dive(id);
+            let color = thread_color(id);
+            let buf = crate::app::tests::draw(&mut st, 120, 40);
+            assert_eq!(buf[(0, 0)].bg, color, "{id}");
+            let back = (0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
+            assert_eq!(buf[(back, 0)].fg, crate::color::text_on(color), "{id}");
+            let input = st.view.panes.get(&PaneId::Input).unwrap().area;
+            assert_eq!(buf[(input.x - 1, input.y)].fg, color, "{id}: the border");
+            assert_eq!(buf[(input.x + 1, input.y - 1)].symbol(), "→");
+            assert_eq!(buf[(input.x + 1, input.y - 1)].bg, color, "{id}: the label");
+            let hint = (input.x..input.right())
+                .find(|x| buf[(*x, input.y - 1)].symbol() == "E")
+                .unwrap();
+            assert_eq!(buf[(hint, input.y - 1)].fg, color, "{id}: the hint");
+        }
+        assert_eq!(target_color(None), Color::Cyan);
+        assert_eq!(target_fill(None).bg, Some(Color::Indexed(80)));
+        let st = crate::app::tests::with_orch();
+        let orch = st.orchestrator().unwrap();
+        assert_eq!(target_color(Some(orch)), Color::Magenta);
+        assert_eq!(target_fill(Some(orch)).bg, Some(Color::Indexed(176)));
+        assert_eq!(target_fill(Some(orch)).fg, Some(Color::Indexed(16)));
+    }
+
+    /// `[tui] colors = "16"` draws the whole frame in the 16 named colors: a thread's color as
+    /// the old dark grey, a dive's band as the old magenta. `"none"` draws it in the
+    /// terminal's own colors, the bands reversed, the borders' shapes kept: a selected card
+    /// thick, the dived one double.
+    #[test]
+    fn sixteen_colors_and_no_color_reach_the_whole_frame() {
+        let mut st = three_threads();
+        st.dive("t-beta");
+        st.set_focus(Some("t-gamma".into()));
+        st.view.colors = crate::color::Depth::Basic;
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        let s = screen(&buffer_lines(&buf));
+        for cell in &buf.content {
+            for c in [cell.fg, cell.bg] {
+                assert!(
+                    !matches!(c, Color::Indexed(_) | Color::Rgb(..)),
+                    "{c:?}: {s}"
+                );
+            }
+        }
+        assert_eq!(buf[(0, 0)].bg, Color::Magenta, "the band");
+        let cards = card_corners(&st, &buf);
+        let corner = |id: &str| cards.iter().find(|(i, ..)| i == id).unwrap().1;
+        assert_eq!(corner("t-alpha").fg, Color::DarkGray);
+        assert_eq!(corner("t-beta").fg, Color::DarkGray);
+        assert_eq!(corner("t-beta").symbol(), "╔");
+        assert_eq!(corner("t-gamma").fg, Color::Yellow);
+        st.view.colors = crate::color::Depth::None;
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        let s = screen(&buffer_lines(&buf));
+        assert!(
+            buf.content
+                .iter()
+                .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
+            "{s}"
+        );
+        assert!(
+            buf[(0, 0)].modifier.contains(Modifier::REVERSED),
+            "the band"
+        );
+        let cards = card_corners(&st, &buf);
+        let corner = |id: &str| cards.iter().find(|(i, ..)| i == id).unwrap().1;
+        assert_eq!(corner("t-alpha").symbol(), "┌");
+        assert_eq!(corner("t-beta").symbol(), "╔");
+        assert_eq!(corner("t-gamma").symbol(), "┏");
+        assert!(!corner("t-alpha").modifier.contains(Modifier::REVERSED));
+        // Full color draws as it always did.
+        st.view.colors = crate::color::Depth::Full;
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"));
+        // The compact tab bar without colors: the current tab alone is reversed.
+        let mut st = three_threads();
+        st.view.compact_width = 60;
+        st.view.compact_pane = crate::app::CompactPane::Threads;
+        st.view.colors = crate::color::Depth::None;
+        let buf = crate::app::tests::draw(&mut st, 40, 30);
+        let lines = buffer_lines(&buf);
+        let y = lines.iter().position(|l| l.contains("Threads")).unwrap() as u16;
+        let at = |word: &str| col(&lines[usize::from(y)], word).unwrap() as u16;
+        let reversed = |x: u16| buf[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(reversed(at("Threads")), "{lines:#?}");
+        assert!(!reversed(at("Chat")), "{lines:#?}");
+        assert!(!reversed(at("Needs")), "{lines:#?}");
+    }
+
+    /// The orchestrator's conversation ([`crate::app::tests::orch_conversation`]) with a
+    /// message the user took back after its replies (`stop that`).
+    fn with_taken_back() -> AppState {
+        use crate::app::tests::{
+            orch_conversation, thread_item, with_orch, without_worker_requests,
+        };
+        use twr_core::event::{Event, EventBody, Source, TurnStarted, TurnWithdrawn};
+        let mut st = without_worker_requests(with_orch());
+        orch_conversation(&mut st);
+        let seq = st.transcript.as_ref().unwrap().last_seq;
+        let started = Event::new(
+            "t-orch",
+            seq + 1,
+            Some(3),
+            Source::Hub,
+            EventBody::TurnStarted(TurnStarted {
+                prompt: "stop that".into(),
+                ..Default::default()
+            }),
+        );
+        let withdrawn = Event::new(
+            "t-orch",
+            seq + 2,
+            Some(3),
+            Source::Hub,
+            EventBody::TurnWithdrawn(TurnWithdrawn {
+                msg_ref: 9,
+                turn: 3,
+                ..Default::default()
+            }),
+        );
+        for ev in [started, withdrawn] {
+            st.apply_event(&thread_item(&ev));
+        }
+        st
+    }
+
+    /// With 16 colors a message's band reads, taken back or not: the band, a taken-back
+    /// message's dimmed text and every message's mark all come down to dark grey, and the text
+    /// and the mark take a light grey on it; a message's own text stays white, brighter than a
+    /// taken-back one's.
+    #[test]
+    fn sixteen_colors_keep_a_messages_text_and_mark_on_its_band() {
+        let mut st = with_taken_back();
+        st.view.colors = crate::color::Depth::Basic;
+        let buf = crate::app::tests::draw(&mut st, 160, 40);
+        let s = screen(&buffer_lines(&buf));
+        let area = st.view.panes.get(&PaneId::Transcript).unwrap().area;
+        assert!(s.contains("taken back"), "{s}");
+        let sent = find_text(&buf, area, "❯ which threads need me?").expect(&s);
+        let back = find_text(&buf, area, "❯ stop that").expect(&s);
+        for (row, text) in [(sent, Color::White), (back, Color::Gray)] {
+            let cell = |x: u16| &buf[(x, row.y)];
+            assert_eq!(cell(row.x).bg, Color::DarkGray, "the band: {s}");
+            assert_eq!(cell(row.x).fg, Color::Gray, "the mark: {s}");
+            assert_eq!(cell(row.x + 2).fg, text, "the text: {s}");
+            for x in row.x..area.right() {
+                assert_ne!(cell(x).fg, cell(x).bg, "{x}: {s}");
+            }
+        }
+        assert!(buf[(back.x + 2, back.y)]
+            .modifier
+            .contains(Modifier::CROSSED_OUT));
+    }
+
+    /// No cell of a frame drawn in 16 colors has its text in its fill's color where full color
+    /// drew them apart, in the usual views: the cards with a dive and a selection, the
+    /// orchestrator's conversation with a taken-back message (wide, and narrow with the cards
+    /// in a row above), the grid, the compact screens.
+    #[test]
+    fn sixteen_colors_never_hide_a_cells_text_in_the_usual_views() {
+        use crate::app::tests::draw_at;
+        use crate::app::CompactPane;
+        use crate::color::Depth;
+        let now = std::time::Instant::now();
+        let check = |mut st: AppState, w: u16, h: u16, what: &str| {
+            st.view.colors = Depth::Full;
+            let full = draw_at(&mut st, w, h, now);
+            st.view.colors = Depth::Basic;
+            let basic = draw_at(&mut st, w, h, now);
+            let s = screen(&buffer_lines(&basic));
+            for (i, (f, b)) in full.content.iter().zip(&basic.content).enumerate() {
+                assert_eq!(f.symbol(), b.symbol(), "{what}: the same frame: {s}");
+                if f.fg != f.bg {
+                    let (x, y) = (i as u16 % w, i as u16 / w);
+                    assert_ne!(
+                        b.fg, b.bg,
+                        "{what}: ({x}, {y}) {:?} on {:?}: {s}",
+                        f.fg, f.bg
+                    );
+                }
+            }
+        };
+        let mut dived = three_threads();
+        dived.dive("t-beta");
+        dived.set_focus(Some("t-gamma".into()));
+        check(dived, 160, 40, "a dive");
+        check(three_threads(), 160, 40, "the cards");
+        check(with_taken_back(), 160, 40, "the conversation");
+        check(with_taken_back(), 60, 30, "the conversation, narrow");
+        let mut grid = with_taken_back();
+        grid.view.screen = Screen::Grid;
+        check(grid, 160, 40, "the grid");
+        for pane in [CompactPane::Threads, CompactPane::Chat] {
+            let mut compact = with_taken_back();
+            compact.view.compact_width = 60;
+            compact.view.compact_pane = pane;
+            check(compact, 40, 30, "compact");
+        }
+    }
+
     /// At any width a box's rows fit the pane, its text wrapped inside; below
     /// [`BOX_MIN_WIDTH`] the section is its name, then its text, with no frame. Nothing
     /// panics, down to no width at all.
@@ -14469,6 +16265,7 @@ mod tests {
             outcome: outcome.map(str::to_string),
             seq: 0,
             resolution: false,
+            routine: None,
         };
         let mut entries = vec![
             Entry::TurnStart {
@@ -14583,6 +16380,7 @@ mod tests {
             outcome: outcome.map(str::to_string),
             seq: 0,
             resolution: false,
+            routine: None,
         };
         let show = |entries: &[Entry], w: u16, all: bool| -> Vec<String> {
             let c = Collapse {
@@ -15091,6 +16889,7 @@ mod tests {
                 about: None,
                 outcome: None,
                 resolution: false,
+                routine: None,
             },
             Entry::HubUpdate {
                 seq: 25,
@@ -15100,6 +16899,7 @@ mod tests {
                 about: None,
                 outcome: None,
                 resolution: false,
+                routine: None,
             },
             Entry::TurnStart {
                 seq: 26,

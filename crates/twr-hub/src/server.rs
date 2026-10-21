@@ -6,6 +6,7 @@
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
 //! | `hub.info`          | -                                                   | `{version, build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
 //! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
@@ -27,6 +28,7 @@
 //! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
 //! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
 //! | `suggest.next`      | `{thread, turn, model}` (users only)                | `{thread, turn, model, suggestion, reason?, cached, stats}`: a likely next message of the user's after turn `turn` ended, from `claude -p` with the user's login (`hub::suggest`) |
+//! | `summary.thread`    | `{thread, models?, every_secs}` (users only)        | `{thread, summary, basis, runtime, model, cached, reason?, next_after_secs?, stats}`: one line on where a worker thread stands, from its state, activity and routine updates, by the small model a suggestion uses (`hub::summary`, `twr_core::proto::SummaryThreadResult`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -636,6 +638,7 @@ pub const METHODS: &[&str] = &[
     "hello",
     "say",
     "hub.info",
+    "hub.glance",
     "hub.shutdown",
     "config.show",
     "box.add",
@@ -672,6 +675,7 @@ pub const METHODS: &[&str] = &[
     "shell.run",
     "shell.cd",
     "suggest.next",
+    "summary.thread",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -708,6 +712,7 @@ pub const METHODS: &[&str] = &[
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hello",
     "hub.info",
+    "hub.glance",
     "box.agents",
     "config.show",
     "thread.new",
@@ -785,6 +790,7 @@ pub const AGENT_METHODS: &[&str] = &[
     "job.list",
     "job.log",
     "hub.info",
+    "hub.glance",
     "box.agents",
     "thread.list",
     "thread.activity",
@@ -1052,11 +1058,11 @@ async fn connection(
                     break;
                 }
             }
-            // A suggestion asked for is the client's only while it waits for it: its client
-            // gone (the user turned suggestions off), the ask goes too, before any model is
-            // asked, or with the CLI it started (`hub::suggest`).
+            // A suggestion or summary asked for is the client's only while it waits for it:
+            // its client gone (the user turned them off, or quit), the ask goes too, before
+            // any model is asked, or with the CLI it started (`hub::suggest`, `hub::summary`).
             // (Dispatched by `call_async`: its own arm there is the method's.)
-            method @ "suggest.next" => {
+            method @ ("suggest.next" | "summary.thread") => {
                 let result = tokio::select! {
                     r = call_async(&hub, &caller, method, req.params) => r,
                     () = hung_up(&mut reader) => break,
@@ -1915,6 +1921,10 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             let (thread, turn, ask) = suggest_params(p)?;
             hub.suggest_ask(&thread, turn, &ask, caller).await
         }
+        "summary.thread" => {
+            let p: twr_core::proto::SummaryThreadParams = params(p)?;
+            hub.summary_thread(&p, caller).await
+        }
         "usage.threads" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -2417,6 +2427,7 @@ fn call(
         }
         "thread.list" => Ok(Value::Array(hub.list_threads())),
         "thread.activity" => Ok(hub.thread_activity()),
+        "hub.glance" => hub.glance(),
         "usage.get" => Ok(hub.usage()),
         // A user's TUI: whether the user looks at it, so the notification hook keeps quiet
         // meanwhile (`hub::hook`).

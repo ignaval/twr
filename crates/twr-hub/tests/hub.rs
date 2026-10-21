@@ -3571,6 +3571,7 @@ async fn a_stalled_item_resolves_in_the_batch_of_the_activity() {
         (r.attn_id.as_str(), r.by),
         (stalled.attn_id.as_str(), ResolvedBy::Timeout)
     );
+    assert!(went_on(&r.ext), "its runtime's output: {r:?}");
     assert_eq!(evs[1].seq, evs[0].seq + 1);
     hub.shutdown().await;
 }
@@ -3600,6 +3601,8 @@ async fn a_stalled_item_left_open_behind_a_closed_turn_is_resolved_at_startup() 
         panic!("{:?}", kinds(&evs))
     };
     assert_eq!((r.attn_id.as_str(), r.by), ("stall-1", ResolvedBy::Timeout));
+    // Its thread's work is gone, not going on.
+    assert!(!went_on(&r.ext), "{r:?}");
     hub.shutdown().await;
 }
 

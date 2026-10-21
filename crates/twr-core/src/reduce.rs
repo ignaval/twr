@@ -1044,6 +1044,11 @@ impl Registry {
         self.deleted.get(id)
     }
 
+    /// The views of the deleted threads ([`Registry::deleted_view`]), in no order.
+    pub fn deleted_views(&self) -> impl Iterator<Item = &ThreadView> {
+        self.deleted.values()
+    }
+
     /// Number of threads.
     pub fn len(&self) -> usize {
         self.threads.len()
