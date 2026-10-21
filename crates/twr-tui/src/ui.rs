@@ -11633,19 +11633,22 @@ mod tests {
             );
             st
         };
-        let compact = |st: &mut AppState| {
+        // The list: what the case is called, the screen's size, how the view is set up and
+        // the most rows a card gets there.
+        type Case = (&'static str, u16, u16, fn(&mut AppState), u16);
+        let compact: fn(&mut AppState) = |st| {
             st.view.compact_width = 60;
             st.view.compact_pane = crate::app::CompactPane::Threads;
         };
-        let grid = |st: &mut AppState| st.view.screen = Screen::Grid;
-        let plain = |_: &mut AppState| {};
-        let cases: [(&str, u16, u16, &dyn Fn(&mut AppState), u16); 6] = [
-            ("column 120", 120, 45, &plain, COMPACT_CARD_HEIGHT),
-            ("column 160", 160, 45, &plain, COMPACT_CARD_HEIGHT),
-            ("column 200", 200, 45, &plain, COMPACT_CARD_HEIGHT),
-            ("row 90", 90, 40, &plain, CARD_HEIGHT),
-            ("grid 160", 160, 40, &grid, TILE_HEIGHT),
-            ("compact 40", 40, 30, &compact, COMPACT_CARD_HEIGHT),
+        let grid: fn(&mut AppState) = |st| st.view.screen = Screen::Grid;
+        let plain: fn(&mut AppState) = |_| {};
+        let cases: [Case; 6] = [
+            ("column 120", 120, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 160", 160, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 200", 200, 45, plain, COMPACT_CARD_HEIGHT),
+            ("row 90", 90, 40, plain, CARD_HEIGHT),
+            ("grid 160", 160, 40, grid, TILE_HEIGHT),
+            ("compact 40", 40, 30, compact, COMPACT_CARD_HEIGHT),
         ];
         for (what, w, h, setup, cap) in cases {
             // Each from a fresh state: a card drawn taller once keeps its height a while.
