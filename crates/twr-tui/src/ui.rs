@@ -2191,8 +2191,9 @@ fn at_work(t: &ThreadView) -> bool {
 /// the state says already ([`after_state`]): while the thread is at work ([`at_work`]) or failed,
 /// what it does now or why it failed (the hub's activity line, `thread.activity`; until the hub
 /// said, what its status says, [`twr_core::activity::fallback`]); else its last report (dim), or
-/// the activity line when it has none (`idle · not started`). A selected card waiting on
-/// background work shows the report its turn yielded under that: an interim one. With an item
+/// the activity line when it has none (`idle · not started`). A card waiting on background
+/// work shows the report its turn yielded under that: an interim one, selected or not (a card
+/// has the same rows either way). With an item
 /// open (`item`), a thread at work but not waiting on the user (running, on background tasks,
 /// attached: a stalled notice, a review) still says what it does; one waiting on the user, or
 /// not at work, shows the state alone: the item says the rest. Also returns the section on
@@ -2277,8 +2278,7 @@ fn section_lines(
     }
     let line = one(&spans);
     let mut lines = wrapped(spans);
-    let selected = highlighted(state) == Some(t.id.as_str());
-    if selected && status == ThreadStatus::Background && t.reported {
+    if status == ThreadStatus::Background && t.reported {
         if let Some(r) = &t.last_report {
             lines.extend(wrapped(vec![report(r)]));
         }
@@ -11462,8 +11462,9 @@ mod tests {
     /// One section on its status: a card says its state (with its report's grade once it is
     /// done), then what is going on, nothing twice: an open item, else what it does while at
     /// work or why it failed (an activity line that starts with the state's word goes on from
-    /// it), else its last report, cut to the rows the card has. Never the activity and the
-    /// report both, never a report of an earlier turn while it works, never a `report:` label
+    /// it; waiting on background work, the report its turn yielded under it), else its last
+    /// report, cut to the rows the card has. Never the activity next to a report of an
+    /// earlier turn, never a report of an earlier turn while it works, never a `report:` label
     /// or a `›`. Who runs it is in the title. In the column
     /// (34, 40 and 48 columns), the row above a narrow conversation, the grid, and the compact
     /// layout's Threads screen (40 columns).
@@ -11477,8 +11478,11 @@ mod tests {
             ),
             (
                 "bg",
-                &["background (1 bg) · cargo test --workspace"],
-                &["Tests run", "earlier", "waiting on"],
+                &[
+                    "background (1 bg) · cargo test --workspace",
+                    "Tests run in the background.",
+                ],
+                &["earlier", "waiting on"],
             ),
             (
                 "perm",
@@ -11549,11 +11553,6 @@ mod tests {
                 st.set_focus(Some(format!("t-{name}")));
                 let lines = draw_panes(&mut st, w, 40);
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-                if *name == "bg" {
-                    // Selected, it shows the report its turn yielded with: an interim one.
-                    assert!(text.contains("Tests run in the"), "row {w}:\n{text}");
-                    continue;
-                }
                 check(&format!("row {w}"), &text, name);
             }
         }
@@ -11573,11 +11572,114 @@ mod tests {
             let lines = draw_panes(&mut st, 40, 20);
             assert!(st.compact());
             let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-            if *name == "bg" {
-                assert!(text.contains("Tests run in the"), "compact:\n{text}");
-                continue;
-            }
             check("compact", &text, name);
+        }
+    }
+
+    /// A card shows the same rows selected or not. Three cards, the first waiting on background
+    /// work after a long interim report: with nothing selected, with another card selected and
+    /// selected itself, it shows its state, what it waits on and the report under them, up to
+    /// the rows the list gives it, the last one cut with `…`. In the column (120, 160 and 200
+    /// columns), the row above a narrow conversation, the grid and the compact Threads screen.
+    #[test]
+    fn an_unselected_card_shows_its_whole_section() {
+        use crate::app::tests::control;
+        use twr_core::event::{Grade, TaskUpdated};
+        let interim = "The gates job is running: cargo deny passed, fmt passed and clippy is \
+                       in progress. The PR body is drafted in pr-body.md, with the changelog \
+                       entries and the screenshots it links. The hub will wake me when the job \
+                       ends; I will open the PR then, say how the gates went and list what is \
+                       left for the release, which is the docs pass and the tag.";
+        let three = || {
+            let mut st = AppState::new();
+            st.view.animate = false;
+            for (i, name) in ["first", "second", "third"].iter().enumerate() {
+                let mut s = ThreadScript::new(format!("t-{name}"));
+                let mut evs = vec![
+                    s.at(i as i64).created(name),
+                    s.turn_started("go"),
+                    s.git(&format!("twr/{name}"), 1),
+                ];
+                match *name {
+                    "first" => {
+                        let mut report = s.report(Some(1), Grade::Success);
+                        if let EventBody::ReportReady(p) = &mut report.body {
+                            p.summary = interim.into();
+                        }
+                        evs.extend([
+                            s.event(EventBody::TaskUpdated(TaskUpdated {
+                                task_id: "job".into(),
+                                running: true,
+                                ..Default::default()
+                            })),
+                            s.turn_ended(TurnResult::Completed),
+                            report,
+                        ]);
+                    }
+                    "third" => evs.extend([
+                        s.turn_ended(TurnResult::Completed),
+                        s.report(Some(1), Grade::Success),
+                    ]),
+                    _ => {}
+                }
+                control(&mut st, &evs);
+            }
+            st.apply_result(
+                "thread.activity",
+                &serde_json::json!({
+                    "t-first": {"activity": "waiting on background: job sync gates: running"},
+                    "t-second": {"activity": "running the invoice tests"},
+                }),
+            );
+            st
+        };
+        // The list: what the case is called, the screen's size, how the view is set up and
+        // the most rows a card gets there.
+        type Case = (&'static str, u16, u16, fn(&mut AppState), u16);
+        let compact: fn(&mut AppState) = |st| {
+            st.view.compact_width = 60;
+            st.view.compact_pane = crate::app::CompactPane::Threads;
+        };
+        let grid: fn(&mut AppState) = |st| st.view.screen = Screen::Grid;
+        let plain: fn(&mut AppState) = |_| {};
+        let cases: [Case; 6] = [
+            ("column 120", 120, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 160", 160, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 200", 200, 45, plain, COMPACT_CARD_HEIGHT),
+            ("row 90", 90, 40, plain, CARD_HEIGHT),
+            ("grid 160", 160, 40, grid, TILE_HEIGHT),
+            ("compact 40", 40, 30, compact, COMPACT_CARD_HEIGHT),
+        ];
+        for (what, w, h, setup, cap) in cases {
+            // Each from a fresh state: a card drawn taller once keeps its height a while.
+            let inside = |focus: Option<&str>| {
+                let mut st = three();
+                setup(&mut st);
+                st.set_focus(focus.map(String::from));
+                let lines = draw_panes(&mut st, w, h);
+                card_lines(&st, &lines, "t-first")
+            };
+            let none = inside(None);
+            let other = inside(Some("t-second"));
+            let own = inside(Some("t-first"));
+            let text = none.join("\n");
+            let words = none.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+            assert!(words.contains("background (1 bg)"), "{what}:\n{text}");
+            assert!(
+                words.contains("The gates job is running"),
+                "{what}:\n{text}"
+            );
+            assert_eq!(
+                none.len(),
+                usize::from(cap - 2),
+                "{what}: all its rows\n{text}"
+            );
+            assert!(
+                none.iter().any(|l| l.trim_end().ends_with('…')),
+                "{what}: cut at its last row\n{text}"
+            );
+            assert_eq!(none, other, "{what}: another card selected");
+            assert_eq!(none, own, "{what}: selected itself");
         }
     }
 
