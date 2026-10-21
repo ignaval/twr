@@ -14,21 +14,48 @@ twr ws                       # list them
 
 ## In the TUI
 
-With more than one workspace, a strip of tabs tops every view:
+On a screen 120 columns wide or more, a sidebar on the left lists every workspace, a card each:
 
 ```
- default ⚠1 ●2 │ client-x ●1 │ scratch ○
+ WORKSPACES            ‹
+▌_ default         ⚠1 ●2
+▌  running
+▌  Merged api into dev;
+▌  the web tests still…
+
+ _ client-x           ●1
+   waiting on you
+   I need you to approve
+   the deploy of the…
+
+ ○ scratch
+   hub not running
+   Done: the parser
+   handles the new format.
+
+ + New workspace
+ ⚙ Settings
 ```
 
-`⚠` counts the permissions and questions waiting on you, `●` the threads running, and `○` marks a workspace whose hub isn't running. The current tab is highlighted. Switch with:
+Each card has the workspace's name, its orchestrator's status (running, idle, waiting on you, failed, or `hub not running`) and the start of the orchestrator's latest reply. The working icon before the name means the orchestrator or a thread there is working: a turn, background tasks or a job. `⚠` counts the permissions and questions waiting on you, `●` the threads running, and `○` marks a workspace whose hub isn't running; its card keeps the last reply the TUI saw. The current workspace's card is highlighted.
 
-- a click on a tab;
-- `Alt-1` to `Alt-9` for the tab at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
+`Ctrl-T` (or `/spaces`, or the `‹` in its header) hides the sidebar and shows it again; the TUI remembers it for the next time. Narrower than 120 columns, or with the sidebar hidden, a strip of tabs tops every view instead, once there is more than one workspace:
+
+```
+ ≡  default ⚠1 ●2 │ client-x ●1 │ scratch ○
+```
+
+The `≡` at its left shows the sidebar, or on a narrower screen opens it as a drawer over the view (so does `Ctrl-T`); `↑`/`↓` and `Enter` pick a card or a button there, and `Esc` or a click outside closes it. In the [compact layout](tui.md#on-a-phone) the workspaces are a screen of their own, `Workspaces`. Switch with:
+
+- a click on a card or a tab;
+- `Alt-1` to `Alt-9` for the workspace at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
 - `/ws <name>`; `/ws` alone lists them. A name that doesn't exist yet asks `y` to create it.
 
-The TUI is connected to one hub at a time. Switching opens the other workspace's hub, starting it if it isn't running, and replays its log the way opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing, the selected card, pins, the view, the scroll position and the thread you were talking to. Every five seconds the TUI asks the other running hubs for their counts, and with [notifications](tui.md#notifications) on, a workspace that gets a new permission or question notifies you, naming the workspace.
+`+ New workspace` (or `/ws new`) asks for a name and checks it the way `twr ws new` does: lowercase letters, digits and `-`, not `default` or one that exists. `Enter` creates the workspace and switches to it. `/ws new <name>` does it in one go. A TUI that a thread's agent runs creates no workspace, whichever way it's asked, and neither does `twr ws new` from an agent. `⚙ Settings` opens the [settings](tui.md#settings).
 
-A TUI opened with `--socket` shows that hub alone, without tabs.
+The TUI is connected to one hub at a time. Switching opens the other workspace's hub, starting it if it isn't running, and replays its log the way opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing, the selected card, pins, the view, the scroll position and the thread you were talking to. The TUI asks every running hub how it is every five seconds, with one light call each (`hub.glance`), and a stopped hub or one that didn't answer every fifteen seconds; it never starts a hub to ask it. A hub older than this TUI answers with its counts only, without its orchestrator's reply, until it's restarted. With [notifications](tui.md#notifications) on, a workspace that gets a new permission or question notifies you, naming the workspace.
+
+A TUI opened with `--socket` shows that hub alone, without the sidebar or tabs.
 
 ## What's separate and what's shared
 

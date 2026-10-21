@@ -27,11 +27,34 @@ The TUI only asks when no orchestrator was ever chosen: no orchestrator thread e
 
 ## Workspaces
 
-With more than one [workspace](workspaces.md), a strip of tabs tops every view, one per workspace: ` default ⚠1 ●2 │ client-x ●1 │ scratch ○`. `⚠` counts the permissions and questions waiting on you, `●` the threads running, and `○` marks a workspace whose hub isn't running (`…` one that didn't answer). The current one is highlighted, and the strip names it in place of the `[instance]` label. When the tabs don't fit, the strip shows the ones around the current tab, with `‹` and `›` for the rest.
+From 120 columns, a sidebar left of the view (the stack, the grid and the decision table) lists every [workspace](workspaces.md), `default` first, a card each: its name, its orchestrator's status (`running`, `idle`, `waiting on you` in yellow, `failed` in red, `hub not running`), and the start of the orchestrator's latest reply on two rows, cut with `…`. The working icon before the name says the orchestrator or one of its threads is working (a turn, background tasks, a job); `⚠2` counts the permissions and questions waiting on you there and `●3` the threads running, and `○` marks a workspace whose hub isn't running, its card keeping the last reply the TUI saw. The current workspace's name row is highlighted, its other rows marked at the left. Under the cards, `+ New workspace` and `⚙ Settings`. Too many cards for the height scroll with the wheel, with `↑ more` and `↓ more` at the edges.
 
-A click on a tab, `Alt-1` to `Alt-9` (the tab at that place), `Ctrl-PgUp` and `Ctrl-PgDn` (the previous and next tab) switch, whatever is open, a new workspace's first-run question included. `/ws <name>` switches too; for a name that doesn't exist yet, it asks `y` to create the workspace. `/ws` alone lists them.
+`Ctrl-T`, `/spaces`, or a tap on the sidebar's header (`WORKSPACES ‹`) hides it; `Ctrl-T` or `/spaces` again shows it, and `/spaces on` / `/spaces off` set it. The TUI remembers it across runs (in `tui-state.json`, in twr's data directory). While the sidebar shows, no strip of tabs is drawn and the `[instance]` label is left out: the sidebar names the workspace. Hidden, or on a screen narrower than 120 columns, a strip of tabs tops every view once there is more than one workspace, ` ≡  default ⚠1 ●2 │ client-x ●1 │ scratch ○`, the current one highlighted, `…` on one whose hub didn't answer; when the tabs don't fit, the strip shows the ones around the current tab, with `‹` and `›` for the rest. A tap on its `≡` shows the sidebar, or, narrower than 120 columns, opens it as a drawer over the left of the view, as `Ctrl-T` does there: `↑`/`↓` pick a card or a button, `Enter` acts on it, `Esc`, `Ctrl-T`, its `✕` or a click outside closes it, and any other key closes it and goes where it would. In the [compact layout](#on-a-phone) the workspaces are its `Workspaces` screen.
 
-The TUI is connected to one hub at a time: switching opens the other workspace's hub, starting it if it isn't running, and replays its log as opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing (not a history entry Up was showing), the selected card and request, pins, the view, the conversations it showed with their scroll positions, a confirm card's scroll, the selected decision, and the thread you were talking to, if it's still there. What you sent just before switching still goes to the workspace you left; if it fails, the status bar says so, naming that workspace. Every five seconds the TUI asks the other running hubs for their counts; with [notifications](#notifications) on, a workspace that gets a new permission or question notifies you, naming it. A TUI opened with `--socket` shows that hub alone.
+A click on a card or a tab, `Alt-1` to `Alt-9` (the workspace at that place), `Ctrl-PgUp` and `Ctrl-PgDn` (the previous and next one) switch, whatever is open, a new workspace's first-run question included. `/ws <name>` switches too; for a name that doesn't exist yet, it asks `y` to create the workspace. `/ws` alone lists them.
+
+`+ New workspace` and `/ws new` ask for the new workspace's name in a box of their own: what `twr ws new` refuses (anything but lowercase letters, digits and `-`, or a name that starts or ends with `-`), `default` and a workspace that exists are said under it, and `Enter` does nothing then; a good name is created and switched to. `Esc` or the box's `✕` cancels. `/ws new <name>` creates it at once (a workspace named `new` is reached with its card, its tab or `Alt-1`..`9`). A TUI that a thread's agent runs creates no workspace: the button, `/ws new` and `/ws` with a new name say so, and the CLI refuses an agent's `twr ws new` too.
+
+The TUI is connected to one hub at a time: switching opens the other workspace's hub, starting it if it isn't running, and replays its log as opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing (not a history entry Up was showing), the selected card and request, pins, the view, the conversations it showed with their scroll positions, a confirm card's scroll, the selected decision, and the thread you were talking to, if it's still there. What you sent just before switching still goes to the workspace you left; if it fails, the status bar says so, naming that workspace. Every five seconds the TUI asks each running hub how it is, one light call each, and a stopped one every fifteen seconds (it never starts a hub to ask it); with [notifications](#notifications) on, a workspace that gets a new permission or question notifies you, naming it. A TUI opened with `--socket` shows that hub alone, without the sidebar or tabs.
+
+### Settings
+
+`⚙ Settings`, or `/settings`, opens what is most often changed, each with the value in effect and where it is kept:
+
+| Setting | Kept in | Changed here |
+|---|---|---|
+| Suggestions | `[tui] suggest` | on, off |
+| Suggestion model | `[tui] suggest_model` | no: edit the file |
+| Card order | `[tui] card_order` | `stable`, `attention` |
+| Notifications | `[tui.notify] terminal` | `off`, `bell`, `osc9`, `osc777` |
+| Compact below | `[tui] compact_width` | 0 (never), 40, 50, 60, 80, 100, 120 columns |
+| Workspace sidebar | `tui-state.json` | shown, hidden (as `Ctrl-T`) |
+| Codex auto | `[codex] auto`, the hub's | no: edit the file, then restart the hub |
+| Wake after | `wake_after_secs`, the hub's | no: edit the file, then restart the hub |
+
+`↑`/`↓` select a row, `Enter`, `Space` or `→` change it to the next value and `←` back, `Esc` closes. A tap selects a row and a tap on the selected one changes it; the top border's `✕` closes. A change applies at once, for every workspace this TUI shows, and is written to the [config file](configuration.md) (`~/.config/twr/config.toml`) where the table says. The TUI changes that one line, or adds it under its table, or adds the table at the end, and nothing else: comments, blank lines, the order of the keys and every other table, secrets included, stay byte for byte as they were. It checks the result before writing it: read back, the file must hold exactly what it held before with that one value changed, and still be a config twr loads. It replaces the file in one step, keeping its permissions (and a symlink as a symlink), and only if nobody changed it meanwhile. When it can't be sure (the table written inline, `tui = { ... }`, or with dotted keys, a value spread over several lines, a file twr doesn't load), it leaves the file alone: the status bar says why, and the change holds for this session only. A row shows `the file says …` when the value in effect differs from the file's, after `/suggest` or `/compact` for example.
+
+The hub's own settings are shown as the running hub has them (`config.show`), not changed: it reads them when it starts, and `[codex] auto` decides what Codex threads run without asking you, which no stray tap should change. The suggestion models are free text with a size check of their own, so they're shown too. A TUI that a thread's agent runs shows the settings read-only.
 
 ## Stack view
 
@@ -448,9 +471,10 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Ctrl-G | the grid, or back to the stack view (`/grid`) |
 | Ctrl-O | expand or fold tool calls (the orchestrator's, or in a dive the thread's) and the hub's updates |
 | Ctrl-B | show or hide the thread sidebar |
+| Ctrl-T | show or hide the [workspace sidebar](#workspaces); narrower than 120 columns, open or close it as a drawer; in the compact layout, the Workspaces screen or back to the conversation |
 | Ctrl-F | toggle Focus mode: working threads and anything needing you |
 | Ctrl-L | repaint the whole screen |
-| Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the tab at that place, or the previous / next one |
+| Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the workspace at that place, or the previous / next one |
 | ? | typed on an empty line: help, commands and keys (and what a card's rows say), wrapped to the screen's width (below 70 columns each command or key on a row of its own, what it does indented under it). Taller than the screen, it scrolls with ↑↓, PgUp/PgDn, Home/End and the wheel, and its bottom border says `↓ more` while there is more below; Esc or any other key closes it, and so does a click outside it or on the `✕` of its top border. After text, `?` is a character |
 | Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise quit (also `/quit`); the TUI clears the screen it drew on |
 
@@ -485,7 +509,11 @@ These controls are drawn to be clicked, each at least a row tall (most a whole r
 
 | Control | Where | Does |
 |---|---|---|
-| `Chat`, `Needs you 2`, `Threads` | the compact layout's tab bar | each tab, its whole third of the bar (every row of it, and the gap after it), shows that screen, as `/c`, `/n`, `/t` |
+| `Chat`, `Needs you 2`, `Threads`, `Workspaces` | the compact layout's tab bar | each tab, its whole share of the bar (every row of it, and the gap after it), shows that screen, as `/c`, `/n`, `/t`, `/w` |
+| a workspace's card | the workspace sidebar, its drawer, the Workspaces screen (every row of the card) | switches to that workspace, as its tab does |
+| `+ New workspace`, `⚙ Settings` | under the workspaces (the whole row) | asks for a new workspace's name; opens the [settings](#settings) |
+| `WORKSPACES ‹`, `≡` | the workspace sidebar's header (the whole row); the tab strip's left end | hides the sidebar; shows it, or opens its drawer, as `Ctrl-T` |
+| a setting | the settings (every row of it) | selects it; on the selected one, changes it |
 | `‹ back` | a dive's header band (the whole band) | back to the orchestrator conversation, as `/back` |
 | `‹ stack` | the grid's header | back to the stack view, as `Ctrl-G` |
 | `↓ 12 lines below` | the main pane's last row while scrolled up (the whole row) | to the bottom, following it, as `End` |
@@ -542,13 +570,14 @@ A phone in portrait gives the TUI 40 to 60 columns and about 20 rows with its ke
 
 ![The compact layout's Threads screen at 40x20](img/tui-compact.svg)
 
-Each tab is a filled block a third of the screen wide, the current one reversed, `Needs you` yellow while something waits on you (`Needs 2` where `Needs you 2` doesn't fit its third). The bar is 3 rows tall on a screen of 24 rows or more, 2 rows from 14 rows (a phone with its keyboard up has about 20), and a single row on a shorter screen, which needs its rows for what the screen shows.
+Each tab is a filled block an equal share of the screen wide (a quarter with the Workspaces tab, a third in a TUI opened with `--socket`), the current one reversed, `Needs you` yellow while something waits on you (`Needs 2` where `Needs you 2` doesn't fit its share), `Workspaces` yellow while something waits in another workspace (`Spaces ⚠2` on a phone). The bar is 3 rows tall on a screen of 24 rows or more, 2 rows from 14 rows (a phone with its keyboard up has about 20), and a single row on a shorter screen, which needs its rows for what the screen shows.
 
 - **Chat** is the conversation alone, the orchestrator's or the thread you dived into, with the input box under it. On an empty line, Enter opens the item that has waited on you longest. A dive (Talk to it, `/open`) shows here, and so does an item too long for its popup.
 - **Needs you** lists every thread waiting on you, one line each, most urgent first, with its first item: `api · permission · Bash: git push`, and `(+2 more)` when it has more. ↑ and ↓ on an empty line pick one, and Enter opens its [action popup](#the-action-popup), where a digit answers it, as on a card; the next item comes up after.
 - **Threads** shows the threads' cards, the same cards as the stack view's ([Stack view](#stack-view)): the title with who runs the thread (and the box token of a remote box), the status section and the git state, as wide as the screen, in the same order and with the same fixed heights. The selected card stays in view as ↑ and ↓ move on, the cards scroll with the wheel, and the edge cards say `↑ 2 more` or `↓ 3 more`. Enter opens a thread's popup, where Talk to it dives in.
+- **Workspaces** lists the [workspaces](#workspaces), a card each as in the sidebar, then `+ New workspace` and `⚙ Settings`. ↑ and ↓ on an empty line pick a card or a button, and Enter switches to that workspace or presses the button; a tap does the same. The compact layout has no tab strip: this screen takes its place.
 
-`/c`, `/n` and `/t` switch between them, since Tab and the Shift-arrows are awkward on a phone keyboard, and so does a tap on a tab (the whole bar is tappable: each tab owns its third of the bar, every row of it and the gap after it). On the lists, a tap selects a row or card and a tap on the selected one opens its action popup, where `talk to` is already picked (one more tap dives in) and an option takes two taps once the item has been read (see [The action popup](#the-action-popup)). A swipe your terminal sends as the wheel scrolls a list, the cards or the conversation; one it sends as a drag selects and copies text. On the lists, Shift-↑ and Shift-↓ move like ↑ and ↓; in Chat they step through its long blocks and requests, as with the main pane selected. The compact layout has no grid: it shows the stack view's conversation. `/compact off` brings the full layout back on a narrow screen, for every workspace until you quit, and each workspace keeps the screen it was on. Answers go through the same checks as anywhere else, the guard against a key meant for something that just moved included.
+`/c`, `/n`, `/t` and `/w` switch between them (`Ctrl-T` shows Workspaces and goes back to Chat), since Tab and the Shift-arrows are awkward on a phone keyboard, and so does a tap on a tab (the whole bar is tappable: each tab owns its third of the bar, every row of it and the gap after it). On the lists, a tap selects a row or card and a tap on the selected one opens its action popup, where `talk to` is already picked (one more tap dives in) and an option takes two taps once the item has been read (see [The action popup](#the-action-popup)). A swipe your terminal sends as the wheel scrolls a list, the cards or the conversation; one it sends as a drag selects and copies text. On the lists, Shift-↑ and Shift-↓ move like ↑ and ↓; in Chat they step through its long blocks and requests, as with the main pane selected. The compact layout has no grid: it shows the stack view's conversation. `/compact off` brings the full layout back on a narrow screen, for every workspace until you quit, and each workspace keeps the screen it was on. Answers go through the same checks as anywhere else, the guard against a key meant for something that just moved included.
 
 Over mosh on a slow link, `mosh --predict-overwrite` keeps its predictive typing echo from shifting what's on screen. With the hub's [notification command](notifications.md) pushing to your phone, a phone running mosh covers answering and following threads without a server or an app.
 
@@ -611,6 +640,9 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal; no argument toggles |
 | `/suggest [on\|off]` | [suggest your next message](#suggestions) after a turn (`[tui] suggest`); no argument toggles |
 | `/ws [name]` | list the [workspaces](#workspaces), or switch to one; a new name asks `y` to create it; alias `/workspace` |
+| `/ws new [name]` | create a workspace and switch to it; without a name, ask for it |
+| `/spaces [on\|off]` | show or hide the workspace sidebar, as Ctrl-T does; no argument toggles |
+| `/settings` | the [settings](#settings) |
 | `/help` | commands and keys, as `?` on an empty line |
 | `/quit` | quit, as Ctrl-C does |
 
