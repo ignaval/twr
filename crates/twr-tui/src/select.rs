@@ -30,6 +30,9 @@ pub enum PaneId {
     Help,
     /// A workspace's tab in the strip ([`crate::workspace`]): a click switches to it.
     Tab(String),
+    /// The workspace sidebar, its drawer or the compact layout's Workspaces screen
+    /// ([`crate::sidebar`]): the wheel scrolls it.
+    Workspaces,
     /// Any other text: the status bar, headers, the first-run picker.
     Text,
 }
@@ -91,6 +94,19 @@ pub enum Target {
     /// A queued message listed above the input box, by its ref: selects it, and a tap on the
     /// selected one opens its action popup (Enter).
     Queued(i64),
+    /// A workspace's card in the workspace sidebar, its drawer or the compact layout's
+    /// Workspaces screen (every row of the card): switches to it, as its tab does.
+    Workspace(String),
+    /// `+ New workspace` under the workspaces (the whole row): asks for the new one's name.
+    NewWorkspace,
+    /// `⚙ Settings` under the workspaces (the whole row): opens the settings, as `/settings`.
+    Settings,
+    /// The workspace sidebar's header (`‹`, the whole row) hides it, and the tab strip's `≡`
+    /// shows it (or, where it does not fit, opens it as a drawer), as Ctrl-T does.
+    WsSidebar,
+    /// A row of the settings, by what it sets: selects it, and a tap on the selected one
+    /// changes it (Enter).
+    Setting(crate::settings::Key),
 }
 
 /// How a drawn row continues the row above it in the copied text.
@@ -268,6 +284,12 @@ pub struct Panes {
     pub trash_max: u16,
     /// The help overlay's furthest scroll as drawn (its rows past its height).
     pub help_max: u16,
+    /// The workspace list's furthest scroll as drawn (its rows past its height), and the row
+    /// it showed first ([`crate::sidebar::render_list`]): the wheel scrolls from there.
+    pub ws_max: usize,
+    pub ws_start: usize,
+    /// Where the workspace drawer was drawn: a click outside it closes it.
+    pub drawer: Option<Rect>,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the

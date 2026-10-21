@@ -118,6 +118,36 @@ use crate::adapter::CodexAuto;
 use crate::notify::NotifyEvent;
 use crate::paths::Paths;
 
+/// How long a read of the config file waits for a writer's lock ([`read_locked`]).
+pub const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The text of the file at `path`, read under a shared lock (`flock`): the TUI's settings
+/// write the config file in place under an exclusive one, so a reader never sees it half
+/// written. A writer still holding it after `wait` fails the read (`TimedOut`): half a file is
+/// never read. A file system without locks reads as it is.
+pub fn read_locked(path: &Path, wait: std::time::Duration) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let until = std::time::Instant::now() + wait;
+    loop {
+        match f.try_lock_shared() {
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "another program is writing it (it holds its lock): try again",
+                ));
+            }
+            _ => break,
+        }
+    }
+    let mut text = String::new();
+    f.read_to_string(&mut text)?;
+    Ok(text)
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1462,7 +1492,8 @@ impl Config {
 
     /// Loads `path` (missing file = defaults).
     pub fn load(path: &Path) -> anyhow::Result<Config> {
-        match std::fs::read_to_string(path) {
+        // Under a shared lock: never a file the TUI's settings are writing ([`read_locked`]).
+        match read_locked(path, CONFIG_LOCK_WAIT) {
             Ok(s) => Self::from_toml_str(&s).with_context(|| format!("in {}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),

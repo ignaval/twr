@@ -93,6 +93,19 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else {
         area
     };
+    // The workspace sidebar, docked left of every view: the strip is not drawn then. It is
+    // drawn after the overlays, which stay right of it: its cards stay on screen and
+    // tappable, as the strip's tabs do.
+    let (dock, body) = if state.ws_docked() {
+        let [dock, rest] = Layout::horizontal([
+            Constraint::Length(crate::sidebar::DOCK_WIDTH),
+            Constraint::Min(0),
+        ])
+        .areas(body);
+        (Some(dock), rest)
+    } else {
+        (None, body)
+    };
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
         // A phone: one screen at a time.
@@ -106,13 +119,22 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     // clickable.
     if state.picker_open() {
         render_picker(frame, body, state, &mut panes);
+    } else if state.view.new_ws.is_some() {
+        crate::sidebar::render_new(frame, body, state, &mut panes);
+    } else if state.view.settings.is_some() {
+        crate::settings::render(frame, body, state, &mut panes);
     } else if state.view.help {
         render_help(frame, body, state.view.help_scroll, &mut panes);
     } else if let Some(trash) = &state.view.trash {
         render_trash(frame, body, trash, state.view.trash_scroll, &mut panes);
+    } else if state.ws_drawer_open() {
+        crate::sidebar::render_drawer(frame, body, state, &mut panes);
     } else if render_action_popup(frame, body, state, &mut panes).is_some() {
     } else {
         render_popup(frame, body, state, &mut panes);
+    }
+    if let Some(dock) = dock {
+        crate::sidebar::render_docked(frame, dock, state, &mut panes);
     }
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
@@ -125,7 +147,11 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes
 }
 
-/// The workspaces' tab strip ([`crate::workspace`]): each tab's name with its badges (`⚠n`
+/// The tab strip's control of the workspace sidebar.
+const MENU: &str = " ≡ ";
+
+/// The workspaces' tab strip ([`crate::workspace`]), after the `≡` that shows the workspace
+/// sidebar (or its drawer): each tab's name with its badges (`⚠n`
 /// items waiting on the user, `●n` threads running, `○` a stopped hub, `…` one that did not
 /// answer), the current one highlighted. A click on a tab switches to it
 /// ([`PaneId::Tab`]). When they don't all fit, the tabs around the current one show, with
@@ -156,6 +182,8 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             (t.name.clone(), badges, waiting, current)
         })
         .collect();
+    // The `≡` before them.
+    let width = width.saturating_sub(crate::edit::width(MENU));
     let cells = |(name, badges, waiting, _): &(String, String, Option<String>, bool)| {
         crate::edit::width(name)
             + crate::edit::width(badges)
@@ -193,6 +221,14 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         spans.push(Span::styled(text, style));
         w
     };
+    // The workspace sidebar's control: shows it, or opens it as a drawer where it does not
+    // fit ([`crate::sidebar`]).
+    let menu = x;
+    x += push(&mut spans, MENU.into(), Style::default().fg(Color::Cyan));
+    panes.target(
+        Rect::new(menu, area.y, x - menu, 1).intersection(area),
+        Target::WsSidebar,
+    );
     if first > 0 {
         x += push(&mut spans, "‹ ".into(), dim);
     }
@@ -228,13 +264,13 @@ fn on(area: Rect, cell: Rect) -> bool {
 
 /// The `✕` an overlay's top border ends in: the whole border row is its control
 /// ([`close_row`]).
-fn close_title() -> Line<'static> {
+pub(crate) fn close_title() -> Line<'static> {
     Line::from(" ✕ ").right_aligned()
 }
 
 /// Records the top border row of an overlay drawn over `rect` as control `target` (its `✕`,
 /// [`close_title`]): a row wide, for a finger.
-fn close_row(panes: &mut Panes, rect: Rect, target: Target) {
+pub(crate) fn close_row(panes: &mut Panes, rect: Rect, target: Target) {
     panes.target(
         Rect::new(rect.x, rect.y, rect.width, rect.height.min(1)),
         target,
@@ -364,6 +400,11 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-B", "show or hide the thread sidebar (/sidebar)"),
     (
+        "Ctrl-T",
+        "show or hide the workspace sidebar (/spaces); on a narrower screen open it as a \
+         drawer (↑↓ Enter, Esc closes), in the compact layout the Workspaces screen",
+    ),
+    (
         "Ctrl-F",
         "Focus mode: working threads and anything needing you (/focus)",
     ),
@@ -447,7 +488,10 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     ),
     (
         "controls",
-        "the Chat, Needs you and Threads tabs switch screens (a whole third of the bar each); \
+        "a workspace's card in the sidebar switches to it, + New workspace asks for a name, \
+         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ≡ shows \
+         it; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
+         the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
          [ no ] answer a question; a tap on a notice clears it, on a note does what its key \
@@ -488,8 +532,9 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread) and Threads (the cards), switched with /c, /n and /t or \
-         a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter opens it, its \
+         Needs you (a line per thread), Threads (the cards) and Workspaces, switched with /c, \
+         /n, /t and /w or a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter \
+         opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
     (
@@ -605,7 +650,7 @@ fn help_entry(
 }
 
 /// A `width` x `height` rect centered in `area` (clipped to it).
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let (width, height) = (area.width.min(width), area.height.min(height));
     Rect {
         x: area.x + (area.width - width) / 2,
@@ -1002,6 +1047,8 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
+    } else if pane == CompactPane::Workspaces {
+        crate::sidebar::render_screen(frame, list, state, panes);
     } else {
         render_compact_cards(frame, list, state, panes);
     }
@@ -1028,16 +1075,18 @@ pub const TAB_BAR_TALL_FROM: u16 = 24;
 /// From this many rows (and up to [`TAB_BAR_TALL_FROM`]) it is 2 rows tall.
 pub const TAB_BAR_SHORT_FROM: u16 = 14;
 
-/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2` and `Threads`, each a filled
-/// tab a third of the width wide and the bar's height tall, its name centered (`Needs 2`, then
-/// cut, where it does not fit), the current one reversed and bold, `Needs you` yellow while
-/// something waits. A tap anywhere in a tab's third (the gap after it included) shows its
-/// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
+/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2`, `Threads` and, when the TUI
+/// can switch workspaces, `Workspaces` (`⚠2`: what waits on the user in the others), each a
+/// filled tab an equal share of the width wide and the bar's height tall, its name centered
+/// (`Needs 2`, `Spaces`, then cut, where it does not fit), the current one reversed and bold,
+/// `Needs you` and `Workspaces` yellow while something waits. A tap anywhere in a tab's share
+/// (the gap after it included) shows its screen, as `/c`, `/n`, `/t` and `/w` do: the whole bar
+/// is tappable.
 fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let pane = state.view.compact_pane;
     let needs = state.needs_count();
-    let names = [
+    let mut names = vec![
         (CompactPane::Chat, "Chat".to_string(), "Chat".to_string()),
         if needs > 0 {
             (
@@ -1050,13 +1099,32 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         },
         (CompactPane::Threads, "Threads".into(), "Threads".into()),
     ];
+    // The workspaces, with what waits on the user in the others (a TUI opened on a socket
+    // has none to show).
+    let elsewhere = other_waiting(state);
+    if state.workspace.is_some() {
+        names.push(if elsewhere > 0 {
+            (
+                CompactPane::Workspaces,
+                format!("Workspaces ⚠{elsewhere}"),
+                format!("Spaces ⚠{elsewhere}"),
+            )
+        } else {
+            (
+                CompactPane::Workspaces,
+                "Workspaces".into(),
+                "Spaces".into(),
+            )
+        });
+    }
     panes.add(PaneId::Text, bar);
     // Fixed 256-color values, like the header band's ([`target_fill`]): legible on dark and
     // light terminals alike.
     let off = Style::default()
         .fg(Color::Indexed(252))
         .bg(Color::Indexed(238));
-    let shares = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(bar);
+    let n = u32::try_from(names.len()).unwrap_or(3);
+    let shares = Layout::horizontal(vec![Constraint::Ratio(1, n); names.len()]).split(bar);
     for (k, ((p, long, short), share)) in names.iter().zip(shares.iter()).enumerate() {
         panes.target(*share, Target::Screen(*p));
         // A column apart from the next tab.
@@ -1070,7 +1138,9 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         };
         let style = if *p == pane {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
-        } else if *p == CompactPane::Needs && needs > 0 {
+        } else if (*p == CompactPane::Needs && needs > 0)
+            || (*p == CompactPane::Workspaces && elsewhere > 0)
+        {
             off.fg(Color::Indexed(220)).add_modifier(Modifier::BOLD)
         } else {
             off
@@ -1092,6 +1162,17 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
             tab,
         );
     }
+}
+
+/// The items waiting on the user (permissions and questions) in the workspaces other than the
+/// one shown, as their hubs last said.
+fn other_waiting(state: &AppState) -> usize {
+    state
+        .tabs
+        .iter()
+        .filter(|t| state.workspace.as_deref() != Some(t.name.as_str()))
+        .map(|t| t.hub.waiting())
+        .sum()
 }
 
 /// The compact layout's Threads screen: the threads' cards, as the stack view draws them, in a
@@ -2218,7 +2299,7 @@ fn card_rows(
 }
 
 /// `line` ending in `…`, within `width` cells: what comes after it was cut.
-fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
+pub(crate) fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
     let style = line.spans.last().map(|s| s.style).unwrap_or_default();
     let mut spans = line.spans;
     spans.push(Span::styled("…", style));
@@ -2232,7 +2313,7 @@ fn ellipsized(line: Line<'static>, width: usize) -> Line<'static> {
 /// grapheme clusters, never inside one: a joined emoji stays whole). Drawn without
 /// wrapping, each row shows in full (but for a character wider than a row: see
 /// [`AttnRows::exact`]).
-fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+pub(crate) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     wrap_joined(line, width)
         .into_iter()
         .map(|(l, _)| l)
@@ -7718,7 +7799,7 @@ fn decision_filter_line(state: &AppState) -> Line<'static> {
 /// `s` cut to `width` cells of display width ([`crate::edit::width`]), ending in `…` when
 /// cut: a wide character with no room before the `…` is left out whole, so the result may be
 /// a cell narrower than `width`.
-fn truncate_cells(s: &str, width: usize) -> String {
+pub(crate) fn truncate_cells(s: &str, width: usize) -> String {
     if crate::edit::width(s) <= width {
         return s.to_string();
     }
@@ -8797,6 +8878,7 @@ mod tests {
                 .map(|(name, hub)| crate::workspace::Tab {
                     name: name.to_string(),
                     hub: *hub,
+                    glance: None,
                 })
                 .collect(),
         );
@@ -8826,13 +8908,15 @@ mod tests {
                 ("c", TabHub::Busy),
             ],
         );
+        // (Wide enough, the workspace sidebar lists them instead: hidden here.)
+        st.view.ws_sidebar_hidden = true;
         for (w, h) in [(160, 42), (80, 24)] {
             for view in [Screen::Stack, Screen::Grid, Screen::Decisions] {
                 st.view.screen = view;
                 let lines = draw(&st, w, h);
                 let strip = lines[0].trim_end();
                 assert!(
-                    strip.starts_with(" default ⚠2 ●1 │ a"),
+                    strip.starts_with(" ≡  default ⚠2 ●1 │ a"),
                     "{view:?} {w}: {strip}"
                 );
                 assert!(strip.ends_with("│ b ○ │ c …"), "{view:?} {w}: {strip}");
@@ -8950,7 +9034,7 @@ mod tests {
         );
         st.view.help = true;
         let lines = draw(&st, 80, 10);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
         st.view.help = false;
         st.view.picker = Some(crate::app::Picker {
@@ -8961,7 +9045,7 @@ mod tests {
             switch: false,
         });
         let lines = draw(&st, 80, 6);
-        assert!(lines[0].starts_with(" default"), "{}", screen(&lines));
+        assert!(lines[0].starts_with(" ≡  default"), "{}", screen(&lines));
         assert!(lines[0].contains("│ a ○"), "{}", screen(&lines));
     }
 
@@ -8981,14 +9065,14 @@ mod tests {
         let mut st = crate::app::tests::with_orch();
         with_tabs(&mut st, "workspace-06", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with("‹ "), "{strip}");
+        assert!(strip.starts_with(" ≡ ‹ "), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
         assert!(strip.contains("workspace-06"), "{strip}");
         assert!(!strip.contains("workspace-01"), "{strip}");
         // At the start, only the right one.
         with_tabs(&mut st, "workspace-01", &tabs);
         let strip = draw(&st, 60, 24)[0].clone();
-        assert!(strip.starts_with(" workspace-01"), "{strip}");
+        assert!(strip.starts_with(" ≡  workspace-01"), "{strip}");
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
     }
 

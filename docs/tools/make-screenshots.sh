@@ -10,7 +10,8 @@
 # up each hub notice in a sentence. It makes five small git repositories, says hello to the
 # orchestrator through the TUI, and drives eight threads into different states: waiting on a
 # permission, asking a question, failed, running, done and parked. The orchestrator hears
-# about them from the hub, and then the TUI asks it what needs the user. Then it runs `twr` in
+# about them from the hub, and then the TUI asks it what needs the user. It makes a second
+# workspace, left stopped, for the workspace sidebar to list. Then it runs `twr` in
 # a private tmux server, captures the stack view (160x42), the grid view (160x25) and the
 # compact layout's Threads screen (40x20, a phone) with their colors, and turns the captures
 # into SVG with docs/tools/ansi2svg.py. No real agent
@@ -303,7 +304,7 @@ first_frame() {
 # orchestrator's answer.
 tui_say() {
     tmux -L "$tmux_name" -f /dev/null new-session -d -x 160 -y 42 \
-        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
+        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_TUI_HIDE_LOAD=1 TWR_HOME='$TWR_HOME' '$twr'"
     first_frame
     # What is typed goes to the orchestrator.
     tmux -L "$tmux_name" send-keys -l "$1"
@@ -410,6 +411,8 @@ wait_for ratelimit waiting
 sleep 32
 wait_orchestrator
 tui_say "What needs me right now?"
+# A second workspace, its hub not running: the workspace sidebar lists it under `default`.
+env -i HOME="$work/home" PATH=/usr/bin:/bin TWR_HOME="$TWR_HOME" "$twr" ws new client-x > /dev/null
 
 # capture NAME COLS ROWS KEYS...: run the TUI at COLS x ROWS, press KEYS, capture the screen.
 # The TUI opens with nothing selected; Tab selects the first card (or tile).
@@ -417,7 +420,7 @@ capture() {
     name=$1 cols=$2 rows=$3
     shift 3
     tmux -L "$tmux_name" -f /dev/null new-session -d -x "$cols" -y "$rows" \
-        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_HOME='$TWR_HOME' '$twr'"
+        "env -i HOME='$work/home' PATH=/usr/bin:/bin TERM=xterm-256color TWR_TUI_HIDE_LOAD=1 TWR_HOME='$TWR_HOME' '$twr'"
     first_frame
     # A pause after each key, as a person presses them.
     for k in "$@"; do

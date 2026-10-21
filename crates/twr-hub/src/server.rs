@@ -6,6 +6,7 @@
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
 //! | `hub.info`          | -                                                   | `{version, build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
 //! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
@@ -636,6 +637,7 @@ pub const METHODS: &[&str] = &[
     "hello",
     "say",
     "hub.info",
+    "hub.glance",
     "hub.shutdown",
     "config.show",
     "box.add",
@@ -708,6 +710,7 @@ pub const METHODS: &[&str] = &[
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hello",
     "hub.info",
+    "hub.glance",
     "box.agents",
     "config.show",
     "thread.new",
@@ -785,6 +788,7 @@ pub const AGENT_METHODS: &[&str] = &[
     "job.list",
     "job.log",
     "hub.info",
+    "hub.glance",
     "box.agents",
     "thread.list",
     "thread.activity",
@@ -2417,6 +2421,7 @@ fn call(
         }
         "thread.list" => Ok(Value::Array(hub.list_threads())),
         "thread.activity" => Ok(hub.thread_activity()),
+        "hub.glance" => hub.glance(),
         "usage.get" => Ok(hub.usage()),
         // A user's TUI: whether the user looks at it, so the notification hook keeps quiet
         // meanwhile (`hub::hook`).

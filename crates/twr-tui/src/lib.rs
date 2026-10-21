@@ -16,6 +16,7 @@
 pub mod app;
 #[cfg(test)]
 mod bench;
+pub mod config_edit;
 pub mod edit;
 pub mod firstrun;
 pub mod icon;
@@ -25,7 +26,9 @@ pub mod notify;
 pub mod order;
 pub mod queue;
 pub mod select;
+pub mod settings;
 pub mod shell;
+pub mod sidebar;
 pub mod slash;
 pub mod suggest;
 pub mod terminal_setup;
@@ -409,7 +412,11 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
+        | Action::WsSidebar(_)
+        | Action::Setting(_)
+        | Action::SettingsFile
         | Action::TerminalSetup { .. } => None,
+        Action::ConfigShow => Some(("config.show", Value::Null)),
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -680,6 +687,20 @@ fn save_seen(state: &mut AppState, file: Option<&Path>) {
             twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
         }
     });
+}
+
+/// Writes setting `change` to the config file the environment names, where the settings
+/// keep it ([`settings::Change::config_key`]): `Ok` with the file's path as shown, else why it
+/// was left alone. On the settings writer's thread ([`spawn_settings_writer`]).
+fn save_setting(change: &settings::Change) -> Result<String, String> {
+    let Some((table, key, value)) = change.config_key() else {
+        return Err("not a setting of the config file".into());
+    };
+    let path = twr_core::paths::Paths::from_env()
+        .map_err(|e| format!("no config file here: {e:#}"))?
+        .config_file;
+    config_edit::write_key(&path, table, key, &value)?;
+    Ok(settings::shown_path(&path))
 }
 
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
@@ -1451,8 +1472,14 @@ pub struct Switching {
     pub workspaces: std::sync::Arc<dyn Workspaces>,
 }
 
-/// How often the tab strip asks the other workspaces' hubs how they are.
-const TABS_EVERY: Duration = Duration::from_secs(5);
+/// How often the TUI looks for workspaces' hubs due to be asked how they are
+/// ([`workspace::PollClock`]).
+const TABS_EVERY: Duration = workspace::POLL_RUNNING;
+
+/// `TWR_TUI_HIDE_LOAD=1`: the TUI never reads this machine's load, so its status bar never
+/// says the machine is busy. Only `docs/tools/make-screenshots.sh` and `make-demo.sh` set it:
+/// the images must not depend on the load of the machine they are made on.
+pub const HIDE_LOAD_ENV: &str = "TWR_TUI_HIDE_LOAD";
 
 /// How often the TUI reads this machine's load for its status bar ([`twr_core::load`]).
 pub const LOAD_EVERY: Duration = Duration::from_secs(5);
@@ -1569,69 +1596,102 @@ fn check_hub_workspace(info: &Value, expected: &str, socket: &Path) -> anyhow::R
     }
 }
 
-/// What the tab strip shows of the workspaces other than `current`: each hub asked how it is
-/// ([`tab_hub`]), in the order [`Workspaces::names`] gives.
-async fn poll_tabs(ws: &dyn Workspaces, current: Option<&str>) -> Vec<workspace::Tab> {
-    let Ok(names) = ws.names() else {
-        return Vec::new();
-    };
-    let mut tabs = Vec::new();
-    for name in names {
-        let hub = if Some(name.as_str()) == current {
-            workspace::TabHub::Unknown
-        } else {
-            match ws.socket(&name) {
-                Ok(socket) => tab_hub(&socket, &name).await,
-                Err(_) => workspace::TabHub::Unknown,
-            }
-        };
-        tabs.push(workspace::Tab { name, hub });
-    }
-    tabs
+/// How many hubs one poll asks at once ([`poll_tabs`]).
+const POLL_AT_ONCE: usize = 4;
+
+/// One poll of the workspaces' hubs: how each hub of `due` is ([`glance_hub`]), asked a few
+/// at a time. A workspace whose socket can't be named is left as it was.
+async fn poll_tabs(ws: &dyn Workspaces, due: Vec<String>) -> Vec<workspace::Polled> {
+    use futures::StreamExt;
+    let asks: Vec<(String, PathBuf)> = due
+        .into_iter()
+        .filter_map(|name| Some((ws.socket(&name).ok()?, name)))
+        .map(|(socket, name)| (name, socket))
+        .collect();
+    futures::stream::iter(asks)
+        .map(|(name, socket)| async move {
+            let (hub, glance) = glance_hub(&socket, &name).await;
+            workspace::Polled { name, hub, glance }
+        })
+        .buffer_unordered(POLL_AT_ONCE)
+        .collect()
+        .await
 }
 
-/// How the hub of workspace `name` on `socket` is, for its tab: stopped when nothing listens,
-/// busy when it does not answer within [`TAB_TIMEOUT`] (or is another workspace's), else its
-/// worker threads, how many run and the permissions and questions waiting on the user.
-async fn tab_hub(socket: &Path, name: &str) -> workspace::TabHub {
-    use workspace::TabHub;
+/// How the hub of workspace `name` on `socket` is, for its tab and its sidebar card: stopped
+/// when nothing listens (it is never started to be asked), busy when it does not answer within
+/// [`TAB_TIMEOUT`] (or is another workspace's), else its counts and what it says of its
+/// orchestrator, in one `hub.glance`. A hub older than that method answers `thread.list` and
+/// `attention.list` instead, as tabs asked before: the same counts, its orchestrator's status
+/// without its latest reply.
+async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<workspace::Glance>) {
+    use workspace::{Glance, TabHub};
     let Ok(Ok(mut c)) = tokio::time::timeout(TAB_TIMEOUT, Client::connect(socket)).await else {
-        return TabHub::Stopped;
+        return (TabHub::Stopped, None);
     };
     let answer = tokio::time::timeout(TAB_TIMEOUT, async {
         let hello = c.hello(json!({ "client": CLIENT_NAME })).await?;
         check_hub_workspace(&hello, name, socket)?;
-        let threads = c.call("thread.list", Value::Null).await?;
-        let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok((threads, items))
+        match c.call("hub.glance", Value::Null).await {
+            Ok(g) => anyhow::Ok(Ok(g)),
+            Err(e)
+                if e.downcast_ref::<twr_core::proto::RpcError>()
+                    .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+            {
+                let threads = c.call("thread.list", Value::Null).await?;
+                let items = c.call("attention.list", json!({ "all": true })).await?;
+                Ok(Err((threads, items)))
+            }
+            Err(e) => Err(e),
+        }
     })
     .await;
-    let Ok(Ok((threads, items))) = answer else {
-        return TabHub::Busy;
+    let Ok(Ok(answer)) = answer else {
+        return (TabHub::Busy, None);
     };
-    let workers: Vec<&Value> = threads
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| t["role"] != "orchestrator")
-        .collect();
-    let running = workers
-        .iter()
-        .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
-        .count();
-    let of = |reason: &str| {
-        items
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|i| i["reason"].as_str() == Some(reason))
-            .count()
+    let count = |v: &Value| {
+        v.as_u64()
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
     };
-    TabHub::Running {
-        threads: workers.len(),
-        running,
-        permissions: of("permission"),
-        questions: of("question"),
+    match answer {
+        Ok(g) => (
+            TabHub::Running {
+                threads: count(&g["threads"]),
+                running: count(&g["running"]),
+                permissions: count(&g["permissions"]),
+                questions: count(&g["questions"]),
+            },
+            Some(Glance::from_json(&g)),
+        ),
+        Err((threads, items)) => {
+            let workers: Vec<&Value> = threads
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["role"] != "orchestrator")
+                .collect();
+            let running = workers
+                .iter()
+                .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
+                .count();
+            let of = |reason: &str| {
+                items
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|i| i["reason"].as_str() == Some(reason))
+                    .count()
+            };
+            (
+                TabHub::Running {
+                    threads: workers.len(),
+                    running,
+                    permissions: of("permission"),
+                    questions: of("question"),
+                },
+                Some(Glance::from_threads(&threads)),
+            )
+        }
     }
 }
 
@@ -1744,6 +1804,67 @@ fn spawn_history_writer(
                 if let Err(e) = save_history(&path, &added) {
                     status.send((format!("input history: {e}"), false));
                 }
+            }
+        })
+        .ok();
+    (tx, writer)
+}
+
+/// A setting to keep, or the settings to read, for the settings writer
+/// ([`spawn_settings_writer`]).
+enum Save {
+    /// The workspace sidebar shown or not, in `tui-state.json` at this path.
+    WsSidebar(PathBuf, bool),
+    /// A setting of the config file ([`save_setting`]); the file is read again after it.
+    Setting(settings::Change),
+    /// Read what the config file says of the TUI's settings ([`settings::read_file`]).
+    ReadFile,
+}
+
+/// What the settings writer did.
+enum Saved {
+    /// The workspace sidebar remembered shown (or hidden), or why not.
+    WsSidebar(bool, Result<(), String>),
+    /// A setting kept (where, as shown), or why not.
+    Setting(settings::Change, Result<String, String>),
+    /// What the config file says of the TUI's settings.
+    File(Vec<(settings::Key, Option<String>)>),
+}
+
+/// Starts the thread that keeps the settings changed in the TUI, one after another in the
+/// order they were changed: a later change never lands before an earlier one, and the IO loop
+/// never waits on a file or its lock (another TUI may hold it). Each outcome comes back on
+/// `done`. Its sender closed, the thread ends once it kept what it has.
+fn spawn_settings_writer(
+    done: mpsc::UnboundedSender<Saved>,
+) -> (
+    std::sync::mpsc::Sender<Save>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Save>();
+    let writer = std::thread::Builder::new()
+        .name("twr-settings".into())
+        .spawn(move || {
+            let file = || {
+                twr_core::paths::Paths::from_env()
+                    .ok()
+                    .map(|p| settings::read_file(&p.config_file))
+                    .unwrap_or_default()
+            };
+            for save in rx {
+                let saved = match save {
+                    Save::WsSidebar(path, on) => Saved::WsSidebar(
+                        on,
+                        firstrun::set_workspaces_sidebar(&path, on).map_err(|e| e.to_string()),
+                    ),
+                    Save::Setting(change) => {
+                        let r = save_setting(&change);
+                        let _ = done.send(Saved::Setting(change, r));
+                        Saved::File(file())
+                    }
+                    Save::ReadFile => Saved::File(file()),
+                };
+                let _ = done.send(saved);
             }
         })
         .ok();
@@ -1985,6 +2106,8 @@ struct Shared {
     epoch: std::time::Instant,
     workspaces: Option<std::sync::Arc<dyn Workspaces>>,
     waiting_seen: std::collections::HashMap<String, usize>,
+    /// When each workspace's hub is asked next how it is ([`workspace::PollClock`]).
+    poll_clock: workspace::PollClock,
     /// What the terminal tells apart ([`enhance_keyboard`]); its notice goes to the first
     /// workspace shown, and a Shift-Enter seen in one is known in every other.
     keys: keys::Keys,
@@ -1992,6 +2115,16 @@ struct Shared {
     compact: Option<bool>,
     /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
     suggest: Option<bool>,
+    /// The workspace sidebar hidden ([`crate::sidebar`]), for every workspace shown (and,
+    /// in `tui-state.json`, the next runs).
+    ws_sidebar_hidden: bool,
+    /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
+    /// no setting.
+    agent: Option<String>,
+    /// The settings writer ([`spawn_settings_writer`]), and what it kept; taken (closed) as
+    /// the TUI quits.
+    saves: Option<std::sync::mpsc::Sender<Save>>,
+    saved_rx: mpsc::UnboundedReceiver<Saved>,
     /// What the TUI has told the user across runs, and where it keeps that
     /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
     seen: firstrun::Seen,
@@ -2124,6 +2257,8 @@ pub async fn run_with(
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
+    let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
+    let (saves, settings_writer) = spawn_settings_writer(saved_tx);
     let mut ctx = Shared {
         callers: std::collections::HashMap::new(),
         all_callers: Vec::new(),
@@ -2135,9 +2270,14 @@ pub async fn run_with(
         epoch: std::time::Instant::now(),
         workspaces: switching.as_ref().map(|s| s.workspaces.clone()),
         waiting_seen: std::collections::HashMap::new(),
+        poll_clock: workspace::PollClock::default(),
         keys,
         compact: None,
         suggest: None,
+        ws_sidebar_hidden: seen.workspaces_sidebar == Some(false),
+        agent,
+        saves: Some(saves),
+        saved_rx,
         seen,
         seen_file,
         offer,
@@ -2155,10 +2295,7 @@ pub async fn run_with(
         .and_then(|ws| ws.names().ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|name| workspace::Tab {
-            name,
-            hub: workspace::TabHub::Unknown,
-        })
+        .map(workspace::Tab::new)
         .collect();
     let mut carried = Carried {
         mouse: ctx.tui.mouse,
@@ -2213,12 +2350,15 @@ pub async fn run_with(
     // The terminal is the user's again before anything else waits.
     drop(guard);
     // The lines sent last are written before the TUI exits, unless another TUI holds the
-    // file's lock past [`HISTORY_FLUSH`].
+    // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
     flush_history(history_writer);
+    drop(ctx.saves.take());
+    flush_history(settings_writer);
     result
 }
 
-/// Waits for the history writer to finish, at most [`HISTORY_FLUSH`].
+/// Waits for the history writer (or the settings writer) to finish, at most
+/// [`HISTORY_FLUSH`].
 fn flush_history(writer: Option<std::thread::JoinHandle<()>>) {
     if let Some(w) = writer {
         let until = std::time::Instant::now() + HISTORY_FLUSH;
@@ -2330,6 +2470,9 @@ async fn drive(
     state.view.compact_width = ctx.tui.compact_width;
     state.view.compact = ctx.compact;
     state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
+    state.view.notify_terminal = ctx.tui.notify.terminal;
+    state.view.ws_sidebar_hidden = ctx.ws_sidebar_hidden;
+    state.agent = ctx.agent.clone();
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.view.picker = Picker::from_show(&show);
     state.workspace = current;
@@ -2367,6 +2510,9 @@ async fn drive(
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tabs_pending = false;
     // This machine's load: read now, then every [`LOAD_EVERY`].
+    // Never read for the screenshots: they must not show the load of the machine they are
+    // made on ([`HIDE_LOAD_ENV`]).
+    let hide_load = std::env::var_os(HIDE_LOAD_ENV).is_some_and(|v| v == "1");
     let mut load_poll = tokio::time::interval(LOAD_EVERY);
     load_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_pending = false;
@@ -2387,7 +2533,16 @@ async fn drive(
     let mut info_poll = tokio::time::interval(INFO_EVERY);
     info_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (load_tx, mut load_rx) = mpsc::unbounded_channel::<Option<twr_core::load::Load>>();
-    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<Vec<workspace::Tab>>();
+    // A poll's answers: the workspaces listed (`None`: they could not be), how the hubs
+    // asked were, and when they were asked.
+    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<(
+        Option<Vec<String>>,
+        Vec<workspace::Polled>,
+        std::time::Instant,
+    )>();
+    // The workspaces as listed for a poll (`None`: they could not be), read off the loop: a
+    // directory on a slow mount never holds up the view.
+    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<String>>>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
     type Opened = (String, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
@@ -2629,6 +2784,33 @@ async fn drive(
                                 save_seen(&mut state, ctx.seen_file.as_deref());
                                 continue;
                             }
+                            // Kept for the next runs (and the next workspaces shown).
+                            // Kept by the settings writer, in order.
+                            Action::WsSidebar(on) => {
+                                ctx.ws_sidebar_hidden = !on;
+                                if let (Some(file), Some(saves)) = (&ctx.seen_file, &ctx.saves) {
+                                    let _ = saves.send(Save::WsSidebar(file.clone(), on));
+                                }
+                                continue;
+                            }
+                            // A setting changed in the settings overlay, applied to the view
+                            // already: the notifier takes it too, and the config file keeps
+                            // it when it can be changed safely ([`config_edit`]).
+                            Action::SettingsFile => {
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::ReadFile);
+                                }
+                                continue;
+                            }
+                            Action::Setting(change) => {
+                                if let settings::Change::Notify(alert) = change {
+                                    notifier.set_alert(alert);
+                                }
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::Setting(change));
+                                }
+                                continue;
+                            }
                             // The workspace's hub is opened (started when needed) and
                             // connected to off the loop; this one stays until it is.
                             Action::Workspace { name, create } => {
@@ -2800,7 +2982,7 @@ async fn drive(
                     }
                 }
                 // Read off the loop: a few small files, but a `sysctl` on macOS.
-                _ = load_poll.tick(), if !load_pending => {
+                _ = load_poll.tick(), if !load_pending && !hide_load => {
                     load_pending = true;
                     let tx = load_tx.clone();
                     tokio::task::spawn_blocking(move || {
@@ -2817,21 +2999,50 @@ async fn drive(
                         let _ = call_tx.send(("hub.info", Value::Null));
                     }
                 }
-                // The other workspaces' hubs, for their tabs.
+                // The workspaces' hubs due to be asked how they are, for their tabs and
+                // sidebar cards ([`workspace::PollClock`]); this one's too, for its
+                // orchestrator's latest reply while its conversation is not loaded.
                 _ = tab_poll.tick(), if ctx.workspaces.is_some() && !tabs_pending => {
                     if let Some(ws) = ctx.workspaces.clone() {
                         tabs_pending = true;
-                        let (current, tx) = (state.workspace.clone(), tabs_tx.clone());
+                        let tx = names_tx.clone();
                         tokio::spawn(async move {
-                            let _ = tx.send(poll_tabs(ws.as_ref(), current.as_deref()).await);
+                            let names = tokio::task::spawn_blocking(move || ws.names().ok())
+                                .await
+                                .ok()
+                                .flatten();
+                            let _ = tx.send(names);
                         });
                     }
                 }
-                Some(tabs) = tabs_rx.recv() => {
+                // Listed: the hubs due are asked.
+                Some(names) = names_rx.recv() => {
+                    match ctx.workspaces.clone() {
+                        Some(ws) => {
+                            let listed: Vec<String> = match &names {
+                                Some(n) => n.clone(),
+                                None => state.tabs.iter().map(|t| t.name.clone()).collect(),
+                            };
+                            let now = std::time::Instant::now();
+                            let due = ctx.poll_clock.take_due(&listed, now);
+                            let tx = tabs_tx.clone();
+                            tokio::spawn(async move {
+                                let polled = poll_tabs(ws.as_ref(), due).await;
+                                let _ = tx.send((names, polled, now));
+                            });
+                        }
+                        None => tabs_pending = false,
+                    }
+                }
+                Some((names, polled, asked)) = tabs_rx.recv() => {
                     tabs_pending = false;
+                    for p in &polled {
+                        ctx.poll_clock.answered(&p.name, &p.hub, asked);
+                    }
+                    state.merge_poll(names, polled);
                     let alerts = workspace::waiting_alerts(
                         &mut ctx.waiting_seen,
-                        &tabs,
+                        &state.tabs,
                         state.workspace.as_deref(),
                         notifier,
                         std::time::Instant::now(),
@@ -2843,8 +3054,19 @@ async fn drive(
                             state.view.status = Some(format!("notification: {e}"));
                         }
                     }
-                    state.set_tabs(tabs);
                 }
+                // What the settings writer kept, or why not, and what it read.
+                Some(saved) = ctx.saved_rx.recv() => match saved {
+                    Saved::WsSidebar(on, Err(e)) => {
+                        let how = if on { "shown" } else { "hidden" };
+                        state.view.status = Some(format!(
+                            "workspace sidebar {how}, but not remembered for the next runs: {e}"
+                        ));
+                    }
+                    Saved::WsSidebar(_, Ok(())) => {}
+                    Saved::Setting(change, r) => state.setting_saved(&change, r),
+                    Saved::File(file) => state.settings_file(file),
+                },
                 // An error of a call the workspace left had asked for.
                 Some((msg, transient)) = ctx.late_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
@@ -2854,15 +3076,16 @@ async fn drive(
                         // What the user saw of this workspace's waiting items: no alert for
                         // them once it is in the background.
                         if let Some(current) = &state.workspace {
-                            let hub = state.tab_hub(&workspace::Tab {
-                                name: current.clone(),
-                                hub: workspace::TabHub::Unknown,
-                            });
+                            let hub = state.tab_hub(&workspace::Tab::new(current.clone()));
                             if let workspace::TabHub::Running { permissions, questions, .. } = hub {
                                 let waiting = notifier.waiting_count(permissions, questions);
                                 ctx.waiting_seen.insert(current.clone(), waiting);
                             }
                         }
+                        // Its hub may just have been started: its card is asked at once.
+                        ctx.poll_clock.soon(&name);
+                        // What this workspace's card showed stays on it.
+                        state.keep_live_glance();
                         return Ok(End::Switch {
                             to: name,
                             next: Box::new(next),
@@ -2901,9 +3124,14 @@ async fn drive(
     }
     .await;
 
-    // `/compact on|off` holds in the next workspace shown too.
+    // `/compact on|off` holds in the next workspace shown too, and so do the settings
+    // changed here ([`crate::settings`]).
     ctx.compact = state.view.compact;
     ctx.suggest = Some(state.view.suggest);
+    ctx.ws_sidebar_hidden = state.view.ws_sidebar_hidden;
+    ctx.tui.card_order = state.view.card_order;
+    ctx.tui.compact_width = state.view.compact_width;
+    ctx.tui.notify.terminal = state.view.notify_terminal;
     save_seen(&mut state, ctx.seen_file.as_deref());
     ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
@@ -3641,6 +3869,217 @@ mod tests {
         assert!(first_handle.is_finished(), "the predecessor too");
         assert!(second.is_finished() && background.is_finished());
         drop(tx1);
+    }
+
+    /// The settings writer keeps the changes in the order they were made, each outcome
+    /// coming back in that order; closed, it ends once it kept them all.
+    #[tokio::test]
+    async fn the_settings_writer_keeps_changes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tui-state.json");
+        let (done, mut outcomes) = mpsc::unbounded_channel();
+        let (saves, writer) = super::spawn_settings_writer(done);
+        for i in 0..20 {
+            saves
+                .send(super::Save::WsSidebar(file.clone(), i % 2 == 0))
+                .unwrap();
+        }
+        saves
+            .send(super::Save::WsSidebar(file.clone(), false))
+            .unwrap();
+        drop(saves);
+        writer.unwrap().join().unwrap();
+        let mut n = 0;
+        while let Ok(saved) = outcomes.try_recv() {
+            let super::Saved::WsSidebar(on, r) = saved else {
+                panic!("only the sidebar was saved");
+            };
+            assert!(r.is_ok());
+            assert_eq!(on, n < 20 && n % 2 == 0, "{n}");
+            n += 1;
+        }
+        assert_eq!(n, 21);
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, Some(false));
+    }
+
+    /// How a fake hub of [`fake_hub`] answers.
+    #[derive(Clone)]
+    enum Fake {
+        /// `hub.glance` with this.
+        Glance(Value),
+        /// An older hub: no `hub.glance`, `thread.list` and `attention.list` with these.
+        Old(Value, Value),
+        /// Takes the connection and never answers.
+        Silent,
+    }
+
+    /// A fake hub of workspace `name` on `<dir>/<name>.sock`, answering as `fake` says; the
+    /// methods it was asked, in order.
+    fn fake_hub(
+        dir: &std::path::Path,
+        name: &str,
+        fake: Fake,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let sock = dir.join(format!("{name}.sock"));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, name) = (std::sync::Arc::clone(&asked), name.to_string());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (log, fake, name) = (std::sync::Arc::clone(&log), fake.clone(), name.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default().to_string();
+                        log.lock().unwrap().push(method.clone());
+                        if matches!(fake, Fake::Silent) {
+                            continue;
+                        }
+                        let answer = match (method.as_str(), &fake) {
+                            ("hello", _) => json!({"result": {"workspace": name}}),
+                            ("hub.glance", Fake::Glance(g)) => json!({"result": g}),
+                            ("thread.list", Fake::Old(t, _)) => json!({"result": t}),
+                            ("attention.list", Fake::Old(_, a)) => json!({"result": a}),
+                            _ => json!({"error": {"code": "method_not_found", "message": method}}),
+                        };
+                        let mut frame = answer;
+                        frame["id"] = req["id"].clone();
+                        let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (sock, asked)
+    }
+
+    /// The workspaces of a poll test: their sockets by name.
+    struct Fakes(std::collections::HashMap<String, std::path::PathBuf>);
+
+    impl super::Workspaces for Fakes {
+        fn names(&self) -> anyhow::Result<Vec<String>> {
+            let mut names: Vec<String> = self.0.keys().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
+        fn socket(&self, name: &str) -> anyhow::Result<std::path::PathBuf> {
+            self.0
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no {name}"))
+        }
+        fn open(
+            &self,
+            _: &str,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<std::path::PathBuf>> {
+            unreachable!("a poll never opens a hub")
+        }
+        fn create(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// A poll asks each running hub one `hub.glance` (after `hello`), an older hub
+    /// `thread.list` and `attention.list` instead; a stopped hub is not started (nothing is
+    /// opened: [`Fakes::open`] panics), and one that never answers is busy within the
+    /// timeout. The answers become the tabs' counts and the sidebar's cards.
+    #[tokio::test]
+    async fn a_poll_glances_at_each_hub_once_and_starts_none() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let glance = json!({
+            "workspace": "new", "threads": 3, "running": 1, "permissions": 2, "questions": 1,
+            "active": true,
+            "orchestrator": {"id": "o", "name": "orch", "status": "waiting",
+                             "preview": "Approve the deploy?", "preview_seq": 9},
+        });
+        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance));
+        let threads = json!([
+            {"role": "orchestrator", "status": "running"},
+            {"role": "orchestrator", "status": "idle", "retired": true},
+            {"status": "idle"},
+        ]);
+        let items = json!([{"reason": "question"}, {"reason": "error"}]);
+        let (old_sock, old_asked) = fake_hub(dir.path(), "old", Fake::Old(threads, items));
+        let (silent_sock, _) = fake_hub(dir.path(), "silent", Fake::Silent);
+        let ws = Fakes(
+            [
+                ("new", new_sock),
+                ("old", old_sock),
+                ("silent", silent_sock),
+                ("stopped", dir.path().join("stopped.sock")),
+            ]
+            .into_iter()
+            .map(|(n, p)| (n.to_string(), p))
+            .collect(),
+        );
+        let started = std::time::Instant::now();
+        let mut polled = poll_tabs(&ws, ws.names().unwrap()).await;
+        polled.sort_by(|a, b| a.name.cmp(&b.name));
+        // The silent hub held nobody up: they were asked together.
+        assert!(started.elapsed() < 2 * TAB_TIMEOUT + Duration::from_millis(500));
+        let by = |n: &str| polled.iter().find(|p| p.name == n).unwrap().clone();
+        let new = by("new");
+        assert_eq!(
+            new.hub,
+            TabHub::Running {
+                threads: 3,
+                running: 1,
+                permissions: 2,
+                questions: 1
+            }
+        );
+        let g = new.glance.unwrap();
+        assert!(g.active);
+        let o = g.orch.unwrap();
+        assert_eq!(o.status, twr_core::reduce::ThreadStatus::Waiting);
+        assert_eq!(o.preview.as_deref(), Some("Approve the deploy?"));
+        assert_eq!(*new_asked.lock().unwrap(), ["hello", "hub.glance"]);
+        let old = by("old");
+        assert_eq!(
+            old.hub,
+            TabHub::Running {
+                threads: 1,
+                running: 0,
+                permissions: 0,
+                questions: 1
+            }
+        );
+        let g = old.glance.unwrap();
+        assert!(g.active, "its orchestrator runs");
+        assert_eq!(
+            g.orch.unwrap().status,
+            twr_core::reduce::ThreadStatus::Running
+        );
+        assert_eq!(
+            *old_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list", "attention.list"]
+        );
+        assert_eq!(
+            by("silent"),
+            Polled {
+                name: "silent".into(),
+                hub: TabHub::Busy,
+                glance: None
+            }
+        );
+        assert_eq!(by("stopped").hub, TabHub::Stopped);
+        assert!(
+            !dir.path().join("stopped.sock").exists(),
+            "nothing started it"
+        );
+        // Only the hubs due are asked.
+        let polled = poll_tabs(&ws, vec!["new".into()]).await;
+        assert_eq!(polled.len(), 1);
+        assert_eq!(new_asked.lock().unwrap().len(), 4);
     }
 
     /// Every connection to a workspace's socket checks the hub serves that workspace.

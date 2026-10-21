@@ -129,6 +129,7 @@ mod disk;
 mod drain;
 mod find_project;
 mod git;
+mod glance;
 mod handoff;
 mod hook;
 mod jobs;

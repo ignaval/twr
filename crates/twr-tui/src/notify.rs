@@ -163,6 +163,12 @@ impl Notifier {
         }
     }
 
+    /// Alerts the terminal as `alert` says from now on (the settings changed
+    /// `[tui.notify] terminal`), the rest as it was.
+    pub fn set_alert(&mut self, alert: TerminalAlert) {
+        self.alert = alert;
+    }
+
     /// Whether it alerts at all (`terminal` is not `off`).
     pub fn enabled(&self) -> bool {
         self.alert != TerminalAlert::Off
@@ -178,11 +184,12 @@ impl Notifier {
         attention: &AttentionStack,
         now: Instant,
     ) {
-        if !self.enabled() {
-            return;
-        }
+        // Followed while off too (what turns run), so that alerts turned on midway (the
+        // settings) know of the turns already started; nothing is held for them meanwhile.
         if let Some(c) = self.policy.observe(ev, gseq, registry, attention) {
-            self.pending.add(c, now);
+            if self.enabled() {
+                self.pending.add(c, now);
+            }
         }
     }
 
@@ -195,9 +202,7 @@ impl Notifier {
         registry: &Registry,
         attention: &AttentionStack,
     ) {
-        if self.enabled() {
-            self.policy.recall(ev, gseq, registry, attention);
-        }
+        self.policy.recall(ev, gseq, registry, attention);
     }
 
     /// A notifier for another hub (a workspace switched to): nothing held or remembered of
@@ -455,6 +460,32 @@ mod tests {
         w.push(api.report(Some(1), Grade::Success), secs(t0, 1.0));
         assert_eq!(w.n.next_due(), None);
         assert_eq!(w.flush(secs(t0, 20.0)), None);
+    }
+
+    /// Alerts turned on during an orchestrator turn the user started (the settings) still
+    /// say its reply: the turn was followed while they were off.
+    #[test]
+    fn alerts_turned_on_midway_know_the_turn_running() {
+        use twr_core::event::{Source, ThreadCreated};
+        let t0 = Instant::now();
+        let mut w = World::new(TerminalAlert::Off, NotifyWhen::Always);
+        let mut o = ThreadScript::new("o1");
+        w.push(
+            o.event(EventBody::ThreadCreated(ThreadCreated {
+                name: "orch".into(),
+                ext: serde_json::json!({"twr": {"role": "orchestrator"}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            })),
+            t0,
+        );
+        let mut said = o.turn_started("what is api doing?");
+        said.source = Source::User("tui".into());
+        w.push(said, t0);
+        w.n.set_alert(TerminalAlert::Bell);
+        w.push(o.turn_ended(TurnResult::Completed), t0);
+        assert!(w.flush(secs(t0, 60.0)).is_some());
     }
 
     #[test]

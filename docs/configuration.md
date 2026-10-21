@@ -176,7 +176,7 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 
 When `[orchestrator] runtime` isn't set and no orchestrator exists yet, the TUI asks which agent should run it the first time it opens. See [tui.md](tui.md#choosing-the-orchestrator).
 
-The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the TUI captures the mouse: a drag copies text from one pane, without borders, and the wheel scrolls. Shift-drag, or Option-drag in iTerm2, still uses the terminal's own selection. `/mouse` toggles it while the TUI runs. See [tui.md](tui.md#mouse).
+The TUI reads `[tui]` when it opens; the hub ignores it. Its [settings](tui.md#settings) (`/settings`) change `suggest`, `card_order`, `compact_width` and `[tui.notify] terminal` while it runs and write them back here, changing that one line and nothing else of the file, or leave the file alone and say why when they can't be sure of that. With `mouse = true` the TUI captures the mouse: a drag copies text from one pane, without borders, and the wheel scrolls. Shift-drag, or Option-drag in iTerm2, still uses the terminal's own selection. `/mouse` toggles it while the TUI runs. See [tui.md](tui.md#mouse).
 
 `animate = true` animates the working cursor on whatever is running a turn: worker cards, grid tiles, and the main pane's header while the orchestrator or the thread you dived into works, plus the cursor where that thread's next text will appear. The TUI then redraws about eight times a second, but only while an icon is on screen. With `false` the same places show a still `_` and the TUI redraws only when something changes. See [tui.md](tui.md#what-is-working).
 
