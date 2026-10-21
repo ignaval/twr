@@ -2532,6 +2532,9 @@ async fn drive(
         Vec<workspace::Polled>,
         std::time::Instant,
     )>();
+    // The workspaces as listed for a poll (`None`: they could not be), read off the loop: a
+    // directory on a slow mount never holds up the view.
+    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<String>>>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
     type Opened = (String, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
@@ -2993,19 +2996,34 @@ async fn drive(
                 // orchestrator's latest reply while its conversation is not loaded.
                 _ = tab_poll.tick(), if ctx.workspaces.is_some() && !tabs_pending => {
                     if let Some(ws) = ctx.workspaces.clone() {
-                        let names = ws.names().ok();
-                        let listed: Vec<String> = match &names {
-                            Some(n) => n.clone(),
-                            None => state.tabs.iter().map(|t| t.name.clone()).collect(),
-                        };
-                        let now = std::time::Instant::now();
-                        let due = ctx.poll_clock.take_due(&listed, now);
                         tabs_pending = true;
-                        let tx = tabs_tx.clone();
+                        let tx = names_tx.clone();
                         tokio::spawn(async move {
-                            let polled = poll_tabs(ws.as_ref(), due).await;
-                            let _ = tx.send((names, polled, now));
+                            let names = tokio::task::spawn_blocking(move || ws.names().ok())
+                                .await
+                                .ok()
+                                .flatten();
+                            let _ = tx.send(names);
                         });
+                    }
+                }
+                // Listed: the hubs due are asked.
+                Some(names) = names_rx.recv() => {
+                    match ctx.workspaces.clone() {
+                        Some(ws) => {
+                            let listed: Vec<String> = match &names {
+                                Some(n) => n.clone(),
+                                None => state.tabs.iter().map(|t| t.name.clone()).collect(),
+                            };
+                            let now = std::time::Instant::now();
+                            let due = ctx.poll_clock.take_due(&listed, now);
+                            let tx = tabs_tx.clone();
+                            tokio::spawn(async move {
+                                let polled = poll_tabs(ws.as_ref(), due).await;
+                                let _ = tx.send((names, polled, now));
+                            });
+                        }
+                        None => tabs_pending = false,
                     }
                 }
                 Some((names, polled, asked)) = tabs_rx.recv() => {
