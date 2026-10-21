@@ -1006,6 +1006,9 @@ pub enum Action {
     Setting(crate::settings::Change),
     /// Ask the hub for its settings (`config.show`), for the settings overlay.
     ConfigShow,
+    /// Read what the config file says of the TUI's settings, for the settings overlay: the
+    /// IO loop has the settings writer read it, off the loop.
+    SettingsFile,
     /// Switch to workspace `name` (a tab, `/ws`): the IO loop opens its hub (starting it when
     /// needed) and shows it in place of this one.
     Workspace {

@@ -351,12 +351,21 @@ pub fn set_key(text: &str, table: &[&str], key: &str, value: &Scalar) -> Result<
 }
 
 /// The value of `table.key` as the file at `path` has it now (`None` when unset, or when the
-/// file is missing, not a regular file or does not parse), for the settings view to show what
-/// the file says. A FIFO in its place is not waited on.
+/// file is missing, not a regular file, does not parse or is being written), for the settings
+/// view to show what the file says. A FIFO in its place is not waited on.
 pub fn read_key(path: &Path, table: &[&str], key: &str) -> Option<toml::Value> {
+    key_of(&read_doc(path)?, table, key)
+}
+
+/// The file at `path` as a document, read once ([`read_key`]'s `None` cases are `None`).
+pub fn read_doc(path: &Path) -> Option<toml::Table> {
     let bytes = read_plain(&std::fs::canonicalize(path).ok()?).ok()?;
-    let doc: toml::Table = std::str::from_utf8(&bytes).ok()?.parse().ok()?;
-    match find_table(&doc, table) {
+    std::str::from_utf8(&bytes).ok()?.parse().ok()
+}
+
+/// The value of `table.key` in `doc`.
+pub fn key_of(doc: &toml::Table, table: &[&str], key: &str) -> Option<toml::Value> {
+    match find_table(doc, table) {
         Found::Table(t) => t.get(key).cloned(),
         _ => None,
     }
@@ -399,22 +408,20 @@ fn write_key_with(
 }
 
 /// The bytes of `file`, read without following a link or waiting on a FIFO put in its place,
-/// under a shared lock (another TUI's [`rewrite`] is never seen half done; one holding it past
-/// [`READ_WAIT`] does not hold up the view, which reads as it is then).
+/// under a shared lock: another TUI's [`rewrite`] is never seen half done, and one still
+/// writing after [`twr_core::config::CONFIG_LOCK_WAIT`] fails the read rather than show half a
+/// file.
 fn read_plain(file: &Path) -> Result<Vec<u8>, String> {
     let mut f = open_plain(file, false)?;
-    let until = std::time::Instant::now() + READ_WAIT;
+    let until = std::time::Instant::now() + twr_core::config::CONFIG_LOCK_WAIT;
     while let Err(std::fs::TryLockError::WouldBlock) = f.try_lock_shared() {
         if std::time::Instant::now() >= until {
-            break;
+            return Err("config.toml is being written by another program: try again".into());
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     read_all(&mut f)
 }
-
-/// How long [`read_key`] waits for a writer: it runs where the TUI draws.
-const READ_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// `file` opened (for writing too, with `write`), never through a link nor waiting on a FIFO
 /// put in its place; only a regular file.
@@ -994,6 +1001,23 @@ terminal = \"bell\"
         std::fs::write(&file, "[tui]\ncompact_width = 0\n").unwrap();
         writer.unlock().unwrap();
         assert_eq!(reader.join().unwrap(), Some(toml::Value::Integer(0)));
+    }
+
+    /// A writer still holding the lock past the wait fails the read: half a file is never
+    /// read.
+    #[test]
+    fn a_read_past_the_wait_fails_rather_than_read_half() {
+        let (_dir, file) = dir_with("[tui]\ncompact_width = 120\n");
+        let writer = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+        writer.lock().unwrap();
+        let err = read_plain(&file).unwrap_err();
+        assert!(err.contains("being written"), "{err}");
+        assert_eq!(read_key(&file, &["tui"], "compact_width"), None);
+        let core =
+            twr_core::config::read_locked(&file, std::time::Duration::from_millis(50)).unwrap_err();
+        assert_eq!(core.kind(), std::io::ErrorKind::TimedOut);
+        writer.unlock().unwrap();
+        assert!(read_plain(&file).is_ok());
     }
 
     /// Two TUIs editing at once both land: the lock makes the second read the first's result.

@@ -983,7 +983,7 @@ mod tests {
         let mut st = in_workspaces("default");
         st.view.suggest = true;
         let a = tap(&mut st, 160, 40, &Target::Settings);
-        assert_eq!(a, vec![Action::ConfigShow]);
+        assert_eq!(a, vec![Action::ConfigShow, Action::SettingsFile]);
         st.apply_result(
             "config.show",
             &serde_json::json!({"codex": {"auto": "ask"}, "wake_after_secs": 45}),
@@ -1061,7 +1061,7 @@ mod tests {
         st.view.input.set("/settings");
         assert_eq!(
             st.handle_key(crate::app::tests::key(KeyCode::Enter)),
-            vec![Action::ConfigShow]
+            vec![Action::ConfigShow, Action::SettingsFile]
         );
         let r = rows(&mut st, 160, 40).join("\n");
         assert!(r.contains("read-only"), "{r}");
@@ -1345,6 +1345,28 @@ mod tests {
         assert!(cursor.x < 39, "{cursor:?}");
         let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
         assert_eq!(workspace_action(&a), Some((name.into(), true)));
+    }
+
+    /// The current workspace's hub gone (a poll found nothing listening): its card says so,
+    /// with the last reply, rather than what the view last knew.
+    #[test]
+    fn a_stopped_current_hub_shows_as_stopped() {
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        tabs[0].hub = TabHub::Stopped;
+        tabs[0].glance = Some(Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Idle,
+                preview: Some("last words".into()),
+            }),
+        });
+        st.set_tabs(tabs);
+        let tab = st.tabs[0].clone();
+        assert_eq!(st.tab_hub(&tab), TabHub::Stopped);
+        assert!(!st.tab_glance(&tab).unwrap().active);
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(r.contains("○ default") && r.contains("last words"), "{r}");
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.

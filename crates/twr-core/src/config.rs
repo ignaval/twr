@@ -123,8 +123,8 @@ pub const CONFIG_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs
 
 /// The text of the file at `path`, read under a shared lock (`flock`): the TUI's settings
 /// write the config file in place under an exclusive one, so a reader never sees it half
-/// written. A writer holding it longer than `wait`, or a file system without locks, does not
-/// stop the read: it reads as it is then.
+/// written. A writer still holding it after `wait` fails the read (`TimedOut`): half a file is
+/// never read. A file system without locks reads as it is.
 pub fn read_locked(path: &Path, wait: std::time::Duration) -> std::io::Result<String> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
@@ -133,6 +133,12 @@ pub fn read_locked(path: &Path, wait: std::time::Duration) -> std::io::Result<St
         match f.try_lock_shared() {
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
                 std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "another program is writing it (it holds its lock): try again",
+                ));
             }
             _ => break,
         }

@@ -756,13 +756,10 @@ impl AppState {
         self.view.settings = Some(crate::settings::Settings {
             selected: 0,
             hub: None,
-            file: file
-                .as_deref()
-                .map(crate::settings::read_file)
-                .unwrap_or_default(),
+            file: Vec::new(),
             path: file.as_deref().map(crate::settings::shown_path),
         });
-        vec![Action::ConfigShow]
+        vec![Action::ConfigShow, Action::SettingsFile]
     }
 
     /// The settings overlay's keys: ↑↓ select a row, Enter, Space or → change it, ← back, Esc
@@ -846,7 +843,8 @@ impl AppState {
     }
 
     /// Setting `change` was written to the config file (`Ok`: its path as shown) or left
-    /// alone (why): the status bar says which, and the overlay shows what the file says now.
+    /// alone (why): the status bar says which (the file's values come after it,
+    /// [`AppState::settings_file`]).
     pub fn setting_saved(
         &mut self,
         change: &crate::settings::Change,
@@ -866,10 +864,13 @@ impl AppState {
                 format!("{what}: for this session only, the config file was left alone: {why}")
             }
         });
+    }
+
+    /// What the config file says of the TUI's keys, as the settings writer read it, for the
+    /// overlay while it is open.
+    pub fn settings_file(&mut self, file: Vec<(crate::settings::Key, Option<String>)>) {
         if let Some(s) = self.view.settings.as_mut() {
-            if let Ok(paths) = twr_core::paths::Paths::from_env() {
-                s.file = crate::settings::read_file(&paths.config_file);
-            }
+            s.file = file;
         }
     }
 
@@ -883,7 +884,9 @@ impl AppState {
     /// What tab `tab` shows: the current workspace's hub as the state has it now, the
     /// others as last asked.
     pub fn tab_hub(&self, tab: &Tab) -> TabHub {
-        if self.workspace.as_deref() != Some(tab.name.as_str()) {
+        // This workspace's own hub too, once a poll found it gone: what the view holds of it
+        // is no longer news.
+        if self.workspace.as_deref() != Some(tab.name.as_str()) || tab.hub == TabHub::Stopped {
             return tab.hub;
         }
         let workers: Vec<_> = self
@@ -959,7 +962,7 @@ impl AppState {
     /// conversation while the main pane shows it, else as its hub last said it), the others'
     /// as their hubs last said.
     pub fn tab_glance(&self, tab: &Tab) -> Option<Glance> {
-        if self.workspace.as_deref() != Some(tab.name.as_str()) {
+        if self.workspace.as_deref() != Some(tab.name.as_str()) || tab.hub == TabHub::Stopped {
             return tab.glance.clone();
         }
         let threads = self.registry.list();

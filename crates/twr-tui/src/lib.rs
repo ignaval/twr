@@ -414,6 +414,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::Workspace { .. }
         | Action::WsSidebar(_)
         | Action::Setting(_)
+        | Action::SettingsFile
         | Action::TerminalSetup { .. } => None,
         Action::ConfigShow => Some(("config.show", Value::Null)),
         // The revision of the card on screen: an item raised again since (it may ask
@@ -1804,16 +1805,26 @@ fn spawn_history_writer(
     (tx, writer)
 }
 
-/// A setting to keep, for the settings writer ([`spawn_settings_writer`]).
+/// A setting to keep, or the settings to read, for the settings writer
+/// ([`spawn_settings_writer`]).
 enum Save {
     /// The workspace sidebar shown or not, in `tui-state.json` at this path.
     WsSidebar(PathBuf, bool),
-    /// A setting of the config file ([`save_setting`]).
+    /// A setting of the config file ([`save_setting`]); the file is read again after it.
     Setting(settings::Change),
+    /// Read what the config file says of the TUI's settings ([`settings::read_file`]).
+    ReadFile,
 }
 
-/// What became of a [`Save`]: `Ok` with where it was kept, as shown, or why it was not.
-type Saved = (Save, Result<String, String>);
+/// What the settings writer did.
+enum Saved {
+    /// The workspace sidebar remembered shown (or hidden), or why not.
+    WsSidebar(bool, Result<(), String>),
+    /// A setting kept (where, as shown), or why not.
+    Setting(settings::Change, Result<String, String>),
+    /// What the config file says of the TUI's settings.
+    File(Vec<(settings::Key, Option<String>)>),
+}
 
 /// Starts the thread that keeps the settings changed in the TUI, one after another in the
 /// order they were changed: a later change never lands before an earlier one, and the IO loop
@@ -1829,14 +1840,26 @@ fn spawn_settings_writer(
     let writer = std::thread::Builder::new()
         .name("twr-settings".into())
         .spawn(move || {
+            let file = || {
+                twr_core::paths::Paths::from_env()
+                    .ok()
+                    .map(|p| settings::read_file(&p.config_file))
+                    .unwrap_or_default()
+            };
             for save in rx {
-                let r = match &save {
-                    Save::WsSidebar(file, on) => firstrun::set_workspaces_sidebar(file, *on)
-                        .map(|()| String::new())
-                        .map_err(|e| e.to_string()),
-                    Save::Setting(change) => save_setting(change),
+                let saved = match save {
+                    Save::WsSidebar(path, on) => Saved::WsSidebar(
+                        on,
+                        firstrun::set_workspaces_sidebar(&path, on).map_err(|e| e.to_string()),
+                    ),
+                    Save::Setting(change) => {
+                        let r = save_setting(&change);
+                        let _ = done.send(Saved::Setting(change, r));
+                        Saved::File(file())
+                    }
+                    Save::ReadFile => Saved::File(file()),
                 };
-                let _ = done.send((save, r));
+                let _ = done.send(saved);
             }
         })
         .ok();
@@ -2762,6 +2785,12 @@ async fn drive(
                             // A setting changed in the settings overlay, applied to the view
                             // already: the notifier takes it too, and the config file keeps
                             // it when it can be changed safely ([`config_edit`]).
+                            Action::SettingsFile => {
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::ReadFile);
+                                }
+                                continue;
+                            }
                             Action::Setting(change) => {
                                 if let settings::Change::Notify(alert) = change {
                                     notifier.set_alert(alert);
@@ -3000,16 +3029,16 @@ async fn drive(
                         }
                     }
                 }
-                // What the settings writer kept, or why not.
-                Some((save, r)) = ctx.saved_rx.recv() => match save {
-                    Save::WsSidebar(..) => {
-                        if let Err(e) = r {
-                            state.view.status = Some(format!(
-                                "workspace sidebar: not remembered for the next runs: {e}"
-                            ));
-                        }
+                // What the settings writer kept, or why not, and what it read.
+                Some(saved) = ctx.saved_rx.recv() => match saved {
+                    Saved::WsSidebar(_, Err(e)) => {
+                        state.view.status = Some(format!(
+                            "workspace sidebar: not remembered for the next runs: {e}"
+                        ));
                     }
-                    Save::Setting(change) => state.setting_saved(&change, r),
+                    Saved::WsSidebar(_, Ok(())) => {}
+                    Saved::Setting(change, r) => state.setting_saved(&change, r),
+                    Saved::File(file) => state.settings_file(file),
                 },
                 // An error of a call the workspace left had asked for.
                 Some((msg, transient)) = ctx.late_rx.recv() => {
@@ -3832,11 +3861,12 @@ mod tests {
         drop(saves);
         writer.unwrap().join().unwrap();
         let mut n = 0;
-        while let Ok((save, r)) = outcomes.try_recv() {
+        while let Ok(saved) = outcomes.try_recv() {
+            let super::Saved::WsSidebar(on, r) = saved else {
+                panic!("only the sidebar was saved");
+            };
             assert!(r.is_ok());
-            if let super::Save::WsSidebar(_, on) = save {
-                assert_eq!(on, n < 20 && n % 2 == 0, "{n}");
-            }
+            assert_eq!(on, n < 20 && n % 2 == 0, "{n}");
             n += 1;
         }
         assert_eq!(n, 21);

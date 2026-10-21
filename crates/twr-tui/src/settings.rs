@@ -119,8 +119,8 @@ pub struct Settings {
     /// The hub's `config.show` (`None` until it answered): its `[codex] auto` and
     /// `wake_after_secs`.
     pub hub: Option<Value>,
-    /// What the config file says of the TUI's keys now, read when the overlay opened and after
-    /// each write: a value shown when it differs from the one in effect.
+    /// What the config file says of the TUI's keys now, read (off the loop) when the overlay
+    /// opened and after each write: a value shown when it differs from the one in effect.
     pub file: Vec<(Key, Option<String>)>,
     /// The file's path, as shown (`~` for the home directory), when the environment names one.
     pub path: Option<String>,
@@ -179,10 +179,12 @@ fn width_text(w: u16) -> String {
 }
 
 /// What the config file says of the TUI's keys, as the overlay shows it (`None`: unset, or
-/// no file).
+/// no file), read once. It may wait on a writer: never on the IO loop (the settings writer
+/// reads it, [`crate::app::Action::SettingsFile`]).
 pub fn read_file(path: &std::path::Path) -> Vec<(Key, Option<String>)> {
+    let doc = crate::config_edit::read_doc(path).unwrap_or_default();
     let read = |table: &[&str], key: &str| {
-        crate::config_edit::read_key(path, table, key).map(|v| match v {
+        crate::config_edit::key_of(&doc, table, key).map(|v| match v {
             toml::Value::String(s) => s,
             other => other.to_string(),
         })
