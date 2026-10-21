@@ -1673,6 +1673,15 @@ const LATEST_FINAL_TEXT: &str = concat!(
      AND json_extract(data, '$.final') = 1 ORDER BY turn DESC, seq DESC LIMIT 1"
 );
 
+/// [`updates_about`]: through the kind index (`+seq`: not the primary key's order, which would
+/// read every event of the conversation), the thread's updates only, filtered before the limit.
+const UPDATES_ABOUT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'conversation.update' AND thread = ?1
+     AND json_extract(data, '$.about_thread') = ?2 ORDER BY +seq DESC LIMIT ?3"
+);
+
 /// [`latest_of_kind`].
 const LATEST_OF_KIND: &str = concat!(
     "SELECT ",
@@ -1791,6 +1800,20 @@ pub fn latest_of_kind(
 ) -> anyhow::Result<Vec<Event>> {
     let mut st = conn.prepare_cached(LATEST_OF_KIND)?;
     let rows = st.query_map(params![kind, thread, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The latest `limit` `conversation.update`s of `thread` about thread `about`
+/// (`about_thread`), newest first, as stored (possibly capped): however many updates about
+/// other threads came after them.
+pub fn updates_about(
+    conn: &Connection,
+    thread: &str,
+    about: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(UPDATES_ABOUT)?;
+    let rows = st.query_map(params![thread, about, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 

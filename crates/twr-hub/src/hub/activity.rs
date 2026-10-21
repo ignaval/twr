@@ -22,6 +22,8 @@
 //! turn and the turn's prompt, both cut short) to the event before it is recorded, so the
 //! user can judge the request without asking the orchestrator ([`Core::request_context`]).
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use twr_core::activity;
@@ -74,6 +76,19 @@ pub(super) struct Activity {
 }
 
 impl Activity {
+    /// What the agent is at in its open turn, from its own words and actions: the step of its
+    /// plan in progress or what it said it is about to do, then what its latest action does.
+    fn working(&self) -> Option<String> {
+        let lead = self.step.as_deref().or(self.intent.as_deref());
+        match (lead, self.action.as_deref()) {
+            // (`committing part 1`, not `committing part 1 · committing`.)
+            (Some(l), Some(x)) if !l.starts_with(x) => Some(format!("{l} · {x}")),
+            (Some(l), _) => Some(l.to_string()),
+            (None, Some(x)) => Some(x.to_string()),
+            (None, None) => None,
+        }
+    }
+
     /// What the message streamed so far says the agent is about to do, when it says so: the
     /// thread's intent from now on ([`activity::intent`]).
     fn note_intent(&mut self) {
@@ -334,20 +349,13 @@ impl Core {
                     (n, ds) => format!("waiting on {n} background tasks: {}", ds.join(", ")),
                 }
             }
-            ThreadStatus::Running => {
-                let lead = a.and_then(|a| a.step.as_deref().or(a.intent.as_deref()));
-                let action = a.and_then(|a| a.action.as_deref());
-                match (lead, action) {
-                    // (`committing part 1`, not `committing part 1 · committing`.)
-                    (Some(l), Some(x)) if !l.starts_with(x) => format!("{l} · {x}"),
-                    (Some(l), _) => l.to_string(),
-                    (None, Some(x)) => x.to_string(),
-                    (None, None) => match a.and_then(|a| a.task.as_deref()) {
-                        Some(task) => format!("starting: {task}"),
-                        None => activity::fallback(v).to_string(),
-                    },
-                }
-            }
+            ThreadStatus::Running => match a.and_then(Activity::working) {
+                Some(line) => line,
+                None => match a.and_then(|a| a.task.as_deref()) {
+                    Some(task) => format!("starting: {task}"),
+                    None => activity::fallback(v).to_string(),
+                },
+            },
             // The hub's error item (`api: turn 3 failed: …`), without the thread's name, and
             // with what happened when it does not say.
             ThreadStatus::Error => match self.open_reason(&v.id, AttentionReason::Error) {
@@ -398,6 +406,29 @@ impl Core {
             _ => line,
         };
         activity::cut(&line, activity::ACTIVITY_MAX)
+    }
+
+    /// [`Core::activity_line`] as a thread summary may read it (`hub::summary`): only what the
+    /// agent's own words and actions, its own background tasks and its reports say; `None` while
+    /// that line would quote an item (waiting on the user, failed) or the turn's prompt (a
+    /// turn just started), and for a thread attached, parked or stopped.
+    ///
+    /// Read off [`own_work`]`(v)`: the `!` commands the user runs on the thread are theirs, as
+    /// they are to the orchestrator, so no line names one (a thread waiting on none but those
+    /// reads as it would without them).
+    pub(super) fn summary_activity(&self, v: &ThreadView) -> Option<String> {
+        let v = own_work(v);
+        let v = v.as_ref();
+        match v.status() {
+            ThreadStatus::Running => self
+                .activity
+                .get(&v.id)
+                .and_then(Activity::working)
+                .map(|l| activity::cut(&l, activity::ACTIVITY_MAX)),
+            ThreadStatus::Background => Some(self.activity_line(v)),
+            ThreadStatus::Done | ThreadStatus::Idle if !v.stopped => Some(self.activity_line(v)),
+            _ => None,
+        }
     }
 
     /// The summary of `thread`'s first open permission or question (in attention order), if
@@ -462,6 +493,19 @@ impl Core {
         }
         Value::Object(out)
     }
+}
+
+/// `v` as its own work has it: without the `!` commands the user runs on it
+/// ([`twr_core::reduce::BackgroundTask::shell`], shared or not: a shared one's command goes to
+/// the thread only when it ends), so its status and activity line say nothing of them. `v`
+/// itself when it runs none.
+pub(super) fn own_work(v: &ThreadView) -> Cow<'_, ThreadView> {
+    if v.background_tasks.values().all(|t| !t.shell) {
+        return Cow::Borrowed(v);
+    }
+    let mut own = v.clone();
+    own.background_tasks.retain(|_, t| !t.shell);
+    Cow::Owned(own)
 }
 
 /// The first line of `s` with any text on it.

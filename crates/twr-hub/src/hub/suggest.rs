@@ -130,7 +130,7 @@ pub const RUNTIMES: [&str; 2] = ["claude-code", "codex"];
 pub const DOWN_FOR: Duration = Duration::from_secs(3600);
 
 /// What a runtime is called in messages.
-fn title(runtime: &str) -> &'static str {
+pub(super) fn title(runtime: &str) -> &'static str {
     match runtime {
         "codex" => "Codex",
         _ => "Claude Code",
@@ -160,7 +160,7 @@ fn probed_out(agents: &[twr_core::runner::AgentInfo], runtime: &str) -> Option<S
 }
 
 /// The reason for a failed call's `e`: [`UNAVAILABLE`] ones as they are, else `failed: `.
-fn failed_reason(e: &str) -> String {
+pub(super) fn failed_reason(e: &str) -> String {
     if e.starts_with(UNAVAILABLE) || e.starts_with("retry: ") {
         e.to_string()
     } else {
@@ -198,8 +198,9 @@ pub(super) struct Suggestions {
     starts: VecDeque<Instant>,
     /// No call of a runtime before then (after its call failed).
     backoff_until: HashMap<&'static str, Instant>,
-    /// Runtimes whose call said they can't run, why, and since when ([`DOWN_FOR`]).
-    down: HashMap<&'static str, (String, Instant)>,
+    /// Runtimes whose call said they can't run, why, and since when ([`DOWN_FOR`]): a summary
+    /// call's too (`hub::summary`), which shares this.
+    pub(super) down: HashMap<&'static str, (String, Instant)>,
     /// Counts since the hub started: calls, failures, cost at list price (Codex's estimated
     /// from its tokens, [`codex_cost`]).
     calls: u64,
@@ -244,7 +245,7 @@ pub(super) fn codex_global_instructions(dir: &Path) -> Option<PathBuf> {
 /// The Codex home the hub's Codex uses ([`codex_home_from`] with this process's environment
 /// and account); a suggestion call passes it to Codex as `CODEX_HOME`, so that the home twr
 /// checked is the one Codex reads.
-fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
+pub(super) fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
     codex_home_from(
         given,
         std::env::var_os("CODEX_HOME"),
@@ -337,7 +338,7 @@ pub(super) fn unavailable(probe: &Probe, s: &Suggestions, now: Instant) -> Optio
 
 /// `model` is a model name or alias the CLI takes: letters, digits and `._:-[]`, not
 /// starting with `-`.
-fn valid_model(model: &str) -> bool {
+pub(super) fn valid_model(model: &str) -> bool {
     !model.is_empty()
         && model.len() <= 64
         && !model.starts_with('-')
@@ -347,7 +348,7 @@ fn valid_model(model: &str) -> bool {
 }
 
 /// The start of `s`, at most `max` bytes, on a character boundary.
-fn head(s: &str, max: usize) -> &str {
+pub(super) fn head(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -599,11 +600,12 @@ fn scrub_env(cmd: &mut tokio::process::Command, marker: &str, prefixes: &[&str],
     cmd.env(super::AGENT_ENV, marker);
 }
 
-/// Asks Claude Code's CLI once in print mode (see the module docs), in `dir`: its `result`,
-/// and what it cost.
-async fn ask_claude(
+/// Asks Claude Code's CLI once in print mode (see the module docs), in `dir`, with `system` as
+/// its system prompt: its `result`, and what it cost.
+pub(super) async fn ask_claude(
     bin: &Path,
     model: &str,
+    system: &str,
     input: &str,
     dir: &Path,
     marker: &str,
@@ -623,7 +625,7 @@ async fn ask_claude(
         "--setting-sources",
         "",
         "--system-prompt",
-        SYSTEM,
+        system,
     ]);
     cmd.current_dir(dir);
     // Not the hub's own Claude Code session's (a hub run from one): this is a session of its
@@ -712,7 +714,7 @@ fn codex_cost(model: &str, usage: &Value) -> f64 {
 
 /// Asks Codex's CLI once (`codex exec`, see the module docs), in `dir`, with `system` as the
 /// model's instructions: its last message, and what it cost.
-async fn ask_codex(
+pub(super) async fn ask_codex(
     bin: &Path,
     model: &str,
     input: &str,
@@ -809,7 +811,7 @@ async fn ask_codex(
 /// else why none can (`unavailable: ...`). Its model looking large
 /// ([`twr_core::config::suggest_model_too_large`]) is a `failed: ...`: no other runtime, and
 /// no other provider, stands in for a setting.
-fn plan(
+pub(super) fn plan(
     runtime: &str,
     allowed: &[&str],
     models: &SuggestModels,
@@ -968,68 +970,80 @@ impl Hub {
             at: hub.local_agents.probed_at(),
             codex_home: codex_home(hub.suggest_codex_home.as_deref()),
         };
-        // Answered already, or being asked: that answer.
-        let waiting = {
-            let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
-            // Turned on again by the user: what the calls found is found again.
-            if ask.retry {
-                s.down.clear();
-            }
-            if let Some((_, a)) = s.done.iter().find(|(k, _)| *k == key) {
-                let (a, rt, model) = a.clone();
-                drop(s);
-                let reason = a.is_none().then_some("none");
-                return Ok(answer(&id, turn, Some((rt, &model, a)), reason, true, &hub));
-            }
-            // In flight: wait for it. Else, the limits allowing, reserve the call and register
-            // it as in flight under this same lock, so an ask that comes meanwhile shares it.
-            match s.flight.get(&key) {
-                Some(rx) => Ok(rx.clone()),
-                None => {
-                    let now = Instant::now();
-                    // No runtime that may run it: nothing goes anywhere. The one that would
-                    // failed a moment ago (a usage limit, a timeout): none is asked, not even
-                    // another runtime, which only stands in for one that can't run at all.
-                    let way = match plan(&runtime, allowed, models, &probe, &s, now) {
-                        Ok(way) => way,
-                        Err(why) => {
-                            drop(s);
-                            return Ok(none(&id, &why));
-                        }
-                    };
-                    if s.backoff_until.get(way.0).is_some_and(|t| now < *t) {
-                        drop(s);
-                        return Ok(none(&id, "backoff"));
-                    }
-                    while s.starts.front().is_some_and(|t| {
-                        now.saturating_duration_since(*t) > Duration::from_secs(3600)
-                    }) {
-                        s.starts.pop_front();
-                    }
-                    let too_soon = s
-                        .starts
-                        .back()
-                        .is_some_and(|t| now.saturating_duration_since(*t) < MIN_GAP);
-                    if too_soon || s.starts.len() >= HOURLY_MAX {
-                        drop(s);
-                        return Ok(none(&id, "limit"));
-                    }
-                    s.starts.push_back(now);
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    s.flight.insert(key.clone(), rx);
-                    Err((tx, way))
+        // Answered already, or being asked: that answer. An ask that waited on a call whose
+        // asker hung up (or turned suggestions off) before its answer takes the call over: its
+        // start, counted already, is this one's.
+        let mut took_over = false;
+        let (tx, (rt, model)) = loop {
+            let waiting = {
+                let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
+                // Turned on again by the user: what the calls found is found again.
+                if ask.retry {
+                    s.down.clear();
                 }
+                if let Some((_, a)) = s.done.iter().find(|(k, _)| *k == key) {
+                    let (a, rt, model) = a.clone();
+                    drop(s);
+                    let reason = a.is_none().then_some("none");
+                    return Ok(answer(&id, turn, Some((rt, &model, a)), reason, true, &hub));
+                }
+                // In flight: wait for it. Else, the limits allowing, reserve the call and register
+                // it as in flight under this same lock, so an ask that comes meanwhile shares it.
+                match s.flight.get(&key) {
+                    // (Not one whose asker is gone: its entry goes with it.)
+                    Some(rx) if rx.has_changed().is_ok() => Ok(rx.clone()),
+                    _ => {
+                        let now = Instant::now();
+                        // No runtime that may run it: nothing goes anywhere. The one that would
+                        // failed a moment ago (a usage limit, a timeout): none is asked, not even
+                        // another runtime, which only stands in for one that can't run at all.
+                        let way = match plan(&runtime, allowed, models, &probe, &s, now) {
+                            Ok(way) => way,
+                            Err(why) => {
+                                drop(s);
+                                return Ok(none(&id, &why));
+                            }
+                        };
+                        if s.backoff_until.get(way.0).is_some_and(|t| now < *t) {
+                            drop(s);
+                            return Ok(none(&id, "backoff"));
+                        }
+                        if !took_over {
+                            while s.starts.front().is_some_and(|t| {
+                                now.saturating_duration_since(*t) > Duration::from_secs(3600)
+                            }) {
+                                s.starts.pop_front();
+                            }
+                            let too_soon = s
+                                .starts
+                                .back()
+                                .is_some_and(|t| now.saturating_duration_since(*t) < MIN_GAP);
+                            if too_soon || s.starts.len() >= HOURLY_MAX {
+                                drop(s);
+                                return Ok(none(&id, "limit"));
+                            }
+                            s.starts.push_back(now);
+                        }
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        s.flight.insert(key.clone(), rx);
+                        Err((tx, way))
+                    }
+                }
+            };
+            match waiting {
+                Err(call) => break call,
+                Ok(rx) => match wait_for(rx, &id, turn, &hub).await {
+                    Some(said) => return Ok(said),
+                    None => took_over = true,
+                },
             }
-        };
-        let (tx, (rt, model)) = match waiting {
-            Err(call) => call,
-            Ok(rx) => return Ok(wait_for(rx, &id, turn, &hub).await),
         };
         // Whatever ends this call (its answer, or the request dropped), it is no longer in
         // flight: an ask after it finds its answer, or asks again.
-        let _flight = Flight {
+        let flight = Flight {
             hub: Arc::clone(&hub),
             key: key.clone(),
+            rx: tx.subscribe(),
         };
         let dir = hub
             .db_path
@@ -1042,7 +1056,7 @@ impl Hub {
         // user may have turned off meanwhile.
         let r = match twr_core::paths::ensure_private_dir(&dir) {
             Err(e) => Err(format!("cannot make {}: {e:#}", dir.display())),
-            Ok(()) if rt == "codex" => match system_file(&dir) {
+            Ok(()) if rt == "codex" => match system_file(&dir, CODEX_INSTRUCTIONS, SYSTEM) {
                 Err(e) => Err(e),
                 Ok(system) => match &probe.codex_home {
                     Some(home) => {
@@ -1052,7 +1066,7 @@ impl Hub {
                     None => Err("twr can't tell which Codex home Codex would use".into()),
                 },
             },
-            Ok(()) => ask_claude(&hub.suggest_bin, &model, &input, &dir, &marker).await,
+            Ok(()) => ask_claude(&hub.suggest_bin, &model, SYSTEM, &input, &dir, &marker).await,
         };
         let mut result: Answer = {
             let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
@@ -1099,7 +1113,7 @@ impl Hub {
         };
         {
             let mut s = hub.suggestions.lock().unwrap_or_else(|e| e.into_inner());
-            s.flight.remove(&key);
+            end_flight(&mut s.flight, &key, &flight.rx);
             if let Ok(a) = &result {
                 s.done.push_back((key, a.clone()));
                 while s.done.len() > CACHE_MAX {
@@ -1131,13 +1145,20 @@ impl Hub {
     }
 }
 
-/// The file Codex reads the model's instructions from ([`SYSTEM`]), in the private folder
-/// `dir`, written when it isn't there as it should be.
-fn system_file(dir: &Path) -> Result<PathBuf, String> {
-    let file = dir.join("codex-instructions.md");
-    if std::fs::read_to_string(&file).ok().as_deref() != Some(SYSTEM) {
-        let tmp = dir.join(format!("codex-instructions.{}.tmp", std::process::id()));
-        std::fs::write(&tmp, SYSTEM)
+/// The file Codex reads a suggestion's instructions from ([`SYSTEM`]), in the private folder.
+const CODEX_INSTRUCTIONS: &str = "codex-instructions.md";
+
+/// The file `name` Codex reads the model's instructions `system` from, in the private folder
+/// `dir`, written when it isn't there as it should be (through a file of this call's own: two
+/// calls at once write two).
+pub(super) fn system_file(dir: &Path, name: &str, system: &str) -> Result<PathBuf, String> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let file = dir.join(name);
+    if std::fs::read_to_string(&file).ok().as_deref() != Some(system) {
+        let stem = name.strip_suffix(".md").unwrap_or(name);
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!("{stem}.{}.{n}.tmp", std::process::id()));
+        std::fs::write(&tmp, system)
             .and_then(|()| twr_core::paths::restrict_file(&tmp))
             .and_then(|()| std::fs::rename(&tmp, &file))
             .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
@@ -1149,40 +1170,55 @@ fn system_file(dir: &Path) -> Result<PathBuf, String> {
 struct Flight {
     hub: Arc<Inner>,
     key: (String, u64, String),
+    /// Its answer's channel: what tells it from a later call under the same key.
+    rx: tokio::sync::watch::Receiver<Option<Answer>>,
 }
 
 impl Drop for Flight {
     fn drop(&mut self) {
-        self.hub
+        let mut s = self
+            .hub
             .suggestions
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .flight
-            .remove(&self.key);
+            .unwrap_or_else(|e| e.into_inner());
+        end_flight(&mut s.flight, &self.key, &self.rx);
     }
 }
 
-/// An ask that came while the same call was in flight (`rx`): that call's answer.
+/// Ends the call in flight under `key` whose answer comes on `rx` (of suggestions or
+/// summaries): only while the entry is that call's. Once it ended (with its answer kept),
+/// another ask may have started a call under the same key, which goes on.
+pub(super) fn end_flight<K: Eq + std::hash::Hash, T>(
+    flight: &mut HashMap<K, tokio::sync::watch::Receiver<T>>,
+    key: &K,
+    rx: &tokio::sync::watch::Receiver<T>,
+) {
+    if flight.get(key).is_some_and(|f| f.same_channel(rx)) {
+        flight.remove(key);
+    }
+}
+
+/// An ask that came while the same call was in flight (`rx`): that call's answer; `None` when
+/// the call went without one (its asker hung up).
 async fn wait_for(
     mut rx: tokio::sync::watch::Receiver<Option<Answer>>,
     id: &str,
     turn: u64,
     hub: &Inner,
-) -> Value {
+) -> Option<Value> {
     let got = rx
         .wait_for(Option::is_some)
         .await
         .map(|a| a.clone())
         .ok()
         .flatten();
-    match got {
-        Some(Ok((a, rt, model))) => {
+    Some(match got? {
+        Ok((a, rt, model)) => {
             let reason = a.is_none().then_some("none");
             answer(id, turn, Some((rt, &model, a)), reason, true, hub)
         }
-        Some(Err(e)) => answer(id, turn, None, Some(&failed_reason(&e)), true, hub),
-        None => answer(id, turn, None, Some("failed"), true, hub),
-    }
+        Err(e) => answer(id, turn, None, Some(&failed_reason(&e)), true, hub),
+    })
 }
 
 /// `suggest.next`'s result; `ran`: the runtime and model that answered, and their suggestion.
@@ -1217,6 +1253,34 @@ fn answer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A call that ended (a failure, say, after which another runtime answers the next ask)
+    /// ends only its own entry: the guard dropped after a later call registered under the
+    /// same key leaves that call in flight, so asks meanwhile share it rather than start
+    /// another.
+    #[test]
+    fn a_call_that_ended_never_ends_a_later_one_under_its_key() {
+        let mut flight: HashMap<&str, tokio::sync::watch::Receiver<Option<u8>>> = HashMap::new();
+        let (first_tx, first_rx) = tokio::sync::watch::channel(None);
+        flight.insert("api", first_rx);
+        let first = first_tx.subscribe();
+        // The first call ends: its entry goes.
+        end_flight(&mut flight, &"api", &first);
+        assert!(flight.is_empty());
+        // Another ask starts a call (the fallback runtime) before the first one's guard drops.
+        let (second_tx, second_rx) = tokio::sync::watch::channel(None);
+        flight.insert("api", second_rx);
+        end_flight(&mut flight, &"api", &first);
+        assert!(
+            flight
+                .get("api")
+                .is_some_and(|rx| rx.same_channel(&second_tx.subscribe())),
+            "the later call is still in flight"
+        );
+        // It ends its own.
+        end_flight(&mut flight, &"api", &second_tx.subscribe());
+        assert!(flight.is_empty());
+    }
 
     /// A call that found a runtime unable to run leaves it out for [`DOWN_FOR`], unless a
     /// probe that ended since found it there and signed in.

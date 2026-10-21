@@ -479,6 +479,48 @@ async fn waiting_on_a_hung_turn_raises_no_other_card_for_it() {
     hub.shutdown().await;
 }
 
+/// A plain stall open when the turn turns out hung: the hung-turn card replaces it in one
+/// batch, closing it `by: timeout` with `ext.twr.superseded_by` naming the card (its activity
+/// did not resume).
+#[tokio::test]
+async fn a_hung_card_closes_the_plain_stall_it_replaces_as_superseded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path(), None);
+    o.stall_after = Some(Duration::from_millis(400));
+    let hub = Hub::open(o).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "!sleep 600000", &Caller::user("test"))
+        .unwrap();
+    until(&hub, &api, |e| e.iter().any(|e| e.kind() == "turn.started")).await;
+    let evs = until(&hub, &api, |e| !stalls(e).is_empty()).await;
+    let plain = stalls(&evs)[0].clone();
+    assert!(!is_hung_card(&plain.ext));
+    // A message of the user's then waits behind the silent turn.
+    hub.send_by(&api, "and then this", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| hung_card(e).is_some()).await;
+    let card = hung_card(&evs).unwrap();
+    let at = evs
+        .iter()
+        .position(
+            |e| matches!(&e.body, EventBody::AttentionResolved(p) if p.attn_id == plain.attn_id),
+        )
+        .expect("the plain stall is closed");
+    let EventBody::AttentionResolved(closed) = &evs[at].body else {
+        unreachable!()
+    };
+    assert_eq!(closed.by, ResolvedBy::Timeout);
+    assert_eq!(superseded_by(&closed.ext), Some(card.attn_id.as_str()));
+    assert!(!went_on(&closed.ext), "it did not go on: {closed:?}");
+    // In the card's batch, right before it.
+    assert!(
+        matches!(&evs[at + 1].body, EventBody::AttentionRaised(p) if p.attn_id == card.attn_id),
+        "{:#?}",
+        &evs[at..]
+    );
+    hub.shutdown().await;
+}
+
 /// A worker that yielded with its runtime's watcher running and a job of its own: no stall
 /// while the job runs (the watcher waits on it); once it ended, the silent watcher stalls.
 #[tokio::test]

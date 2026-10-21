@@ -69,6 +69,62 @@ pub fn is_hung_card(ext: &Option<JsonMap>) -> bool {
         .is_some_and(|v| !v.is_null())
 }
 
+/// `attention.resolved` `ext.twr` key of a plain stalled item the hub closed (`by: timeout`)
+/// because a hung-turn card took its place, in the same batch: the card's attn_id. Its
+/// thread's activity did not resume.
+pub const SUPERSEDED_BY_KEY: &str = "superseded_by";
+
+/// The item that took the place of the one an `attention.resolved` with `ext` closed
+/// ([`SUPERSEDED_BY_KEY`]), if another did.
+pub fn superseded_by(ext: &Option<JsonMap>) -> Option<&str> {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(SUPERSEDED_BY_KEY))
+        .and_then(Value::as_str)
+}
+
+/// `attention.resolved` `ext.twr` key of a stalled item the hub closed (`by: timeout`) because
+/// its thread went on working: its runtime said, did or finished something (`true`). A stall
+/// closed for anything else (the thread stopped, crashed, was interrupted or parked, its turn
+/// failed, the hub's startup found its work gone, a hung-turn card took its place, or someone's
+/// event that is no work of the thread's) has none: a client keeps showing that one.
+pub const WENT_ON_KEY: &str = "went_on";
+
+/// Whether the `attention.resolved` with `ext` closed a stall because its thread went on
+/// working ([`WENT_ON_KEY`]).
+pub fn went_on(ext: &Option<JsonMap>) -> bool {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(WENT_ON_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// `conversation.update` `ext.twr` key of a routine update the hub mirrors into the
+/// orchestrator's conversation (`twr-hub` `hub::updates`): one that tells of work going on, not
+/// of something to decide. Its value says which: [`ROUTINE_INTERIM`], [`ROUTINE_BACKGROUND_DONE`]
+/// or [`ROUTINE_AUTO_WAKE`]. A client may fold a thread's routine updates into one line (and a
+/// summary of them, `summary.thread`); the hub drops all but the newest of a thread's from the
+/// background facts it gives the orchestrator. `null`: no routine update, whatever its words
+/// say (a failed turn's report, though tasks ran on after it). Updates written before it have
+/// none.
+pub const ROUTINE_KEY: &str = "routine";
+/// [`ROUTINE_KEY`]: an interim report (its turn yielded with background tasks still running).
+pub const ROUTINE_INTERIM: &str = "interim";
+/// [`ROUTINE_KEY`]: "X background work finished."
+pub const ROUTINE_BACKGROUND_DONE: &str = "background_done";
+/// [`ROUTINE_KEY`]: the hub woke the worker after its background work, or chose not to.
+pub const ROUTINE_AUTO_WAKE: &str = "auto_wake";
+
+/// The kind of routine update a `conversation.update` with `ext` is ([`ROUTINE_KEY`]), if it
+/// is one.
+pub fn routine_of(ext: &Option<JsonMap>) -> Option<&str> {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(ROUTINE_KEY))
+        .and_then(Value::as_str)
+}
+
 /// Whether an `attention.raised` on `thread` with `ext` is a delete card ([`DELETE_KEY`]).
 pub fn is_delete_card(thread: &str, ext: &Option<JsonMap>) -> bool {
     thread == HUB_THREAD

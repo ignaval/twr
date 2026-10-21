@@ -88,21 +88,8 @@ impl AppState {
         if !self.seen.suggest_notice {
             self.suggest_due.as_ref()?;
             let notice = crate::firstrun::suggest_notice(&self.view.suggest_model);
-            let on_screen = self.view.status.as_deref() == Some(notice.as_str());
-            match &self.once {
-                // A question has the status bar: after it.
-                _ if self.view.confirm.is_some() => {}
-                // Shown, not drawn yet: wait for a frame.
-                Some((crate::firstrun::Once::SuggestNotice, _)) if on_screen => {}
-                // Shown, then replaced before a frame showed it: shown again.
-                Some((crate::firstrun::Once::SuggestNotice, _)) => {
-                    self.view.status = Some(notice);
-                }
-                // Another notice told once that a frame hasn't shown: after it, unless it was
-                // replaced meanwhile (it comes back at the next start).
-                Some((_, text)) if self.view.status.as_deref() == Some(text) => {}
-                _ => self.show_once(crate::firstrun::Once::SuggestNotice, notice),
-            }
+            let short = crate::firstrun::suggest_notice_short(&self.view.suggest_model);
+            self.wait_for_notice(crate::firstrun::Once::SuggestNotice, notice, short);
             return None;
         }
         let (thread, turn) = self.suggest_due.take()?;

@@ -11,23 +11,28 @@
 //! is later, while that prompt waits (a job's end, a message): the turn should have ended and
 //! did not (a runtime that wrote its reply and never closed the turn). Such a turn gets no
 //! plain stalled item meanwhile; it gets a distinct one, a hung-turn card ([`HUNG_KEY`]:
-//! `{turn, waiting}`), replacing an open plain one in the same batch: `"<thread>'s turn N
+//! `{turn, waiting}`), replacing an open plain one in the same batch (closed `by: timeout` with
+//! `ext.twr.superseded_by` the card's id, [`SUPERSEDED_BY_KEY`]): `"<thread>'s turn N
 //! seems hung: ..."` with the options [`HUNG_INTERRUPT`] (the turn is interrupted, as
 //! `message.send_now` does, and the prompt that waits runs next) and [`HUNG_WAIT`] (the card
 //! closes, and no other hung-turn card is raised for that turn; plain stalls go on). Only the
 //! user answers it. It notifies as `hung` (on by default, unlike `stalled`), and the
 //! orchestrator gets it as an urgent notice line (`reason=hung`).
 //!
-//! The item resolves `by: timeout` (activity resumed) as soon as another progress event is appended
-//! to that thread, including the turn's end or the runtime's closing sequence: the resolution
-//! is part of the batch that records the activity ([`Core::stall_resolutions`]), so a hub that
-//! dies in between cannot leave it open. Startup resolves any stalled item whose turn is no
-//! longer active (logs written before that). Inventory heartbeats renew task liveness without
-//! resetting stalls or repeatedly resolving and raising them. A thread has at
-//! most one open stalled item. The check runs on a hub tick every `min(30 s, stall_after / 4)`;
-//! `stall_after_secs = 0` turns it off.
+//! The item resolves `by: timeout` as soon as another progress event is appended to that
+//! thread, including the turn's end or the runtime's closing sequence: the resolution is part
+//! of the batch that records the activity ([`Core::stall_resolutions`]), so a hub that dies in
+//! between cannot leave it open. When that batch is the thread's own work going on (its
+//! runtime said, did or finished something, [`goes_on`]) and nothing in it ends that work (a
+//! stop, a crash, an interrupt, a park, a failed turn, [`ends_work`]), the resolution says so,
+//! `ext.twr.went_on` ([`WENT_ON_KEY`]): only such a stall resolved by itself (a client folds
+//! it away, and a summary's basis reads past it, [`Core::stall_went_on`]). Startup resolves
+//! any stalled item whose turn is no longer active (logs written before that), without it.
+//! Inventory heartbeats renew task liveness without resetting stalls or repeatedly resolving
+//! and raising them. A thread has at most one open stalled item. The check runs on a hub tick
+//! every `min(30 s, stall_after / 4)`; `stall_after_secs = 0` turns it off.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -63,6 +68,15 @@ pub(super) struct HungState {
     /// The turn of each thread whose card the user answered: no other card for it.
     answered: HashMap<String, u64>,
 }
+
+/// The stalls of a thread whose resolution says its work went on ([`WENT_ON_KEY`]) that are
+/// kept, the newest: more than a summary's basis reads past (`hub::summary`).
+const WENT_ON_KEPT: usize = 64;
+
+/// The plain stalls each thread went on from ([`WENT_ON_KEY`]; not a hung-turn card), folded
+/// from the log: thread -> attn_ids, oldest first, at most [`WENT_ON_KEPT`].
+#[derive(Debug, Default)]
+pub(super) struct WentOn(HashMap<String, VecDeque<String>>);
 
 /// Longest tick period.
 const TICK_MAX: Duration = Duration::from_secs(30);
@@ -154,16 +168,22 @@ impl Core {
                     format!("{} s", hung_after(after).as_secs().max(1))
                 }
             );
+            let card = new_id();
             let mut batch = Batch::default();
             if let Some(attn_id) = plain {
-                batch.push(&thread, Some(turn), Source::Hub, resolution(&attn_id));
+                // Closed for the card, not because activity resumed: it says so.
+                let mut closed = resolution(&attn_id);
+                if let EventBody::AttentionResolved(p) = &mut closed {
+                    p.ext = twr_ext_map(json!({ SUPERSEDED_BY_KEY: card }));
+                }
+                batch.push(&thread, Some(turn), Source::Hub, closed);
             }
             batch.push(
                 &thread,
                 Some(turn),
                 Source::Hub,
                 EventBody::AttentionRaised(AttentionRaised {
-                    attn_id: new_id(),
+                    attn_id: card,
                     reason: AttentionReason::Stalled,
                     summary,
                     options: vec![HUNG_INTERRUPT.into(), HUNG_WAIT.into()],
@@ -255,6 +275,17 @@ impl Core {
             }
             EventBody::AttentionResolved(p) if self.stalled.get(&ev.thread) == Some(&p.attn_id) => {
                 self.stalled.remove(&ev.thread);
+                // (A hung-turn card is never folded away: not one of them.)
+                if went_on(&p.ext) && !self.hung.cards.contains_key(&p.attn_id) {
+                    let kept = self.went_on.0.entry(ev.thread.clone()).or_default();
+                    kept.push_back(p.attn_id.clone());
+                    while kept.len() > WENT_ON_KEPT {
+                        kept.pop_front();
+                    }
+                }
+            }
+            EventBody::ThreadDeleted(_) => {
+                self.went_on.0.remove(&ev.thread);
             }
             _ => {}
         }
@@ -286,6 +317,15 @@ impl Core {
             }
             _ => {}
         }
+    }
+
+    /// Whether `attn_id` is a plain stall of `thread` that resolved because the thread went on
+    /// working ([`WENT_ON_KEY`]; one of the newest [`WENT_ON_KEPT`]).
+    pub(super) fn stall_went_on(&self, thread: &str, attn_id: &str) -> bool {
+        self.went_on
+            .0
+            .get(thread)
+            .is_some_and(|k| k.iter().any(|a| a == attn_id))
     }
 
     /// Whether `attn_id` is an open hung-turn card.
@@ -403,7 +443,9 @@ impl Core {
 
     /// The resolutions (`by: timeout`) a batch of `events` implies: activity on a thread with
     /// an open stalled item resolves it, after the batch's own events. The item's own events do
-    /// not count, and a batch that resolves the item itself needs none.
+    /// not count, and a batch that resolves the item itself needs none. A resolution says the
+    /// thread went on working ([`WENT_ON_KEY`]) when the batch has its own work going on and
+    /// nothing that ends it ([`went_on_in`]).
     pub(super) fn stall_resolutions(&self, events: &[BatchEvent]) -> Vec<BatchEvent> {
         let mut out: Vec<BatchEvent> = Vec::new();
         for ev in events {
@@ -435,12 +477,22 @@ impl Core {
             if resolved_here {
                 continue;
             }
-            let open = self.registry.get(&ev.thread).and_then(|v| v.current_turn);
+            let view = self.registry.get(&ev.thread);
+            let open = view.and_then(|v| v.current_turn);
+            // The turn was being interrupted or taken back: its end is no work going on.
+            let stopping =
+                view.is_some_and(|v| v.current_turn_interrupted || v.current_turn_withdrawn);
+            let mut body = resolution(attn_id);
+            if went_on_in(events, &ev.thread, stopping) {
+                if let EventBody::AttentionResolved(p) = &mut body {
+                    p.ext = twr_ext_map(json!({ WENT_ON_KEY: true }));
+                }
+            }
             out.push(BatchEvent {
                 thread: ev.thread.clone(),
                 turn: ev.turn.or(open),
                 source: Source::Hub,
-                body: resolution(attn_id),
+                body,
                 raw: None,
             });
         }
@@ -478,6 +530,51 @@ fn job_running(v: &ThreadView, now: DateTime<Utc>) -> bool {
     v.background_tasks
         .values()
         .any(|t| t.job && !t.shell && now - t.updated_at <= JOB_ALIVE)
+}
+
+/// Whether `events` (a batch) have `thread`'s own work going on ([`goes_on`]) and nothing that
+/// ends it ([`ends_work`]); `stopping`: its open turn was being interrupted or taken back.
+fn went_on_in(events: &[BatchEvent], thread: &str, stopping: bool) -> bool {
+    let mine = || events.iter().filter(|e| e.thread == thread);
+    !mine().any(|e| ends_work(&e.body)) && mine().any(|e| goes_on(e, stopping))
+}
+
+/// Whether `e` is the thread's own work going on: its runtime said, thought, did or finished
+/// something, asked the user (a permission, a question, a review), started a turn of its own,
+/// or one of its background tasks moved (not a heartbeat; a job's task is the hub's). Not a
+/// turn's end once it was being interrupted or taken back (`stopping`).
+fn goes_on(e: &BatchEvent, stopping: bool) -> bool {
+    if !matches!(e.source, Source::Adapter(_)) {
+        return false;
+    }
+    match &e.body {
+        EventBody::AgentText(_)
+        | EventBody::AgentToolCall(_)
+        | EventBody::AgentToolResult(_)
+        | EventBody::AgentThinking(_)
+        | EventBody::TurnStarted(_) => true,
+        EventBody::TaskUpdated(p) => !p.heartbeat,
+        EventBody::TurnEnded(p) => p.result == TurnResult::Completed && !stopping,
+        EventBody::AttentionRaised(p) => p.reason != AttentionReason::Error,
+        _ => false,
+    }
+}
+
+/// Whether `body` ends a thread's work rather than going on with it: its runtime stopped,
+/// crashed, was parked or taken over (attached), its turn was interrupted or taken back, ended
+/// otherwise than completed, or failed (an `error` item).
+fn ends_work(body: &EventBody) -> bool {
+    match body {
+        EventBody::ThreadStopped(_)
+        | EventBody::ThreadCrashed(_)
+        | EventBody::ThreadParked(_)
+        | EventBody::ThreadAttached(_)
+        | EventBody::TurnInterrupted(_)
+        | EventBody::TurnWithdrawn(_) => true,
+        EventBody::TurnEnded(p) => p.result != TurnResult::Completed,
+        EventBody::AttentionRaised(p) => p.reason == AttentionReason::Error,
+        _ => false,
+    }
 }
 
 /// Whether `body` is one of the stalled item `attn_id`'s own events.

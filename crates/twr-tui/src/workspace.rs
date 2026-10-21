@@ -266,6 +266,8 @@ pub struct SavedView {
     suggested_refs: std::collections::VecDeque<(String, i64)>,
     /// Which of its sends still to be answered were suggestions ([`AppState::sends_suggested`]).
     sends_suggested: std::collections::VecDeque<bool>,
+    /// Its threads' summaries, their pace and the hub's counts ([`crate::summary::Saved`]).
+    summary: crate::summary::Saved,
 }
 
 /// What of a [`SavedView`] waits until the replay is applied ([`AppState::finish_restore`]):
@@ -829,6 +831,9 @@ impl AppState {
                 Key::SuggestModel => "the suggestion models are set in the config file: \
                                       [tui] suggest_model"
                     .into(),
+                Key::SummaryEvery => "the summaries' pace is set in the config file: \
+                                      [tui] summary_every"
+                    .into(),
                 _ => "a hub setting: edit the config file, then restart the hub \
                       (twr hub stop, then twr)"
                     .into(),
@@ -837,6 +842,11 @@ impl AppState {
         };
         match &change {
             Change::Suggest(on) => self.toggle_suggest(Some(*on)),
+            Change::Summaries(on) => self.toggle_summaries(Some(*on)),
+            Change::Colors(mode) => {
+                self.view.color_mode = *mode;
+                self.view.colors = crate::color::resolve_env(*mode);
+            }
             Change::CardOrder(order) => {
                 self.view.card_order = *order;
                 self.view.shown_cards = None;
@@ -1229,6 +1239,7 @@ impl AppState {
         let taken_suggestion = self.taken_suggestion.take();
         let suggested_refs = std::mem::take(&mut self.suggested_refs);
         let sends_suggested = std::mem::take(&mut self.sends_suggested);
+        let summary = self.take_summaries();
         let v = &self.view;
         // Up on the input line shows a history entry (unedited): what the user had typed is
         // the line to keep.
@@ -1266,6 +1277,7 @@ impl AppState {
             taken_suggestion,
             suggested_refs,
             sends_suggested,
+            summary,
             session_history: v
                 .history
                 .iter()
@@ -1320,6 +1332,7 @@ impl AppState {
         self.taken_suggestion = saved.taken_suggestion;
         self.suggested_refs = saved.suggested_refs;
         self.sends_suggested = saved.sends_suggested;
+        self.restore_summaries(saved.summary);
         // The file's history goes before them as it is read ([`AppState::load_history`]).
         self.view.history = saved.session_history;
         self.restoring = Some(saved.restoring);

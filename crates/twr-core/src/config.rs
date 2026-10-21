@@ -89,6 +89,10 @@
 //! # The small model suggestions come from, per runtime (a string: Claude Code's). Only a
 //! # Haiku for Claude Code, a Luna (mini, nano) for Codex: a large one is never used.
 //! suggest_model = { claude-code = "claude-haiku-5-5", codex = "gpt-6-luna" }
+//! summaries = true     # the same small model writes one live line per active thread in the
+//!                      # conversation; false: routine updates fold without a model
+//! summary_every = "5m" # at most one summary per thread this often (and none when nothing changed)
+//! colors = "auto"      # auto (default) | 256 | 16 | none: the colors the TUI draws with
 //!
 //! [tui.notify]
 //! terminal = "bell"    # off (default) | bell | osc9 | osc777: how the TUI alerts its terminal
@@ -303,6 +307,53 @@ pub struct TuiConfig {
     /// The small model suggestions come from, per runtime ([`SuggestModels`]): Claude Code's
     /// `claude-haiku-5-5` and Codex's `gpt-6-luna` by default.
     pub suggest_model: SuggestModels,
+    /// Summarize what each active worker thread is doing (default `true`): its routine
+    /// updates in the orchestrator conversation fold into one live line per thread, written
+    /// by the same small model as suggestions ([`TuiConfig::suggest_model`]) under the same
+    /// rules. `false`: the line is put together without a model.
+    pub summaries: bool,
+    /// The shortest time between two summaries of one thread, as a span (`5m`, the default;
+    /// [`TuiConfig::summary_every`]). A thread whose updates did not change gets none.
+    #[serde(rename = "summary_every")]
+    pub summary_every_span: String,
+    /// The colors the TUI draws with ([`ColorMode`]).
+    pub colors: ColorMode,
+}
+
+impl TuiConfig {
+    /// `summary_every` as a duration (checked by [`Config::validate`]; 5 minutes if it is not
+    /// a span).
+    pub fn summary_every(&self) -> std::time::Duration {
+        parse_span(&self.summary_every_span).unwrap_or(DEFAULT_SUMMARY_EVERY)
+    }
+}
+
+/// The shortest time between two summaries of one thread unless `[tui] summary_every` says
+/// otherwise.
+pub const DEFAULT_SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The shortest `[tui] summary_every` there may be: a summary costs a model call.
+pub const MIN_SUMMARY_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `[tui] colors`: the colors the TUI draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ColorMode {
+    /// From the environment: none when `NO_COLOR` is set (and not empty), else 256 colors
+    /// unless `TERM` says the terminal has only 16 (`linux`, `vt100`, `xterm` without
+    /// `COLORTERM`, ...).
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    /// 256 colors (and the 16 named ones).
+    #[serde(rename = "256")]
+    Full,
+    /// The 16 named colors only: other colors are drawn as the nearest of them, and threads
+    /// have no color of their own.
+    #[serde(rename = "16")]
+    Basic,
+    /// No color: bold, dim, reverse video and the border shapes only.
+    #[serde(rename = "none")]
+    None,
 }
 
 /// The model Claude Code's suggestions come from unless `[tui] suggest_model` names another:
@@ -425,6 +476,9 @@ impl Default for TuiConfig {
             notify: TuiNotifyConfig::default(),
             suggest: true,
             suggest_model: SuggestModels::default(),
+            summaries: true,
+            summary_every_span: "5m".to_string(),
+            colors: ColorMode::Auto,
         }
     }
 }
@@ -1039,8 +1093,11 @@ impl ProjectConfig {
     }
 }
 
+/// The longest span the config may write ([`parse_span`]): ten years.
+pub const MAX_SPAN: std::time::Duration = std::time::Duration::from_secs(10 * 365 * 86400);
+
 /// A span of time as the config writes it: a whole number and its unit, `s`, `m`, `h` or `d`
-/// (`90m`, `24h`, `2d`); `None` for anything else, zero, or more than ten years.
+/// (`90m`, `24h`, `2d`); `None` for anything else, zero, or more than ten years ([`MAX_SPAN`]).
 pub fn parse_span(s: &str) -> Option<std::time::Duration> {
     let s = s.trim();
     let split = s.find(|c: char| !c.is_ascii_digit())?;
@@ -1055,7 +1112,7 @@ pub fn parse_span(s: &str) -> Option<std::time::Duration> {
     };
     let secs = n
         .checked_mul(mult)
-        .filter(|v| *v > 0 && *v <= 10 * 365 * 86400)?;
+        .filter(|v| *v > 0 && *v <= MAX_SPAN.as_secs())?;
     Some(std::time::Duration::from_secs(secs))
 }
 
@@ -1345,6 +1402,13 @@ impl Config {
         }
         for (name, b) in &self.boxes {
             b.check(name)?;
+        }
+        match parse_span(&self.tui.summary_every_span) {
+            Some(d) if d >= MIN_SUMMARY_EVERY => {}
+            _ => anyhow::bail!(
+                "tui.summary_every: {:?} is not a span of time of a minute or more (5m, 1h)",
+                self.tui.summary_every_span
+            ),
         }
         for (name, p) in &self.projects {
             if let Some(b) = &p.base {
@@ -2099,6 +2163,29 @@ mod tests {
             c.tui.suggest_model,
             models("claude-haiku-4-5", "gpt-5.6-luna")
         );
+        // Summaries: on, every 5 minutes at most; colors from the environment.
+        let c = Config::from_toml_str("[tui]\n").unwrap();
+        assert!(c.tui.summaries);
+        assert_eq!(c.tui.summary_every(), DEFAULT_SUMMARY_EVERY);
+        assert_eq!(c.tui.colors, ColorMode::Auto);
+        let c = Config::from_toml_str(
+            "[tui]\nsummaries = false\nsummary_every = \"10m\"\ncolors = \"16\"\n",
+        )
+        .unwrap();
+        assert!(!c.tui.summaries);
+        assert_eq!(c.tui.summary_every(), std::time::Duration::from_secs(600));
+        assert_eq!(c.tui.colors, ColorMode::Basic);
+        for (text, mode) in [
+            ("none", ColorMode::None),
+            ("256", ColorMode::Full),
+            ("auto", ColorMode::Auto),
+        ] {
+            let c = Config::from_toml_str(&format!("[tui]\ncolors = \"{text}\"\n")).unwrap();
+            assert_eq!(c.tui.colors, mode);
+        }
+        assert!(Config::from_toml_str("[tui]\ncolors = \"8\"\n").is_err());
+        assert!(Config::from_toml_str("[tui]\nsummary_every = \"30s\"\n").is_err());
+        assert!(Config::from_toml_str("[tui]\nsummary_every = \"soon\"\n").is_err());
         let c = Config::from_toml_str("[tui.suggest_model]\ncodex = \"gpt-6-luna\"\n").unwrap();
         assert_eq!(
             c.tui.suggest_model,

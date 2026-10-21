@@ -980,6 +980,7 @@ mod tests {
         use crate::app::Action;
         use crate::settings::{Change, Key};
         use crossterm::event::KeyCode;
+        use twr_core::config::ColorMode;
         let mut st = in_workspaces("default");
         st.view.suggest = true;
         let a = tap(&mut st, 160, 40, &Target::Settings);
@@ -993,6 +994,10 @@ mod tests {
             "settings",
             "Suggestions",
             "[tui] suggest",
+            "Summaries",
+            "[tui] summaries",
+            "Summary pace",
+            "[tui] summary_every",
             "Card order",
             "stable",
             "Notifications",
@@ -1001,6 +1006,8 @@ mod tests {
             "60 columns",
             "Workspace sidebar",
             "shown",
+            "Colors",
+            "[tui] colors",
             "Codex auto",
             "ask",
             "restart the hub",
@@ -1013,6 +1020,23 @@ mod tests {
         let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
         assert_eq!(a, vec![Action::Setting(Change::Suggest(false))]);
         assert!(!st.view.suggest);
+        // Summaries, as `/summaries` turns them; their pace is shown only.
+        st.summary.on = true;
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(a, vec![Action::Setting(Change::Summaries(false))]);
+        assert!(!st.summary.on);
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        assert!(st
+            .handle_key(crate::app::tests::key(KeyCode::Enter))
+            .is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("[tui] summary_every"));
         // A tap selects a row, a tap on the selected one changes it.
         assert!(tap(&mut st, 160, 40, &Target::Setting(Key::CardOrder)).is_empty());
         let a = tap(&mut st, 160, 40, &Target::Setting(Key::CardOrder));
@@ -1041,6 +1065,21 @@ mod tests {
         let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
         assert_eq!(a, vec![Action::WsSidebar(false)]);
         assert!(st.view.settings.is_some(), "it stays open");
+        // The colors step through auto, 256, 16 and none, and apply at once.
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        for (want, depth) in [
+            (ColorMode::Full, crate::color::Depth::Full),
+            (ColorMode::Basic, crate::color::Depth::Basic),
+            (ColorMode::None, crate::color::Depth::None),
+        ] {
+            let a = st.handle_key(crate::app::tests::key(KeyCode::Right));
+            assert_eq!(a, vec![Action::Setting(Change::Colors(want))]);
+            assert_eq!((st.view.color_mode, st.view.colors), (want, depth));
+        }
+        let r = rows(&mut st, 160, 40).join("\n");
+        assert!(r.contains("no color"), "{r}");
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Left));
+        assert_eq!(a, vec![Action::Setting(Change::Colors(ColorMode::Basic))]);
         // The hub's rows change nothing.
         st.handle_key(crate::app::tests::key(KeyCode::Down));
         assert!(st
@@ -1649,6 +1688,54 @@ mod tests {
         );
         assert_eq!(st.view.ws_scroll, 1);
         assert_eq!(st.view.settings.as_ref().unwrap().selected, 0);
+    }
+
+    /// The sidebar, its drawer, the new-workspace dialog and the settings come down to the
+    /// colors the terminal has (`[tui] colors`) with the rest of the screen: none left at
+    /// `none`, the selected card and the current workspace still told apart (reverse video);
+    /// only the 16 named colors at `16`.
+    #[test]
+    fn the_sidebar_and_its_dialogs_follow_the_colors() {
+        use ratatui::buffer::Buffer;
+        let named = |c: Color| !matches!(c, Color::Indexed(_) | Color::Rgb(..));
+        let check = |st: &mut AppState, w: u16, h: u16, case: &str| {
+            st.view.colors = crate::color::Depth::None;
+            let buf: Buffer = crate::app::tests::draw(st, w, h);
+            assert!(
+                buf.content
+                    .iter()
+                    .all(|c| c.fg == Color::Reset && c.bg == Color::Reset),
+                "{case}: a color at none"
+            );
+            assert!(
+                buf.content
+                    .iter()
+                    .any(|c| c.modifier.contains(Modifier::REVERSED)),
+                "{case}: nothing reversed"
+            );
+            st.view.colors = crate::color::Depth::Basic;
+            let buf: Buffer = crate::app::tests::draw(st, w, h);
+            assert!(
+                buf.content.iter().all(|c| named(c.fg) && named(c.bg)),
+                "{case}: a color past the 16 at 16"
+            );
+        };
+        // Docked, with the settings over the view, then the new-workspace dialog.
+        let mut st = in_workspaces("default");
+        st.open_settings();
+        check(&mut st, 160, 40, "docked, settings");
+        st.view.settings = None;
+        st.open_new_ws(None);
+        check(&mut st, 160, 40, "docked, new workspace");
+        // The drawer, a card selected with the keys.
+        let mut st = in_workspaces("default");
+        st.view.ws_drawer = true;
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+        check(&mut st, 100, 30, "drawer");
+        // The compact Workspaces screen.
+        let mut st = in_workspaces("default");
+        st.show_pane(crate::app::CompactPane::Workspaces);
+        check(&mut st, 40, 20, "compact");
     }
 
     /// A reply a stop cut short is not the orchestrator's latest reply: the card keeps the

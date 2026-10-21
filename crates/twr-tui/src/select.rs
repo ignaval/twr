@@ -295,6 +295,10 @@ pub struct Panes {
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the
     /// list keeps showing it first rather than the card now at its index.
     pub list_first: Option<String>,
+    /// The cards (and tiles) the draw measured, on each list it drew: the heights their text
+    /// takes there, from which [`crate::app::ViewState::card_fit`] keeps how tall each is
+    /// ([`crate::order::note`]).
+    pub fits: Vec<crate::order::Measure>,
     /// The action popup's rows the draw showed, whole, and what it was open on: Enter runs
     /// only one of them ([`crate::app::AppState`]'s `action_key`).
     pub popup_rows: Option<(crate::app::ActionTarget, Vec<crate::app::ActionKind>)>,
@@ -308,6 +312,9 @@ pub struct Panes {
     pub long_item: Option<String>,
     /// The controls drawn to be tapped ([`Target`]), in drawing order, none under an overlay.
     pub targets: Vec<(Rect, Target)>,
+    /// The folded rows of routine updates drawn in the orchestrator conversation, none under
+    /// an overlay: what a summary may be asked for ([`crate::summary`]).
+    pub routine: Vec<crate::summary::DrawnRun>,
 }
 
 /// The list of cards (a column, a row) or the grid of tiles as drawn: where it is and which
@@ -327,7 +334,7 @@ pub struct ListWindow {
 }
 
 /// Which list of cards: a first card (row) of one means nothing in another.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListLayout {
     /// The column of cards beside the main pane.
     Column,
@@ -397,6 +404,7 @@ impl Panes {
                 self.items.retain(|i| !i.area.intersects(a));
                 self.moving.retain(|c| !c.intersects(a));
                 self.targets.retain(|(r, _)| !r.intersects(a));
+                self.routine.retain(|r| !r.area.intersects(a));
                 if self.card.as_ref().is_some_and(|c| c.area.intersects(a)) {
                     self.card = None;
                 }
@@ -406,6 +414,7 @@ impl Panes {
                 self.items.clear();
                 self.moving.clear();
                 self.targets.clear();
+                self.routine.clear();
                 self.card = None;
             }
         }

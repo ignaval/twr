@@ -16,6 +16,7 @@
 pub mod app;
 #[cfg(test)]
 mod bench;
+pub mod color;
 pub mod config_edit;
 pub mod edit;
 pub mod firstrun;
@@ -31,6 +32,7 @@ pub mod shell;
 pub mod sidebar;
 pub mod slash;
 pub mod suggest;
+pub mod summary;
 pub mod terminal_setup;
 pub mod ui;
 pub mod workspace;
@@ -2125,6 +2127,8 @@ struct Shared {
     /// the TUI quits.
     saves: Option<std::sync::mpsc::Sender<Save>>,
     saved_rx: mpsc::UnboundedReceiver<Saved>,
+    /// `/summaries on|off`, for every workspace shown ([`crate::summary`]).
+    summaries: Option<bool>,
     /// What the TUI has told the user across runs, and where it keeps that
     /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
     seen: firstrun::Seen,
@@ -2133,10 +2137,13 @@ struct Shared {
     offer: Option<firstrun::TerminalOffer>,
     /// The suggestion asks on their way, of every workspace shown ([`Asks`]).
     asking: Asks,
+    /// The summary asks on their way, of every workspace shown ([`Asks`]).
+    summarizing: Asks,
 }
 
-/// The suggestion asks on their way (`suggest.next`, each on a connection of its own), of
-/// every workspace shown: once suggestions are off, in whichever workspace, they are aborted,
+/// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
+/// summary asks (`summary.thread`), of every workspace shown: once they are off, in whichever
+/// workspace, they are aborted,
 /// which closes their connections, and the hub drops them, before any model is asked or with
 /// the call it started.
 #[derive(Default)]
@@ -2278,10 +2285,12 @@ pub async fn run_with(
         agent,
         saves: Some(saves),
         saved_rx,
+        summaries: None,
         seen,
         seen_file,
         offer,
         asking: Asks::default(),
+        summarizing: Asks::default(),
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2343,6 +2352,7 @@ pub async fn run_with(
     // Nothing is sent once the user quit, from any workspace: no suggestion asked either.
     abort_all(&mut ctx.all_callers);
     ctx.asking.settle(false);
+    ctx.summarizing.settle(false);
 
     // Nothing reads the terminal once it is the user's again.
     drop(input);
@@ -2466,6 +2476,8 @@ async fn drive(
     state.view.orch_default = orch_default;
     state.view.mouse = carried.mouse;
     state.view.animate = ctx.tui.animate;
+    state.view.color_mode = ctx.tui.colors;
+    state.view.colors = crate::color::resolve_env(ctx.tui.colors);
     state.view.card_order = ctx.tui.card_order;
     state.view.compact_width = ctx.tui.compact_width;
     state.view.compact = ctx.compact;
@@ -2474,6 +2486,8 @@ async fn drive(
     state.view.ws_sidebar_hidden = ctx.ws_sidebar_hidden;
     state.agent = ctx.agent.clone();
     state.view.suggest_model = ctx.tui.suggest_model.clone();
+    state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
+    state.summary.every = ctx.tui.summary_every();
     state.view.picker = Picker::from_show(&show);
     state.workspace = current;
     state.set_tabs(carried.tabs);
@@ -2564,6 +2578,8 @@ async fn drive(
     // Suggestion calls' answers: each call on a connection of its own, as it takes a second
     // or more and nothing else waits for it.
     let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
+    // Summary calls' answers, by thread and ask, each call on a connection of its own too.
+    let (sum_tx, mut sum_rx) = mpsc::unbounded_channel::<(String, u64, summary::Answer)>();
 
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
@@ -2628,7 +2644,7 @@ async fn drive(
                 {
                     repaint(terminal)?;
                 }
-                // The cards' order as of now: what waited may be due.
+                // The cards' order and heights as of now: what waited may be due.
                 state.settle_order(std::time::Instant::now());
                 state.view.frame = icon::frame_at(epoch.elapsed());
                 let mut panes = select::Panes::default();
@@ -2707,6 +2723,22 @@ async fn drive(
                     let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
                 });
                 ctx.asking.add(task.abort_handle());
+            }
+            // Summaries of the routine rows the last frame drew (the activity poll's tick, every
+            // [`ACTIVITY_EVERY`], comes back here: one due later waits no longer than that).
+            ctx.summarizing.settle(state.summary.running());
+            for ask in state.take_summaries_due(std::time::Instant::now()) {
+                let (socket, tx) = (socket.clone(), sum_tx.clone());
+                let task = tokio::spawn(async move {
+                    let r = async { connect(&socket).await?.summary_thread(&ask.params).await }.await;
+                    let answer = match r {
+                        Ok(r) => summary::Answer::Got(Box::new(r)),
+                        Err(e) if e.downcast_ref::<twr_core::proto::RpcError>().is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND) => summary::Answer::Unsupported,
+                        Err(e) => summary::Answer::Failed(format!("{e:#}")),
+                    };
+                    let _ = tx.send((ask.thread, ask.id, answer));
+                });
+                ctx.summarizing.add(task.abort_handle());
             }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
@@ -2932,7 +2964,8 @@ async fn drive(
                 _ = sleep_opt(state.status_deadline()) => {
                     state.expire_status(std::time::Instant::now());
                 }
-                // A card move that waited is due, or the mouse's hold on the cards ended.
+                // A card move or a card's shrink that waited is due, or the mouse's hold on
+                // the cards ended.
                 _ = sleep_opt(state.order_deadline(std::time::Instant::now())) => {
                     state.settle_order(std::time::Instant::now());
                 }
@@ -2945,6 +2978,9 @@ async fn drive(
                     state.expire_unsend(std::time::Instant::now());
                 }
                 Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
+                Some((thread, ask, answer)) = sum_rx.recv() => {
+                    state.summary_result(&thread, ask, answer, std::time::Instant::now());
+                }
                 Some((attn, revision, r)) = hyd_rx.recv() => {
                     state.hydrated(&attn, revision, r, std::time::Instant::now());
                 }
@@ -3132,6 +3168,8 @@ async fn drive(
     ctx.tui.card_order = state.view.card_order;
     ctx.tui.compact_width = state.view.compact_width;
     ctx.tui.notify.terminal = state.view.notify_terminal;
+    ctx.tui.colors = state.view.color_mode;
+    ctx.summaries = Some(state.summary.on);
     save_seen(&mut state, ctx.seen_file.as_deref());
     ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
