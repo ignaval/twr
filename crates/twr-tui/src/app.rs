@@ -318,6 +318,9 @@ pub struct ViewState {
     pub ws_sel: Option<WsRow>,
     /// Rows the workspace list is scrolled by the wheel.
     pub ws_scroll: usize,
+    /// The tab of the strip a press under a modal overlay went down on, as drawn then: its
+    /// release switches only to that one.
+    pub pressed_tab: Option<String>,
     /// The wheel scrolled the workspace list last: it stays where the wheel left it, rather
     /// than showing the selected card, until a key moves the selection.
     pub ws_wheeled: bool,
@@ -1013,6 +1016,10 @@ pub enum Action {
     },
 }
 
+/// How much of a reply a transcript keeps as its latest ([`Transcript::last_reply`]): more
+/// than two rows of a card ever show.
+pub const LAST_REPLY_CHARS: usize = 600;
+
 /// One rendered unit of a thread's transcript.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
@@ -1168,9 +1175,9 @@ pub struct Transcript {
     /// `thread.model_changed` that moved it): what a handoff marker names. `None` until one
     /// did (the transcript replays only the latest events).
     pub runtime: Option<String>,
-    /// The text of the latest final reply (a final `agent.text`) applied: what the workspace
-    /// sidebar shows of the orchestrator's last reply. A text a stop or crash cut short is
-    /// never one.
+    /// The start of the latest final reply (a final `agent.text`) applied, up to
+    /// [`LAST_REPLY_CHARS`]: what the workspace sidebar shows of the orchestrator's last reply.
+    /// A text a stop or crash cut short is never one.
     pub last_reply: Option<String>,
 }
 
@@ -1279,7 +1286,8 @@ impl Transcript {
                     }),
                 }
                 if p.is_final && !p.text.trim().is_empty() {
-                    self.last_reply = Some(p.text.clone());
+                    // Its start only: a card shows two rows of it.
+                    self.last_reply = Some(p.text.chars().take(LAST_REPLY_CHARS).collect());
                 }
                 if capped && p.is_final {
                     self.notice(
@@ -6789,9 +6797,17 @@ impl AppState {
         // (their rows) and the new-workspace dialog.
         if self.picker_open() || self.view.settings.is_some() || self.view.new_ws.is_some() {
             match ev.kind {
-                MouseEventKind::Down(MouseButton::Left) => self.press(x, y),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.press(x, y);
+                    // The tab under the press, as drawn then: a frame drawn before the
+                    // release may put another there.
+                    self.view.pressed_tab = match self.view.panes.at(x, y).map(|p| &p.id) {
+                        Some(PaneId::Tab(name)) => Some(name.clone()),
+                        _ => None,
+                    };
+                }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    let pressed = self.view.press.as_ref().map(|p| (p.0, p.1));
+                    let pressed = self.view.pressed_tab.take();
                     let (click, target) = self.tapped(x, y);
                     match (click, target) {
                         // A workspace's card in the docked sidebar, which it does not cover,
@@ -6803,17 +6819,12 @@ impl AppState {
                         (_, Some(t)) => return self.tap(t),
                         (_, None) => {}
                     }
-                    // A tab, tapped: pressed and released on it as drawn.
-                    let tab = |at: Option<(u16, u16)>| {
-                        at.and_then(|(x, y)| self.view.panes.at(x, y))
-                            .and_then(|p| match &p.id {
-                                PaneId::Tab(name) => Some(name.clone()),
-                                _ => None,
-                            })
+                    // A tab, tapped: pressed and released on it, the same tab as drawn at each.
+                    let released = match self.view.panes.at(x, y).map(|p| &p.id) {
+                        Some(PaneId::Tab(name)) => Some(name.clone()),
+                        _ => None,
                     };
-                    if let Some(name) =
-                        tab(Some((x, y))).filter(|n| click && tab(pressed).as_ref() == Some(n))
-                    {
+                    if let Some(name) = released.filter(|n| click && pressed.as_ref() == Some(n)) {
                         return self.switch_workspace(&name);
                     }
                 }

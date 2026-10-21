@@ -11,10 +11,11 @@
 //! that twr itself would refuse) is refused with a short reason the TUI shows, so the user
 //! edits it by hand instead.
 //!
-//! [`write_key`] puts the result on disk through a temporary file renamed over the old one
-//! (a crash leaves the old file or the new one), keeping the file's permissions, editing what
-//! a symbolic link names rather than replacing the link, and refusing when the file changed
-//! between the read and the rename.
+//! [`write_key`] writes the result into the file itself ([`rewrite`]): it stays the same
+//! file, so who may read it (owner, group, mode, ACLs) and its links stay as they were, and a
+//! symbolic link's target is what is edited. The file is locked from the read to the write, so
+//! two TUIs' edits never lose one another, and it is left alone when an editor changed it
+//! meanwhile.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -353,7 +354,7 @@ pub fn set_key(text: &str, table: &[&str], key: &str, value: &Scalar) -> Result<
 /// file is missing, not a regular file or does not parse), for the settings view to show what
 /// the file says. A FIFO in its place is not waited on.
 pub fn read_key(path: &Path, table: &[&str], key: &str) -> Option<toml::Value> {
-    let (bytes, _) = read_plain(&std::fs::canonicalize(path).ok()?).ok()?;
+    let bytes = read_plain(&std::fs::canonicalize(path).ok()?).ok()?;
     let doc: toml::Table = std::str::from_utf8(&bytes).ok()?.parse().ok()?;
     match find_table(&doc, table) {
         Found::Table(t) => t.get(key).cloned(),
@@ -362,20 +363,20 @@ pub fn read_key(path: &Path, table: &[&str], key: &str) -> Option<toml::Value> {
 }
 
 /// Reads the file at `path` (missing = empty), applies [`set_key`], and writes the result
-/// back safely ([`replace`]); a missing file is created private to the user (0600, in a
+/// back safely ([`rewrite`]); a missing file is created private to the user (0600, in a
 /// private directory). Returns why not when it did not.
 pub fn write_key(path: &Path, table: &[&str], key: &str, value: &Scalar) -> Result<(), String> {
     write_key_with(path, table, key, value, |_| {})
 }
 
-/// [`write_key`], calling `before_swap` with the file's path once the new text is ready and
-/// before the file is checked for a change and replaced (tests change the file there).
+/// [`write_key`], calling `before_write` with the file's path once the new text is ready and
+/// before the file is checked for a change and written (tests change the file there).
 fn write_key_with(
     path: &Path,
     table: &[&str],
     key: &str,
     value: &Scalar,
-    before_swap: impl FnOnce(&Path),
+    before_write: impl FnOnce(&Path),
 ) -> Result<(), String> {
     let file = match std::fs::canonicalize(path) {
         // What a symbolic link names: the link stays.
@@ -390,32 +391,25 @@ fn write_key_with(
                     .map_err(|e| format!("creating the config directory: {e}"))?;
             }
             let new = set_key("", table, key, value)?;
-            return create(path, &new, before_swap);
+            return create(path, &new, before_write);
         }
         Err(e) => return Err(format!("reading config.toml: {e}")),
     };
-    let (old, perm) = read_plain(&file)?;
-    let text = String::from_utf8(old.clone())
-        .map_err(|_| "config.toml is not utf-8: edit it by hand".to_string())?;
-    let new = set_key(&text, table, key, value)?;
-    if new == text {
-        return Ok(());
-    }
-    replace(&file, &old, &new, perm, before_swap)
+    rewrite(&file, table, key, value, before_write)
 }
 
-/// Who may read a file: its permission bits and, for one that exists, its owner and group.
-#[derive(Debug, Clone, Copy)]
-struct Perm {
-    mode: u32,
-    owner: Option<(u32, u32)>,
+/// The bytes of `file`, read without following a link or waiting on a FIFO put in its place.
+fn read_plain(file: &Path) -> Result<Vec<u8>, String> {
+    let mut f = open_plain(file, false)?;
+    read_all(&mut f)
 }
 
-/// The bytes of `file`, its permission bits, owner and group, read without following a link or
-/// waiting on a FIFO put in its place.
-fn read_plain(file: &Path) -> Result<(Vec<u8>, Perm), String> {
-    let mut f = std::fs::OpenOptions::new()
+/// `file` opened (for writing too, with `write`), never through a link nor waiting on a FIFO
+/// put in its place; only a regular file.
+fn open_plain(file: &Path, write: bool) -> Result<std::fs::File, String> {
+    let f = std::fs::OpenOptions::new()
         .read(true)
+        .write(write)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(file)
         .map_err(|e| format!("reading config.toml: {e}"))?;
@@ -425,32 +419,76 @@ fn read_plain(file: &Path) -> Result<(Vec<u8>, Perm), String> {
     if !meta.is_file() {
         return Err("config.toml is not a regular file: edit it by hand".into());
     }
-    let mut bytes = Vec::new();
-    f.read_to_end(&mut bytes)
-        .map_err(|e| format!("reading config.toml: {e}"))?;
-    use std::os::unix::fs::MetadataExt;
-    Ok((
-        bytes,
-        Perm {
-            mode: meta.permissions().mode() & 0o7777,
-            owner: Some((meta.uid(), meta.gid())),
-        },
-    ))
+    Ok(f)
 }
 
-/// A temporary file beside the config, removed when dropped unless [`Temp::keep`] said it was
-/// renamed or linked into place.
+/// What `f` holds, from its start.
+fn read_all(f: &mut std::fs::File) -> Result<Vec<u8>, String> {
+    use std::io::Seek;
+    let mut bytes = Vec::new();
+    f.rewind()
+        .and_then(|()| f.read_to_end(&mut bytes))
+        .map_err(|e| format!("reading config.toml: {e}"))?;
+    Ok(bytes)
+}
+
+/// Sets `table.key` in `file` ([`set_key`]), in place: the file stays the same file, so its
+/// owner, group, mode, ACLs, extended attributes and hard links stay what they were, whatever
+/// they are, and no copy of it ever exists that others could read. It is locked (`flock`) from
+/// the read to the end of the write, so another TUI's edit waits and then reads this one's
+/// result: neither is lost. An editor takes no lock: the file is read again just before it is
+/// written, and left alone when it changed. While the new text is written, a copy of the old
+/// one, private to the user (0600), waits beside it, removed once the file is on disk: what a
+/// crash in between leaves to restore it from.
+fn rewrite(
+    file: &Path,
+    table: &[&str],
+    key: &str,
+    value: &Scalar,
+    before_write: impl FnOnce(&Path),
+) -> Result<(), String> {
+    use std::io::Seek;
+    let mut f = open_plain(file, true)?;
+    f.lock().map_err(|e| format!("locking config.toml: {e}"))?;
+    let old = read_all(&mut f)?;
+    let text = String::from_utf8(old.clone())
+        .map_err(|_| "config.toml is not utf-8: edit it by hand".to_string())?;
+    let new = set_key(&text, table, key, value)?;
+    if new == text {
+        return Ok(());
+    }
+    let backup = Temp::write(dir_of(file), file.file_name().unwrap_or_default(), &text)?;
+    before_write(file);
+    if read_all(&mut f)? != old {
+        return Err("config.toml changed meanwhile: try again".into());
+    }
+    let len = u64::try_from(new.len()).unwrap_or(u64::MAX);
+    f.rewind()
+        .and_then(|()| f.write_all(new.as_bytes()))
+        .and_then(|()| f.set_len(len))
+        .and_then(|()| f.sync_all())
+        .map_err(|e| {
+            format!(
+                "writing config.toml: {e} (its old text is in {})",
+                backup.path.display()
+            )
+        })
+        .inspect_err(|_| backup.keep())?;
+    drop(backup);
+    Ok(())
+}
+
+/// A temporary file beside the config, private to the user, removed when dropped unless
+/// [`Temp::keep`] said it is still needed.
 struct Temp {
     path: PathBuf,
-    keep: bool,
+    keep: std::cell::Cell<bool>,
 }
 
 impl Temp {
     /// Creates a new temporary file in `dir` (never through a link, never over a file that is
-    /// there) with the owner, group and mode of `perm`, holding `text`, flushed to disk. A new
-    /// file gets the process's group (or the directory's): one whose group or owner can't be
-    /// made the old file's is refused, as its mode alone would then let other people read it.
-    fn write(dir: &Path, name: &std::ffi::OsStr, text: &str, perm: Perm) -> Result<Temp, String> {
+    /// there) with mode 0600, holding `text`, flushed to disk.
+    fn write(dir: &Path, name: &std::ffi::OsStr, text: &str) -> Result<Temp, String> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -464,41 +502,31 @@ impl Temp {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
-            .map_err(|e| format!("writing config.toml: {e}"))?;
-        let temp = Temp { path, keep: false };
-        if let Some((uid, gid)) = perm.owner {
-            use std::os::unix::fs::MetadataExt;
-            let meta = f
-                .metadata()
-                .map_err(|e| format!("writing config.toml: {e}"))?;
-            if (meta.uid(), meta.gid()) != (uid, gid)
-                && std::os::unix::fs::fchown(&f, Some(uid), Some(gid)).is_err()
-            {
-                return Err(
-                    "config.toml's owner or group can't be kept on a new copy: edit it by hand"
-                        .into(),
-                );
-            }
-        }
+            .map_err(|e| format!("writing a copy of config.toml beside it: {e}"))?;
+        let temp = Temp {
+            path,
+            keep: std::cell::Cell::new(false),
+        };
         let written = (|| {
             // Set on the descriptor, whatever the umask took off at creation.
-            f.set_permissions(std::fs::Permissions::from_mode(perm.mode))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             f.write_all(text.as_bytes())?;
             f.sync_all()
         })();
-        written.map_err(|e| format!("writing config.toml: {e}"))?;
+        written.map_err(|e| format!("writing a copy of config.toml beside it: {e}"))?;
         Ok(temp)
     }
 
-    /// Marks the file as moved into place: dropping it no longer removes it.
-    fn keep(mut self) {
-        self.keep = true;
+    /// Marks the file as still needed (it holds what a failed write lost): dropping it no
+    /// longer removes it.
+    fn keep(&self) {
+        self.keep.set(true);
     }
 }
 
 impl Drop for Temp {
     fn drop(&mut self) {
-        if !self.keep {
+        if !self.keep.get() {
             let _ = std::fs::remove_file(&self.path);
         }
     }
@@ -511,50 +539,21 @@ fn dir_of(file: &Path) -> &Path {
         .unwrap_or(Path::new("."))
 }
 
-/// Flushes `dir`'s entries to disk, so a rename in it survives a crash. Best effort: the file
-/// is in place already when this runs, and a directory some systems do not let one sync is no
-/// reason to report the edit failed.
+/// Flushes `dir`'s entries to disk, so a link made in it survives a crash. Best effort: the
+/// file is in place already when this runs, and a directory some systems do not let one sync
+/// is no reason to report the edit failed.
 fn sync_dir(dir: &Path) {
     if let Ok(d) = std::fs::File::open(dir) {
         let _ = d.sync_all();
     }
 }
 
-/// Replaces `file`, which held `old` with the owner, group and permission bits `perm`, by
-/// `new`: a temporary file beside it, renamed over it once `file` is seen to still hold exactly
-/// `old`.
-fn replace(
-    file: &Path,
-    old: &[u8],
-    new: &str,
-    perm: Perm,
-    before_swap: impl FnOnce(&Path),
-) -> Result<(), String> {
-    let dir = dir_of(file);
-    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, perm)?;
-    before_swap(file);
-    // Its bytes, owner, group and mode as read before: a file tightened meanwhile (made
-    // 0600, say) is not loosened back by the copy.
-    let (now, perm_now) = read_plain(file)?;
-    if now != old || perm_now.mode != perm.mode || perm_now.owner != perm.owner {
-        return Err("config.toml changed meanwhile: try again".into());
-    }
-    std::fs::rename(&temp.path, file).map_err(|e| format!("writing config.toml: {e}"))?;
-    temp.keep();
-    sync_dir(dir);
-    Ok(())
-}
-
 /// Creates `file`, missing until now, holding `new` with mode 0600: a temporary file beside it,
 /// linked into place (which fails, rather than replaces, when a file appeared there meanwhile).
-fn create(file: &Path, new: &str, before_swap: impl FnOnce(&Path)) -> Result<(), String> {
+fn create(file: &Path, new: &str, before_write: impl FnOnce(&Path)) -> Result<(), String> {
     let dir = dir_of(file);
-    let perm = Perm {
-        mode: 0o600,
-        owner: None,
-    };
-    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new, perm)?;
-    before_swap(file);
+    let temp = Temp::write(dir, file.file_name().unwrap_or_default(), new)?;
+    before_write(file);
     match std::fs::hard_link(&temp.path, file) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -914,18 +913,54 @@ terminal = \"bell\"
         assert!(!dir.path().join("gone").exists());
     }
 
-    /// A file tightened meanwhile (its bytes the same) is not loosened back by the copy.
+    /// The file stays the same file: a mode tightened meanwhile stays, a hard link sees the
+    /// edit, and so would its ACLs and extended attributes (nothing is copied over it).
     #[test]
-    fn a_mode_changed_meanwhile_is_not_overwritten() {
-        let (_dir, file) = dir_with(SAMPLE);
+    fn the_file_is_edited_in_place() {
+        let (dir, file) = dir_with(SAMPLE);
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
-        let err = write_key_with(&file, &["tui"], "mouse", &Scalar::Bool(false), |f| {
+        let link = dir.path().join("hard");
+        std::fs::hard_link(&file, &link).unwrap();
+        let inode = std::fs::metadata(&file).unwrap().ino();
+        write_key_with(&file, &["tui"], "mouse", &Scalar::Bool(false), |f| {
             std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o600)).unwrap();
         })
-        .unwrap_err();
-        assert_eq!(err, "config.toml changed meanwhile: try again");
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), SAMPLE);
-        assert_eq!(std::fs::metadata(&file).unwrap().mode() & 0o7777, 0o600);
+        .unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!((meta.ino(), meta.mode() & 0o7777), (inode, 0o600));
+        let text = std::fs::read_to_string(&link).unwrap();
+        assert!(text.contains("mouse = false"), "{text}");
+        assert_eq!(
+            names(dir.path()),
+            vec!["config.toml", "hard"],
+            "no copy left"
+        );
+    }
+
+    /// Two TUIs editing at once both land: the lock makes the second read the first's result.
+    #[test]
+    fn concurrent_edits_are_both_kept() {
+        let (_dir, file) = dir_with(SAMPLE);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let run = |key: &'static str, values: Vec<Scalar>| {
+            let (file, barrier) = (file.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                for v in &values {
+                    write_key(&file, &["tui"], key, v).unwrap();
+                }
+            })
+        };
+        let a = run("mouse", (0..30).map(|i| Scalar::Bool(i % 2 == 1)).collect());
+        let b = run(
+            "compact_width",
+            (0..30).map(|i| Scalar::Int(40 + i)).collect(),
+        );
+        a.join().unwrap();
+        b.join().unwrap();
+        let doc: toml::Table = std::fs::read_to_string(&file).unwrap().parse().unwrap();
+        assert_eq!(doc["tui"]["mouse"], toml::Value::Boolean(true));
+        assert_eq!(doc["tui"]["compact_width"], toml::Value::Integer(69));
     }
 
     #[test]

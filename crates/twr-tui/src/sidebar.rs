@@ -366,7 +366,8 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
     if width == 0 || max == 0 {
         return Vec::new();
     }
-    let words: Vec<String> = text
+    // Lazily: only the words the rows take (and one more, to know whether to cut) are read.
+    let mut words = text
         .lines()
         .map(str::trim)
         .filter(|l| {
@@ -376,39 +377,37 @@ pub fn preview_rows(text: &str, width: usize, max: usize) -> Vec<String> {
         .flat_map(str::split_whitespace)
         .map(|w| w.replace("**", "").replace('`', ""))
         .filter(|w| !w.is_empty())
-        .collect();
+        .peekable();
     let mut rows: Vec<String> = Vec::new();
     let mut row = String::new();
     let mut cut = false;
-    for (i, word) in words.iter().enumerate() {
-        let w = crate::edit::width(word);
-        let used = crate::edit::width(&row);
+    while let Some(word) = words.next() {
+        let w = crate::edit::width(&word);
         if row.is_empty() {
-            row = crate::ui::truncate_cells(word, width);
+            row = crate::ui::truncate_cells(&word, width);
             if w > width && rows.len() + 1 == max {
-                cut = i + 1 < words.len() || w > width;
+                cut = true;
                 break;
             }
-        } else if used + 1 + w <= width {
+        } else if crate::edit::width(&row) + 1 + w <= width {
             row.push(' ');
-            row.push_str(word);
+            row.push_str(&word);
         } else {
             rows.push(std::mem::take(&mut row));
             if rows.len() == max {
                 cut = true;
                 break;
             }
-            row = crate::ui::truncate_cells(word, width);
+            row = crate::ui::truncate_cells(&word, width);
         }
     }
     if !row.is_empty() && rows.len() < max {
         rows.push(row);
     }
-    if cut {
+    if cut || words.peek().is_some() && rows.len() == max {
         if let Some(last) = rows.last_mut().filter(|l| !l.ends_with('…')) {
-            let keep = width.saturating_sub(1);
-            let mut s = crate::ui::truncate_cells(last, keep);
-            // (`truncate` ends what it cut with `…` itself.)
+            let mut s = crate::ui::truncate_cells(last, width.saturating_sub(1));
+            // (`truncate_cells` ends what it cut with `…` itself.)
             if !s.ends_with('…') {
                 s.push('…');
             }
@@ -1247,6 +1246,47 @@ mod tests {
         assert!(workspace_action(&a).is_none());
         let a = tap_at(&mut st, 110, 30, tab.x + 1, tab.y);
         assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+    }
+
+    /// Under the settings, a tab that moved under the finger between the press and the
+    /// release (a redraw in between) is not switched to: only the tab pressed is.
+    #[test]
+    fn a_tab_moved_under_the_finger_is_not_switched_to() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        st.open_settings();
+        rows(&mut st, 110, 30);
+        let tab = st
+            .view
+            .panes
+            .panes
+            .iter()
+            .find(|p| p.id == PaneId::Tab("scratch".into()))
+            .unwrap()
+            .area;
+        let ev = |kind| MouseEvent {
+            kind,
+            column: tab.x + 1,
+            row: tab.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let screen = crate::app::tests::draw(&mut st, 110, 30);
+        st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left)), &screen);
+        // `scratch` is gone: `docs` is drawn where it was.
+        let tabs: Vec<Tab> = st
+            .tabs
+            .iter()
+            .filter(|t| t.name != "scratch")
+            .cloned()
+            .collect();
+        st.set_tabs(tabs);
+        let screen = crate::app::tests::draw(&mut st, 110, 30);
+        assert_eq!(
+            st.view.panes.at(tab.x + 1, tab.y).map(|p| p.id.clone()),
+            Some(PaneId::Tab("docs".into()))
+        );
+        let a = st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen);
+        assert!(workspace_action(&a).is_none());
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
