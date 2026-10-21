@@ -2293,6 +2293,9 @@ pub struct AppState {
     /// The thread's agent this TUI runs for, if it does: it creates no workspace and
     /// changes no setting (the CLI refuses an agent's workspace too).
     pub agent: Option<String>,
+    /// The control stream ended ([`AppState::control_ended`]): what the view holds of its hub
+    /// is no longer news (its workspace's card goes by the polls then).
+    pub control_lost: bool,
     /// The workspace being opened, until it is shown or fails.
     pub switching: Option<String>,
     /// What of a view kept for this workspace waits until the replay is applied
@@ -2408,6 +2411,7 @@ impl AppState {
     /// so a view kept for this workspace is restored with what was applied, and the answers to
     /// its messages that waited for that are applied ([`AppState::finish_restore`]).
     pub fn control_ended(&mut self) {
+        self.control_lost = true;
         self.catch_up = None;
         self.finish_restore();
     }

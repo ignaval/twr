@@ -230,14 +230,13 @@ pub fn render_list(
     frame.render_widget(Paragraph::new(lines), buttons);
 }
 
-/// Whether workspace `name`'s card shows that something there works.
+/// Whether workspace `name`'s card shows that something there works (its icon moves): its
+/// hub runs, as [`card_lines`] has it.
 fn tab_active(state: &AppState, name: &str) -> bool {
-    state
-        .tabs
-        .iter()
-        .find(|t| t.name == name)
-        .and_then(|t| state.tab_glance(t))
-        .is_some_and(|g| g.active)
+    state.tabs.iter().find(|t| t.name == name).is_some_and(|t| {
+        matches!(state.tab_hub(t), TabHub::Running { .. })
+            && state.tab_glance(t).is_some_and(|g| g.active)
+    })
 }
 
 /// Workspace `tab`'s card, `width` columns wide, [`CARD_ROWS`] rows: its name with the icon
@@ -1367,6 +1366,73 @@ mod tests {
         assert!(!st.tab_glance(&tab).unwrap().active);
         let r = rows(&mut st, 160, 40).join("\n");
         assert!(r.contains("○ default") && r.contains("last words"), "{r}");
+    }
+
+    /// The control stream lost (the hub stopped or restarted under the view): the current
+    /// card goes by the polls, keeping the newest reply the conversation had while no hub
+    /// answers; a stopped card's icon does not move, whatever its last glance said.
+    #[test]
+    fn a_lost_current_hub_goes_by_the_polls() {
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = crate::app::Transcript::new(orch.clone());
+        t.settle();
+        let mut o = twr_core::testkit::ThreadScript::new(orch);
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("reply B"));
+        st.transcript = Some(t);
+        let mut tabs = st.tabs.clone();
+        tabs[0].hub = TabHub::Busy;
+        tabs[0].glance = Some(Glance {
+            active: true,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Running,
+                preview: Some("reply A".into()),
+            }),
+        });
+        st.set_tabs(tabs);
+        st.control_ended();
+        let tab = st.tabs[0].clone();
+        assert_eq!(st.tab_hub(&tab), TabHub::Busy);
+        let g = st.tab_glance(&tab).unwrap();
+        assert!(!g.active);
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("reply B"));
+        // Restarted: the hub answers again, and says what is current.
+        let mut tabs = st.tabs.clone();
+        tabs[0].hub = TabHub::Running {
+            threads: 0,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        tabs[0].glance = Some(Glance {
+            active: false,
+            orch: Some(OrchGlance {
+                status: ThreadStatus::Idle,
+                preview: Some("reply C".into()),
+            }),
+        });
+        st.set_tabs(tabs);
+        let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
+        assert_eq!(g.orch.unwrap().preview.as_deref(), Some("reply C"));
+        // A stopped card whose last glance was active keeps no clock ticking.
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        tabs[1].hub = TabHub::Stopped;
+        st.set_tabs(tabs);
+        assert!(st.tabs[1].glance.as_ref().unwrap().active);
+        st.view.animate = true;
+        rows(&mut st, 160, 40);
+        let dock = Rect::new(0, 0, DOCK_WIDTH, 40);
+        assert!(
+            st.view
+                .panes
+                .moving
+                .iter()
+                .all(|c| !c.intersects(dock) || c.y < 5),
+            "{:?}",
+            st.view.panes.moving
+        );
     }
 
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.

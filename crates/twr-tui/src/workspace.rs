@@ -884,9 +884,7 @@ impl AppState {
     /// What tab `tab` shows: the current workspace's hub as the state has it now, the
     /// others as last asked.
     pub fn tab_hub(&self, tab: &Tab) -> TabHub {
-        // This workspace's own hub too, once a poll found it gone: what the view holds of it
-        // is no longer news.
-        if self.workspace.as_deref() != Some(tab.name.as_str()) || tab.hub == TabHub::Stopped {
+        if !self.shows_live(tab) {
             return tab.hub;
         }
         let workers: Vec<_> = self
@@ -957,13 +955,40 @@ impl AppState {
         self.set_tabs(tabs);
     }
 
+    /// Whether workspace `tab`'s card comes from the view itself: the current workspace while
+    /// its control stream runs and no poll found its hub gone. Otherwise what the view holds
+    /// of it is no longer news (its hub stopped, or restarted under it).
+    fn shows_live(&self, tab: &Tab) -> bool {
+        self.workspace.as_deref() == Some(tab.name.as_str())
+            && !self.control_lost
+            && tab.hub != TabHub::Stopped
+    }
+
     /// What workspace `tab`'s card says of its orchestrator and its work: the current
     /// workspace's from the state itself (its orchestrator's latest reply from its
     /// conversation while the main pane shows it, else as its hub last said it), the others'
     /// as their hubs last said.
     pub fn tab_glance(&self, tab: &Tab) -> Option<Glance> {
-        if self.workspace.as_deref() != Some(tab.name.as_str()) || tab.hub == TabHub::Stopped {
+        if self.workspace.as_deref() != Some(tab.name.as_str()) {
             return tab.glance.clone();
+        }
+        if !self.shows_live(tab) {
+            // A hub that answers (restarted since) says what is current; one that does not
+            // leaves the newest reply known, which the conversation may have had after the
+            // last poll, and nothing working.
+            if matches!(tab.hub, TabHub::Running { .. }) {
+                return tab.glance.clone();
+            }
+            let mut g = tab.glance.clone().unwrap_or_default();
+            g.active = false;
+            if let Some(o) = self.orchestrator() {
+                let preview = self
+                    .latest_reply(&o.id)
+                    .or_else(|| g.orch.as_ref().and_then(|p| p.preview.clone()));
+                let status = g.orch.as_ref().map_or(o.status(), |p| p.status);
+                g.orch = Some(OrchGlance { status, preview });
+            }
+            return Some(g);
         }
         let threads = self.registry.list();
         let active = threads.iter().any(|t| {
