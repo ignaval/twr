@@ -1485,6 +1485,42 @@ mod tests {
         assert_eq!(preview(&st), "reply B");
     }
 
+    /// A reply the conversation showed after the last poll stays on the card once the view is
+    /// left, and when that hub then stops before a poll caught up.
+    #[test]
+    fn a_live_reply_stays_on_the_card_after_a_switch() {
+        let mut st = in_workspaces("default");
+        let orch = st.orchestrator().unwrap().id.clone();
+        let mut t = crate::app::Transcript::new(orch.clone());
+        t.settle();
+        let mut o = twr_core::testkit::ThreadScript::new(orch.clone());
+        t.apply(&o.turn_started("hi"));
+        t.apply(&o.text("reply B"));
+        let b = t.last_reply.as_ref().unwrap().0;
+        st.transcript = Some(t);
+        st.tabs[0].glance = Some(Glance {
+            active: true,
+            orch: Some(OrchGlance {
+                id: Some(orch.clone()),
+                preview_seq: Some(b - 1),
+                status: ThreadStatus::Running,
+                preview: Some("reply A".into()),
+            }),
+        });
+        st.keep_live_glance();
+        // In the next view (another workspace), its card is the tab as kept.
+        let mut next = in_workspaces("client-x");
+        next.set_tabs(st.tabs.clone());
+        next.tabs[0].hub = TabHub::Stopped;
+        let g = next.tab_glance(&next.tabs[0].clone()).unwrap();
+        let o = g.orch.unwrap();
+        assert_eq!(
+            (o.preview.as_deref(), o.preview_seq),
+            (Some("reply B"), Some(b))
+        );
+        assert!(!g.active);
+    }
+
     /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
     #[test]
     fn ctrl_t_leaves_the_compact_decisions_for_the_workspaces() {

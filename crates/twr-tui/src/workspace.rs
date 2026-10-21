@@ -995,14 +995,18 @@ impl AppState {
             g.active = false;
             if let Some(o) = self.orchestrator() {
                 let polled = g.orch.clone();
-                let preview = self.newest_reply(&o.id, polled.as_ref(), true);
+                let (preview, preview_seq) = self.newest_reply(&o.id, polled.as_ref(), true);
                 g.orch = Some(match polled {
-                    Some(p) => OrchGlance { preview, ..p },
+                    Some(p) => OrchGlance {
+                        preview,
+                        preview_seq,
+                        ..p
+                    },
                     None => OrchGlance {
                         id: Some(o.id.clone()),
                         status: o.status(),
                         preview,
-                        ..Default::default()
+                        preview_seq,
                     },
                 });
             }
@@ -1015,16 +1019,38 @@ impl AppState {
                 && ((t.current_turn.is_some() && !t.is_blocked()) || t.own_background())
         });
         let polled = tab.glance.as_ref().and_then(|g| g.orch.as_ref());
-        let orch = self.orchestrator().map(|o| OrchGlance {
-            id: Some(o.id.clone()),
-            preview_seq: None,
-            status: o.status(),
-            preview: self.newest_reply(&o.id, polled, false),
+        let orch = self.orchestrator().map(|o| {
+            let (preview, preview_seq) = self.newest_reply(&o.id, polled, false);
+            OrchGlance {
+                id: Some(o.id.clone()),
+                preview_seq,
+                status: o.status(),
+                preview,
+            }
         });
         Some(Glance { active, orch })
     }
 
-    /// The newest reply known of orchestrator `id`: the conversation's ([`Transcript::last_reply`],
+    /// Keeps what the current workspace's card shows ([`AppState::tab_glance`]) as its tab's
+    /// last glance, as this view is left: a reply the conversation showed after the last poll
+    /// stays on its card from another workspace, and once its hub stops.
+    pub fn keep_live_glance(&mut self) {
+        let Some(at) = self
+            .tabs
+            .iter()
+            .position(|t| self.workspace.as_deref() == Some(t.name.as_str()))
+        else {
+            return;
+        };
+        let tab = self.tabs[at].clone();
+        if let Some(mut g) = self.tab_glance(&tab) {
+            // Nothing works there for all a card left alone can tell.
+            g.active = false;
+            self.tabs[at].glance = Some(g);
+        }
+    }
+
+    /// The newest reply known of orchestrator `id`, with its seq: the conversation's ([`Transcript::last_reply`],
     /// while the main pane follows it) or the hub's (`polled`), whichever came later. A poll
     /// about another orchestrator is about the hub's current one when the view's is no longer
     /// news (`polled_is_current`: its control stream ended), else about one the view has
@@ -1034,24 +1060,29 @@ impl AppState {
         id: &str,
         polled: Option<&OrchGlance>,
         polled_is_current: bool,
-    ) -> Option<String> {
-        let live = self.latest_reply(id);
+    ) -> (Option<String>, Option<u64>) {
+        let live = self
+            .latest_reply(id)
+            .map(|(seq, text)| (Some(text), Some(seq)));
         let Some(p) = polled else {
-            return live.map(|(_, text)| text);
+            return live.unwrap_or_default();
         };
+        let hubs = (p.preview.clone(), p.preview_seq);
         if p.id.as_deref().is_some_and(|pid| pid != id) {
             return if polled_is_current {
-                p.preview.clone()
+                hubs
             } else {
-                live.map(|(_, text)| text)
+                live.unwrap_or_default()
             };
         }
         match live {
-            Some((seq, _)) if p.preview.is_some() && p.preview_seq.is_some_and(|s| s > seq) => {
-                p.preview.clone()
+            Some((_, Some(seq)))
+                if p.preview.is_some() && p.preview_seq.is_some_and(|s| s > seq) =>
+            {
+                hubs
             }
-            Some((_, text)) => Some(text),
-            None => p.preview.clone(),
+            Some(live) => live,
+            None => hubs,
         }
     }
 

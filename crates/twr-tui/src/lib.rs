@@ -3057,6 +3057,8 @@ async fn drive(
                         }
                         // Its hub may just have been started: its card is asked at once.
                         ctx.poll_clock.soon(&name);
+                        // What this workspace's card showed stays on it.
+                        state.keep_live_glance();
                         return Ok(End::Switch {
                             to: name,
                             next: Box::new(next),
