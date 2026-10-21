@@ -1,6 +1,7 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`, `/rename`,
 //! `/orch`, `/new`, `/park`, `/resume`, `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
-//! `/parked`, `/sidebar`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/ws`, `/help`, `/quit`. Pure parsing, the
+//! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/ws`,
+//! `/settings`, `/help`, `/quit`. Pure parsing, the
 //! suggestions of the popup above the input line ([`suggest`]) and Tab completion;
 //! [`crate::app`] turns a parsed command into actions, confirmations or a status line. The same
 //! popup completes an `@` mention of a worker thread anywhere in a message ([`mention`]).
@@ -111,6 +112,13 @@ pub enum Slash {
     /// `/ws [name]` (alias `/workspace`): list the workspaces, or switch to one (a new name
     /// asks to create it).
     Ws(Option<String>),
+    /// `/ws new [name]`: create a workspace and switch to it; without a name, ask for it
+    /// (the new-workspace dialog, [`crate::sidebar`]).
+    WsNew(Option<String>),
+    /// `/spaces [on|off]`: show or hide the workspace sidebar (Ctrl-T); `None` toggles.
+    Spaces(Option<bool>),
+    /// `/settings`: the settings overlay ([`crate::settings`]).
+    Settings,
     /// `/help`.
     Help,
     /// `/quit`: leave the TUI (as Ctrl-C).
@@ -280,6 +288,13 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[ArgKind::OnOff],
     ),
     (
+        "/spaces",
+        "/spaces [on|off]",
+        "show or hide the workspace sidebar (Ctrl-T): each workspace's orchestrator, new \
+         workspace, settings",
+        &[ArgKind::OnOff],
+    ),
+    (
         "/compact",
         "/compact [on|off]",
         "the phone layout: one screen at a time (on by itself below [tui] compact_width columns)",
@@ -293,6 +308,7 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[],
     ),
     ("/t", "/t", "compact layout: the threads", &[]),
+    ("/w", "/w", "compact layout: the workspaces", &[]),
     (
         "/focus",
         "/focus [on|off]",
@@ -325,10 +341,16 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/ws",
-        "/ws [name]",
+        "/ws [name] | /ws new [name]",
         "list the workspaces, or switch to one (Alt-1..9, Ctrl-PgUp/PgDn); a new name asks to \
-         create it; alias /workspace",
+         create it; /ws new creates one; alias /workspace",
         &[ArgKind::Workspace],
+    ),
+    (
+        "/settings",
+        "/settings",
+        "the settings: suggestions, card order, notifications, compact width, ...",
+        &[],
     ),
     (
         "/help",
@@ -571,8 +593,12 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             }
         }
         "/attach" => one(args).map(Slash::Attach),
-        "/ws" => one(args).map(Slash::Ws),
-        "/parked" | "/sidebar" | "/focus" | "/mouse" | "/compact" | "/suggest" => {
+        "/ws" => match args {
+            [new] if new == "new" => Ok(Slash::WsNew(None)),
+            [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
+            _ => one(args).map(Slash::Ws),
+        },
+        "/parked" | "/sidebar" | "/spaces" | "/focus" | "/mouse" | "/compact" | "/suggest" => {
             let on = match one(args)?.as_deref() {
                 None => None,
                 Some("on") => Some(true),
@@ -582,6 +608,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             Ok(match cmd {
                 "/parked" => Slash::Parked(on),
                 "/sidebar" => Slash::Sidebar(on),
+                "/spaces" => Slash::Spaces(on),
                 "/focus" => Slash::Focus(on),
                 "/compact" => Slash::Compact(on),
                 "/suggest" => Slash::Suggest(on),
@@ -593,6 +620,8 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/c" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Chat)),
         "/n" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Needs)),
         "/t" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Threads)),
+        "/w" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Workspaces)),
+        "/settings" if args.is_empty() => Ok(Slash::Settings),
         "/decisions" if args.is_empty() => Ok(Slash::Decisions),
         "/quit" if args.is_empty() => Ok(Slash::Quit),
         _ => bad(),

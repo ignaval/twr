@@ -118,6 +118,20 @@ pub enum CompactPane {
     Needs,
     /// The threads, one per line.
     Threads,
+    /// The workspaces, a card each, and the buttons under them ([`crate::sidebar`]).
+    Workspaces,
+}
+
+/// A row of the workspace list the keys select (in its drawer and the compact layout's
+/// Workspaces screen): a workspace's card, by its name, or a button under them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsRow {
+    /// A workspace's card: Enter switches to it.
+    Workspace(String),
+    /// `+ New workspace`: Enter asks for its name.
+    New,
+    /// `⚙ Settings`: Enter opens them.
+    Settings,
 }
 
 /// A command waiting for a one-key confirmation (`y`) in the status bar.
@@ -292,6 +306,24 @@ pub struct ViewState {
     pub show_parked: bool,
     /// Ctrl-B, `/sidebar`: hide the worker cards so the conversation uses the full area.
     pub sidebar_hidden: bool,
+    /// Ctrl-T, `/spaces off`, the workspace sidebar's `‹`: the workspace sidebar is not
+    /// docked left of the views ([`crate::sidebar`]). Kept across runs (`tui-state.json`)
+    /// and across the workspaces shown.
+    pub ws_sidebar_hidden: bool,
+    /// The workspace list is open as a drawer over the view's left (Ctrl-T where the sidebar
+    /// is not docked, the tab strip's `☰`); Esc, a click outside it or its `✕` closes it.
+    pub ws_drawer: bool,
+    /// The row of the workspace list the keys select in its drawer and on the compact
+    /// layout's Workspaces screen (`None`: the current workspace's card).
+    pub ws_sel: Option<WsRow>,
+    /// Rows the workspace list is scrolled by the wheel.
+    pub ws_scroll: usize,
+    /// The new-workspace dialog, while open: the name typed so far.
+    pub new_ws: Option<String>,
+    /// The settings overlay, while open ([`crate::settings`]).
+    pub settings: Option<crate::settings::Settings>,
+    /// `[tui.notify] terminal`, as in effect (the settings change it).
+    pub notify_terminal: twr_core::config::TerminalAlert,
     /// `[tui] compact_width`: below it the compact layout is on ([`AppState::compact`]); 0:
     /// never by itself.
     pub compact_width: u16,
@@ -959,6 +991,15 @@ pub enum Action {
     /// terminal up (the IO loop edits its settings file), `no` leaves it; either is
     /// remembered.
     TerminalSetup { yes: bool },
+    /// The workspace sidebar shown (`true`) or hidden: the IO loop keeps that for the next
+    /// runs (`tui-state.json`) and the next workspaces shown.
+    WsSidebar(bool),
+    /// A setting changed in the settings overlay, applied to the view already: the IO loop
+    /// writes it where it is kept ([`crate::settings::Change::config_key`]) and holds it for
+    /// the next workspaces shown.
+    Setting(crate::settings::Change),
+    /// Ask the hub for its settings (`config.show`), for the settings overlay.
+    ConfigShow,
     /// Switch to workspace `name` (a tab, `/ws`): the IO loop opens its hub (starting it when
     /// needed) and shows it in place of this one.
     Workspace {
@@ -2228,6 +2269,9 @@ pub struct AppState {
     pub workspace: Option<String>,
     /// The workspaces' tabs, in the strip's order ([`crate::workspace`]).
     pub tabs: Vec<crate::workspace::Tab>,
+    /// The thread's agent this TUI runs for, if it does: it creates no workspace and
+    /// changes no setting (the CLI refuses an agent's workspace too).
+    pub agent: Option<String>,
     /// The workspace being opened, until it is shown or fails.
     pub switching: Option<String>,
     /// What of a view kept for this workspace waits until the replay is applied
@@ -2858,6 +2902,7 @@ impl AppState {
             "job.log" => self.shell_log(result, Instant::now()),
             "job.cancel" => self.shell_cancel_result(result),
             "suggest.next" => self.suggest_result(result),
+            "config.show" => self.settings_hub(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
             "orchestrator.reset" => {
@@ -3268,16 +3313,24 @@ impl AppState {
             .sum()
     }
 
-    /// Whether a compact layout's list shows (not its conversation): its rows are what is
-    /// selected, nothing else.
+    /// Whether a compact layout's list of threads shows (not its conversation, nor the
+    /// workspaces): its rows are what is selected, nothing else.
     pub fn compact_listed(&self) -> bool {
         self.compact()
             && self.view.screen != Screen::Decisions
-            && self.view.compact_pane != CompactPane::Chat
+            && matches!(
+                self.view.compact_pane,
+                CompactPane::Needs | CompactPane::Threads
+            )
     }
 
     /// Shows compact screen `pane`, its list's selection kept when it is in it.
-    fn show_pane(&mut self, pane: CompactPane) {
+    pub(crate) fn show_pane(&mut self, pane: CompactPane) {
+        if pane == CompactPane::Workspaces {
+            // Its selection starts on the current workspace.
+            self.view.ws_sel = None;
+            self.view.ws_scroll = 0;
+        }
         self.view.compact_pane = pane;
         self.view.action = None;
         self.view.shown = None;
@@ -3504,6 +3557,8 @@ impl AppState {
             match self.view.compact_pane {
                 CompactPane::Needs => return self.needs_order(),
                 CompactPane::Threads => return self.compact_threads(),
+                // Its rows are workspaces, which the keys select apart from the cards.
+                CompactPane::Workspaces => return Vec::new(),
                 CompactPane::Chat => {}
             }
         }
@@ -4422,6 +4477,10 @@ impl AppState {
                 });
                 self.ensure_focus();
             }
+            Slash::Pane(crate::app::CompactPane::Workspaces) if self.workspace.is_none() => {
+                self.view.status =
+                    Some("workspaces: not here (this TUI was opened on a socket)".into());
+            }
             Slash::Pane(pane) => {
                 if self.compact() {
                     self.show_pane(pane);
@@ -4462,6 +4521,9 @@ impl AppState {
             }
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
+            Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
+            Slash::Spaces(on) => return (self.spaces(on), true),
+            Slash::Settings => return (self.open_settings(), true),
         }
         (Vec::new(), true)
     }
@@ -4616,16 +4678,24 @@ impl AppState {
         // workspace must not keep the user in it.
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char(c @ '1'..='9') if alt && !ctrl && self.tabs_shown() => {
+            KeyCode::Char(c @ '1'..='9') if alt && !ctrl && self.switchable() => {
                 return self.switch_tab(usize::from(c as u8 - b'1'));
             }
-            KeyCode::PageUp | KeyCode::PageDown if ctrl && self.tabs_shown() => {
+            KeyCode::PageUp | KeyCode::PageDown if ctrl && self.switchable() => {
                 return self.step_tab(key.code == KeyCode::PageDown);
             }
             _ => {}
         }
         if self.picker_open() {
             return self.picker_key(key);
+        }
+        // The new-workspace dialog and the settings take every key ([`crate::sidebar`],
+        // [`crate::settings`]).
+        if self.view.new_ws.is_some() {
+            return self.new_ws_key(key);
+        }
+        if self.view.settings.is_some() {
+            return self.settings_key(key);
         }
         // The help is drawn over the trash: it takes the key first. Both scroll with the
         // arrows, PgUp/PgDn and Home/End; any other key closes them.
@@ -4672,6 +4742,12 @@ impl AppState {
             self.view.status = Some("cancelled".into());
             return Vec::new();
         }
+        // The workspace drawer takes its keys; any other closes it and goes on.
+        if self.ws_drawer_open() {
+            if let Some(actions) = self.ws_drawer_key(key) {
+                return actions;
+            }
+        }
         // The decisions overlay has keys of its own, and no input box to type into.
         if self.view.screen == Screen::Decisions {
             if let Some(actions) = self.decisions_key(key) {
@@ -4700,6 +4776,10 @@ impl AppState {
             && self.accept_suggestion()
         {
             return Vec::new();
+        }
+        // The compact layout's Workspaces screen: ↑↓ and Enter on an empty line.
+        if let Some(actions) = self.ws_screen_key(key) {
+            return actions;
         }
         // The slash command popup takes its keys first.
         if let Some(actions) = self.popup_key(key) {
@@ -4851,7 +4931,8 @@ impl AppState {
         Some(Vec::new())
     }
 
-    /// Keys about the view, whatever is selected or typed: Ctrl-B (the sidebar), Ctrl-F
+    /// Keys about the view, whatever is selected or typed: Ctrl-B (the sidebar), Ctrl-T (the
+    /// workspace sidebar, [`crate::sidebar`]), Ctrl-F
     /// (Focus mode), Ctrl-O (tool calls), Ctrl-G (stack or grid), PgUp/PgDn (a page of the
     /// main pane, or of a detail view that takes it), and Ctrl-↑/↓ or Alt-↑/↓ (a line of it;
     /// Alt for macOS, whose Ctrl-↑/↓ belong to Mission Control). `None`: not one of them.
@@ -4860,6 +4941,7 @@ impl AppState {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('b') if ctrl => self.set_sidebar(self.view.sidebar_hidden),
+            KeyCode::Char('t') if ctrl => return Some(self.toggle_workspaces()),
             KeyCode::Char('f') if ctrl => self.set_focus_mode(!self.view.focus_mode),
             KeyCode::Char('o') if ctrl => {
                 self.view.expand_all = !self.view.expand_all;
@@ -6266,7 +6348,7 @@ impl AppState {
     fn decisions_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('b' | 'f' | 'o') if ctrl => return None,
+            KeyCode::Char('b' | 'f' | 'o' | 't') if ctrl => return None,
             _ if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Esc => self.toggle_decisions(),
             KeyCode::Down | KeyCode::Char('j') => self.move_decision(1),
@@ -6690,8 +6772,9 @@ impl AppState {
         self.view.pointer = Some((ev.column, ev.row, Instant::now()));
         let (x, y) = (ev.column, ev.row);
         // The picker is modal: its runtimes and its ✕ are tapped, the wheel picks. Only a tab
-        // of the strip, which it does not cover, switches workspaces.
-        if self.picker_open() {
+        // of the strip, which it does not cover, switches workspaces. So are the settings
+        // (their rows) and the new-workspace dialog.
+        if self.picker_open() || self.view.settings.is_some() || self.view.new_ws.is_some() {
             match ev.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.press(x, y),
                 MouseEventKind::Up(MouseButton::Left) => {
@@ -6709,7 +6792,13 @@ impl AppState {
                     } else {
                         KeyCode::Down
                     };
-                    return self.picker_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    let arrow = KeyEvent::new(code, KeyModifiers::NONE);
+                    if self.picker_open() {
+                        return self.picker_key(arrow);
+                    }
+                    if self.view.settings.is_some() {
+                        return self.settings_key(arrow);
+                    }
                 }
                 _ => {}
             }
@@ -6727,6 +6816,19 @@ impl AppState {
                     if !std::mem::take(&mut self.view.help) {
                         self.view.trash = None;
                     }
+                    self.view.press = None;
+                    if !matches!(id, Some(PaneId::Tab(_))) {
+                        return Vec::new();
+                    }
+                }
+                // So does one outside the workspace drawer.
+                let in_drawer = self
+                    .view
+                    .panes
+                    .drawer
+                    .is_some_and(|d| d.contains(ratatui::layout::Position { x, y }));
+                if self.ws_drawer_open() && !in_drawer {
+                    self.view.ws_drawer = false;
                     self.view.press = None;
                     if !matches!(id, Some(PaneId::Tab(_))) {
                         return Vec::new();
@@ -6935,6 +7037,11 @@ impl AppState {
                 self.follow();
             }
             Target::Close => return self.close_top(),
+            Target::Workspace(name) => return self.ws_activate(WsRow::Workspace(name)),
+            Target::NewWorkspace => return self.ws_activate(WsRow::New),
+            Target::Settings => return self.ws_activate(WsRow::Settings),
+            Target::WsSidebar => return self.toggle_workspaces(),
+            Target::Setting(key) => return self.tap_setting(key),
             // A queued message: a tap selects it, a tap on the selected one opens its popup.
             Target::Queued(r) => {
                 if self.view.queued == Some(r) {
@@ -7018,6 +7125,13 @@ impl AppState {
     fn close_top(&mut self) -> Vec<Action> {
         if self.picker_open() {
             return self.picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if self.view.new_ws.take().is_some() || self.view.settings.take().is_some() {
+            return Vec::new();
+        }
+        if self.ws_drawer_open() {
+            self.view.ws_drawer = false;
+            return Vec::new();
         }
         let closed = std::mem::take(&mut self.view.help)
             || self.view.trash.take().is_some()
@@ -7412,6 +7526,10 @@ impl AppState {
         }
         if self.view.trash.is_some() {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
+            return;
+        }
+        if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) {
+            self.ws_wheel(up);
             return;
         }
         let arrow = KeyEvent::new(

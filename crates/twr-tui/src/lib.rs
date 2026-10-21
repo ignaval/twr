@@ -16,6 +16,7 @@
 pub mod app;
 #[cfg(test)]
 mod bench;
+pub mod config_edit;
 pub mod edit;
 pub mod firstrun;
 pub mod icon;
@@ -25,7 +26,9 @@ pub mod notify;
 pub mod order;
 pub mod queue;
 pub mod select;
+pub mod settings;
 pub mod shell;
+pub mod sidebar;
 pub mod slash;
 pub mod suggest;
 pub mod terminal_setup;
@@ -409,7 +412,10 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::Copy { .. }
         | Action::Mouse(_)
         | Action::Workspace { .. }
+        | Action::WsSidebar(_)
+        | Action::Setting(_)
         | Action::TerminalSetup { .. } => None,
+        Action::ConfigShow => Some(("config.show", Value::Null)),
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -680,6 +686,20 @@ fn save_seen(state: &mut AppState, file: Option<&Path>) {
             twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
         }
     });
+}
+
+/// Writes setting `change` to the config file the environment names, where the settings
+/// keep it ([`settings::Change::config_key`]): `Ok` with the file's path as shown, else why it
+/// was left alone. A small local file: written on the loop, at the user's own key.
+fn save_setting(change: &settings::Change) -> Result<String, String> {
+    let Some((table, key, value)) = change.config_key() else {
+        return Err("not a setting of the config file".into());
+    };
+    let path = twr_core::paths::Paths::from_env()
+        .map_err(|e| format!("no config file here: {e:#}"))?
+        .config_file;
+    config_edit::write_key(&path, table, key, &value)?;
+    Ok(settings::shown_path(&path))
 }
 
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
@@ -1451,8 +1471,9 @@ pub struct Switching {
     pub workspaces: std::sync::Arc<dyn Workspaces>,
 }
 
-/// How often the tab strip asks the other workspaces' hubs how they are.
-const TABS_EVERY: Duration = Duration::from_secs(5);
+/// How often the TUI looks for workspaces' hubs due to be asked how they are
+/// ([`workspace::PollClock`]).
+const TABS_EVERY: Duration = workspace::POLL_RUNNING;
 
 /// How often the TUI reads this machine's load for its status bar ([`twr_core::load`]).
 pub const LOAD_EVERY: Duration = Duration::from_secs(5);
@@ -1569,69 +1590,102 @@ fn check_hub_workspace(info: &Value, expected: &str, socket: &Path) -> anyhow::R
     }
 }
 
-/// What the tab strip shows of the workspaces other than `current`: each hub asked how it is
-/// ([`tab_hub`]), in the order [`Workspaces::names`] gives.
-async fn poll_tabs(ws: &dyn Workspaces, current: Option<&str>) -> Vec<workspace::Tab> {
-    let Ok(names) = ws.names() else {
-        return Vec::new();
-    };
-    let mut tabs = Vec::new();
-    for name in names {
-        let hub = if Some(name.as_str()) == current {
-            workspace::TabHub::Unknown
-        } else {
-            match ws.socket(&name) {
-                Ok(socket) => tab_hub(&socket, &name).await,
-                Err(_) => workspace::TabHub::Unknown,
-            }
-        };
-        tabs.push(workspace::Tab { name, hub });
-    }
-    tabs
+/// How many hubs one poll asks at once ([`poll_tabs`]).
+const POLL_AT_ONCE: usize = 4;
+
+/// One poll of the workspaces' hubs: how each hub of `due` is ([`glance_hub`]), asked a few
+/// at a time. A workspace whose socket can't be named is left as it was.
+async fn poll_tabs(ws: &dyn Workspaces, due: Vec<String>) -> Vec<workspace::Polled> {
+    use futures::StreamExt;
+    let asks: Vec<(String, PathBuf)> = due
+        .into_iter()
+        .filter_map(|name| Some((ws.socket(&name).ok()?, name)))
+        .map(|(socket, name)| (name, socket))
+        .collect();
+    futures::stream::iter(asks)
+        .map(|(name, socket)| async move {
+            let (hub, glance) = glance_hub(&socket, &name).await;
+            workspace::Polled { name, hub, glance }
+        })
+        .buffer_unordered(POLL_AT_ONCE)
+        .collect()
+        .await
 }
 
-/// How the hub of workspace `name` on `socket` is, for its tab: stopped when nothing listens,
-/// busy when it does not answer within [`TAB_TIMEOUT`] (or is another workspace's), else its
-/// worker threads, how many run and the permissions and questions waiting on the user.
-async fn tab_hub(socket: &Path, name: &str) -> workspace::TabHub {
-    use workspace::TabHub;
+/// How the hub of workspace `name` on `socket` is, for its tab and its sidebar card: stopped
+/// when nothing listens (it is never started to be asked), busy when it does not answer within
+/// [`TAB_TIMEOUT`] (or is another workspace's), else its counts and what it says of its
+/// orchestrator, in one `hub.glance`. A hub older than that method answers `thread.list` and
+/// `attention.list` instead, as tabs asked before: the same counts, its orchestrator's status
+/// without its latest reply.
+async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<workspace::Glance>) {
+    use workspace::{Glance, TabHub};
     let Ok(Ok(mut c)) = tokio::time::timeout(TAB_TIMEOUT, Client::connect(socket)).await else {
-        return TabHub::Stopped;
+        return (TabHub::Stopped, None);
     };
     let answer = tokio::time::timeout(TAB_TIMEOUT, async {
         let hello = c.hello(json!({ "client": CLIENT_NAME })).await?;
         check_hub_workspace(&hello, name, socket)?;
-        let threads = c.call("thread.list", Value::Null).await?;
-        let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok((threads, items))
+        match c.call("hub.glance", Value::Null).await {
+            Ok(g) => anyhow::Ok(Ok(g)),
+            Err(e)
+                if e.downcast_ref::<twr_core::proto::RpcError>()
+                    .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+            {
+                let threads = c.call("thread.list", Value::Null).await?;
+                let items = c.call("attention.list", json!({ "all": true })).await?;
+                Ok(Err((threads, items)))
+            }
+            Err(e) => Err(e),
+        }
     })
     .await;
-    let Ok(Ok((threads, items))) = answer else {
-        return TabHub::Busy;
+    let Ok(Ok(answer)) = answer else {
+        return (TabHub::Busy, None);
     };
-    let workers: Vec<&Value> = threads
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| t["role"] != "orchestrator")
-        .collect();
-    let running = workers
-        .iter()
-        .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
-        .count();
-    let of = |reason: &str| {
-        items
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|i| i["reason"].as_str() == Some(reason))
-            .count()
+    let count = |v: &Value| {
+        v.as_u64()
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
     };
-    TabHub::Running {
-        threads: workers.len(),
-        running,
-        permissions: of("permission"),
-        questions: of("question"),
+    match answer {
+        Ok(g) => (
+            TabHub::Running {
+                threads: count(&g["threads"]),
+                running: count(&g["running"]),
+                permissions: count(&g["permissions"]),
+                questions: count(&g["questions"]),
+            },
+            Some(Glance::from_json(&g)),
+        ),
+        Err((threads, items)) => {
+            let workers: Vec<&Value> = threads
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["role"] != "orchestrator")
+                .collect();
+            let running = workers
+                .iter()
+                .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
+                .count();
+            let of = |reason: &str| {
+                items
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|i| i["reason"].as_str() == Some(reason))
+                    .count()
+            };
+            (
+                TabHub::Running {
+                    threads: workers.len(),
+                    running,
+                    permissions: of("permission"),
+                    questions: of("question"),
+                },
+                Some(Glance::from_threads(&threads)),
+            )
+        }
     }
 }
 
@@ -1985,6 +2039,8 @@ struct Shared {
     epoch: std::time::Instant,
     workspaces: Option<std::sync::Arc<dyn Workspaces>>,
     waiting_seen: std::collections::HashMap<String, usize>,
+    /// When each workspace's hub is asked next how it is ([`workspace::PollClock`]).
+    poll_clock: workspace::PollClock,
     /// What the terminal tells apart ([`enhance_keyboard`]); its notice goes to the first
     /// workspace shown, and a Shift-Enter seen in one is known in every other.
     keys: keys::Keys,
@@ -1992,6 +2048,12 @@ struct Shared {
     compact: Option<bool>,
     /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
     suggest: Option<bool>,
+    /// The workspace sidebar hidden ([`crate::sidebar`]), for every workspace shown (and,
+    /// in `tui-state.json`, the next runs).
+    ws_sidebar_hidden: bool,
+    /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
+    /// no setting.
+    agent: Option<String>,
     /// What the TUI has told the user across runs, and where it keeps that
     /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
     seen: firstrun::Seen,
@@ -2135,9 +2197,12 @@ pub async fn run_with(
         epoch: std::time::Instant::now(),
         workspaces: switching.as_ref().map(|s| s.workspaces.clone()),
         waiting_seen: std::collections::HashMap::new(),
+        poll_clock: workspace::PollClock::default(),
         keys,
         compact: None,
         suggest: None,
+        ws_sidebar_hidden: seen.workspaces_sidebar == Some(false),
+        agent,
         seen,
         seen_file,
         offer,
@@ -2155,10 +2220,7 @@ pub async fn run_with(
         .and_then(|ws| ws.names().ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|name| workspace::Tab {
-            name,
-            hub: workspace::TabHub::Unknown,
-        })
+        .map(workspace::Tab::new)
         .collect();
     let mut carried = Carried {
         mouse: ctx.tui.mouse,
@@ -2330,6 +2392,9 @@ async fn drive(
     state.view.compact_width = ctx.tui.compact_width;
     state.view.compact = ctx.compact;
     state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
+    state.view.notify_terminal = ctx.tui.notify.terminal;
+    state.view.ws_sidebar_hidden = ctx.ws_sidebar_hidden;
+    state.agent = ctx.agent.clone();
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.view.picker = Picker::from_show(&show);
     state.workspace = current;
@@ -2387,7 +2452,13 @@ async fn drive(
     let mut info_poll = tokio::time::interval(INFO_EVERY);
     info_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (load_tx, mut load_rx) = mpsc::unbounded_channel::<Option<twr_core::load::Load>>();
-    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<Vec<workspace::Tab>>();
+    // A poll's answers: the workspaces listed (`None`: they could not be), how the hubs
+    // asked were, and when they were asked.
+    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<(
+        Option<Vec<String>>,
+        Vec<workspace::Polled>,
+        std::time::Instant,
+    )>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
     type Opened = (String, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
@@ -2629,6 +2700,30 @@ async fn drive(
                                 save_seen(&mut state, ctx.seen_file.as_deref());
                                 continue;
                             }
+                            // Kept for the next runs (and the next workspaces shown).
+                            Action::WsSidebar(on) => {
+                                ctx.ws_sidebar_hidden = !on;
+                                if let Some(file) = ctx.seen_file.clone() {
+                                    let out = status.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if let Err(e) = firstrun::set_workspaces_sidebar(&file, on) {
+                                            out.send((format!("workspace sidebar: not remembered for the next runs: {e}"), false));
+                                        }
+                                    });
+                                }
+                                continue;
+                            }
+                            // A setting changed in the settings overlay, applied to the view
+                            // already: the notifier takes it too, and the config file keeps
+                            // it when it can be changed safely ([`config_edit`]).
+                            Action::Setting(change) => {
+                                if let settings::Change::Notify(alert) = change {
+                                    notifier.set_alert(alert);
+                                }
+                                let saved = save_setting(&change);
+                                state.setting_saved(&change, saved);
+                                continue;
+                            }
                             // The workspace's hub is opened (started when needed) and
                             // connected to off the loop; this one stays until it is.
                             Action::Workspace { name, create } => {
@@ -2817,21 +2912,35 @@ async fn drive(
                         let _ = call_tx.send(("hub.info", Value::Null));
                     }
                 }
-                // The other workspaces' hubs, for their tabs.
+                // The workspaces' hubs due to be asked how they are, for their tabs and
+                // sidebar cards ([`workspace::PollClock`]); this one's too, for its
+                // orchestrator's latest reply while its conversation is not loaded.
                 _ = tab_poll.tick(), if ctx.workspaces.is_some() && !tabs_pending => {
                     if let Some(ws) = ctx.workspaces.clone() {
+                        let names = ws.names().ok();
+                        let listed: Vec<String> = match &names {
+                            Some(n) => n.clone(),
+                            None => state.tabs.iter().map(|t| t.name.clone()).collect(),
+                        };
+                        let now = std::time::Instant::now();
+                        let due = ctx.poll_clock.take_due(&listed, now);
                         tabs_pending = true;
-                        let (current, tx) = (state.workspace.clone(), tabs_tx.clone());
+                        let tx = tabs_tx.clone();
                         tokio::spawn(async move {
-                            let _ = tx.send(poll_tabs(ws.as_ref(), current.as_deref()).await);
+                            let polled = poll_tabs(ws.as_ref(), due).await;
+                            let _ = tx.send((names, polled, now));
                         });
                     }
                 }
-                Some(tabs) = tabs_rx.recv() => {
+                Some((names, polled, asked)) = tabs_rx.recv() => {
                     tabs_pending = false;
+                    for p in &polled {
+                        ctx.poll_clock.answered(&p.name, &p.hub, asked);
+                    }
+                    state.merge_poll(names, polled);
                     let alerts = workspace::waiting_alerts(
                         &mut ctx.waiting_seen,
-                        &tabs,
+                        &state.tabs,
                         state.workspace.as_deref(),
                         notifier,
                         std::time::Instant::now(),
@@ -2843,7 +2952,6 @@ async fn drive(
                             state.view.status = Some(format!("notification: {e}"));
                         }
                     }
-                    state.set_tabs(tabs);
                 }
                 // An error of a call the workspace left had asked for.
                 Some((msg, transient)) = ctx.late_rx.recv() => {
@@ -2854,15 +2962,14 @@ async fn drive(
                         // What the user saw of this workspace's waiting items: no alert for
                         // them once it is in the background.
                         if let Some(current) = &state.workspace {
-                            let hub = state.tab_hub(&workspace::Tab {
-                                name: current.clone(),
-                                hub: workspace::TabHub::Unknown,
-                            });
+                            let hub = state.tab_hub(&workspace::Tab::new(current.clone()));
                             if let workspace::TabHub::Running { permissions, questions, .. } = hub {
                                 let waiting = notifier.waiting_count(permissions, questions);
                                 ctx.waiting_seen.insert(current.clone(), waiting);
                             }
                         }
+                        // Its hub may just have been started: its card is asked at once.
+                        ctx.poll_clock.soon(&name);
                         return Ok(End::Switch {
                             to: name,
                             next: Box::new(next),
@@ -2901,9 +3008,14 @@ async fn drive(
     }
     .await;
 
-    // `/compact on|off` holds in the next workspace shown too.
+    // `/compact on|off` holds in the next workspace shown too, and so do the settings
+    // changed here ([`crate::settings`]).
     ctx.compact = state.view.compact;
     ctx.suggest = Some(state.view.suggest);
+    ctx.ws_sidebar_hidden = state.view.ws_sidebar_hidden;
+    ctx.tui.card_order = state.view.card_order;
+    ctx.tui.compact_width = state.view.compact_width;
+    ctx.tui.notify.terminal = state.view.notify_terminal;
     save_seen(&mut state, ctx.seen_file.as_deref());
     ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.

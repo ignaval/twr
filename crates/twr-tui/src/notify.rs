@@ -163,6 +163,12 @@ impl Notifier {
         }
     }
 
+    /// Alerts the terminal as `alert` says from now on (the settings changed
+    /// `[tui.notify] terminal`), the rest as it was.
+    pub fn set_alert(&mut self, alert: TerminalAlert) {
+        self.alert = alert;
+    }
+
     /// Whether it alerts at all (`terminal` is not `off`).
     pub fn enabled(&self) -> bool {
         self.alert != TerminalAlert::Off

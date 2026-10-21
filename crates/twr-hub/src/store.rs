@@ -1662,6 +1662,17 @@ const LAST_FINAL_TEXT: &str = concat!(
      AND json_extract(data, '$.final') = 1 ORDER BY +seq DESC LIMIT 1"
 );
 
+/// [`latest_final_text`]. Ordered by `turn` first, which `events_kind_turn` gives walking
+/// backwards: SQLite reads the texts of the newest turns until a turn has a final one (and
+/// sorts only that turn's by `seq`), where `ORDER BY +seq` would read and sort every text of
+/// the thread.
+const LATEST_FINAL_TEXT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'agent.text' AND thread = ?1
+     AND json_extract(data, '$.final') = 1 ORDER BY turn DESC, seq DESC LIMIT 1"
+);
+
 /// [`latest_of_kind`].
 const LATEST_OF_KIND: &str = concat!(
     "SELECT ",
@@ -1718,6 +1729,14 @@ pub fn last_final_text(
     let row = st
         .query_row(params![thread, to_i64(turn)?], row_to_raw)
         .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// The latest final `agent.text` of `thread` in any turn (that of its newest turn that has
+/// one: turns follow the log), as stored (possibly capped).
+pub fn latest_final_text(conn: &Connection, thread: &str) -> anyhow::Result<Option<Event>> {
+    let mut st = conn.prepare_cached(LATEST_FINAL_TEXT)?;
+    let row = st.query_row(params![thread], row_to_raw).optional()?;
     row.map(|r| r.into_event()).transpose()
 }
 
@@ -2114,6 +2133,9 @@ mod tests {
         assert_eq!(seq(last_final_text(c, "t1", 1).unwrap()), Some(2));
         assert_eq!(seq(last_final_text(c, "t1", 2).unwrap()), None);
         assert_eq!(seq(last_final_text(c, "t1", 3).unwrap()), Some(8));
+        assert_eq!(seq(latest_final_text(c, "t1").unwrap()), Some(8));
+        assert_eq!(seq(latest_final_text(c, "t2").unwrap()), Some(1));
+        assert_eq!(seq(latest_final_text(c, "t3").unwrap()), None);
         assert_eq!(seqs(latest_of_kind(c, "t1", kind, 2).unwrap()), [6, 4]);
         assert_eq!(
             seqs(latest_of_kind(c, "t1", "agent.text", 9).unwrap()),
@@ -2135,6 +2157,7 @@ mod tests {
             LAST_OF_KIND,
             FIRST_OF_KIND,
             LAST_FINAL_TEXT,
+            LATEST_FINAL_TEXT,
             LATEST_OF_KIND,
             SEQS_OF_KIND,
         ] {
@@ -2155,7 +2178,48 @@ mod tests {
             );
             assert!(!plan.contains("SCAN "), "{sql}:\n{plan}");
             assert!(!plan.contains("(thread=?)"), "{sql}:\n{plan}");
+            // The latest reply in any turn is read off the index's turn order: only the
+            // texts of the newest turns are read and sorted (by `seq`, within a turn), never
+            // all of the thread's.
+            if sql == LATEST_FINAL_TEXT {
+                assert!(plan.contains("USE TEMP B-TREE FOR "), "{sql}:\n{plan}");
+                assert!(
+                    !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                    "{sql}:\n{plan}"
+                );
+            }
         }
+    }
+
+    /// [`latest_final_text`] reads the texts of the newest turns only: on a thread of 5000
+    /// replies whose last turn has a partial text alone, it takes about as many steps as on
+    /// a thread of one.
+    #[test]
+    fn latest_final_text_reads_the_newest_turns_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let fill = |thread: &str, turns: u32| {
+            s.conn()
+                .execute(
+                    "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data)
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+                     SELECT ?1, i, ?1 || '-' || i, 1, '2026-10-21T00:00:00Z', i, 'adapter:fake',
+                     'agent.text', json_object('text', 'reply ' || i, 'final', json(i < ?2))
+                     FROM n",
+                    params![thread, turns + 1],
+                )
+                .unwrap();
+        };
+        fill("big", 5000);
+        fill("small", 1);
+        let steps = |thread: &str| {
+            let mut st = s.conn().prepare(LATEST_FINAL_TEXT).unwrap();
+            let seq: i64 = st.query_row(params![thread], |r| r.get(1)).unwrap();
+            (seq, st.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let (big, small) = (steps("big"), steps("small"));
+        assert_eq!((big.0, small.0), (5000, 1));
+        assert!(big.1 < 2 * small.1 + 100, "{big:?} {small:?}");
     }
 
     #[test]

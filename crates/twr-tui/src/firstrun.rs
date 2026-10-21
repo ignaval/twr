@@ -16,6 +16,10 @@
 //!   SSH or mosh, inside tmux or screen, a terminal it can't tell or edit), a notice says how
 //!   instead, once ([`TerminalOffer::Notice`]). Nothing is edited without the user's `y`.
 //!
+//! It also keeps what the user set in the TUI that is no setting of the config file: whether
+//! the workspace sidebar shows (Ctrl-T, [`crate::sidebar`]), written only when it is changed
+//! ([`set_workspaces_sidebar`]), so another TUI's older idea of it never overwrites it.
+//!
 //! A notice counts as told once a frame has shown it ([`crate::app::AppState::note_drawn`]);
 //! the file only ever gains what was told (several TUIs merge into it, [`save`]). Without a
 //! file to keep it in, the suggestions notice shows every run and the Shift-Enter offer never.
@@ -40,6 +44,9 @@ pub struct Seen {
     pub terminal: BTreeMap<String, String>,
     /// How many times the Shift-Enter offer was made, by place.
     pub terminal_offers: BTreeMap<String, u32>,
+    /// Whether the workspace sidebar shows, as the user last set it (`None`: never set; it
+    /// shows).
+    pub workspaces_sidebar: Option<bool>,
 }
 
 /// One thing told once ([`crate::app::AppState::show_once`]).
@@ -72,6 +79,7 @@ impl Seen {
                 .into_iter()
                 .filter_map(|(k, v)| Some((k, u32::try_from(v.as_u64()?).ok()?)))
                 .collect(),
+            workspaces_sidebar: v["prefs"]["workspaces_sidebar"].as_bool(),
         }
     }
 
@@ -82,12 +90,15 @@ impl Seen {
             "suggest_unavailable": self.suggest_unavailable,
             "terminal": self.terminal,
             "terminal_offers": self.terminal_offers,
+            "prefs": { "workspaces_sidebar": self.workspaces_sidebar },
         })
     }
 
     /// Adds what `other` told: a flag set in either stays set, an answer once given stays
-    /// (the first one), the larger count of offers.
+    /// (the first one), the larger count of offers. A preference stays as this one has it
+    /// (the file's, as [`save`] merges): only [`set_workspaces_sidebar`] changes it.
     pub fn merge(&mut self, other: &Seen) {
+        self.workspaces_sidebar = self.workspaces_sidebar.or(other.workspaces_sidebar);
         self.suggest_notice |= other.suggest_notice;
         self.suggest_unavailable |= other.suggest_unavailable;
         for (k, v) in &other.terminal {
@@ -134,6 +145,12 @@ pub fn load(path: &Path) -> Seen {
 /// ([`Seen::merge`]).
 pub fn save(path: &Path, seen: &Seen) -> std::io::Result<()> {
     update(path, |all| all.merge(seen))
+}
+
+/// Records in the file at `path` that the workspace sidebar shows (`on`) or not, whatever it
+/// said before.
+pub fn set_workspaces_sidebar(path: &Path, on: bool) -> std::io::Result<()> {
+    update(path, |all| all.workspaces_sidebar = Some(on))
 }
 
 /// Takes one of the Shift-Enter offers left for place `key` ([`MAX_OFFERS`]), in the file at
