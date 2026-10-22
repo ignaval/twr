@@ -90,7 +90,7 @@ use super::{AdapterScope, Batch, Core, Inner};
 pub(super) const UNKNOWN: &str = "unknown";
 
 /// What a runtime process was started with.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct RunSettings {
     /// The runtime (adapter).
     pub(super) runtime: String,

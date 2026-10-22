@@ -127,6 +127,8 @@ A card is framed in its thread's color, and its title says which thread it is an
 └──────────────────────────────────────────────┘
 ```
 
+When its runtime has said how full the thread's context is, the card's bottom border says it on the right, `ctx 34%` (`ctx 35k` without a window), before an edge card's `↓ 3 more`; a grid tile's too ([runtimes.md](runtimes.md#context-compaction)). It is the first to give way to a box's state.
+
 Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out, then the box's name is cut (`@gp… offline`). Only then does the mode go. The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the card's bottom border says it (`└ @gpu offline ──┘`), where the `↓ 3 more` of an edge card gives way to it if it must. The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
 
 The section starts with the state, then says what is going on, without saying anything twice:
@@ -165,6 +167,7 @@ A card or grid tile whose thread is at work, or failed, says in its status secti
 The hub writes it from the thread's own events, so it costs no model call and a restarted hub says the same:
 
 - While a turn runs, it leads with the step the agent's own plan has in progress, when its runtime keeps one (Claude Code's todo list and tasks: the `activeForm` of the one in progress, `implementing scroll anchoring`). Without one, it leads with what the agent last said it is about to do: a sentence such as `Now let me run the tests.` reads `running the tests`. After that comes what its latest action does: the purpose the agent gave a command (Claude Code's Bash `description`), else what the tool and its input say (`running tests` for `cargo test`, `npm test` or `pytest`, `linting`, `building`, `committing`, `editing ui.rs`, `reading app.rs`, `searching for <pattern>`, `researching <query>` for a web search), `thinking`, or `writing`. Before any of that, `starting: <the first line of the prompt>`.
+- While its runtime compacts its context: `compacting context…` (after the step, when there is one); then the compaction's line, `context compacted (auto) · 34.9k tokens → 12.7k`, which the dive also shows ([runtimes.md](runtimes.md#context-compaction)).
 - Waiting on you: `waiting for permission: <what it asks>` or `waiting for your answer: <the question>`.
 - With its turn over and background tasks left: `waiting on background: <the task>` (`waiting on 2 background tasks: …`).
 - Finished: `done: <what it came to>`, the first sentence of its report, or of the agent's last message when there is no report yet; `interrupted`; `failed` or `crashed` with the error card's reason; `stopped`; `parked`; `not started`.
@@ -658,6 +661,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/new <project> [--runtime r] [--name n]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
 | `/park [thread]`, `/stop [thread]` | park or stop a thread, the one you dived into or the selected one by default; asks `y` |
 | `/resume [thread]` | resume a parked thread |
+| `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). `/compact` is the phone layout |
 | `/trim [thread]` | delete an idle thread's build output (`target/`, `node_modules/`, ...), the one you dived into or the selected one by default ([worktrees.md](worktrees.md#trim)) |
 | `/pin [thread]` | pin or unpin a thread's card, the selected one by default |
 | `/delete <thread>...` | delete one or more threads: their worktrees and branches go to the trash; asks on a delete card |

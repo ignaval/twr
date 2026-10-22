@@ -27,7 +27,9 @@
 //! started it reports an interim report, and the thread's activity line names it. Unlike a
 //! runtime's own tasks it outlives the runtime (a settings restart, a crash), and neither a
 //! settings restart nor an automatic retry waits for it. While it runs the hub renews it every
-//! [`PROGRESS_EVERY`] (`queued (2 ahead)`, `running 6m`). It ends with a `task.updated`
+//! [`PROGRESS_EVERY`] (`queued (2 ahead)`, `running 6m 0s`); what the hub shows of it (the
+//! activity line, `thread.get`) is what it does now, read off the job itself
+//! ([`Core::job_description`]). It ends with a `task.updated`
 //! (`running: false`) whose `ext.twr.job` says how: `{id, name, argv, outcome: exited |
 //! cancelled | timed_out | failed_to_start | lost, exit?, signal?, duration_ms?, log, why?}`.
 //!
@@ -68,8 +70,10 @@ use super::shell::{
 };
 use super::{rpc, twr_ext_map, Core, Inner};
 
-/// How often a running or queued job renews its task (liveness, and what it says now).
-pub const PROGRESS_EVERY: Duration = Duration::from_secs(60);
+/// How often a running or queued job renews its task (liveness, and what it says now): for the
+/// log only. What the hub shows of a job it runs is read off the job ([`Core::job_description`]),
+/// and a stall asks whether the hub runs it ([`Core::runs_jobs_of`]).
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often the members of a running job's process group are read, and recorded when they
 /// changed ([`record_members`]).
 const GROUP_EVERY: Duration = Duration::from_secs(5);
@@ -299,6 +303,18 @@ fn duration_text(d: Duration) -> String {
         0..=59 => format!("{s}s"),
         60..=3599 => format!("{}m {}s", s / 60, s % 60),
         _ => format!("{}h {}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// What a job (`what`: `job`, or `!` for a user's command) named `name` that ran `ran` does,
+/// as the hub shows it: `running`, then the whole minutes it ran (`running 6m 0s`).
+fn running_text(what: &str, name: &str, ran: Duration) -> String {
+    match ran.as_secs() / 60 * 60 {
+        0 => format!("{what} {name}: running"),
+        s => format!(
+            "{what} {name}: running {}",
+            duration_text(Duration::from_secs(s))
+        ),
     }
 }
 
@@ -806,6 +822,48 @@ impl Core {
     /// Whether thread `thread` has a job queued or running.
     pub(super) fn has_jobs(&self, thread: &str) -> bool {
         self.jobs.jobs.values().any(|j| j.thread == thread)
+    }
+
+    /// Whether this hub runs (or has queued) a job of thread `thread`'s own: not a `!` command
+    /// of the user's. Jobs never outlive their hub: one the log shows running that no job of
+    /// this hub is was lost ([`Core::close_lost_jobs`]).
+    pub(super) fn runs_jobs_of(&self, thread: &str) -> bool {
+        self.jobs
+            .jobs
+            .values()
+            .any(|j| j.thread == thread && j.shell.is_none())
+    }
+
+    /// What job task `task` (`job:<id>`) does now, when this hub runs it: `job <name>: queued
+    /// (N ahead)`, or `running` for how many whole minutes it ran (the line changes once a
+    /// minute, as the renewals once said it). `None` for any other task.
+    pub(super) fn job_description(&self, task: &str) -> Option<String> {
+        let id = task.strip_prefix(JOB_TASK_PREFIX)?;
+        let j = self.jobs.jobs.get(id)?;
+        let what = if j.shell.is_some() { "!" } else { "job" };
+        Some(match j.started {
+            Some(at) => running_text(what, &j.name, at.elapsed()),
+            None if j.shell.is_some() => running_text(what, &j.name, Duration::ZERO),
+            None => {
+                let ahead = self.jobs.queue.iter().position(|q| q == id).unwrap_or(0);
+                format!("job {}: queued ({ahead} ahead)", j.name)
+            }
+        })
+    }
+
+    /// `tasks` as this hub shows them now: the description of each job it runs is what the
+    /// job does now ([`Core::job_description`]).
+    pub(super) fn tasks_now<'a>(
+        &self,
+        tasks: impl Iterator<Item = (&'a String, &'a BackgroundTask)>,
+    ) -> Vec<String> {
+        tasks
+            .map(|(id, t)| {
+                self.job_description(id)
+                    .filter(|_| t.job)
+                    .unwrap_or_else(|| t.description.clone())
+            })
+            .collect()
     }
 
     /// Whether any job is queued or running.
@@ -1852,6 +1910,19 @@ mod tests {
         assert_eq!(duration_text(Duration::from_secs(45)), "45s");
         assert_eq!(duration_text(Duration::from_secs(372)), "6m 12s");
         assert_eq!(duration_text(Duration::from_secs(7380)), "2h 3m");
+        // Shown in whole minutes: the line changes once a minute.
+        assert_eq!(
+            running_text("job", "build", Duration::from_secs(59)),
+            "job build: running"
+        );
+        assert_eq!(
+            running_text("job", "build", Duration::from_secs(372)),
+            "job build: running 6m 0s"
+        );
+        assert_eq!(
+            running_text("!", "ls", Duration::from_secs(7399)),
+            "! ls: running 2h 3m"
+        );
         assert!(valid_job_id("01J0ABC"));
         assert!(!valid_job_id("../x") && !valid_job_id(""));
     }

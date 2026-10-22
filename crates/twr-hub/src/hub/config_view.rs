@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use twr_core::config::{
-    BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig, NotifyConfig, OrchestratorConfig,
-    ProjectConfig, RuntimePreset, ThreadsConfig, TrashConfig, TuiConfig, TuiNotifyConfig,
-    DEFAULT_PROJECT_ROOTS,
+    BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig, LogConfig, NotifyConfig,
+    OrchestratorConfig, ProjectConfig, RuntimePreset, ThreadsConfig, TrashConfig, TuiConfig,
+    TuiNotifyConfig, DEFAULT_PROJECT_ROOTS,
 };
 
 /// A runtime as `config.show` shows it: a name as it is, a command line (`acp:<command>`,
@@ -39,6 +39,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         projects,
         threads,
         trash,
+        log,
         stall_after_secs,
         background_timeout_secs,
         wake_after_secs,
@@ -85,6 +86,10 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         memory_high,
     } = threads;
     let TrashConfig { keep_days } = trash;
+    let LogConfig {
+        retention_days,
+        archive,
+    } = log;
     let TuiConfig {
         mouse,
         animate,
@@ -210,6 +215,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "memory_high": memory_high,
         },
         "trash": { "keep_days": keep_days },
+        "log": { "retention_days": retention_days, "archive": archive },
         "codex": { "auto": codex_auto.as_str() },
         "notify": {
             "command_set": !hook_command.is_empty(),

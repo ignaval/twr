@@ -164,17 +164,23 @@ impl Candidate {
 }
 
 /// The rules: which events are wanted, what was already turned into a candidate, and the
-/// orchestrator turns users started (whose end is a reply).
-#[derive(Debug, Clone, Default)]
+/// orchestrator turns users started (whose end is a reply). Serialized whole (sets sorted) in
+/// the hub's checkpoints of its folded state. Equal policies remember the same (the compacted
+/// backlog's tests compare them, [`crate::compact`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
+    #[serde(serialize_with = "crate::sorted::set")]
     events: HashSet<NotifyEvent>,
     /// Keys already given out, oldest first (bounded by [`KEYS_MAX`]).
     order: VecDeque<String>,
+    #[serde(serialize_with = "crate::sorted::set")]
     given: HashSet<String>,
     /// Open orchestrator turns a user started: (thread, turn).
+    #[serde(serialize_with = "crate::sorted::set")]
     user_turns: HashSet<(String, u64)>,
     /// Per thread, the turns whose report is known: a rewrite of one only revises it,
     /// whatever the thread did since. Kept across a delete: a deleted thread can be restored.
+    #[serde(serialize_with = "crate::sorted::map_of_sets")]
     reported: HashMap<String, HashSet<u64>>,
 }
 
@@ -185,6 +191,13 @@ impl Policy {
             events: events.iter().copied().collect(),
             ..Default::default()
         }
+    }
+
+    /// The wanted events, most urgent first.
+    pub fn wanted(&self) -> Vec<NotifyEvent> {
+        let mut out: Vec<NotifyEvent> = self.events.iter().copied().collect();
+        out.sort();
+        out
     }
 
     /// Whether `event` is wanted.
@@ -307,7 +320,9 @@ impl Policy {
                 let turn = ev.turn?;
                 // The user's message, or the runtime going on by itself (a background task
                 // of the user's request finished); never a hub notice or handoff.
-                let user = matches!(ev.source, Source::User(_)) || p.from == TurnFrom::Runtime;
+                // (Not a compaction the user asked for: it replies nothing.)
+                let user = (matches!(ev.source, Source::User(_)) || p.from == TurnFrom::Runtime)
+                    && !crate::event::is_compact_turn(p);
                 if user && registry.get(&ev.thread)?.is_current_orchestrator() {
                     self.user_turns.insert((ev.thread.clone(), turn));
                 }
@@ -949,6 +964,18 @@ mod tests {
         said.source = Source::User("tui".into());
         f.push(said);
         assert_eq!(f.push(o.turn_ended(TurnResult::Error)), None);
+        // A compaction the user asked for replies nothing.
+        let mut compact = o.turn_started("/compact");
+        compact.source = Source::User("tui".into());
+        if let EventBody::TurnStarted(p) = &mut compact.body {
+            crate::event::set_twr_ext(
+                &mut p.ext,
+                crate::event::COMPACT_TURN_KEY,
+                serde_json::json!(true),
+            );
+        }
+        f.push(compact);
+        assert_eq!(f.push(o.turn_ended(TurnResult::Completed)), None);
     }
 
     #[test]

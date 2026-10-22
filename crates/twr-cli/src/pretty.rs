@@ -304,6 +304,7 @@ pub fn summary(ev: &Event) -> String {
                 p.source
             )
         }
+        EventBody::ContextCompacted(p) => p.line(),
         other => json_short(&other.data().unwrap_or_default()),
     }
 }

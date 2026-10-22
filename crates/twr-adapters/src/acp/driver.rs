@@ -320,6 +320,11 @@ pub async fn drive<D: Dialect>(
                 Some(AdapterCmd::Interrupt) => {
                     for line in tr.interrupt().writes { queue_line(&mut stdin, line, log); }
                 },
+                Some(AdapterCmd::Compact { turn }) => {
+                    if apply(&mut stdin, &end, &tail, tr.compact(turn), log) {
+                        stop_deadline = Some(begin_stop(&mut tr, &mut stdin, grace, log));
+                    }
+                }
             },
             _ = sleep_until_opt(stop_deadline) => {
                 tracing::warn!(?pid, "{log}: runtime did not exit after stop; killing its process group");

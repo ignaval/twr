@@ -20,6 +20,10 @@ pub const ACTIVITY_MAX: usize = 160;
 /// characters.
 pub const PHRASE_MAX: usize = 80;
 
+/// What a thread whose runtime compacts its context does (`context.compacting`, until its
+/// `context.compacted`).
+pub const COMPACTING: &str = "compacting context…";
+
 /// What `v` is doing, from its status alone: what a client shows before the hub said more.
 pub fn fallback(v: &ThreadView) -> &'static str {
     match v.status() {

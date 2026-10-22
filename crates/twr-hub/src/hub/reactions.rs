@@ -156,6 +156,10 @@ impl Core {
                 }
             }
         }
+        // A compaction is maintenance (`hub::compact`): no grade, report or review.
+        if self.is_compaction(thread, turn)? {
+            return self.react_to_compaction_end(hub, thread, turn, result);
+        }
         let done = store::turn_reactions(self.store.conn(), thread, turn)?;
         let view = self.view(thread).map_err(anyhow::Error::new)?;
         if view.is_orchestrator() {
@@ -420,7 +424,8 @@ impl Core {
     /// Startup recovery: completes the reactions of every ended (`completed` / `error`) worker
     /// turn that has no report (a hub crash between `turn.ended` and its reactions would
     /// otherwise skip them forever), oldest first, of every failed orchestrator turn without
-    /// its `error` item (orchestrator turns get no report,
+    /// its `error` item (a compaction whose `context.compacted` says it failed included,
+    /// whatever its end said; orchestrator turns get no report,
     /// [`Core::react_to_orchestrator_turn_end`]), and of every thread's last
     /// ended turn (a log written before reactions were one batch can also hold a report
     /// without its review). Uses the turn's final text from the log, hydrated, and the turn's

@@ -22,7 +22,9 @@ twr-docs = { path = "crates/twr-docs" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 # `raw_value`: event payloads parse straight into their types (`twr_core::event`).
-serde_json = { version = "1", features = ["raw_value"] }
+# `float_roundtrip`: a float reads back as the same float (the hub's checkpoints hold sums of
+# costs, `twr_hub` `hub::checkpoint`).
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 ulid = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }

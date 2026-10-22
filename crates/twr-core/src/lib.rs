@@ -11,9 +11,11 @@
 //! - [`load`]: how loaded the machine is (pressure stall information, the load average)
 //! - [`paths`], [`config`]: filesystem layout and `config.toml`
 //! - [`notify`]: which control events deserve a user notification
+//! - [`compact`]: the compacted control backlog (`control.subscribe` with `compact`)
 //! - [`proto`], [`client`]: the hub socket protocol and an async client
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
+//! - [`sorted`]: hash sets serialized in a fixed order
 //! - [`testkit`]: event-sequence builders for tests
 //! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
@@ -23,6 +25,7 @@ pub mod adapter;
 pub mod b64;
 pub mod blob;
 pub mod client;
+pub mod compact;
 pub mod config;
 pub mod event;
 pub mod git;
@@ -36,6 +39,7 @@ pub mod reduce;
 pub mod runner;
 pub mod sealed;
 pub mod shell;
+pub mod sorted;
 pub mod testkit;
 pub mod trace;
 pub mod usage;

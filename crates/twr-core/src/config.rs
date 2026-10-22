@@ -80,6 +80,10 @@
 //! [trash]
 //! keep_days = 7        # deleted threads stay in the trash this long (`twr trash empty` sooner)
 //!
+//! [log]
+//! retention_days = 30  # agent events of turns older than this move out of twr.db (7 at least)
+//! archive = true       # into archive.db beside it; false: they are deleted
+//!
 //! [tui]
 //! mouse = true         # the TUI selects and copies text itself; false = the terminal's own
 //! animate = true       # the working icon moves; false = a still `twr_` marker
@@ -170,6 +174,8 @@ pub struct Config {
     pub threads: ThreadsConfig,
     /// The trash deleted threads go to.
     pub trash: TrashConfig,
+    /// What the hub keeps of its log (`[log]`).
+    pub log: LogConfig,
     /// Seconds without progress in a turn or background tasks (not waiting on the user) before the hub
     /// raises `stalled`; 0 turns the stall timer off.
     pub stall_after_secs: u64,
@@ -227,6 +233,7 @@ impl Default for Config {
             projects: BTreeMap::new(),
             threads: ThreadsConfig::default(),
             trash: TrashConfig::default(),
+            log: LogConfig::default(),
             stall_after_secs: 600,
             background_timeout_secs: 86400,
             wake_after_secs: 30,
@@ -1291,6 +1298,45 @@ impl TrashConfig {
     }
 }
 
+/// `[log]`: what the hub keeps of its log in `twr.db` (`hub::prune`). The control events (what
+/// threads, turns, items, reports and decisions are) always stay. The agent events (`agent.*`:
+/// what the agents said, thought and did) of turns older than `retention_days` move to
+/// `archive.db` beside it, except what the hub still reads (each turn's final reply, the last
+/// turn of each thread, a turn whose reactions are not complete); those of a deleted thread move
+/// once its trash item is purged.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// Days the agent events of a turn stay in `twr.db` after it ended (default 30, at least
+    /// [`MIN_LOG_RETENTION_DAYS`]).
+    pub retention_days: u64,
+    /// Move them into `archive.db` (default); `false` deletes them.
+    pub archive: bool,
+}
+
+/// Default `log.retention_days`.
+pub const DEFAULT_LOG_RETENTION_DAYS: u64 = 30;
+
+/// Smallest `log.retention_days`: a day more than a remote box's recorded commands are resent
+/// ([`crate::runner::RESEND_HORIZON`], 6 days), whose resend reads its turn's agent events.
+pub const MIN_LOG_RETENTION_DAYS: u64 = crate::runner::RESEND_HORIZON.as_secs() / 86_400 + 1;
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        LogConfig {
+            retention_days: DEFAULT_LOG_RETENTION_DAYS,
+            archive: true,
+        }
+    }
+}
+
+impl LogConfig {
+    /// How long a turn's agent events stay.
+    pub fn retention(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.retention_days.saturating_mul(86_400))
+    }
+}
+
 /// Why `name` cannot be the name of a `threads.env` / `[projects.<name>] env` variable: empty,
 /// with `=` or a NUL byte, or `TWR_*` (twr's own markers, which the hub sets: an agent's
 /// processes are told from the user's by them).
@@ -1397,6 +1443,13 @@ impl Config {
     /// every twr command loads the config, and one that is too short must not keep `twr hub
     /// stop` from stopping a hub started before the minimum.
     pub fn validate(&self) -> anyhow::Result<()> {
+        if self.log.retention_days < MIN_LOG_RETENTION_DAYS {
+            anyhow::bail!(
+                "log.retention_days: {} is less than {MIN_LOG_RETENTION_DAYS} (a remote box's \
+                 commands are resent for 6 days, and a resend reads its turn's events)",
+                self.log.retention_days
+            );
+        }
         for (name, preset) in &self.runtimes {
             preset.validate(name)?;
         }
@@ -2402,6 +2455,25 @@ mod tests {
         let c = Config::from_toml_str("[trash]\nkeep_days = 2").unwrap();
         assert_eq!((c.trash.keep_days, c.trash.keep_ms()), (2, 2 * 86_400_000));
         assert!(Config::from_toml_str("[trash]\nkeep = 2").is_err());
+    }
+
+    /// `[log]`: 30 days and an archive by default; a retention under a week is refused (a
+    /// remote box's commands are resent for 6 days, reading their turn's events).
+    #[test]
+    fn log_retention_defaults_floor_and_overrides() {
+        let c = Config::from_toml_str("").unwrap();
+        assert_eq!((c.log.retention_days, c.log.archive), (30, true));
+        assert_eq!(c.log.retention().as_secs(), 30 * 86_400);
+        c.validate().unwrap();
+        let c = Config::from_toml_str("[log]\nretention_days = 7\narchive = false").unwrap();
+        assert_eq!((c.log.retention_days, c.log.archive), (7, false));
+        c.validate().unwrap();
+        assert_eq!(MIN_LOG_RETENTION_DAYS, 7);
+        let e = Config::from_toml_str("[log]\nretention_days = 6")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("log.retention_days"), "{e}");
+        assert!(Config::from_toml_str("[log]\nkeep = 2").is_err());
     }
 
     #[test]

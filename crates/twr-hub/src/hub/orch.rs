@@ -326,7 +326,7 @@ fn same_secret(a: &str, b: &str) -> bool {
 }
 
 /// The orchestrator's turn in progress, as the relay guard sees it.
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 struct OrchTurn {
     turn: u64,
     notice: bool,
@@ -338,12 +338,15 @@ struct OrchTurn {
     /// `ext.twr.said_after`: the control head when the user's message arrived.
     said_after: Option<u64>,
     /// Items the orchestrator answered in this turn.
+    #[serde(serialize_with = "twr_core::sorted::set")]
     answered: HashSet<String>,
     /// Threads whose mode the orchestrator changed in this turn (`thread.mode_changed` by
     /// the orchestrator): the message's authority for them is used up.
+    #[serde(serialize_with = "twr_core::sorted::set")]
     modes_set: HashSet<String>,
     /// Threads the orchestrator proposed to move to another runtime in this turn
     /// (`hub::model`): once per thread per turn.
+    #[serde(serialize_with = "twr_core::sorted::set")]
     moved: HashSet<String>,
     /// What the orchestrator proposed in this turn (`hub::proposal`), in order: memory only,
     /// raised as one confirm card when the turn ends.
@@ -358,7 +361,7 @@ struct OrchTurn {
 }
 
 /// One queued notice line.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Notice {
     /// Names it in a notice turn's `ext.twr.`[`NOTICES_LEFT_KEY`]: the id of the event that
     /// queued it (a line the hub adds on its own, which no replay rebuilds, gets a fresh one).
@@ -434,7 +437,7 @@ impl Notice {
 }
 
 /// The orchestrator token and the runtime it belongs to.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct OrchToken {
     secret: String,
     /// The generation of the orchestrator runtime that got it: valid only while that runtime
@@ -444,7 +447,7 @@ struct OrchToken {
 
 /// Whose an item is and what it asks, as the relay guard keeps it (what the user's message is
 /// read against, `twr_decisions::code::command`).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ItemFacts {
     /// Its thread (id).
     pub(super) thread: String,
@@ -473,7 +476,7 @@ fn facts_at(revisions: &Revisions, at: u64) -> Option<&ItemFacts> {
 /// An open item as the relay guard sees it. An item can be raised again while open (an
 /// adapter re-sends a permission with new options or summary): that is a new *revision* of
 /// the same open item, not a new item.
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
 struct OpenItem {
     /// Control gseq of its latest `attention.raised` (its current revision): what a message
     /// can answer is judged against this (a re-raise can change what is asked).
@@ -490,7 +493,7 @@ struct OpenItem {
 
 /// A blocking interval of an item that ended (resolved, or raised again as something that
 /// does not block): `[since, until)` in control gseqs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ClosedBlocking {
     since: u64,
     until: u64,
@@ -501,7 +504,7 @@ struct ClosedBlocking {
 
 /// When a thread was created and when it stopped or ran again (control gseqs), for which
 /// threads were workers when a message arrived (the `set_mode` gate's frozen view).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct ThreadLife {
     created: u64,
     /// `(gseq, stopped)` transitions, oldest first, at most [`LIFE_HISTORY`].
@@ -579,12 +582,16 @@ impl ThreadLife {
     }
 }
 
-/// Orchestrator bookkeeping in the hub core. Everything but the token is rebuilt from the log.
-#[derive(Debug, Default)]
+/// Orchestrator bookkeeping in the hub core. Everything but the token is rebuilt from the log,
+/// and goes into the hub's checkpoints (`hub::checkpoint`); the fields skipped there are memory
+/// only, and the fold never sets them.
+#[derive(Debug, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct OrchState {
     /// The orchestrator thread's id, once created.
     pub(super) thread: Option<String>,
-    /// The current token (memory only; never logged, never in an event).
+    /// The current token (memory only; never logged, never in an event, never in a
+    /// checkpoint).
+    #[serde(skip)]
     token: Option<OrchToken>,
     /// Each open item.
     attn_gseq: HashMap<String, OpenItem>,
@@ -633,6 +640,7 @@ pub(super) struct OrchState {
     pub(super) idle_fired: HashMap<String, Option<u64>>,
     /// What the orchestrator read of the projects in its current turn (`hub::project_read`):
     /// memory only.
+    #[serde(skip)]
     reads: ReadBudget,
     /// The orchestrator's turns whose message the user took back (`turn.withdrawn`), each
     /// with that message and the turn that tells it to disregard it: the latest turn the hub
@@ -651,11 +659,16 @@ pub(super) struct OrchState {
     /// Control gseq of the latest `turn.withdrawn` of the orchestrator: a user message that
     /// arrived after it ends the taint of the runtime's own turns.
     withdrawn_at: u64,
+    /// The orchestrator's turns that were compactions the user asked for (`hub::compact`):
+    /// maintenance, no work. What a withdrawal taints reads past them
+    /// ([`OrchState::work_turn`]). Rebuilt from the log.
+    #[serde(default)]
+    maintenance_turns: std::collections::BTreeSet<u64>,
 }
 
 /// The project reads of one orchestrator turn: at most [`project_read::TURN_CALLS`] calls and
 /// [`project_read::TURN_BYTES`] bytes of content.
-#[derive(Debug, Default)]
+#[derive(Debug, PartialEq, Default)]
 struct ReadBudget {
     /// The orchestrator thread and turn counted (turn `None`: calls outside a turn, counted
     /// together).
@@ -675,6 +688,81 @@ pub(super) struct ReadKey {
 }
 
 impl OrchState {
+    /// The fields checkpoints hold (tests: what it serializes to, `hub::checkpoint`).
+    #[cfg(test)]
+    pub(super) const KEPT: &'static [&'static str] = &[
+        "thread",
+        "attn_gseq",
+        "closed_blocking",
+        "closed_horizon",
+        "lives",
+        "user_modes",
+        "arrivals",
+        "latest_arrival",
+        "turn",
+        "notices",
+        "notices_dropped",
+        "wake",
+        "switching",
+        "pending_handoff",
+        "card",
+        "watches",
+        "watch_count",
+        "idle_fired",
+        "taken_back",
+        "withdrawn_turns",
+        "withdrawn_at",
+        "maintenance_turns",
+    ];
+
+    /// The fields checkpoints skip (`#[serde(skip)]`) that are set (tests: a fold must set
+    /// none of them, `hub::checkpoint`). Names every field: a new one is placed here, and in
+    /// [`OrchState::KEPT`] when checkpoints hold it.
+    #[cfg(test)]
+    pub(super) fn skipped_set(&self) -> Vec<&'static str> {
+        let OrchState {
+            token,
+            reads,
+            // In the checkpoint.
+            thread: _,
+            attn_gseq: _,
+            closed_blocking: _,
+            closed_horizon: _,
+            lives: _,
+            user_modes: _,
+            arrivals: _,
+            latest_arrival: _,
+            turn: _,
+            notices: _,
+            notices_dropped: _,
+            wake: _,
+            switching: _,
+            pending_handoff: _,
+            card: _,
+            watches: _,
+            watch_count: _,
+            idle_fired: _,
+            taken_back: _,
+            withdrawn_turns: _,
+            withdrawn_at: _,
+            maintenance_turns: _,
+        } = self;
+        let reads_set = reads.key.is_some() || reads.calls > 0 || reads.bytes > 0 || reads.over;
+        [("orch.token", token.is_some()), ("orch.reads", reads_set)]
+            .into_iter()
+            .filter_map(|(f, set)| set.then_some(f))
+            .collect()
+    }
+
+    /// The orchestrator's latest turn of work at or before `turn`: `turn` itself, unless it
+    /// is a compaction (maintenance), whose withdrawal state is the work turn's before it.
+    fn work_turn(&self, mut turn: u64) -> u64 {
+        while turn > 0 && self.maintenance_turns.contains(&turn) {
+            turn -= 1;
+        }
+        turn
+    }
+
     /// The current orchestrator thread and turn, `None` without an orchestrator.
     fn read_key(&self) -> Option<ReadKey> {
         Some(ReadKey {
@@ -1411,6 +1499,7 @@ impl Core {
                         self.orch.notices_dropped = 0;
                         self.orch.taken_back.clear();
                         self.orch.withdrawn_turns.clear();
+                        self.orch.maintenance_turns.clear();
                     }
                     self.orch.thread = Some(ev.thread.clone());
                     self.orch.pending_handoff = twr_ext(&p.ext)
@@ -1448,9 +1537,17 @@ impl Core {
                 // A turn the hub started from a prompt it queued for the runtime (a shared `!!`
                 // command's output, a job's end) is no continuation: it is told, as any prompt
                 // the hub delivers.
-                if p.from == TurnFrom::Runtime && ev.source != Source::Hub {
-                    if n > 0
-                        && self.orch.withdrawn_turns.contains(&(n - 1))
+                // A compaction (`hub::compact`) carries no prompt of the hub's: it tells
+                // nothing, and is no message of the user's.
+                // The runtime's own turn continues the work turn before it, past any
+                // compaction in between.
+                let compact = is_compact_turn(p);
+                if compact {
+                    self.orch.maintenance_turns.insert(n);
+                } else if p.from == TurnFrom::Runtime && ev.source != Source::Hub {
+                    let before = self.orch.work_turn(n.saturating_sub(1));
+                    if before > 0
+                        && self.orch.withdrawn_turns.contains(&before)
                         && self.orch.latest_arrival <= self.orch.withdrawn_at
                     {
                         self.orch.withdrawn_turns.insert(n);
@@ -1466,7 +1563,7 @@ impl Core {
                 let said_after = twr_ext(&p.ext)
                     .and_then(|t| t.get("said_after"))
                     .and_then(Value::as_u64);
-                let user = p.from == TurnFrom::User && !notice;
+                let user = p.from == TurnFrom::User && !notice && !compact;
                 let arrived = user
                     .then(|| self.orch.take_arrival(p.routed_by.as_deref()))
                     .flatten();
@@ -1522,14 +1619,19 @@ impl Core {
                 }
             }
             // A worker's turn: a held line about it going idle is moot (its report fires the
-            // watches).
-            EventBody::TurnStarted(_) => {
+            // watches). Not a compaction: it reports nothing, and the worker is as idle after.
+            EventBody::TurnStarted(p) if !is_compact_turn(p) => {
                 self.orch.drop_idle(&ev.thread);
             }
             EventBody::TurnEnded(_) if self.is_orch(&ev.thread) => {
                 self.orch.end_turn();
                 self.orch.wake = true;
             }
+            // A worker's turn ended: idle after its interim report again when the turn was a
+            // compaction (maintenance, which reported nothing: its interim report stands), as
+            // when its work ends (`queue_idle_watches` checks; a work turn's end, with its
+            // report still to come, is never idle).
+            EventBody::TurnEnded(_) => self.queue_idle_watches(ev),
             // The user took back the message of the orchestrator's turn: what it proposed for it
             // goes (no card), and its next turn is told ([`Core::taken_back_fact`]).
             EventBody::TurnWithdrawn(_) if self.is_orch(&ev.thread) => {
@@ -2422,7 +2524,8 @@ impl Core {
                 ),
             ));
         };
-        let taken_back = |t: u64| self.orch.withdrawn_turns.contains(&t);
+        // (A call bound to a compaction is the work turn's before it.)
+        let taken_back = |t: u64| self.orch.withdrawn_turns.contains(&self.orch.work_turn(t));
         let bound = match c.turn {
             Some(t) => taken_back(t),
             None => c.turns > 0 && taken_back(c.turns),
@@ -3435,6 +3538,18 @@ impl Hub {
             return Err(rpc(
                 codes::CONFLICT,
                 format!("turn {turn} of {} has not finished", view.name),
+            ));
+        }
+        // A compaction is maintenance (`hub::compact`): it has no report, and one written for
+        // it would read as the thread's work (replacing an interim report, say).
+        if core.is_compaction(&id, turn).map_err(internal)? {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                format!(
+                    "turn {turn} of {} compacted its context: it has no report (report its \
+                     work turn instead)",
+                    view.name
+                ),
             ));
         }
         let summary = report::trim_summary(summary, WRITTEN_SUMMARY_MAX);

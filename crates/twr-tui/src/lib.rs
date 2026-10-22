@@ -17,6 +17,8 @@ pub mod app;
 #[cfg(test)]
 mod bench;
 pub mod color;
+#[cfg(test)]
+mod compact_tests;
 pub mod config_edit;
 pub mod edit;
 pub mod firstrun;
@@ -247,6 +249,13 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
             return Some(msg);
         }
         "thread.resume" => return Some("resumed".into()),
+        "thread.compact" => {
+            let name = result["thread_name"].as_str().unwrap_or("the thread");
+            return Some(match result["state"].as_str() {
+                Some("started") => format!("{name} compacts its context now"),
+                _ => format!("{name} compacts its context after its running turn"),
+            });
+        }
         "thread.trim" => {
             let name = result["thread_name"].as_str().unwrap_or("?");
             let deleted = result["deleted"].as_array().map_or(0, Vec::len);
@@ -519,6 +528,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Park { thread } => Some(("thread.park", json!({"thread": thread}))),
         Action::Resume { thread } => Some(("thread.resume", json!({"thread": thread}))),
         Action::Trim { thread } => Some(("thread.trim", json!({"thread": thread}))),
+        Action::CompactContext { thread } => Some(("thread.compact", json!({"thread": thread}))),
         Action::ResetOrchestrator => Some(("orchestrator.reset", json!({}))),
         Action::UseOrchestrator {
             runtime,
@@ -1495,7 +1505,7 @@ const TAB_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info` and
 /// `orchestrator.show`, the connection for calls, and the control stream with the head its
-/// replay runs up to.
+/// replay runs up to (and, compacted, how many items the replay has).
 struct Session {
     socket: PathBuf,
     calls: Client,
@@ -1503,6 +1513,7 @@ struct Session {
     show: Value,
     control: ItemStream,
     head: u64,
+    backlog: Option<u64>,
 }
 
 impl Session {
@@ -1529,21 +1540,18 @@ impl Session {
         })
         .await
         .unwrap_or(Value::Null);
-        let control = within(
+        let (control, backlog) = within(
             CONNECT_TIMEOUT,
             "subscribing to the control stream",
-            async {
-                connect(socket)
-                    .await?
-                    .subscribe("control.subscribe", json!({"since": 0}))
-                    .await
-                    .context("subscribing to the control stream")
-            },
+            subscribe_control(socket),
         )
         .await?;
         // The replay up to the ack's head is the initial state; focus waits for it.
         let head = control.ack()["head"].as_u64().unwrap_or(0);
-        twr_core::trace::mark_with(|| format!("tui: control subscribed (head {head})"));
+        twr_core::trace::mark_with(|| match backlog {
+            Some(n) => format!("tui: control subscribed (head {head}, {n} items compacted)"),
+            None => format!("tui: control subscribed (head {head})"),
+        });
         let blobs = connect(socket).await?;
         let control = read_ahead(hydrating(
             Box::pin(control.into_stream()),
@@ -1558,7 +1566,43 @@ impl Session {
             show,
             control,
             head,
+            backlog,
         })
+    }
+}
+
+/// Subscribes to the control stream from its start, on a connection of its own, its stored
+/// backlog compacted ([`twr_core::compact`]: what the TUI folds of it, without the updates
+/// that change nothing of that). A hub from before compaction refuses `compact`
+/// (`bad_request`): it is asked again without. Returns the subscription and, when its backlog
+/// is compacted, how many items it has (the ack's `backlog`).
+async fn subscribe_control(
+    socket: &Path,
+) -> anyhow::Result<(twr_core::client::Subscription, Option<u64>)> {
+    let compacted = connect(socket)
+        .await?
+        .subscribe("control.subscribe", json!({"since": 0, "compact": true}))
+        .await;
+    let refused = |e: &anyhow::Error| {
+        e.downcast_ref::<twr_core::proto::RpcError>()
+            .is_some_and(|r| r.code == twr_core::proto::codes::BAD_REQUEST)
+    };
+    match compacted {
+        Ok(sub) => {
+            let backlog = (sub.ack()["compacted"] == true)
+                .then(|| sub.ack()["backlog"].as_u64())
+                .flatten();
+            Ok((sub, backlog))
+        }
+        Err(e) if refused(&e) => {
+            let sub = connect(socket)
+                .await?
+                .subscribe("control.subscribe", json!({"since": 0}))
+                .await
+                .context("subscribing to the control stream")?;
+            Ok((sub, None))
+        }
+        Err(e) => Err(e).context("subscribing to the control stream"),
     }
 }
 
@@ -2406,6 +2450,7 @@ async fn drive(
         show,
         control,
         head,
+        backlog,
     } = session;
     let epoch = ctx.epoch;
     let instance = info["instance"].as_str().map(str::to_string);
@@ -2506,7 +2551,10 @@ async fn drive(
     state.apply_suggest_info(&info);
     // Another workspace's frame may be on screen: the first one starts from a clear screen.
     state.view.repaint = true;
-    state.begin_catch_up(head);
+    match backlog {
+        Some(items) => state.begin_compacted_catch_up(head, items),
+        None => state.begin_catch_up(head),
+    }
     // The history file is written on a thread of its own, in order: a save waits for the
     // file's lock (another TUI may hold it), and the input loop never does.
     // (One JSON string per line, oldest first: [`load_history`].)
@@ -5146,6 +5194,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!((m, p), ("thread.trim", json!({"thread": "t1"})));
+        let (m, p) = action_request(&Action::CompactContext {
+            thread: "t1".into(),
+        })
+        .unwrap();
+        assert_eq!((m, p), ("thread.compact", json!({"thread": "t1"})));
+        assert_eq!(
+            result_status(
+                "thread.compact",
+                &json!({"thread_name": "api", "state": "queued"})
+            )
+            .as_deref(),
+            Some("api compacts its context after its running turn")
+        );
         assert_eq!(
             result_status(
                 "thread.trim",
@@ -5734,6 +5795,66 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let second = out.next().await.unwrap().unwrap();
         assert_eq!(second.event.body, finals[1].0);
+    }
+
+    /// The TUI asks for a compacted control backlog and takes how many items it has; a hub
+    /// from before compaction refuses the key (`bad_request`, as `deny_unknown_fields` does),
+    /// and is asked again without it: the replay is then a full one.
+    #[tokio::test]
+    async fn the_control_backlog_is_compacted_unless_the_hub_is_older() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let dir = tempfile::tempdir().unwrap();
+        for old in [false, true] {
+            let sock = dir.path().join(format!("hub-{old}.sock"));
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&asked);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        let (r, mut w) = stream.into_split();
+                        let mut lines = BufReader::new(r).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let params = req["params"].clone();
+                            let frame = match req["method"].as_str() {
+                                Some("control.subscribe") => {
+                                    log.lock().unwrap().push(params.clone());
+                                    if params.get("compact").is_some() && old {
+                                        json!({"id": req["id"], "error": {"code": "bad_request",
+                                            "message": "unknown field `compact`, expected `since` or `limit`"}})
+                                    } else if params.get("compact").is_some() {
+                                        json!({"id": req["id"], "result": {"since": 0, "head": 9,
+                                            "backlog": 4, "compacted": true}})
+                                    } else {
+                                        json!({"id": req["id"], "result": {"since": 0, "head": 9}})
+                                    }
+                                }
+                                _ => json!({"id": req["id"], "result": {}}),
+                            };
+                            let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                        }
+                    });
+                }
+            });
+            let (sub, backlog) = subscribe_control(&sock).await.unwrap();
+            assert_eq!(sub.ack()["head"], 9);
+            let asked = asked.lock().unwrap().clone();
+            if old {
+                assert_eq!(backlog, None);
+                assert_eq!(
+                    asked,
+                    [json!({"since": 0, "compact": true}), json!({"since": 0})]
+                );
+            } else {
+                assert_eq!(backlog, Some(4));
+                assert_eq!(asked, [json!({"since": 0, "compact": true})]);
+            }
+        }
     }
 
     /// Every connection the TUI opens starts with `hello {client: "tui"}`.

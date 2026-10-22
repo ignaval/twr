@@ -342,6 +342,13 @@ enum Cmd {
         /// Thread id, name, alias or unique prefix.
         thread: String,
     },
+    /// Compact a thread's context, as its agent's own /compact does: a turn of its own, now or
+    /// after its running turn and the messages queued before. Claude Code, Codex and Grok
+    /// Build threads on this machine; refused for other runtimes and remote boxes.
+    Compact {
+        /// Thread id, name, alias or unique prefix.
+        thread: String,
+    },
     /// Delete threads: stop each one's runtime and move its worktree (uncommitted changes too,
     /// or only its record when a park removed it) and its recorded branch (`twr/<its name when
     /// the worktree was made>`: a rename does not change it) to the trash of its box (`twr trash`: purged after `[trash] keep_days`, 7 by default; `twr trash
@@ -362,6 +369,11 @@ enum Cmd {
     Trash {
         #[command(subcommand)]
         cmd: TrashCmd,
+    },
+    /// The hub's log: its size, and moving old agent events out of it (`[log]`).
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
     },
     /// Run a command for a thread as a job of the hub: it waits for the machine's job slots,
     /// shows as the thread's background work, and its end (exit code and the end of its
@@ -852,6 +864,35 @@ enum JobCmd {
     Cancel {
         /// The job's id, or a unique start of it.
         job: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LogCmd {
+    /// Move the agent events `[log]` lets go (of turns older than `retention_days` whose
+    /// reactions are done, and of deleted threads whose trash item is purged) and the blobs
+    /// only they reach out of twr.db into archive.db now (or delete them, with `archive =
+    /// false`). The hub does this every hour by itself when 2 000 rows or more can go.
+    Compact {
+        /// Then rewrite twr.db whole (`VACUUM`), which gives the freed space back to the
+        /// file system and turns on incremental vacuum for the next runs. The hub waits for
+        /// it, doing nothing else meanwhile: 3 to 18 seconds for a 475 MB twr.db.
+        #[arg(long)]
+        vacuum: bool,
+        /// Drop the hub's checkpoints of its state first (its next start folds the whole log).
+        #[arg(long)]
+        drop_checkpoints: bool,
+        /// Print the raw `log.compact` JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sizes of twr.db, its write-ahead log and archive.db, rows and bytes per kind, blobs,
+    /// checkpoints, the control backlog (whole and compacted), and what the next compaction
+    /// would move.
+    Stats {
+        /// Print the raw `log.stats` JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1856,6 +1897,14 @@ async fn run_simple(
             outln!("{}", resume_outcome(&thread, &r));
             Ok(())
         }
+        Cmd::Compact { thread } => {
+            let mut c = connect(&socket).await?;
+            let r = c
+                .call("thread.compact", json!({ "thread": thread }))
+                .await?;
+            outln!("{}", compact_outcome(&thread, &r));
+            Ok(())
+        }
         Cmd::Delete { threads, yes } => {
             // As for `twr respond`: only a terminal can confirm, else --yes.
             let mut ask = ask_on_stderr;
@@ -1865,6 +1914,7 @@ async fn run_simple(
             cmd: TrashCmd::List { json },
         } => trash_list(&socket, json).await,
         Cmd::Job { cmd } => job_cmd(&socket, cmd).await,
+        Cmd::Log { cmd } => log_cmd(&socket, cmd).await,
         Cmd::Trash {
             cmd: TrashCmd::Empty { items, all, yes },
         } => {
@@ -2367,6 +2417,15 @@ fn park_outcome(thread: &str, r: &Value) -> String {
         )),
     }
     out
+}
+
+/// What `twr compact` prints for a `thread.compact` result.
+fn compact_outcome(thread: &str, r: &Value) -> String {
+    let name = r["thread_name"].as_str().unwrap_or(thread);
+    match (r["state"].as_str(), r["turn"].as_u64()) {
+        (Some("started"), Some(turn)) => format!("{name}: compacting its context (turn {turn})"),
+        _ => format!("{name}: compacts its context after its running turn"),
+    }
 }
 
 /// What `twr resume` prints for a `thread.resume` result.
@@ -5045,6 +5104,204 @@ async fn delete(socket: &Path, threads: &[String], consent: Consent<'_>) -> anyh
 // --- trash -------------------------------------------------------------------------------------
 
 /// `twr trash list`: the trash of every box, as a table (or the raw JSON with `raw`).
+/// `twr log compact` and `twr log stats`.
+async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    match cmd {
+        LogCmd::Compact {
+            vacuum,
+            drop_checkpoints,
+            json,
+        } => {
+            if vacuum && !json {
+                errln!(
+                    "compacting the log, then VACUUM: the hub does nothing else until it is \
+                     done (3 to 18 s for a 475 MB twr.db)…"
+                );
+            }
+            let r = c
+                .call(
+                    "log.compact",
+                    json!({ "vacuum": vacuum, "drop_checkpoints": drop_checkpoints }),
+                )
+                .await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                out!("{}", log_compact_text(&r));
+            }
+        }
+        LogCmd::Stats { json } => {
+            let r = c.call("log.stats", Value::Null).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                out!("{}", log_stats_text(&r));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Bytes as `twr trash list` shows them.
+fn bytes_text(v: &Value) -> String {
+    twr_core::git::human_bytes(v.as_u64().unwrap_or(0))
+}
+
+/// `twr log compact` for a `log.compact` result.
+fn log_compact_text(r: &Value) -> String {
+    let n = |k: &str| r[k].as_u64().unwrap_or(0);
+    let mut out = String::new();
+    if n("checkpoints_dropped") > 0 {
+        out.push_str(&format!(
+            "dropped {} checkpoint(s)\n",
+            n("checkpoints_dropped")
+        ));
+    }
+    match r["skipped"].as_str() {
+        Some(why) => {
+            out.push_str(&format!("moved nothing: {why}\n"));
+            if n("blobs") > 0 {
+                out.push_str(&format!(
+                    "{} blob(s), {} no row left in twr.db reaches\n",
+                    n("blobs"),
+                    bytes_text(&r["blob_bytes"])
+                ));
+            }
+        }
+        None => {
+            let whither = if r["archived"] == true {
+                "into archive.db"
+            } else {
+                "deleted (archive = false)"
+            };
+            out.push_str(&format!(
+                "{} agent event(s), {} ({} purged thread(s), {} turn(s)), {whither}\n",
+                n("rows"),
+                bytes_text(&r["bytes"]),
+                n("purged_threads"),
+                n("turns"),
+            ));
+            out.push_str(&format!(
+                "{} blob(s), {} no row left in twr.db reaches\n",
+                n("blobs"),
+                bytes_text(&r["blob_bytes"])
+            ));
+            out.push_str(&format!(
+                "{} transaction(s), the longest {} ms; {} ms in all\n",
+                n("batches"),
+                n("longest_batch_ms"),
+                n("total_ms")
+            ));
+        }
+    }
+    if n("freed_pages") > 0 {
+        out.push_str(&format!("{} free page(s) given back\n", n("freed_pages")));
+    }
+    if let Some(v) = r["vacuum"].as_object() {
+        let b = |k: &str| bytes_text(&v[k]);
+        out.push_str(&format!(
+            "VACUUM: twr.db {} → {} in {} ms{}\n",
+            b("before"),
+            b("after"),
+            v["ms"].as_u64().unwrap_or(0),
+            if v["incremental_set"] == true {
+                " (incremental vacuum on from now)"
+            } else {
+                ""
+            }
+        ));
+    }
+    out
+}
+
+/// `twr log stats` for a `log.stats` result.
+fn log_stats_text(r: &Value) -> String {
+    let mut out = String::new();
+    let db = &r["db"];
+    out.push_str(&format!(
+        "twr.db       {} (write-ahead log {}; {} free page(s) of {}, auto_vacuum {})\n",
+        bytes_text(&db["bytes"]),
+        bytes_text(&db["wal"]),
+        db["free_pages"].as_u64().unwrap_or(0),
+        db["pages"].as_u64().unwrap_or(0),
+        db["auto_vacuum"].as_str().unwrap_or("?"),
+    ));
+    let a = &r["archive"];
+    if a.is_object() {
+        out.push_str(&format!(
+            "archive.db   {} (write-ahead log {})\n",
+            bytes_text(&a["bytes"]),
+            bytes_text(&a["wal"])
+        ));
+    } else {
+        out.push_str("archive.db   none yet\n");
+    }
+    let kinds = |label: &str, v: &Value, out: &mut String| {
+        let Some(k) = v["kinds"].as_object() else {
+            return;
+        };
+        let rows: Vec<[String; 3]> = k
+            .iter()
+            .map(|(kind, e)| {
+                [
+                    kind.clone(),
+                    e["rows"].as_u64().unwrap_or(0).to_string(),
+                    bytes_text(&e["bytes"]),
+                ]
+            })
+            .collect();
+        out.push_str(&format!("\n{label}\n"));
+        out.push_str(&table(&["KIND", "ROWS", "BYTES"], &rows));
+        out.push_str(&format!(
+            "blobs: {}, {}\n",
+            v["blobs"]["count"].as_u64().unwrap_or(0),
+            bytes_text(&v["blobs"]["bytes"])
+        ));
+    };
+    kinds("twr.db", db, &mut out);
+    if a.is_object() {
+        kinds("archive.db", a, &mut out);
+    }
+    let b = &r["backlog"];
+    out.push_str(&format!(
+        "\ncontrol backlog: {} item(s), {} compacted\n",
+        b["full"].as_u64().unwrap_or(0),
+        b["compacted"].as_u64().unwrap_or(0)
+    ));
+    let cps = r["checkpoints"].as_array().cloned().unwrap_or_default();
+    if cps.is_empty() {
+        out.push_str("checkpoints: none\n");
+    }
+    for c in &cps {
+        let age = c["age_secs"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "checkpoint {}: {} min old, {}, {} event(s) after it\n",
+            c["id"],
+            age / 60,
+            bytes_text(&c["bytes"]),
+            c["events_after"].as_u64().unwrap_or(0)
+        ));
+    }
+    let next = &r["next"];
+    out.push_str(&format!(
+        "\nnext compaction ([log] retention_days = {}, archive = {}): {} agent event(s), {} \
+         ({} purged thread(s), {} turn(s)){}\n",
+        r["retention_days"].as_u64().unwrap_or(0),
+        r["archive_on"].as_bool().unwrap_or(true),
+        next["rows"].as_u64().unwrap_or(0),
+        bytes_text(&next["bytes"]),
+        next["purged_threads"].as_u64().unwrap_or(0),
+        next["turns"].as_u64().unwrap_or(0),
+        if next["automatic"] == true {
+            ", within the hour"
+        } else {
+            "; the hub waits for 2 000 (`twr log compact` moves them now)"
+        }
+    ));
+    out
+}
+
 async fn trash_list(socket: &Path, raw: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let r = c.call("trash.list", Value::Null).await?;
@@ -7875,6 +8132,15 @@ mod tests {
         ));
         let c = Cli::try_parse_from(["twr", "resume", "api"]).unwrap();
         assert!(matches!(c.cmd, Some(Cmd::Resume { ref thread }) if thread == "api"));
+        let c = Cli::try_parse_from(["twr", "compact", "api"]).unwrap();
+        assert!(matches!(c.cmd, Some(Cmd::Compact { ref thread }) if thread == "api"));
+        assert_eq!(
+            compact_outcome(
+                "api",
+                &json!({"thread_name": "api", "state": "started", "turn": 4})
+            ),
+            "api: compacting its context (turn 4)"
+        );
         let c = Cli::try_parse_from(["twr", "thread", "new", ".", "--base", "v1.2"]).unwrap();
         assert!(matches!(
             c.cmd,
@@ -9125,6 +9391,59 @@ mod tests {
             ],
         );
         assert_eq!(t, "A    BB\nxxx  y\nz\n");
+    }
+
+    /// `twr log compact` says what moved, where to, how long the write lock was held at most,
+    /// and what the `VACUUM` did; `twr log stats` the sizes, kinds, checkpoints, backlog and
+    /// what the next run moves.
+    #[test]
+    fn log_texts() {
+        let r = json!({
+            "rows": 1200, "bytes": 5_000_000, "purged_threads": 2, "turns": 7, "blobs": 30,
+            "blob_bytes": 9_000_000, "archived": true, "batches": 2, "longest_batch_ms": 14,
+            "total_ms": 900, "freed_pages": 0, "checkpoints_dropped": 2,
+            "vacuum": {"ms": 3100, "before": 400_000_000, "after": 90_000_000,
+                       "incremental_set": true},
+        });
+        let t = log_compact_text(&r);
+        assert!(t.contains("dropped 2 checkpoint(s)"), "{t}");
+        assert!(
+            t.contains(
+                "1200 agent event(s), 5 MB (2 purged thread(s), 7 turn(s)), into archive.db"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("the longest 14 ms"), "{t}");
+        assert!(
+            t.contains("VACUUM: twr.db 381 MB → 86 MB in 3100 ms"),
+            "{t}"
+        );
+        let t = log_compact_text(&json!({"skipped": "no agent events to move", "archived": false}));
+        assert_eq!(t, "moved nothing: no agent events to move\n");
+        let st = json!({
+            "db": {"bytes": 1000, "wal": 0, "free_pages": 3, "pages": 10,
+                   "auto_vacuum": "none",
+                   "kinds": {"agent.text": {"rows": 5, "bytes": 500}},
+                   "blobs": {"count": 1, "bytes": 10}},
+            "archive": null,
+            "backlog": {"full": 40, "compacted": 9},
+            "checkpoints": [{"id": 3, "age_secs": 600, "bytes": 2048, "events_after": 12}],
+            "retention_days": 30, "archive_on": true,
+            "next": {"rows": 5, "bytes": 500, "purged_threads": 0, "turns": 1,
+                     "automatic": false},
+        });
+        let t = log_stats_text(&st);
+        for want in [
+            "auto_vacuum none",
+            "archive.db   none yet",
+            "agent.text",
+            "control backlog: 40 item(s), 9 compacted",
+            "checkpoint 3: 10 min old, 2 KB, 12 event(s) after it",
+            "5 agent event(s), 500 bytes",
+            "the hub waits for 2 000",
+        ] {
+            assert!(t.contains(want), "{want}: {t}");
+        }
     }
 
     /// A socket that accepts connections but only answers after `quiet` has passed.

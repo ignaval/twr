@@ -76,6 +76,20 @@
 //!   `api_error_status` with the turn's API error message (an `assistant` message carrying
 //!   `error`), else `terminal_reason` / the subtype.
 //!
+//! Context compaction (Claude Code 2.1.304, see the recorded fixtures): `system/status`
+//! `status: "compacting"` starts one (`context.compacting`; Claude says nothing else until it
+//! ends, minutes on a large context); a later `status` with `compact_result: "failed"` (and
+//! `compact_error`) ends it unchanged (`context.compacted` with `error`); `system/compact_boundary`
+//! `compact_metadata {trigger, pre_tokens, post_tokens, duration_ms}` is the compaction done
+//! (`context.compacted`). The synthetic user message that follows (`isSynthetic`, the summary)
+//! and the replayed `<local-command-stdout>` are neither a prompt nor the agent's text: nothing.
+//! A manual compaction is the user message `/compact` ([`Translator::compact_message`]): its
+//! `compacting` comes before the `init` (it opens the queued turn), and its `result` ran no
+//! agent call (`num_turns: 0`, `local_command: compact`, usage all zero; the summary itself is
+//! a model call, billed: the total cost goes up) and ends that turn as any other. A turn's `turn.ended` `context` is its `result` `usage` (input, cache writes
+//! and cache reads: the last call's) and the largest `modelUsage[].contextWindow`; after a
+//! compaction with no call since, the boundary's `post_tokens`.
+//!
 //! Turn stamping: every user message written for turn `n` queues `n`; the first in-turn line
 //! after a `result` (normally the next `system/init`) opens the oldest queued turn, and the
 //! `result` closes it. Claude runs queued user messages as separate turns in order, so FIFO
@@ -384,6 +398,21 @@ pub struct Translator {
     notice_quiet: bool,
     /// The last turn ended `error`.
     last_failed: bool,
+    /// Turns written as `/compact` ([`Translator::compact_message`]) not ended yet: a
+    /// compaction in them is `manual`.
+    compact_turns: std::collections::HashSet<u64>,
+    /// The trigger of the compaction under way (`system/status` `compacting` seen, no end yet).
+    compacting: Option<String>,
+    /// The context a compaction left, until a model call reports another: what a turn that
+    /// ran no agent call (a manual `/compact`'s) ends with.
+    compacted_to: Option<u64>,
+    /// The model's context window, as the last `result`'s `modelUsage` said.
+    context_window: Option<u64>,
+    /// A compaction began in the runtime's turn opened for a notification while its run was
+    /// awaited ([`Watch::NoticeRun`]): the wait is held until the compaction ends (at most
+    /// [`twr_core::event::COMPACTING_HOLD_SECS`]), then starts again (a compaction can take
+    /// longer than the wait).
+    notice_held: bool,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
 }
@@ -431,6 +460,11 @@ impl Translator {
             absorb_result: false,
             notice_quiet: false,
             last_failed: false,
+            compact_turns: Default::default(),
+            compacting: None,
+            compacted_to: None,
+            context_window: None,
+            notice_held: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
@@ -532,6 +566,13 @@ impl Translator {
             "session_id": "",
         })
         .to_string()
+    }
+
+    /// The stdin line starting turn `turn` as a compaction of the context: the user message
+    /// `/compact`, as given (Claude runs it as its own command, not a prompt).
+    pub fn compact_message(&mut self, turn: u64) -> String {
+        self.compact_turns.insert(turn);
+        self.user_message("/compact", turn)
     }
 
     /// The stdin line interrupting the running turn, if one is running or queued.
@@ -721,13 +762,17 @@ impl Translator {
         // A line of the main agent's run: the notification's run started. Not a subagent's
         // line, a task's, a rate limit's, the answer to a request of twr's, a request for the
         // user (a subagent's carries no mark of it; while one is open the wait is held, and it
-        // starts again when the last closes), nor anything unknown (a `result` is
-        // [`Translator::on_result`]'s to judge).
+        // starts again when the last closes), nor a compaction's bookkeeping (its summary,
+        // `isSynthetic`, and a replayed command output, `isReplay`: a compaction's end starts
+        // the wait again), nor anything unknown (a `result` is [`Translator::on_result`]'s to
+        // judge).
         let kind = str_at(&v, "type");
         let main = v.get("parent_tool_use_id").is_none_or(Value::is_null);
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
         let run_line = match kind {
             "system" => matches!(str_at(&v, "subtype"), "init" | "api_retry"),
-            "stream_event" | "assistant" | "user" => main,
+            "user" => main && !flag("isSynthetic") && !flag("isReplay"),
+            "stream_event" | "assistant" => main,
             _ => false,
         };
         if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
@@ -753,6 +798,7 @@ impl Translator {
                     self.read_usage(&mut out);
                 }
                 self.on_task(&v, line, &mut out);
+                self.on_compaction(&v, line, &mut out);
                 // Claude retries a request refused for authentication before giving up.
                 if str_at(&v, "subtype") == "api_retry" && str_at(&v, "error") == AUTH_FAILED {
                     self.in_turn();
@@ -1108,6 +1154,85 @@ impl Translator {
         }
     }
 
+    /// A compaction's start, failure or end (see the module docs).
+    fn on_compaction(&mut self, v: &Value, line: &str, out: &mut Translated) {
+        match str_at(v, "subtype") {
+            "status" if str_at(v, "status") == "compacting" => {
+                // A manual one comes before the `init` of the turn written for it: the oldest
+                // queued turn is the one it runs in.
+                let turn = if self.active {
+                    self.turn
+                } else {
+                    self.queued.front().copied()
+                };
+                let manual = turn.is_some_and(|t| self.compact_turns.contains(&t));
+                let trigger = if manual { "manual" } else { "auto" };
+                self.compacting = Some(trigger.to_string());
+                // The notification's run is compacting: its wait holds until that ends, for
+                // as long as the hub holds its stall checks for one at most.
+                if matches!(self.watch, Some((Watch::NoticeRun, _))) {
+                    let hold =
+                        std::time::Duration::from_secs(twr_core::event::COMPACTING_HOLD_SECS);
+                    self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(hold)));
+                    self.notice_held = true;
+                }
+                let body = EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                    trigger: Some(trigger.into()),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "status" if str_at(v, "compact_result") == "failed" => {
+                self.resume_notice_wait();
+                let trigger = self.compacting.take().unwrap_or_else(|| "auto".into());
+                let error = match str_at(v, "compact_error") {
+                    "" => "failed".to_string(),
+                    e => e.to_string(),
+                };
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    error: Some(error),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "compact_boundary" => {
+                self.resume_notice_wait();
+                let m = &v["compact_metadata"];
+                let n = |k: &str| m.get(k).and_then(Value::as_u64);
+                let trigger = match str_at(m, "trigger") {
+                    "" => self.compacting.clone().unwrap_or_else(|| "auto".into()),
+                    t => t.to_string(),
+                };
+                self.compacting = None;
+                self.compacted_to = n("post_tokens");
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    pre_tokens: n("pre_tokens"),
+                    post_tokens: n("post_tokens"),
+                    duration_ms: n("duration_ms"),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            _ => {}
+        }
+    }
+
+    /// A compaction that held a notification's wait ended: the wait starts again from now
+    /// (its run's output ends it as usual; none within it ends the turn `no_run`).
+    fn resume_notice_wait(&mut self) {
+        if std::mem::take(&mut self.notice_held)
+            && self.notice_quiet
+            && self.active
+            && self.turn.is_none()
+            && self.runtime_turn.is_some()
+        {
+            let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
+            self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
+        }
+    }
+
     /// A background task of the main agent's ended: Claude starts a run of its own for its
     /// notification. With no turn running or queued, the runtime's turn opens now, not at the
     /// run's first output (see the module docs).
@@ -1193,6 +1318,7 @@ impl Translator {
             e.raw = None;
             if let EventBody::TurnEnded(t) = &mut e.body {
                 t.usage = None;
+                t.context = None;
                 if let Some(claude) = t.ext.as_mut().and_then(|x| x.get_mut(EXT)) {
                     if let Some(c) = claude.as_object_mut() {
                         c.retain(|k, _| k == "mode_changed" || k == "mode_note");
@@ -1249,6 +1375,8 @@ impl Translator {
         }
         let ev = &v["event"];
         if str_at(ev, "type") == "message_start" {
+            // A model call: what a compaction left is no longer the context.
+            self.compacted_to = None;
             self.model_ran = true;
             self.absorb_result = false;
             self.notice_quiet = false;
@@ -1753,6 +1881,10 @@ impl Translator {
         if !self.pending.is_empty() {
             return;
         }
+        // (A compaction holds a notification run's wait, whatever closed meanwhile.)
+        if matches!(self.watch, Some((Watch::NoticeRun, _))) && self.notice_held {
+            return;
+        }
         if let Some((watch, _)) = self.watch {
             let after = match watch {
                 Watch::Result => self
@@ -1864,6 +1996,31 @@ impl Translator {
             output: tok("output_tokens"),
             cost,
         };
+        // How full the context is: the last call's input, else (no call since a compaction,
+        // a manual `/compact`'s turn) what the compaction left.
+        let window = v["modelUsage"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+            .filter_map(|m| m.get("contextWindow").and_then(Value::as_u64))
+            .max();
+        if window.is_some() {
+            self.context_window = window;
+        }
+        let context = if usage.input > 0 {
+            self.compacted_to = None;
+            Some(usage.input)
+        } else {
+            self.compacted_to
+        }
+        .map(|tokens| twr_core::event::ContextSize {
+            tokens,
+            window: self.context_window,
+        });
+        if let Some(t) = turn {
+            self.compact_turns.remove(&t);
+        }
+        self.compacting = None;
 
         let mut claude = Map::new();
         claude.insert("subtype".into(), json!(subtype));
@@ -1922,6 +2079,7 @@ impl Translator {
                 session_id,
                 usage: Some(usage),
                 duration_ms: v.get("duration_ms").and_then(Value::as_u64),
+                context,
                 ext,
                 ..Default::default()
             }),
@@ -3438,6 +3596,75 @@ mod tests {
         assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
         assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
         assert!(!t.busy());
+    }
+
+    /// A notification's run that begins by compacting the context (minutes of silence, the
+    /// compaction's own lines aside) is no run that never came: the wait holds while it
+    /// compacts (for `COMPACTING_HOLD_SECS` at most) and starts again once it ended.
+    #[test]
+    fn a_compaction_holds_a_notification_runs_wait() {
+        let status = |s: &str| {
+            json!({"type": "system", "subtype": "status", "status": s, "session_id": "s"})
+                .to_string()
+        };
+        let boundary = json!({"type": "system", "subtype": "compact_boundary",
+            "session_id": "s", "compact_metadata": {"trigger": "auto", "pre_tokens": 900_000,
+            "post_tokens": 40_000}})
+        .to_string();
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        let wait = t.deadline().unwrap();
+        let events = feed(&mut t, &[&status("compacting")]);
+        assert!(matches!(events[0].body, EventBody::ContextCompacting(_)));
+        let held = t.deadline().unwrap();
+        assert!(
+            held - wait > chrono::Duration::minutes(20),
+            "held for the compaction"
+        );
+        assert!(t
+            .expire(wait + chrono::Duration::minutes(5))
+            .events
+            .is_empty());
+        assert!(t.busy(), "the turn still runs");
+        // Done compacting: the wait starts again, and ends the turn if still nothing runs;
+        // the summary Claude writes into the session (`isSynthetic`) and a replayed command
+        // output (`isReplay`) are no run.
+        let summary = json!({"type": "user", "isSynthetic": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text",
+            "text": "This session is being continued from a previous conversation."}]}})
+        .to_string();
+        let replayed = json!({"type": "user", "isReplay": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user",
+            "content": "<local-command-stdout>Compacted </local-command-stdout>"}})
+        .to_string();
+        feed(&mut t, &[&boundary, &summary, &replayed]);
+        let again = t.deadline().unwrap();
+        assert!(again < held);
+        let events = t.expire(again).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        // A request of the user's closed meanwhile (a subagent's permission answered or
+        // withdrawn) leaves the hold as it is.
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let held = t.deadline().unwrap();
+        t.translate(r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","message":"Name?"}}"#);
+        t.translate(r#"{"type":"control_cancel_request","request_id":"e1"}"#);
+        assert_eq!(t.deadline(), Some(held));
+        // Held no longer than the hub holds its stall checks.
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
     }
 
     /// Claude 2.1.295+ folds a prompt written into a run it started itself into that run, and

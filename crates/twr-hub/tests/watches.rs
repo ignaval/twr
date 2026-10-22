@@ -148,6 +148,7 @@ impl Env {
             match name {
                 "fake" => Some(Arc::clone(&fake)),
                 "claude-code" => Some(Arc::clone(&orch)),
+                "bgc" => Some(Arc::new(BgCompact)),
                 _ => None,
             }
         });
@@ -745,5 +746,126 @@ async fn watches_replay_and_go_with_unwatch_deletion_and_reset() {
     let hub = env.reopen().await;
     assert!(watch_ids(&hub).is_empty());
     assert_eq!(watch(&hub, "*", "tell the user", true)["watch"], "w4");
+    hub.shutdown().await;
+}
+
+/// Runtime `bgc`: a prompt's turn yields with task `tests` running (an interim report); a
+/// compaction ends that task while it compacts.
+struct BgCompact;
+
+impl Adapter for BgCompact {
+    fn info(&self) -> AdapterInfo {
+        AdapterInfo {
+            name: "bgc",
+            tier: Tier::Headless,
+            description: "background work ending during a compaction",
+        }
+    }
+
+    fn compacts(&self) -> bool {
+        true
+    }
+
+    fn spawn(&self, _cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
+        let (h, mut end) = AdapterHandle::pair();
+        tokio::spawn(async move {
+            end.emit(
+                EventBody::ThreadStarted(SessionPayload {
+                    session_id: Some("s-bgc".into()),
+                    ..Default::default()
+                }),
+                None,
+            );
+            let mut first = prompt.map(|_| 1);
+            loop {
+                let cmd = match first.take() {
+                    Some(turn) => AdapterCmd::Send {
+                        text: String::new(),
+                        turn,
+                    },
+                    None => match end.cmds.recv().await {
+                        Some(c) => c,
+                        None => break,
+                    },
+                };
+                match cmd {
+                    AdapterCmd::Send { turn, .. } => {
+                        end.emit(task(true), None);
+                        end.emit(
+                            EventBody::AgentText(AgentText {
+                                text: "Tests are running in the background.".into(),
+                                is_final: true,
+                                ..Default::default()
+                            }),
+                            Some(turn),
+                        );
+                        end.emit(EventBody::TurnEnded(TurnEnded::default()), Some(turn));
+                    }
+                    AdapterCmd::Compact { turn } => {
+                        end.emit(
+                            EventBody::ContextCompacting(ContextCompacting::default()),
+                            Some(turn),
+                        );
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        end.emit(task(false), None);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        end.emit(
+                            EventBody::ContextCompacted(ContextCompacted {
+                                trigger: "manual".into(),
+                                ..Default::default()
+                            }),
+                            Some(turn),
+                        );
+                        end.emit(EventBody::TurnEnded(TurnEnded::default()), Some(turn));
+                    }
+                    AdapterCmd::Stop => break,
+                    _ => {}
+                }
+            }
+            end.exited(Some(0), "");
+        });
+        Ok(h)
+    }
+}
+
+/// With the hub's wake off, a worker whose background work ends while the user compacts its
+/// context is idle after the compaction, which reported nothing: its interim report stands,
+/// and its watch fires with the idle line.
+#[tokio::test]
+async fn work_that_ends_during_a_compaction_fires_the_idle_watch_after_it() {
+    let mut env = Env::new();
+    let hub = env.hub(None).await;
+    let api = hub
+        .new_thread(
+            NewThread {
+                project: env.path().to_string_lossy().into_owned(),
+                runtime: Some("bgc".into()),
+                name: Some("api".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (mut rt, t1) = env.orchestrator(&hub).await;
+    watch(&hub, "api", "tell the user", false);
+    rt.end_turn(t1, "Watching api.");
+    let mut sub = hub.subscribe_control(0);
+    hub.send_by(&api, "run the tests", &tui()).unwrap();
+    until(&mut sub, report_of(&api, 1)).await;
+    hub.compact_thread(&api, &tui()).unwrap();
+    until(&mut sub, |e| {
+        e.kind() == "turn.ended" && e.thread == api && e.turn == Some(2)
+    })
+    .await;
+    let (notice, _) = rt.next_turn().await;
+    assert!(
+        notice.lines().any(|l| l.starts_with("- thread=api idle:")),
+        "{notice}"
+    );
+    drop(rt);
     hub.shutdown().await;
 }

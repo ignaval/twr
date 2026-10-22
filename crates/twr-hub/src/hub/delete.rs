@@ -945,7 +945,7 @@ fn added_since_card(card: &DeleteCard, targets: &[Target]) -> Vec<String> {
 }
 
 /// An open delete card, from its `attention.raised` (live and on replay).
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct DeleteCard {
     /// The threads it deletes, in order.
     pub(super) threads: Vec<String>,

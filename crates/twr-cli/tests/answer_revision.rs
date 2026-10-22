@@ -130,7 +130,7 @@ async fn play(mut end: AdapterEnd, turn: Option<u64>, told: Told) {
                 }
             }
             AdapterCmd::Stop | AdapterCmd::Interrupt => break,
-            AdapterCmd::Send { .. } => {}
+            AdapterCmd::Send { .. } | AdapterCmd::Compact { .. } => {}
         }
     }
     end.exited(Some(0), "");

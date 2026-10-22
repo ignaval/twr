@@ -1399,3 +1399,83 @@ async fn a_connection_holds_a_bounded_number_of_subscriptions() {
     th.hub.request_shutdown();
     let _ = timeout(WAIT, th.task).await;
 }
+
+/// `control.subscribe` with `compact`: the ack says how many stored items come before the
+/// live ones, and they are the latest of what folds to the latest; then live items follow.
+/// Without it nothing changes; a `compact` that is no boolean, or one asked of
+/// `control.read`, is refused.
+#[tokio::test]
+async fn a_compacted_control_subscription_says_its_backlog() {
+    let th = start().await;
+    let snapshot = |dirty| {
+        EventBody::GitSnapshot(twr_core::event::GitSnapshot {
+            dirty_files: dirty,
+            ..Default::default()
+        })
+    };
+    for dirty in 0..50 {
+        th.hub
+            .append("w1", None, Source::Hub, snapshot(dirty), None)
+            .unwrap();
+    }
+    // A task that ran and ended with nothing reading it: the head, not in the backlog.
+    for running in [true, false] {
+        let task = EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+            task_id: "bg".into(),
+            running,
+            ..Default::default()
+        });
+        let source = Source::Adapter("fake".into());
+        th.hub.append("w1", None, source, task, None).unwrap();
+    }
+    let mut full = Client::subscribe_at(&th.socket, "control.subscribe", json!({"since": 0}))
+        .await
+        .unwrap();
+    assert_eq!(full.ack()["head"], 52);
+    assert!(full.ack().get("backlog").is_none() && full.ack().get("compacted").is_none());
+    let mut sub = Client::subscribe_at(
+        &th.socket,
+        "control.subscribe",
+        json!({"since": 0, "compact": true}),
+    )
+    .await
+    .unwrap();
+    let ack = sub.ack().clone();
+    assert_eq!(ack["head"], 52, "{ack}");
+    assert_eq!(ack["compacted"], true, "{ack}");
+    // The thread's first item (its view starts then) and its latest snapshot.
+    assert_eq!(ack["backlog"], 2, "{ack}");
+    assert_eq!(next_item(&mut sub).await.gseq, Some(1));
+    let last = next_item(&mut sub).await;
+    assert_eq!(last.gseq, Some(50));
+    assert_eq!(last.event.body, snapshot(49));
+    th.hub
+        .append("w1", None, Source::Hub, snapshot(7), None)
+        .unwrap();
+    assert_eq!(next_item(&mut sub).await.gseq, Some(53));
+    for g in 1..=53 {
+        assert_eq!(next_item(&mut full).await.gseq, Some(g));
+    }
+
+    // From the head: nothing stored to wait for.
+    let at_head = Client::subscribe_at(
+        &th.socket,
+        "control.subscribe",
+        json!({"since": 53, "compact": true}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(at_head.ack()["backlog"], 0);
+
+    for (method, params) in [
+        ("control.subscribe", json!({"since": 0, "compact": "yes"})),
+        ("control.read", json!({"since": 0, "compact": true})),
+    ] {
+        let e = Client::subscribe_at(&th.socket, method, params)
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::BAD_REQUEST, "{method}");
+    }
+    th.hub.request_shutdown();
+    let _ = timeout(WAIT, th.task).await;
+}

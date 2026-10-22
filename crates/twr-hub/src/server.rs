@@ -24,6 +24,7 @@
 //! | `say`               | `{message, focused?, seen_gseq?}`                   | `{action, thread?, thread_name?, ref?, turn?, attn_id?, options?, answer?, decision_ids}` |
 //! | `message.withdraw`  | `{thread, ref}` (users only)                        | `{withdrawn: true, state: "queued" \| "running", thread, thread_name, ref, prompt, turn?}` or `{withdrawn: false, reason: "acted" \| "ended" \| "uninterruptible" \| "withdrawn" \| "unknown", message, thread, thread_name, ref, turn?}` (`hub::withdraw`) |
 //! | `message.send_now`  | `{thread, ref}` (users only)                        | `{sent_now: true, state: "interrupting" \| "started" \| "waiting", thread, thread_name, ref, turn?, message?}` or `{sent_now: false, reason: "unknown" \| "not_next" \| "uninterruptible", message, ...}`: runs the next queued message now, interrupting the turn that runs (`hub::queue`) |
+//! | `thread.compact`    | `{thread}` (users only)                             | `{thread, thread_name, state: "started" \| "queued", turn?, already?}`: compacts the thread's context in a turn of its own, now or after its running turn and the messages queued before (`hub::compact`); refused for a runtime that cannot, a remote box, a thread with no session, parked or attached |
 //! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, newest_mine, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
 //! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
 //! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
@@ -37,6 +38,8 @@
 //! | `trash.list`        | -                                                   | `{items: [{item, short, thread, thread_name, project, box, deleted_at, deleted_at_ms, purge_at, purge_at_ms, bytes, size, losses, worktree, branch, dir, incomplete?, kept?, box_offline?}], keep_days, bytes, size, unavailable: [{box, error}], message}` (oldest first) |
 //! | `trash.empty`       | `{items?: [string], all?, dry_run?}` (users only)   | `{purged: [{item, short, thread_name, box, bytes}], failed: [{item, box, error}], bytes, size, message}`; with `dry_run` nothing is purged: `{dry_run: true, items: [item as in trash.list], bytes, size, message}` (clients purge exactly those ids after asking) |
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
+//! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
+//! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
 //! | `orchestrator.show` | -                                                   | `{available, runtime, model, thread, name, status, live, configured: {runtime, model}, retired, runtimes}` |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
 //! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
@@ -50,10 +53,10 @@
 //! | `attach.begin`      | `{thread, force?}`                                  | `{thread, lease, argv, cwd, env, session_id, runtime, box?, trust_prompt?}` |
 //! | `attach.child`      | `{thread, pid, start_time}` (on the connection that attached) | `{thread}` |
 //! | `attach.end`        | `{thread}` (on the connection that attached)        | `{thread, detached: true}` |
-//! | `thread.events`     | `{thread, since_seq?, limit?}`                      | `{thread, events: [event], last_seq, next, more}` |
+//! | `thread.events`     | `{thread, since_seq?, limit?}`                      | `{thread, events: [event], last_seq, next, more}` (archived events too; `thread` may be a deleted thread's id) |
 //! | `thread.subscribe`  | `{thread, since_seq?}`                              | ack `{thread, since_seq, head}`, then `{"stream":"thread","event":...}` items |
 //! | `control.read`      | `{since?, limit?}`                                  | `{items: [{"stream":"control","gseq","event"}], head, next, more}` |
-//! | `control.subscribe` | `{since?}`                                          | ack `{since, head}`, then `{"stream":"control","gseq":n,"event":...}` items |
+//! | `control.subscribe` | `{since?, compact?}`                                | ack `{since, head}` (with `compact`: `backlog, compacted: true`), then `{"stream":"control","gseq":n,"event":...}` items |
 //! | `blob.get`          | `{ref, offset?, len?}`                              | `{ref, size, offset, encoding: "utf8" \| "base64", data, eof}` |
 //! | `context.read`      | `{project}`                                         | `{project, path, content, hash, bytes, remote, utf8, truncated}` |
 //! | `project.files`     | `{project, path?, thread?}`                         | `{project, commit, branch_of, path, entries: [{name, kind, size, utf8?, secret?}], total, more}`: a directory of a committed tree (`hub::project_read`; not for agents) |
@@ -671,6 +674,7 @@ pub const METHODS: &[&str] = &[
     "thread.subscribe",
     "message.withdraw",
     "message.send_now",
+    "thread.compact",
     "thread.queue",
     "shell.run",
     "shell.cd",
@@ -679,6 +683,8 @@ pub const METHODS: &[&str] = &[
     "trash.list",
     "trash.empty",
     "trash.restore",
+    "log.compact",
+    "log.stats",
     "orchestrator.show",
     "orchestrator.reset",
     "orchestrator.use",
@@ -1008,8 +1014,8 @@ async fn connection(
                 match sub_slot(&sub_count, subs.len(), agent)
                     .and_then(|slot| Ok((slot, control_subscribe(&hub, req.params)?)))
                 {
-                    Ok((slot, (ack, sub))) => {
-                        subs.spawn(pump_control(writer.clone(), id, ack, sub, slot));
+                    Ok((slot, (since, sub))) => {
+                        subs.spawn(pump_control(writer.clone(), id, since, sub, slot));
                     }
                     Err(e) => {
                         let _ = send(&writer, &Response::err(id, e)).await;
@@ -1078,8 +1084,8 @@ async fn connection(
             "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "project.files" | "project.read" | "project.search" | "box.add" | "box.install"
-            | "box.restart" | "box.projects" | "box.token" => {
+            | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
+            | "box.add" | "box.install" | "box.restart" | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
@@ -1270,15 +1276,31 @@ struct Item<'a> {
     event: &'a Event,
 }
 
-/// Serves control subscription `sub` (request `id`, acknowledged with `ack`) until it ends,
-/// counted in the hub's subscriptions (`_slot`) meanwhile.
+/// Serves control subscription `sub` (request `id`, from `since`) until it ends, counted in
+/// the hub's subscriptions (`_slot`) meanwhile. A compacted one is acknowledged once its
+/// backlog is selected, with how many items it has (`backlog`); the selection failing fails
+/// the request.
 async fn pump_control(
     w: Writer,
     id: u64,
-    ack: Value,
-    sub: crate::hub::ControlSubscription,
+    since: u64,
+    mut sub: crate::hub::ControlSubscription,
     _slot: SubSlot,
 ) {
+    let mut ack = json!({ "since": since, "head": sub.head() });
+    if sub.compacted() {
+        match sub.compact().await {
+            Ok(backlog) => {
+                ack["backlog"] = json!(backlog);
+                ack["compacted"] = json!(true);
+            }
+            Err(e) => {
+                let e = RpcError::new(codes::INTERNAL, format!("{e:#}"));
+                let _ = send(&w, &Response::err(id, e)).await;
+                return;
+            }
+        }
+    }
     pump(w, id, ack, sub).await;
 }
 
@@ -1864,6 +1886,21 @@ struct ControlParams {
     limit: Option<usize>,
 }
 
+/// `control.subscribe`'s parameters. An older hub refuses `compact` (`bad_request`): a client
+/// asks again without it.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscribeParams {
+    #[serde(default)]
+    since: u64,
+    /// Accepted, as it always was (it was `control.read`'s), and unused.
+    #[allow(dead_code)]
+    limit: Option<usize>,
+    /// Compact the stored backlog ([`twr_core::compact`]).
+    #[serde(default)]
+    compact: bool,
+}
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BlobParams {
@@ -1972,6 +2009,20 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             hub.trash_restore(&p.item, p.as_name.as_deref(), caller)
                 .await
         }
+        // A compaction of the log now (`hub::prune`).
+        "log.compact" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct LogCompactParams {
+                #[serde(default)]
+                vacuum: bool,
+                #[serde(default)]
+                drop_checkpoints: bool,
+            }
+            let p: LogCompactParams = params(p)?;
+            hub.log_compact(p.vacuum, p.drop_checkpoints, caller).await
+        }
+        "log.stats" => hub.log_stats(caller).await,
         // Reads config.toml and boxes.toml again (`hub::boxes`).
         "box.add" => {
             let p: BoxParams = params(p)?;
@@ -2494,6 +2545,10 @@ fn call(
             let p: WithdrawParams = params(p)?;
             hub.send_now(&p.thread, p.msg_ref, caller)
         }
+        "thread.compact" => {
+            let p: ThreadRef = params(p)?;
+            hub.compact_thread(&p.thread, caller)
+        }
         "thread.queue" => {
             let p: ThreadRef = params(p)?;
             hub.thread_queue(&p.thread, caller)
@@ -2684,14 +2739,13 @@ fn call(
     }
 }
 
+/// `control.subscribe`: the subscription, and the `since` it starts after.
 fn control_subscribe(
     hub: &Hub,
     p: Value,
-) -> Result<(Value, crate::hub::ControlSubscription), RpcError> {
-    let p: ControlParams = params(p)?;
-    let sub = hub.subscribe_control(p.since);
-    let ack = json!({ "since": p.since, "head": sub.head() });
-    Ok((ack, sub))
+) -> Result<(u64, crate::hub::ControlSubscription), RpcError> {
+    let p: SubscribeParams = params(p)?;
+    Ok((p.since, hub.subscribe_control_with(p.since, p.compact)))
 }
 
 fn thread_subscribe(

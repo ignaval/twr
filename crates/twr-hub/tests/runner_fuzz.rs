@@ -458,6 +458,7 @@ impl Sess {
 
     fn on_cmd(&mut self, cmd: Option<AdapterCmd>, waiting: Option<&str>) -> Flow<Option<Answer>> {
         match cmd {
+            Some(AdapterCmd::Compact { .. }) => Ok(None),
             Some(AdapterCmd::Send { text, turn }) => {
                 self.queue.push_back((text, turn));
                 Ok(None)

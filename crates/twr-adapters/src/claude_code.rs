@@ -371,6 +371,11 @@ impl Adapter for ClaudeCodeAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// `/compact` as the turn's message ([`Translator::compact_message`]).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let mode = permission_mode(&cfg)?;
@@ -874,6 +879,11 @@ fn on_cmd(
             if let Some(line) = tr.interrupt() {
                 queue_line(stdin, line);
             }
+            false
+        }
+        Some(AdapterCmd::Compact { turn }) => {
+            let line = tr.compact_message(turn);
+            queue_line(stdin, line);
             false
         }
         Some(AdapterCmd::Stop) | None => true,

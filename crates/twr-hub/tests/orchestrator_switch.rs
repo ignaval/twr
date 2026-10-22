@@ -164,7 +164,7 @@ impl Adapter for OrchAdapter {
                         let _ = stop_tx.send(());
                         return;
                     }
-                    AdapterCmd::Respond { .. } => {}
+                    AdapterCmd::Respond { .. } | AdapterCmd::Compact { .. } => {}
                 }
             }
         });

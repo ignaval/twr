@@ -61,6 +61,24 @@
 //!   account's credit period, `{config: {currentPeriod: {type: USAGE_PERIOD_TYPE_WEEKLY, start,
 //!   end}, creditUsagePercent, ...}, subscription_tier}` ([`billing_windows`]); read when
 //!   [`TranslatorOptions::usage`] is set (the adapter sets it).
+//! - Context compaction (grok 1.0.62, see the `real_compact_*` recordings): notifications
+//!   `_x.ai/session_notification` `{sessionId, update: {sessionUpdate, ...}}`
+//!   ([`compaction`]). An auto-compaction (at the start of a prompt, before the model call, once
+//!   the context passes `[session] auto_compact_threshold_percent`, 85 by default, or
+//!   `GROK_AUTO_COMPACT_THRESHOLD_PERCENT`) is `auto_compact_started` (`tokens_used`,
+//!   `context_window`, `percentage`, `reason`; `context.compacting`), seconds of silence, then
+//!   `auto_compact_completed` (`tokens_before`, `tokens_after`, `elapsed_ms`;
+//!   `context.compacted`), inside the prompt's turn. The user's compaction is the prompt
+//!   `/compact` (a turn of its own, which grok queues behind a running prompt): it sends only
+//!   an `auto_compact_completed` whose counters do not hold (`tokens_after` equal to or more
+//!   than `tokens_before`): unknown then. `auto_compact_failed` / `_cancelled` were not seen
+//!   live; they are read as a failure. `_x.ai/compact_conversation` is not used: it is no
+//!   turn, and during a prompt it drops that prompt's answer from the context. A
+//!   `session/load` replays the compaction as `_x.ai/session/update` (with a replay-only
+//!   `compaction_checkpoint`): not recorded again. How full the context is: the prompt
+//!   result's `_meta.totalTokens` (0, ignored, for a turn that called no model, `/compact`'s);
+//!   the window: the model catalog's `totalContextTokens` (`initialize`
+//!   `_meta.modelState`).
 //! - Everything else grok sends under `_x.ai/*` / `x.ai/*` (setup phases, queue, usage, hooks,
 //!   MCP status, ...) is ignored.
 //! - `thread.started` `ext.grok` adds `verified_with`, the profile's `tools` and the
@@ -74,7 +92,7 @@ pub use crate::acp::translate::{
     Emitted, ModeLevel, Options, Translated, INPUT_SUMMARY_MAX, OUTPUT_SUMMARY_MAX,
     OVERSIZED_ERROR, PLAN_MAX, PROTOCOL_VERSION, RISKY_KINDS,
 };
-use crate::acp::translate::{Dialect, ExtRequest, SessionCtx, ToolMeta};
+use crate::acp::translate::{Compaction, Dialect, ExtRequest, SessionCtx, ToolMeta};
 #[cfg(test)]
 use twr_core::event::{EventBody, TurnResult};
 
@@ -95,6 +113,49 @@ pub const BILLING_METHOD: &str = "_x.ai/billing";
 
 /// Grok's session-list notification (carries `yolo` per session).
 pub const SESSIONS_CHANGED: &str = "_x.ai/sessions/changed";
+
+/// Grok's session notifications (hooks, turn ends, auto-compaction, ...).
+pub const SESSION_NOTIFICATION: &str = "_x.ai/session_notification";
+
+/// What a [`SESSION_NOTIFICATION`] (`params`) says of a compaction, if it is about one (see
+/// the module docs). A replay's (`_x.ai/session/update`) is none: it happened before.
+pub fn compaction(method: &str, params: &Value) -> Option<Compaction> {
+    if method != SESSION_NOTIFICATION {
+        return None;
+    }
+    let u = params.get("update").unwrap_or(params);
+    let kind = u
+        .get("sessionUpdate")
+        .or_else(|| u.get("type"))
+        .and_then(Value::as_str)?;
+    let n = |keys: &[&str]| keys.iter().find_map(|k| u.get(*k).and_then(Value::as_u64));
+    Some(match kind {
+        "auto_compact_started" => Compaction::Started {
+            tokens: n(&["tokens_used"]),
+            window: n(&["context_window"]),
+        },
+        "auto_compact_completed" => {
+            let (before, after) = (n(&["tokens_before"]), n(&["tokens_after"]));
+            // A manual one's counters do not hold (1.0.62: equal, or growing).
+            let held = matches!((before, after), (Some(b), Some(a)) if a < b);
+            Compaction::Completed {
+                before: before.filter(|_| held),
+                after: after.filter(|_| held),
+                elapsed_ms: n(&["elapsed_ms"]),
+            }
+        }
+        "auto_compact_failed" => Compaction::Failed(
+            ["error", "message", "reason"]
+                .iter()
+                .find_map(|k| u.get(*k).and_then(Value::as_str))
+                .filter(|e| !e.trim().is_empty())
+                .unwrap_or("failed")
+                .to_string(),
+        ),
+        "auto_compact_cancelled" => Compaction::Failed("cancelled".into()),
+        _ => return None,
+    })
+}
 
 /// Static facts about the session a translator serves.
 #[derive(Debug, Clone, Default)]
@@ -147,6 +208,10 @@ pub struct Grok {
     yolo_overflow: bool,
     /// Read the credit usage ([`TranslatorOptions::usage`]).
     usage: bool,
+    /// Each model's context window (`initialize` `_meta.modelState.availableModels[]`
+    /// `_meta.totalContextTokens`), and the current model then.
+    windows: Vec<(String, u64)>,
+    current_model: Option<String>,
 }
 
 /// Sessions whose `yolo` is remembered while a new session opens.
@@ -223,6 +288,8 @@ impl Translator {
             yolo_seen: Vec::new(),
             yolo_overflow: false,
             usage: opts.usage,
+            windows: Vec::new(),
+            current_model: None,
         };
         let core = Options {
             thinking: opts.thinking,
@@ -276,6 +343,44 @@ impl Dialect for Grok {
         r.pointer("/_meta/agentVersion")
             .and_then(Value::as_str)
             .map(str::to_string)
+    }
+
+    /// The model catalog's context windows, for [`Dialect::context_window`].
+    fn on_initialized(&mut self, r: &Value) {
+        let state = r.pointer("/_meta/modelState");
+        self.current_model = state
+            .and_then(|m| m.get("currentModelId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        self.windows = state
+            .and_then(|m| m.get("availableModels"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| {
+                let id = m.get("modelId").and_then(Value::as_str)?;
+                let w = m
+                    .pointer("/_meta/totalContextTokens")
+                    .and_then(Value::as_u64)?;
+                Some((id.to_string(), w))
+            })
+            .collect();
+    }
+
+    fn compact_prompt(&self) -> Option<&'static str> {
+        Some("/compact")
+    }
+
+    fn compaction(&self, method: &str, params: &Value) -> Option<Compaction> {
+        compaction(method, params)
+    }
+
+    fn context_window(&self, model: Option<&str>) -> Option<u64> {
+        let model = model.or(self.current_model.as_deref())?;
+        self.windows
+            .iter()
+            .find(|(id, _)| id == model)
+            .map(|(_, w)| *w)
     }
 
     fn model_request(

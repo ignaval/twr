@@ -71,7 +71,7 @@ const TASKS_LISTED: usize = 10;
 pub const WAKE_PROMPT_START: &str = "[twr] Your background work finished";
 
 /// One task that ended since the worker's last turn ended.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct EndedTask {
     /// What its end said (a job's: `job <name>: exited 0 after 3m`).
     description: String,
@@ -80,7 +80,7 @@ struct EndedTask {
 }
 
 /// A wake waiting for its time.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Pending {
     /// The turn whose interim report the wake is for.
     turn: u64,
@@ -105,10 +105,11 @@ enum Ready {
 }
 
 /// The hub's wakes (see the module docs).
-#[derive(Debug, Default)]
+#[derive(PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct WakeState {
     /// [`super::HubOptions::wake_after`], set once the log is replayed (zero until then:
-    /// replay schedules no wake); zero = never.
+    /// replay schedules no wake); zero = never. Not in a checkpoint: the hub's setting.
+    #[serde(skip)]
     pub(super) after: chrono::Duration,
     pending: HashMap<String, Pending>,
     /// The tasks that ended since each thread's last turn ended (one that saw no run aside):
@@ -118,6 +119,10 @@ pub(super) struct WakeState {
     woken: HashMap<String, u64>,
     /// Wakes in a row per thread, with no turn of the user's or the orchestrator's since.
     chain: HashMap<String, u32>,
+    /// Threads whose open turn is a compaction (`hub::compact`): maintenance, which handles
+    /// none of the work that ended, and wakes after it as if it had not run.
+    #[serde(serialize_with = "twr_core::sorted::set")]
+    compacting: std::collections::HashSet<String>,
 }
 
 /// `report.ready` `ext.twr` key of the report of a turn that saw no run ([`no_run_report`]):
@@ -146,6 +151,23 @@ pub(super) fn no_run_of(r: &ReportReady) -> Option<u64> {
 }
 
 impl WakeState {
+    /// The fields checkpoints skip that are set (tests, `hub::checkpoint`).
+    #[cfg(test)]
+    pub(super) fn skipped_set(&self) -> Vec<&'static str> {
+        let WakeState {
+            after,
+            pending: _,
+            ended: _,
+            woken: _,
+            chain: _,
+            compacting: _,
+        } = self;
+        match after.is_zero() {
+            true => Vec::new(),
+            false => vec!["wake.after"],
+        }
+    }
+
     /// When thread `thread`'s pending wake is due, if one is.
     pub(super) fn due(&self, thread: &str) -> Option<DateTime<Utc>> {
         self.pending.get(thread).map(|p| p.due)
@@ -218,7 +240,12 @@ impl Core {
                     self.wake.pending.remove(&ev.thread);
                 }
             }
+            // A compaction handles none of the work: a wake waits for its end (`wake_ready`).
+            EventBody::TurnStarted(p) if is_compact_turn(p) => {
+                self.wake.compacting.insert(ev.thread.clone());
+            }
             EventBody::TurnStarted(p) => {
+                self.wake.compacting.remove(&ev.thread);
                 self.wake.pending.remove(&ev.thread);
                 // A turn of the user's or the orchestrator's: someone is looking after it.
                 if p.from != TurnFrom::Runtime {
@@ -226,14 +253,31 @@ impl Core {
                 }
             }
             // The tasks that ended before it were the turn's to handle; not those of a turn
-            // opened for a notification that saw no run: that turn handled nothing.
+            // opened for a notification that saw no run, nor a compaction's: those handled
+            // nothing. After a compaction, work that ended meanwhile wakes the worker as it
+            // would have without it.
             EventBody::TurnEnded(p) => {
                 let no_run = twr_ext(&p.ext)
                     .and_then(|t| t.get(NO_RUN_KEY))
                     .and_then(Value::as_bool)
                     == Some(true);
-                if !no_run {
+                let compact = self.wake.compacting.remove(&ev.thread);
+                if !no_run && !compact {
                     self.wake.ended.remove(&ev.thread);
+                }
+                let ended = self
+                    .wake
+                    .ended
+                    .get(&ev.thread)
+                    .is_some_and(|e| !e.is_empty());
+                if compact
+                    && ended
+                    && self.wake.after > chrono::Duration::zero()
+                    && !self.wake.pending.contains_key(&ev.thread)
+                {
+                    if let Some(turn) = self.registry.get(&ev.thread).and_then(interim_turn) {
+                        self.schedule_wake(&ev.thread, turn, ev.ts + self.wake.after);
+                    }
                 }
             }
             // The report of a turn that saw no run, the worker idle: woken at once.
@@ -339,8 +383,13 @@ impl Core {
         let Some(v) = self.registry.get(id) else {
             return Ok(Ready::Never);
         };
+        // A compaction runs: the wake goes after it.
+        if v.current_turn_compact {
+            return Ok(Ready::Later);
+        }
+        // (`last_turn`, not `turns`: a compaction since is no turn of work.)
         if interim_turn(v) != Some(turn)
-            || v.turns != turn
+            || v.last_turn.as_ref().map(|t| t.turn) != Some(turn)
             || v.attached.is_some()
             || v.crashed
             || v.is_blocked()

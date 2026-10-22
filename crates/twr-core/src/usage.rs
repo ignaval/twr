@@ -196,7 +196,7 @@ pub fn changed(old: &[UsageWindow], new: &[UsageWindow]) -> bool {
 }
 
 /// The latest known usage of one account of one runtime.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageEntry {
     /// Runtime name (`claude-code`, `codex`, `grok-build`, ...).
     pub runtime: String,
@@ -265,10 +265,29 @@ fn runtime_rank(runtime: &str) -> (u8, &str) {
     }
 }
 
-/// The latest usage per runtime and account, folded from `account.usage` events.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// The latest usage per runtime and account, folded from `account.usage` events. Serialized
+/// (in the hub's checkpoints of its folded state) as its entries, in order: each one's key is
+/// its runtime and account.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "Vec<UsageEntry>", into = "Vec<UsageEntry>")]
 pub struct UsageView {
     entries: BTreeMap<(String, Option<String>), UsageEntry>,
+}
+
+impl From<Vec<UsageEntry>> for UsageView {
+    fn from(entries: Vec<UsageEntry>) -> Self {
+        let entries = entries
+            .into_iter()
+            .map(|e| ((e.runtime.clone(), e.account.clone()), e))
+            .collect();
+        UsageView { entries }
+    }
+}
+
+impl From<UsageView> for Vec<UsageEntry> {
+    fn from(v: UsageView) -> Self {
+        v.entries.into_values().collect()
+    }
 }
 
 impl UsageView {
@@ -589,6 +608,16 @@ pub fn tokens_text(n: u64) -> String {
         format!("{:.1}M", f / 1e6)
     } else {
         format!("{:.1}B", f / 1e9)
+    }
+}
+
+/// A token count with a decimal more than [`tokens_text`] below 100k: `850`, `34.9k`, `127k`,
+/// `1.2M` (what a compaction line says, where `35k → 13k` would hide the change).
+pub fn tokens_text_fine(n: u64) -> String {
+    if (1_000..99_950).contains(&n) {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        tokens_text(n)
     }
 }
 

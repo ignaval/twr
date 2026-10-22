@@ -24,6 +24,12 @@
 //! | `!crash`               | exit with code 1 (no `turn.ended`)                                         |
 //! | `!deaf`                | the session ignores the first interrupt of this turn, whether it comes before the turn began or during it (as a runtime that has not begun a turn may); emits nothing |
 //! | `!write <file> [text]` | writes `text` plus a newline to `<file>` under the session's `cwd` (relative path without `..`; parent directories created), as a non-risky `Write` `agent.tool_call` + `agent.tool_result` (`ok:false` when it cannot) |
+//! | `!compact [manual] [ms]` | `context.compacting`, a pause of `ms` (commands keep being accepted), then `context.compacted{pre_tokens: 2000, post_tokens: 500}`, trigger `auto` (or `manual`); the turn's end then reports a context of 500 tokens |
+//! | `!context <tokens> [window]` | the turn's end reports a context of `tokens` (window default [`CONTEXT_WINDOW`]) |
+//!
+//! [`AdapterCmd::Compact`] runs `!compact manual` as the turn, when the adapter was made
+//! [`FakeAdapter::with_compaction`] (it then [`Adapter::compacts`]); otherwise the turn ends
+//! `error`.
 //!
 //! Sessions: the first event is `thread.started{session_id}` (a ULID) with
 //! `ext.fake.transcript_len`, the number of turns the session has finished, and
@@ -65,6 +71,12 @@ pub const DEFAULT_MODEL: &str = "fake-1";
 
 /// Final text emitted by `!giveup`.
 pub const GIVE_UP_TEXT: &str = "I couldn't finish";
+
+/// The context window a fake session reports (`!context`, `!compact`).
+pub const CONTEXT_WINDOW: u64 = 100_000;
+
+/// The turn a compaction runs as ([`AdapterCmd::Compact`]).
+const COMPACT_PROMPT: &str = "!compact manual";
 
 static SESSIONS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
 
@@ -120,6 +132,8 @@ pub enum Step {
 #[derive(Debug, Clone, Default)]
 pub struct FakeAdapter {
     script: Option<Arc<Vec<Step>>>,
+    /// [`AdapterCmd::Compact`] runs a compaction ([`FakeAdapter::with_compaction`]).
+    compaction: bool,
 }
 
 impl FakeAdapter {
@@ -133,7 +147,15 @@ impl FakeAdapter {
     pub fn scripted(steps: Vec<Step>) -> Self {
         FakeAdapter {
             script: Some(Arc::new(steps)),
+            compaction: false,
         }
+    }
+
+    /// The same adapter, compacting a session's context on [`AdapterCmd::Compact`] (as
+    /// `!compact manual`); without it, the fake runtime is one that cannot.
+    pub fn with_compaction(mut self) -> Self {
+        self.compaction = true;
+        self
     }
 }
 
@@ -173,6 +195,7 @@ impl Adapter for FakeAdapter {
             effort: cfg.effort.clone().filter(|e| !e.trim().is_empty()),
             codex_auto: cfg.codex_auto.as_str(),
             queue: VecDeque::new(),
+            compaction: self.compaction,
             interruptible: self.script.is_none(),
             deaf: false,
             deaf_used: None,
@@ -197,6 +220,10 @@ impl Adapter for FakeAdapter {
     /// steps to the end.
     fn interrupts_turns(&self) -> bool {
         self.script.is_none()
+    }
+
+    fn compacts(&self) -> bool {
+        self.compaction && self.script.is_none()
     }
 
     fn attach_command(&self, cfg: &SpawnConfig, session_id: &str) -> Option<std::process::Command> {
@@ -254,6 +281,8 @@ struct Session {
     /// Reported in `thread.started` `ext.fake.codex_auto` (`SpawnConfig::codex_auto`).
     codex_auto: &'static str,
     queue: VecDeque<(String, u64)>,
+    /// [`FakeAdapter::with_compaction`].
+    compaction: bool,
     interruptible: bool,
     /// `!deaf`: the next interrupt is ignored.
     deaf: bool,
@@ -279,6 +308,14 @@ impl Session {
         match cmd {
             Some(AdapterCmd::Send { text, turn }) => {
                 self.queue.push_back((text, turn));
+                Ok(None)
+            }
+            Some(AdapterCmd::Compact { turn }) => {
+                let prompt = match self.compaction {
+                    true => COMPACT_PROMPT,
+                    false => "!error the fake runtime cannot compact its context",
+                };
+                self.queue.push_back((prompt.to_string(), turn));
                 Ok(None)
             }
             Some(AdapterCmd::Respond { attn_id, answer }) => {
@@ -422,6 +459,7 @@ impl Session {
         let mut n = 0u64;
         let mut result = TurnResult::Completed;
         let mut end_ext: Option<Map<String, Value>> = None;
+        let mut context: Option<ContextSize> = None;
         let owed = {
             let mut left = transient_left();
             match left.get_mut(&self.session_id) {
@@ -463,6 +501,8 @@ impl Session {
                     | "crash"
                     | "write"
                     | "deaf"
+                    | "compact"
+                    | "context"
             );
             if !known {
                 if !trimmed.is_empty() {
@@ -553,6 +593,47 @@ impl Session {
                     self.sleep(ms).await?;
                     slept += ms;
                 }
+                "compact" => {
+                    let words: Vec<&str> = rest.split_whitespace().collect();
+                    let trigger = if words.contains(&"manual") {
+                        "manual"
+                    } else {
+                        "auto"
+                    };
+                    let ms: u64 = words.iter().find_map(|w| w.parse().ok()).unwrap_or(0);
+                    self.emit(
+                        EventBody::ContextCompacting(ContextCompacting {
+                            trigger: Some(trigger.into()),
+                            ..Default::default()
+                        }),
+                        t,
+                    )?;
+                    self.sleep(ms).await?;
+                    slept += ms;
+                    self.emit(
+                        EventBody::ContextCompacted(ContextCompacted {
+                            trigger: trigger.into(),
+                            pre_tokens: Some(2000),
+                            post_tokens: Some(500),
+                            duration_ms: Some(ms),
+                            ..Default::default()
+                        }),
+                        t,
+                    )?;
+                    context = Some(ContextSize {
+                        tokens: 500,
+                        window: Some(CONTEXT_WINDOW),
+                    });
+                }
+                "context" => {
+                    let mut words = rest.split_whitespace().filter_map(|w| w.parse().ok());
+                    let tokens = words.next().unwrap_or(0);
+                    let window = words.next().unwrap_or(CONTEXT_WINDOW);
+                    context = Some(ContextSize {
+                        tokens,
+                        window: Some(window),
+                    });
+                }
                 "error" => {
                     result = TurnResult::Error;
                     let msg = if rest.is_empty() { "fake error" } else { rest };
@@ -610,6 +691,7 @@ impl Session {
                     cost: Some(0.0),
                 }),
                 duration_ms: Some(slept),
+                context,
                 ext: end_ext,
                 ..Default::default()
             }),

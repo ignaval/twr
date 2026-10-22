@@ -158,6 +158,15 @@ pub trait ThreadHost: Send + Sync {
         false
     }
 
+    /// Whether `runtime` here compacts a session's context on [`AdapterCmd::Compact`]
+    /// ([`Adapter::compacts`]). A remote box's sessions take no compaction (the runner
+    /// protocol has no such command): `false` elsewhere.
+    ///
+    /// [`AdapterCmd::Compact`]: twr_core::adapter::AdapterCmd::Compact
+    fn compacts(&self, _runtime: &str) -> bool {
+        false
+    }
+
     /// Which of `cfg`'s settings `runtime`'s attach command for `cfg` runs the session with
     /// ([`Adapter::attach_applies`]). Only the hub's own box is asked (it makes every attach
     /// command, a remote box's too): neither elsewhere.
@@ -283,6 +292,10 @@ impl ThreadHost for LocalHost {
 
     fn interrupts_turns(&self, runtime: &str) -> bool {
         (self.adapters)(runtime).is_some_and(|a| a.interrupts_turns())
+    }
+
+    fn compacts(&self, runtime: &str) -> bool {
+        (self.adapters)(runtime).is_some_and(|a| a.compacts())
     }
 
     fn attach_applies(&self, runtime: &str, cfg: &SpawnConfig) -> AttachApplies {

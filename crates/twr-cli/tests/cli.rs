@@ -2837,3 +2837,31 @@ fn wait_tells_how_threads_ended_and_send_after_follows() {
         "{out}"
     );
 }
+
+/// `twr log stats` and `twr log compact` ask the running hub, in words and as JSON.
+#[test]
+fn log_stats_and_compact() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let _hub = start_hub(home);
+    let text = ok(home, &["log", "stats"]);
+    assert!(
+        text.contains("twr.db") && text.contains("next compaction"),
+        "{text}"
+    );
+    let stats: Value = serde_json::from_str(&ok(home, &["log", "stats", "--json"])).unwrap();
+    assert!(stats["db"]["bytes"].as_u64().unwrap() > 0, "{stats}");
+    assert_eq!(stats["retention_days"], 30);
+    assert!(stats["archive"].is_null(), "{stats}");
+    let text = ok(home, &["log", "compact"]);
+    assert!(text.contains("moved nothing"), "{text}");
+    let r: Value = serde_json::from_str(&ok(
+        home,
+        &["log", "compact", "--vacuum", "--drop-checkpoints", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(r["rows"], 0, "{r}");
+    assert_eq!(r["vacuum"]["incremental_set"], true, "{r}");
+    let stats: Value = serde_json::from_str(&ok(home, &["log", "stats", "--json"])).unwrap();
+    assert_eq!(stats["db"]["auto_vacuum"], "incremental", "{stats}");
+}

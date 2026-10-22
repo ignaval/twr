@@ -14,6 +14,10 @@ use crate::store;
 /// Rows fetched per catch-up read.
 const CATCH_UP_BATCH: usize = 512;
 
+/// Rows a compacted backlog's selection reads per lock of the reader connection
+/// ([`ControlSubscription::compact`]): other readers wait for one read at most.
+const SELECT_BATCH: usize = 4096;
+
 impl Hub {
     /// Filtered transcript, defaulting to the latest turn when no cursor is supplied.
     pub fn transcript_events(
@@ -41,15 +45,26 @@ impl Hub {
             .map_err(internal)?;
         Ok((thread, since, chosen, events))
     }
-    /// `thread.events`: events of a thread with `seq > since_seq`.
+    /// `thread.events`: events of a thread with `seq > since_seq`, those archived too
+    /// (`hub::prune`). `query` may also be a deleted thread's id.
     pub fn thread_events(
         &self,
         query: &str,
         since_seq: u64,
         limit: usize,
     ) -> Result<(String, Vec<Event>), RpcError> {
-        let id = self.resolve(query)?;
-        let events = store::read_thread_events(&self.inner.reader(), &id, since_seq, limit)
+        // A deleted thread's own id reads its events too (read only: nothing else takes it).
+        let id = match self.resolve(query) {
+            Ok(id) => id,
+            Err(_) if self.inner.core().registry.is_deleted(query) => query.to_string(),
+            Err(e) => return Err(e),
+        };
+        // With those archived (`hub::prune`), merged by seq: `twr.db` read first, then the
+        // archive (where a row a compaction moved meanwhile is by then).
+        let hot = store::read_thread_events(&self.inner.reader(), &id, since_seq, limit)
+            .map_err(internal)?;
+        let archived = self.inner.archive_reader();
+        let events = super::prune::merge_archived(hot, archived.as_ref(), &id, since_seq, limit)
             .map_err(internal)?;
         Ok((id, events))
     }
@@ -67,7 +82,15 @@ impl Hub {
 
     /// A whole blob.
     pub fn blob(&self, blob_ref: &str) -> anyhow::Result<Option<Vec<u8>>> {
-        store::get_blob(&self.inner.reader(), blob_ref)
+        // `twr.db` first, then the archive (a blob a compaction moved meanwhile is there).
+        let hot = store::get_blob(&self.inner.reader(), blob_ref)?;
+        match hot {
+            Some(b) => Ok(Some(b)),
+            None => match self.inner.archive_reader().as_ref() {
+                Some(a) => store::get_blob(a, blob_ref),
+                None => Ok(None),
+            },
+        }
     }
 
     /// `blob.get`: up to `len` bytes of a blob from `offset`, plus its total size.
@@ -77,24 +100,47 @@ impl Hub {
         offset: u64,
         len: usize,
     ) -> anyhow::Result<Option<(u64, Vec<u8>)>> {
-        store::get_blob_chunk(&self.inner.reader(), blob_ref, offset, len)
+        // `twr.db` first, then the archive (a blob a compaction moved meanwhile is there).
+        let hot = store::get_blob_chunk(&self.inner.reader(), blob_ref, offset, len)?;
+        match hot {
+            Some(b) => Ok(Some(b)),
+            None => match self.inner.archive_reader().as_ref() {
+                Some(a) => store::get_blob_chunk(a, blob_ref, offset, len),
+                None => Ok(None),
+            },
+        }
     }
 
     /// Subscribes to the control stream from `gseq > since`: the backlog from SQLite, then
     /// live items, gap-free and duplicate-free.
     pub fn subscribe_control(&self, since: u64) -> ControlSubscription {
+        self.subscribe_control_with(since, false)
+    }
+
+    /// [`Hub::subscribe_control`], its backlog up to the head of now compacted with `compact`
+    /// ([`twr_core::compact`]): [`ControlSubscription::compact`] selects it before anything
+    /// is read.
+    pub fn subscribe_control_with(&self, since: u64, compact: bool) -> ControlSubscription {
         let core = self.inner.core();
         let rx = self.inner.control_tx.subscribe();
         let head = core.gseq;
+        // What the selection needs of the state at the head, taken with it.
+        let compact = compact.then(|| Compact {
+            head,
+            at_head: Some(twr_core::compact::Head::of(&core.registry)),
+            kept: VecDeque::new(),
+        });
         drop(core);
         ControlSubscription {
             hub: Arc::clone(&self.inner),
             rx,
             state: self.inner.state.subscribe(),
+            since,
             last: since,
             head,
             backlog: VecDeque::new(),
             lines: VecDeque::new(),
+            compact,
         }
     }
 
@@ -199,18 +245,150 @@ pub struct ControlSubscription {
     hub: Arc<Inner>,
     rx: broadcast::Receiver<ControlItem>,
     state: watch::Receiver<HubState>,
+    since: u64,
     last: u64,
     /// Everything up to here is committed and readable from SQLite.
     head: u64,
     backlog: VecDeque<(u64, Event)>,
     /// Stored items read as their lines ([`ControlSubscription::write_stored`]).
     lines: VecDeque<(u64, Vec<u8>)>,
+    /// The compacted backlog still to deliver, when it is one.
+    compact: Option<Compact>,
+}
+
+/// The control items as the compacted backlog's selection reads them
+/// ([`twr_core::compact::Row`]), those of `(0, upto]`: what the replay found as the hub
+/// opened, then read from the store as later ones are asked for. A stored control item never
+/// changes.
+#[derive(Default)]
+pub(super) struct CompactRows {
+    rows: Vec<twr_core::compact::Row>,
+    upto: u64,
+}
+
+impl CompactRows {
+    /// The rows of the control items up to `upto`, in gseq order.
+    pub(super) fn new(rows: Vec<twr_core::compact::Row>, upto: u64) -> CompactRows {
+        CompactRows { rows, upto }
+    }
+
+    /// The rows known.
+    #[cfg(test)]
+    pub(super) fn rows(&self) -> &[twr_core::compact::Row] {
+        &self.rows
+    }
+
+    /// The rows of `(0, head]`, those after the ones known read from the store by `read`
+    /// (the rows after a gseq up to `head`, at most [`SELECT_BATCH`] of them).
+    fn upto(
+        &mut self,
+        head: u64,
+        mut read: impl FnMut(u64) -> anyhow::Result<Vec<twr_core::compact::Row>>,
+    ) -> anyhow::Result<&[twr_core::compact::Row]> {
+        while self.upto < head {
+            let batch = read(self.upto)?;
+            match batch.last() {
+                Some(end) => self.upto = end.gseq,
+                // Nothing more is committed.
+                None => self.upto = head,
+            }
+            self.rows.extend(batch);
+        }
+        Ok(&self.rows[..self.rows.partition_point(|r| r.gseq <= head)])
+    }
+}
+
+/// Reads the compacted backlog's rows up to `head` (the control head as the hub opened) in a
+/// blocking task, when the replay did not (it started from a checkpoint): on a connection of
+/// its own to `db`, in batches, holding only the rows' lock, never the core lock. A selection
+/// that comes meanwhile waits for it and then reads only what came after; one that came
+/// first read them itself, and this reads nothing.
+pub(super) fn warm_up(rows: Arc<std::sync::Mutex<CompactRows>>, db: std::path::PathBuf, head: u64) {
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let mut known = rows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if known.upto >= head {
+            return;
+        }
+        let read = store::connect(&db).and_then(|conn| {
+            known
+                .upto(head, |after| {
+                    store::read_control_rows(&conn, after, head, SELECT_BATCH)
+                })
+                .map(|r| r.len())
+        });
+        match read {
+            Ok(n) => tracing::debug!(
+                rows = n,
+                ms = started.elapsed().as_millis() as u64,
+                "compacted backlog rows read"
+            ),
+            // The next selection reads them.
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "cannot read the compacted backlog's rows")
+            }
+        }
+    });
+}
+
+/// A compacted backlog ([`ControlSubscription::compact`]).
+struct Compact {
+    /// The control head it runs up to: once its items are delivered, the subscription goes
+    /// on from here, in full.
+    head: u64,
+    /// The state at `head` the selection reads; `None` once it ran.
+    at_head: Option<twr_core::compact::Head>,
+    /// The gseqs of what it keeps, still to deliver.
+    kept: VecDeque<u64>,
 }
 
 impl ControlSubscription {
     /// The control head when the subscription was made.
     pub fn head(&self) -> u64 {
         self.head
+    }
+
+    /// Whether it was made with `compact` ([`Hub::subscribe_control_with`]).
+    pub fn compacted(&self) -> bool {
+        self.compact.is_some()
+    }
+
+    /// Selects the compacted backlog of a subscription made with `compact`, in a blocking
+    /// task, outside the core lock: of the items up to its head as the selection reads them
+    /// ([`CompactRows`], those not known yet read from the store without decoding them), it
+    /// keeps what [`twr_core::compact::select`] does. Returns how many items it delivers
+    /// before the live ones.
+    pub async fn compact(&mut self) -> anyhow::Result<u64> {
+        let Some(c) = self.compact.as_mut() else {
+            anyhow::bail!("not a compacted subscription");
+        };
+        let Some(at_head) = c.at_head.take() else {
+            return Ok(c.kept.len() as u64);
+        };
+        let (hub, since, head) = (Arc::clone(&self.hub), self.since, c.head);
+        let kept = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<u64>> {
+            let started = std::time::Instant::now();
+            let mut known = hub
+                .compact_rows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let rows = known.upto(head, |after| {
+                store::read_control_rows(&hub.reader(), after, head, SELECT_BATCH)
+            })?;
+            let kept = twr_core::compact::select(rows, since, &at_head);
+            tracing::debug!(
+                items = rows.len(),
+                kept = kept.len(),
+                ms = started.elapsed().as_millis() as u64,
+                "compacted control backlog selected"
+            );
+            Ok(kept)
+        })
+        .await??;
+        c.kept = kept.into();
+        Ok(c.kept.len() as u64)
     }
 
     /// Appends the line of the next item committed up to the head known to `buf`, read from
@@ -235,6 +413,11 @@ impl ControlSubscription {
                 }
                 continue;
             }
+            if let Some(batch) = self.compacted_batch()? {
+                let rows = store::read_control_lines_at(&self.hub.reader(), &batch)?;
+                self.lines.extend(rows);
+                continue;
+            }
             if self.last < self.head {
                 let rows =
                     store::read_control_lines(&self.hub.reader(), self.last, CATCH_UP_BATCH)?;
@@ -249,6 +432,26 @@ impl ControlSubscription {
         }
     }
 
+    /// The gseqs of the compacted backlog's next items to read, if any are left; once none
+    /// is, the subscription goes on after its head, in full (`Ok(None)`). Call it only with
+    /// what was read before delivered.
+    fn compacted_batch(&mut self) -> anyhow::Result<Option<Vec<u64>>> {
+        let Some(c) = self.compact.as_mut() else {
+            return Ok(None);
+        };
+        if c.at_head.is_some() {
+            anyhow::bail!("the compacted backlog was not selected");
+        }
+        if !c.kept.is_empty() {
+            let n = c.kept.len().min(CATCH_UP_BATCH);
+            return Ok(Some(c.kept.drain(..n).collect()));
+        }
+        // Everything up to its head is delivered, or needs not be.
+        self.last = self.last.max(c.head);
+        self.compact = None;
+        Ok(None)
+    }
+
     /// The next item committed up to the head known, read from the store; `Ok(None)` when
     /// the next one is still to come live. Never waits.
     fn next_stored(&mut self) -> anyhow::Result<Option<ControlItem>> {
@@ -258,6 +461,11 @@ impl ControlSubscription {
                     self.last = g;
                     return Ok(Some((g, Arc::new(ev))));
                 }
+                continue;
+            }
+            if let Some(batch) = self.compacted_batch()? {
+                let rows = store::read_control_events_at(&self.hub.reader(), &batch)?;
+                self.backlog.extend(rows);
                 continue;
             }
             if self.last < self.head {
