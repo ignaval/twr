@@ -335,7 +335,23 @@ pub fn list(dir: &Path) -> std::io::Result<Listing> {
             ..Listing::default()
         });
     };
-    list_held(&held, dir)
+    list_held(&held, None)
+}
+
+/// Whether `dir` still names the memory directory `held` (the same file system object): a
+/// directory swapped in after it was opened is refused, never written in its place.
+fn still_held(held: &Dir, dir: &Path) -> Result<(), Refused> {
+    use std::os::unix::fs::MetadataExt;
+    let now = std::fs::symlink_metadata(dir);
+    let was = held.file().metadata()?;
+    if now.is_ok_and(|m| m.is_dir() && (m.dev(), m.ino()) == (was.dev(), was.ino())) {
+        Ok(())
+    } else {
+        Err(Refused::Changed(format!(
+            "{} was replaced while the memory was changed; try again",
+            dir.display()
+        )))
+    }
 }
 
 /// The version of a whole memory from each note's name and version, and each unreadable
@@ -345,18 +361,27 @@ fn memory_rev(entries: &BTreeMap<String, String>) -> String {
     rev_of(id.as_bytes())
 }
 
-fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
+/// Whether `held`'s entry `file` is a regular file (a symlink is not followed: no).
+fn regular(held: &Dir, file: &str) -> bool {
+    held.open_entry(OsStr::new(file))
+        .and_then(|f| f.metadata())
+        .is_ok_and(|m| m.is_file())
+}
+
+/// What the memory directory `held` holds, listed through it. Past [`FILES_MAX`] files the
+/// rest are counted, not read, but note `wanted` (one named by a call) is read wherever it
+/// is.
+fn list_held(held: &Dir, wanted: Option<&str>) -> std::io::Result<Listing> {
     let mut names: Vec<String> = Vec::new();
     // Notes moved aside by a change in progress (or interrupted): still the note until
     // their replacement is in place.
     let mut aside: BTreeMap<String, String> = BTreeMap::new();
-    for e in std::fs::read_dir(dir)? {
-        let e = e?;
-        let Some(file) = e.file_name().to_str().map(str::to_string) else {
+    for file in held.listed()? {
+        let Some(file) = file.to_str().map(str::to_string) else {
             continue;
         };
         if let Some((name, OLD)) = in_flight_parts(&file) {
-            if e.file_type().is_ok_and(|t| t.is_file()) {
+            if regular(held, &file) {
                 aside.insert(name.to_string(), file.clone());
             }
             continue;
@@ -378,7 +403,12 @@ fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
     let mut out = Listing::default();
     if names.len() > FILES_MAX {
         out.skipped = names.len() - FILES_MAX;
+        let kept = wanted.filter(|w| names[FILES_MAX..].iter().any(|n| n == w));
         names.truncate(FILES_MAX);
+        if let Some(w) = kept {
+            names.push(w.to_string());
+            out.skipped -= 1;
+        }
         out.entries
             .insert(format!("+{}", out.skipped), "skipped".into());
     }
@@ -479,21 +509,21 @@ pub(super) fn recover(dir: &Path) {
             return;
         }
     };
-    recover_held(&held, dir);
+    recover_held(&held);
 }
 
-fn recover_held(held: &Dir, dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn recover_held(held: &Dir) {
+    let Ok(entries) = held.listed() else {
         return;
     };
-    for e in entries.flatten() {
-        let Some(file) = e.file_name().to_str().map(str::to_string) else {
+    for file in entries {
+        let Some(file) = file.to_str().map(str::to_string) else {
             continue;
         };
         let Some((name, what)) = in_flight_parts(&file) else {
             continue;
         };
-        if !e.file_type().is_ok_and(|t| t.is_file()) {
+        if !regular(held, &file) {
             continue;
         }
         let done = match what {
@@ -1177,7 +1207,10 @@ impl Hub {
         self.memory_refused(caller)?;
         check_name(&p.name)?;
         let missing = || rpc(codes::NOT_FOUND, format!("no note named {}", p.name));
-        let l = list(&self.memory_dir()).map_err(io_err)?;
+        let Some(held) = open_dir(&self.memory_dir(), false).map_err(io_err)? else {
+            return Err(missing());
+        };
+        let l = list_held(&held, Some(&p.name)).map_err(io_err)?;
         if let Some((_, why)) = l.unreadable.iter().find(|(n, _)| *n == p.name) {
             return Err(rpc(
                 codes::CONFLICT,
@@ -1219,8 +1252,9 @@ impl Hub {
         let held = open_dir(&dir, true)
             .map_err(io_err)?
             .ok_or_else(|| internal("the memory directory could not be made"))?;
-        recover_held(&held, &dir);
-        let before = list_held(&held, &dir).map_err(io_err)?;
+        recover_held(&held);
+        still_held(&held, &dir)?;
+        let before = list_held(&held, Some(&p.name)).map_err(io_err)?;
         let current = before.get(&p.name);
         if before.unreadable.iter().any(|(n, _)| *n == p.name) {
             return Err(rpc(
@@ -1302,8 +1336,9 @@ impl Hub {
             ));
         }
         self.memory_still_admitted("memory.save", caller, bound)?;
+        still_held(&held, &dir)?;
         commit_save(&held, &note, p.rev.as_deref())?;
-        let after = list_held(&held, &dir).map_err(io_err)?;
+        let after = list_held(&held, None).map_err(io_err)?;
         // What the memory is with this change alone: another change made meanwhile is still
         // news to the orchestrator.
         let mut expected = before.entries.clone();
@@ -1362,8 +1397,9 @@ impl Hub {
         let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = || rpc(codes::NOT_FOUND, format!("no note named {}", p.name));
         let held = open_dir(&dir, false).map_err(io_err)?.ok_or_else(missing)?;
-        recover_held(&held, &dir);
-        let before = list_held(&held, &dir).map_err(io_err)?;
+        recover_held(&held);
+        still_held(&held, &dir)?;
+        let before = list_held(&held, Some(&p.name)).map_err(io_err)?;
         let unreadable = before.unreadable.iter().any(|(n, _)| *n == p.name);
         match (before.get(&p.name), &p.rev) {
             (None, _) if !unreadable => return Err(missing()),
@@ -1390,8 +1426,9 @@ impl Hub {
             _ => {}
         }
         self.memory_still_admitted("memory.forget", caller, bound)?;
+        still_held(&held, &dir)?;
         commit_forget(&held, &p.name, p.rev.as_deref())?;
-        let after = list_held(&held, &dir).map_err(io_err)?;
+        let after = list_held(&held, None).map_err(io_err)?;
         let mut expected = before.entries.clone();
         expected.remove(&p.name);
         self.memory_record(
@@ -1829,6 +1866,16 @@ mod tests {
         let l = list(&dir).unwrap();
         assert_eq!(l.notes.len(), FILES_MAX);
         assert_eq!(l.skipped, 4);
+        // A note named by a call is read wherever it is.
+        let last = format!("z{:04}", FILES_MAX + 2);
+        let l = list_held(&held, Some(&last)).unwrap();
+        assert!(l.get(&last).is_some());
+        assert_eq!(l.skipped, 3);
+        // A memory directory swapped after it was opened is never written in its place.
+        assert!(still_held(&held, &dir).is_ok());
+        std::fs::rename(&dir, tmp.path().join("old-memory")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert!(matches!(still_held(&held, &dir), Err(Refused::Changed(_))));
     }
 
     #[test]

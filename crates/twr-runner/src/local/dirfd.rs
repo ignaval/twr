@@ -355,7 +355,7 @@ impl Dir {
     /// system: `fdopendir` of a duplicate of it, rewound first (a duplicate shares its read
     /// position). Never by a path: the directory held, wherever it is now and whatever is at the
     /// path it was reached by.
-    pub(crate) fn listed(&self) -> io::Result<Vec<OsString>> {
+    pub fn listed(&self) -> io::Result<Vec<OsString>> {
         sys()?;
         /// Closes the stream (and with it the duplicate) when dropped.
         struct Stream(*mut libc::DIR);
