@@ -705,6 +705,17 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
 fn commit_forget(held: &Dir, name: &str, rev: Option<&str>) -> Result<(), Refused> {
     // Moved aside as one to put back until its version is checked: only then is it gone.
     let aside = take_aside(held, name, rev)?;
+    // A directory of a note's name is no note: it goes back, for the user to remove.
+    let dir = held
+        .open_entry(OsStr::new(&aside))
+        .and_then(|f| f.metadata())
+        .is_ok_and(|m| m.is_dir());
+    if dir {
+        put_back(held, name, &aside);
+        return Err(Refused::Changed(format!(
+            "{name}.md is a directory, not a note; the user can remove it"
+        )));
+    }
     let gone = in_flight(name, GONE);
     if let Err(e) = held.rename(OsStr::new(&aside), OsStr::new(&gone)) {
         put_back(held, name, &aside);
@@ -1866,11 +1877,19 @@ mod tests {
         let l = list(&dir).unwrap();
         assert_eq!(l.notes.len(), FILES_MAX);
         assert_eq!(l.skipped, 4);
+        // A directory of a note's name is not forgotten (and never hidden).
+        std::fs::create_dir(dir.join("dirnote.md")).unwrap();
+        assert!(matches!(
+            commit_forget(&held, "dirnote", None),
+            Err(Refused::Changed(_))
+        ));
+        assert!(dir.join("dirnote.md").is_dir());
         // A note named by a call is read wherever it is.
         let last = format!("z{:04}", FILES_MAX + 2);
         let l = list_held(&held, Some(&last)).unwrap();
         assert!(l.get(&last).is_some());
-        assert_eq!(l.skipped, 3);
+        // (Five past the cap with the directory: the one named is read.)
+        assert_eq!(l.skipped, 4);
         // A memory directory swapped after it was opened is never written in its place.
         assert!(still_held(&held, &dir).is_ok());
         std::fs::rename(&dir, tmp.path().join("old-memory")).unwrap();
