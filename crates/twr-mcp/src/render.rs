@@ -896,6 +896,102 @@ pub fn trash(r: &Value) -> String {
     out
 }
 
+/// `s` on one line, at most `max` characters (`…` when cut): a field of a note, which a file
+/// edited by hand may make long.
+fn note_field(s: &str, max: usize) -> String {
+    let one: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let one = one.trim();
+    match one.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &one[..i]),
+        None => one.to_string(),
+    }
+}
+
+/// A note's line: `- <name> (<type>, <date>[, unconfirmed]) rev=<rev>: <description>`.
+fn note_line(n: &Value) -> String {
+    let mut line = format!(
+        "- {} ({}, {}",
+        note_field(str_of(n, "name"), 64),
+        note_field(str_of(n, "type"), 16),
+        note_field(str_of(n, "updated").get(..10).unwrap_or(""), 10),
+    );
+    if n.get("unconfirmed").and_then(Value::as_bool) == Some(true) {
+        line.push_str(", unconfirmed: saved in a turn the user did not start");
+    }
+    line.push_str(&format!(
+        ") rev={}: {}",
+        note_field(str_of(n, "rev"), 12),
+        note_field(str_of(n, "description"), 200)
+    ));
+    line
+}
+
+/// `memory_list`: the memory's notes, newest first, one line each, within [`OUTPUT_CAP`].
+pub fn memory_list(r: &Value) -> String {
+    let notes = r
+        .get("notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = format!(
+        "{} note{} (at most {} notes, {} KB):\n",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+        r["limits"]["notes"],
+        r["limits"]["bytes"].as_u64().unwrap_or(0) / 1024
+    );
+    let room = OUTPUT_CAP - 256;
+    for (i, n) in notes.iter().enumerate() {
+        let line = note_line(n);
+        if out.len() + line.len() + 1 > room {
+            out.push_str(&format!(
+                "[{} more notes not shown; memory_read one by name from your memory block]\n",
+                notes.len() - i
+            ));
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let unreadable = r.get("unreadable").and_then(Value::as_array);
+    for u in unreadable.into_iter().flatten().take(20) {
+        let line = format!(
+            "unreadable: {}.md: {}\n",
+            note_field(str_of(u, "name"), 64),
+            note_field(str_of(u, "why"), 100)
+        );
+        if out.len() + line.len() > OUTPUT_CAP {
+            break;
+        }
+        out.push_str(&line);
+    }
+    if let Some(n) = r.get("skipped").and_then(Value::as_u64).filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{n} more files not read (the user can tidy the memory)\n"
+        ));
+    }
+    out
+}
+
+/// `memory_read`: the note's line, then its text, within [`OUTPUT_CAP`].
+pub fn memory_note(n: &Value) -> String {
+    let mut out = note_line(n);
+    out.push('\n');
+    let body = str_of(n, "body");
+    let room = OUTPUT_CAP.saturating_sub(out.len() + 64);
+    match body.char_indices().find(|(i, _)| *i >= room) {
+        Some((i, _)) => {
+            out.push_str(&body[..i]);
+            out.push_str("\n[cut]");
+        }
+        None => out.push_str(body),
+    }
+    out
+}
+
 /// Room kept under [`OUTPUT_CAP`] for a project result's frame and notes.
 const PROJECT_FRAME_ROOM: usize = 1024;
 

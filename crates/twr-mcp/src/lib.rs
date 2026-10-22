@@ -559,9 +559,9 @@ pub struct MemoryNameParams {
 pub struct MemoryForgetParams {
     /// The note's name.
     pub name: String,
-    /// Its rev, so a note changed since you read it is not forgotten unseen.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<String>,
+    /// Its rev (from memory_list or memory_read), so a note changed since you read it is not
+    /// forgotten unseen.
+    pub rev: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1580,24 +1580,29 @@ impl TwrMcp {
 
     #[tool(
         description = "List your memory: the notes you keep across sessions in this workspace \
-                       (name, type, description, rev, when and in what kind of turn saved). \
-                       Your notes come into a new session on their own; use this to check \
-                       before saving. JSON.",
+                       (name, type, date, rev, whether unconfirmed, description), newest \
+                       first. Your notes come into a new session on their own; use this to \
+                       check before saving. Text.",
         annotations(read_only_hint = true)
     )]
     async fn memory_list(&self) -> Result<String, String> {
-        self.call_text("memory.list", json!({})).await
+        self.call("memory.list", json!({}))
+            .await
+            .map(|r| render::memory_list(&r))
     }
 
     #[tool(
-        description = "Read one note of your memory in full, with its rev. JSON.",
+        description = "Read one note of your memory in full: its line (with its rev), then its \
+                       text. Text.",
         annotations(read_only_hint = true)
     )]
     async fn memory_read(
         &self,
         Parameters(p): Parameters<MemoryNameParams>,
     ) -> Result<String, String> {
-        self.call_text("memory.read", to_params(&p)?).await
+        self.call("memory.read", to_params(&p)?)
+            .await
+            .map(|r| render::memory_note(&r))
     }
 
     #[tool(
@@ -1617,8 +1622,8 @@ impl TwrMcp {
     }
 
     #[tool(
-        description = "Forget a note of your memory: when it is wrong or out of date, or \
-                          the user asks. The user sees it."
+        description = "Forget a note of your memory, naming the rev you read: when it is wrong \
+                       or out of date, or the user asks. The user sees it."
     )]
     async fn memory_forget(
         &self,

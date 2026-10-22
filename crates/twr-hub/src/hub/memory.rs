@@ -55,7 +55,7 @@ use twr_runner::local::dirfd::{not_a_dir, Dir};
 
 use super::lifecycle::data_dir_of;
 use super::project_read::secret_marker;
-use super::{internal, rpc, Caller, Core, Hub, Inner};
+use super::{internal, rpc, Caller, Core, Hub, Inner, OrchCall};
 
 /// The memory's directory in the data directory.
 pub const DIR: &str = "memory";
@@ -72,11 +72,17 @@ pub const TOTAL_MAX: usize = 64 * 1024;
 /// Most bytes of a [`block`].
 pub const INJECT_MAX: usize = 12 * 1024;
 /// Largest note file read; a larger one is listed as unreadable.
-const FILE_MAX: u64 = 8 * 1024;
+pub const FILE_MAX: u64 = 8 * 1024;
+/// Most `<name>.md` files read (in name order); more, made by hand, are skipped and counted.
+pub const FILES_MAX: usize = 2 * NOTES_MAX;
 /// Hex digits of a version.
 pub const REV_LEN: usize = 12;
 /// The note types.
 pub const TYPES: &[&str] = &["user", "feedback", "project", "reference"];
+
+/// How many of the orchestrator's memory calls [`Core::redact_memory_call`] remembers by id
+/// (then it starts over: a result that comes so much later is not told apart).
+const MEMORY_CALLS_KEPT: usize = 1024;
 
 /// Serializes the hub's writes to the memory (in-process: one hub per data directory).
 static LOCK: Mutex<()> = Mutex::new(());
@@ -146,6 +152,8 @@ pub struct Listing {
     pub entries: BTreeMap<String, String>,
     /// The version of the whole memory: changes with any note.
     pub rev: String,
+    /// `<name>.md` files past [`FILES_MAX`], not read.
+    pub skipped: usize,
 }
 
 impl Listing {
@@ -168,7 +176,13 @@ fn rev_of(bytes: &[u8]) -> String {
 /// `s` on one line: control characters and line breaks become spaces.
 fn one_line(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string()
@@ -333,12 +347,21 @@ fn memory_rev(entries: &BTreeMap<String, String>) -> String {
 
 fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
     let mut names: Vec<String> = Vec::new();
+    // Notes moved aside by a change in progress (or interrupted): still the note until
+    // their replacement is in place.
+    let mut aside: BTreeMap<String, String> = BTreeMap::new();
     for e in std::fs::read_dir(dir)? {
         let e = e?;
         let Some(file) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // Dot files are the hub's own in-flight files (a note being written or forgotten).
+        if let Some((name, OLD)) = in_flight_parts(&file) {
+            if e.file_type().is_ok_and(|t| t.is_file()) {
+                aside.insert(name.to_string(), file.clone());
+            }
+            continue;
+        }
+        // Dot files: the hub's own in-flight files, or the user's.
         if file.starts_with('.') {
             continue;
         }
@@ -346,13 +369,31 @@ fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
             names.push(name.to_string());
         }
     }
+    for name in aside.keys() {
+        if !names.contains(name) {
+            names.push(name.clone());
+        }
+    }
     names.sort();
     let mut out = Listing::default();
+    if names.len() > FILES_MAX {
+        out.skipped = names.len() - FILES_MAX;
+        names.truncate(FILES_MAX);
+        out.entries
+            .insert(format!("+{}", out.skipped), "skipped".into());
+    }
     for name in names {
-        let read = if valid_name(&name) {
-            read_note(held, &name).map_err(|e| e.to_string())
-        } else {
+        let read = if !valid_name(&name) {
             Err("not a note name (lowercase letters, digits and -)".into())
+        } else {
+            match read_note(held, &name) {
+                Ok(None) => match aside.get(&name) {
+                    Some(file) => read_entry(held, file, &name),
+                    None => Ok(None),
+                },
+                r => r,
+            }
+            .map_err(|e| e.to_string())
         };
         match read {
             Ok(Some(n)) => {
@@ -394,25 +435,41 @@ impl From<Refused> for RpcError {
     }
 }
 
-/// A new hidden entry name of `held` for note `name`'s file in flight: [`TMP`], [`OLD`] or
-/// [`GONE`].
+/// A new hidden entry name of `held` for note `name`'s file in flight: [`TMP`], [`OLD`],
+/// [`GONE`] or [`KEPT`].
 fn in_flight(name: &str, what: &str) -> String {
     format!(".{name}.{}.{what}", ulid::Ulid::generate())
+}
+
+/// The note and the kind of an in-flight file's name ([`in_flight`]): `.<name>.<ulid>.<what>`
+/// with a note name and a ULID; `None` for any other name (a file of the user's).
+fn in_flight_parts(file: &str) -> Option<(&str, &str)> {
+    let mut parts = file.strip_prefix('.')?.rsplitn(3, '.');
+    let (what, id, name) = (parts.next()?, parts.next()?, parts.next()?);
+    let ours = valid_name(name)
+        && ulid::Ulid::from_string(id).is_ok()
+        && [TMP, OLD, GONE, KEPT].contains(&what);
+    ours.then_some((name, what))
 }
 
 /// A note's new file, written before it takes the note's place: removed by [`recover`].
 const TMP: &str = "tmp";
 /// A note's file moved aside to be replaced or forgotten, its version not checked yet or its
-/// replacement not in place: put back by [`recover`] when nothing replaced it.
+/// replacement not in place: put back by [`recover`] when nothing replaced it, and read as
+/// the note meanwhile ([`list_held`]).
 const OLD: &str = "old";
 /// A note's file moved aside to be forgotten, once its version was checked: removed by
 /// [`recover`].
 const GONE: &str = "gone";
+/// A file moved aside that could not be put back (a file of its name was made meanwhile):
+/// never touched again, logged; the user decides.
+const KEPT: &str = "kept";
 
 /// Finishes the changes a hub that stopped in the middle left in the memory at `dir`: a note
 /// moved aside for a replacement that never came back is put back (its replacement was never
 /// in place), and the rest of the in-flight files go. Run when the hub opens and before each
-/// change (under [`LOCK`]); failures are logged.
+/// change (under [`LOCK`]); failures are logged. Only regular files with the hub's own names
+/// ([`in_flight_parts`]) are touched.
 pub(super) fn recover(dir: &Path) {
     let held = match open_dir(dir, false) {
         Ok(Some(h)) => h,
@@ -433,20 +490,18 @@ fn recover_held(held: &Dir, dir: &Path) {
         let Some(file) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        // `.<name>.<ulid>.<what>`
-        let mut parts = file.rsplitn(3, '.');
-        let (Some(what), Some(_ulid), Some(name)) = (parts.next(), parts.next(), parts.next())
-        else {
+        let Some((name, what)) = in_flight_parts(&file) else {
             continue;
         };
-        let Some(name) = name.strip_prefix('.').filter(|n| valid_name(n)) else {
+        if !e.file_type().is_ok_and(|t| t.is_file()) {
             continue;
-        };
+        }
         let done = match what {
             TMP | GONE => held.unlink(OsStr::new(&file)),
             OLD => {
                 let note = format!("{name}.md");
-                match held.rename_new(OsStr::new(&file), held, OsStr::new(&note)) {
+                match place(held, &file, &note) {
+                    // Replaced meanwhile: the replacement stands, and this version goes.
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                         held.unlink(OsStr::new(&file))
                     }
@@ -460,10 +515,35 @@ fn recover_held(held: &Dir, dir: &Path) {
                 file,
                 "finished an interrupted change to the orchestrator's memory"
             ),
-            Err(e) => {
-                tracing::warn!(file, error = %e, "could not finish an interrupted change to the orchestrator's memory")
+            Err(e) => tracing::warn!(
+                file,
+                error = %e,
+                "could not finish an interrupted change to the orchestrator's memory"
+            ),
+        }
+    }
+}
+
+/// Moves `held`'s entry `from` to `to` only when there is no `to` (`AlreadyExists` then). On a
+/// file system without such a rename (NFS: `EINVAL`), it checks that there is no `to` and
+/// renames: the rest of a change is serialized by [`LOCK`], and a file made by hand in that
+/// instant is the one the rename replaces.
+fn place(held: &Dir, from: &str, to: &str) -> std::io::Result<()> {
+    match held.rename_new(OsStr::new(from), held, OsStr::new(to)) {
+        Err(e)
+            if e.kind() != std::io::ErrorKind::AlreadyExists
+                && e.kind() != std::io::ErrorKind::NotFound =>
+        {
+            match held.open_entry(OsStr::new(to)) {
+                Err(n) if n.kind() == std::io::ErrorKind::NotFound => {
+                    held.rename(OsStr::new(from), OsStr::new(to))
+                }
+                Ok(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
+                // A symlink there (or anything): it exists.
+                Err(_) => Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)),
             }
         }
+        r => r,
     }
 }
 
@@ -471,7 +551,7 @@ fn recover_held(held: &Dir, dir: &Path) {
 fn write_temp(held: &Dir, note: &Note) -> std::io::Result<String> {
     let mut tries = 0;
     let (mut f, tmp) = loop {
-        let tmp = in_flight(&note.name, "tmp");
+        let tmp = in_flight(&note.name, TMP);
         match held.create_new(OsStr::new(&tmp), 0o600) {
             Ok(f) => break (f, tmp),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
@@ -489,11 +569,12 @@ fn write_temp(held: &Dir, note: &Note) -> std::io::Result<String> {
     Ok(tmp)
 }
 
-/// Moves note `name`'s file aside (a hidden name) and checks that it is version `rev`
-/// (`None`: whatever it is, an unreadable file too): the name it is under now. A file of
-/// another version goes back, and the change is refused. So a file edited by hand after the
-/// caller checked it is never overwritten or removed unseen: an edit lands either before the
-/// move (the check sees it) or in the file moved aside, which the check reads.
+/// Moves note `name`'s file aside (a hidden name, read as the note meanwhile) and checks that
+/// it is version `rev` (`None`: whatever it is, an unreadable file too): the name it is under
+/// now. A file of another version goes back, and the change is refused. So a file edited by
+/// hand after the caller checked it is never overwritten or removed unseen: an edit lands
+/// either before the move (the check sees it) or in the file moved aside, which the check
+/// reads (an editor still writing to a file it opened before is not seen).
 fn take_aside(held: &Dir, name: &str, rev: Option<&str>) -> Result<String, Refused> {
     let file = format!("{name}.md");
     let aside = in_flight(name, OLD);
@@ -515,25 +596,43 @@ fn take_aside(held: &Dir, name: &str, rev: Option<&str>) -> Result<String, Refus
         Ok(None) => "gone".into(),
         Err(_) => "unreadable".into(),
     };
-    put_back(held, &aside, &file);
+    put_back(held, name, &aside);
     Err(Refused::Changed(format!(
         "note {name} changed since it was read (rev {rev}, now {now}); read it again"
     )))
 }
 
-/// Puts a file taken aside back as `file`, unless one of that name was made meanwhile (then
-/// the aside copy stays, hidden, and is logged).
-fn put_back(held: &Dir, aside: &str, file: &str) {
-    if let Err(e) = held.rename_new(OsStr::new(aside), held, OsStr::new(file)) {
-        tracing::warn!(aside, file, error = %e, "could not put a memory note back; it is kept under its hidden name");
+/// Puts note `name`'s file taken aside back, unless one of its name was made meanwhile: then
+/// it is kept, hidden ([`KEPT`]), never touched again, and logged.
+fn put_back(held: &Dir, name: &str, aside: &str) {
+    let file = format!("{name}.md");
+    if let Err(e) = place(held, aside, &file) {
+        let kept = in_flight(name, KEPT);
+        let moved = held.rename(OsStr::new(aside), OsStr::new(&kept));
+        tracing::warn!(
+            aside,
+            kept,
+            file,
+            error = %e,
+            kept_ok = moved.is_ok(),
+            "could not put a memory note back; it is kept under a hidden name"
+        );
     }
 }
 
 /// Puts `note` in place: a new note when `rev` is `None` (refused when a file of its name
 /// exists, even one made a moment ago), else in place of version `rev` ([`take_aside`]).
+/// Errors once the new version is in place are logged, not returned: the change is made.
 fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused> {
     let file = format!("{}.md", note.name);
-    let tmp = write_temp(held, note)?;
+    let written = write_temp(held, note)?;
+    // The rename that puts it in place, tried first between hidden names: one the file
+    // system cannot do fails here, before the note is moved aside.
+    let tmp = in_flight(&note.name, TMP);
+    if let Err(e) = place(held, &written, &tmp) {
+        let _ = held.unlink(OsStr::new(&written));
+        return Err(e.into());
+    }
     let aside = match rev
         .map(|r| take_aside(held, &note.name, Some(r)))
         .transpose()
@@ -544,7 +643,7 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
             return Err(e);
         }
     };
-    if let Err(e) = held.rename_new(OsStr::new(&tmp), held, OsStr::new(&file)) {
+    if let Err(e) = place(held, &tmp, &file) {
         let _ = held.unlink(OsStr::new(&tmp));
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             // A file of that name was made meanwhile: it stays; the version this replaced
@@ -558,25 +657,35 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
             )));
         }
         if let Some(a) = aside {
-            put_back(held, &a, &file);
+            put_back(held, &note.name, &a);
         }
         return Err(e.into());
     }
-    if let Some(a) = aside {
-        let _ = held.unlink(OsStr::new(&a));
+    let after = aside
+        .map_or(Ok(()), |a| held.unlink(OsStr::new(&a)))
+        .and_then(|()| held.file().sync_all());
+    if let Err(e) = after {
+        tracing::warn!(note = %note.name, error = %e, "a memory note is saved, but cleaning up after it failed");
     }
-    held.file().sync_all()?;
     Ok(())
 }
 
-/// Removes note `name`'s file, when it is version `rev` (`None`: whatever it is).
+/// Removes note `name`'s file, when it is version `rev` (`None`: whatever it is). Errors once
+/// it is gone from the memory are logged, not returned.
 fn commit_forget(held: &Dir, name: &str, rev: Option<&str>) -> Result<(), Refused> {
     // Moved aside as one to put back until its version is checked: only then is it gone.
     let aside = take_aside(held, name, rev)?;
     let gone = in_flight(name, GONE);
-    held.rename(OsStr::new(&aside), OsStr::new(&gone))?;
-    held.unlink(OsStr::new(&gone))?;
-    held.file().sync_all()?;
+    if let Err(e) = held.rename(OsStr::new(&aside), OsStr::new(&gone)) {
+        put_back(held, name, &aside);
+        return Err(e.into());
+    }
+    let after = held
+        .unlink(OsStr::new(&gone))
+        .and_then(|()| held.file().sync_all());
+    if let Err(e) = after {
+        tracing::warn!(note = name, error = %e, "a memory note is forgotten, but removing its file failed");
+    }
     Ok(())
 }
 
@@ -623,6 +732,29 @@ fn io_err(e: std::io::Error) -> RpcError {
     }
 }
 
+/// A note's version as [`rev_of`] spells it: at most [`REV_LEN`] lowercase hex digits.
+fn check_rev(rev: &str) -> Result<(), RpcError> {
+    let ok = !rev.is_empty()
+        && rev.len() <= REV_LEN
+        && rev
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(bad(format!(
+            "rev is a note's version, {REV_LEN} hex digits (from memory_list or memory_read)"
+        )))
+    }
+}
+
+/// What kind of secret a note holds, if any ([`secret_marker`]): a file edited by hand can.
+fn note_secret(note: &Note) -> Option<&'static str> {
+    [&note.description, &note.body]
+        .into_iter()
+        .find_map(|s| secret_marker(s.as_bytes()))
+}
+
 fn check_name(name: &str) -> Result<(), RpcError> {
     if valid_name(name) {
         Ok(())
@@ -640,8 +772,12 @@ pub fn check_save(p: &SaveParams) -> Result<(), RpcError> {
     if !TYPES.contains(&p.kind.as_str()) {
         return Err(bad(format!("type is one of {}", TYPES.join(", "))));
     }
-    let description = p.description.trim();
-    if description.is_empty() || description.len() > DESCRIPTION_MAX || description.contains('\n') {
+    // As it is saved: control characters become spaces.
+    let description = one_line(&p.description);
+    if description.is_empty()
+        || description.len() > DESCRIPTION_MAX
+        || p.description.trim().contains('\n')
+    {
         return Err(bad(format!(
             "description is one line of at most {DESCRIPTION_MAX} bytes"
         )));
@@ -691,7 +827,11 @@ pub fn block(listing: &Listing, id: &str) -> (String, bool) {
     let mut cut = false;
     // Every note gets its line and at least a line standing for its text; a note's text goes
     // in only when it fits with that much for every note after it.
-    let left_out = |note: &Note| format!("    [text left out: memory_read {}]\n", note.name);
+    // A text holding a secret (a file edited by hand) never goes in.
+    let left_out = |note: &Note| match note_secret(note) {
+        Some(what) => format!("    [text left out: it holds {what}; the user can fix it]\n"),
+        None => format!("    [text left out: memory_read {}]\n", note.name),
+    };
     let heads: Vec<String> = listing.notes.iter().map(head).collect();
     let least: Vec<usize> = heads
         .iter()
@@ -711,8 +851,11 @@ pub fn block(listing: &Listing, id: &str) -> (String, bool) {
         }
         s.push_str(head);
         s.push('\n');
-        let text: String = note.body.lines().map(|l| format!("    {l}\n")).collect();
-        if s.len() + text.len() + after[i + 1] <= budget {
+        let text: String = text_lines(&note.body)
+            .iter()
+            .map(|l| format!("    {l}\n"))
+            .collect();
+        if note_secret(note).is_none() && s.len() + text.len() + after[i + 1] <= budget {
             s.push_str(&text);
         } else {
             cut = true;
@@ -721,6 +864,22 @@ pub fn block(listing: &Listing, id: &str) -> (String, bool) {
     }
     s.push_str(&end);
     (s, cut)
+}
+
+/// `text`'s lines, split at every line break (`\r`, form feeds, Unicode separators too), with
+/// other control characters made spaces: what a [`block`] indents, so that no line of a note
+/// starts at the margin.
+fn text_lines(text: &str) -> Vec<String> {
+    text.replace("\r\n", "\n")
+        .split([
+            '\n', '\r', '\u{0b}', '\u{0c}', '\u{85}', '\u{2028}', '\u{2029}',
+        ])
+        .map(|l| {
+            l.chars()
+                .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+                .collect()
+        })
+        .collect()
 }
 
 /// A note's line in a [`block`]: name, type, date, whether it is unconfirmed, description.
@@ -741,7 +900,11 @@ fn head(note: &Note) -> String {
              unconfirmed",
         );
     }
-    s.push_str(&format!("): {}", one_line(&note.description)));
+    let description = match secret_marker(note.description.as_bytes()) {
+        Some(what) => format!("(left out: it holds {what})"),
+        None => one_line(&note.description),
+    };
+    s.push_str(&format!("): {description}"));
     s
 }
 
@@ -812,15 +975,13 @@ impl Core {
             .get(thread)
             .and_then(|r| r.live.as_ref())
             .map(|l| l.generation);
-        // What this runtime got before, if anything.
-        let had = self
-            .memory_seen
-            .as_ref()
-            .filter(|s| s.thread == thread && Some(s.generation) == live)
-            .map(|s| s.rev.as_str());
-        // Nothing new; or nothing at all for a runtime that never got notes. A runtime that
-        // did is told they are all gone.
-        if had == Some(listing.rev.as_str()) || (listing.notes.is_empty() && had.is_none()) {
+        // This runtime got this version already; or there is nothing to tell: no notes, and
+        // the latest memory this orchestrator got held none either. A session that may
+        // still hold notes (a resumed or compacted one too) is told they are all gone.
+        let current = self.memory_seen.as_ref().is_some_and(|s| {
+            s.thread == thread && Some(s.generation) == live && s.rev == listing.rev
+        });
+        if current || (listing.notes.is_empty() && !self.orch.memory_notes) {
             return Some(ForTurn {
                 text: None,
                 rev: listing.rev,
@@ -880,11 +1041,15 @@ impl Core {
     }
 
     /// Records the orchestrator's calls of its memory tools, and their results, without their
-    /// text (`body` of an adapter event on `thread`): the notes stay in the memory alone, so a
-    /// forgotten note is gone. The call keeps its tool (and an ACP agent's `mcp_tool`), its
-    /// result whether it succeeded; both lose their summaries' text, full payloads, unknown
-    /// keys and the runtime's raw line, and get `ext.twr.memory_call` ([`MEMORY_CALL_KEY`]):
-    /// no action on the user's message (`ThreadView::current_turn_acted`).
+    /// text (`body` of an adapter event on `thread`, the orchestrator or a retired one): the
+    /// notes stay in the memory alone, so a forgotten note is gone from the log. The call keeps
+    /// its tool (and an ACP agent's `tool` and `mcp_tool`), its result whether it succeeded;
+    /// both lose their summaries' text, full payloads, unknown keys and the runtime's raw line,
+    /// and get `ext.twr.memory_call` ([`MEMORY_CALL_KEY`]): no action on the user's message
+    /// (`ThreadView::current_turn_acted`). An ACP agent's progress of the call
+    /// (`task.updated` `tool:<call id>`, whose raw line carries its input or output) loses its
+    /// description and raw line too. Calls are remembered by id across turns (a result can
+    /// come after its turn ended), the latest [`MEMORY_CALLS_KEPT`].
     pub(super) fn redact_memory_call(
         &mut self,
         thread: &str,
@@ -892,21 +1057,30 @@ impl Core {
         raw: &mut Option<String>,
         source: &Source,
     ) {
-        if !matches!(source, Source::Adapter(_)) || !self.is_orch(thread) {
+        let orchestrator = self.is_orch(thread)
+            || self
+                .registry
+                .get(thread)
+                .is_some_and(|v| v.is_orchestrator());
+        if !matches!(source, Source::Adapter(_)) || !orchestrator {
             return;
         }
+        let key = |id: &str| (thread.to_string(), id.to_string());
         match body {
             EventBody::AgentToolCall(p)
-                if memory_tool_call(p) || self.memory_calls.contains(&p.call_id) =>
+                if memory_tool_call(p) || self.memory_calls.contains(&key(&p.call_id)) =>
             {
-                self.memory_calls.insert(p.call_id.clone());
+                if self.memory_calls.len() >= MEMORY_CALLS_KEPT {
+                    self.memory_calls.clear();
+                }
+                self.memory_calls.insert(key(&p.call_id));
                 p.input_summary = "(arguments not recorded: the orchestrator's memory)".into();
                 p.input_ref = None;
                 p.extra.clear();
                 p.ext = redacted_ext(p.ext.take());
                 *raw = None;
             }
-            EventBody::AgentToolResult(p) if self.memory_calls.contains(&p.call_id) => {
+            EventBody::AgentToolResult(p) if self.memory_calls.contains(&key(&p.call_id)) => {
                 p.output_summary = if p.ok {
                     "(result not recorded: the orchestrator's memory)".into()
                 } else {
@@ -917,7 +1091,16 @@ impl Core {
                 p.ext = redacted_ext(p.ext.take());
                 *raw = None;
             }
-            EventBody::TurnEnded(_) => self.memory_calls.clear(),
+            EventBody::TaskUpdated(p)
+                if p.task_id
+                    .strip_prefix("tool:")
+                    .is_some_and(|id| self.memory_calls.contains(&key(id))) =>
+            {
+                p.description = "the orchestrator's memory".into();
+                p.extra.clear();
+                p.ext = redacted_ext(p.ext.take());
+                *raw = None;
+            }
             _ => {}
         }
     }
@@ -961,11 +1144,13 @@ impl Hub {
             "unreadable": l.unreadable.iter()
                 .map(|(n, why)| json!({"name": n, "why": why}))
                 .collect::<Vec<_>>(),
+            "skipped": l.skipped,
             "rev": l.rev,
             "count": l.notes.len(),
             "bytes": l.bytes(),
             "limits": {"notes": NOTES_MAX, "bytes": TOTAL_MAX, "body": BODY_MAX,
-                       "description": DESCRIPTION_MAX, "name": NAME_MAX},
+                       "description": DESCRIPTION_MAX, "name": NAME_MAX,
+                       "file": FILE_MAX, "files": FILES_MAX},
             "enabled": self.inner.config.orchestrator.memory,
         });
         if !caller.is_orchestrator() {
@@ -974,26 +1159,49 @@ impl Hub {
         Ok(out)
     }
 
-    /// `memory.read`.
+    /// `memory.read`. The orchestrator does not get a text holding a private key or a token
+    /// (a file edited by hand): `conflict`.
     pub async fn memory_read(&self, p: ReadParams, caller: &Caller) -> Result<Value, RpcError> {
         self.memory_refused(caller)?;
         check_name(&p.name)?;
-        let Some(held) = open_dir(&self.memory_dir(), false).map_err(io_err)? else {
-            return Err(rpc(codes::NOT_FOUND, format!("no note named {}", p.name)));
-        };
-        let note = read_note(&held, &p.name)
-            .map_err(io_err)?
-            .ok_or_else(|| rpc(codes::NOT_FOUND, format!("no note named {}", p.name)))?;
-        let mut v = note_json(&note);
+        let missing = || rpc(codes::NOT_FOUND, format!("no note named {}", p.name));
+        let l = list(&self.memory_dir()).map_err(io_err)?;
+        if let Some((_, why)) = l.unreadable.iter().find(|(n, _)| *n == p.name) {
+            return Err(rpc(
+                codes::CONFLICT,
+                format!("note {} cannot be read: {why}", p.name),
+            ));
+        }
+        let note = l.get(&p.name).ok_or_else(missing)?;
+        if caller.is_orchestrator() {
+            if let Some(what) = note_secret(note) {
+                return Err(rpc(
+                    codes::CONFLICT,
+                    format!(
+                        "note {} holds {what}; the user can fix or remove it (twr memory edit)",
+                        p.name
+                    ),
+                ));
+            }
+        }
+        let mut v = note_json(note);
         v["body"] = json!(note.body);
         Ok(v)
     }
 
-    /// `memory.save`.
-    pub async fn memory_save(&self, p: SaveParams, caller: &Caller) -> Result<Value, RpcError> {
+    /// `memory.save`; `bound`: the orchestrator's call as it was admitted (`server`).
+    pub async fn memory_save(
+        &self,
+        p: SaveParams,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<Value, RpcError> {
         self.memory_refused(caller)?;
         check_save(&p)?;
-        let (origin, runtime, thread, turn) = self.memory_caller(caller);
+        if let Some(r) = &p.rev {
+            check_rev(r)?;
+        }
+        let (origin, runtime, thread, turn) = self.memory_caller(caller, bound);
         let dir = self.memory_dir();
         let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let held = open_dir(&dir, true)
@@ -1064,10 +1272,14 @@ impl Hub {
             n.bytes = text.len();
             n
         };
+        // Full: refused when the change grows the memory past a limit (one that shrinks a
+        // memory past them, through files made by hand, still goes).
         let others = before.notes.iter().filter(|n| n.name != p.name);
         let count = others.clone().count() + 1;
         let total = others.map(|n| n.bytes).sum::<usize>() + note.bytes;
-        if count > NOTES_MAX || total > TOTAL_MAX {
+        let grows_count = current.is_none() && count > NOTES_MAX;
+        let grows_total = total > TOTAL_MAX && total > before.bytes();
+        if grows_count || grows_total {
             return Err(rpc(
                 codes::CONFLICT,
                 format!(
@@ -1077,6 +1289,7 @@ impl Hub {
                 ),
             ));
         }
+        self.memory_still_admitted("memory.save", caller, bound)?;
         commit_save(&held, &note, p.rev.as_deref())?;
         let after = list_held(&held, &dir).map_err(io_err)?;
         // What the memory is with this change alone: another change made meanwhile is still
@@ -1113,11 +1326,27 @@ impl Hub {
         }))
     }
 
-    /// `memory.forget`.
-    pub async fn memory_forget(&self, p: ForgetParams, caller: &Caller) -> Result<Value, RpcError> {
+    /// `memory.forget`; `bound` as for [`Hub::memory_save`]. The orchestrator names the version
+    /// it forgets (`rev`), so a note changed since it read it is never forgotten unseen.
+    pub async fn memory_forget(
+        &self,
+        p: ForgetParams,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<Value, RpcError> {
         self.memory_refused(caller)?;
         check_name(&p.name)?;
-        let (origin, _, thread, turn) = self.memory_caller(caller);
+        match &p.rev {
+            Some(r) => check_rev(r)?,
+            None if caller.is_orchestrator() => {
+                return Err(bad(
+                    "rev is the note's version (from memory_list or memory_read): a note \
+                     changed since you read it is not forgotten unseen",
+                ))
+            }
+            None => {}
+        }
+        let (origin, _, thread, turn) = self.memory_caller(caller, bound);
         let dir = self.memory_dir();
         let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = || rpc(codes::NOT_FOUND, format!("no note named {}", p.name));
@@ -1132,7 +1361,8 @@ impl Hub {
                 return Err(rpc(
                     codes::CONFLICT,
                     format!(
-                        "note {} cannot be read, so it is not rev {r}; forget it without a rev",
+                        "note {} cannot be read, so it is not rev {r}; the user can remove it \
+                         (twr memory rm)",
                         p.name
                     ),
                 ))
@@ -1148,6 +1378,7 @@ impl Hub {
             }
             _ => {}
         }
+        self.memory_still_admitted("memory.forget", caller, bound)?;
         commit_forget(&held, &p.name, p.rev.as_deref())?;
         let after = list_held(&held, &dir).map_err(io_err)?;
         let mut expected = before.entries.clone();
@@ -1175,26 +1406,54 @@ impl Hub {
         Ok(json!({"name": p.name, "op": "forgotten", "count": after.notes.len()}))
     }
 
-    /// For a call of `caller`: the kind of turn the orchestrator is in (`None` for the user),
-    /// its runtime, and the orchestrator's thread and open turn (where the change is shown).
+    /// The orchestrator's change may still be made, just before it is: refused once the user
+    /// took back the message of the turn it came in (checked when it came in, `server`, and
+    /// again here, since the memory's files were read meanwhile).
+    fn memory_still_admitted(
+        &self,
+        method: &str,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<(), RpcError> {
+        if !caller.is_orchestrator() {
+            return Ok(());
+        }
+        let core = self.inner.core();
+        match bound {
+            Some(b) => core.orchestrator_admitted(method, Some(b)).map(drop),
+            None if core.orch_turn_withdrawn() => Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                format!(
+                    "the user took back the message that started this turn: {method} is \
+                     refused"
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// For a call of `caller`: the kind of turn the orchestrator was in (`None` for the user),
+    /// its runtime, and the orchestrator's thread and the turn the change is shown in. With
+    /// `bound` (the call as admitted), its turn: a turn that ended since is `none`.
     fn memory_caller(
         &self,
         caller: &Caller,
+        bound: Option<&OrchCall>,
     ) -> (Option<String>, Option<String>, Option<String>, Option<u64>) {
         let core = self.inner.core();
         let thread = core.orch.thread.clone();
         let view = thread.as_ref().and_then(|t| core.registry.get(t));
-        let turn = view.and_then(|v| v.current_turn);
+        let now = view.and_then(|v| v.current_turn);
         if !caller.is_orchestrator() {
-            return (None, None, thread, None);
+            return (None, None, thread, now);
         }
         let runtime = view.map(|v| v.runtime.clone());
-        (
-            Some(core.orch_turn_origin().to_string()),
-            runtime,
-            thread,
-            turn,
-        )
+        let (origin, turn) = match bound {
+            Some(b) if b.turn.is_some() && b.turn == now => (core.orch_turn_origin(), b.turn),
+            Some(b) => ("none", b.turn),
+            None => (core.orch_turn_origin(), now),
+        };
+        (Some(origin.to_string()), runtime, thread, turn)
     }
 
     /// Shows a change on the orchestrator's thread (if there is one) and updates what its
@@ -1495,5 +1754,76 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0);
+    }
+
+    #[test]
+    fn every_line_break_stays_indented_and_secrets_stay_out() {
+        let mut odd = note(
+            "odd",
+            "one\rtwo\u{2028}three\u{0c}four\r\nfive\u{7}six",
+            "2026-10-02",
+        );
+        odd.description = "fine".into();
+        let key = ["-----BEGIN OPENSSH ", "PRIVATE KEY-----"].concat();
+        let mut secret = note("secret", &format!("token\n{key}\nabc"), "2026-10-01");
+        secret.description = key.clone();
+        let l = Listing {
+            notes: vec![odd, secret],
+            ..Listing::default()
+        };
+        let (b, _) = block(&l, "q");
+        for word in ["one", "two", "three", "four", "five"] {
+            assert!(b.contains(&format!("\n    {word}")), "{word}: {b:?}");
+        }
+        assert!(b.contains("    five six"), "{b:?}");
+        assert!(!b.contains("PRIVATE KEY"), "{b}");
+        assert!(
+            b.contains("- secret (user, 2026-10-01): (left out: it holds"),
+            "{b}"
+        );
+        assert!(b.contains("[text left out: it holds"), "{b}");
+    }
+
+    #[test]
+    fn a_note_mid_change_is_listed_and_strangers_are_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(DIR);
+        let held = open_dir(&dir, true).unwrap().unwrap();
+        let a = note("a", "x", "2026-10-01");
+        assert!(commit_save(&held, &a, None).is_ok());
+        // Moved aside by a change in progress: still the note.
+        let aside = in_flight("a", OLD);
+        std::fs::rename(dir.join("a.md"), dir.join(&aside)).unwrap();
+        let l = list(&dir).unwrap();
+        assert_eq!(l.get("a").map(|n| n.rev.clone()), Some(a.rev.clone()));
+        recover(&dir);
+        assert!(dir.join("a.md").is_file());
+        // The user's own dot files look like ours but are not: never touched.
+        for f in [".a.md.old", ".b.bak.tmp", ".a.notaulid.gone"] {
+            std::fs::write(dir.join(f), "mine").unwrap();
+        }
+        recover(&dir);
+        for f in [".a.md.old", ".b.bak.tmp", ".a.notaulid.gone"] {
+            assert!(dir.join(f).is_file(), "{f}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.md")).unwrap(),
+            a.render()
+        );
+        // Past FILES_MAX files: the rest are counted, not read.
+        for i in 0..FILES_MAX + 3 {
+            std::fs::write(dir.join(format!("z{i:04}.md")), "t").unwrap();
+        }
+        let l = list(&dir).unwrap();
+        assert_eq!(l.notes.len(), FILES_MAX);
+        assert_eq!(l.skipped, 4);
+    }
+
+    #[test]
+    fn revs_are_hex_versions() {
+        assert!(check_rev("0123456789ab").is_ok());
+        for bad in ["", "XYZ", "0123456789abc", "../x", "ABC"] {
+            assert!(check_rev(bad).is_err(), "{bad}");
+        }
     }
 }

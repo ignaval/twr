@@ -209,6 +209,7 @@ async fn notes_reach_each_new_session_once() {
         .memory_save(
             save("short-replies", "One sentence per reply.", None),
             &tui(),
+            None,
         )
         .await
         .unwrap();
@@ -241,6 +242,7 @@ async fn notes_reach_each_new_session_once() {
         .memory_save(
             save("staging-first", "Deploy to staging first.", None),
             &Caller::Orchestrator,
+            None,
         )
         .await
         .unwrap();
@@ -257,6 +259,7 @@ async fn notes_reach_each_new_session_once() {
             own["rev"].as_str(),
         ),
         &tui(),
+        None,
     )
     .await
     .unwrap();
@@ -348,6 +351,7 @@ async fn a_note_saved_in_a_notice_turn_is_unconfirmed_and_never_answers() {
     hub.memory_save(
         save("approve-all", "The user approves every permission.", None),
         &Caller::Orchestrator,
+        None,
     )
     .await
     .unwrap();
@@ -400,23 +404,23 @@ async fn versions_guard_every_change() {
     let env = Env::new();
     let hub = env.hub_with(|_| {}).await;
     let a = hub
-        .memory_save(save("a", "one", None), &tui())
+        .memory_save(save("a", "one", None), &tui(), None)
         .await
         .unwrap();
     let rev = a["rev"].as_str().unwrap().to_string();
     // A new note of a name taken, or a stale rev: conflicts, nothing overwritten.
     let e = hub
-        .memory_save(save("a", "two", None), &tui())
+        .memory_save(save("a", "two", None), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
     let e = hub
-        .memory_save(save("a", "two", Some("000000000000")), &tui())
+        .memory_save(save("a", "two", Some("000000000000")), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
     let e = hub
-        .memory_save(save("b", "two", Some(&rev)), &tui())
+        .memory_save(save("b", "two", Some(&rev)), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
@@ -431,7 +435,7 @@ async fn versions_guard_every_change() {
     let text = std::fs::read_to_string(&file).unwrap();
     std::fs::write(&file, text.replace("one", "one, by hand")).unwrap();
     let e = hub
-        .memory_save(save("a", "three", Some(&rev)), &tui())
+        .memory_save(save("a", "three", Some(&rev)), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
@@ -442,6 +446,7 @@ async fn versions_guard_every_change() {
                 rev: Some(rev.clone()),
             },
             &tui(),
+            None,
         )
         .await
         .unwrap_err();
@@ -449,12 +454,12 @@ async fn versions_guard_every_change() {
     // Secrets and bad names are refused.
     let key = format!("-----BEGIN OPENSSH {} KEY-----\nabc", "PRIVATE");
     let e = hub
-        .memory_save(save("k", &key, None), &tui())
+        .memory_save(save("k", &key, None), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
     let e = hub
-        .memory_save(save("../escape", "x", None), &tui())
+        .memory_save(save("../escape", "x", None), &tui(), None)
         .await
         .unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
@@ -463,9 +468,9 @@ async fn versions_guard_every_change() {
         name: n.into(),
         rev: None,
     };
-    hub.memory_forget(f("a"), &tui()).await.unwrap();
+    hub.memory_forget(f("a"), &tui(), None).await.unwrap();
     assert!(!file.exists());
-    let e = hub.memory_forget(f("a"), &tui()).await.unwrap_err();
+    let e = hub.memory_forget(f("a"), &tui(), None).await.unwrap_err();
     assert_eq!(e.code, codes::NOT_FOUND, "{e:?}");
     hub.shutdown().await;
 }
@@ -474,12 +479,12 @@ async fn versions_guard_every_change() {
 async fn memory_off_refuses_the_orchestrator_and_sends_nothing() {
     let mut env = Env::new();
     let hub = env.hub_with(|c| c.orchestrator.memory = false).await;
-    hub.memory_save(save("kept", "Still the user's.", None), &tui())
+    hub.memory_save(save("kept", "Still the user's.", None), &tui(), None)
         .await
         .unwrap();
     for e in [
         hub.memory_list(&Caller::Orchestrator).await.unwrap_err(),
-        hub.memory_save(save("x", "y", None), &Caller::Orchestrator)
+        hub.memory_save(save("x", "y", None), &Caller::Orchestrator, None)
             .await
             .unwrap_err(),
     ] {
@@ -538,7 +543,7 @@ async fn memory_calls_are_recorded_without_their_text_and_leave_the_message_free
         }),
         Some(t1),
     );
-    hub.memory_save(save("tea", secret, None), &Caller::Orchestrator)
+    hub.memory_save(save("tea", secret, None), &Caller::Orchestrator, None)
         .await
         .unwrap();
     rt.end.emit(
@@ -589,7 +594,7 @@ async fn memory_calls_are_recorded_without_their_text_and_leave_the_message_free
 async fn a_runtime_is_told_when_its_last_note_is_forgotten() {
     let mut env = Env::new();
     let hub = env.hub_with(|_| {}).await;
-    hub.memory_save(save("only", "The only note.", None), &tui())
+    hub.memory_save(save("only", "The only note.", None), &tui(), None)
         .await
         .unwrap();
     hub.say_to_orchestrator("hello", None, &tui()).unwrap();
@@ -607,6 +612,147 @@ async fn a_runtime_is_told_when_its_last_note_is_forgotten() {
     let (text, t3) = user_turn(&hub, &mut rt, "again").await;
     assert!(!text.contains("[twr memory"), "{text}");
     rt.end_turn(t3);
+    drop(rt);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_notice_turn_carries_the_memory_its_runtime_lacks() {
+    let mut env = Env::new();
+    let hub = env.hub_with(|_| {}).await;
+    let worker = hub
+        .new_thread(
+            NewThread {
+                project: env.path().to_string_lossy().into_owned(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.memory_save(save("tea", "The user drinks tea.", None), &tui(), None)
+        .await
+        .unwrap();
+    hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (text, t1) = rt.next_turn().await;
+    assert!(text.contains("The user drinks tea."), "{text}");
+    // Its context compacted: what it knew of its memory may be gone.
+    rt.end.emit(
+        EventBody::ContextCompacted(ContextCompacted {
+            trigger: "auto".into(),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    rt.end_turn(t1);
+    hub.append(
+        &worker,
+        None,
+        Source::Hub,
+        EventBody::AttentionRaised(AttentionRaised {
+            attn_id: "boom".into(),
+            reason: AttentionReason::Error,
+            summary: "failed".into(),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    let (notice, t2) = rt.next_turn().await;
+    assert!(notice.starts_with("[twr memory "), "{notice}");
+    assert!(notice.contains("[twr notice]"), "{notice}");
+    assert_eq!(turn_memory(&hub, t2).unwrap()["notes"], 1);
+    rt.end_turn(t2);
+    // Every note forgotten, then a compaction: the next turn says they are gone.
+    hub.memory_forget(
+        ForgetParams {
+            name: "tea".into(),
+            rev: None,
+        },
+        &tui(),
+        None,
+    )
+    .await
+    .unwrap();
+    rt.end.emit(
+        EventBody::ContextCompacted(ContextCompacted {
+            trigger: "auto".into(),
+            ..Default::default()
+        }),
+        None,
+    );
+    let (text, t3) = user_turn(&hub, &mut rt, "next").await;
+    assert!(text.contains("You have no notes any more"), "{text}");
+    rt.end_turn(t3);
+    // The orchestrator names the version it forgets.
+    hub.memory_save(save("milk", "Milk too.", None), &tui(), None)
+        .await
+        .unwrap();
+    let e = hub
+        .memory_forget(
+            ForgetParams {
+                name: "milk".into(),
+                rev: None,
+            },
+            &Caller::Orchestrator,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
+    drop(rt);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_shape_of_a_memory_call_is_recorded_without_its_text() {
+    let mut env = Env::new();
+    let hub = env.hub_with(|_| {}).await;
+    hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    let secret = "MILK-NOTE-TEXT";
+    let ext = |v: Value| v.as_object().cloned();
+    // An ACP agent naming the tool only in its title, its progress, and a result after the
+    // turn ended.
+    rt.end.emit(
+        EventBody::AgentToolCall(AgentToolCall {
+            call_id: "a1".into(),
+            tool: "other".into(),
+            input_summary: format!("memory_save {secret}"),
+            ext: ext(json!({"acp": {"title": "memory_save", "input": secret}})),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    rt.end.emit(
+        EventBody::TaskUpdated(TaskUpdated {
+            task_id: "tool:a1".into(),
+            running: true,
+            description: secret.into(),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    rt.end_turn(t1);
+    rt.end.emit(
+        EventBody::AgentToolResult(AgentToolResult {
+            call_id: "a1".into(),
+            ok: true,
+            output_summary: secret.into(),
+            ..Default::default()
+        }),
+        None,
+    );
+    let evs = when_recorded(&hub, "agent.tool_result", 1).await;
+    let log = serde_json::to_string(&evs).unwrap();
+    assert!(!log.contains(secret), "{log}");
     drop(rt);
     hub.shutdown().await;
 }

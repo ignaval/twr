@@ -670,6 +670,11 @@ pub(super) struct OrchState {
     /// ([`OrchState::work_turn`]). Rebuilt from the log.
     #[serde(default)]
     maintenance_turns: std::collections::BTreeSet<u64>,
+    /// The latest of the orchestrator's turns that carried its memory (`ext.twr.memory`,
+    /// `hub::memory`) held notes: its session may still hold them, so it is told when they
+    /// are all gone. Rebuilt from the log.
+    #[serde(default)]
+    pub(super) memory_notes: bool,
 }
 
 /// The project reads of one orchestrator turn: at most [`project_read::TURN_CALLS`] calls and
@@ -719,6 +724,7 @@ impl OrchState {
         "withdrawn_turns",
         "withdrawn_at",
         "maintenance_turns",
+        "memory_notes",
     ];
 
     /// The fields checkpoints skip (`#[serde(skip)]`) that are set (tests: a fold must set
@@ -752,6 +758,7 @@ impl OrchState {
             withdrawn_turns: _,
             withdrawn_at: _,
             maintenance_turns: _,
+            memory_notes: _,
         } = self;
         let reads_set = reads.key.is_some() || reads.calls > 0 || reads.bytes > 0 || reads.over;
         [("orch.token", token.is_some()), ("orch.reads", reads_set)]
@@ -1510,6 +1517,7 @@ impl Core {
                         self.orch.taken_back.clear();
                         self.orch.withdrawn_turns.clear();
                         self.orch.maintenance_turns.clear();
+                        self.orch.memory_notes = false;
                     }
                     self.orch.thread = Some(ev.thread.clone());
                     self.orch.pending_handoff = twr_ext(&p.ext)
@@ -1552,6 +1560,9 @@ impl Core {
                 // The runtime's own turn continues the work turn before it, past any
                 // compaction in between.
                 let compact = is_compact_turn(p);
+                if let Some(m) = twr_ext(&p.ext).and_then(|t| t.get("memory")) {
+                    self.orch.memory_notes = m.get("notes").and_then(Value::as_u64) > Some(0);
+                }
                 if compact {
                     self.orch.maintenance_turns.insert(n);
                 } else if p.from == TurnFrom::Runtime && ev.source != Source::Hub {
@@ -2037,12 +2048,21 @@ impl Core {
             return Ok(());
         }
         let now = Utc::now();
-        let Some((text, ext)) = self.notice_turn(now) else {
+        let Some((text, mut ext)) = self.notice_turn(now) else {
             // Nothing due: what is not held goes (lines about items closed meanwhile).
             self.orch.notices.retain(|n| n.held(now));
             return Ok(());
         };
         let turn = self.view(&orch).map_err(anyhow::Error::new)?.turns + 1;
+        // Its memory, as a turn `start_turn` starts gets it (`hub::memory`): a notice can be
+        // the first turn of a runtime.
+        let memory = self.memory_for_turn(hub, &orch);
+        if let (Some(m), Some(e)) = (
+            memory.as_ref().and_then(|m| m.ext.clone()),
+            ext.as_object_mut(),
+        ) {
+            e.insert("memory".into(), m);
+        }
         // The notice turn is committed before it is delivered, like any turn. If the hub dies
         // in between, startup ends it `interrupted` and its notices are not sent again (not
         // restarted): they are advisory, and the events they describe stay on
@@ -2067,7 +2087,15 @@ impl Core {
             .map(|f| json!(f).to_string())
             .collect();
         let text = super::updates::with_hub_facts(&facts, text, false);
-        self.deliver(hub, &orch, text, turn)
+        let text = match memory.as_ref().and_then(|m| m.text.as_deref()) {
+            Some(block) => format!("{block}{text}"),
+            None => text,
+        };
+        self.deliver(hub, &orch, text, turn)?;
+        if let Some(m) = memory {
+            self.memory_delivered(&orch, m.rev);
+        }
+        Ok(())
     }
 
     /// The notice turn the queue makes at `now`: its prompt and its `ext.twr`, `None` when no
@@ -2494,7 +2522,7 @@ impl Core {
 
     /// Whether the orchestrator's open turn is one whose message the user took back
     /// (`turn.withdrawn`): it has no authority left.
-    fn orch_turn_withdrawn(&self) -> bool {
+    pub(super) fn orch_turn_withdrawn(&self) -> bool {
         self.orch
             .thread
             .as_deref()

@@ -1595,23 +1595,27 @@ impl MemoryChanged {
 pub const MEMORY_TOOLS: &[&str] = &["memory_list", "memory_read", "memory_save", "memory_forget"];
 
 /// Whether `name` names one of twr's memory tools as a runtime calls it: `mcp__twr__<tool>`
-/// (Claude Code, Codex), `twr__<tool>` (an ACP agent's MCP call, `ext.<dialect>.mcp_tool`), or
-/// the bare name.
+/// (Claude Code, Codex), `twr__<tool>` (Grok Build's MCP call, `ext.<dialect>.mcp_tool`),
+/// `twr/<tool>`, `twr.<tool>`, `twr:<tool>` or the bare name (an ACP agent's title); only its
+/// first word counts (a title may go on with the input).
 pub fn is_memory_tool(name: &str) -> bool {
-    let bare = name
-        .strip_prefix("mcp__twr__")
-        .or_else(|| name.strip_prefix("twr__"))
-        .unwrap_or(name);
+    let first = name.split_whitespace().next().unwrap_or("");
+    let bare = ["mcp__twr__", "twr__", "twr/", "twr.", "twr:"]
+        .iter()
+        .find_map(|p| first.strip_prefix(p))
+        .unwrap_or(first);
     MEMORY_TOOLS.contains(&bare)
 }
 
-/// Whether `p` calls one of twr's memory tools: its tool, or the MCP tool an ACP agent's call
-/// runs (`ext.<dialect>.mcp_tool`).
+/// Whether `p` calls one of twr's memory tools: its tool, or what an ACP agent's call names
+/// in `ext.<dialect>`: the MCP tool it runs (`mcp_tool`), its tool or its title.
 pub fn memory_tool_call(p: &AgentToolCall) -> bool {
     is_memory_tool(&p.tool)
         || p.ext.as_ref().is_some_and(|ext| {
             ext.values()
-                .filter_map(|v| v.get("mcp_tool").and_then(Value::as_str))
+                .flat_map(|v| ["mcp_tool", "tool", "title"].map(|k| v.get(k)))
+                .flatten()
+                .filter_map(Value::as_str)
                 .any(is_memory_tool)
         })
 }

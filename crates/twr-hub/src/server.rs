@@ -1111,9 +1111,23 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
-            | "memory.list" | "memory.read" | "memory.save" | "memory.forget" | "box.add"
-            | "box.install" | "box.restart" | "box.projects" | "box.token" => {
+            | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
+            | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            // A change to the orchestrator's memory: the orchestrator's is bound to the turn it
+            // came in (`hub::memory`: the kind of turn it records, and the take-back check
+            // again).
+            "memory.save" | "memory.forget" => {
+                let result =
+                    memory_change(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -1529,6 +1543,21 @@ fn agent_thread(hub: &Hub, agent: &crate::hub::AgentPeer) -> Result<String, RpcE
 /// from, a process twr started for that thread: what it found when the connection opened is
 /// not kept as that proof (the peer may have left its runtime since, or the runtime or attach
 /// may have ended).
+/// `memory.save` / `memory.forget` of the orchestrator, bound to the call as it was admitted.
+async fn memory_change(
+    hub: &Hub,
+    caller: &Caller,
+    method: &str,
+    p: Value,
+    received: Option<&crate::hub::OrchCall>,
+) -> Result<Value, RpcError> {
+    if method == "memory.save" {
+        hub.memory_save(params(p)?, caller, received).await
+    } else {
+        hub.memory_forget(params(p)?, caller, received).await
+    }
+}
+
 async fn job_request(
     hub: &Hub,
     conn: &Conn,
@@ -2102,8 +2131,8 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             hub.memory_list(caller).await
         }
         "memory.read" => hub.memory_read(params(p)?, caller).await,
-        "memory.save" => hub.memory_save(params(p)?, caller).await,
-        "memory.forget" => hub.memory_forget(params(p)?, caller).await,
+        "memory.save" => hub.memory_save(params(p)?, caller, None).await,
+        "memory.forget" => hub.memory_forget(params(p)?, caller, None).await,
         "context.set" => {
             let p: ContextSetParams = params(p)?;
             hub.context_set(&p.project, &p.content, p.expect_hash.as_deref(), caller)
