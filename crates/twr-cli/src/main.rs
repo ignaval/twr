@@ -6455,48 +6455,28 @@ async fn events(
     }
     // The stored events page by page through `thread.events`, which reads the archive too
     // (`[log]`); then, with `--follow`, what comes after them, from the subscription, with
-    // no gap or repeat: it delivers what has a seq above the last one printed.
-    let mut since = since;
-    loop {
-        let r = c
-            .call(
-                "thread.events",
-                json!({ "thread": thread, "since_seq": since, "limit": PAGE }),
-            )
-            .await?;
-        let evs: Vec<Event> = serde_json::from_value(r["events"].clone())?;
-        for ev in &evs {
-            let j = if hydrate {
-                Some(hydrate_event(&mut c, ev).await?)
-            } else {
-                None
-            };
-            p.event(None, ev, j)?;
-        }
-        since = r["next"]
-            .as_u64()
-            .or(evs.last().map(|e| e.seq))
-            .unwrap_or(since);
-        // Pages are bounded by size too: `more` says whether to continue from `next`.
-        if evs.is_empty() || r["more"] != true {
-            break;
-        }
-    }
+    // no gap or repeat: it delivers what has a seq above the last one printed. After the
+    // first page, the thread is named by the id that page answered with: a name or alias
+    // that comes to mean another thread meanwhile (an orchestrator switch, a new thread
+    // taking the name) does not change which one is read.
+    let (id, since) = print_stored(&mut c, &mut p, thread, since, hydrate).await?;
     if !follow {
         return p.flush();
     }
+    hub_test_gate(EVENTS_FOLLOW_GATE_ENV);
     let sub_conn = connect(socket).await?;
     let sub = match sub_conn
         .subscribe(
             "thread.subscribe",
-            json!({ "thread": thread, "since_seq": since }),
+            json!({ "thread": id, "since_seq": since }),
         )
         .await
     {
         Ok(sub) => sub,
-        // Its events were read, but it cannot be followed: a deleted thread (read by its id),
-        // which records nothing more.
+        // It cannot be followed: deleted (now or before; read by its id), it records nothing
+        // more. What it recorded since the last page (its deletion) is printed first.
         Err(e) if is_not_found(&e) => {
+            print_stored(&mut c, &mut p, &id, since, hydrate).await?;
             p.flush()?;
             errln!("{thread} is deleted: nothing more comes");
             return Ok(());
@@ -6508,6 +6488,52 @@ async fn events(
         print_item(&mut c, &mut p, &item, hydrate).await?;
     }
     p.flush()
+}
+
+/// `TWR_TEST_EVENTS_FOLLOW_GATE=<file>`, for tests of `twr events --follow`: once the stored
+/// events are printed, before it subscribes, it waits at the gate ([`hub_test_gate`]).
+const EVENTS_FOLLOW_GATE_ENV: &str = "TWR_TEST_EVENTS_FOLLOW_GATE";
+
+/// Prints the stored events of thread `thread` with seq above `since`, page by page
+/// (`thread.events`, archived ones too): the thread's id, as the hub resolved it, and the
+/// last seq printed (`since` when none was). Later pages name the thread by that id.
+async fn print_stored(
+    c: &mut Client,
+    p: &mut Printer,
+    thread: &str,
+    since: u64,
+    hydrate: bool,
+) -> anyhow::Result<(String, u64)> {
+    let mut since = since;
+    let mut id = thread.to_string();
+    loop {
+        let r = c
+            .call(
+                "thread.events",
+                json!({ "thread": id, "since_seq": since, "limit": PAGE }),
+            )
+            .await?;
+        if let Some(t) = r["thread"].as_str() {
+            id = t.to_string();
+        }
+        let evs: Vec<Event> = serde_json::from_value(r["events"].clone())?;
+        for ev in &evs {
+            let j = if hydrate {
+                Some(hydrate_event(c, ev).await?)
+            } else {
+                None
+            };
+            p.event(None, ev, j)?;
+        }
+        since = r["next"]
+            .as_u64()
+            .or(evs.last().map(|e| e.seq))
+            .unwrap_or(since);
+        // Pages are bounded by size too: `more` says whether to continue from `next`.
+        if evs.is_empty() || r["more"] != true {
+            return Ok((id, since));
+        }
+    }
 }
 
 async fn print_item(

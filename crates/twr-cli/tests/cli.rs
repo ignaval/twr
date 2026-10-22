@@ -2947,3 +2947,131 @@ fn following_events_reads_what_plain_events_reads() {
         "{out:?}"
     );
 }
+
+/// `twr events <thread> --follow` held at its gate between the stored events and the
+/// subscription (`TWR_TEST_EVENTS_FOLLOW_GATE`): the follower, and the gate file to remove to
+/// let it go on, once it is there.
+fn follower_at_gate(home: &Path, thread: &str) -> (Child, std::path::PathBuf) {
+    let gate = home.join("follow.gate");
+    std::fs::write(&gate, "").unwrap();
+    let child = twr_cmd()
+        .args(["events", thread, "--follow"])
+        .env("TWR_HOME", home)
+        .env("TWR_TEST_EVENTS_FOLLOW_GATE", &gate)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let reached = home.join("follow.gate.reached");
+    poll("the follower at its gate", || {
+        reached.exists().then_some(())
+    });
+    (child, gate)
+}
+
+/// The lines `child` prints within `wait` (or until it ends), as events.
+fn lines_within(child: &mut Child, wait: Duration) -> Vec<Value> {
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let until = Instant::now() + wait;
+    let mut out = Vec::new();
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match rx.recv_timeout(left) {
+            Ok(l) => out.push(serde_json::from_str(&l).unwrap()),
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// Following goes on with the thread its first page named: a name that comes to mean another
+/// thread between the stored events and the subscription (a new thread taking it exactly)
+/// does not switch it to that thread.
+#[test]
+fn following_events_stays_on_the_thread_it_started_with() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let project = home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let _hub = start_hub(home);
+    let new = |name: &str| {
+        ok(
+            home,
+            &[
+                "thread",
+                "new",
+                project.to_str().unwrap(),
+                "--runtime",
+                "fake",
+                "--name",
+                name,
+            ],
+        );
+        thread_get(home, name)["id"].as_str().unwrap().to_string()
+    };
+    let a = new("abcd");
+    // `abc`: a prefix of a's name, until a thread is named `abc` exactly.
+    let (mut child, gate) = follower_at_gate(home, "abc");
+    let b = new("abc");
+    std::fs::remove_file(&gate).unwrap();
+    // Both work; the follower prints a's turn only.
+    ok(home, &["send", &b, "hello"]);
+    ok(home, &["send", &a, "hello"]);
+    poll("both reports", || {
+        (reports(&events_of(home, &a)) == 1 && reports(&events_of(home, &b)) == 1).then_some(())
+    });
+    let lines = lines_within(&mut child, Duration::from_secs(3));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        lines.iter().any(|e| e["kind"] == "report.ready"),
+        "{lines:?}"
+    );
+    assert!(lines.iter().all(|e| e["thread"] == a.as_str()), "{lines:?}");
+}
+
+/// A thread deleted between the stored events and the subscription: the follower prints what
+/// it recorded meanwhile (its deletion) before it ends.
+#[test]
+fn following_a_thread_deleted_meanwhile_prints_its_deletion() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let project = home.join("proj");
+    std::fs::create_dir(&project).unwrap();
+    let _hub = start_hub(home);
+    ok(
+        home,
+        &[
+            "thread",
+            "new",
+            project.to_str().unwrap(),
+            "--runtime",
+            "fake",
+            "--name",
+            "d",
+        ],
+    );
+    let id = thread_get(home, "d")["id"].as_str().unwrap().to_string();
+    let (mut child, gate) = follower_at_gate(home, "d");
+    ok(home, &["delete", "d", "--yes"]);
+    poll("d deleted", || {
+        (!twr(home, &["thread", "get", &id]).status.success()).then_some(())
+    });
+    std::fs::remove_file(&gate).unwrap();
+    let lines = lines_within(&mut child, WAIT);
+    let status = child.wait().unwrap();
+    assert!(status.success());
+    let kinds: Vec<&str> = lines.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert_eq!(kinds.first(), Some(&"thread.created"), "{kinds:?}");
+    assert_eq!(kinds.last(), Some(&"thread.deleted"), "{kinds:?}");
+    let seqs: Vec<u64> = lines.iter().filter_map(|e| e["seq"].as_u64()).collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+}
