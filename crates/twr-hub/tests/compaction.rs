@@ -690,3 +690,121 @@ async fn no_report_is_written_for_a_compaction() {
     assert_eq!(v.last_report.as_ref().and_then(|r| r.turn), Some(1));
     hub.shutdown().await;
 }
+
+/// Runtime `slowc`: prompts end at once; a compaction takes 1.5 s.
+struct SlowCompaction;
+
+impl Adapter for SlowCompaction {
+    fn info(&self) -> AdapterInfo {
+        AdapterInfo {
+            name: "slowc",
+            tier: Tier::Headless,
+            description: "slow compactions",
+        }
+    }
+
+    fn compacts(&self) -> bool {
+        true
+    }
+
+    fn spawn(&self, _cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
+        let (h, mut end) = AdapterHandle::pair();
+        tokio::spawn(async move {
+            end.emit(
+                EventBody::ThreadStarted(SessionPayload {
+                    session_id: Some("s-slow".into()),
+                    ..Default::default()
+                }),
+                None,
+            );
+            let done = || EventBody::TurnEnded(TurnEnded::default());
+            if prompt.is_some() {
+                end.emit(done(), Some(1));
+            }
+            while let Some(cmd) = end.cmds.recv().await {
+                match cmd {
+                    AdapterCmd::Send { turn, .. } => {
+                        end.emit(done(), Some(turn));
+                    }
+                    AdapterCmd::Compact { turn } => {
+                        end.emit(
+                            EventBody::ContextCompacting(ContextCompacting::default()),
+                            Some(turn),
+                        );
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        end.emit(
+                            EventBody::ContextCompacted(ContextCompacted {
+                                trigger: "manual".into(),
+                                ..Default::default()
+                            }),
+                            Some(turn),
+                        );
+                        end.emit(done(), Some(turn));
+                    }
+                    AdapterCmd::Stop => break,
+                    _ => {}
+                }
+            }
+            end.exited(Some(0), "");
+        });
+        Ok(h)
+    }
+}
+
+/// A report of the work turn recorded while a compaction runs (here the user's, written
+/// when the hub's own could not be recorded) covers that turn once the compaction ends: the
+/// thread is reported, with that report, live and after a restart.
+#[tokio::test]
+async fn a_report_recorded_during_a_compaction_covers_the_work_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    let fallback = o.adapters.clone();
+    o.adapters = Arc::new(move |name: &str| -> Option<Arc<dyn Adapter>> {
+        match name {
+            "slowc" => Some(Arc::new(SlowCompaction)),
+            other => fallback(other),
+        }
+    });
+    let hub = Hub::open(o).await.unwrap();
+    let t = new_thread(&hub, dir.path(), "api", "slowc").await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    let db = dir.path().join("data").join("twr.db");
+    let c = rusqlite::Connection::open(&db).unwrap();
+    c.busy_timeout(Duration::from_secs(5)).unwrap();
+    c.execute_batch(
+        "CREATE TRIGGER inject BEFORE INSERT ON events
+         WHEN NEW.kind = 'report.ready' AND NEW.turn = 1
+         BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    )
+    .unwrap();
+    send(&hub, &t, "fine");
+    until(&mut sub, ended_turn(1)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!hub.thread_view(&t).unwrap().reported);
+    c.execute_batch("DROP TRIGGER inject").unwrap();
+    let user = Caller::user("test");
+    hub.compact_thread(&t, &user).unwrap();
+    until(&mut sub, |e| e.kind() == "context.compacting").await;
+    hub.write_report(&t, Some(1), "Built it.", Grade::Success, &user)
+        .unwrap();
+    until(&mut sub, ended_turn(2)).await;
+    let reported = |hub: &Hub| {
+        let v = hub.thread_view(&t).unwrap();
+        (v.reported, v.last_report.as_ref().and_then(|r| r.turn))
+    };
+    assert_eq!(reported(&hub), (true, Some(1)), "live");
+    hub.shutdown().await;
+    drop((sub, hub));
+    let hub = timeout(WAIT, async {
+        loop {
+            match Hub::open(opts(dir.path())).await {
+                Ok(h) => return h,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("reopening the hub");
+    assert_eq!(reported(&hub), (true, Some(1)), "replayed");
+    hub.shutdown().await;
+}

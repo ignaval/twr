@@ -1676,6 +1676,53 @@ pub(super) mod tests {
         (fold_dump(core), replayed)
     }
 
+    /// A work turn's report that comes while a compaction the user asked for runs (its
+    /// reaction late) covers that turn: whole-log replay and a start from a checkpoint taken
+    /// while the compaction ran (before the report) both say the thread is reported, with that
+    /// report.
+    #[test]
+    fn a_report_that_comes_during_a_compaction_covers_the_work_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let mut l = Log::default();
+        l.ev(
+            "t-w",
+            Source::Hub,
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "w".into(),
+                box_name: "local".into(),
+                runtime: "fake".into(),
+                mode: "manual".into(),
+                ..Default::default()
+            }),
+        );
+        l.with("t-w", ADAPTER(), |s| s.started("sw"));
+        l.with("t-w", USER(), |s| s.turn_started("build it"));
+        l.with("t-w", ADAPTER(), |s| s.turn_ended(TurnResult::Completed));
+        let compact = l.with("t-w", USER(), |s| s.turn_started("/compact"));
+        l.edit(|b| {
+            if let EventBody::TurnStarted(p) = b {
+                p.ext = twr(json!({"compact": true}));
+            }
+        });
+        l.with("t-w", Source::Hub, |s| s.report(Some(1), Grade::Success));
+        l.with("t-w", ADAPTER(), |s| s.turn_ended(TurnResult::Completed));
+        l.write(&db);
+        let reported = |core: &Core| {
+            let v = core.registry.get("t-w").unwrap();
+            (v.reported, v.last_report.as_ref().and_then(|r| r.turn))
+        };
+        let (core, _) = Core::replay_with(&db, None).unwrap();
+        assert_eq!(reported(&core), (true, Some(1)), "whole log");
+        drop(core);
+        let written = write_at(&db, &NotifyConfig::default(), &compact.id)
+            .unwrap()
+            .expect("a checkpoint");
+        let (core, _) = Core::replay_with(&db, None).unwrap();
+        assert_eq!(core.replayed.checkpoint, Some(written.id));
+        assert_eq!(reported(&core), (true, Some(1)), "from the checkpoint");
+    }
+
     /// A checkpoint of another format, build or settings, one whose last event the log does
     /// not have (or has at another control position), and one whose state does not read are
     /// each passed over, with why, for an older one or the whole log; the state is then the

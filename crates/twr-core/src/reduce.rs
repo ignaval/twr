@@ -705,7 +705,9 @@ impl ThreadView {
             EventBody::ReportReady(p) => {
                 self.set_session(&p.session_id);
                 let covers = p.turn.or(ev.turn);
-                if self.current_turn.is_none() {
+                // (A report of the last work turn that comes while a compaction runs, its
+                // reaction late, covers it as well: the compaction's end keeps it.)
+                if self.current_turn.is_none() || self.current_turn_compact {
                     if let Some(last) = &self.last_turn {
                         if covers.is_none_or(|t| t == last.turn) {
                             self.reported = true;
@@ -1659,11 +1661,14 @@ mod tests {
             (v.crashed, v.crashed_turn, v.failed_turn()),
             (true, Some(1), Some(1))
         );
-        let mut compact = t.turn_started("/compact");
-        if let EventBody::TurnStarted(p) = &mut compact.body {
-            set_twr_ext(&mut p.ext, COMPACT_TURN_KEY, serde_json::json!(true));
-        }
-        v.apply(&compact);
+        let compact_of = |t: &mut ThreadScript| {
+            let mut compact = t.turn_started("/compact");
+            if let EventBody::TurnStarted(p) = &mut compact.body {
+                set_twr_ext(&mut p.ext, COMPACT_TURN_KEY, serde_json::json!(true));
+            }
+            compact
+        };
+        v.apply(&compact_of(&mut t));
         assert!(v.current_turn_compact);
         v.apply(&t.turn_ended(TurnResult::Completed));
         assert!(v.current_turn.is_none() && !v.current_turn_compact);
@@ -1673,6 +1678,18 @@ mod tests {
         );
         assert_eq!(v.status(), ThreadStatus::Error);
         assert_eq!(v.turns, 2);
+        // The work turn's report, late, while a compaction runs, covers it all the same.
+        let mut v = ThreadView::new("t1");
+        let mut t = ThreadScript::new("t1");
+        v.apply(&t.created("a"));
+        v.apply(&t.turn_started("build it"));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        v.apply(&compact_of(&mut t));
+        v.apply(&t.report(Some(1), Grade::Success));
+        assert!(v.reported, "covers the work turn");
+        assert_eq!(v.last_report.as_ref().and_then(|r| r.turn), Some(1));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert!(v.reported && v.current_turn.is_none());
         // A work turn after it is the thread's again.
         v.apply(&t.turn_started("again"));
         v.apply(&t.turn_ended(TurnResult::Completed));
