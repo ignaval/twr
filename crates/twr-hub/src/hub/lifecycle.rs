@@ -47,6 +47,8 @@ impl Hub {
         checked_config(&mut opts.config)?;
         // MCP config files of orchestrators that outlived a previous hub (dead tokens).
         orch::remove_stale_mcp_files(&data_dir_of(&opts.db_path));
+        // A change to the orchestrator's memory the previous hub did not finish (`hub::memory`).
+        super::memory::recover(&super::memory::dir_of(&opts.db_path));
         // The hook's policy recalls the replay (a report it already knew of, rewritten later,
         // only revises it), and is fed from the commit path from here on: the past is no news.
         let (feed, hook_rx) = hook::HookFeed::new(&opts.config.notify).unzip();

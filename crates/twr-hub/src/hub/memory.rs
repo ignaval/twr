@@ -394,9 +394,75 @@ impl From<Refused> for RpcError {
     }
 }
 
-/// A new hidden entry name of `held` for note `name`'s file in flight (`what`: `tmp`, `old`).
+/// A new hidden entry name of `held` for note `name`'s file in flight: [`TMP`], [`OLD`] or
+/// [`GONE`].
 fn in_flight(name: &str, what: &str) -> String {
     format!(".{name}.{}.{what}", ulid::Ulid::generate())
+}
+
+/// A note's new file, written before it takes the note's place: removed by [`recover`].
+const TMP: &str = "tmp";
+/// A note's file moved aside to be replaced: put back by [`recover`] when nothing replaced it.
+const OLD: &str = "old";
+/// A note's file moved aside to be forgotten: removed by [`recover`].
+const GONE: &str = "gone";
+
+/// Finishes the changes a hub that stopped in the middle left in the memory at `dir`: a note
+/// moved aside for a replacement that never came back is put back (its replacement was never
+/// in place), and the rest of the in-flight files go. Run when the hub opens and before each
+/// change (under [`LOCK`]); failures are logged.
+pub(super) fn recover(dir: &Path) {
+    let held = match open_dir(dir, false) {
+        Ok(Some(h)) => h,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(dir = %dir.display(), error = %e, "could not open the orchestrator's memory");
+            return;
+        }
+    };
+    recover_held(&held, dir);
+}
+
+fn recover_held(held: &Dir, dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let Some(file) = e.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        // `.<name>.<ulid>.<what>`
+        let mut parts = file.rsplitn(3, '.');
+        let (Some(what), Some(_ulid), Some(name)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Some(name) = name.strip_prefix('.').filter(|n| valid_name(n)) else {
+            continue;
+        };
+        let done = match what {
+            TMP | GONE => held.unlink(OsStr::new(&file)),
+            OLD => {
+                let note = format!("{name}.md");
+                match held.rename_new(OsStr::new(&file), held, OsStr::new(&note)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        held.unlink(OsStr::new(&file))
+                    }
+                    r => r,
+                }
+            }
+            _ => continue,
+        };
+        match done {
+            Ok(()) => tracing::info!(
+                file,
+                "finished an interrupted change to the orchestrator's memory"
+            ),
+            Err(e) => {
+                tracing::warn!(file, error = %e, "could not finish an interrupted change to the orchestrator's memory")
+            }
+        }
+    }
 }
 
 /// Writes `note`'s file whole to a new hidden file (for its owner only), synced: its name.
@@ -426,9 +492,9 @@ fn write_temp(held: &Dir, note: &Note) -> std::io::Result<String> {
 /// another version goes back, and the change is refused. So a file edited by hand after the
 /// caller checked it is never overwritten or removed unseen: an edit lands either before the
 /// move (the check sees it) or in the file moved aside, which the check reads.
-fn take_aside(held: &Dir, name: &str, rev: Option<&str>) -> Result<String, Refused> {
+fn take_aside(held: &Dir, name: &str, rev: Option<&str>, what: &str) -> Result<String, Refused> {
     let file = format!("{name}.md");
-    let aside = in_flight(name, "old");
+    let aside = in_flight(name, what);
     match held.rename(OsStr::new(&file), OsStr::new(&aside)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -467,7 +533,7 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
     let file = format!("{}.md", note.name);
     let tmp = write_temp(held, note)?;
     let aside = match rev
-        .map(|r| take_aside(held, &note.name, Some(r)))
+        .map(|r| take_aside(held, &note.name, Some(r), OLD))
         .transpose()
     {
         Ok(a) => a,
@@ -503,7 +569,7 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
 
 /// Removes note `name`'s file, when it is version `rev` (`None`: whatever it is).
 fn commit_forget(held: &Dir, name: &str, rev: Option<&str>) -> Result<(), Refused> {
-    let aside = take_aside(held, name, rev)?;
+    let aside = take_aside(held, name, rev, GONE)?;
     held.unlink(OsStr::new(&aside))?;
     held.file().sync_all()?;
     Ok(())
@@ -928,6 +994,7 @@ impl Hub {
         let held = open_dir(&dir, true)
             .map_err(io_err)?
             .ok_or_else(|| internal("the memory directory could not be made"))?;
+        recover_held(&held, &dir);
         let before = list_held(&held, &dir).map_err(io_err)?;
         let current = before.get(&p.name);
         if before.unreadable.iter().any(|(n, _)| *n == p.name) {
@@ -1050,6 +1117,7 @@ impl Hub {
         let _lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let missing = || rpc(codes::NOT_FOUND, format!("no note named {}", p.name));
         let held = open_dir(&dir, false).map_err(io_err)?.ok_or_else(missing)?;
+        recover_held(&held, &dir);
         let before = list_held(&held, &dir).map_err(io_err)?;
         let unreadable = before.unreadable.iter().any(|(n, _)| *n == p.name);
         match (before.get(&p.name), &p.rev) {
@@ -1393,13 +1461,31 @@ mod tests {
         assert!(hidden.is_empty(), "{hidden:?}");
         assert!(commit_forget(&held, "a", None).is_ok());
         assert!(!dir.join("a.md").exists());
+        // A hub that stopped mid-change: a replaced note moved aside comes back, a forgotten
+        // one and a new file in flight go, and a note replaced already stays as replaced.
+        std::fs::rename(dir.join("b.md"), dir.join(".b.01ABC.old")).unwrap();
+        std::fs::write(dir.join(".c.01ABD.gone"), "x").unwrap();
+        std::fs::write(dir.join(".c.01ABE.tmp"), "x").unwrap();
+        commit_save(&held, &note("d", "new", "2026-10-05"), None).ok();
+        std::fs::write(dir.join(".d.01ABF.old"), "older d").unwrap();
+        recover(&dir);
+        assert!(dir.join("b.md").is_file());
+        assert!(std::fs::read_to_string(dir.join("d.md"))
+            .unwrap()
+            .contains("new"));
+        let hidden: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "{hidden:?}");
         // A memory directory that is a link is refused.
         let tmp2 = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(&dir, tmp2.path().join(DIR)).unwrap();
         assert!(list(&tmp2.path().join(DIR)).is_err());
         // Files are for their owner only.
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(dir.join("a.md"))
+        let mode = std::fs::metadata(dir.join("b.md"))
             .unwrap()
             .permissions()
             .mode();
