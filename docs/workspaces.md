@@ -63,7 +63,7 @@ A TUI opened with `--socket` shows that hub alone, without the sidebar or tabs.
 |---|---|
 | Hub, socket and log | yes |
 | Orchestrator and its conversation | yes |
-| Orchestrator's [memory](orchestrator.md#memory) | yes, on every runtime; and its own working directory, so a Claude Code orchestrator's own memory directory is the workspace's too |
+| Orchestrator's [memory](orchestrator.md#memory) | yes, on every runtime. A named workspace's orchestrator also has its own working directory, so a Claude Code orchestrator's own memory directory is that workspace's too |
 | Threads, watches, reports, attention | yes |
 | Worktrees and trash | yes |
 | Branches | new threads use `twr/@<workspace>/<name>`, so two workspaces can each have an `api` thread in one repository |
