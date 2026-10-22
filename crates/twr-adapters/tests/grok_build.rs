@@ -1820,6 +1820,26 @@ fn env_disables_updates_and_sets_no_config_overlay() {
     );
 }
 
+/// The orchestrator's grok runs with grok's own memory off, whatever an inherited
+/// `GROK_MEMORY` says; other threads keep the user's setting.
+#[test]
+fn native_memory_off_sets_grok_memory_zero() {
+    let cfg = SpawnConfig {
+        env: vec![("GROK_MEMORY".into(), "1".into())],
+        native_memory_off: true,
+        ..Default::default()
+    };
+    let env = build_env(&cfg);
+    let memory: Vec<&str> = env
+        .iter()
+        .filter(|(k, _)| k == "GROK_MEMORY")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(memory, ["0"]);
+    let worker = SpawnConfig::default();
+    assert!(!build_env(&worker).iter().any(|(k, _)| k == "GROK_MEMORY"));
+}
+
 #[test]
 fn mcp_config_maps_to_acp_servers() {
     let claude = json!({"mcpServers": {

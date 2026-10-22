@@ -1544,6 +1544,96 @@ impl ProjectRead {
     }
 }
 
+/// `memory.changed`: a note of the orchestrator's memory saved or forgotten (`hub::memory`),
+/// appended by the hub on the orchestrator's thread so the user sees every change. It names
+/// the note, never its text: a forgotten note's text is gone from the hub.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryChanged {
+    /// `saved` (new), `updated` or `forgotten`.
+    pub op: String,
+    /// The note's name.
+    pub name: String,
+    /// The note's version after the change (`None` once forgotten).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// Who changed it: `orchestrator` or `user`.
+    pub by: String,
+    /// For the orchestrator, the kind of turn it was in: `user` (a turn the user's message
+    /// started), `notice`, `handoff`, `runtime` (one its runtime started), `none` (between
+    /// turns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+impl MemoryChanged {
+    /// One line saying what changed, as the TUI and transcripts show it: `saved memory
+    /// user-prefers-short-replies`, `forgot memory x (by you)`.
+    pub fn line(&self) -> String {
+        let verb = match self.op.as_str() {
+            "updated" => "updated memory",
+            "forgotten" => "forgot memory",
+            _ => "saved memory",
+        };
+        let mut s = format!("{verb} {}", self.name);
+        if self.by == "user" {
+            s.push_str(" (by you)");
+        } else if let Some(o) = self.origin.as_deref().filter(|o| *o != "user") {
+            s.push_str(&format!(" (in a {} turn)", o));
+        }
+        s
+    }
+}
+
+/// The orchestrator's memory tools (twr's MCP server), by their own names.
+pub const MEMORY_TOOLS: &[&str] = &["memory_list", "memory_read", "memory_save", "memory_forget"];
+
+/// Whether `name` names one of twr's memory tools as a runtime calls it: `mcp__twr__<tool>`
+/// (Claude Code, Codex), `twr__<tool>` (Grok Build's MCP call, `ext.<dialect>.mcp_tool`),
+/// `twr/<tool>`, `twr.<tool>`, `twr:<tool>` or the bare name (an ACP agent's title); only its
+/// first word counts (a title may go on with the input).
+pub fn is_memory_tool(name: &str) -> bool {
+    let first = name.split_whitespace().next().unwrap_or("");
+    let bare = ["mcp__twr__", "twr__", "twr/", "twr.", "twr:"]
+        .iter()
+        .find_map(|p| first.strip_prefix(p))
+        .unwrap_or(first);
+    MEMORY_TOOLS.contains(&bare)
+}
+
+/// Whether `p` calls one of twr's memory tools: its tool, or what an ACP agent's call names
+/// in `ext.<dialect>`: the MCP tool it runs (`mcp_tool`), its tool or its title.
+pub fn memory_tool_call(p: &AgentToolCall) -> bool {
+    is_memory_tool(&p.tool)
+        || p.ext.as_ref().is_some_and(|ext| {
+            ext.values()
+                .flat_map(|v| ["mcp_tool", "tool", "title"].map(|k| v.get(k)))
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(is_memory_tool)
+        })
+}
+
+/// `ext.twr` key the hub sets (`true`) on the orchestrator's memory tool calls and their
+/// results, whose arguments and output it does not record (`hub::memory`): such a call is no
+/// action on the user's message (it can still be taken back).
+pub const MEMORY_CALL_KEY: &str = "memory_call";
+
+/// Whether `ext` marks a memory tool call or result ([`MEMORY_CALL_KEY`]).
+pub fn is_memory_call(ext: &Option<JsonMap>) -> bool {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(MEMORY_CALL_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// `context.updated`
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1927,6 +2017,8 @@ event_body! {
     AccountUsage(AccountUsage) => "account.usage",
     /// `project.read`
     ProjectRead(ProjectRead) => "project.read",
+    /// `memory.changed`
+    MemoryChanged(MemoryChanged) => "memory.changed",
     /// `worktree.disk`
     WorktreeDisk(WorktreeDiskMeasured) => "worktree.disk",
     /// `worktree.trimmed`
@@ -1956,6 +2048,7 @@ impl EventBody {
 /// `context.updated`, `context.compacting` and `context.compacted` (a runtime compacting its
 /// context: a few per session at most, and cards show it), `conversation.update`, `account.*`
 /// (the hub's `account.usage`), `project.read` (an orchestrator read, shown to the user),
+/// `memory.changed` (a note of the orchestrator's memory saved or forgotten, shown too),
 /// `worktree.*` and `trash.*` (the hub's `trash.purged`). `agent.*` never goes on the control
 /// stream.
 pub fn is_control_kind(kind: &str) -> bool {
@@ -1977,6 +2070,7 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind == "conversation.update"
         || kind.starts_with("account.")
         || kind == "project.read"
+        || kind == "memory.changed"
         || kind.starts_with("worktree.")
         || kind.starts_with("trash.")
 }
@@ -2273,6 +2367,14 @@ mod tests {
                 path: Some("README.md".into()),
                 commit: Some("a1b2c3d".into()),
                 bytes: 42,
+                ..Default::default()
+            }),
+            EventBody::MemoryChanged(MemoryChanged {
+                op: "saved".into(),
+                name: "short-replies".into(),
+                rev: Some("0123456789ab".into()),
+                by: "orchestrator".into(),
+                origin: Some("user".into()),
                 ..Default::default()
             }),
             EventBody::WorktreeDisk(WorktreeDiskMeasured {
@@ -2684,6 +2786,7 @@ mod tests {
         let yes = [
             "thread.created",
             "project.read",
+            "memory.changed",
             "thread.crashed",
             "thread.attached",
             "thread.renamed",

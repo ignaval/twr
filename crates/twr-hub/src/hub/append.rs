@@ -464,6 +464,8 @@ impl Core {
         let mut prepared: Vec<(Event, EventBody, Option<String>)> =
             Vec::with_capacity(events.len());
         for mut e in events {
+            // The orchestrator's memory calls are recorded without their text (`hub::memory`).
+            self.redact_memory_call(&e.thread, &mut e.body, &mut e.raw, &e.source);
             if self.is_orch(&e.thread) {
                 if let EventBody::TurnStarted(p) = &mut e.body {
                     let ext = p.ext.get_or_insert_with(JsonMap::new);

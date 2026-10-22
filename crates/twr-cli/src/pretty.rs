@@ -305,6 +305,8 @@ pub fn summary(ev: &Event) -> String {
             )
         }
         EventBody::ContextCompacted(p) => p.line(),
+        EventBody::ProjectRead(p) => p.line(),
+        EventBody::MemoryChanged(p) => p.line(),
         other => json_short(&other.data().unwrap_or_default()),
     }
 }
@@ -485,6 +487,31 @@ mod tests {
             }),
         );
         assert_eq!(summary(&ev), "Claude: 5h 78% · wk 56% left (read)");
+    }
+
+    /// What the orchestrator read and kept in its memory read as lines, not JSON.
+    #[test]
+    fn reads_and_memory_changes_read_as_lines() {
+        let ev = |body| Event::new("orch", 3, Some(2), Source::Hub, body);
+        let saved = ev(EventBody::MemoryChanged(twr_core::event::MemoryChanged {
+            op: "saved".into(),
+            name: "short-replies".into(),
+            by: "orchestrator".into(),
+            origin: Some("notice".into()),
+            ..Default::default()
+        }));
+        assert_eq!(
+            summary(&saved),
+            "saved memory short-replies (in a notice turn)"
+        );
+        let read = ev(EventBody::ProjectRead(twr_core::event::ProjectRead {
+            tool: "read".into(),
+            project: "api".into(),
+            path: Some("README.md".into()),
+            bytes: 10,
+            ..Default::default()
+        }));
+        assert_eq!(summary(&read), "read api:README.md (10 bytes)");
     }
 
     /// A stop the hub makes to restart a runtime says why, not that the thread stopped.

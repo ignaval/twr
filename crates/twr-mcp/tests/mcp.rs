@@ -329,6 +329,20 @@ async fn conn(mock: Arc<Mock>, stream: UnixStream, n: usize) {
                 "hits": [{"path": "src/a.rs", "line": 3, "text": "fn parse_config() {"}],
                 "more": true,
             })),
+            "memory.list" => Ok(json!({
+                "notes": [{"name": "short-replies", "type": "feedback",
+                           "description": "Short", "updated": "2026-10-22T10:00:00Z",
+                           "rev": "0123456789ab", "by": "user", "origin": "user"}],
+                "unreadable": [], "skipped": 0, "rev": "aaaaaaaaaaaa", "count": 1,
+                "bytes": 200, "limits": {"notes": 100, "bytes": 65536},
+            })),
+            "memory.read" => Ok(json!({
+                "name": p["name"], "type": "feedback", "description": "Short",
+                "updated": "2026-10-22T10:00:00Z", "rev": "0123456789ab",
+                "body": "One sentence.",
+            })),
+            "memory.save" => Ok(json!({"name": p["name"], "rev": "0123456789ab", "op": "saved"})),
+            "memory.forget" => Ok(json!({"name": p["name"], "op": "forgotten", "count": 0})),
             other => Err(RpcError::new(
                 codes::METHOD_NOT_FOUND,
                 format!("unknown method {other:?}"),
@@ -440,6 +454,10 @@ const TOOLS: &[&str] = &[
     "list_project_files",
     "read_project_file",
     "search_project",
+    "memory_list",
+    "memory_read",
+    "memory_save",
+    "memory_forget",
 ];
 
 #[tokio::test]
@@ -984,6 +1002,30 @@ async fn each_tool_sends_the_expected_request() {
         ),
         // Served from the compiled-in docs: no hub call.
         ("read_docs", json!({ "query": "workspaces" }), vec![]),
+        ("memory_list", json!({}), vec![("memory.list", json!({}))]),
+        (
+            "memory_read",
+            json!({ "name": "short-replies" }),
+            vec![("memory.read", json!({ "name": "short-replies" }))],
+        ),
+        (
+            "memory_save",
+            json!({ "name": "short-replies", "type": "feedback", "description": "Short",
+                    "body": "One sentence." }),
+            vec![(
+                "memory.save",
+                json!({ "name": "short-replies", "type": "feedback", "description": "Short",
+                        "body": "One sentence." }),
+            )],
+        ),
+        (
+            "memory_forget",
+            json!({ "name": "short-replies", "rev": "0123456789ab" }),
+            vec![(
+                "memory.forget",
+                json!({ "name": "short-replies", "rev": "0123456789ab" }),
+            )],
+        ),
     ];
     let mut seen = std::collections::BTreeSet::new();
     for (tool, args, want) in cases {
@@ -1120,6 +1162,10 @@ const OTHER_TOOLS: &[&str] = &[
     "list_project_files",
     "read_project_file",
     "search_project",
+    "memory_list",
+    "memory_read",
+    "memory_save",
+    "memory_forget",
 ];
 
 #[tokio::test]

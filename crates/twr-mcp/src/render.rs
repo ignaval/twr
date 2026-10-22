@@ -262,7 +262,9 @@ pub fn transcript_line(ev: &Value) -> Option<String> {
             }
             format!("text: {}", clip.field(&d, "text", FIELD_CAP))
         }
-        "conversation.update" | "project.read" | "context.compacted" => control_line(ev, &mut clip),
+        "conversation.update" | "project.read" | "memory.changed" | "context.compacted" => {
+            control_line(ev, &mut clip)
+        }
         "agent.tool_call" => {
             let risky = if d.get("risky").and_then(Value::as_bool).unwrap_or(false) {
                 " [risky]"
@@ -318,6 +320,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
     match kind {
         "project.read" => {
             let p: twr_core::event::ProjectRead =
+                serde_json::from_value(d.clone()).unwrap_or_default();
+            format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
+        }
+        "memory.changed" => {
+            let p: twr_core::event::MemoryChanged =
                 serde_json::from_value(d.clone()).unwrap_or_default();
             format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
         }
@@ -889,6 +896,107 @@ pub fn trash(r: &Value) -> String {
     out
 }
 
+/// `s` on one line, at most `max` characters (`…` when cut): a field of a note, which a file
+/// edited by hand may make long.
+fn note_field(s: &str, max: usize) -> String {
+    let one: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let one = one.trim();
+    match one.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &one[..i]),
+        None => one.to_string(),
+    }
+}
+
+/// A note's line: `- <name> (<type>, <date>[, unconfirmed]) rev=<rev>: <description>`, the
+/// description cut to `description` characters.
+fn note_line(n: &Value, description: usize) -> String {
+    let mut line = format!(
+        "- {} ({}, {}",
+        note_field(str_of(n, "name"), 64),
+        note_field(str_of(n, "type"), 16),
+        note_field(str_of(n, "updated").get(..10).unwrap_or(""), 10),
+    );
+    if n.get("unconfirmed").and_then(Value::as_bool) == Some(true) {
+        line.push_str(", unconfirmed: saved in a turn the user did not start");
+    }
+    line.push_str(&format!(") rev={}", note_field(str_of(n, "rev"), 12)));
+    if description > 0 {
+        line.push_str(&format!(
+            ": {}",
+            note_field(str_of(n, "description"), description)
+        ));
+    }
+    line
+}
+
+/// `memory_list`: the memory's notes, newest first, one line each, within [`OUTPUT_CAP`]:
+/// every note's name and rev, the descriptions cut to what room is left.
+pub fn memory_list(r: &Value) -> String {
+    let notes = r
+        .get("notes")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = format!(
+        "{} note{} (at most {} notes, {} KB):\n",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+        r["limits"]["notes"],
+        r["limits"]["bytes"].as_u64().unwrap_or(0) / 1024
+    );
+    // Room for the unreadable and skipped lines after the notes.
+    let room = OUTPUT_CAP - 2048 - out.len();
+    let bare: usize = notes.iter().map(|n| note_line(n, 0).len() + 1).sum();
+    // Bytes for each description (a character is at most 4 bytes; ": " before it).
+    let each = room.saturating_sub(bare) / notes.len().max(1);
+    let description = (each.saturating_sub(2) / 4).min(200);
+    for (i, n) in notes.iter().enumerate() {
+        let line = note_line(n, description);
+        if out.len() + line.len() + 1 > OUTPUT_CAP - 2048 {
+            out.push_str(&format!(
+                "[{} more notes not shown; the user can tidy the memory]\n",
+                notes.len() - i
+            ));
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    let unreadable = r.get("unreadable").and_then(Value::as_array);
+    for u in unreadable.into_iter().flatten().take(10) {
+        out.push_str(&format!(
+            "unreadable: {}.md: {}\n",
+            note_field(str_of(u, "name"), 64),
+            note_field(str_of(u, "why"), 100)
+        ));
+    }
+    if let Some(n) = r.get("skipped").and_then(Value::as_u64).filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "{n} more files not read (the user can tidy the memory)\n"
+        ));
+    }
+    out
+}
+
+/// `memory_read`: the note's line, then its text, within [`OUTPUT_CAP`].
+pub fn memory_note(n: &Value) -> String {
+    let mut out = note_line(n, 200);
+    out.push('\n');
+    let body = str_of(n, "body");
+    let room = OUTPUT_CAP.saturating_sub(out.len() + 64);
+    match body.char_indices().find(|(i, _)| *i >= room) {
+        Some((i, _)) => {
+            out.push_str(&body[..i]);
+            out.push_str("\n[cut]");
+        }
+        None => out.push_str(body),
+    }
+    out
+}
+
 /// Room kept under [`OUTPUT_CAP`] for a project result's frame and notes.
 const PROJECT_FRAME_ROOM: usize = 1024;
 
@@ -1222,6 +1330,44 @@ mod tests {
         assert_eq!(
             control_body(&event),
             "hub: refused to list api's top: project reads are off"
+        );
+    }
+
+    /// A full memory (100 notes, long names and descriptions) lists every name and rev
+    /// within the cap; a description holding nothing but quotes is cut, never the index.
+    #[test]
+    fn a_full_memory_lists_every_note() {
+        let notes: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({"name": format!("n{i:03}-{}", "x".repeat(59)), "type": "feedback",
+                       "updated": "2026-10-22T10:00:00Z", "rev": "0123456789ab",
+                       "description": "\"".repeat(200), "unconfirmed": i % 2 == 0})
+            })
+            .collect();
+        let r = json!({"notes": notes, "limits": {"notes": 100, "bytes": 65536},
+                       "unreadable": [], "skipped": 0});
+        let out = memory_list(&r);
+        assert!(out.len() <= OUTPUT_CAP, "{}", out.len());
+        for i in 0..100 {
+            assert!(out.contains(&format!("- n{i:03}-")), "{i}");
+        }
+        assert!(!out.contains("more notes not shown"));
+    }
+
+    #[test]
+    fn memory_changes_are_transcript_lines() {
+        let event = json!({"seq": 6, "thread": "orch", "kind": "memory.changed",
+            "data": {"op": "saved", "name": "short-replies", "rev": "0123456789ab",
+                "by": "orchestrator", "origin": "notice"}});
+        assert_eq!(
+            transcript_line(&event).as_deref(),
+            Some("hub: saved memory short-replies (in a notice turn)")
+        );
+        let event = json!({"seq": 7, "kind": "memory.changed",
+            "data": {"op": "forgotten", "name": "short-replies", "by": "user"}});
+        assert_eq!(
+            control_body(&event),
+            "hub: forgot memory short-replies (by you)"
         );
     }
 

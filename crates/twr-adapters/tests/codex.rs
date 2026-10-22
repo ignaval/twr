@@ -2518,10 +2518,14 @@ async fn hub_orchestrator_on_codex() {
         parse(stdin.lines().nth(read).unwrap())["params"]["cwd"],
         dir.path().to_string_lossy().as_ref()
     );
+    // Codex's own memory off: the orchestrator keeps twr's.
+    for key in codex::MEMORY_OFF {
+        assert_eq!(p["config"][*key], false, "{key}");
+    }
     assert_eq!(
         p["config"].as_object().unwrap().len(),
-        builtin_len() + 2,
-        "the built-in switches, plugins off and the MCP servers, nothing else"
+        builtin_len() + 2 + codex::MEMORY_OFF.len(),
+        "the built-in switches, plugins off, the MCP servers and memory off, nothing else"
     );
     let run = std::fs::read_to_string(dir.path().join("run.json")).unwrap();
     let run = parse(&run);

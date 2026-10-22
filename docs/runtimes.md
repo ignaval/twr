@@ -156,7 +156,11 @@ You can compact a thread yourself: `/compact-context` in the TUI (in a dive, tha
 | any ACP agent | the agent's business | | nothing | refused |
 | PTY | the program's business | | nothing | refused |
 
-A session resumes after a compaction as after anything else (checked on all three). twr does not use Grok's `_x.ai/compact_conversation`: it is no turn, and sent while a prompt runs it drops that prompt's answer from the context.
+A session resumes after a compaction as after anything else (checked on all three). The orchestrator's next turn after one gets its [memory](orchestrator.md#memory) again, since the summary may have dropped it.
+
+### The agents' own memories
+
+Claude Code, Codex and Grok Build can each keep memories of their own across sessions. Your workers get whatever your settings say. The orchestrator keeps twr's memory instead, the same on every runtime, so the hub turns Codex's (`features.memories`, `memories.use_memories`, `memories.generate_memories` = false) and Grok Build's (`GROK_MEMORY=0`) off for it, and leaves a Claude Code orchestrator its own memory directory too ([orchestrator.md](orchestrator.md#each-runtimes-own-memory)). twr does not use Grok's `_x.ai/compact_conversation`: it is no turn, and sent while a prompt runs it drops that prompt's answer from the context.
 
 ## Claude Code
 

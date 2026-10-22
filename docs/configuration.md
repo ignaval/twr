@@ -79,6 +79,7 @@ wake_after_secs = 30              # wake a worker idle this long after its backg
 autostart = false                 # start it with the hub instead of on your first message
 project_reads = true              # it may read your projects' committed files (false: never)
 # read_deny = ["*.sqlite", "config/prod/**"]  # more files it may never read, over the built-in secret names
+memory = true                     # it keeps notes across sessions and runtimes (false: no memory tools, nothing loaded)
 
 [threads]
 default_mode = "auto"             # permission mode for new threads; checked when the hub starts
@@ -172,6 +173,8 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 ## Notes on some keys
 
 `[orchestrator] project_reads` (default `true`) lets the orchestrator read your projects' committed files, and `read_deny` lists more file names it may never read, as globs: `*` within a path part, `**` across parts, `?` one character. A pattern without `/` matches a file name, `*.sqlite`, and one with `/` a path from the repository's top, `config/prod/**`. They add to the built-in secret names and never remove one. See [Reading your projects](orchestrator.md#reading-your-projects).
+
+`[orchestrator] memory` (default `true`) lets the orchestrator keep notes across its sessions, on any runtime, in the workspace's data directory. `false` refuses its memory tools and loads nothing into its sessions; the notes stay, and `twr memory` still shows and changes them. See [orchestrator.md](orchestrator.md#memory).
 
 `default_runtime`, `[projects.<name>] runtime` and `[orchestrator] runtime` take the same values as `twr thread new --runtime`. A thread's runtime is the one given on the command line, else its project's, else `default_runtime`. See [runtimes.md](runtimes.md).
 

@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 pub use hub::{
     local_agent, lock_opened, AgentJobBy, AttachGrant, Caller, Hub, HubOptions, HubState, JobStart,
-    NewThread, Relay, SendOutcome, ShellRun, SuggestAsk, SwitchOptions, LOCK_FILE,
+    NewThread, Relay, SendOutcome, ShellRun, SuggestAsk, SwitchOptions, LOCK_FILE, MEMORY_DIR,
 };
 pub use job_gate::job_gate_main;
 

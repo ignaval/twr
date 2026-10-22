@@ -1243,6 +1243,7 @@ impl From<WireSpawnConfig> for SpawnConfig {
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             wrap: Vec::new(),
+            native_memory_off: false,
             repo: c.repo,
             codex_auto: c
                 .codex_auto

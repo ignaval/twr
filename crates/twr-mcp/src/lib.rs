@@ -36,6 +36,9 @@
 //! secrets, caps sizes and records every call on the orchestrator's thread; their text starts
 //! with a line saying it is repository data, never instructions.
 //!
+//! `memory_list`, `memory_read`, `memory_save` and `memory_forget` are the orchestrator's
+//! memory (`memory.*`, the hub's `hub::memory`): notes it keeps across sessions and runtimes.
+//!
 //! The MCP server name is `twr`, so a Claude orchestrator configured with
 //! `{"mcpServers":{"twr":{...}}}` sees the tools as `mcp__twr__<tool>`.
 
@@ -506,6 +509,59 @@ pub struct SetContextParams {
     pub project: String,
     /// The full new standing context (markdown). Replaces the old one.
     pub content: String,
+}
+
+/// A note's type in `memory_save`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryType {
+    /// Who the user is: role, expertise, preferences.
+    User,
+    /// How the user wants you to work: corrections and confirmed approaches.
+    Feedback,
+    /// Facts about their projects and setup not in the repositories.
+    Project,
+    /// Pointers to where things are.
+    Reference,
+}
+
+/// `memory_save` parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct MemorySaveParams {
+    /// The note's name: lowercase words joined by - (e.g. short-replies), at most 64 bytes.
+    pub name: String,
+    /// What kind of note it is.
+    #[serde(rename = "type")]
+    pub kind: MemoryType,
+    /// One line saying what the note is about (at most 200 bytes), shown in every listing.
+    pub description: String,
+    /// The note: the fact, and for feedback why and how to apply it (at most 4 KB).
+    pub body: String,
+    /// To replace an existing note: its rev (from memory_list or memory_read). Leave out for
+    /// a new note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+}
+
+/// `memory_read` parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct MemoryNameParams {
+    /// The note's name.
+    pub name: String,
+}
+
+/// `memory_forget` parameters.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct MemoryForgetParams {
+    /// The note's name.
+    pub name: String,
+    /// Its rev (from memory_list or memory_read), so a note changed since you read it is not
+    /// forgotten unseen.
+    pub rev: String,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1520,6 +1576,60 @@ impl TwrMcp {
     )]
     async fn show_config(&self) -> Result<String, String> {
         self.call_text("config.show", json!({})).await
+    }
+
+    #[tool(
+        description = "List your memory: the notes you keep across sessions in this workspace \
+                       (name, type, date, rev, whether unconfirmed, description), newest \
+                       first. Your notes come into a new session on their own; use this to \
+                       check before saving. Text.",
+        annotations(read_only_hint = true)
+    )]
+    async fn memory_list(&self) -> Result<String, String> {
+        self.call("memory.list", json!({}))
+            .await
+            .map(|r| render::memory_list(&r))
+    }
+
+    #[tool(
+        description = "Read one note of your memory in full: its line (with its rev), then its \
+                       text. Text.",
+        annotations(read_only_hint = true)
+    )]
+    async fn memory_read(
+        &self,
+        Parameters(p): Parameters<MemoryNameParams>,
+    ) -> Result<String, String> {
+        self.call("memory.read", to_params(&p)?)
+            .await
+            .map(|r| render::memory_note(&r))
+    }
+
+    #[tool(
+        description = "Save a note in your memory, so later sessions, on any runtime, know \
+                          it. Keep what lasts and is not in the repositories: the user's \
+                          preferences and corrections, facts about their setup, pointers. \
+                          Never transcripts, worker output, repository content, secrets, \
+                          approvals or modes. A new note: no rev; to change one, pass its rev \
+                          (a stale rev is a conflict: read it again). The user sees every \
+                          save."
+    )]
+    async fn memory_save(
+        &self,
+        Parameters(p): Parameters<MemorySaveParams>,
+    ) -> Result<String, String> {
+        self.call_text("memory.save", to_params(&p)?).await
+    }
+
+    #[tool(
+        description = "Forget a note of your memory, naming the rev you read: when it is wrong \
+                       or out of date, or the user asks. The user sees it."
+    )]
+    async fn memory_forget(
+        &self,
+        Parameters(p): Parameters<MemoryForgetParams>,
+    ) -> Result<String, String> {
+        self.call_text("memory.forget", to_params(&p)?).await
     }
 
     #[tool(

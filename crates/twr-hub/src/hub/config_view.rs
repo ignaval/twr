@@ -65,6 +65,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         effort: orch_effort,
         project_reads,
         read_deny,
+        memory,
     } = orchestrator;
     let HubConfig {
         socket,
@@ -200,6 +201,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "autostart": autostart,
             "project_reads": project_reads,
             "read_deny": read_deny,
+            "memory": memory,
         },
         "threads": {
             "default_mode": default_mode,

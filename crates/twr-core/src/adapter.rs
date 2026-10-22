@@ -91,6 +91,11 @@ pub struct SpawnConfig {
     /// What a Codex thread in `auto` does with a command its sandbox does not allow (`[codex]
     /// auto`, `[projects.<name>] codex_auto`). Other runtimes and modes ignore it.
     pub codex_auto: CodexAuto,
+    /// Turn the runtime's own cross-session memory off (the orchestrator's: it keeps twr's
+    /// memory instead, `twr-hub`'s `hub::memory`): Codex's `memories` feature and Grok
+    /// Build's memory (`GROK_MEMORY=0`). Claude Code ignores it (its orchestrator keeps its
+    /// own memory directory). Never sent to a runner.
+    pub native_memory_off: bool,
 }
 
 /// What a Codex thread in `auto` mode does with a command its sandbox does not allow, when

@@ -1406,6 +1406,17 @@ impl Transcript {
                 resolution: false,
                 routine: None,
             }),
+            // A note of the orchestrator's memory saved or forgotten: shown the same way.
+            EventBody::MemoryChanged(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
+            }),
             EventBody::ConversationUpdate(p) => {
                 let twr = p.ext.as_ref().and_then(|e| e.get("twr"));
                 let attn_id = twr
@@ -8257,6 +8268,30 @@ pub(crate) mod tests {
                 "refused to read api:.env: .env is an environment file",
             ]
         );
+    }
+
+    #[test]
+    fn memory_changes_show_as_hub_lines() {
+        let mut t = Transcript::new("t-orch");
+        let mut o = ThreadScript::new("t-orch");
+        t.apply(
+            &o.event(EventBody::MemoryChanged(twr_core::event::MemoryChanged {
+                op: "updated".into(),
+                name: "short-replies".into(),
+                by: "orchestrator".into(),
+                origin: Some("user".into()),
+                ..Default::default()
+            })),
+        );
+        let texts: Vec<&str> = t
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::HubUpdate { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["updated memory short-replies"]);
     }
 
     /// A request's end goes onto the hub update that raised it: one entry, its outcome

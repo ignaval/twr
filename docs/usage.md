@@ -311,6 +311,18 @@ twr context edit api    # opens a copy in $VISUAL, else $EDITOR, else vi
 
 If the context changed while you were editing, or the save fails, nothing is overwritten and your edit is kept in a temporary file whose path is printed. The hub refuses a symlinked `.twr/` or `context.md`, and writes the file inside the `.twr/` directory it checked (held open), so one swapped for a symlink meanwhile is never written through; reads at most 1 MiB of the file and injects at most 64 KiB. Threads on a remote box get the project's context from the hub's log, the last version set or captured, because the hub never reads files on another machine.
 
+## The orchestrator's memory
+
+The orchestrator keeps notes across its sessions and runtimes, one memory per workspace ([orchestrator.md](orchestrator.md#memory)). You can read, change and remove them:
+
+```sh
+twr memory list
+twr memory show short-replies
+twr memory edit short-replies   # or a new name for a new note
+twr memory rm short-replies
+twr memory path
+```
+
 ## Subscription usage
 
 ```sh

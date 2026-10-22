@@ -178,6 +178,19 @@ impl Hub {
         self.inner.core().orchestrator_acts(method, received)
     }
 
+    /// [`Core::orchestrator_admitted`]: the checks of [`Hub::orchestrator_acts`] without
+    /// marking the turn acted.
+    pub fn orchestrator_admitted(
+        &self,
+        method: &str,
+        received: Option<&OrchCall>,
+    ) -> Result<(), RpcError> {
+        self.inner
+            .core()
+            .orchestrator_admitted(method, received)
+            .map(drop)
+    }
+
     /// The orchestrator as a call it makes now is bound to; `None` without one.
     pub fn orchestrator_call(&self) -> Option<OrchCall> {
         self.inner.core().orchestrator_call()
