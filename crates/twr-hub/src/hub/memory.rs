@@ -402,9 +402,11 @@ fn in_flight(name: &str, what: &str) -> String {
 
 /// A note's new file, written before it takes the note's place: removed by [`recover`].
 const TMP: &str = "tmp";
-/// A note's file moved aside to be replaced: put back by [`recover`] when nothing replaced it.
+/// A note's file moved aside to be replaced or forgotten, its version not checked yet or its
+/// replacement not in place: put back by [`recover`] when nothing replaced it.
 const OLD: &str = "old";
-/// A note's file moved aside to be forgotten: removed by [`recover`].
+/// A note's file moved aside to be forgotten, once its version was checked: removed by
+/// [`recover`].
 const GONE: &str = "gone";
 
 /// Finishes the changes a hub that stopped in the middle left in the memory at `dir`: a note
@@ -492,9 +494,9 @@ fn write_temp(held: &Dir, note: &Note) -> std::io::Result<String> {
 /// another version goes back, and the change is refused. So a file edited by hand after the
 /// caller checked it is never overwritten or removed unseen: an edit lands either before the
 /// move (the check sees it) or in the file moved aside, which the check reads.
-fn take_aside(held: &Dir, name: &str, rev: Option<&str>, what: &str) -> Result<String, Refused> {
+fn take_aside(held: &Dir, name: &str, rev: Option<&str>) -> Result<String, Refused> {
     let file = format!("{name}.md");
-    let aside = in_flight(name, what);
+    let aside = in_flight(name, OLD);
     match held.rename(OsStr::new(&file), OsStr::new(&aside)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -533,7 +535,7 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
     let file = format!("{}.md", note.name);
     let tmp = write_temp(held, note)?;
     let aside = match rev
-        .map(|r| take_aside(held, &note.name, Some(r), OLD))
+        .map(|r| take_aside(held, &note.name, Some(r)))
         .transpose()
     {
         Ok(a) => a,
@@ -569,8 +571,11 @@ fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused
 
 /// Removes note `name`'s file, when it is version `rev` (`None`: whatever it is).
 fn commit_forget(held: &Dir, name: &str, rev: Option<&str>) -> Result<(), Refused> {
-    let aside = take_aside(held, name, rev, GONE)?;
-    held.unlink(OsStr::new(&aside))?;
+    // Moved aside as one to put back until its version is checked: only then is it gone.
+    let aside = take_aside(held, name, rev)?;
+    let gone = in_flight(name, GONE);
+    held.rename(OsStr::new(&aside), OsStr::new(&gone))?;
+    held.unlink(OsStr::new(&gone))?;
     held.file().sync_all()?;
     Ok(())
 }
