@@ -2865,3 +2865,85 @@ fn log_stats_and_compact() {
     let stats: Value = serde_json::from_str(&ok(home, &["log", "stats", "--json"])).unwrap();
     assert_eq!(stats["db"]["auto_vacuum"], "incremental", "{stats}");
 }
+
+/// `twr events --follow` prints the stored events as plain `twr events` does (archived ones
+/// too, through `thread.events`), then what comes: the same lines first. A deleted thread is
+/// read by its id both ways; following it prints its events and ends, saying it is deleted.
+#[test]
+fn following_events_reads_what_plain_events_reads() {
+    use twr_core::testkit::git::init_repo;
+    let home = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(home.path()).unwrap();
+    let home = home.as_path();
+    let repo = init_repo(&home.join("proj"));
+    let _hub = start_hub(home);
+    ok(
+        home,
+        &[
+            "thread",
+            "new",
+            repo.to_str().unwrap(),
+            "--runtime",
+            "fake",
+            "--name",
+            "wt",
+        ],
+    );
+    ok(home, &["send", "wt", "hello"]);
+    poll("the first report", || {
+        (reports(&events_of(home, "wt")) == 1).then_some(())
+    });
+    let id = thread_get(home, "wt")["id"].as_str().unwrap().to_string();
+    // Live: the backlog `--follow` prints first is what plain `twr events` prints.
+    let plain = ok(home, &["events", "wt"]);
+    let n = plain.lines().count();
+    let mut child = twr_cmd()
+        .args(["events", "wt", "--follow"])
+        .env("TWR_HOME", home)
+        .env_remove("RUST_LOG")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    let mut followed = Vec::new();
+    while followed.len() < n {
+        match rx.recv_timeout(WAIT) {
+            Ok(l) => followed.push(l),
+            Err(_) => break,
+        }
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(followed, plain.lines().collect::<Vec<_>>());
+    // Deleted, its item purged, its agent events archived.
+    ok(home, &["delete", "wt", "--yes"]);
+    poll("wt deleted", || {
+        (!twr(home, &["thread", "get", "wt"]).status.success()).then_some(())
+    });
+    ok(home, &["trash", "empty", "--all", "--yes"]);
+    let r: Value = serde_json::from_str(&ok(home, &["log", "compact", "--json"])).unwrap();
+    assert!(r["rows"].as_u64().unwrap() > 0, "{r}");
+    let plain = ok(home, &["events", &id]);
+    let kinds: Vec<String> = ndjson(&plain)
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(kinds.iter().any(|k| k.starts_with("agent.")), "{kinds:?}");
+    assert!(kinds.iter().any(|k| k == "thread.deleted"), "{kinds:?}");
+    let out = twr(home, &["events", &id, "--follow"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), plain);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is deleted"),
+        "{out:?}"
+    );
+}

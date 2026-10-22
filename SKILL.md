@@ -1464,7 +1464,7 @@ it is the socket call's result as is.
 | `twr park <thread> [--keep] [--force]` | `thread.park` |
 | `twr resume <thread>` | `thread.resume` |
 | `twr attach <thread> [--force]` | `attach.begin` / `attach.child` / `attach.end` |
-| `twr events <thread> [--follow] [--since N] [--hydrate] [--pretty]` | `thread.events` / `thread.subscribe` |
+| `twr events <thread> [--follow] [--since N] [--hydrate] [--pretty]` | `thread.events` (archived events too; a deleted thread's id works), page by page; with `--follow`, then `thread.subscribe` from the last seq printed (no gap, no repeat); a deleted thread's events are printed and it ends, saying it is deleted |
 | `twr control [--follow] [--since N] [--pretty]` | `control.read` / `control.subscribe` |
 | `twr context show <project>` | `context.read` |
 | `twr context edit <project>` | `context.read`, `$VISUAL`/`$EDITOR`/`vi` on a temp copy, then `context.set` with `expect_hash` if it changed (on failure the copy is kept and its path printed) |

@@ -6453,20 +6453,9 @@ async fn events(
         p.names
             .insert(str_of(&t["id"]).to_string(), str_of(&t["name"]).to_string());
     }
-    if follow {
-        let sub_conn = connect(socket).await?;
-        let sub = sub_conn
-            .subscribe(
-                "thread.subscribe",
-                json!({ "thread": thread, "since_seq": since }),
-            )
-            .await?;
-        let mut sub = items(sub);
-        while let Some(item) = next_item(&mut sub, &mut p).await? {
-            print_item(&mut c, &mut p, &item, hydrate).await?;
-        }
-        return p.flush();
-    }
+    // The stored events page by page through `thread.events`, which reads the archive too
+    // (`[log]`); then, with `--follow`, what comes after them, from the subscription, with
+    // no gap or repeat: it delivers what has a seq above the last one printed.
     let mut since = since;
     loop {
         let r = c
@@ -6484,15 +6473,41 @@ async fn events(
             };
             p.event(None, ev, j)?;
         }
-        // Pages are bounded by size too: `more` says whether to continue from `next`.
-        if evs.is_empty() || r["more"] != true {
-            return p.flush();
-        }
         since = r["next"]
             .as_u64()
             .or(evs.last().map(|e| e.seq))
             .unwrap_or(since);
+        // Pages are bounded by size too: `more` says whether to continue from `next`.
+        if evs.is_empty() || r["more"] != true {
+            break;
+        }
     }
+    if !follow {
+        return p.flush();
+    }
+    let sub_conn = connect(socket).await?;
+    let sub = match sub_conn
+        .subscribe(
+            "thread.subscribe",
+            json!({ "thread": thread, "since_seq": since }),
+        )
+        .await
+    {
+        Ok(sub) => sub,
+        // Its events were read, but it cannot be followed: a deleted thread (read by its id),
+        // which records nothing more.
+        Err(e) if is_not_found(&e) => {
+            p.flush()?;
+            errln!("{thread} is deleted: nothing more comes");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut sub = items(sub);
+    while let Some(item) = next_item(&mut sub, &mut p).await? {
+        print_item(&mut c, &mut p, &item, hydrate).await?;
+    }
+    p.flush()
 }
 
 async fn print_item(
