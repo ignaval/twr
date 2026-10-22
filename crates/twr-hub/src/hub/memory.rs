@@ -1140,7 +1140,19 @@ impl Hub {
         let dir = self.memory_dir();
         let l = list(&dir).map_err(io_err)?;
         let mut out = json!({
-            "notes": l.notes.iter().map(note_json).collect::<Vec<_>>(),
+            "notes": l.notes.iter().map(|n| {
+                let mut v = note_json(n);
+                // A description holding a secret (a file edited by hand) is not the
+                // orchestrator's to see; the user's listing shows it.
+                if let Some(what) = caller
+                    .is_orchestrator()
+                    .then(|| secret_marker(n.description.as_bytes()))
+                    .flatten()
+                {
+                    v["description"] = json!(format!("(left out: it holds {what})"));
+                }
+                v
+            }).collect::<Vec<_>>(),
             "unreadable": l.unreadable.iter()
                 .map(|(n, why)| json!({"name": n, "why": why}))
                 .collect::<Vec<_>>(),
@@ -1727,11 +1739,11 @@ mod tests {
         assert!(!dir.join("a.md").exists());
         // A hub that stopped mid-change: a replaced note moved aside comes back, a forgotten
         // one and a new file in flight go, and a note replaced already stays as replaced.
-        std::fs::rename(dir.join("b.md"), dir.join(".b.01ABC.old")).unwrap();
-        std::fs::write(dir.join(".c.01ABD.gone"), "x").unwrap();
-        std::fs::write(dir.join(".c.01ABE.tmp"), "x").unwrap();
-        commit_save(&held, &note("d", "new", "2026-10-05"), None).ok();
-        std::fs::write(dir.join(".d.01ABF.old"), "older d").unwrap();
+        std::fs::rename(dir.join("b.md"), dir.join(in_flight("b", OLD))).unwrap();
+        std::fs::write(dir.join(in_flight("c", GONE)), "x").unwrap();
+        std::fs::write(dir.join(in_flight("c", TMP)), "x").unwrap();
+        assert!(commit_save(&held, &note("d", "new", "2026-10-05"), None).is_ok());
+        std::fs::write(dir.join(in_flight("d", OLD)), "older d").unwrap();
         recover(&dir);
         assert!(dir.join("b.md").is_file());
         assert!(std::fs::read_to_string(dir.join("d.md"))

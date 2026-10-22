@@ -910,8 +910,9 @@ fn note_field(s: &str, max: usize) -> String {
     }
 }
 
-/// A note's line: `- <name> (<type>, <date>[, unconfirmed]) rev=<rev>: <description>`.
-fn note_line(n: &Value) -> String {
+/// A note's line: `- <name> (<type>, <date>[, unconfirmed]) rev=<rev>: <description>`, the
+/// description cut to `description` characters.
+fn note_line(n: &Value, description: usize) -> String {
     let mut line = format!(
         "- {} ({}, {}",
         note_field(str_of(n, "name"), 64),
@@ -921,15 +922,18 @@ fn note_line(n: &Value) -> String {
     if n.get("unconfirmed").and_then(Value::as_bool) == Some(true) {
         line.push_str(", unconfirmed: saved in a turn the user did not start");
     }
-    line.push_str(&format!(
-        ") rev={}: {}",
-        note_field(str_of(n, "rev"), 12),
-        note_field(str_of(n, "description"), 200)
-    ));
+    line.push_str(&format!(") rev={}", note_field(str_of(n, "rev"), 12)));
+    if description > 0 {
+        line.push_str(&format!(
+            ": {}",
+            note_field(str_of(n, "description"), description)
+        ));
+    }
     line
 }
 
-/// `memory_list`: the memory's notes, newest first, one line each, within [`OUTPUT_CAP`].
+/// `memory_list`: the memory's notes, newest first, one line each, within [`OUTPUT_CAP`]:
+/// every note's name and rev, the descriptions cut to what room is left.
 pub fn memory_list(r: &Value) -> String {
     let notes = r
         .get("notes")
@@ -943,12 +947,17 @@ pub fn memory_list(r: &Value) -> String {
         r["limits"]["notes"],
         r["limits"]["bytes"].as_u64().unwrap_or(0) / 1024
     );
-    let room = OUTPUT_CAP - 256;
+    // Room for the unreadable and skipped lines after the notes.
+    let room = OUTPUT_CAP - 2048 - out.len();
+    let bare: usize = notes.iter().map(|n| note_line(n, 0).len() + 1).sum();
+    // Bytes for each description (a character is at most 4 bytes; ": " before it).
+    let each = room.saturating_sub(bare) / notes.len().max(1);
+    let description = (each.saturating_sub(2) / 4).min(200);
     for (i, n) in notes.iter().enumerate() {
-        let line = note_line(n);
-        if out.len() + line.len() + 1 > room {
+        let line = note_line(n, description);
+        if out.len() + line.len() + 1 > OUTPUT_CAP - 2048 {
             out.push_str(&format!(
-                "[{} more notes not shown; memory_read one by name from your memory block]\n",
+                "[{} more notes not shown; the user can tidy the memory]\n",
                 notes.len() - i
             ));
             break;
@@ -957,16 +966,12 @@ pub fn memory_list(r: &Value) -> String {
         out.push('\n');
     }
     let unreadable = r.get("unreadable").and_then(Value::as_array);
-    for u in unreadable.into_iter().flatten().take(20) {
-        let line = format!(
+    for u in unreadable.into_iter().flatten().take(10) {
+        out.push_str(&format!(
             "unreadable: {}.md: {}\n",
             note_field(str_of(u, "name"), 64),
             note_field(str_of(u, "why"), 100)
-        );
-        if out.len() + line.len() > OUTPUT_CAP {
-            break;
-        }
-        out.push_str(&line);
+        ));
     }
     if let Some(n) = r.get("skipped").and_then(Value::as_u64).filter(|n| *n > 0) {
         out.push_str(&format!(
@@ -978,7 +983,7 @@ pub fn memory_list(r: &Value) -> String {
 
 /// `memory_read`: the note's line, then its text, within [`OUTPUT_CAP`].
 pub fn memory_note(n: &Value) -> String {
-    let mut out = note_line(n);
+    let mut out = note_line(n, 200);
     out.push('\n');
     let body = str_of(n, "body");
     let room = OUTPUT_CAP.saturating_sub(out.len() + 64);
@@ -1326,6 +1331,27 @@ mod tests {
             control_body(&event),
             "hub: refused to list api's top: project reads are off"
         );
+    }
+
+    /// A full memory (100 notes, long names and descriptions) lists every name and rev
+    /// within the cap; a description holding nothing but quotes is cut, never the index.
+    #[test]
+    fn a_full_memory_lists_every_note() {
+        let notes: Vec<Value> = (0..100)
+            .map(|i| {
+                json!({"name": format!("n{i:03}-{}", "x".repeat(59)), "type": "feedback",
+                       "updated": "2026-10-22T10:00:00Z", "rev": "0123456789ab",
+                       "description": "\"".repeat(200), "unconfirmed": i % 2 == 0})
+            })
+            .collect();
+        let r = json!({"notes": notes, "limits": {"notes": 100, "bytes": 65536},
+                       "unreadable": [], "skipped": 0});
+        let out = memory_list(&r);
+        assert!(out.len() <= OUTPUT_CAP, "{}", out.len());
+        for i in 0..100 {
+            assert!(out.contains(&format!("- n{i:03}-")), "{i}");
+        }
+        assert!(!out.contains("more notes not shown"));
     }
 
     #[test]

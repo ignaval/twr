@@ -756,3 +756,31 @@ async fn every_shape_of_a_memory_call_is_recorded_without_its_text() {
     drop(rt);
     hub.shutdown().await;
 }
+
+#[tokio::test]
+async fn a_secret_in_a_hand_edited_note_never_reaches_the_orchestrator() {
+    let env = Env::new();
+    let hub = env.hub_with(|_| {}).await;
+    let token = format!("ghp_{}", "a1B2".repeat(9));
+    std::fs::create_dir_all(env.memory_dir()).unwrap();
+    std::fs::write(
+        env.memory_dir().join("leaky.md"),
+        format!("---\ndescription: token {token}\ntype: user\n---\n\nalso {token}\n"),
+    )
+    .unwrap();
+    let orch = hub.memory_list(&Caller::Orchestrator).await.unwrap();
+    assert!(!orch.to_string().contains(&token), "{orch}");
+    let user = hub.memory_list(&tui()).await.unwrap();
+    assert!(user.to_string().contains(&token));
+    let e = hub
+        .memory_read(
+            ReadParams {
+                name: "leaky".into(),
+            },
+            &Caller::Orchestrator,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+    hub.shutdown().await;
+}
