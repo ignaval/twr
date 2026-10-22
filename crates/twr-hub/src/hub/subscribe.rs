@@ -53,11 +53,13 @@ impl Hub {
         since_seq: u64,
         limit: usize,
     ) -> Result<(String, Vec<Event>), RpcError> {
-        // A deleted thread's own id reads its events too (read only: nothing else takes it).
-        let id = match self.resolve(query) {
-            Ok(id) => id,
-            Err(_) if self.inner.core().registry.is_deleted(query) => query.to_string(),
-            Err(e) => return Err(e),
+        // A deleted thread's own id reads its events too (read only: nothing else takes it),
+        // before any name: a later thread may be named or aliased like that id.
+        let deleted = self.inner.core().registry.is_deleted(query);
+        let id = if deleted {
+            query.to_string()
+        } else {
+            self.resolve(query)?
         };
         // With those archived (`hub::prune`), merged by seq: `twr.db` read first, then the
         // archive (where a row a compaction moved meanwhile is by then).
@@ -151,6 +153,14 @@ impl Hub {
         since_seq: u64,
     ) -> Result<ThreadSubscription, RpcError> {
         let core = self.inner.core();
+        // A deleted thread's id names that thread, never a later one named like it: nothing
+        // more comes for it (`thread.events` reads what it has).
+        if core.registry.is_deleted(query) {
+            return Err(super::rpc(
+                twr_core::proto::codes::NOT_FOUND,
+                format!("thread {query} is deleted"),
+            ));
+        }
         let thread = core.resolve(query)?;
         let rx = self.inner.events_tx.subscribe();
         let head = core.seqs.get(&thread).copied().unwrap_or(0);
