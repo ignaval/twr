@@ -304,6 +304,13 @@ pub struct ThreadView {
     /// (`turn.interrupted`): it is being interrupted, and ends `interrupted`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current_turn_interrupted: bool,
+    /// The currently open turn is a compaction of the context the user asked for
+    /// ([`is_compact_turn`]): maintenance, no work. Its end leaves [`ThreadView::last_turn`],
+    /// the report and what the last work turn left (its interim report, its failure) as they
+    /// were, so nothing that waits on the thread's work (a wake, a watch, `send --after`, a
+    /// retry) counts it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_turn_compact: bool,
     /// Every automatic retry seen: retry turn -> the turn it retried (`ext.twr.retry_of`).
     /// Kept per turn number so a `turn.ended` that arrives after `thread.crashed` (which closes
     /// the open turn) still knows its turn was a retry.
@@ -332,6 +339,16 @@ pub struct ThreadView {
     /// ([`crate::usage::Spent`]).
     #[serde(default, skip_serializing_if = "crate::usage::Spent::is_empty")]
     pub spent: crate::usage::Spent,
+    /// How full its session's context is: the latest `turn.ended` `context`, then what a
+    /// compaction since left (`context.compacted` `post_tokens`, the window kept). A new
+    /// session (a `thread.started` with another session id, a move to another runtime) has
+    /// none until its first turn ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSize>,
+    /// When its runtime began compacting its context (`context.compacting`), while it does:
+    /// until the `context.compacted`, the end of the turn or of the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacting: Option<DateTime<Utc>>,
     /// Client currently attached.
     pub attached: Option<String>,
     /// Parked.
@@ -471,6 +488,11 @@ impl ThreadView {
                 self.handoff_pending = false;
                 self.cut_tasks();
                 self.task_tracking_closed = false;
+                // Another session starts with a context of its own.
+                if p.session_id.is_some() && p.session_id != self.session_id {
+                    self.context = None;
+                }
+                self.compacting = None;
                 self.set_session(&p.session_id);
                 self.stopped = false;
                 self.actual_model = reported_model(p.ext.as_ref()).map(str::to_string);
@@ -531,6 +553,7 @@ impl ThreadView {
                     self.acp_command = acp_command(p.ext.as_ref()).cloned();
                     self.session_id = None;
                     self.actual_model = None;
+                    self.context = None;
                     self.handoff_pending = true;
                 }
             }
@@ -539,7 +562,10 @@ impl ThreadView {
             EventBody::ThreadCrashed(_) => {
                 self.crashed = true;
                 self.crashed_turn = match self.current_turn {
-                    Some(t) => (!self.current_turn_withdrawn && !self.current_turn_interrupted)
+                    // (A compaction is no work to retry.)
+                    Some(t) => (!self.current_turn_withdrawn
+                        && !self.current_turn_interrupted
+                        && !self.current_turn_compact)
                         .then_some(t),
                     None => self
                         .last_turn
@@ -557,6 +583,23 @@ impl ThreadView {
                 self.task_tracking_closed = true;
             }
             EventBody::ThreadDetached(_) => self.attached = None,
+            // A compaction (maintenance) keeps what the last work turn left.
+            EventBody::TurnStarted(p) if is_compact_turn(p) => {
+                let n = ev.turn.unwrap_or(self.turns + 1);
+                self.turns = self.turns.max(n);
+                self.current_turn = Some(n);
+                self.task_tracking_closed = false;
+                self.current_turn_retry_of = None;
+                self.current_runtime_turn = None;
+                self.current_turn_ref = None;
+                self.current_turn_acted = false;
+                self.current_turn_withdrawn = false;
+                self.current_turn_interrupted = false;
+                self.current_turn_compact = true;
+                // (A crash before it stays the thread's failure: `crashed`, `crashed_turn`.)
+                self.stopped = false;
+                self.parked = false;
+            }
             EventBody::TurnStarted(p) => {
                 let n = ev.turn.unwrap_or(self.turns + 1);
                 self.turns = self.turns.max(n);
@@ -586,7 +629,16 @@ impl ThreadView {
                 if let Some(u) = &p.usage {
                     self.spent.add(u);
                 }
+                if let Some(c) = p.context.filter(|_| !self.handoff_pending) {
+                    self.context = Some(c);
+                }
+                self.compacting = None;
                 let n = ev.turn.or(self.current_turn).unwrap_or(self.turns);
+                // The end of a compaction: maintenance, what the last work turn left stays.
+                if self.current_turn == Some(n) && self.current_turn_compact {
+                    self.close_turn();
+                    return;
+                }
                 let retry = self.turn_retry_of.get(&n).copied();
                 self.last_turn = Some(LastTurn {
                     turn: n,
@@ -653,7 +705,9 @@ impl ThreadView {
             EventBody::ReportReady(p) => {
                 self.set_session(&p.session_id);
                 let covers = p.turn.or(ev.turn);
-                if self.current_turn.is_none() {
+                // (A report of the last work turn that comes while a compaction runs, its
+                // reaction late, covers it as well: the compaction's end keeps it.)
+                if self.current_turn.is_none() || self.current_turn_compact {
                     if let Some(last) = &self.last_turn {
                         if covers.is_none_or(|t| t == last.turn) {
                             self.reported = true;
@@ -706,6 +760,17 @@ impl ThreadView {
                     d.bytes = d.bytes.saturating_sub(freed);
                 }
                 self.trimmed = Some((ev.ts, p.freed));
+            }
+            EventBody::ContextCompacting(_) => self.compacting = Some(ev.ts),
+            EventBody::ContextCompacted(p) => {
+                self.compacting = None;
+                if let (None, Some(post), false) = (&p.error, p.post_tokens, self.handoff_pending) {
+                    let window = self.context.and_then(|c| c.window);
+                    self.context = Some(ContextSize {
+                        tokens: post,
+                        window,
+                    });
+                }
             }
             _ => {}
         }
@@ -779,6 +844,7 @@ impl ThreadView {
     /// nothing can still be waiting on the agent side. Retry links survive in
     /// [`ThreadView::turn_retry_of`].
     fn close_for_exit(&mut self) {
+        self.compacting = None;
         self.cut_tasks();
         self.task_tracking_closed = true;
         self.close_turn();
@@ -794,6 +860,7 @@ impl ThreadView {
         self.current_turn_acted = false;
         self.current_turn_withdrawn = false;
         self.current_turn_interrupted = false;
+        self.current_turn_compact = false;
     }
 
     /// Whether `ev` was recorded in the currently open turn (not a request of the runtime's
@@ -956,7 +1023,9 @@ pub enum ResolveError {
 /// All thread views, keyed by thread id. The reserved [`HUB_THREAD`] is never listed, nor is
 /// a deleted thread (`thread.deleted`): its view is set aside, and every later event of it is
 /// dropped until a `thread.restored` brings it back as it was.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Serialized whole in the hub's checkpoints of its folded state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
     threads: BTreeMap<String, ThreadView>,
     /// Deleted threads, by id, with their views as they were when deleted.
@@ -1294,8 +1363,9 @@ pub fn compare_attention(a: &AttentionItem, b: &AttentionItem, pins: &HashSet<St
         .then(a.event_id.cmp(&b.event_id))
 }
 
-/// Open attention items across all threads (including [`HUB_THREAD`]).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Open attention items across all threads (including [`HUB_THREAD`]). Serialized whole in the
+/// hub's checkpoints of its folded state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttentionStack {
     items: BTreeMap<String, AttentionItem>,
 }
@@ -1575,6 +1645,56 @@ mod tests {
         v.apply(&task(&mut t, "job:J1", false, Source::Hub));
         v.apply(&task(&mut t, "job:J3", false, Source::Hub));
         assert!(v.background_tasks.is_empty());
+    }
+
+    /// A compaction (maintenance) leaves what the last work turn left: its last turn, its
+    /// report, and a crash that took it down (no `turn.ended`) as the thread's failure.
+    #[test]
+    fn a_compaction_keeps_the_last_work_turns_outcome() {
+        let mut t = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.created("a"));
+        v.apply(&t.event(EventBody::ThreadStarted(SessionPayload::default())));
+        v.apply(&t.turn_started("build it"));
+        v.apply(&t.event(EventBody::ThreadCrashed(Default::default())));
+        assert_eq!(
+            (v.crashed, v.crashed_turn, v.failed_turn()),
+            (true, Some(1), Some(1))
+        );
+        let compact_of = |t: &mut ThreadScript| {
+            let mut compact = t.turn_started("/compact");
+            if let EventBody::TurnStarted(p) = &mut compact.body {
+                set_twr_ext(&mut p.ext, COMPACT_TURN_KEY, serde_json::json!(true));
+            }
+            compact
+        };
+        v.apply(&compact_of(&mut t));
+        assert!(v.current_turn_compact);
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert!(v.current_turn.is_none() && !v.current_turn_compact);
+        assert_eq!(
+            (v.crashed, v.crashed_turn, v.failed_turn()),
+            (true, Some(1), Some(1))
+        );
+        assert_eq!(v.status(), ThreadStatus::Error);
+        assert_eq!(v.turns, 2);
+        // The work turn's report, late, while a compaction runs, covers it all the same.
+        let mut v = ThreadView::new("t1");
+        let mut t = ThreadScript::new("t1");
+        v.apply(&t.created("a"));
+        v.apply(&t.turn_started("build it"));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        v.apply(&compact_of(&mut t));
+        v.apply(&t.report(Some(1), Grade::Success));
+        assert!(v.reported, "covers the work turn");
+        assert_eq!(v.last_report.as_ref().and_then(|r| r.turn), Some(1));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert!(v.reported && v.current_turn.is_none());
+        // A work turn after it is the thread's again.
+        v.apply(&t.turn_started("again"));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert_eq!(v.last_turn.as_ref().map(|l| l.turn), Some(3));
+        assert!(!v.crashed);
     }
 
     /// A thread's view sums what its turns spent; a turn without usage adds nothing.

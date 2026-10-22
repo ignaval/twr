@@ -101,7 +101,7 @@ fn picks_new_thread(item: &AttentionItem, decision: &str) -> bool {
 const PREVIEW_CHARS: usize = 80;
 
 /// The message a hub question routes once answered.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct PendingRoute {
     /// The user's message.
     pub(super) message: String,

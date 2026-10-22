@@ -990,6 +990,11 @@ pub enum Action {
         /// Thread id.
         thread: String,
     },
+    /// Compact a thread's context (`thread.compact`).
+    CompactContext {
+        /// Thread id.
+        thread: String,
+    },
     /// Switch the orchestrator to `runtime` (`orchestrator.use`): a new orchestrator session
     /// that starts with a handoff.
     UseOrchestrator {
@@ -1377,6 +1382,17 @@ impl Transcript {
             // A job's task is the hub's: no other source draws a `!` command.
             EventBody::TaskUpdated(p) if ev.source == twr_core::event::Source::Hub => {
                 self.apply_shell(ev.seq, p)
+            }
+            // The runtime compacted its context (or failed to): a line of its own, in a dive
+            // and in the orchestrator's conversation alike. While it runs, the activity line
+            // says so.
+            EventBody::ContextCompacted(p) => {
+                self.close_text();
+                let level = match p.error {
+                    Some(_) => NoticeLevel::Error,
+                    None => NoticeLevel::Info,
+                };
+                self.notice(level, p.line());
             }
             // What the orchestrator read of a project: shown like a hub update, so it stays on
             // screen when tool calls are folded.
@@ -2281,6 +2297,10 @@ pub struct AppState {
     /// is still running. The view kept for this workspace waits for it, and keys do (the IO
     /// loop drops them), so nothing answers a state the screen has not shown yet.
     pub catch_up: Option<u64>,
+    /// The initial replay is a compacted backlog ([`AppState::begin_compacted_catch_up`]):
+    /// how many of its items came, of how many. It ends after the last of them, whatever its
+    /// gseq.
+    pub catch_up_items: Option<(u64, u64)>,
     /// Recent `decision.made` events for the audit view.
     pub decisions: DecisionLog,
     /// The latest usage of each runtime's account, from `account.usage` (the status bar's
@@ -2446,6 +2466,7 @@ impl AppState {
     /// kept to what the replayed stack lists. Nothing is selected until the user selects a
     /// card (the TUI opens with none, unless a kept view had one).
     pub fn begin_catch_up(&mut self, head: u64) {
+        self.catch_up_items = None;
         if head > self.last_gseq {
             self.catch_up = Some(head);
         } else {
@@ -2456,12 +2477,27 @@ impl AppState {
         }
     }
 
+    /// [`AppState::begin_catch_up`] for a compacted replay (`control.subscribe` with
+    /// `compact`): `items` items of those up to `head`, not every one ([`twr_core::compact`]).
+    /// It ends after the last of them, and the TUI then stands at `head`, as after a full
+    /// replay (what it has seen, [`AppState::seen_gseq`], counts from there).
+    pub fn begin_compacted_catch_up(&mut self, head: u64, items: u64) {
+        if items == 0 {
+            self.last_gseq = self.last_gseq.max(head);
+        }
+        self.begin_catch_up(head);
+        if self.catch_up.is_some() {
+            self.catch_up_items = Some((0, items));
+        }
+    }
+
     /// The control stream ended (lost, or the hub closed it): no replay is coming any more,
     /// so a view kept for this workspace is restored with what was applied, and the answers to
     /// its messages that waited for that are applied ([`AppState::finish_restore`]).
     pub fn control_ended(&mut self) {
         self.control_lost = true;
         self.catch_up = None;
+        self.catch_up_items = None;
         self.finish_restore();
     }
 
@@ -2470,20 +2506,33 @@ impl AppState {
     pub fn apply_event(&mut self, item: &StreamItem) {
         match item.stream {
             StreamKind::Control => {
-                if let Some(g) = item.gseq {
-                    if g <= self.last_gseq {
-                        return;
-                    }
-                    self.last_gseq = g;
+                if let Some((came, _)) = &mut self.catch_up_items {
+                    *came += 1;
                 }
-                self.apply_control_at(&item.event, item.gseq);
-                self.note_capped(item);
-                if self.catch_up.is_some_and(|head| self.last_gseq >= head) {
-                    self.catch_up = None;
+                let new = item.gseq.is_none_or(|g| g > self.last_gseq);
+                if new {
+                    if let Some(g) = item.gseq {
+                        self.last_gseq = g;
+                    }
+                    self.apply_control_at(&item.event, item.gseq);
+                    self.note_capped(item);
+                }
+                // A compacted replay ends with its last item, which may come before the head.
+                let compacted = self
+                    .catch_up_items
+                    .is_some_and(|(came, items)| came >= items);
+                let ended = self.catch_up.is_some_and(|head| self.last_gseq >= head) || compacted;
+                if ended {
+                    if let Some(head) = self.catch_up.take() {
+                        self.last_gseq = self.last_gseq.max(head);
+                    }
+                    self.catch_up_items = None;
                     self.finish_restore();
                     self.ensure_focus();
                 }
-                self.sync_action();
+                if new || ended {
+                    self.sync_action();
+                }
             }
             StreamKind::Thread => {
                 self.clear_transient_on(&item.event);
@@ -4556,6 +4605,18 @@ impl AppState {
                 let (thread, name) = (t.id.clone(), t.name.clone());
                 self.view.status = Some(format!("trim {name}: deleting its build output"));
                 return (vec![Action::Trim { thread }], true);
+            }
+            Slash::CompactContext(q) => {
+                let t = match self.thread_arg(q.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.view.status = Some(e);
+                        return (Vec::new(), false);
+                    }
+                };
+                let (thread, name) = (t.id.clone(), t.name.clone());
+                self.view.status = Some(format!("compact {name}'s context: waiting for the hub"));
+                return (vec![Action::CompactContext { thread }], true);
             }
             Slash::Stop(q) => {
                 let Some((thread, name)) = thread(self, &q) else {
@@ -12439,6 +12500,44 @@ pub(crate) mod tests {
         assert!(matches!(
             tr.entries.last(),
             Some(Entry::Notice { text, .. }) if text == "restarting the runtime in its new mode"
+        ));
+    }
+
+    /// A compaction of the runtime's context reads as a line of the transcript (a dive's and
+    /// the orchestrator's conversation alike): its sizes, or why it failed.
+    #[test]
+    fn a_compaction_reads_as_a_line_of_the_transcript() {
+        let mut s = ThreadScript::new("t1");
+        let mut tr = Transcript::new("t1");
+        tr.apply(&s.event(EventBody::ContextCompacting(Default::default())));
+        assert!(tr.entries.is_empty(), "the activity line says it runs");
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                pre_tokens: Some(34_878),
+                post_tokens: Some(12_726),
+                ..Default::default()
+            },
+        )));
+        assert_eq!(
+            tr.entries.last(),
+            Some(&Entry::Notice {
+                seq: tr.last_seq,
+                level: NoticeLevel::Info,
+                text: "context compacted (auto) · 34.9k tokens → 12.7k".into()
+            })
+        );
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                error: Some("too_few_groups".into()),
+                ..Default::default()
+            },
+        )));
+        assert!(matches!(
+            tr.entries.last(),
+            Some(Entry::Notice { level: NoticeLevel::Error, text, .. })
+                if text == "context compaction failed (auto): too_few_groups"
         ));
     }
 

@@ -262,7 +262,7 @@ pub fn transcript_line(ev: &Value) -> Option<String> {
             }
             format!("text: {}", clip.field(&d, "text", FIELD_CAP))
         }
-        "conversation.update" | "project.read" => control_line(ev, &mut clip),
+        "conversation.update" | "project.read" | "context.compacted" => control_line(ev, &mut clip),
         "agent.tool_call" => {
             let risky = if d.get("risky").and_then(Value::as_bool).unwrap_or(false) {
                 " [risky]"
@@ -320,6 +320,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
             let p: twr_core::event::ProjectRead =
                 serde_json::from_value(d.clone()).unwrap_or_default();
             format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
+        }
+        "context.compacted" => {
+            let p: twr_core::event::ContextCompacted =
+                serde_json::from_value(d.clone()).unwrap_or_default();
+            clip.text(&p.line(), FIELD_CAP)
         }
         "conversation.update" => {
             let user = d

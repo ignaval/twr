@@ -1,0 +1,15 @@
+>> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"twr","version":"0.1.0"}}}
+<< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true,"promptCapabilities":{"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":true,"sse":true},"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"authMethods":[{"id":"grok.com","name":"Grok","description":"Sign in with Grok"}],"_meta":{"agentVersion":"1.0.50","modelState":{"currentModelId":"grok-4.7","availableModels":[{"modelId":"grok-4.7","name":"Grok 4.7","_meta":{"totalContextTokens":256000}},{"modelId":"grok-4.7-build-fast","name":"Grok 4.7 Build Fast","_meta":{"totalContextTokens":500000}}]}}}}
+>> {"jsonrpc":"2.0","id":2,"method":"session/resume","params":{"cwd":"/work/repo","mcpServers":[],"sessionId":"s-old","_meta":{"yoloMode":false}}}
+<< {"jsonrpc":"2.0","id":2,"result":{}}
+>> {"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"s-old","prompt":[{"type":"text","text":"Summarize the repo"}]}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Reading. "}},"_meta":{"totalTokens":230000}}}
+<< {"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s-old","update":{"sessionUpdate":"auto_compact_started","tokens_used":230000,"context_window":256000,"percentage":89}}}
+<< {"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s-other","update":{"sessionUpdate":"auto_compact_started","tokens_used":1000,"context_window":256000,"percentage":1}}}
+<< {"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s-old","update":{"sessionUpdate":"auto_compact_completed","tokens_before":230000,"tokens_after":41000,"summary_preview":"The user asked for a summary of the repo."}}}
+<< {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-old","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"It is a CLI."}},"_meta":{"totalTokens":42000}}}
+<< {"jsonrpc":"2.0","id":3,"result":{"stopReason":"end_turn","_meta":{"totalTokens":42100}}}
+>> {"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"s-old","prompt":[{"type":"text","text":"/compact"}]}}
+<< {"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s-old","update":{"sessionUpdate":"auto_compact_started","tokens_used":42100,"context_window":256000,"percentage":16}}}
+<< {"jsonrpc":"2.0","method":"_x.ai/session_notification","params":{"sessionId":"s-old","update":{"sessionUpdate":"auto_compact_failed","error":"conversation too short"}}}
+<< {"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}

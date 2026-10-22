@@ -61,8 +61,10 @@ pub fn side_width(width: u16) -> u16 {
 /// the view: how far the replay is. No key acts on it (the view is not drawn yet).
 pub fn render_loading(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
-    let text = match state.catch_up {
-        Some(head) if head > 0 && head < u64::MAX => {
+    let text = match (state.catch_up, state.catch_up_items) {
+        // A compacted replay: its items, not the gseqs up to the head.
+        (Some(_), Some((came, items))) => format!("Loading… {} of {items} events", came.min(items)),
+        (Some(head), None) if head > 0 && head < u64::MAX => {
             format!("Loading… {} of {head} events", state.last_gseq.min(head))
         }
         _ => "Loading…".to_string(),
@@ -1969,6 +1971,16 @@ fn card_block(
     (block, unsaid)
 }
 
+/// A card's or tile's right bottom label: how full its thread's context is, when its runtime
+/// said (`ctx 34%`, [`twr_core::event::ContextSize::short`]), before the `more` label `right`.
+fn with_context(t: &ThreadView, right: Option<String>) -> Option<String> {
+    let ctx = t.context.map(|c| c.short());
+    match (ctx, right) {
+        (Some(c), Some(r)) => Some(format!("{c} · {r}")),
+        (c, r) => c.or(r),
+    }
+}
+
 /// `block`, a card or tile `width` columns wide, with its bottom border's labels: the `more`
 /// labels (left, right: `↑ 2 more`, `↓ 3 more`), and after the left one the box `token` when
 /// the title had no room for the state of its box ([`card_block`]), so that state is always on
@@ -2045,6 +2057,7 @@ fn render_card(
     let (block, unsaid) = card_block(state, t, pinned, area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
+    let more_right = with_context(t, more_right);
     let block = card_bottom(block, area.width, (more_left, more_right), token);
 
     let inner = block.inner(area);
@@ -3755,7 +3768,7 @@ fn render_tile(
     let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let block = card_bottom(block, area.width, (None, None), token);
+    let block = card_bottom(block, area.width, (None, with_context(t, None)), token);
     let inner = block.inner(area);
     let body = tile_body(state, t, inner.width);
     let status_row = body
@@ -12534,6 +12547,43 @@ mod tests {
     }
 
     /// A tile says what its thread's turns spent after the turn count.
+    /// A card and a tile say how full their thread's context is on their bottom border, once
+    /// its runtime said, and what a compaction left after it.
+    #[test]
+    fn cards_say_how_full_the_context_is() {
+        let mut st = crate::app::tests::five_threads();
+        let mut z = ThreadScript::new("t-zeta");
+        z.at(40);
+        let evs = vec![z.created("zeta"), z.turn_started("go")];
+        crate::app::tests::control(&mut st, &evs);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(!screen.contains("ctx "), "nothing said yet: {screen}");
+        let mut end = z.turn_ended(twr_core::event::TurnResult::Completed);
+        if let EventBody::TurnEnded(p) = &mut end.body {
+            p.context = Some(twr_core::event::ContextSize {
+                tokens: 342_000,
+                window: Some(1_000_000),
+            });
+        }
+        crate::app::tests::control(&mut st, &[end]);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 34%"), "{screen}");
+        let compacted = z.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "manual".into(),
+                pre_tokens: Some(342_000),
+                post_tokens: Some(20_000),
+                ..Default::default()
+            },
+        ));
+        crate::app::tests::control(&mut st, &[compacted]);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 2%"), "{screen}");
+        st.view.screen = Screen::Grid;
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 2%"), "a tile too: {screen}");
+    }
+
     #[test]
     fn grid_tiles_say_what_the_turns_spent() {
         let mut st = grid_state();

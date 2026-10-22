@@ -34,7 +34,7 @@ The [notification command](notifications.md) and every [job](usage.md#jobs) carr
 
 An agent's connection may call only reads and its own thread's jobs: list and read threads, transcripts, events and the control stream, what is waiting on you, the trash's list, usage, the hub's info, a project's standing context, and every thread's jobs and their output. It may start and cancel jobs for its own thread, under the rule in [Jobs](#jobs). Anything else is refused with a message naming the agent's thread. A `twr` command an agent runs gets the same refusal, as does an agent inside `twr attach`.
 
-Reads are not limited to the agent's own thread. Any agent can read every thread's transcript and every job's output.
+Reads are not limited to the agent's own thread. Any agent can read every thread's transcript and every job's output, and a deleted thread's events by its id (`thread.events`; agents run as your user and can read `twr.db` and `archive.db` themselves).
 
 A connection may hold at most 16 subscriptions (`control.subscribe`, `thread.subscribe`) at once, and the hub serves at most 1024, of which agents' connections together hold at most 256, so an agent can't grow the hub's memory without bound by subscribing again and again, nor take the subscriptions your TUI needs.
 
@@ -48,7 +48,7 @@ The orchestrator is the agent most exposed to text that you didn't write: it rea
 
 ### What it may do on its own
 
-Through its MCP tools it may start workers (in a configured project, a repository under `project_roots`, or any git repository by absolute path that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data directory, `TWR_HOME` or a credentials folder such as `~/.ssh` or `~/.config`), send them prompts, cancel prompts held with `--after`, stop, park, resume and rename them, change a worker's model, move a worker in `plan`, `read-only` or `dontAsk` to another runtime (any other move goes on a confirm card, since runtimes differ in what one mode lets through), write reports, annotate cards, set watches, and read and set a project's standing context (`.twr/context.md`, which goes into every later worker prompt for that project). New workers always start in `[threads] default_mode`, never a mode it picks, and only with a built-in runtime (Claude Code, Codex, Grok Build), a preset you configured, or the project's or default runtime: it never names a command line. It can't attach, stop the hub, switch itself to another runtime, run jobs, empty or restore the trash, or trim.
+Through its MCP tools it may start workers (in a configured project, a repository under `project_roots`, or any git repository by absolute path that isn't, and doesn't hold, your home folder, and doesn't hold and isn't inside twr's data directory, `TWR_HOME` or a credentials folder such as `~/.ssh` or `~/.config`), send them prompts, cancel prompts held with `--after`, stop, park, resume and rename them, change a worker's model, move a worker in `plan`, `read-only` or `dontAsk` to another runtime (any other move goes on a confirm card, since runtimes differ in what one mode lets through), write reports, annotate cards, set watches, and read and set a project's standing context (`.twr/context.md`, which goes into every later worker prompt for that project). New workers always start in `[threads] default_mode`, never a mode it picks, and only with a built-in runtime (Claude Code, Codex, Grok Build), a preset you configured, or the project's or default runtime: it never names a command line. It can't attach, stop the hub, switch itself to another runtime, run jobs, empty or restore the trash, trim, or compact a thread's context (`thread.compact`: a compaction loses detail the agent had, so only you ask for one; agents can't either). A prompt of its whose first word is `/compact`, which Claude Code and Grok Build would run as the command, is refused too, however it is queued.
 
 ### The relay rule
 
@@ -186,6 +186,8 @@ Limits:
 [worktrees.md](worktrees.md#what-twrs-git-runs) describes the same from the user's side.
 
 ## The trash and trims
+
+Compacting the log (`twr log compact`, `log.compact`) and its statistics (`log.stats`) are yours too: neither the orchestrator nor an agent can call them. `archive.db`, where old agent events go, is created 0600 in the data directory, as `twr.db` is.
 
 Deleting threads, and purging and restoring the trash, are yours: an agent can't ask for them, and the orchestrator's deletion is a card only you answer. A deletion moves a thread's worktree, git's record of it and its branch into the trash, with refs under `refs/twr-trash/<item>/` that keep every commit they reach. It deletes nothing else on the way except the thread's build output. A purge removes only trash items whose manifest names them, and only the refs of that item. twr never removes a worktree by force and never deletes a branch except the one it moves to the trash, with two exceptions for what it made itself and is undoing: a worktree a failed or interrupted thread creation left (removed by force only when its record proves it is that worktree, on the branch twr made for it; that branch goes too, only while its tip is still where twr made it), and one it made while restoring a trash item that failed (checked to be that worktree first) ([worktrees.md](worktrees.md#delete)).
 

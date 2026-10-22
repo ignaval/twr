@@ -1031,12 +1031,62 @@ pub struct TurnEnded {
     pub usage: Option<Usage>,
     /// Wall-clock duration.
     pub duration_ms: Option<u64>,
+    /// How full the session's context was when the turn ended, when the runtime says
+    /// ([`ContextSize`]). Logs from before it have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSize>,
     /// Runtime-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<JsonMap>,
     /// Unknown keys, including `<field>_ref` blob pointers.
     #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
     pub extra: JsonMap,
+}
+
+/// How full a session's context is: the tokens of its last model call's input (what the next
+/// call starts from) and the model's context window, when known. Claude Code: the `result`'s
+/// `usage` input, cache writes and cache reads, and `modelUsage[].contextWindow`; Codex:
+/// `thread/tokenUsage/updated` `last.totalTokens` and `modelContextWindow`; Grok Build:
+/// `session/update` `_meta.totalTokens` and the model catalog's `totalContextTokens`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextSize {
+    /// Tokens in the context.
+    pub tokens: u64,
+    /// The model's context window in tokens, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+}
+
+impl ContextSize {
+    /// The share of the window in use, in whole percent (rounded), when the window is known.
+    pub fn percent(&self) -> Option<u64> {
+        let w = self.window.filter(|w| *w > 0)?;
+        Some((self.tokens.saturating_mul(100) + w / 2) / w)
+    }
+
+    /// Short text for cards: `ctx 34%`, or `ctx 35k` without a window.
+    pub fn short(&self) -> String {
+        match self.percent() {
+            Some(p) => format!("ctx {p}%"),
+            None => format!("ctx {}", crate::usage::tokens_text(self.tokens)),
+        }
+    }
+}
+
+/// `ext.twr` key of a `turn.started` the user asked for with `thread.compact` (`true`): the
+/// runtime compacts its context in that turn instead of answering a prompt (its `prompt` is
+/// `/compact`, sent as given, with nothing prepended).
+pub const COMPACT_TURN_KEY: &str = "compact";
+
+/// Whether turn start `p` is a compaction the user asked for ([`COMPACT_TURN_KEY`]).
+pub fn is_compact_turn(p: &TurnStarted) -> bool {
+    p.ext
+        .as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(COMPACT_TURN_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// `ext.twr` key of a `turn.started` whose prompt came from the queue (`thread.send`, `say`):
@@ -1508,6 +1558,81 @@ pub struct ContextUpdated {
     pub extra: JsonMap,
 }
 
+/// `context.compacting` (adapter, in the turn it happens in, or none): the runtime began
+/// compacting its context (Claude Code's `system/status` `compacting`, Codex's
+/// `contextCompaction` item starting, Grok Build's `auto_compact_started`). It can take minutes
+/// with nothing else said: until its `context.compacted` the hub holds the thread's stall and
+/// hung-turn checks (`twr-hub` `hub::stall`, for at most [`COMPACTING_HOLD_SECS`]), and its
+/// activity line says so. On the control stream.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextCompacting {
+    /// `auto` or `manual` (the user's `thread.compact`), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// The longest a compaction holds its thread's stall and hung-turn checks
+/// ([`ContextCompacting`]): past it, the thread's silence counts again as any other.
+pub const COMPACTING_HOLD_SECS: u64 = 30 * 60;
+
+/// `context.compacted` (adapter, like [`ContextCompacting`]): the runtime compacted its
+/// context, from `pre_tokens` to `post_tokens`, or failed to (`error`). On the control stream,
+/// so cards and the orchestrator's conversation show it.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextCompacted {
+    /// `auto` (the runtime's own threshold), `manual` (asked for: the user's `/compact`), or
+    /// what else the runtime says.
+    pub trigger: String,
+    /// Tokens in the context before, when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pre_tokens: Option<u64>,
+    /// Tokens in the context after (an estimate for Codex), when known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_tokens: Option<u64>,
+    /// How long it took, when the runtime says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Why it failed (the context is as it was); `None`: it was compacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+impl ContextCompacted {
+    /// One line for transcripts: `context compacted (auto) · 34.9k tokens → 12.7k`, or
+    /// `context compaction failed (auto): too_few_groups`.
+    pub fn line(&self) -> String {
+        let trigger = match self.trigger.trim() {
+            "" => String::new(),
+            t => format!(" ({t})"),
+        };
+        if let Some(e) = &self.error {
+            return format!("context compaction failed{trigger}: {e}");
+        }
+        let tok = |n: u64| crate::usage::tokens_text_fine(n);
+        let sizes = match (self.pre_tokens, self.post_tokens) {
+            (Some(a), Some(b)) => format!(" · {} tokens → {}", tok(a), tok(b)),
+            (Some(a), None) => format!(" · from {} tokens", tok(a)),
+            (None, Some(b)) => format!(" · now {} tokens", tok(b)),
+            (None, None) => String::new(),
+        };
+        format!("context compacted{trigger}{sizes}")
+    }
+}
+
 /// `runtime.limits`: a runtime's report of its plan's usage windows (Claude's
 /// `rate_limit_event` and `get_usage`, Codex's `account/rateLimits/*`, Grok Build's
 /// `_x.ai/billing`), sent by its adapter. The hub folds it into `account.usage` and does not
@@ -1594,6 +1719,30 @@ pub struct WorktreeTrimmed {
     /// What did not go as it should.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `trash.purged` (on the hub's own thread, source `hub`): trash item `item` of deleted thread
+/// `thread` is gone from its box. The hub purged it (`[trash] keep_days`, `trash.empty`), or
+/// found it gone when its box listed the trash after its purge time (`gone`: a purge before
+/// purges were recorded, or the item removed by hand). A thread whose item of its latest
+/// deletion is purged can no longer be restored: the hub archives its agent events
+/// (`hub::prune`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrashPurged {
+    /// The trash item.
+    pub item: String,
+    /// The deleted thread it kept.
+    pub thread: String,
+    /// The item was found gone rather than purged by the hub.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
     /// Runtime-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<JsonMap>,
@@ -1768,6 +1917,10 @@ event_body! {
     RunnerDisconnected(RunnerPayload) => "runner.disconnected",
     /// `context.updated`
     ContextUpdated(ContextUpdated) => "context.updated",
+    /// `context.compacting`
+    ContextCompacting(ContextCompacting) => "context.compacting",
+    /// `context.compacted`
+    ContextCompacted(ContextCompacted) => "context.compacted",
     /// `runtime.limits`
     RuntimeLimits(RuntimeLimits) => "runtime.limits",
     /// `account.usage`
@@ -1778,6 +1931,8 @@ event_body! {
     WorktreeDisk(WorktreeDiskMeasured) => "worktree.disk",
     /// `worktree.trimmed`
     WorktreeTrimmed(WorktreeTrimmed) => "worktree.trimmed",
+    /// `trash.purged`
+    TrashPurged(TrashPurged) => "trash.purged",
 }
 
 impl EventBody {
@@ -1798,9 +1953,11 @@ impl EventBody {
 /// `prompt.withdrawn` (a message the user took back), `turn.interrupted` (the user sent the next
 /// queued message now), `task.updated`, `attention.*`,
 /// `report.*`, `decision.*`, and the small hub-relevant kinds `git.snapshot`, `runner.*`,
-/// `context.updated`, `conversation.update`, `account.*` (the hub's `account.usage`),
-/// `project.read` (an orchestrator read, shown to the user) and `worktree.*`. `agent.*` never
-/// goes on the control stream.
+/// `context.updated`, `context.compacting` and `context.compacted` (a runtime compacting its
+/// context: a few per session at most, and cards show it), `conversation.update`, `account.*`
+/// (the hub's `account.usage`), `project.read` (an orchestrator read, shown to the user),
+/// `worktree.*` and `trash.*` (the hub's `trash.purged`). `agent.*` never goes on the control
+/// stream.
 pub fn is_control_kind(kind: &str) -> bool {
     kind.starts_with("thread.")
         || kind == "turn.started"
@@ -1815,10 +1972,13 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind == "git.snapshot"
         || kind.starts_with("runner.")
         || kind == "context.updated"
+        || kind == "context.compacting"
+        || kind == "context.compacted"
         || kind == "conversation.update"
         || kind.starts_with("account.")
         || kind == "project.read"
         || kind.starts_with("worktree.")
+        || kind.starts_with("trash.")
 }
 
 impl Serialize for EventBody {
@@ -2072,6 +2232,17 @@ mod tests {
                 hash: "sha256:ab".into(),
                 ..Default::default()
             }),
+            EventBody::ContextCompacting(ContextCompacting {
+                trigger: Some("auto".into()),
+                ..Default::default()
+            }),
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                pre_tokens: Some(34_878),
+                post_tokens: Some(12_726),
+                duration_ms: Some(9_901),
+                ..Default::default()
+            }),
             EventBody::RuntimeLimits(RuntimeLimits {
                 windows: vec![crate::usage::UsageWindow {
                     window: "five_hour".into(),
@@ -2114,7 +2285,46 @@ mod tests {
                 freed: 6 << 30,
                 ..Default::default()
             }),
+            EventBody::TrashPurged(TrashPurged {
+                item: "01JTRASHITEM".into(),
+                thread: "t1".into(),
+                gone: true,
+                ..Default::default()
+            }),
         ]
+    }
+
+    /// The transcript line of a compaction, and a context's share of its window.
+    #[test]
+    fn compaction_lines_and_context_sizes() {
+        let mut c = ContextCompacted {
+            trigger: "auto".into(),
+            pre_tokens: Some(34_878),
+            post_tokens: Some(12_726),
+            ..Default::default()
+        };
+        assert_eq!(c.line(), "context compacted (auto) · 34.9k tokens → 12.7k");
+        c.trigger = "manual".into();
+        c.pre_tokens = Some(500_000);
+        assert_eq!(c.line(), "context compacted (manual) · 500k tokens → 12.7k");
+        c.post_tokens = None;
+        assert_eq!(c.line(), "context compacted (manual) · from 500k tokens");
+        c.error = Some("too_few_groups".into());
+        assert_eq!(
+            c.line(),
+            "context compaction failed (manual): too_few_groups"
+        );
+        let size = ContextSize {
+            tokens: 34_878,
+            window: Some(100_000),
+        };
+        assert_eq!(size.percent(), Some(35));
+        assert_eq!(size.short(), "ctx 35%");
+        let bare = ContextSize {
+            tokens: 34_878,
+            window: None,
+        };
+        assert_eq!(bare.short(), "ctx 35k");
     }
 
     #[test]
@@ -2492,9 +2702,12 @@ mod tests {
             "runner.connected",
             "runner.disconnected",
             "context.updated",
+            "context.compacting",
+            "context.compacted",
             "account.usage",
             "worktree.disk",
             "worktree.trimmed",
+            "trash.purged",
         ];
         let no = [
             "runtime.limits",
@@ -2503,6 +2716,7 @@ mod tests {
             "agent.tool_result",
             "agent.thinking",
             "turn.other",
+            "context.other",
             "future.thing",
         ];
         for k in yes {

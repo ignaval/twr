@@ -221,6 +221,7 @@ impl Adapter for ProbeAdapter {
                         end.emit(ended(), Some(turn));
                     }
                     AdapterCmd::Interrupt => record("interrupt".into()),
+                    AdapterCmd::Compact { .. } => record("compact".into()),
                     AdapterCmd::Stop => {
                         record("stop".into());
                         break;

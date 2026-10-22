@@ -117,8 +117,11 @@ mod bench;
 mod box_agents;
 mod box_switch;
 mod boxes;
+mod checkpoint;
 mod closing;
+mod coalesce;
 mod commands;
+mod compact;
 mod config_view;
 mod context;
 /// `O_NOFOLLOW | O_NONBLOCK` for this platform (0 where twr does not spell it out): for opening
@@ -140,6 +143,7 @@ mod model;
 mod orch;
 mod project_read;
 mod proposal;
+mod prune;
 mod queue;
 mod reactions;
 mod rename;
@@ -176,6 +180,7 @@ pub use box_agents::{
     own_agent_probe, AgentProbe, AgentsPoll, BoxView, AGENTS_EVERY, AGENTS_FIRST, AGENTS_TIMEOUT,
 };
 pub(crate) use boxes::WeakHub;
+pub use checkpoint::{CHECKPOINT_EVERY, CHECKPOINT_TICK};
 pub use config_view::config_view;
 pub use context::{injection, CONTEXT_DIR, CONTEXT_FILE, INJECT_MAX, SET_MAX};
 pub use disk::{DISK_TICK, NOT_NOW as DISK_NOT_NOW, TRIM as DISK_TRIM};
@@ -332,6 +337,17 @@ pub struct HubOptions {
     /// Period of the disk round (each box's free space, the worktrees due a measurement, the
     /// disk cards; `hub::disk`); `None` = [`DISK_TICK`] (5 minutes), zero = never.
     pub disk_tick: Option<Duration>,
+    /// How often the hub looks whether a checkpoint of its folded state is due
+    /// (`hub::checkpoint`; the first time sooner); `None` = [`CHECKPOINT_TICK`] (an hour),
+    /// zero = never.
+    pub checkpoint_tick: Option<Duration>,
+    /// How many events must come after the newest checkpoint before another one is written;
+    /// `None` = [`CHECKPOINT_EVERY`] (5 000).
+    pub checkpoint_events: Option<u64>,
+    /// How often the hub looks whether its log has agent events to archive or prune
+    /// (`hub::prune`, `[log]`; the first time sooner); `None` = an hour, zero = never on its
+    /// own (`log.compact` still does).
+    pub prune_tick: Option<Duration>,
     /// The lock of `boxes.toml` ([`twr_core::config::BoxesFile::lock`]) taken before `config`
     /// was read (`twr hub`), held by [`crate::run`] until the hub's socket is bound: a `twr box
     /// remove` or `twr box token --rotate` that edits the file under that lock and then finds
@@ -472,6 +488,9 @@ impl HubOptions {
             git_tick: None,
             trash_tick: None,
             disk_tick: None,
+            checkpoint_tick: None,
+            checkpoint_events: None,
+            prune_tick: None,
             job_slots_dir: None,
             boxes_lock: None,
             config_file: None,
@@ -670,6 +689,10 @@ pub struct Hub {
 struct Inner {
     core: Mutex<Core>,
     reader: Mutex<Connection>,
+    /// The control items as the compacted backlog's selection reads them
+    /// ([`subscribe::CompactRows`]). Taken by a compacted subscription's selection only,
+    /// never with the core lock held.
+    compact_rows: Arc<Mutex<subscribe::CompactRows>>,
     control_tx: broadcast::Sender<ControlItem>,
     events_tx: broadcast::Sender<Arc<Event>>,
     live_count: watch::Sender<usize>,
@@ -765,6 +788,17 @@ struct Inner {
     trash_tick: Duration,
     /// The disk round's period ([`HubOptions::disk_tick`]); zero = off.
     disk_tick: Duration,
+    /// [`HubOptions::checkpoint_tick`]; zero = off.
+    checkpoint_tick: Duration,
+    /// [`HubOptions::checkpoint_events`].
+    checkpoint_events: u64,
+    /// [`HubOptions::prune_tick`]; zero = off.
+    prune_tick: Duration,
+    /// Held while a checkpoint is written or the log is compacted (`hub::checkpoint`,
+    /// `hub::prune`): a `VACUUM` renumbers the rows a checkpoint's replay looks up.
+    maintenance: Mutex<()>,
+    /// A reader of `archive.db` (`hub::prune`), once there is one.
+    archive_reader: Mutex<Option<Connection>>,
     /// The machine's job slots ([`HubOptions::job_slots_dir`], `hub::jobs`).
     job_slots_dir: PathBuf,
     /// [`HubOptions::test_user_token`].
@@ -816,6 +850,18 @@ impl Inner {
         self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The reader of `archive.db`, opened the first time there is one (`None` until then).
+    fn archive_reader(&self) -> MutexGuard<'_, Option<Connection>> {
+        let mut a = self
+            .archive_reader
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if a.is_none() {
+            *a = crate::archive::open_reader(&crate::archive::path_of(&self.db_path));
+        }
+        a
+    }
+
     fn fatal(&self) -> Option<String> {
         self.fatal
             .lock()
@@ -824,10 +870,22 @@ impl Inner {
     }
 }
 
+/// `TWR_CHECKPOINT_CHECK=1` (the crate's tests): each hub's log is checked against checkpoints
+/// as the hub goes away (`hub::checkpoint`).
+#[cfg(test)]
+impl Drop for Inner {
+    fn drop(&mut self) {
+        checkpoint::tests::check_on_drop(&self.db_path, &self.config.notify);
+    }
+}
+
 /// Per-thread runtime bookkeeping (not state: rebuilt from the log or from live processes).
-#[derive(Default)]
+/// What the log rebuilds goes into the hub's checkpoints (`hub::checkpoint`); the fields
+/// skipped there are memory only, and the fold never sets them.
+#[derive(Default, serde::Serialize, Deserialize)]
 struct ThreadRt {
     /// The running adapter, if any.
+    #[serde(skip)]
     live: Option<Live>,
     /// The log shows a runtime process that has not stopped, crashed or parked.
     process_live: bool,
@@ -838,10 +896,12 @@ struct ThreadRt {
     /// Full text of the open turn's latest final `agent.text` (report fallback).
     final_text: Option<String>,
     /// The attach lease, from `attach.begin` until `thread.detached`.
+    #[serde(skip)]
     attach: Option<AttachLease>,
     /// Where the thread works (`thread.created` `ext.twr`, `hub::git`).
     workspace: git::Workspace,
     /// A `thread.park` in progress (from the request until its worktree is dealt with).
+    #[serde(skip)]
     park: Option<git::ParkLease>,
     /// A `thread.resume` in progress (recreating the worktree).
     resuming: bool,
@@ -857,6 +917,7 @@ struct ThreadRt {
     /// The runtime that exit took, when a runner connection brought it
     /// ([`Core::begin_exit_on`]): kept until [`Core::finish_exit`], to be put back as it was
     /// when `box.token` changes the token that connection proved ([`TakenExit`]).
+    #[serde(skip)]
     taken: Option<TakenExit>,
     /// A `thread.stop` asked the runtime to stop and its closing sequence is not recorded yet
     /// (mirrors the durable `stop_requests` row, see [`crate::store`]): its exit, whenever and
@@ -895,6 +956,7 @@ struct ThreadRt {
     /// [`ThreadRt::reaping`]: the end of the kill runs it ([`reap_runtime`]).
     ///
     /// [`reap_runtime`]: supervisor::reap_runtime
+    #[serde(skip)]
     after_reap: AfterReap,
     /// The permission mode, model and reasoning effort the thread's runtime process was
     /// started with: set when the hub starts it, and from the log (`thread.started` /
@@ -916,6 +978,7 @@ struct ThreadRt {
     /// (`box_upgrade`, `hub::box_switch`), after which the thread is not free until that is
     /// over. A `thread.stop` meanwhile clears it (the stop wins). Memory only: a hub restart
     /// starts every local runtime afresh in the thread's settings anyway.
+    #[serde(skip)]
     restart_reason: Option<&'static str>,
     /// The runtime's own turns whose start the hub dropped (`hub::supervisor`): runtime turn
     /// id → the open turn that took them in. Each one's end adds its usage to that turn once.
@@ -935,6 +998,79 @@ struct ThreadRt {
     /// the signs it showed (`hub::withdraw`): each kind of sign interrupts it again once.
     /// Memory only.
     reinterrupted: Option<(u64, u8)>,
+    /// A compaction of its context the user asked for that has not started (`hub::compact`):
+    /// the next turn once the messages queued before it are done. Memory only.
+    #[serde(skip)]
+    compact: Option<compact::CompactAsk>,
+}
+
+/// Equal in every field (tests: a fold from a checkpoint against a fold of the whole log,
+/// `hub::checkpoint`); a live runtime, lease or exit, and a compaction asked for, by whether
+/// there is one.
+#[cfg(test)]
+impl PartialEq for ThreadRt {
+    fn eq(&self, o: &Self) -> bool {
+        let ThreadRt {
+            live,
+            process_live,
+            pid,
+            start_time,
+            exe,
+            final_text,
+            attach,
+            workspace,
+            park,
+            resuming,
+            pty_command,
+            acp_env,
+            exiting,
+            taken,
+            stop_requested,
+            closed_runtimes,
+            queue_held,
+            crash_hold,
+            reaping,
+            after_reap,
+            runtime_settings,
+            session_settings,
+            restart_reason,
+            absorbed,
+            folded_usage,
+            deleting,
+            trimming,
+            reinterrupted,
+            compact,
+        } = self;
+        live.is_some() == o.live.is_some()
+            && *process_live == o.process_live
+            && *pid == o.pid
+            && *start_time == o.start_time
+            && *exe == o.exe
+            && *final_text == o.final_text
+            && attach.is_some() == o.attach.is_some()
+            && *workspace == o.workspace
+            && park.is_some() == o.park.is_some()
+            && *resuming == o.resuming
+            && *pty_command == o.pty_command
+            && *acp_env == o.acp_env
+            && *exiting == o.exiting
+            && taken.is_some() == o.taken.is_some()
+            && *stop_requested == o.stop_requested
+            && *closed_runtimes == o.closed_runtimes
+            && *queue_held == o.queue_held
+            && *crash_hold == o.crash_hold
+            && *reaping == o.reaping
+            && *after_reap == o.after_reap
+            && *runtime_settings == o.runtime_settings
+            && *session_settings == o.session_settings
+            && *restart_reason == o.restart_reason
+            && *absorbed == o.absorbed
+            && *folded_usage == o.folded_usage
+            && *deleting == o.deleting
+            && *trimming == o.trimming
+            && *reinterrupted == o.reinterrupted
+            && compact.is_some() == o.compact.is_some()
+    }
 }
 
 /// A runtime an exit a runner connection brought took ([`ThreadRt::taken`]), and that
@@ -961,6 +1097,84 @@ enum AfterReap {
 }
 
 impl ThreadRt {
+    /// The fields checkpoints hold (tests: what it serializes to, `hub::checkpoint`).
+    #[cfg(test)]
+    const KEPT: &'static [&'static str] = &[
+        "process_live",
+        "pid",
+        "start_time",
+        "exe",
+        "final_text",
+        "workspace",
+        "resuming",
+        "pty_command",
+        "acp_env",
+        "exiting",
+        "stop_requested",
+        "closed_runtimes",
+        "queue_held",
+        "crash_hold",
+        "reaping",
+        "runtime_settings",
+        "session_settings",
+        "absorbed",
+        "folded_usage",
+        "deleting",
+        "trimming",
+        "reinterrupted",
+    ];
+
+    /// The fields checkpoints skip (`#[serde(skip)]`) that are set (tests: a fold must set
+    /// none of them, `hub::checkpoint`). Names every field: a new one is placed here, and in
+    /// [`ThreadRt::KEPT`] when checkpoints hold it.
+    #[cfg(test)]
+    fn skipped_set(&self) -> Vec<&'static str> {
+        let ThreadRt {
+            live,
+            attach,
+            park,
+            taken,
+            after_reap,
+            restart_reason,
+            compact,
+            // In the checkpoint.
+            process_live: _,
+            pid: _,
+            start_time: _,
+            exe: _,
+            final_text: _,
+            workspace: _,
+            resuming: _,
+            pty_command: _,
+            acp_env: _,
+            exiting: _,
+            stop_requested: _,
+            closed_runtimes: _,
+            queue_held: _,
+            crash_hold: _,
+            reaping: _,
+            runtime_settings: _,
+            session_settings: _,
+            absorbed: _,
+            folded_usage: _,
+            deleting: _,
+            trimming: _,
+            reinterrupted: _,
+        } = self;
+        [
+            ("live", live.is_some()),
+            ("attach", attach.is_some()),
+            ("park", park.is_some()),
+            ("taken", taken.is_some()),
+            ("after_reap", *after_reap != AfterReap::Nothing),
+            ("restart_reason", restart_reason.is_some()),
+            ("compact", compact.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(f, set)| set.then_some(f))
+        .collect()
+    }
+
     /// The live runtime is one the hub gave up on ([`give_up_runtime`]) and has not exited yet,
     /// or what may be left of a runtime of the thread is being killed ([`reap_runtime`]).
     ///
@@ -1252,6 +1466,15 @@ struct PendingExit {
     at: Option<DateTime<Utc>>,
 }
 
+/// The hub's state, under its lock. What the log rebuilds (the fold: [`Core::apply`] of every
+/// event, live as it is recorded and on replay, from the event and this state alone) is also
+/// what the hub's checkpoints hold (`hub::checkpoint`): a field the fold sets must go into
+/// [`checkpoint::FoldSnapshot`], and every field that stays out is named memory only in
+/// [`Core::into_snapshot`], which lists each one, so that a new field does not compile until it
+/// is placed. Inside a folded field's type, what the checkpoint skips (`#[serde(skip)]`) is
+/// memory only too: the fold never sets it. A hash set in one is serialized sorted
+/// (`twr_core::sorted`; a test looks for any that is not). The checkpoint tests compare a fold
+/// that starts from a checkpoint with a fold of the whole log.
 struct Core {
     store: Store,
     registry: Registry,
@@ -1279,6 +1502,13 @@ struct Core {
     ///
     /// [`strip_body_capping_metadata`]: twr_core::blob::strip_body_capping_metadata
     sanitized_events: u64,
+    /// Runtime task updates not recorded (`hub::coalesce`).
+    coalesced_events: u64,
+    /// The control items as the compacted backlog reads them, as the replay found them: taken
+    /// into [`Inner::compact_rows`] when the hub opens.
+    compact_rows: subscribe::CompactRows,
+    /// When each runtime task's progress was last recorded (`hub::coalesce`).
+    task_progress: coalesce::TaskProgress,
     /// Store writes retried after a failure ([`persist`]).
     ///
     /// [`persist`]: supervisor::persist
@@ -1363,6 +1593,8 @@ struct Core {
     defer_ack_sync: bool,
     /// The latest usage of each runtime's account, from `account.usage` (`hub::usage`).
     usage: twr_core::usage::UsageView,
+    /// How the hub's start rebuilt this state (`hub::checkpoint`). Memory only.
+    replayed: checkpoint::Replayed,
 }
 
 fn rpc(code: &str, msg: impl Into<String>) -> RpcError {
@@ -1462,6 +1694,19 @@ impl Core {
     fn thread_json(&self, v: &ThreadView) -> Value {
         let mut j = serde_json::to_value(v).unwrap_or(Value::Null);
         if let Value::Object(m) = &mut j {
+            // A job this hub runs says what it does now (`hub::jobs`), not its last renewal.
+            if let Some(Value::Object(tasks)) = m.get_mut("background_tasks") {
+                for (id, t) in tasks.iter_mut() {
+                    let now = v
+                        .background_tasks
+                        .get(id)
+                        .filter(|b| b.job)
+                        .and_then(|_| self.job_description(id));
+                    if let (Some(now), Some(t)) = (now, t.as_object_mut()) {
+                        t.insert("description".into(), json!(now));
+                    }
+                }
+            }
             m.insert("status".into(), json!(v.status()));
             // What it does now, one line (`hub::activity`).
             m.insert("activity".into(), json!(self.activity_line(v)));
@@ -1570,6 +1815,7 @@ impl Core {
         if prompt.trim().is_empty() {
             return Err(rpc(codes::BAD_REQUEST, "prompt is empty"));
         }
+        compact::refuse_compact_command(prompt, from)?;
         if self.shutting_down {
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
         }
@@ -1894,7 +2140,12 @@ impl Core {
         if self.rt.get(thread).is_some_and(|r| r.queue_held) {
             return Ok(None);
         }
-        let Some(p) = self.store.next_pending(thread)? else {
+        let next = self.store.next_pending(thread)?;
+        // A compaction the user asked for, once what was queued before it ran (`hub::compact`).
+        if self.compaction_due(hub, thread, next.as_ref().map(|p| p.id)) {
+            return Ok(Some((self.start_compact_turn(hub, thread)?, None)));
+        }
+        let Some(p) = next else {
             return Ok(None);
         };
         // A new orchestrator's handoff is its first turn, before the first queued prompt
@@ -2339,6 +2590,7 @@ impl Hub {
             "open_attention": core.attention.len(),
             "dropped_events": core.dropped_events,
             "sanitized_events": core.sanitized_events,
+            "coalesced_events": core.coalesced_events,
             "persist_retries": core.persist_retries,
             "orchestrator": core.orchestrator_json(&self.inner),
             "load": load,

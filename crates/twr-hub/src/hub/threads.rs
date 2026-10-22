@@ -217,6 +217,9 @@ impl Hub {
     /// (`project_found`).
     pub async fn new_thread_by(&self, req: NewThread, caller: &Caller) -> Result<Value, RpcError> {
         let cfg = &self.inner.config;
+        if let Some(p) = &req.first_prompt {
+            super::compact::refuse_compact_command(p, caller.from())?;
+        }
         // Held until the thread is recorded (or refused): its box is not switched meanwhile.
         let (box_name, host, remote, mut op) = self.thread_box(&req)?;
         let found = self.find_project(&req, remote).await?;

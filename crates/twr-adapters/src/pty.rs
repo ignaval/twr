@@ -602,6 +602,22 @@ async fn drive(
                     }
                 }
                 Some(AdapterCmd::Interrupt) => tracing::warn!("pty: turn interruption is unsupported; session retained"),
+                // The hub refuses a compaction for a pty thread (`Adapter::compacts`).
+                Some(AdapterCmd::Compact { turn }) => {
+                    tracing::warn!(turn, "pty: context compaction is unsupported");
+                    let mut ext = None;
+                    twr_core::event::set_twr_ext(
+                        &mut ext,
+                        "error",
+                        json!("a pty session cannot compact its context from twr"),
+                    );
+                    let ended = twr_core::event::TurnEnded {
+                        result: twr_core::event::TurnResult::Error,
+                        ext,
+                        ..Default::default()
+                    };
+                    hub_gone = !end.emit(EventBody::TurnEnded(ended), Some(turn));
+                }
                 Some(AdapterCmd::Stop) | None => {
                     stop_deadline = Some(begin_stop(&mut io, &mut core, grace));
                 }

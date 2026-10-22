@@ -361,6 +361,11 @@ impl Adapter for GrokBuildAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// The prompt `/compact` (checked with grok 1.0.62, see `acp`).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let mode = permission_mode(&cfg)?;

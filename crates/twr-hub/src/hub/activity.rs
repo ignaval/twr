@@ -48,7 +48,7 @@ const TEXT_KEEP: usize = 4096;
 const HEAD_KEEP: usize = 1024;
 
 /// What the log says about one thread's agent that no reducer keeps ([`Core::track_activity`]).
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Activity {
     /// Its latest action in the open turn, in one line: `thinking`, `Bash: cargo test`, the
     /// last line of what it is writing. `None` before its first one.
@@ -263,6 +263,19 @@ impl Core {
                 };
                 act(a, last);
             }
+            // Compacting its context: minutes, maybe, with nothing else said.
+            EventBody::ContextCompacting(_) => {
+                let a = self.activity.entry(ev.thread.clone()).or_default();
+                a.action = Some(activity::COMPACTING.into());
+                act(a, activity::COMPACTING.into());
+            }
+            EventBody::ContextCompacted(c) => {
+                let a = self.activity.entry(ev.thread.clone()).or_default();
+                if a.action.as_deref() == Some(activity::COMPACTING) {
+                    a.action = None;
+                }
+                act(a, c.line());
+            }
             // The turn is over: its actions are; what it said stays.
             EventBody::TurnEnded(_) => {
                 let a = self.activity.entry(ev.thread.clone()).or_default();
@@ -292,11 +305,7 @@ impl Core {
             ThreadStatus::Background => format!(
                 "working in background · {} task(s): {}",
                 v.background_tasks.len(),
-                v.background_tasks
-                    .values()
-                    .map(|t| t.description.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                self.tasks_now(v.background_tasks.iter()).join(", ")
             ),
             ThreadStatus::Running => match a.and_then(|a| a.last.as_deref()) {
                 Some(last) => last.to_string(),
@@ -337,10 +346,10 @@ impl Core {
                 None => activity::fallback(v).to_string(),
             },
             ThreadStatus::Background => {
-                let tasks: Vec<&str> = v
-                    .background_tasks
-                    .values()
-                    .map(|t| t.description.as_str())
+                let now = self.tasks_now(v.background_tasks.iter());
+                let tasks: Vec<&str> = now
+                    .iter()
+                    .map(String::as_str)
                     .filter(|d| !d.trim().is_empty())
                     .collect();
                 match (v.background_tasks.len(), tasks.as_slice()) {

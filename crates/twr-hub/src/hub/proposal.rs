@@ -114,7 +114,7 @@ pub(super) enum Proposed {
 }
 
 /// The proposals of one orchestrator turn that ended, not on a card yet.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(super) struct PendingCard {
     /// The orchestrator thread.
     pub(super) orchestrator: String,

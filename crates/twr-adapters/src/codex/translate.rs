@@ -79,7 +79,17 @@
 //!   not gone) is the passive report. Both become `runtime.limits`.
 //! - Tokens: `thread/tokenUsage/updated` after every model call; `total` is cumulative for the
 //!   thread (a resumed thread first replays its old total), so a turn's usage is the growth of
-//!   `total` over the turn. There is no USD cost.
+//!   `total` over the turn. There is no USD cost. `last.totalTokens` is how full the context
+//!   is, `modelContextWindow` the window: a turn's end carries the latest (`turn.ended`
+//!   `context`).
+//! - Context compaction (Codex 0.162.1): an item `{type: "contextCompaction"}` between its
+//!   `item/started` (`context.compacting`) and `item/completed` (`context.compacted`), at a
+//!   turn's start or after a tool's output; in between, a `thread/tokenUsage/updated` whose
+//!   `last` has only `totalTokens` (every other count 0) estimates the context after it
+//!   (`post_tokens`; `pre_tokens` is the `last.totalTokens` before). The user's compaction
+//!   ([`Translator::compact`]) is `thread/compact/start {threadId}`, answered `{}`, then a turn
+//!   of its own that no `turn/start` named: the next `turn/started` is the turn twr opened for
+//!   it. Sent during a turn it interrupts that turn, so it is queued like a prompt.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -223,6 +233,10 @@ enum Req {
         turn: u64,
     },
     Interrupt,
+    /// `thread/compact/start` for twr's turn `turn`.
+    Compact {
+        turn: u64,
+    },
     Steer,
     Terminals,
     ChildRead {
@@ -286,6 +300,21 @@ struct Current {
     /// The last `error` notification of the turn (`params.error`) and its `willRetry`: the
     /// cause of a failed turn whose `turn/completed` names none.
     last_error: Option<(Value, bool)>,
+    /// The turn is a compaction twr asked for (`thread/compact/start`): no answer names its id,
+    /// the next `turn/started` does.
+    compact: bool,
+}
+
+/// A compaction under way (a `contextCompaction` item started).
+#[derive(Debug, Clone)]
+struct Compacting {
+    item: String,
+    trigger: &'static str,
+    /// How full the context was before.
+    pre: Option<u64>,
+    /// Codex's estimate of the context after.
+    post: Option<u64>,
+    since: DateTime<Utc>,
 }
 
 /// A turn Codex started while twr's `turn/start` had no answer yet: whose it is is known once
@@ -392,6 +421,13 @@ pub struct Translator {
     routed: Vec<Emitted>,
     /// Latest thread token total seen.
     tokens: Tokens,
+    /// Queued turns that are compactions ([`Translator::compact`]).
+    compact_queued: HashSet<u64>,
+    /// The compaction under way.
+    compacting: Option<Compacting>,
+    /// How full the context is (the latest `last.totalTokens`) and the window.
+    context: Option<u64>,
+    context_window: Option<u64>,
     /// Item id → summary of its `item/started` (tool calls already reported).
     items: HashMap<String, String>,
     pending: Vec<Pending>,
@@ -439,6 +475,10 @@ impl Translator {
             own_turns: HashMap::new(),
             routed: Vec::new(),
             tokens: Tokens::default(),
+            compact_queued: HashSet::new(),
+            compacting: None,
+            context: None,
+            context_window: None,
             items: HashMap::new(),
             pending: Vec::new(),
             used_attn_ids: Recent::new(ATTN_IDS_KEPT),
@@ -550,12 +590,20 @@ impl Translator {
         self.dispatch().into_iter().collect()
     }
 
+    /// Queues turn `turn` as a compaction of the thread's context (`thread/compact/start`),
+    /// started like a prompt when no other turn runs ([`Translator::send`]).
+    pub fn compact(&mut self, turn: u64) -> Vec<String> {
+        self.compact_queued.insert(turn);
+        self.send("", turn)
+    }
+
     fn dispatch(&mut self) -> Option<String> {
         if !self.ready || self.current.is_some() {
             return None;
         }
         let thread_id = self.thread_id.clone()?;
         let (text, turn) = self.queued.pop_front()?;
+        let compact = self.compact_queued.remove(&turn);
         self.current = Some(Current {
             turn: Some(turn),
             codex_id: None,
@@ -564,7 +612,15 @@ impl Translator {
             interrupt_wanted: false,
             interrupt_sent: false,
             last_error: None,
+            compact,
         });
+        if compact {
+            return Some(self.request(
+                Req::Compact { turn },
+                "thread/compact/start",
+                json!({"threadId": thread_id}),
+            ));
+        }
         let mut params = json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": text, "text_elements": []}],
@@ -580,6 +636,7 @@ impl Translator {
     /// goes out as soon as it is.
     pub fn interrupt(&mut self) -> Option<String> {
         self.queued.clear();
+        self.compact_queued.clear();
         self.interrupt_current()
     }
 
@@ -593,6 +650,7 @@ impl Translator {
             cur.interrupt_sent = false;
             out.replies.extend(self.interrupt_current());
         } else if let Some((_, turn)) = self.queued.pop_front() {
+            self.compact_queued.remove(&turn);
             self.push(
                 &mut out,
                 EventBody::TurnEnded(TurnEnded {
@@ -1313,37 +1371,18 @@ impl Translator {
                 }
                 None => self.on_open(&v["result"], line, out),
             },
+            // Its turn comes as a `turn/started` of its own; a refusal ends twr's turn as a
+            // refused `turn/start` does.
+            Req::Compact { turn } => {
+                if let Some(e) = error_text {
+                    tracing::warn!(turn, error = %e, "codex: thread/compact/start failed");
+                    self.refused_turn(turn, &e, line, out);
+                }
+            }
             Req::TurnStart { turn } => match error_text {
                 Some(e) => {
                     tracing::warn!(turn, error = %e, "codex: turn/start failed");
-                    let mut codex = Map::new();
-                    codex.insert("error".into(), json!({"message": e}));
-                    codex.insert("transient".into(), json!(false));
-                    let auth = auth_failure(&json!({"message": e}));
-                    if auth {
-                        codex.insert("auth_failed".into(), json!(true));
-                    }
-                    let mut ext = ext_of(codex);
-                    let why = if auth {
-                        format!("{}{AUTH_HINT}", error_line(&e))
-                    } else {
-                        error_line(&e)
-                    };
-                    ext.get_or_insert_with(JsonMap::new)
-                        .insert("twr".into(), json!({ "error": why }));
-                    let body = EventBody::TurnEnded(TurnEnded {
-                        result: TurnResult::Error,
-                        session_id: self.thread_id.clone(),
-                        usage: None,
-                        ext,
-                        ..Default::default()
-                    });
-                    if self.current.as_ref().is_some_and(|c| c.turn == Some(turn)) {
-                        self.current = None;
-                    }
-                    self.push(out, body, Some(turn), Some(line));
-                    self.settle_unbound(None, line, out);
-                    out.replies.extend(self.dispatch());
+                    self.refused_turn(turn, &e, line, out);
                 }
                 None => {
                     if let Some(id) = v.pointer("/result/turn/id").and_then(Value::as_str) {
@@ -1377,6 +1416,39 @@ impl Translator {
                 }
             }
         }
+    }
+
+    /// Codex refused to start twr's turn `turn` (`turn/start`, `thread/compact/start`) with
+    /// error `e`: the turn ends `error` saying so, and the next one is dispatched.
+    fn refused_turn(&mut self, turn: u64, e: &str, line: &str, out: &mut Translated) {
+        let mut codex = Map::new();
+        codex.insert("error".into(), json!({"message": e}));
+        codex.insert("transient".into(), json!(false));
+        let auth = auth_failure(&json!({"message": e}));
+        if auth {
+            codex.insert("auth_failed".into(), json!(true));
+        }
+        let mut ext = ext_of(codex);
+        let why = if auth {
+            format!("{}{AUTH_HINT}", error_line(e))
+        } else {
+            error_line(e)
+        };
+        ext.get_or_insert_with(JsonMap::new)
+            .insert("twr".into(), json!({ "error": why }));
+        let body = EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Error,
+            session_id: self.thread_id.clone(),
+            usage: None,
+            ext,
+            ..Default::default()
+        });
+        if self.current.as_ref().is_some_and(|c| c.turn == Some(turn)) {
+            self.current = None;
+        }
+        self.push(out, body, Some(turn), Some(line));
+        self.settle_unbound(None, line, out);
+        out.replies.extend(self.dispatch());
     }
 
     fn on_open(&mut self, r: &Value, line: &str, out: &mut Translated) {
@@ -2165,10 +2237,18 @@ impl Translator {
                             interrupt_wanted: false,
                             interrupt_sent: false,
                             last_error: None,
+                            compact: false,
                         });
                         self.push_runtime_start(id, line, out);
                     }
                     if self
+                        .current
+                        .as_ref()
+                        .is_some_and(|c| c.compact && c.codex_id.is_none())
+                    {
+                        // twr's compaction: no answer names its turn, this start does.
+                        self.bind(id);
+                    } else if self
                         .current
                         .as_ref()
                         .is_some_and(|c| c.turn.is_some() && c.codex_id.is_none())
@@ -2226,6 +2306,25 @@ impl Translator {
                 }
             }
             "thread/tokenUsage/updated" => {
+                if let Some(last) = p.pointer("/tokenUsage/last").filter(|l| l.is_object()) {
+                    let n = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    if let Some(tokens) = last.get("totalTokens").and_then(Value::as_u64) {
+                        // During a compaction, the estimate after it: every count but the
+                        // total is 0.
+                        let estimate = n("inputTokens") == 0 && n("outputTokens") == 0;
+                        match self.compacting.as_mut() {
+                            Some(c) if estimate => c.post = Some(tokens),
+                            _ => {}
+                        }
+                        self.context = Some(tokens);
+                    }
+                }
+                if let Some(w) = p
+                    .pointer("/tokenUsage/modelContextWindow")
+                    .and_then(Value::as_u64)
+                {
+                    self.context_window = Some(w);
+                }
                 let Some(total) = p.pointer("/tokenUsage/total") else {
                     return;
                 };
@@ -2299,6 +2398,27 @@ impl Translator {
         out: &mut Translated,
     ) {
         self.item_tasks(item, false, line, out);
+        if str_at(item, "type") == "contextCompaction" {
+            let manual = self
+                .current
+                .as_ref()
+                .is_some_and(|c| c.compact && (turn_id.is_none() || turn_id == c.codex_id));
+            let trigger = if manual { "manual" } else { "auto" };
+            self.compacting = Some(Compacting {
+                item: str_at(item, "id").to_string(),
+                trigger,
+                pre: self.context,
+                post: None,
+                since: (self.clock)(),
+            });
+            let turn = self.turn_of(turn_id.as_deref());
+            let body = EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                trigger: Some(trigger.into()),
+                ..Default::default()
+            });
+            self.push(out, body, turn, Some(line));
+            return;
+        }
         let Some(call) = tool_call(item, self.cwd.as_deref()) else {
             return;
         };
@@ -2445,6 +2565,28 @@ impl Translator {
         self.item_tasks(item, true, line, out);
         let turn = self.turn_of(turn_id.as_deref());
         match str_at(item, "type") {
+            "contextCompaction" => {
+                let id = str_at(item, "id");
+                let c = self
+                    .compacting
+                    .take_if(|c| c.item == id || id.is_empty())
+                    .unwrap_or(Compacting {
+                        item: id.to_string(),
+                        trigger: "auto",
+                        pre: None,
+                        post: None,
+                        since: (self.clock)(),
+                    });
+                let took = ((self.clock)() - c.since).num_milliseconds();
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger: c.trigger.into(),
+                    pre_tokens: c.pre,
+                    post_tokens: c.post,
+                    duration_ms: u64::try_from(took).ok().filter(|_| c.pre.is_some()),
+                    ..Default::default()
+                });
+                self.push(out, body, turn, Some(line));
+            }
             "agentMessage" => {
                 let text = str_at(item, "text");
                 if !text.is_empty() {
@@ -2674,11 +2816,19 @@ impl Translator {
                 set_twr_ext(&mut ext, RUNTIME_TURN_KEY, json!(id));
             }
         }
+        let context = self.context.map(|tokens| twr_core::event::ContextSize {
+            tokens,
+            window: self.context_window,
+        });
+        if is_current {
+            self.compacting = None;
+        }
         let body = EventBody::TurnEnded(TurnEnded {
             result,
             session_id: self.thread_id.clone(),
             usage,
             duration_ms: t.get("durationMs").and_then(Value::as_u64),
+            context,
             ext,
             ..Default::default()
         });
@@ -2723,6 +2873,7 @@ impl Translator {
                         interrupt_wanted: false,
                         interrupt_sent: false,
                         last_error: u.last_error,
+                        compact: false,
                     });
                 } else {
                     self.own_turns.insert(

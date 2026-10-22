@@ -1016,6 +1016,11 @@ impl RemoteBox {
                 tracing::warn!(%thread, "remote turn interruption is unsupported; session retained");
                 return None;
             }
+            // The hub refuses a compaction on a remote box (`ThreadHost::compacts`).
+            AdapterCmd::Compact { turn } => {
+                tracing::warn!(%thread, turn, "remote context compaction is unsupported");
+                return None;
+            }
         })
     }
 
@@ -1264,7 +1269,7 @@ impl RemoteBox {
                     st.take_respond(thread, &attn_id).map(|(id, _)| id)
                 }
                 AdapterCmd::Stop => st.stops.remove(thread),
-                AdapterCmd::Interrupt => None,
+                AdapterCmd::Interrupt | AdapterCmd::Compact { .. } => None,
             };
             ids.extend(id);
         }

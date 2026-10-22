@@ -1,6 +1,7 @@
 //! twr hub daemon: event store, control stream, socket API and adapter supervisors.
 //!
 //! - [`store`]: SQLite schema, append-only log, blobs, pending prompts
+//! - [`archive`]: `archive.db`, where the agent events the hub no longer reads go
 //! - [`hub`]: the single-writer core, turn dispatch, supervisors, subscriptions
 //! - [`host`]: where runtimes run ([`host::ThreadHost`])
 //! - [`remote`]: remote boxes (a runner's box as a [`host::ThreadHost`])
@@ -10,6 +11,7 @@
 //! - [`server`]: the Unix socket NDJSON API
 //! - [`job_gate`]: the process a job's command starts as, until the hub lets it run
 
+pub mod archive;
 pub mod host;
 pub mod hub;
 pub mod job_gate;

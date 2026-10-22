@@ -1,5 +1,6 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`, `/rename`,
-//! `/orch`, `/new`, `/park`, `/resume`, `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
+//! `/orch`, `/new`, `/park`, `/resume`, `/compact-context`, `/stop`, `/pin`, `/delete`,
+//! `/trash`, `/attach`,
 //! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/ws`,
 //! `/settings`, `/help`, `/quit`. Pure parsing, the
 //! suggestions of the popup above the input line ([`suggest`]) and Tab completion;
@@ -78,6 +79,9 @@ pub enum Slash {
     Resume(Option<String>),
     /// `/trim [thread]`: delete the build output of a thread's worktree (`thread.trim`).
     Trim(Option<String>),
+    /// `/compact-context [thread]`: compact a thread's context (`thread.compact`, what the
+    /// agent's own `/compact` does; `/compact` is the TUI's phone layout).
+    CompactContext(Option<String>),
     /// `/stop [thread]`.
     Stop(Option<String>),
     /// `/pin [thread]`: pin or unpin a thread's card (default: the selected one).
@@ -246,6 +250,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/trim",
         "/trim [thread]",
         "delete an idle thread's build output (target/, node_modules/, ...)",
+        &[ArgKind::Thread],
+    ),
+    (
+        "/compact-context",
+        "/compact-context [thread]",
+        "compact a thread's context, as its agent's own /compact does (in a dive: that thread)",
         &[ArgKind::Thread],
     ),
     (
@@ -570,6 +580,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/park" => one(args).map(Slash::Park),
         "/resume" => one(args).map(Slash::Resume),
         "/trim" => one(args).map(Slash::Trim),
+        "/compact-context" => one(args).map(Slash::CompactContext),
         "/stop" => one(args).map(Slash::Stop),
         "/pin" => one(args).map(Slash::Pin),
         "/delete" => match args {
@@ -1154,6 +1165,14 @@ mod tests {
         assert_eq!(parse("/resume web"), Ok(Slash::Resume(Some("web".into()))));
         assert_eq!(parse("/trim web"), Ok(Slash::Trim(Some("web".into()))));
         assert_eq!(parse("/trim"), Ok(Slash::Trim(None)));
+        // The context's compaction is no layout: `/compact` stays the phone layout's.
+        assert_eq!(
+            parse("/compact-context web"),
+            Ok(Slash::CompactContext(Some("web".into())))
+        );
+        assert_eq!(parse("/compact-context"), Ok(Slash::CompactContext(None)));
+        assert_eq!(parse("/compact"), Ok(Slash::Compact(None)));
+        assert!(parse("/compact-context a b").is_err());
         assert_eq!(parse("/attach"), Ok(Slash::Attach(None)));
         assert_eq!(parse("/help"), Ok(Slash::Help));
         assert_eq!(parse("/parked"), Ok(Slash::Parked(None)));
@@ -1345,6 +1364,7 @@ mod tests {
                 "/orch",
                 "/mode",
                 "/model",
+                "/compact-context",
                 "/stop",
                 "/compact",
                 "/focus",
@@ -1357,7 +1377,18 @@ mod tests {
         assert_eq!(names("/se", &pools), ["/settings", "/unsend", "/mouse"]);
         assert_eq!(
             names("/P", &pools),
-            ["/park", "/pin", "/parked", "/open", "/stop", "/spaces", "/compact", "/ws", "/help"]
+            [
+                "/park",
+                "/pin",
+                "/parked",
+                "/open",
+                "/compact-context",
+                "/stop",
+                "/spaces",
+                "/compact",
+                "/ws",
+                "/help"
+            ]
         );
         // Taking arguments or not.
         let help = &suggest("/he", &pools).items[0];

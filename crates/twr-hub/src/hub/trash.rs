@@ -29,7 +29,17 @@
 //! - The purge: items deleted more than `[trash] keep_days` ago go, on every online box, once
 //!   right after the hub starts and then every [`TRASH_TICK`] ([`Hub::purge_trash`]). The hub
 //!   drives it (a runner does not know the hub's config); a box offline then is purged at the
-//!   next tick it is online.
+//!   next tick it is online. Every item purged, here or by `trash.empty`, is recorded
+//!   (`trash.purged {item, thread}` on the hub's thread), and so is an item of the hub's own
+//!   box the log knows that is past its purge time and whose directory is not there
+//!   (`gone: true`: purged before purges were recorded, or removed by hand; an item the box
+//!   merely could not list is not). A remote box's item is recorded purged only from that
+//!   box's own answer to the purge, for the ids it was asked about. Known limitation: when
+//!   that answer is lost (a crash, a failed append), nothing is recorded: the item is still
+//!   listed for the box while it is offline, and its thread's agent events are not archived
+//!   as a purged thread's (only the per-turn retention applies). A deleted thread whose item is
+//!   purged is never restored, and comes back only from the item of its latest deletion; its
+//!   agent events are archived (`hub::prune`).
 //! - Reconciliation ([`Hub::reconcile_boxes`]): when the hub starts, when a runner's box comes
 //!   online and before every purge, what a crash or a failed append left the log and a box
 //!   disagreeing on is settled (what an unrecorded restore made removed, a deletion recorded).
@@ -43,8 +53,8 @@ use chrono::{TimeZone, Utc};
 use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::git::{
-    human_bytes, thread_branch, valid_branch_component, RestoreRequest, TrashItem, TrashPurge,
-    TRASH_BIG_BYTES,
+    human_bytes, thread_branch, valid_branch_component, valid_trash_id, RestoreRequest, TrashItem,
+    TrashPurge, TRASH_BIG_BYTES,
 };
 use twr_core::proto::{codes, RpcError};
 
@@ -61,7 +71,7 @@ const FRESH_PATHS: usize = 9;
 
 /// A trash item as the log knows it (`thread.deleted` `trash`): shown for a box that is not
 /// online.
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Seen {
     pub(super) thread: String,
     pub(super) name: String,
@@ -77,7 +87,7 @@ pub(super) struct Seen {
 
 /// A trash item a `thread.restored` named (from the log): the item stays in the trash, listed
 /// as restored, until it is purged, and is not restored again.
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Restored {
     /// The name the thread was restored under.
     pub(super) name: String,
@@ -101,13 +111,19 @@ pub(super) struct Restored {
 /// runtime was over and recorded), and a restored one starts parked.
 ///
 /// [`ThreadRt`]: super::ThreadRt
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DeletedRt {
     workspace: Workspace,
     pty_command: Option<String>,
     acp_env: Vec<(String, String)>,
     session_settings: Option<super::restart::RunSettings>,
     closed_runtimes: u64,
+    /// The trash item of its deletion (`thread.deleted` `trash`), if it has one.
+    #[serde(default)]
+    pub(super) item: Option<String>,
+    /// That item is purged (`trash.purged`): the thread cannot be restored any more.
+    #[serde(default)]
+    pub(super) purged: bool,
 }
 
 impl DeletedRt {
@@ -119,6 +135,8 @@ impl DeletedRt {
             acp_env: rt.acp_env,
             session_settings: rt.session_settings,
             closed_runtimes: rt.closed_runtimes,
+            item: None,
+            purged: false,
         }
     }
 
@@ -251,7 +269,46 @@ impl Entry {
     }
 }
 
+/// What the boxes listed of their trash ([`Hub::trash_listing`]).
+#[derive(Debug, Default)]
+struct Listed {
+    /// The boxes that listed it.
+    boxes: HashSet<String>,
+    /// Every item they listed.
+    ids: HashSet<String>,
+    /// When the listing began (ms since the epoch): an item whose deletion was recorded before
+    /// it was in its box's trash then.
+    at_ms: u64,
+}
+
 impl Core {
+    /// Records that trash item `item` of thread `thread` is purged (`trash.purged` on the hub's
+    /// thread, `gone`: found gone): its entry goes (the fold drops it). A failure is logged
+    /// and the entry dropped all the same (the item is gone; the next purge after its purge
+    /// time records it). Returns whether it was recorded.
+    pub(super) fn record_purged(
+        &mut self,
+        hub: &Inner,
+        item: &str,
+        thread: &str,
+        gone: bool,
+    ) -> bool {
+        let body = EventBody::TrashPurged(TrashPurged {
+            item: item.to_string(),
+            thread: thread.to_string(),
+            gone,
+            ..Default::default()
+        });
+        match self.append(hub, HUB_THREAD, None, Source::Hub, body) {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(item, thread, error = %format!("{e:#}"), "cannot record a purged trash item");
+                self.trash.remove(item);
+                false
+            }
+        }
+    }
+
     /// Notes trash item `item` of `thread.deleted` `d` (thread `thread`, recorded at `at_ms`).
     pub(super) fn trash_seen(&mut self, thread: &str, d: &ThreadDeleted, at_ms: u64) {
         let Some(item) = &d.trash else {
@@ -297,16 +354,26 @@ impl Hub {
     /// that box's: one whose manifest names another box is left out (and logged), so a
     /// runner's listing never stands for another box's items.
     async fn trash_entries(&self) -> (Vec<Entry>, Vec<(String, String)>) {
+        let (entries, failed, _) = self.trash_listing().await;
+        (entries, failed)
+    }
+
+    /// [`Hub::trash_entries`], and what the boxes listed: the boxes that listed their trash,
+    /// and the id of every item they listed (one whose manifest names another box too).
+    async fn trash_listing(&self) -> (Vec<Entry>, Vec<(String, String)>, Listed) {
+        let at_ms = now_ms();
         let hosts = self.online_hosts();
         let listed =
             futures::future::join_all(hosts.iter().map(|(_, h)| h.git().trash_list())).await;
         let mut entries = Vec::new();
         let mut asked: HashSet<String> = HashSet::new();
+        let mut ids: HashSet<String> = HashSet::new();
         let mut failed = Vec::new();
         for ((name, _), r) in hosts.iter().zip(listed) {
             match r {
                 Ok(items) => {
                     asked.insert(name.clone());
+                    ids.extend(items.iter().map(|i| i.manifest.item.clone()));
                     entries.extend(items.iter().filter_map(|i| Entry::listed(i, name)));
                 }
                 Err(e) => failed.push((name.clone(), format!("{e:#}"))),
@@ -334,7 +401,15 @@ impl Hub {
                 .cmp(&b.seen.deleted_at_ms)
                 .then(a.item.cmp(&b.item))
         });
-        (entries, failed)
+        (
+            entries,
+            failed,
+            Listed {
+                boxes: asked,
+                ids,
+                at_ms,
+            },
+        )
     }
 
     /// `trash.list` (see the module docs): `{items: [{item, short, thread, thread_name,
@@ -507,12 +582,12 @@ impl Hub {
         caller: &Caller,
     ) -> Result<Value, RpcError> {
         let chosen = self.trash_chosen(items, all, caller).await?;
-        let mut by_box: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut by_box: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for e in chosen.values() {
             by_box
                 .entry(e.seen.box_name.clone())
                 .or_default()
-                .push(e.item.clone());
+                .push((e.item.clone(), e.seen.thread.clone()));
         }
         let (purged, failed) = self.purge_on_boxes(by_box).await;
         let purged: Vec<&Entry> = purged.iter().filter_map(|id| chosen.get(id)).collect();
@@ -551,15 +626,22 @@ impl Hub {
         }))
     }
 
-    /// Purges `items` on each box (by box name), forgetting those purged: `(purged ids,
-    /// [(item, box, why)])`. An item being restored or purged meanwhile is left alone.
+    /// Purges `items` (`(item, its thread)`) on each box (by box name), recording each one
+    /// purged (`trash.purged`): `(purged ids, [(item, box, why)])`. An item being restored or
+    /// purged meanwhile is left alone. A box's answer counts only for the ids it was asked to
+    /// purge, and what is recorded of an item (its thread, its box) is what the log says of
+    /// it, never what a box says: an item the log does not know as that box's is not recorded.
+    /// A remote box's answer that is lost (a crash, a failed append) records nothing: the item
+    /// stays as the log knows it (listed for the box while it is offline), and its thread is
+    /// not taken as purged (the hub never infers a remote purge).
     async fn purge_on_boxes(
         &self,
-        items: BTreeMap<String, Vec<String>>,
+        items: BTreeMap<String, Vec<(String, String)>>,
     ) -> (Vec<String>, Vec<(String, String, String)>) {
         let mut purged = Vec::new();
         let mut failed = Vec::new();
         let mut held: Vec<String> = Vec::new();
+        let mut done: Vec<(String, String)> = Vec::new();
         let items: BTreeMap<String, Vec<String>> = {
             let mut core = self.inner.core();
             items
@@ -567,6 +649,7 @@ impl Hub {
                 .map(|(box_name, ids)| {
                     let mine = ids
                         .into_iter()
+                        .map(|(id, _)| id)
                         .filter(|id| {
                             let free = core.trash_busy.insert(id.clone());
                             if free {
@@ -597,6 +680,7 @@ impl Hub {
                 }
                 continue;
             };
+            let asked: HashSet<&String> = ids.iter().collect();
             match host
                 .git()
                 .trash_purge(TrashPurge {
@@ -606,10 +690,16 @@ impl Hub {
                 .await
             {
                 Ok(out) => {
-                    if !out.purged.is_empty() {
-                        tracing::info!(box_name = %box_name, items = ?out.purged, "purged trash items");
+                    let (mine, other): (Vec<String>, Vec<String>) =
+                        out.purged.into_iter().partition(|id| asked.contains(id));
+                    if !other.is_empty() {
+                        tracing::warn!(box_name = %box_name, items = ?other, "a box said it purged trash items it was not asked to; ignored");
                     }
-                    purged.extend(out.purged);
+                    if !mine.is_empty() {
+                        tracing::info!(box_name = %box_name, items = ?mine, "purged trash items");
+                    }
+                    done.extend(mine.iter().map(|id| (id.clone(), box_name.clone())));
+                    purged.extend(mine);
                     for f in out.failed {
                         failed.push((f.item, box_name.clone(), f.error));
                     }
@@ -628,8 +718,16 @@ impl Hub {
         for id in &held {
             core.trash_busy.remove(id);
         }
-        for id in &purged {
-            core.trash.remove(id);
+        for (id, box_name) in &done {
+            match core.trash.get(id) {
+                Some(seen) if seen.box_name == *box_name => {
+                    let thread = seen.thread.clone();
+                    core.record_purged(&self.inner, id, &thread, false);
+                }
+                _ => {
+                    tracing::debug!(item = %id, box_name = %box_name, "purged a trash item the log does not know as that box's; nothing recorded")
+                }
+            }
         }
         (purged, failed)
     }
@@ -641,8 +739,8 @@ impl Hub {
         // What the log and the boxes disagree on is settled first.
         let reconciled = self.reconcile_boxes(None).await;
         let cutoff = now_ms.saturating_sub(self.inner.config.trash.keep_ms());
-        let (entries, unavailable) = self.trash_entries().await;
-        let mut by_box: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let (entries, unavailable, listed) = self.trash_listing().await;
+        let mut by_box: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for e in entries
             .iter()
             .filter(|e| !e.offline && e.seen.deleted_at_ms < cutoff)
@@ -650,9 +748,10 @@ impl Hub {
             by_box
                 .entry(e.seen.box_name.clone())
                 .or_default()
-                .push(e.item.clone());
+                .push((e.item.clone(), e.seen.thread.clone()));
         }
         let (purged, failed) = self.purge_on_boxes(by_box).await;
+        let gone = self.record_gone(&listed, cutoff);
         for (box_name, e) in &unavailable {
             tracing::debug!(box_name = %box_name, error = %e, "cannot list the trash to purge it");
         }
@@ -667,7 +766,57 @@ impl Hub {
                 .map(|(b, e)| json!({ "box": b, "error": e }))
                 .collect::<Vec<_>>(),
             "reconciled": reconciled,
+            "gone": gone,
         })
+    }
+
+    /// Records as purged (`trash.purged` `gone`) each item of the hub's own box (`local`) the
+    /// log knows that is past its purge time (deleted before `cutoff`, ms since the epoch), that
+    /// the box's listing `listed` does not have although its deletion was recorded before the
+    /// listing, and whose directory is not there (`lstat` says so: not merely unreadable): a
+    /// purge from before purges were recorded, or one removed by hand. Nothing else is taken
+    /// as gone: an item a listing skipped (a manifest it cannot read for a while), one not past
+    /// its purge time, one the hub is at work on, and any item of a remote box, whose files the
+    /// hub cannot look at (only that box's own answer to a purge records it purged). A missed
+    /// record only delays archiving; a wrong one would make a thread that can still come back
+    /// unrestorable. Returns the items recorded.
+    fn record_gone(&self, listed: &Listed, cutoff: u64) -> Vec<String> {
+        let root = super::lifecycle::data_dir_of(&self.inner.db_path).join("trash");
+        let candidates: Vec<(String, String)> = {
+            let core = self.inner.core();
+            core.trash
+                .iter()
+                .filter(|(item, seen)| {
+                    seen.box_name == LOCAL_BOX
+                        && listed.boxes.contains(LOCAL_BOX)
+                        && !listed.ids.contains(*item)
+                        && seen.deleted_at_ms < cutoff
+                        && seen.deleted_at_ms < listed.at_ms
+                        && !core.trash_busy.contains(*item)
+                        && valid_trash_id(item)
+                })
+                .map(|(item, seen)| (item.clone(), seen.thread.clone()))
+                .collect()
+        };
+        // Gone for certain: its directory is not there.
+        let gone: Vec<(String, String)> = candidates
+            .into_iter()
+            .filter(|(item, _)| {
+                matches!(
+                    std::fs::symlink_metadata(root.join(item)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound
+                )
+            })
+            .collect();
+        let mut core = self.inner.core();
+        gone.into_iter()
+            .filter(|(item, thread)| {
+                !core.trash_busy.contains(item)
+                    && core.trash.contains_key(item)
+                    && core.record_purged(&self.inner, item, thread, true)
+            })
+            .map(|(item, _)| item)
+            .collect()
     }
 
     /// Settles what the log and the boxes' trash disagree on (see [`Hub::reconcile_boxes`]),
@@ -921,6 +1070,29 @@ impl Hub {
                     ),
                 ));
             }
+            // A thread comes back only from the item of its latest deletion, and never once
+            // that item is purged: what its agent did is archived by then. (An older item of
+            // it, one whose deletion was not recorded, does not bring it back.)
+            let current = core.deleted_rt.get(&thread);
+            if current.is_some_and(|d| d.purged) {
+                return Err(rpc(
+                    codes::CONFLICT,
+                    format!(
+                        "{}'s trash item was purged; the thread cannot be restored",
+                        entry.seen.name
+                    ),
+                ));
+            }
+            if current.is_some_and(|d| d.item.as_deref() != Some(item.as_str())) {
+                return Err(rpc(
+                    codes::CONFLICT,
+                    format!(
+                        "item {} is not the one {} was last deleted into; restore that one",
+                        short(&item),
+                        entry.seen.name
+                    ),
+                ));
+            }
             let name = match as_name {
                 Some(n) => {
                     super::threads::validate_name(n)?;
@@ -1167,6 +1339,58 @@ mod tests {
     use twr_core::config::Config;
 
     use super::super::HubOptions;
+
+    /// A remote box's item is recorded purged only from that box's answer: a listing of the
+    /// box that lacks it (an answer lost to a crash, or a manifest it cannot read) records
+    /// nothing, whatever its age: the item is still listed for the box while it is offline,
+    /// and its thread is not taken as purged.
+    #[tokio::test]
+    async fn a_remote_item_missing_from_its_listing_is_never_taken_as_purged() {
+        use crate::hub::checkpoint::tests::{quiet_options, Log};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        let item = "01AAAAAAAAAAAAAAAAAAAAAAAA";
+        let mut l = Log::default();
+        l.ev(
+            "t-a",
+            Source::Hub,
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "a".into(),
+                box_name: "gpu".into(),
+                runtime: "fake".into(),
+                ..Default::default()
+            }),
+        );
+        l.ev(
+            "t-a",
+            Source::Hub,
+            EventBody::ThreadDeleted(ThreadDeleted {
+                name: "a".into(),
+                trash: Some(item.into()),
+                ..Default::default()
+            }),
+        );
+        l.write(&db);
+        let hub = Hub::open(quiet_options(&db)).await.unwrap();
+        let listed = Listed {
+            boxes: ["gpu".to_string()].into(),
+            ids: Default::default(),
+            at_ms: now_ms(),
+        };
+        assert!(hub.record_gone(&listed, u64::MAX).is_empty());
+        let shown: Vec<String> = hub.trash_list().await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["item"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(shown, [item]);
+        {
+            let core = hub.inner.core();
+            assert!(!core.deleted_rt["t-a"].purged);
+        }
+        hub.shutdown().await;
+    }
 
     /// What a deleted thread's runtime bookkeeping held besides its events comes
     /// back with a restore, live and on replay: the settings its session last ran in (an

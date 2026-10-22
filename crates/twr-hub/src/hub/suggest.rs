@@ -923,6 +923,10 @@ impl Hub {
             if super::orch::is_notice(&p) {
                 return Ok(none(&id, "notice"));
             }
+            // A compaction (`hub::compact`) is no exchange with the user either.
+            if is_compact_turn(&p) {
+                return Ok(none(&id, "compaction"));
+            }
             // Only after a turn the user's own message started: another's prompt (the
             // orchestrator's, a job's end, a shared command's output) is not the user's voice.
             if p.from != TurnFrom::User {

@@ -99,6 +99,10 @@ job_slots = 0                     # the machine's job slots for `twr job run`; 0
 [trash]
 keep_days = 7                     # deleted threads stay in the trash this long; 0 = purge at the next check
 
+[log]
+retention_days = 30               # agent events of turns older than this leave twr.db (7 at least)
+archive = true                    # into archive.db beside it; false = they are deleted
+
 [projects.api]                    # example
 repo = "/home/me/code/api"        # the repository
 # runtime = "codex"               # runtime for this project's threads; unset = default_runtime
@@ -214,6 +218,8 @@ The TUI folds a thread's routine updates in the orchestrator conversation (inter
 `disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts, and `twr box doctor` warns under it. 0 turns them off. See [worktrees.md](worktrees.md#disk-use).
 
 `[trash] keep_days` is how long a deleted thread's worktree, record and branch stay in the trash of its box before the hub purges them. The hub checks when it starts and every hour, on every box that is online; a box that is offline is purged at the first check after it reconnects. `twr trash empty` purges sooner, and `twr trash restore` brings a thread back until then. See [usage.md](usage.md#trash).
+
+`[log]` is what the hub keeps of its log in `twr.db`. What threads, turns, items, reports and decisions are (the control events) always stays. What the agents said, thought and did (the agent events) moves out of `twr.db` into `archive.db` beside it once nothing reads it any more: a deleted thread's once its trash item is purged, and of any other thread, each turn's that ended more than `retention_days` ago and whose report (or, for the orchestrator, its outcome) is recorded. Each turn's final reply, every thread's last turn, and blobs a row that stays still points to stay. `retention_days` is 30 by default and at least 7: a remote box's recorded commands are resent for 6 days, and a resend reads its turn's events; twr refuses a config with less. With `archive = false` those events are deleted instead. The hub looks every hour and moves them once 2 000 or more can go; `twr log compact` does it now, and `twr log stats` says how big the log is and what would move. `twr events` reads archived events too; transcripts and the TUI's dive show an old turn's final reply but not its tool calls. An older twr (0.2.0 and before) refuses a config with a `[log]` table. See [architecture.md](architecture.md#archive-and-prune).
 
 A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can't be a built-in runtime name: `claude-code`, `codex`, `grok-build`, `acp`, `pty` or `fake`. `acp` is required. `attach` must contain `{session}`, which becomes the session id. `{mode}` becomes the thread's permission mode. twr refuses to attach a thread in a restricted mode, such as `plan`, through a template without `{mode}`, since the agent's CLI would then start in its own wider default mode. twr resolves the preset when the thread is created, so a later config change doesn't change an existing thread.
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::Utc;
 use rusqlite::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -16,11 +17,11 @@ use twr_core::proto::RpcError;
 use twr_core::reduce::{AttentionStack, Registry};
 use twr_decisions::Ladder;
 
-use super::append::hydrated_from_store;
+use super::append::{hydrated_from_store, hydrated_whole};
 use super::closing::release_live;
 use super::{
-    after, boxes, context, git, hook, orch, runtime_spec, stall, trash, Core, Exit, Hub,
-    HubOptions, HubState, Inner, GIT_TICK, LOCAL_BOX, LOCK_FILE,
+    after, boxes, checkpoint, coalesce, context, git, hook, orch, runtime_spec, stall, trash, Core,
+    Exit, Hub, HubOptions, HubState, Inner, GIT_TICK, LOCAL_BOX, LOCK_FILE,
 };
 use crate::host::{LocalHost, StaleProcess, ThreadHost};
 use crate::store::{self, Store};
@@ -85,9 +86,12 @@ impl Hub {
             .job_slots_dir
             .clone()
             .unwrap_or_else(|| data_dir_of(&opts.db_path).join("job-slots"));
+        let compact_rows = Arc::new(Mutex::new(std::mem::take(&mut core.compact_rows)));
+        let control_head = core.gseq;
         let inner = Arc::new(Inner {
             core: Mutex::new(core),
             reader: Mutex::new(reader),
+            compact_rows,
             control_tx,
             events_tx,
             live_count: watch::Sender::new(0),
@@ -147,6 +151,13 @@ impl Hub {
             git_tick: opts.git_tick.unwrap_or(GIT_TICK),
             trash_tick: opts.trash_tick.unwrap_or(trash::TRASH_TICK),
             disk_tick: opts.disk_tick.unwrap_or(super::disk::DISK_TICK),
+            checkpoint_tick: opts.checkpoint_tick.unwrap_or(checkpoint::CHECKPOINT_TICK),
+            checkpoint_events: opts
+                .checkpoint_events
+                .unwrap_or(checkpoint::CHECKPOINT_EVERY),
+            prune_tick: opts.prune_tick.unwrap_or(super::prune::PRUNE_TICK),
+            maintenance: Mutex::new(()),
+            archive_reader: Mutex::new(None),
             job_slots_dir,
             test_user_token: opts
                 .test_user_token
@@ -190,6 +201,13 @@ impl Hub {
         }
         twr_core::trace::mark("hub: lost jobs reaped");
         spawn_tasks(&inner, notify_rx);
+        // A hub started from a checkpoint reads the compacted backlog's rows now, so that a
+        // client that subscribes later waits for none of it.
+        super::subscribe::warm_up(
+            Arc::clone(&inner.compact_rows),
+            inner.db_path.clone(),
+            control_head,
+        );
         if let Some(rx) = hook_rx {
             let task = tokio::spawn(hook::hook_task(
                 Arc::downgrade(&inner),
@@ -477,17 +495,80 @@ impl Core {
     /// reducers, and the `thread.stop`s still waiting for their runtime's exit. Returns it with
     /// a reader connection. With the notification hook's feed ([`hook::HookFeed`]), its
     /// policy recalls each replayed control event as it is folded, and gives nothing for them.
+    ///
+    /// It starts from the newest checkpoint this build can use (`hub::checkpoint`) and folds
+    /// only the events after it; without one, from nothing. Either way the state is the one a
+    /// fold of the whole log builds.
     pub(super) fn replay_with(
         db_path: &Path,
         hook: Option<hook::HookFeed>,
     ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, true)
+    }
+
+    /// [`Core::replay_with`] that folds the whole log, whatever checkpoints it has.
+    #[cfg(test)]
+    pub(super) fn replay_full(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, false)
+    }
+
+    fn replay_from(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        checkpoints: bool,
+    ) -> anyhow::Result<(Core, Connection)> {
         let store = Store::open(db_path)?;
         twr_core::trace::mark("hub: store opened");
         let reader = store::connect(db_path)?;
-        let events = store.load_all_with_gseq()?;
+        let mut refused = Vec::new();
+        let (mut core, after) = match checkpoints {
+            true => checkpoint::start(store, hook, &mut refused)?,
+            false => (Core::empty(store, hook)?, None),
+        };
+        let events = store::load_with_gseq(core.store.conn(), after.as_ref().map(|c| c.row))?;
         twr_core::trace::mark_with(|| format!("hub: {} events loaded", events.len()));
+        let gseq = core.store.control_head()?;
+        // The compacted backlog's rows, when every event is here (`hub::subscribe`); after a
+        // checkpoint the hub reads them in the background once it is open.
+        if after.is_none() {
+            let rows = events
+                .iter()
+                .filter_map(|(ev, g)| g.map(|g| twr_core::compact::Row::of(g, ev)))
+                .collect();
+            core.compact_rows = super::subscribe::CompactRows::new(rows, gseq);
+        }
+        let (hydrating, folding) = core.fold_events(&events);
+        twr_core::trace::mark_with(|| {
+            format!(
+                "hub: log folded (hydration {}ms, reducers {}ms)",
+                hydrating.as_millis(),
+                folding.as_millis()
+            )
+        });
+        core.replayed = checkpoint::Replayed {
+            checkpoint: after.map(|c| c.id),
+            events: events.len(),
+            refused,
+        };
+        core.gseq = gseq;
+        drop(events);
+        // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).
+        // (Only for threads the log has: a deleted one has none, `hub::delete`.)
+        for thread in core.store.stop_requests()? {
+            if let Some(rt) = core.rt.get_mut(&thread) {
+                rt.stop_requested = true;
+            }
+        }
+        Ok((core, reader))
+    }
+
+    /// The state of an empty log on `store`, with the notification hook's feed `hook`.
+    pub(super) fn empty(store: Store, hook: Option<hook::HookFeed>) -> anyhow::Result<Core> {
         let gseq = store.control_head()?;
-        let mut core = Core {
+        Ok(Core {
             store,
             registry: Registry::new(),
             attention: AttentionStack::new(),
@@ -502,6 +583,9 @@ impl Core {
             shutting_down: false,
             dropped_events: 0,
             sanitized_events: 0,
+            coalesced_events: 0,
+            compact_rows: Default::default(),
+            task_progress: coalesce::TaskProgress::default(),
             persist_retries: 0,
             orch: orch::OrchState::default(),
             hub_questions: HashMap::new(),
@@ -533,52 +617,69 @@ impl Core {
             switching_boxes: HashSet::new(),
             draining_boxes: HashMap::new(),
             defer_ack_sync: false,
-        };
+            replayed: Default::default(),
+        })
+    }
+
+    /// Folds stored `events` (each with its control gseq) as a replay does, in order: each one
+    /// hydrated where the reducers need its whole payload, folded, and a control event
+    /// recalled by the notification hook's policy. Returns how long hydration and the reducers
+    /// took, when `TWR_TRACE_STARTUP` records steps (zero otherwise).
+    pub(super) fn fold_events(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+    ) -> (std::time::Duration, std::time::Duration) {
+        // (It fails nothing: a payload it cannot hydrate is folded as stored, and logged.)
+        let lenient = |conn: &Connection, ev: &Event| Ok(hydrated_from_store(conn, ev));
+        self.fold_events_with(events, lenient).unwrap_or_default()
+    }
+
+    /// [`Core::fold_events`] that stops at the first payload it cannot hydrate (the checkpoint
+    /// writer, `hub::checkpoint`): what is folded then is not the log's state.
+    pub(super) fn fold_events_strict(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+    ) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
+        self.fold_events_with(events, |conn, ev| {
+            hydrated_whole(conn, ev).with_context(|| format!("hydrating event {}", ev.id))
+        })
+    }
+
+    fn fold_events_with(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+        hydrate: impl Fn(&Connection, &Event) -> anyhow::Result<Option<Event>>,
+    ) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
         // Reducers fold hydrated payloads: control kinds, agent text whose end the thread's
         // activity keeps (`hub::activity`; a capped one has a `text_ref`), and tool calls,
         // whose input and extras its activity line reads (a capped one keeps a preview).
         // `TWR_TRACE_STARTUP`: the time hydration and the reducers took.
         let timed = twr_core::trace::enabled();
         let (mut hydrating, mut folding) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        for (ev, g) in &events {
+        for (ev, g) in events {
             if let Some(g) = g {
-                core.gseq = *g;
+                self.gseq = *g;
             }
             let t0 = timed.then(std::time::Instant::now);
             let folded_whole = ev.is_control()
                 || matches!(&ev.body, EventBody::AgentText(t) if !t.extra.is_empty())
                 || matches!(&ev.body, EventBody::AgentToolCall(_));
-            let full = folded_whole
-                .then(|| hydrated_from_store(core.store.conn(), ev))
-                .flatten();
+            let full = match folded_whole {
+                true => hydrate(self.store.conn(), ev)?,
+                false => None,
+            };
             let t1 = timed.then(std::time::Instant::now);
             let ev = full.as_ref().unwrap_or(ev);
-            core.apply(ev);
+            self.apply(ev);
             if let Some(g) = g {
-                core.recall_hook(ev, *g);
+                self.recall_hook(ev, *g);
             }
             if let (Some(t0), Some(t1)) = (t0, t1) {
                 hydrating += t1 - t0;
                 folding += t1.elapsed();
             }
         }
-        twr_core::trace::mark_with(|| {
-            format!(
-                "hub: log folded (hydration {}ms, reducers {}ms)",
-                hydrating.as_millis(),
-                folding.as_millis()
-            )
-        });
-        core.gseq = gseq;
-        drop(events);
-        // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).
-        // (Only for threads the log has: a deleted one has none, `hub::delete`.)
-        for thread in core.store.stop_requests()? {
-            if let Some(rt) = core.rt.get_mut(&thread) {
-                rt.stop_requested = true;
-            }
-        }
-        Ok((core, reader))
+        Ok((hydrating, folding))
     }
 }
 
@@ -620,6 +721,19 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
         tokio::spawn(super::disk::disk_ticker(
             Arc::downgrade(inner),
             inner.disk_tick,
+        ));
+    }
+    if !inner.checkpoint_tick.is_zero() {
+        tokio::spawn(checkpoint::checkpoint_ticker(
+            Arc::downgrade(inner),
+            inner.checkpoint_tick,
+            inner.checkpoint_events,
+        ));
+    }
+    if !inner.prune_tick.is_zero() {
+        tokio::spawn(super::prune::prune_ticker(
+            Arc::downgrade(inner),
+            inner.prune_tick,
         ));
     }
     // The hub's own agent CLIs, in the background (`hub::box_agents`).

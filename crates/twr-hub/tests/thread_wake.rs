@@ -563,6 +563,91 @@ async fn background_work_waiting_on_a_job_does_not_stall() {
     hub.shutdown().await;
 }
 
+/// A job the log shows running that this hub does not run (one a stopped hub ran, before it
+/// is recorded lost; here one recorded by hand) holds back no stall: only the jobs the hub runs
+/// do, however recently their task was renewed.
+#[tokio::test]
+async fn a_job_this_hub_does_not_run_holds_back_no_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![session()];
+    script.extend(interim("watcher"));
+    script.push(Step::Sleep(60_000));
+    let mut o = opts(dir.path(), Some(script));
+    o.stall_after = Some(Duration::from_millis(500));
+    o.wake_after = Some(Duration::ZERO);
+    let hub = Hub::open(o).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    let mut ext = None;
+    set_twr_ext(&mut ext, "job", json!({"id": "ghost", "wake": false}));
+    hub.append(
+        &api,
+        None,
+        Source::Hub,
+        EventBody::TaskUpdated(TaskUpdated {
+            task_id: format!("{JOB_TASK_PREFIX}ghost"),
+            running: true,
+            description: "job ghost: running".into(),
+            ext,
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    hub.send_by(&api, "run the gates", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| !stalls(e).is_empty()).await;
+    assert!(ended(&evs, 1));
+    assert!(hub
+        .thread_view(&api)
+        .unwrap()
+        .background_tasks
+        .contains_key("job:ghost"));
+    hub.shutdown().await;
+}
+
+/// A worker whose background task reported progress the hub did not all record
+/// (`hub::coalesce`) is still woken once when the task ends.
+#[tokio::test]
+async fn coalesced_progress_still_wakes_the_worker_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut script = vec![session()];
+    script.extend(interim("tests"));
+    for i in 0..20 {
+        script.push(Step::Sleep(10));
+        script.push(Step::EmitSession(EventBody::TaskUpdated(TaskUpdated {
+            task_id: "tests".into(),
+            running: true,
+            description: format!("background tests: {i} passed"),
+            ..Default::default()
+        })));
+    }
+    script.extend([
+        Step::EmitSession(task("tests", false)),
+        Step::AwaitSend,
+        Step::Emit(text("All tests passed.")),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+        Step::Sleep(60_000),
+    ]);
+    let hub = Hub::open(opts(dir.path(), Some(script))).await.unwrap();
+    let api = thread(&hub, dir.path()).await;
+    hub.send_by(&api, "run the tests", &Caller::user("test"))
+        .unwrap();
+    let evs = until(&hub, &api, |e| ended(e, 2)).await;
+    let updates = evs.iter().filter(|e| e.kind() == "task.updated").count();
+    assert_eq!(updates, 2, "{:#?}", kinds(&evs));
+    assert_eq!(hub.info()["coalesced_events"], 20);
+    let woke = wakes(&evs);
+    assert_eq!(woke.len(), 1, "{woke:?}");
+    assert!(
+        woke[0].contains("- background tests (ended)"),
+        "{}",
+        woke[0]
+    );
+    tokio::time::sleep(WAKE_AFTER * 3).await;
+    assert_eq!(wakes(&events(&hub, &api)).len(), 1);
+    hub.shutdown().await;
+}
+
 fn runtime_turn(id: &str, no_run: bool) -> [Step; 2] {
     let mut ext = None;
     set_twr_ext(&mut ext, RUNTIME_TURN_KEY, id.into());

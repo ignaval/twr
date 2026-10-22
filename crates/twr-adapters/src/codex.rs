@@ -1206,6 +1206,11 @@ impl Adapter for CodexAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// `thread/compact/start`, queued like a prompt (`translate::Translator::compact`).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let open = thread_params(&cfg)?;
@@ -1484,6 +1489,11 @@ async fn drive(
                     let out = tr.interrupt_turn();
                     emit(&mut stdin, &end, &tail, out);
                 },
+                Some(AdapterCmd::Compact { turn }) => {
+                    for l in tr.compact(turn) {
+                        queue_line(&mut stdin, l);
+                    }
+                }
             },
             _ = sleep_until_opt(stop_deadline) => {
                 tracing::warn!(?pid, "codex: runtime did not exit after stop; killing its process group");

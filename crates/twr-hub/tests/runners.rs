@@ -2491,7 +2491,9 @@ async fn an_older_runners_frames_are_recorded_with_their_effects() {
         "{:?}",
         kinds(&evs)
     );
-    assert_eq!(count(&evs, "task.updated"), 3);
+    // The heartbeat came a millisecond after the task's start: not recorded (`hub::coalesce`).
+    assert_eq!(count(&evs, "task.updated"), 2);
+    assert_eq!(h.hub().info()["coalesced_events"], 1);
     assert_eq!(count(&evs, "thread.resumed"), 1);
     // The usage report went to the account's usage, not the thread (its 5-hour window, whose
     // reset time is the capture's, is over).
@@ -3132,6 +3134,101 @@ async fn runner_attention_ids_are_namespaced_by_thread_and_never_move_items() {
     assert_eq!(h.hub().info()["dropped_events"].as_u64().unwrap(), dropped);
     // The local item was never touched.
     assert!(items(h.hub()).contains(&(a_local.clone(), local.clone())));
+    h.shutdown().await;
+}
+
+/// A runner's task updates go through the hub's coalescing (`hub::coalesce`) like a local
+/// runtime's: a frame whose update is not recorded is still acked (its watermark committed
+/// alone), and a hub that restarted in between decides the same from its log, recording at
+/// most one more progress per task, never less of a start, an `ext` update or an end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_runners_task_updates_are_coalesced_and_their_frames_acked() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let mut ws = raw_online(&h, vec![]).await;
+    let t = h.raw_session(&mut ws, dir.path(), "tasks").await;
+    let update = |description: &str, heartbeat: bool, ext: Option<Value>| {
+        EventBody::TaskUpdated(TaskUpdated {
+            task_id: "build".into(),
+            running: true,
+            description: description.into(),
+            heartbeat,
+            ext: ext.map(|e| serde_json::from_value(e).unwrap()),
+            ..Default::default()
+        })
+    };
+    let recorded = |hub: &Hub| -> Vec<(bool, String)> {
+        log(hub, &t)
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::TaskUpdated(p) => Some((p.running, p.description)),
+                _ => None,
+            })
+            .collect()
+    };
+    let coalesced = |hub: &Hub| hub.info()["coalesced_events"].as_u64().unwrap();
+    // (Stalls are off here: progress is recorded once every 30 s, heartbeats every 10 min.)
+    for (rseq, body) in [
+        (2, update("build", false, None)),
+        (3, update("step 1", false, None)),
+        (4, update("", true, None)),
+        (5, update("step 1b", false, Some(json!({"x": 1})))),
+        (6, update("step 2", false, None)),
+    ] {
+        raw_frame(&mut ws, frame(&t, rseq, None, body)).await;
+    }
+    let s = |d: &str| d.to_string();
+    assert_eq!(
+        recorded(h.hub()),
+        [(true, s("build")), (true, s("step 1b"))]
+    );
+    assert_eq!(coalesced(h.hub()), 3);
+    drop(ws);
+    h.crash();
+
+    let h = TestHub::start(dir.path(), config(None)).await;
+    let mut ws = raw(&h.url).await;
+    let mut hi = hello(TOKEN);
+    hi.running = vec![RunningSession {
+        thread: t.clone(),
+        runtime: "fake".into(),
+        run: Some(run_id(&t, "r1")),
+        ..Default::default()
+    }];
+    raw_hello(&mut ws, hi).await;
+    let Some(HubMsg::Welcome { watermarks, .. }) = raw_expect(&mut ws).await else {
+        panic!("no welcome")
+    };
+    // The last frame, which recorded nothing, is acked.
+    assert_eq!(watermarks.get(&t), Some(&6));
+    raw_send(&mut ws, &RunnerMsg::Synced).await;
+    h.online().await;
+    let end = EventBody::TaskUpdated(TaskUpdated {
+        task_id: "build".into(),
+        description: "build".into(),
+        ..Default::default()
+    });
+    for (rseq, body) in [
+        // The log says the task was renewed just now: not due.
+        (7, update("", true, None)),
+        // When its progress was last recorded is the hub's memory only: due once.
+        (8, update("step 3", false, None)),
+        (9, update("step 4", false, None)),
+        (10, end),
+    ] {
+        raw_frame(&mut ws, frame(&t, rseq, None, body)).await;
+    }
+    assert_eq!(
+        recorded(h.hub()),
+        [
+            (true, s("build")),
+            (true, s("step 1b")),
+            (true, s("step 3")),
+            (false, s("build")),
+        ]
+    );
+    assert_eq!(coalesced(h.hub()), 2);
+    assert_eq!(h.hub().get_thread(&t).unwrap()["background_task_count"], 0);
     h.shutdown().await;
 }
 
@@ -4452,7 +4549,9 @@ async fn peers_that_never_read_do_not_keep_the_unauthenticated_slots() {
 async fn a_runner_lists_and_restores_only_its_own_boxes_trash() {
     let dir = tempfile::tempdir().unwrap();
     let h = TestHub::start(dir.path(), config(None)).await;
-    let local = h.new_local_thread(&project(dir.path()), "home").await;
+    // A repository: its deletion puts a trash item on the local box.
+    let repo = twr_core::testkit::git::init_repo(&dir.path().join("repo"));
+    let local = h.new_local_thread(&repo, "home").await;
     let user = Caller::user("test");
     let card = {
         let user = user.clone();
@@ -4493,11 +4592,26 @@ async fn a_runner_lists_and_restores_only_its_own_boxes_trash() {
         item("01FORGEDGPU", BOX),
     ])
     .unwrap();
+    // The local thread's own item, which the gpu runner will also claim to have purged.
+    let local_item = h
+        .hub()
+        .control_read(0, 100_000)
+        .unwrap()
+        .0
+        .into_iter()
+        .find_map(|(_, e)| match e.body {
+            EventBody::ThreadDeleted(d) if e.thread == home => d.trash,
+            _ => None,
+        })
+        .expect("home's trash item");
+    let claimed =
+        json!({"purged": [local_item.clone(), "01FORGEDGPU"], "unknown": [], "failed": []});
     let answering = tokio::spawn(async move {
         while let Some(m) = raw_next(&mut ws).await {
             if let HubMsg::Cmd { cmd_id, op } = m {
                 let r = match op {
                     Op::TrashList {} => Ok(forged.clone()),
+                    Op::TrashPurge { .. } => Ok(claimed.clone()),
                     _ => Ok(Value::Null),
                 };
                 raw_send(&mut ws, &RunnerMsg::CmdResult(CmdResult::new(cmd_id, r))).await;
@@ -4534,6 +4648,35 @@ async fn a_runner_lists_and_restores_only_its_own_boxes_trash() {
         h.hub().thread_view("home").is_err(),
         "the local thread came back"
     );
+    // A purge on the gpu box counts only for what it was asked, and only for an item the log
+    // knows as that box's: the local item it claims is not recorded purged (its thread's
+    // events would be archived), nor is the forged one (the log knows no such item).
+    let out = {
+        let user = user.clone();
+        h.run(move |hub| async move {
+            hub.trash_empty(&["01FORGEDGPU".to_string()], false, &user)
+                .await
+        })
+        .await
+        .unwrap()
+    };
+    let purged: Vec<&str> = out["purged"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["item"].as_str())
+        .collect();
+    assert!(!purged.contains(&local_item.as_str()), "{out}");
+    let recorded: Vec<String> = h
+        .hub()
+        .control_read(0, 100_000)
+        .unwrap()
+        .0
+        .into_iter()
+        .filter(|(_, e)| e.kind().starts_with("trash."))
+        .map(|(_, e)| format!("{} {}", e.kind(), e.body.data().unwrap()))
+        .collect();
+    assert!(recorded.is_empty(), "{recorded:?}");
     answering.abort();
     h.shutdown().await;
 }

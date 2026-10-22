@@ -106,23 +106,42 @@ fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
 /// The event with its payload hydrated from `conn`'s blobs, when it has capped fields (`None`
 /// otherwise, or when hydration fails, which is logged).
 pub(super) fn hydrated_from_store(conn: &Connection, ev: &Event) -> Option<Event> {
+    match try_hydrated(conn, ev) {
+        Ok(full) => full.map(|(ev, _)| ev),
+        Err(e) => {
+            tracing::warn!(event = %ev.id, error = %format!("{e:#}"), "cannot hydrate a capped event");
+            None
+        }
+    }
+}
+
+/// [`hydrated_from_store`], failing when the event has capped fields that cannot be hydrated
+/// (a blob missing or unreadable), with whether every field came back (one whose blob no longer
+/// matches its preview stays capped).
+fn try_hydrated(conn: &Connection, ev: &Event) -> anyhow::Result<Option<(Event, bool)>> {
     // Most events have nothing moved: told without building their `data` (a hub start asks
     // this of every control event of the log).
     if !ev.body.maybe_capped() {
-        return None;
+        return Ok(None);
     }
-    let mut data = ev.body.data().ok()?;
+    let mut data = ev.body.data()?;
     if !has_capped(&data) {
-        return None;
+        return Ok(None);
     }
-    let restored = hydrate_with(&mut data, &mut |r: &str| store::get_blob(conn, r), false)
-        .and_then(|_| Ok(EventBody::from_kind_data(ev.kind(), data)?));
-    match restored {
-        Ok(body) => Some(Event { body, ..ev.clone() }),
-        Err(e) => {
-            tracing::warn!(event = %ev.id, error = %e, "cannot hydrate a capped event");
-            None
-        }
+    hydrate_with(&mut data, &mut |r: &str| store::get_blob(conn, r), false)?;
+    let whole = !has_capped(&data);
+    let body = EventBody::from_kind_data(ev.kind(), data)?;
+    Ok(Some((Event { body, ..ev.clone() }, whole)))
+}
+
+/// The event with its payload hydrated whole from `conn`'s blobs, when it has capped fields
+/// (`None` otherwise); failing when any field cannot be restored (a blob missing, unreadable,
+/// or no longer matching its preview): what a checkpoint's fold needs (`hub::checkpoint`).
+pub(super) fn hydrated_whole(conn: &Connection, ev: &Event) -> anyhow::Result<Option<Event>> {
+    match try_hydrated(conn, ev)? {
+        Some((ev, true)) => Ok(Some(ev)),
+        Some((_, false)) => anyhow::bail!("some of its fields stay capped"),
+        None => Ok(None),
     }
 }
 
@@ -160,10 +179,13 @@ impl Core {
             // Gone (`hub::delete`): its runtime was stopped and its items resolved with it.
             // What a restore needs again is set aside (`hub::trash`), with its trash item.
             EventBody::ThreadDeleted(d) => {
-                if let Some(rt) = self.rt.remove(&ev.thread) {
-                    self.deleted_rt
-                        .insert(ev.thread.clone(), trash::DeletedRt::of(rt));
-                }
+                let mut saved = self
+                    .rt
+                    .remove(&ev.thread)
+                    .map(trash::DeletedRt::of)
+                    .unwrap_or_default();
+                saved.item = d.trash.clone();
+                self.deleted_rt.insert(ev.thread.clone(), saved);
                 if let Some(item) = &d.trash {
                     self.items_deleted.insert(item.clone());
                 }
@@ -257,6 +279,28 @@ impl Core {
                 }
             }
             EventBody::TurnStarted(_) => self.rt(&ev.thread).final_text = None,
+            // A trash item gone from its box (`hub::trash`): no longer listed, and when it is
+            // the deleted thread's own, the thread is not restorable any more; what its agent
+            // did is archived (`hub::prune`), so nothing folded from that is kept.
+            EventBody::TrashPurged(p) if ev.thread == HUB_THREAD && ev.source == Source::Hub => {
+                if self
+                    .trash
+                    .get(&p.item)
+                    .is_some_and(|s| s.thread == p.thread)
+                {
+                    self.trash.remove(&p.item);
+                }
+                if self.registry.is_deleted(&p.thread) {
+                    if let Some(d) = self
+                        .deleted_rt
+                        .get_mut(&p.thread)
+                        .filter(|d| d.item.as_deref() == Some(p.item.as_str()))
+                    {
+                        d.purged = true;
+                        self.activity.remove(&p.thread);
+                    }
+                }
+            }
             EventBody::AttentionRaised(p) => {
                 self.known_attn.insert(p.attn_id.clone());
                 if matches!(ev.source, Source::Adapter(_)) {
@@ -525,6 +569,12 @@ impl Core {
             stop_requests: &stop_requests,
             drop_queues: &drop_queues,
         })?;
+        // A compaction asked for goes with the queue (`hub::compact`).
+        for t in &drop_queues {
+            if let Some(r) = self.rt.get_mut(t) {
+                r.compact = None;
+            }
+        }
         let mut out = Vec::with_capacity(prepared.len());
         for ((ev, full_body, final_text), gseq) in prepared.into_iter().zip(commit.gseqs) {
             // Reducers see the event's own gseq as the head (the relay guard orders by it).
@@ -540,6 +590,7 @@ impl Core {
                 self.feed_hook(&full, g);
             }
             self.feed_after(&full);
+            self.task_progress_after(&full);
             if let Some(text) = final_text {
                 self.rt(&ev.thread).final_text = Some(text);
             }
@@ -563,7 +614,7 @@ impl Core {
     /// The `ts` of an event that happened `at` (a runner's capture time) and is recorded
     /// `now`: `at`, but never before the thread's previous event (`floor`: the log stays in
     /// time order per thread) nor after `now` (a runner clock ahead of the hub's).
-    fn event_time(
+    pub(super) fn event_time(
         at: DateTime<Utc>,
         floor: Option<DateTime<Utc>>,
         now: DateTime<Utc>,

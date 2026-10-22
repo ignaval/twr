@@ -98,6 +98,11 @@ impl Adapter for OrchAdapter {
         }
     }
 
+    /// The user's compaction (`hub::compact`) reaches it as `AdapterCmd::Compact`.
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         if self.1.load(std::sync::atomic::Ordering::SeqCst) {
             anyhow::bail!("claude is not installed");
@@ -1235,4 +1240,242 @@ fn adapters_cannot_emit_withdrawals() {
     ));
     // Both are on the control stream, for clients that track a message they sent.
     assert!(is_control_kind("turn.withdrawn") && is_control_kind("prompt.withdrawn"));
+}
+
+/// A compaction of the orchestrator's context that failed by its own report, its turn ended
+/// `completed`, gets its error card from startup recovery when the hub stopped before it
+/// recorded the card.
+#[tokio::test]
+async fn a_failed_orchestrator_compaction_gets_its_card_after_a_restart() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let mut sub = hub.subscribe_control(0);
+    hub.say_to_orchestrator("hello", Some(head(&hub)), &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Hi.");
+    let orch = hub.orchestrator_thread().unwrap();
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    // The card cannot be recorded: as a hub that stops between the end and its card.
+    let db = rusqlite::Connection::open(env.path().join("data").join("twr.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(5)).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER inject BEFORE INSERT ON events
+         WHEN NEW.kind = 'attention.raised' AND NEW.data LIKE '%compacting its context failed%'
+         BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    )
+    .unwrap();
+    hub.compact_thread(&orch, &tui()).unwrap();
+    let AdapterCmd::Compact { turn } = rt.next_cmd().await else {
+        panic!("a compaction")
+    };
+    rt.end.emit(
+        EventBody::ContextCompacted(ContextCompacted {
+            trigger: "manual".into(),
+            error: Some("conversation too short".into()),
+            ..Default::default()
+        }),
+        Some(turn),
+    );
+    rt.end.emit(
+        EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Completed,
+            ..Default::default()
+        }),
+        Some(turn),
+    );
+    until(&mut sub, |e| {
+        e.kind() == "turn.ended" && e.turn == Some(turn)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let card = |hub: &Hub| {
+        hub.attention_list(true).iter().any(|a| {
+            a["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("compacting its context failed"))
+        })
+    };
+    assert!(!card(&hub));
+    drop(rt);
+    hub.shutdown().await;
+    drop((sub, hub));
+    db.execute_batch("DROP TRIGGER inject").unwrap();
+    drop(db);
+    let hub = env.reopen().await;
+    eventually(|| card(&hub)).await;
+    hub.shutdown().await;
+}
+
+/// A compaction of the orchestrator's context that was cancelled (its compaction reports
+/// `cancelled`, its turn ends `interrupted`) is no failure: no card, live or after a restart.
+#[tokio::test]
+async fn a_cancelled_orchestrator_compaction_gets_no_card_after_a_restart() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let mut sub = hub.subscribe_control(0);
+    hub.say_to_orchestrator("hello", Some(head(&hub)), &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Hi.");
+    let orch = hub.orchestrator_thread().unwrap();
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    hub.compact_thread(&orch, &tui()).unwrap();
+    let AdapterCmd::Compact { turn } = rt.next_cmd().await else {
+        panic!("a compaction")
+    };
+    rt.end.emit(
+        EventBody::ContextCompacted(ContextCompacted {
+            trigger: "manual".into(),
+            error: Some("cancelled".into()),
+            ..Default::default()
+        }),
+        Some(turn),
+    );
+    rt.end.emit(
+        EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Interrupted,
+            ..Default::default()
+        }),
+        Some(turn),
+    );
+    until(&mut sub, |e| {
+        e.kind() == "turn.ended" && e.turn == Some(turn)
+    })
+    .await;
+    let card = |hub: &Hub| {
+        hub.attention_list(true).iter().any(|a| {
+            a["summary"]
+                .as_str()
+                .is_some_and(|s| s.contains("compacting its context failed"))
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!card(&hub));
+    drop(rt);
+    hub.shutdown().await;
+    drop((sub, hub));
+    let hub = env.reopen().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!card(&hub), "a cancelled compaction is no failure");
+    hub.shutdown().await;
+}
+
+/// A compaction between a taken-back turn and what follows changes nothing of its taint: a
+/// call made between them is refused, and the runtime's own turn after the compaction
+/// continues the taken-back work (it is interrupted, and changes nothing).
+#[tokio::test]
+async fn a_compaction_keeps_a_taken_back_turns_taint() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let mut sub = hub.subscribe_control(0);
+    let r = hub
+        .say_to_orchestrator("rewrite the release plan", Some(head(&hub)), &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    withdraw(&hub, "orchestrator", r["ref"].as_i64().unwrap());
+    assert_eq!(rt.next_cmd().await, AdapterCmd::Interrupt);
+    rt.end.emit(
+        EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Interrupted,
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    let orch = hub.orchestrator_thread().unwrap();
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    assert_eq!(
+        hub.compact_thread(&orch, &tui()).unwrap()["state"],
+        "started"
+    );
+    let AdapterCmd::Compact { turn: t2 } = rt.next_cmd().await else {
+        panic!("a compaction")
+    };
+    rt.end.emit(
+        EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Completed,
+            ..Default::default()
+        }),
+        Some(t2),
+    );
+    until(&mut sub, |e| e.kind() == "turn.ended" && e.turn == Some(t2)).await;
+    // Between turns: bound to the compaction, which is the taken-back turn's.
+    eventually(|| hub.orchestrator_call().is_some_and(|c| c.turn().is_none())).await;
+    let idle = hub.orchestrator_call();
+    assert_eq!(
+        hub.orchestrator_acts("thread.rename", idle.as_ref())
+            .unwrap_err()
+            .code,
+        codes::RELAY_FORBIDDEN
+    );
+    // The runtime goes on by itself: the taken-back work again.
+    rt.end.emit(
+        EventBody::TurnStarted(TurnStarted {
+            prompt: "continuing".into(),
+            from: TurnFrom::Runtime,
+            ext: serde_json::json!({"twr": {"runtime_turn": "rt-1"}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        }),
+        None,
+    );
+    assert_eq!(rt.next_cmd().await, AdapterCmd::Interrupt);
+    let call = hub.orchestrator_call();
+    assert_eq!(call.as_ref().and_then(|c| c.turn()), Some(t2 + 1));
+    assert_eq!(
+        hub.orchestrator_acts("thread.send", call.as_ref())
+            .unwrap_err()
+            .code,
+        codes::RELAY_FORBIDDEN
+    );
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// A compaction of the orchestrator's context carries no prompt of the hub's: it tells no
+/// fact of a message taken back, and its end leaves the fact to the next prompt.
+#[tokio::test]
+async fn a_compaction_tells_no_withdrawal_fact() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let mut sub = hub.subscribe_control(0);
+    let r = hub
+        .say_to_orchestrator("drop the staging db", Some(head(&hub)), &tui())
+        .unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    withdraw(&hub, "orchestrator", r["ref"].as_i64().unwrap());
+    assert_eq!(rt.next_cmd().await, AdapterCmd::Interrupt);
+    let orch = hub.orchestrator_thread().unwrap();
+    let end = |rt: &OrchRt, turn: u64| {
+        rt.end.emit(
+            EventBody::TurnEnded(TurnEnded {
+                result: TurnResult::Completed,
+                ..Default::default()
+            }),
+            Some(turn),
+        );
+    };
+    end(&rt, t1);
+    until(&mut sub, is_kind_on("turn.ended", &orch)).await;
+    let c = hub.compact_thread(&orch, &tui()).unwrap();
+    assert_eq!(c["state"], "started");
+    let AdapterCmd::Compact { turn } = rt.next_cmd().await else {
+        panic!("a compaction")
+    };
+    end(&rt, turn);
+    until(&mut sub, |e| {
+        e.kind() == "turn.ended" && e.turn == Some(turn)
+    })
+    .await;
+    hub.say_to_orchestrator("status?", Some(head(&hub)), &tui())
+        .unwrap();
+    let (prompt, _) = rt.next_turn().await;
+    assert!(prompt.contains("«drop the staging db»"), "{prompt}");
+    drop(rt);
+    hub.shutdown().await;
 }

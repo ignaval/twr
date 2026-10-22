@@ -14,6 +14,7 @@ use twr_core::blob::strip_body_capping_metadata;
 use twr_core::event::*;
 
 use super::append::rejection;
+use super::coalesce::Due;
 use super::{
     git, AfterReap, Batch, BatchEvent, Core, EndedTurn, HubState, Inner, PendingExit, LOCAL_BOX,
 };
@@ -113,6 +114,23 @@ impl Core {
                 return Ok(None);
             }
         }
+        // A runtime's task updates come often: only those due are recorded (`hub::coalesce`).
+        let task_update = match &body {
+            EventBody::TaskUpdated(p) => {
+                let now = Utc::now();
+                let at = at.map_or(now, |a| {
+                    Self::event_time(a, self.last_ts.get(thread).copied(), now)
+                });
+                let due = self.task_update_due(hub, thread, p, at);
+                if due == Due::Skip {
+                    self.commit_ack(hub, ack)?;
+                    self.coalesced_events += 1;
+                    return Ok(None);
+                }
+                Some((p.task_id.clone(), p.running, at, due))
+            }
+            _ => None,
+        };
         namespace_attention(thread, self.runtime_gen(thread), &mut body);
         if let EventBody::AttentionResolved(p) = &body {
             if !self.is_adapter_withdrawal(thread, p) {
@@ -326,6 +344,9 @@ impl Core {
             }
         }
         // Recorded: what follows is no reason to record the event again.
+        if let Some((task, running, at, due)) = &task_update {
+            self.task_update_recorded(thread, (task, *running), *at, *due);
+        }
         if let (Some(sign), Some(t)) = (running, turn) {
             self.withdrawn_turn_runs(hub, thread, t, sign);
         }
@@ -411,6 +432,8 @@ pub fn adapter_may_emit(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::TurnEnded(_)
             | EventBody::TaskUpdated(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     ) || matches!(body, EventBody::TurnStarted(p) if p.from == TurnFrom::Runtime)
         || matches!(
             body,
@@ -442,6 +465,8 @@ fn in_turn_kind(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::AttentionResolved(_)
             | EventBody::TurnEnded(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     )
 }
 

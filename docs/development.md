@@ -42,13 +42,23 @@ What doesn't pay off for twr's own threads:
 TWR_TRACE_STARTUP=/tmp/twr-start.log twr
 ```
 
-The CLI marks loading the config and each probe of the hub socket; the hub, locking its data, binding its socket, opening the store, loading and folding the log, recovering and serving, and how long it took to tell who each connection is; the TUI, connecting, subscribing to the control stream, the `Loading…` frame, the end of the control replay, the transcript's subscription, each key, and each frame that shows another thread or loading state, with how long it took to draw. Without the variable nothing is written.
+The CLI marks loading the config and each probe of the hub socket; the hub, locking its data, binding its socket, opening the store, loading and folding the log, recovering and serving, and how long it took to tell who each connection is; the TUI, connecting, subscribing to the control stream, the `Loading…` frame, the end of the control replay, the transcript's subscription, each key, and each frame that shows another thread or loading state, with how long it took to draw. Without the variable nothing is written. The hub's lines say whether it started from a checkpoint (`hub: checkpoint <id> loaded`, or why one was not used) and how many events it then loaded and folded.
+
+`crates/twr-hub/src/hub/bench.rs` times the hub's start: loading and folding the whole log, then writing a checkpoint and starting from it (one 5 000 events behind the log, and one covering all of it). It makes its log up by default; `TWR_BENCH_DB` names a copy of a real `twr.db` instead (it writes checkpoints into it):
+
+```sh
+TWR_BENCH_DB=/path/to/copy/twr.db cargo test --release -p twr-hub --lib -- --ignored --nocapture replay_bench
+```
+
+The checkpoint tests (`hub::checkpoint`) start a hub from a checkpoint at every control event of a made-up log and compare its state with a fold of the whole log, byte for byte. `TWR_CHECKPOINT_DB` names a copy of a real log for the same check at a few of its control events (`--ignored checkpoints_of_a_real_log`, in release mode), and `TWR_CHECKPOINT_CHECK=1` makes every hub of the crate's own tests check its log that way as it goes away.
 
 `crates/twr-tui/src/bench.rs` times what the TUI does with a replay: decoding a control stream of about 30 000 items, applying it, decoding and applying the orchestrator's last 2000 events, laying out the conversation and drawing it. It makes its log up by default; `TWR_BENCH_CONTROL` and `TWR_BENCH_TRANSCRIPT` name files of a real hub's stream lines instead (what `control.subscribe` and `thread.subscribe` push):
 
 ```sh
 cargo test --release -p twr-tui --lib -- --ignored --nocapture replay_bench
 ```
+
+It also times the same replay compacted as a hub compacts it (`control.subscribe` with `compact`). `compact_tests.rs` checks that a compacted replay leaves the TUI in the state a full one does, on made-up logs, and by hand on a real stream (`TWR_BENCH_CONTROL`, `compacted_real`); `crates/twr-hub/src/hub/bench.rs` `compact_bench` times the hub's selection on a copy of a real `twr.db` (`TWR_BENCH_DB`).
 
 ## The fake runtime
 

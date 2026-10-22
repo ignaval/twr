@@ -387,6 +387,63 @@ async fn the_orchestrator_calls_only_its_methods() {
     th.stop().await;
 }
 
+/// The orchestrator cannot compact a worker's context: neither through `thread.compact` nor by
+/// sending the runtime's own command as a prompt (`/compact`, any case, with or without
+/// instructions; delivered as is, Claude Code and Grok Build would run it), now or held for
+/// other threads. The user's own `/compact` message is pointed to `thread.compact`.
+#[tokio::test]
+async fn the_orchestrator_cannot_compact_a_worker() {
+    let mut th = start().await;
+    let mut c = th.client("cli").await;
+    let rt = th.with_orchestrator(&mut c).await;
+    let mut o = Client::connect(&th.socket).await.unwrap();
+    o.hello(json!({"client": "orchestrator", "token": rt.token()}))
+        .await
+        .unwrap();
+    let e = o
+        .call("thread.compact", json!({"thread": "api"}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::UNAUTHORIZED);
+    for prompt in [
+        "/compact",
+        "  /COMPACT keep the plan",
+        "/Compact\nfocus on tests",
+    ] {
+        let e = o
+            .call("thread.send", json!({"thread": "api", "prompt": prompt}))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::UNAUTHORIZED, "{prompt:?}");
+        let e = o
+            .call(
+                "thread.send",
+                json!({"thread": "api", "prompt": prompt, "after": ["web"]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::UNAUTHORIZED, "after: {prompt:?}");
+    }
+    // A word that only starts like it is a prompt as any.
+    o.call(
+        "thread.send",
+        json!({"thread": "api", "prompt": "/compacting is next"}),
+    )
+    .await
+    .unwrap();
+    // The user's own is pointed to the compaction's way.
+    let e = c
+        .call(
+            "thread.send",
+            json!({"thread": "web", "prompt": "/compact"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::BAD_REQUEST);
+    drop(rt);
+    th.stop().await;
+}
+
 /// What the orchestrator reads of the boxes over its connection: each box's name, state,
 /// whether it is online, its version and its agents, and of each agent whether it is found
 /// and signed in (`hub.info`, `box.agents`), where the user's connection reads everything; a

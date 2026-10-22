@@ -175,6 +175,14 @@ pub enum AdapterCmd {
     },
     /// Cancel only the current turn, keeping the runtime session alive.
     Interrupt,
+    /// Start turn `turn` as a compaction of the session's context (the user's `/compact`):
+    /// Claude Code and Grok Build get `/compact` as the turn's message, Codex
+    /// `thread/compact/start`. Like a prompt, the hub sends it only between turns. Only an
+    /// adapter that [`Adapter::compacts`] is sent one; any other ends the turn `error`.
+    Compact {
+        /// Turn number assigned by the hub; echoed on the turn's events.
+        turn: u64,
+    },
     /// Stop the runtime (interrupting any running turn).
     Stop,
 }
@@ -296,6 +304,11 @@ impl AdapterHandle {
             text: text.into(),
             turn,
         })
+    }
+
+    /// Starts turn `turn` as a compaction of the session's context ([`AdapterCmd::Compact`]).
+    pub fn compact(&self, turn: u64) -> Result<(), AdapterGone> {
+        self.command(AdapterCmd::Compact { turn })
     }
 
     /// Answers attention item `attn_id`.
@@ -461,6 +474,13 @@ pub trait Adapter: Send + Sync + 'static {
     /// one cannot, and an adapter that ignores the command overrides this with `false`.
     fn interrupts_turns(&self) -> bool {
         self.info().tier == Tier::Headless
+    }
+
+    /// Whether [`AdapterCmd::Compact`] compacts the session's context here (the user's
+    /// `/compact`, `thread.compact`). Default: no; the hub refuses the request naming the
+    /// runtime.
+    fn compacts(&self) -> bool {
+        false
     }
 
     /// The program this adapter starts (its argv[0], as the spawn would resolve it now: an
