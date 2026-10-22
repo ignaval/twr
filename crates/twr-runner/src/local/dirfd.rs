@@ -223,7 +223,7 @@ impl Dir {
     /// Moves its entry `name` (whatever it is) to `to`'s entry `new` only when there is none:
     /// `AlreadyExists` otherwise, and an error where that cannot be told atomically
     /// ([`rename_new`]).
-    pub(super) fn rename_new(&self, name: &OsStr, to: &Dir, new: &OsStr) -> io::Result<()> {
+    pub fn rename_new(&self, name: &OsStr, to: &Dir, new: &OsStr) -> io::Result<()> {
         let (a, b) = (entry(name)?, entry(new)?);
         rename_new(self.file.as_raw_fd(), &a, to.file.as_raw_fd(), &b)
     }

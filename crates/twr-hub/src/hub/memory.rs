@@ -38,6 +38,7 @@
 //! - **Off.** `[orchestrator] memory = false`: the orchestrator's calls are refused and no
 //!   block is sent; the user's calls still work, and the notes stay.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -140,6 +141,9 @@ pub struct Listing {
     pub notes: Vec<Note>,
     /// `<name>.md` files that cannot be read as notes, with why.
     pub unreadable: Vec<(String, String)>,
+    /// Each note's version by name, and `?` for each unreadable file: what [`Listing::rev`]
+    /// is made of.
+    pub entries: BTreeMap<String, String>,
     /// The version of the whole memory: changes with any note.
     pub rev: String,
 }
@@ -280,8 +284,12 @@ fn open_dir(dir: &Path, create: bool) -> std::io::Result<Option<Dir>> {
 /// Note `name`'s file in `held`: `Ok(None)` when there is none; an error for a symbolic link,
 /// anything but a regular file, a file over [`FILE_MAX`] or not UTF-8.
 fn read_note(held: &Dir, name: &str) -> std::io::Result<Option<Note>> {
-    let file = format!("{name}.md");
-    let f = match held.open_entry(OsStr::new(&file)) {
+    read_entry(held, &format!("{name}.md"), name)
+}
+
+/// [`read_note`] of the entry `file` of `held`, as note `name`.
+fn read_entry(held: &Dir, file: &str, name: &str) -> std::io::Result<Option<Note>> {
+    let f = match held.open_entry(OsStr::new(file)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) if not_a_dir(&e) => {
@@ -309,11 +317,18 @@ fn read_note(held: &Dir, name: &str) -> std::io::Result<Option<Note>> {
 pub fn list(dir: &Path) -> std::io::Result<Listing> {
     let Some(held) = open_dir(dir, false)? else {
         return Ok(Listing {
-            rev: rev_of(b""),
+            rev: memory_rev(&BTreeMap::new()),
             ..Listing::default()
         });
     };
     list_held(&held, dir)
+}
+
+/// The version of a whole memory from each note's name and version, and each unreadable
+/// `<name>.md`'s name (version `?`).
+fn memory_rev(entries: &BTreeMap<String, String>) -> String {
+    let id: String = entries.iter().map(|(n, r)| format!("{n} {r}\n")).collect();
+    rev_of(id.as_bytes())
 }
 
 fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
@@ -323,6 +338,7 @@ fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
         let Some(file) = e.file_name().to_str().map(str::to_string) else {
             continue;
         };
+        // Dot files are the hub's own in-flight files (a note being written or forgotten).
         if file.starts_with('.') {
             continue;
         }
@@ -332,57 +348,165 @@ fn list_held(held: &Dir, dir: &Path) -> std::io::Result<Listing> {
     }
     names.sort();
     let mut out = Listing::default();
-    let mut id = String::new();
     for name in names {
-        if !valid_name(&name) {
-            out.unreadable.push((
-                name,
-                "not a note name (lowercase letters, digits and -)".into(),
-            ));
-            continue;
-        }
-        match read_note(held, &name) {
+        let read = if valid_name(&name) {
+            read_note(held, &name).map_err(|e| e.to_string())
+        } else {
+            Err("not a note name (lowercase letters, digits and -)".into())
+        };
+        match read {
             Ok(Some(n)) => {
-                id.push_str(&format!("{} {}\n", n.name, n.rev));
+                out.entries.insert(n.name.clone(), n.rev.clone());
                 out.notes.push(n);
             }
             Ok(None) => {}
-            Err(e) => {
-                id.push_str(&format!("{name} ?\n"));
-                out.unreadable.push((name, e.to_string()));
+            Err(why) => {
+                out.entries.insert(name.clone(), "?".into());
+                out.unreadable.push((name, why));
             }
         }
     }
     out.notes
         .sort_by(|a, b| b.updated.cmp(&a.updated).then(a.name.cmp(&b.name)));
-    out.rev = rev_of(id.as_bytes());
+    out.rev = memory_rev(&out.entries);
     Ok(out)
 }
 
-/// Writes `note`'s file whole: a new file of its own (for its owner only), synced, renamed over
-/// the note's, then the directory synced.
-fn write_note(held: &Dir, note: &Note) -> std::io::Result<()> {
-    let file = format!("{}.md", note.name);
+/// Why a change to a note was not made.
+enum Refused {
+    /// Its file changed, appeared or went since it was checked: nothing was overwritten.
+    Changed(String),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for Refused {
+    fn from(e: std::io::Error) -> Refused {
+        Refused::Io(e)
+    }
+}
+
+impl From<Refused> for RpcError {
+    fn from(r: Refused) -> RpcError {
+        match r {
+            Refused::Changed(m) => rpc(codes::CONFLICT, m),
+            Refused::Io(e) => io_err(e),
+        }
+    }
+}
+
+/// A new hidden entry name of `held` for note `name`'s file in flight (`what`: `tmp`, `old`).
+fn in_flight(name: &str, what: &str) -> String {
+    format!(".{name}.{}.{what}", ulid::Ulid::generate())
+}
+
+/// Writes `note`'s file whole to a new hidden file (for its owner only), synced: its name.
+fn write_temp(held: &Dir, note: &Note) -> std::io::Result<String> {
     let mut tries = 0;
     let (mut f, tmp) = loop {
-        let tmp = format!(".{}.{}.tmp", note.name, ulid::Ulid::generate());
+        let tmp = in_flight(&note.name, "tmp");
         match held.create_new(OsStr::new(&tmp), 0o600) {
             Ok(f) => break (f, tmp),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 8 => tries += 1,
             Err(e) => return Err(e),
         }
     };
-    let written = (|| {
-        f.write_all(note.render().as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        held.rename(OsStr::new(&tmp), OsStr::new(&file))?;
-        held.file().sync_all()
-    })();
-    if written.is_err() {
+    let written = f
+        .write_all(note.render().as_bytes())
+        .and_then(|()| f.sync_all());
+    drop(f);
+    if let Err(e) = written {
         let _ = held.unlink(OsStr::new(&tmp));
+        return Err(e);
     }
-    written
+    Ok(tmp)
+}
+
+/// Moves note `name`'s file aside (a hidden name) and checks that it is version `rev`
+/// (`None`: whatever it is, an unreadable file too): the name it is under now. A file of
+/// another version goes back, and the change is refused. So a file edited by hand after the
+/// caller checked it is never overwritten or removed unseen: an edit lands either before the
+/// move (the check sees it) or in the file moved aside, which the check reads.
+fn take_aside(held: &Dir, name: &str, rev: Option<&str>) -> Result<String, Refused> {
+    let file = format!("{name}.md");
+    let aside = in_flight(name, "old");
+    match held.rename(OsStr::new(&file), OsStr::new(&aside)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Refused::Changed(format!(
+                "note {name} is gone (removed meanwhile)"
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let Some(rev) = rev else {
+        return Ok(aside);
+    };
+    let now = match read_entry(held, &aside, name) {
+        Ok(Some(n)) if n.rev == rev => return Ok(aside),
+        Ok(Some(n)) => n.rev,
+        Ok(None) => "gone".into(),
+        Err(_) => "unreadable".into(),
+    };
+    put_back(held, &aside, &file);
+    Err(Refused::Changed(format!(
+        "note {name} changed since it was read (rev {rev}, now {now}); read it again"
+    )))
+}
+
+/// Puts a file taken aside back as `file`, unless one of that name was made meanwhile (then
+/// the aside copy stays, hidden, and is logged).
+fn put_back(held: &Dir, aside: &str, file: &str) {
+    if let Err(e) = held.rename_new(OsStr::new(aside), held, OsStr::new(file)) {
+        tracing::warn!(aside, file, error = %e, "could not put a memory note back; it is kept under its hidden name");
+    }
+}
+
+/// Puts `note` in place: a new note when `rev` is `None` (refused when a file of its name
+/// exists, even one made a moment ago), else in place of version `rev` ([`take_aside`]).
+fn commit_save(held: &Dir, note: &Note, rev: Option<&str>) -> Result<(), Refused> {
+    let file = format!("{}.md", note.name);
+    let tmp = write_temp(held, note)?;
+    let aside = match rev
+        .map(|r| take_aside(held, &note.name, Some(r)))
+        .transpose()
+    {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = held.unlink(OsStr::new(&tmp));
+            return Err(e);
+        }
+    };
+    if let Err(e) = held.rename_new(OsStr::new(&tmp), held, OsStr::new(&file)) {
+        let _ = held.unlink(OsStr::new(&tmp));
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            // A file of that name was made meanwhile: it stays; the version this replaced
+            // (checked) goes, since that file replaced it too.
+            if let Some(a) = aside {
+                let _ = held.unlink(OsStr::new(&a));
+            }
+            return Err(Refused::Changed(format!(
+                "a note named {} was made meanwhile; read it, then save again",
+                note.name
+            )));
+        }
+        if let Some(a) = aside {
+            put_back(held, &a, &file);
+        }
+        return Err(e.into());
+    }
+    if let Some(a) = aside {
+        let _ = held.unlink(OsStr::new(&a));
+    }
+    held.file().sync_all()?;
+    Ok(())
+}
+
+/// Removes note `name`'s file, when it is version `rev` (`None`: whatever it is).
+fn commit_forget(held: &Dir, name: &str, rev: Option<&str>) -> Result<(), Refused> {
+    let aside = take_aside(held, name, rev)?;
+    held.unlink(OsStr::new(&aside))?;
+    held.file().sync_all()?;
+    Ok(())
 }
 
 /// `memory.save` parameters.
@@ -494,19 +618,22 @@ pub fn block(listing: &Listing, id: &str) -> (String, bool) {
     // Room kept for a line saying how many notes did not fit.
     const MORE: usize = 64;
     let mut cut = false;
-    // Every note's line and the line standing for its text are counted first; a text that
-    // fits takes the room left plus its stand-in's.
+    // Every note gets its line and at least a line standing for its text; a note's text goes
+    // in only when it fits with that much for every note after it.
     let left_out = |note: &Note| format!("    [text left out: memory_read {}]\n", note.name);
     let heads: Vec<String> = listing.notes.iter().map(head).collect();
-    let index: usize = heads
+    let least: Vec<usize> = heads
         .iter()
         .zip(&listing.notes)
         .map(|(h, note)| h.len() + 1 + left_out(note).len())
-        .sum();
-    let mut room = INJECT_MAX.saturating_sub(s.len() + end.len() + index + MORE);
+        .collect();
+    let mut after = vec![0; n + 1];
+    for i in (0..n).rev() {
+        after[i] = after[i + 1] + least[i];
+    }
+    let budget = INJECT_MAX.saturating_sub(end.len() + MORE);
     for (i, (head, note)) in heads.iter().zip(&listing.notes).enumerate() {
-        let stand_in = left_out(note);
-        if s.len() + head.len() + 1 + stand_in.len() + end.len() + MORE > INJECT_MAX {
+        if s.len() + least[i] > budget {
             cut = true;
             s.push_str(&format!("    ({} more notes: memory_list)\n", n - i));
             break;
@@ -514,12 +641,11 @@ pub fn block(listing: &Listing, id: &str) -> (String, bool) {
         s.push_str(head);
         s.push('\n');
         let text: String = note.body.lines().map(|l| format!("    {l}\n")).collect();
-        if text.len() <= room + stand_in.len() {
-            room = room + stand_in.len() - text.len();
+        if s.len() + text.len() + after[i + 1] <= budget {
             s.push_str(&text);
         } else {
             cut = true;
-            s.push_str(&stand_in);
+            s.push_str(&left_out(note));
         }
     }
     s.push_str(&end);
@@ -879,8 +1005,12 @@ impl Hub {
                 ),
             ));
         }
-        write_note(&held, &note).map_err(io_err)?;
+        commit_save(&held, &note, p.rev.as_deref())?;
         let after = list_held(&held, &dir).map_err(io_err)?;
+        // What the memory is with this change alone: another change made meanwhile is still
+        // news to the orchestrator.
+        let mut expected = before.entries.clone();
+        expected.insert(note.name.clone(), note.rev.clone());
         drop(_lock);
         let op = if current.is_some() {
             "updated"
@@ -900,7 +1030,7 @@ impl Hub {
                 ..Default::default()
             },
             &before.rev,
-            &after.rev,
+            &memory_rev(&expected),
         );
         Ok(json!({
             "name": note.name,
@@ -945,10 +1075,10 @@ impl Hub {
             }
             _ => {}
         }
-        held.unlink(OsStr::new(&format!("{}.md", p.name)))
-            .and_then(|()| held.file().sync_all())
-            .map_err(io_err)?;
+        commit_forget(&held, &p.name, p.rev.as_deref())?;
         let after = list_held(&held, &dir).map_err(io_err)?;
+        let mut expected = before.entries.clone();
+        expected.remove(&p.name);
         drop(_lock);
         self.memory_record(
             caller,
@@ -967,7 +1097,7 @@ impl Hub {
                 ..Default::default()
             },
             &before.rev,
-            &after.rev,
+            &memory_rev(&expected),
         );
         Ok(json!({"name": p.name, "op": "forgotten", "count": after.notes.len()}))
     }
@@ -1182,6 +1312,28 @@ mod tests {
         assert!(b.len() <= INJECT_MAX, "{}", b.len());
         assert!(b.contains("more notes: memory_list)"), "{b}");
         assert!(b.ends_with("[end of twr memory y]\n\n"));
+        // Lines past the cap with short texts first and a long one after them (review round
+        // 2's case): still within the cap.
+        let mixed: Vec<Note> = (0..40)
+            .map(|i| {
+                let body = if i < 34 {
+                    "t".to_string()
+                } else {
+                    "z".repeat(2000)
+                };
+                let mut n = note(&format!("m{i:02}-{}", "x".repeat(55)), &body, "2026-10-01");
+                n.description = "d".repeat(DESCRIPTION_MAX);
+                n
+            })
+            .collect();
+        let (b, _) = block(
+            &Listing {
+                notes: mixed,
+                ..Listing::default()
+            },
+            "z",
+        );
+        assert!(b.len() <= INJECT_MAX, "{}", b.len());
     }
 
     #[test]
@@ -1190,8 +1342,14 @@ mod tests {
         let dir = tmp.path().join(DIR);
         assert!(list(&dir).unwrap().notes.is_empty());
         let held = open_dir(&dir, true).unwrap().unwrap();
-        write_note(&held, &note("a", "x", "2026-10-01")).unwrap();
-        write_note(&held, &note("b", "y", "2026-10-02")).unwrap();
+        let a = note("a", "x", "2026-10-01");
+        assert!(commit_save(&held, &a, None).is_ok());
+        assert!(commit_save(&held, &note("b", "y", "2026-10-02"), None).is_ok());
+        // A new note of a name taken is refused, the file kept.
+        assert!(matches!(
+            commit_save(&held, &note("a", "other", "2026-10-02"), None),
+            Err(Refused::Changed(_))
+        ));
         std::fs::write(dir.join("Bad.md"), "x").unwrap();
         std::fs::write(dir.join("README"), "not a note").unwrap();
         std::os::unix::fs::symlink(tmp.path().join("secret"), dir.join("link.md")).unwrap();
@@ -1202,8 +1360,39 @@ mod tests {
         let bad: Vec<&str> = l.unreadable.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(bad, ["Bad", "link"]);
         let rev = l.rev.clone();
-        write_note(&held, &note("a", "changed", "2026-10-03")).unwrap();
+        assert!(commit_save(&held, &note("a", "changed", "2026-10-03"), Some(&a.rev)).is_ok());
         assert_ne!(list(&dir).unwrap().rev, rev);
+        // An edit by hand after a version was read: neither replaced nor removed, and no
+        // in-flight file is left.
+        let read = list(&dir).unwrap();
+        let seen = read
+            .notes
+            .iter()
+            .find(|n| n.name == "a")
+            .unwrap()
+            .rev
+            .clone();
+        std::fs::write(dir.join("a.md"), "edited by hand").unwrap();
+        assert!(matches!(
+            commit_save(&held, &note("a", "mine", "2026-10-04"), Some(&seen)),
+            Err(Refused::Changed(_))
+        ));
+        assert!(matches!(
+            commit_forget(&held, "a", Some(&seen)),
+            Err(Refused::Changed(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.md")).unwrap(),
+            "edited by hand"
+        );
+        let hidden: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "{hidden:?}");
+        assert!(commit_forget(&held, "a", None).is_ok());
+        assert!(!dir.join("a.md").exists());
         // A memory directory that is a link is refused.
         let tmp2 = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(&dir, tmp2.path().join(DIR)).unwrap();
