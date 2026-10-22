@@ -1591,6 +1591,45 @@ impl MemoryChanged {
     }
 }
 
+/// The orchestrator's memory tools (twr's MCP server), by their own names.
+pub const MEMORY_TOOLS: &[&str] = &["memory_list", "memory_read", "memory_save", "memory_forget"];
+
+/// Whether `name` names one of twr's memory tools as a runtime calls it: `mcp__twr__<tool>`
+/// (Claude Code, Codex), `twr__<tool>` (an ACP agent's MCP call, `ext.<dialect>.mcp_tool`), or
+/// the bare name.
+pub fn is_memory_tool(name: &str) -> bool {
+    let bare = name
+        .strip_prefix("mcp__twr__")
+        .or_else(|| name.strip_prefix("twr__"))
+        .unwrap_or(name);
+    MEMORY_TOOLS.contains(&bare)
+}
+
+/// Whether `p` calls one of twr's memory tools: its tool, or the MCP tool an ACP agent's call
+/// runs (`ext.<dialect>.mcp_tool`).
+pub fn memory_tool_call(p: &AgentToolCall) -> bool {
+    is_memory_tool(&p.tool)
+        || p.ext.as_ref().is_some_and(|ext| {
+            ext.values()
+                .filter_map(|v| v.get("mcp_tool").and_then(Value::as_str))
+                .any(is_memory_tool)
+        })
+}
+
+/// `ext.twr` key the hub sets (`true`) on the orchestrator's memory tool calls and their
+/// results, whose arguments and output it does not record (`hub::memory`): such a call is no
+/// action on the user's message (it can still be taken back).
+pub const MEMORY_CALL_KEY: &str = "memory_call";
+
+/// Whether `ext` marks a memory tool call or result ([`MEMORY_CALL_KEY`]).
+pub fn is_memory_call(ext: &Option<JsonMap>) -> bool {
+    ext.as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(MEMORY_CALL_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// `context.updated`
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]

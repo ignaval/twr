@@ -202,6 +202,7 @@ impl Core {
             replayed: _,
             // Memory only: what the orchestrator's runtime got of its memory (`hub::memory`).
             memory_seen: _,
+            memory_calls: _,
         } = self;
         let snap = FoldSnapshot {
             registry,

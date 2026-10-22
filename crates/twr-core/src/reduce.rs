@@ -733,7 +733,9 @@ impl ThreadView {
                     self.current_turn_acted = true;
                 }
             }
-            EventBody::AgentToolCall(_) if self.in_open_turn(ev) => {
+            // A call of the orchestrator's memory tools changes no thread: its message can
+            // still be taken back.
+            EventBody::AgentToolCall(p) if self.in_open_turn(ev) && !is_memory_call(&p.ext) => {
                 self.current_turn_acted = true;
             }
             EventBody::TurnWithdrawn(_) if self.in_open_turn(ev) => {

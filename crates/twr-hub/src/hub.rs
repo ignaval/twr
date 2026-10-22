@@ -1600,6 +1600,9 @@ struct Core {
     /// What the orchestrator's runtime got of its memory (`hub::memory`). Memory only: a
     /// restarted hub starts the orchestrator's runtime again, which gets its memory then.
     memory_seen: Option<memory::Seen>,
+    /// The orchestrator's memory tool calls of its current turn, by call id, whose results
+    /// are recorded without their text (`hub::memory`). Memory only.
+    memory_calls: HashSet<String>,
 }
 
 fn rpc(code: &str, msg: impl Into<String>) -> RpcError {

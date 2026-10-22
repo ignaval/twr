@@ -46,7 +46,9 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use twr_core::blob::blob_ref;
-use twr_core::event::{EventBody, MemoryChanged, Source};
+use twr_core::event::{
+    memory_tool_call, EventBody, JsonMap, MemoryChanged, Source, MEMORY_CALL_KEY,
+};
 use twr_core::proto::{codes, RpcError};
 use twr_runner::local::dirfd::{not_a_dir, Dir};
 
@@ -546,6 +548,29 @@ fn head(note: &Note) -> String {
     s
 }
 
+/// What a redacted memory call keeps of its `ext` ([`Core::redact_memory_call`]): each
+/// dialect's `tool` and `mcp_tool`, and [`MEMORY_CALL_KEY`].
+fn redacted_ext(ext: Option<JsonMap>) -> Option<JsonMap> {
+    let mut out = JsonMap::new();
+    for (dialect, v) in ext.into_iter().flatten() {
+        if dialect == "twr" {
+            continue;
+        }
+        let kept: JsonMap = v
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(k, _)| matches!(k.as_str(), "tool" | "mcp_tool"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if !kept.is_empty() {
+            out.insert(dialect, Value::Object(kept));
+        }
+    }
+    out.insert("twr".into(), json!({ MEMORY_CALL_KEY: true }));
+    Some(out)
+}
+
 /// Now, as a note's `updated`.
 pub(super) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -590,10 +615,15 @@ impl Core {
             .get(thread)
             .and_then(|r| r.live.as_ref())
             .map(|l| l.generation);
-        let seen = self.memory_seen.as_ref().is_some_and(|s| {
-            s.thread == thread && Some(s.generation) == live && s.rev == listing.rev
-        });
-        if seen || listing.notes.is_empty() {
+        // What this runtime got before, if anything.
+        let had = self
+            .memory_seen
+            .as_ref()
+            .filter(|s| s.thread == thread && Some(s.generation) == live)
+            .map(|s| s.rev.as_str());
+        // Nothing new; or nothing at all for a runtime that never got notes. A runtime that
+        // did is told they are all gone.
+        if had == Some(listing.rev.as_str()) || (listing.notes.is_empty() && had.is_none()) {
             return Some(ForTurn {
                 text: None,
                 rev: listing.rev,
@@ -602,7 +632,18 @@ impl Core {
         }
         let id = ulid::Ulid::generate().to_string().to_lowercase();
         let id = &id[id.len() - 8..];
-        let (text, cut) = block(&listing, id);
+        let (text, cut) = if listing.notes.is_empty() {
+            (
+                format!(
+                    "[twr memory {id}] You have no notes any more: every note you saved was \
+                     forgotten. Do not rely on what earlier notes said.\n\
+                     [end of twr memory {id}]\n\n"
+                ),
+                false,
+            )
+        } else {
+            block(&listing, id)
+        };
         let ext = json!({
             "rev": listing.rev,
             "notes": listing.notes.len(),
@@ -638,6 +679,49 @@ impl Core {
     fn memory_changed_by_orchestrator(&mut self, before: &str, after: &str) {
         if let Some(s) = self.memory_seen.as_mut().filter(|s| s.rev == before) {
             s.rev = after.to_string();
+        }
+    }
+
+    /// Records the orchestrator's calls of its memory tools, and their results, without their
+    /// text (`body` of an adapter event on `thread`): the notes stay in the memory alone, so a
+    /// forgotten note is gone. The call keeps its tool (and an ACP agent's `mcp_tool`), its
+    /// result whether it succeeded; both lose their summaries' text, full payloads, unknown
+    /// keys and the runtime's raw line, and get `ext.twr.memory_call` ([`MEMORY_CALL_KEY`]):
+    /// no action on the user's message (`ThreadView::current_turn_acted`).
+    pub(super) fn redact_memory_call(
+        &mut self,
+        thread: &str,
+        body: &mut EventBody,
+        raw: &mut Option<String>,
+        source: &Source,
+    ) {
+        if !matches!(source, Source::Adapter(_)) || !self.is_orch(thread) {
+            return;
+        }
+        match body {
+            EventBody::AgentToolCall(p)
+                if memory_tool_call(p) || self.memory_calls.contains(&p.call_id) =>
+            {
+                self.memory_calls.insert(p.call_id.clone());
+                p.input_summary = "(arguments not recorded: the orchestrator's memory)".into();
+                p.input_ref = None;
+                p.extra.clear();
+                p.ext = redacted_ext(p.ext.take());
+                *raw = None;
+            }
+            EventBody::AgentToolResult(p) if self.memory_calls.contains(&p.call_id) => {
+                p.output_summary = if p.ok {
+                    "(result not recorded: the orchestrator's memory)".into()
+                } else {
+                    "(failed; not recorded: the orchestrator's memory)".into()
+                };
+                p.output_ref = None;
+                p.extra.clear();
+                p.ext = redacted_ext(p.ext.take());
+                *raw = None;
+            }
+            EventBody::TurnEnded(_) => self.memory_calls.clear(),
+            _ => {}
         }
     }
 
@@ -840,6 +924,16 @@ impl Hub {
         let unreadable = before.unreadable.iter().any(|(n, _)| *n == p.name);
         match (before.get(&p.name), &p.rev) {
             (None, _) if !unreadable => return Err(missing()),
+            // A file that cannot be read has no version a rev could name.
+            (None, Some(r)) => {
+                return Err(rpc(
+                    codes::CONFLICT,
+                    format!(
+                        "note {} cannot be read, so it is not rev {r}; forget it without a rev",
+                        p.name
+                    ),
+                ))
+            }
             (Some(n), Some(r)) if n.rev != *r => {
                 return Err(rpc(
                     codes::CONFLICT,

@@ -499,3 +499,114 @@ async fn memory_off_refuses_the_orchestrator_and_sends_nothing() {
     drop(rt);
     hub.shutdown().await;
 }
+
+/// The events of the orchestrator's thread once `n` of kind `kind` are recorded.
+async fn when_recorded(hub: &Hub, kind: &str, n: usize) -> Vec<Event> {
+    timeout(WAIT, async {
+        loop {
+            let evs = orch_events(hub);
+            if evs.iter().filter(|e| e.kind() == kind).count() >= n {
+                return evs;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("timed out waiting for the orchestrator's events")
+}
+
+#[tokio::test]
+async fn memory_calls_are_recorded_without_their_text_and_leave_the_message_free() {
+    let mut env = Env::new();
+    let hub = env.hub_with(|_| {}).await;
+    let said = hub
+        .say_to_orchestrator("remember that I like tea", None, &tui())
+        .unwrap();
+    let msg_ref = said["ref"].as_i64().expect("the message's ref");
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    let secret = "TEA-NOTE-TEXT";
+    let ext = |v: Value| v.as_object().cloned();
+    // Claude Code's and Codex's name for the tool, and an ACP agent's MCP call.
+    rt.end.emit(
+        EventBody::AgentToolCall(AgentToolCall {
+            call_id: "c1".into(),
+            tool: "mcp__twr__memory_save".into(),
+            input_summary: format!("{{\"body\":\"{secret}\",\"name\":\"tea\"}}"),
+            ext: ext(json!({"codex": {"arguments": secret}})),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    hub.memory_save(save("tea", secret, None), &Caller::Orchestrator)
+        .await
+        .unwrap();
+    rt.end.emit(
+        EventBody::AgentToolResult(AgentToolResult {
+            call_id: "c1".into(),
+            ok: true,
+            output_summary: format!("saved {secret}"),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    rt.end.emit(
+        EventBody::AgentToolCall(AgentToolCall {
+            call_id: "c2".into(),
+            tool: "other".into(),
+            input_summary: format!("twr__memory_read {secret}"),
+            ext: ext(json!({"grok": {"mcp_tool": "twr__memory_read", "title": secret}})),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    rt.end.emit(
+        EventBody::AgentToolResult(AgentToolResult {
+            call_id: "c2".into(),
+            ok: true,
+            output_summary: secret.into(),
+            ..Default::default()
+        }),
+        Some(t1),
+    );
+    let evs = when_recorded(&hub, "agent.tool_result", 2).await;
+    let log = serde_json::to_string(&evs).unwrap();
+    assert!(!log.contains(secret), "{log}");
+    for e in &evs {
+        if let EventBody::AgentToolCall(p) = &e.body {
+            assert!(is_memory_call(&p.ext), "{p:?}");
+        }
+    }
+    // A memory call is no action on the message: it can still be taken back.
+    let orch = hub.orchestrator_thread().unwrap();
+    let w = hub.withdraw_message(&orch, msg_ref, &tui()).unwrap();
+    assert_eq!(w["withdrawn"], true, "{w}");
+    drop(rt);
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_runtime_is_told_when_its_last_note_is_forgotten() {
+    let mut env = Env::new();
+    let hub = env.hub_with(|_| {}).await;
+    hub.memory_save(save("only", "The only note.", None), &tui())
+        .await
+        .unwrap();
+    hub.say_to_orchestrator("hello", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (text, t1) = rt.next_turn().await;
+    assert!(text.contains("The only note."), "{text}");
+    rt.end_turn(t1);
+    // Forgotten by hand: the file goes.
+    std::fs::remove_file(env.memory_dir().join("only.md")).unwrap();
+    let (text, t2) = user_turn(&hub, &mut rt, "next").await;
+    assert!(text.contains("You have no notes any more"), "{text}");
+    assert_eq!(turn_memory(&hub, t2).unwrap()["notes"], 0);
+    rt.end_turn(t2);
+    // Told once.
+    let (text, t3) = user_turn(&hub, &mut rt, "again").await;
+    assert!(!text.contains("[twr memory"), "{text}");
+    rt.end_turn(t3);
+    drop(rt);
+    hub.shutdown().await;
+}
