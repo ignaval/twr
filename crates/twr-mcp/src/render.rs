@@ -1243,7 +1243,10 @@ mod tests {
         );
         let event = json!({"seq": 7, "kind": "memory.changed",
             "data": {"op": "forgotten", "name": "short-replies", "by": "user"}});
-        assert_eq!(control_body(&event), "hub: forgot memory short-replies (by you)");
+        assert_eq!(
+            control_body(&event),
+            "hub: forgot memory short-replies (by you)"
+        );
     }
 
     /// Every shortened field (a cap cut or a `_capped` preview) ends its line with the hint.

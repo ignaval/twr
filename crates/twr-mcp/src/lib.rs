@@ -1600,13 +1600,15 @@ impl TwrMcp {
         self.call_text("memory.read", to_params(&p)?).await
     }
 
-    #[tool(description = "Save a note in your memory, so later sessions, on any runtime, know \
+    #[tool(
+        description = "Save a note in your memory, so later sessions, on any runtime, know \
                           it. Keep what lasts and is not in the repositories: the user's \
                           preferences and corrections, facts about their setup, pointers. \
                           Never transcripts, worker output, repository content, secrets, \
                           approvals or modes. A new note: no rev; to change one, pass its rev \
                           (a stale rev is a conflict: read it again). The user sees every \
-                          save.")]
+                          save."
+    )]
     async fn memory_save(
         &self,
         Parameters(p): Parameters<MemorySaveParams>,
@@ -1614,8 +1616,10 @@ impl TwrMcp {
         self.call_text("memory.save", to_params(&p)?).await
     }
 
-    #[tool(description = "Forget a note of your memory: when it is wrong or out of date, or \
-                          the user asks. The user sees it.")]
+    #[tool(
+        description = "Forget a note of your memory: when it is wrong or out of date, or \
+                          the user asks. The user sees it."
+    )]
     async fn memory_forget(
         &self,
         Parameters(p): Parameters<MemoryForgetParams>,

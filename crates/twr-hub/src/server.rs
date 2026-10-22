@@ -1111,8 +1111,8 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
-            | "memory.list" | "memory.read" | "memory.save" | "memory.forget"
-            | "box.add" | "box.install" | "box.restart" | "box.projects" | "box.token" => {
+            | "memory.list" | "memory.read" | "memory.save" | "memory.forget" | "box.add"
+            | "box.install" | "box.restart" | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),

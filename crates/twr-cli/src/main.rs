@@ -2093,7 +2093,10 @@ async fn run_simple(
 async fn memory(socket: &Path, cmd: MemoryCmd) -> anyhow::Result<()> {
     match cmd {
         MemoryCmd::List { json } => {
-            let r = connect(socket).await?.call("memory.list", json!({})).await?;
+            let r = connect(socket)
+                .await?
+                .call("memory.list", json!({}))
+                .await?;
             if json {
                 outln!("{}", serde_json::to_string_pretty(&r)?);
                 return Ok(());
@@ -2116,7 +2119,11 @@ async fn memory(socket: &Path, cmd: MemoryCmd) -> anyhow::Result<()> {
                 );
             }
             for u in r["unreadable"].as_array().into_iter().flatten() {
-                errln!("{}.md cannot be read: {}", str_of(&u["name"]), str_of(&u["why"]));
+                errln!(
+                    "{}.md cannot be read: {}",
+                    str_of(&u["name"]),
+                    str_of(&u["why"])
+                );
             }
             if notes.iter().any(|n| n["unconfirmed"] == true) {
                 errln!("! saved by the orchestrator in a turn you did not start");
@@ -2154,7 +2161,10 @@ async fn memory(socket: &Path, cmd: MemoryCmd) -> anyhow::Result<()> {
             Ok(())
         }
         MemoryCmd::Path => {
-            let r = connect(socket).await?.call("memory.list", json!({})).await?;
+            let r = connect(socket)
+                .await?
+                .call("memory.list", json!({}))
+                .await?;
             outln!("{}", str_of(&r["dir"]));
             Ok(())
         }
@@ -2203,10 +2213,7 @@ async fn memory_edit(socket: &Path, name: &str) -> anyhow::Result<()> {
             if e.downcast_ref::<RpcError>()
                 .is_some_and(|r| r.code == codes::NOT_FOUND) =>
         {
-            (
-                "description: \ntype: user\n---\n".to_string(),
-                None,
-            )
+            ("description: \ntype: user\n---\n".to_string(), None)
         }
         Err(e) => return Err(e),
     };
@@ -2225,7 +2232,10 @@ async fn memory_edit(socket: &Path, name: &str) -> anyhow::Result<()> {
     let edited = after.as_ref().map_or(true, |a| a != before.as_bytes());
     let keep = |tmp: TempFile, why: String| -> anyhow::Error {
         if edited {
-            anyhow!("{why}; the note is unchanged (your edit is kept in {})", tmp.keep().display())
+            anyhow!(
+                "{why}; the note is unchanged (your edit is kept in {})",
+                tmp.keep().display()
+            )
         } else {
             anyhow!("{why}; the note is unchanged")
         }
@@ -2233,7 +2243,12 @@ async fn memory_edit(socket: &Path, name: &str) -> anyhow::Result<()> {
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => return Err(keep(tmp, format!("the editor `{editor}` exited with {s}"))),
-        Err(e) => return Err(keep(tmp, format!("running the editor `{editor}` failed ({e})"))),
+        Err(e) => {
+            return Err(keep(
+                tmp,
+                format!("running the editor `{editor}` failed ({e})"),
+            ))
+        }
     }
     let after = match after.map(String::from_utf8) {
         Ok(Ok(a)) => a,

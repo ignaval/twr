@@ -206,7 +206,10 @@ async fn notes_reach_each_new_session_once() {
     let mut env = Env::new();
     let hub = env.hub_with(|_| {}).await;
     let saved = hub
-        .memory_save(save("short-replies", "One sentence per reply.", None), &tui())
+        .memory_save(
+            save("short-replies", "One sentence per reply.", None),
+            &tui(),
+        )
         .await
         .unwrap();
     assert_eq!(saved["op"], "saved");
@@ -215,7 +218,10 @@ async fn notes_reach_each_new_session_once() {
     // The first session's first turn carries the memory, framed, before the message.
     hub.say_to_orchestrator("hello", None, &tui()).unwrap();
     let mut rt = env.orch().await;
-    assert!(rt.cfg.native_memory_off, "the orchestrator's own memory is off");
+    assert!(
+        rt.cfg.native_memory_off,
+        "the orchestrator's own memory is off"
+    );
     let (text, t1) = rt.next_turn().await;
     assert!(text.starts_with("[twr memory "), "{text}");
     assert!(text.contains("never approval"), "{text}");
@@ -232,7 +238,10 @@ async fn notes_reach_each_new_session_once() {
     assert!(turn_memory(&hub, t2).is_none());
     // Its own save, in a turn the user started, is not sent back to it.
     let own = hub
-        .memory_save(save("staging-first", "Deploy to staging first.", None), &Caller::Orchestrator)
+        .memory_save(
+            save("staging-first", "Deploy to staging first.", None),
+            &Caller::Orchestrator,
+        )
         .await
         .unwrap();
     rt.end_turn(t2);
@@ -242,7 +251,11 @@ async fn notes_reach_each_new_session_once() {
 
     // A change the user made goes to it.
     hub.memory_save(
-        save("staging-first", "Deploy to staging first, always.", own["rev"].as_str()),
+        save(
+            "staging-first",
+            "Deploy to staging first, always.",
+            own["rev"].as_str(),
+        ),
         &tui(),
     )
     .await
@@ -386,10 +399,16 @@ async fn a_note_saved_in_a_notice_turn_is_unconfirmed_and_never_answers() {
 async fn versions_guard_every_change() {
     let env = Env::new();
     let hub = env.hub_with(|_| {}).await;
-    let a = hub.memory_save(save("a", "one", None), &tui()).await.unwrap();
+    let a = hub
+        .memory_save(save("a", "one", None), &tui())
+        .await
+        .unwrap();
     let rev = a["rev"].as_str().unwrap().to_string();
     // A new note of a name taken, or a stale rev: conflicts, nothing overwritten.
-    let e = hub.memory_save(save("a", "two", None), &tui()).await.unwrap_err();
+    let e = hub
+        .memory_save(save("a", "two", None), &tui())
+        .await
+        .unwrap_err();
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
     let e = hub
         .memory_save(save("a", "two", Some("000000000000")), &tui())
@@ -429,7 +448,10 @@ async fn versions_guard_every_change() {
     assert_eq!(e.code, codes::CONFLICT, "{e:?}");
     // Secrets and bad names are refused.
     let key = format!("-----BEGIN OPENSSH {} KEY-----\nabc", "PRIVATE");
-    let e = hub.memory_save(save("k", &key, None), &tui()).await.unwrap_err();
+    let e = hub
+        .memory_save(save("k", &key, None), &tui())
+        .await
+        .unwrap_err();
     assert_eq!(e.code, codes::BAD_REQUEST, "{e:?}");
     let e = hub
         .memory_save(save("../escape", "x", None), &tui())
