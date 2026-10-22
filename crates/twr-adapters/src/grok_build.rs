@@ -341,12 +341,23 @@ pub fn build_args(cfg: &SpawnConfig) -> Vec<String> {
     a
 }
 
-/// Environment added to the grok process: `cfg.env` and `GROK_DISABLE_AUTOUPDATER=1`.
+/// Environment added to the grok process: `cfg.env` and `GROK_DISABLE_AUTOUPDATER=1`, and
+/// with [`SpawnConfig::native_memory_off`] [`MEMORY_ENV`]`=0`.
 pub fn build_env(cfg: &SpawnConfig) -> Vec<(String, String)> {
     let mut env = cfg.env.clone();
     env.push(("GROK_DISABLE_AUTOUPDATER".into(), "1".into()));
+    if cfg.native_memory_off {
+        env.retain(|(k, _)| k != MEMORY_ENV);
+        env.push((MEMORY_ENV.into(), "0".into()));
+    }
     env
 }
+
+/// Grok's memory switch: `0` turns its cross-session memory off for the whole process, whatever
+/// its config says (grok 1.0.62's docs: "Force-Disable"; only `requirements.toml` ranks above
+/// it). Its memory captures every turn in the background and is read with file tools, which
+/// the orchestrator does not have.
+pub const MEMORY_ENV: &str = "GROK_MEMORY";
 
 impl Adapter for GrokBuildAdapter {
     fn info(&self) -> AdapterInfo {

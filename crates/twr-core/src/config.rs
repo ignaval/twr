@@ -268,6 +268,10 @@ pub struct OrchestratorConfig {
     /// with `/` a path from the repository's top). They add to the built-in secret names,
     /// never remove one.
     pub read_deny: Vec<String>,
+    /// Whether the orchestrator keeps notes across sessions in the workspace's memory
+    /// (`<data dir>/memory/`, `hub::memory`; default `true`). `false`: its memory tools refuse,
+    /// nothing is loaded into its sessions, and the notes stay where they are.
+    pub memory: bool,
 }
 
 impl Default for OrchestratorConfig {
@@ -280,6 +284,7 @@ impl Default for OrchestratorConfig {
             effort: None,
             project_reads: true,
             read_deny: Vec::new(),
+            memory: true,
         }
     }
 }

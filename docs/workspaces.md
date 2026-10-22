@@ -62,7 +62,8 @@ A TUI opened with `--socket` shows that hub alone, without the sidebar or tabs.
 | | Each workspace has its own |
 |---|---|
 | Hub, socket and log | yes |
-| Orchestrator and its conversation | yes, and its own working directory, so a Claude Code orchestrator keeps its own [memories](orchestrator.md#memory) |
+| Orchestrator and its conversation | yes |
+| Orchestrator's [memory](orchestrator.md#memory) | yes, on every runtime; and its own working directory, so a Claude Code orchestrator's own memory directory is the workspace's too |
 | Threads, watches, reports, attention | yes |
 | Worktrees and trash | yes |
 | Branches | new threads use `twr/@<workspace>/<name>`, so two workspaces can each have an `api` thread in one repository |
@@ -70,7 +71,7 @@ A TUI opened with `--socket` shows that hub alone, without the sidebar or tabs.
 
 Every workspace reads the same `config.toml`: projects, runtimes and notification settings apply to all of them. A named workspace ignores what belongs to the `default` hub: `hub.socket`, `hub.listen` and `hub.tls` (runners connect to `default`) and `[orchestrator] cwd`. The default hub's `hub.socket` can't be in the directory of the workspaces' sockets (`.../twr/ws/`). Agent installations and logins are shared, as are your repositories.
 
-One exception for orchestrator memories: Claude Code keys memories by the git repository a working directory is in. If your `TWR_HOME` is inside a git checkout, the orchestrators of all its workspaces share that repository's memories.
+One exception for Claude Code's own memory directory: Claude Code keys memories by the git repository a working directory is in. If your `TWR_HOME` is inside a git checkout, the orchestrators of all its workspaces share that repository's memories.
 
 An agent's own `twr` calls reach its workspace's hub: the hub sets `TWR_WORKSPACE` for everything it starts, and for a CLI you attach. The commands twr suggests, such as the TUI's `/attach` (`twr -w client-x attach api`), `twr resume api` or `twr trash list`, come with the `-w` of the workspace they're about, or `-w default` when your shell's `TWR_WORKSPACE` selects another. What an agent asks to run is shown as it asks, even when it quotes a `twr` command.
 
@@ -106,4 +107,4 @@ twr -w client-x hub stop
 twr ws rm client-x
 ```
 
-`twr ws rm` removes the workspace's data: its log, its orchestrator's conversation and its input history. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's memories stay in `~/.claude/projects/`. `default` can't be removed.
+`twr ws rm` removes the workspace's data: its log, its orchestrator's conversation and memory, and its input history. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's own memory directory stays in `~/.claude/projects/`. `default` can't be removed.

@@ -618,6 +618,7 @@ impl Core {
             draining_boxes: HashMap::new(),
             defer_ack_sync: false,
             replayed: Default::default(),
+            memory_seen: None,
         })
     }
 

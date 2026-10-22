@@ -63,6 +63,10 @@
 //! | `project.read`      | `{project, path, thread?, offset?}`                 | `{project, commit, branch_of, path, kind, content, offset, end, total, utf8?, note?}`: 16 KB of a committed file; secrets, binaries and files over 1 MiB refused |
 //! | `project.search`    | `{project, query, path?, thread?, ignore_case?}`    | `{project, commit, branch_of, query, path, hits: [{path, line, text}], more, hidden}` |
 //! | `context.set`       | `{project, content, expect_hash?}`                  | `{project, path, hash, bytes, changed}` (`conflict` if `expect_hash` is stale or the file is over 1 MiB) |
+//! | `memory.list`       | -                                                   | `{notes: [{name, type, description, updated, by, origin, runtime?, rev, bytes, unconfirmed?}], unreadable: [{name, why}], rev, count, bytes, limits, enabled, dir?}`: the orchestrator's memory (`hub::memory`; not for agents; `dir` for users) |
+//! | `memory.read`       | `{name}`                                            | a note of `memory.list` with its `body` |
+//! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
+//! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
 //! | `usage.get`         | -                                                   | `{now, runtimes: [{runtime, account, label, plan, windows: [{window, label, used_pct, resets_at, minutes}], observed_at, age_secs, stale, source}]}` |
 //!
 //! Identity: a connection is `user:<client>` (source of what it does; its
@@ -707,6 +711,10 @@ pub const METHODS: &[&str] = &[
     "project.files",
     "project.read",
     "project.search",
+    "memory.list",
+    "memory.read",
+    "memory.save",
+    "memory.forget",
     "job.start",
     "job.cancel",
     "job.list",
@@ -754,6 +762,10 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "project.files",
     "project.read",
     "project.search",
+    "memory.list",
+    "memory.read",
+    "memory.save",
+    "memory.forget",
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
@@ -781,6 +793,12 @@ const ORCHESTRATOR_CHANGES: &[&str] = &[
     "orchestrator.watch",
     "orchestrator.unwatch",
 ];
+
+/// The [`ORCHESTRATOR_METHODS`] that change the orchestrator's own memory (`hub::memory`):
+/// refused, like [`ORCHESTRATOR_CHANGES`], once the user took back the message of the turn they
+/// come in, but they leave that message free to be taken back (a note is no change to the
+/// hub's threads).
+const ORCHESTRATOR_NOTES: &[&str] = &["memory.save", "memory.forget"];
 
 /// Methods a thread's agent may call: reads, and starting and cancelling its own thread's jobs
 /// (from a process twr started for the thread; starting only while the thread's mode may run
@@ -1004,6 +1022,14 @@ async fn connection(
                 continue;
             }
         }
+        if caller.is_orchestrator() && ORCHESTRATOR_NOTES.contains(&req.method.as_str()) {
+            if let Err(e) = hub.orchestrator_admitted(&req.method, received.as_ref()) {
+                if send(&writer, &Response::err(id, e)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let client = conn.client.clone();
         // Subscriptions that ended (their stream ended or failed, or their client went) no
         // longer count against this connection's.
@@ -1085,6 +1111,7 @@ async fn connection(
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
+            | "memory.list" | "memory.read" | "memory.save" | "memory.forget"
             | "box.add" | "box.install" | "box.restart" | "box.projects" | "box.token" => {
                 let result = call_async(&hub, &caller, &req.method, req.params).await;
                 let resp = match result {
@@ -2069,6 +2096,14 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             let p: ProjectParams = params(p)?;
             hub.context_read(&p.project).await
         }
+        // The orchestrator's memory (`hub::memory`).
+        "memory.list" => {
+            let _: EmptyParams = params(p)?;
+            hub.memory_list(caller).await
+        }
+        "memory.read" => hub.memory_read(params(p)?, caller).await,
+        "memory.save" => hub.memory_save(params(p)?, caller).await,
+        "memory.forget" => hub.memory_forget(params(p)?, caller).await,
         "context.set" => {
             let p: ContextSetParams = params(p)?;
             hub.context_set(&p.project, &p.content, p.expect_hash.as_deref(), caller)

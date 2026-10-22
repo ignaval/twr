@@ -138,6 +138,8 @@ mod hook;
 mod jobs;
 mod lifecycle;
 mod limits;
+pub mod memory;
+pub use memory::DIR as MEMORY_DIR;
 mod mode;
 mod model;
 mod orch;
@@ -1595,6 +1597,9 @@ struct Core {
     usage: twr_core::usage::UsageView,
     /// How the hub's start rebuilt this state (`hub::checkpoint`). Memory only.
     replayed: checkpoint::Replayed,
+    /// What the orchestrator's runtime got of its memory (`hub::memory`). Memory only: a
+    /// restarted hub starts the orchestrator's runtime again, which gets its memory then.
+    memory_seen: Option<memory::Seen>,
 }
 
 fn rpc(code: &str, msg: impl Into<String>) -> RpcError {
@@ -2214,6 +2219,12 @@ impl Core {
                 json!(orch::prompt_fingerprint()),
             );
         }
+        // The orchestrator's memory, when its runtime has not got this version of it
+        // (`hub::memory`): recorded by its version and size, never its text.
+        let memory = self.memory_for_turn(hub, thread);
+        if let Some(m) = memory.as_ref().and_then(|m| m.ext.clone()) {
+            twr.insert("memory".into(), m);
+        }
         let ext = if twr.is_empty() {
             None
         } else {
@@ -2258,11 +2269,18 @@ impl Core {
                 });
                 facts.extend((!updates.is_empty()).then_some(updates));
             }
-            updates::with_hub_facts(&facts, delivered, from == TurnFrom::User)
+            let delivered = updates::with_hub_facts(&facts, delivered, from == TurnFrom::User);
+            match memory.as_ref().and_then(|m| m.text.as_deref()) {
+                Some(block) => format!("{block}{delivered}"),
+                None => delivered,
+            }
         } else {
             delivered
         };
         self.deliver(hub, thread, delivered, turn)?;
+        if let Some(m) = memory {
+            self.memory_delivered(thread, m.rev);
+        }
         Ok(turn)
     }
 

@@ -200,6 +200,8 @@ impl Core {
             defer_ack_sync: _,
             usage,
             replayed: _,
+            // Memory only: what the orchestrator's runtime got of its memory (`hub::memory`).
+            memory_seen: _,
         } = self;
         let snap = FoldSnapshot {
             registry,

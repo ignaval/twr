@@ -262,7 +262,9 @@ pub fn transcript_line(ev: &Value) -> Option<String> {
             }
             format!("text: {}", clip.field(&d, "text", FIELD_CAP))
         }
-        "conversation.update" | "project.read" | "context.compacted" => control_line(ev, &mut clip),
+        "conversation.update" | "project.read" | "memory.changed" | "context.compacted" => {
+            control_line(ev, &mut clip)
+        }
         "agent.tool_call" => {
             let risky = if d.get("risky").and_then(Value::as_bool).unwrap_or(false) {
                 " [risky]"
@@ -318,6 +320,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
     match kind {
         "project.read" => {
             let p: twr_core::event::ProjectRead =
+                serde_json::from_value(d.clone()).unwrap_or_default();
+            format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
+        }
+        "memory.changed" => {
+            let p: twr_core::event::MemoryChanged =
                 serde_json::from_value(d.clone()).unwrap_or_default();
             format!("hub: {}", clip.text(&p.line(), FIELD_CAP))
         }
@@ -1223,6 +1230,20 @@ mod tests {
             control_body(&event),
             "hub: refused to list api's top: project reads are off"
         );
+    }
+
+    #[test]
+    fn memory_changes_are_transcript_lines() {
+        let event = json!({"seq": 6, "thread": "orch", "kind": "memory.changed",
+            "data": {"op": "saved", "name": "short-replies", "rev": "0123456789ab",
+                "by": "orchestrator", "origin": "notice"}});
+        assert_eq!(
+            transcript_line(&event).as_deref(),
+            Some("hub: saved memory short-replies (in a notice turn)")
+        );
+        let event = json!({"seq": 7, "kind": "memory.changed",
+            "data": {"op": "forgotten", "name": "short-replies", "by": "user"}});
+        assert_eq!(control_body(&event), "hub: forgot memory short-replies (by you)");
     }
 
     /// Every shortened field (a cap cut or a `_capped` preview) ends its line with the hint.

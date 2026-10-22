@@ -1544,6 +1544,53 @@ impl ProjectRead {
     }
 }
 
+/// `memory.changed`: a note of the orchestrator's memory saved or forgotten (`hub::memory`),
+/// appended by the hub on the orchestrator's thread so the user sees every change. It names
+/// the note, never its text: a forgotten note's text is gone from the hub.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryChanged {
+    /// `saved` (new), `updated` or `forgotten`.
+    pub op: String,
+    /// The note's name.
+    pub name: String,
+    /// The note's version after the change (`None` once forgotten).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// Who changed it: `orchestrator` or `user`.
+    pub by: String,
+    /// For the orchestrator, the kind of turn it was in: `user` (a turn the user's message
+    /// started), `notice`, `handoff`, `runtime` (one its runtime started), `none` (between
+    /// turns).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// Extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+impl MemoryChanged {
+    /// One line saying what changed, as the TUI and transcripts show it: `saved memory
+    /// user-prefers-short-replies`, `forgot memory x (by you)`.
+    pub fn line(&self) -> String {
+        let verb = match self.op.as_str() {
+            "updated" => "updated memory",
+            "forgotten" => "forgot memory",
+            _ => "saved memory",
+        };
+        let mut s = format!("{verb} {}", self.name);
+        if self.by == "user" {
+            s.push_str(" (by you)");
+        } else if let Some(o) = self.origin.as_deref().filter(|o| *o != "user") {
+            s.push_str(&format!(" (in a {} turn)", o));
+        }
+        s
+    }
+}
+
 /// `context.updated`
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -1927,6 +1974,8 @@ event_body! {
     AccountUsage(AccountUsage) => "account.usage",
     /// `project.read`
     ProjectRead(ProjectRead) => "project.read",
+    /// `memory.changed`
+    MemoryChanged(MemoryChanged) => "memory.changed",
     /// `worktree.disk`
     WorktreeDisk(WorktreeDiskMeasured) => "worktree.disk",
     /// `worktree.trimmed`
@@ -1956,6 +2005,7 @@ impl EventBody {
 /// `context.updated`, `context.compacting` and `context.compacted` (a runtime compacting its
 /// context: a few per session at most, and cards show it), `conversation.update`, `account.*`
 /// (the hub's `account.usage`), `project.read` (an orchestrator read, shown to the user),
+/// `memory.changed` (a note of the orchestrator's memory saved or forgotten, shown too),
 /// `worktree.*` and `trash.*` (the hub's `trash.purged`). `agent.*` never goes on the control
 /// stream.
 pub fn is_control_kind(kind: &str) -> bool {
@@ -1977,6 +2027,7 @@ pub fn is_control_kind(kind: &str) -> bool {
         || kind == "conversation.update"
         || kind.starts_with("account.")
         || kind == "project.read"
+        || kind == "memory.changed"
         || kind.starts_with("worktree.")
         || kind.starts_with("trash.")
 }
@@ -2273,6 +2324,14 @@ mod tests {
                 path: Some("README.md".into()),
                 commit: Some("a1b2c3d".into()),
                 bytes: 42,
+                ..Default::default()
+            }),
+            EventBody::MemoryChanged(MemoryChanged {
+                op: "saved".into(),
+                name: "short-replies".into(),
+                rev: Some("0123456789ab".into()),
+                by: "orchestrator".into(),
+                origin: Some("user".into()),
                 ..Default::default()
             }),
             EventBody::WorktreeDisk(WorktreeDiskMeasured {
@@ -2684,6 +2743,7 @@ mod tests {
         let yes = [
             "thread.created",
             "project.read",
+            "memory.changed",
             "thread.crashed",
             "thread.attached",
             "thread.renamed",

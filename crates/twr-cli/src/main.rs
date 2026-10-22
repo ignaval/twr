@@ -406,6 +406,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ContextCmd,
     },
+    /// Show, edit or forget the orchestrator's memory: the notes it keeps across sessions,
+    /// restarts and runtimes, one memory per workspace.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Print the hub control stream as NDJSON.
     Control {
         /// Keep streaming new items.
@@ -1006,6 +1012,38 @@ enum ContextCmd {
         /// A configured project name, or the project of a thread.
         project: String,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum MemoryCmd {
+    /// List the notes: name, type, when saved, description; `!` marks a note the orchestrator
+    /// saved in a turn you did not start (it may come from a worker's text).
+    List {
+        /// As JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a note.
+    Show {
+        /// The note's name.
+        name: String,
+    },
+    /// Edit a note (or write a new one) in `$VISUAL` / `$EDITOR` (else `vi`): its
+    /// `description:` and `type:` lines, then its text. Saved when the editor exits
+    /// successfully and the text changed; a note changed meanwhile is a conflict, never
+    /// overwritten.
+    Edit {
+        /// The note's name (lowercase words joined by -).
+        name: String,
+    },
+    /// Forget notes: their files are removed.
+    Rm {
+        /// The notes' names.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Print the memory's directory (one Markdown file per note).
+    Path,
 }
 
 // Parsed once per run: the size of `New` next to the small `List` costs nothing.
@@ -2045,6 +2083,188 @@ async fn run_simple(
         Cmd::Context {
             cmd: ContextCmd::Edit { project },
         } => context_edit(&socket, &project).await,
+        Cmd::Memory { cmd } => memory(&socket, cmd).await,
+    }
+}
+
+// --- memory ------------------------------------------------------------------------------------
+
+/// `twr memory`.
+async fn memory(socket: &Path, cmd: MemoryCmd) -> anyhow::Result<()> {
+    match cmd {
+        MemoryCmd::List { json } => {
+            let r = connect(socket).await?.call("memory.list", json!({})).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            let notes = r["notes"].as_array().cloned().unwrap_or_default();
+            if r["enabled"] == false {
+                errln!("memory is off ([orchestrator] memory = false): the orchestrator neither gets nor changes these notes");
+            }
+            if notes.is_empty() {
+                errln!("no notes ({})", str_of(&r["dir"]));
+            }
+            for n in &notes {
+                let mark = if n["unconfirmed"] == true { "!" } else { " " };
+                outln!(
+                    "{mark} {:<28} {:<9} {:<10} {}",
+                    str_of(&n["name"]),
+                    str_of(&n["type"]),
+                    str_of(&n["updated"]).get(..10).unwrap_or(""),
+                    str_of(&n["description"])
+                );
+            }
+            for u in r["unreadable"].as_array().into_iter().flatten() {
+                errln!("{}.md cannot be read: {}", str_of(&u["name"]), str_of(&u["why"]));
+            }
+            if notes.iter().any(|n| n["unconfirmed"] == true) {
+                errln!("! saved by the orchestrator in a turn you did not start");
+            }
+            Ok(())
+        }
+        MemoryCmd::Show { name } => {
+            let n = connect(socket)
+                .await?
+                .call("memory.read", json!({ "name": name }))
+                .await?;
+            out!("{}", note_text(&n));
+            outln!(
+                "\n(rev {}, saved {} by {}{})",
+                str_of(&n["rev"]),
+                str_of(&n["updated"]),
+                match str_of(&n["by"]) {
+                    "" => "hand",
+                    b => b,
+                },
+                match str_of(&n["origin"]) {
+                    "" | "user" => String::new(),
+                    o => format!(" in a {o} turn"),
+                }
+            );
+            Ok(())
+        }
+        MemoryCmd::Edit { name } => memory_edit(socket, &name).await,
+        MemoryCmd::Rm { names } => {
+            let mut c = connect(socket).await?;
+            for name in names {
+                c.call("memory.forget", json!({ "name": name })).await?;
+                outln!("forgot {name}");
+            }
+            Ok(())
+        }
+        MemoryCmd::Path => {
+            let r = connect(socket).await?.call("memory.list", json!({})).await?;
+            outln!("{}", str_of(&r["dir"]));
+            Ok(())
+        }
+    }
+}
+
+/// A note as `twr memory show` prints it and `twr memory edit` edits it.
+fn note_text(n: &Value) -> String {
+    format!(
+        "description: {}\ntype: {}\n---\n{}\n",
+        str_of(&n["description"]),
+        str_of(&n["type"]),
+        str_of(&n["body"]).trim_end()
+    )
+}
+
+/// The description, type and text of a note as [`note_text`] lays it out.
+fn parse_note_text(text: &str) -> anyhow::Result<(String, String, String)> {
+    let Some((head, body)) = text.split_once("\n---\n") else {
+        bail!("keep the `---` line between the note's description and type and its text");
+    };
+    let (mut description, mut kind) = (String::new(), String::new());
+    for line in head.lines() {
+        match line.split_once(':') {
+            Some(("description", v)) => description = v.trim().to_string(),
+            Some(("type", v)) => kind = v.trim().to_string(),
+            _ if line.trim().is_empty() => {}
+            _ => bail!("only `description:` and `type:` lines go above the `---` line"),
+        }
+    }
+    Ok((description, kind, body.trim().to_string()))
+}
+
+/// `twr memory edit`: edits a temporary copy of the note (a new one from a template) with
+/// `$VISUAL` / `$EDITOR` and saves it with `memory.save` and the rev that was read, so a note
+/// changed meanwhile is a conflict. On any failure after the editor wrote something, the
+/// temporary file is kept and its path printed.
+async fn memory_edit(socket: &Path, name: &str) -> anyhow::Result<()> {
+    let read = connect(socket)
+        .await?
+        .call("memory.read", json!({ "name": name }))
+        .await;
+    let (before, rev) = match read {
+        Ok(n) => (note_text(&n), n["rev"].as_str().map(str::to_string)),
+        Err(e)
+            if e.downcast_ref::<RpcError>()
+                .is_some_and(|r| r.code == codes::NOT_FOUND) =>
+        {
+            (
+                "description: \ntype: user\n---\n".to_string(),
+                None,
+            )
+        }
+        Err(e) => return Err(e),
+    };
+    let tmp = TempFile::create("twr-memory", ".md", before.as_bytes())?;
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("twr-memory-edit")
+        .arg(tmp.path())
+        .status();
+    let after = std::fs::read(tmp.path());
+    let edited = after.as_ref().map_or(true, |a| a != before.as_bytes());
+    let keep = |tmp: TempFile, why: String| -> anyhow::Error {
+        if edited {
+            anyhow!("{why}; the note is unchanged (your edit is kept in {})", tmp.keep().display())
+        } else {
+            anyhow!("{why}; the note is unchanged")
+        }
+    };
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(keep(tmp, format!("the editor `{editor}` exited with {s}"))),
+        Err(e) => return Err(keep(tmp, format!("running the editor `{editor}` failed ({e})"))),
+    }
+    let after = match after.map(String::from_utf8) {
+        Ok(Ok(a)) => a,
+        Ok(Err(_)) => return Err(keep(tmp, "the edited note is not UTF-8".into())),
+        Err(e) => return Err(keep(tmp, format!("reading the edited note failed ({e})"))),
+    };
+    if after == before {
+        outln!("{name}: no changes");
+        return Ok(());
+    }
+    let (description, kind, body) = match parse_note_text(&after) {
+        Ok(p) => p,
+        Err(e) => return Err(keep(tmp, e.to_string())),
+    };
+    let saved = async {
+        connect(socket)
+            .await?
+            .call(
+                "memory.save",
+                json!({ "name": name, "type": kind, "description": description,
+                        "body": body, "rev": rev }),
+            )
+            .await
+    }
+    .await;
+    match saved {
+        Ok(r) => {
+            outln!("{name}: {} (rev {})", str_of(&r["op"]), str_of(&r["rev"]));
+            Ok(())
+        }
+        Err(e) => Err(keep(tmp, format!("saving the note failed: {e:#}"))),
     }
 }
 
@@ -6839,6 +7059,18 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
             if items == 1 { "" } else { "s" }
         );
     }
+    // The orchestrator's memory goes with the data: said, since it is the user's notes.
+    let notes = std::fs::read_dir(ws.data_dir.join(twr_hub::MEMORY_DIR))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.ends_with(".md") && !n.starts_with('.')
+                })
+                .count()
+        })
+        .unwrap_or(0);
     // Moved aside first (a name no workspace can have), so a half-removed directory is never
     // taken for the workspace.
     let doomed = ws
@@ -6849,7 +7081,13 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
     std::fs::remove_dir_all(&doomed).with_context(|| format!("removing {}", doomed.display()))?;
     // A socket file a hub that died left is left too: the next hub there replaces it, and
     // removing it here could remove a new hub's.
-    outln!("removed workspace {name}");
+    match notes {
+        0 => outln!("removed workspace {name}"),
+        n => outln!(
+            "removed workspace {name}, with its orchestrator's {n} memory note{}",
+            if n == 1 { "" } else { "s" }
+        ),
+    }
     Ok(())
 }
 

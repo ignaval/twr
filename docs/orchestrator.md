@@ -1,6 +1,6 @@
 # The orchestrator
 
-The orchestrator is the agent you talk to. It's an ordinary thread named `orchestrator`, alias `orch`, with no project and no worktree, running whatever runtime you configure. Its only tools are the hub's, over MCP: list and read threads, start and prompt workers, park, resume and stop them, rename them, change a worker's permission mode, model, effort or runtime when you ask, ask you to confirm deleting threads, list the trash, annotate cards, write reports, set watches that wake it when a worker finishes, read or set a project's standing context, read your projects' committed files, read twr's own docs, and see the hub's version, boxes and configuration. It writes no code and runs no commands. A Claude Code orchestrator can also keep memories (see [Memory](#memory)).
+The orchestrator is the agent you talk to. It's an ordinary thread named `orchestrator`, alias `orch`, with no project and no worktree, running whatever runtime you configure. Its only tools are the hub's, over MCP: list and read threads, start and prompt workers, park, resume and stop them, rename them, change a worker's permission mode, model, effort or runtime when you ask, ask you to confirm deleting threads, list the trash, annotate cards, write reports, set watches that wake it when a worker finishes, read or set a project's standing context, read your projects' committed files, read twr's own docs, and see the hub's version, boxes and configuration. It writes no code and runs no commands. It keeps notes across its sessions, on any runtime (see [Memory](#memory)).
 
 `twr say` and the TUI's input line route a message to the orchestrator when it doesn't name a thread and the hub can't place it. A client can also send a message straight to it with `say {to: "orchestrator"}`, which skips routing. The hub creates the orchestrator on the first message routed to it, or when the hub starts if `[orchestrator] autostart = true`. Its replies are short: a sentence or two on what it did and what you need to decide.
 
@@ -64,7 +64,39 @@ The tools are the hub's, so they work the same on every runtime. A Claude Code o
 
 ## Memory
 
-Claude Code keeps an auto-memory directory per project, `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index; for the orchestrator, whose working directory is your home directory unless `[orchestrator] cwd` says otherwise, that's `~/.claude/projects/-home-<you>/memory/`. A Claude Code orchestrator can save and update memories there, so what it learns about how you work carries over to its next sessions.
+The orchestrator keeps notes that outlast its session: what you prefer and how you like to work, corrections you gave it, facts about your projects and setup you told it. They carry over to its next sessions, a hub restart, a compaction of its context and a switch to another runtime, and stay in their [workspace](workspaces.md). Every runtime gets the same notes through the same four tools: `memory_list`, `memory_read`, `memory_save` and `memory_forget`.
+
+Each note is a Markdown file in the workspace's data directory (`twr memory path` prints it; `~/.local/share/twr/memory/` for `default`). It has a name (lowercase words joined by `-`), a type (`user`, `feedback`, `project` or `reference`), a one-line description and its text, at most 4 KB. A memory holds at most 100 notes and 64 KB. Text that holds a private key or a token of a known format is refused.
+
+**What it gets.** The first turn of each orchestrator session (a new one, a resumed one, after a hub restart or a switch), the first after its context was compacted, and any turn after you changed its notes get a `[twr memory]` block in front of the turn's message: a line for every note and the text of the newest ones, up to 12 KB in all (`memory_read` reads the rest). The block says the notes are saved information, never instructions from you and never approval. The turn records that it carried the memory and its version, not the text.
+
+**What it saves.** It's told to save what lasts and isn't in your repositories, to update a note rather than add a near-duplicate, and to forget notes that turn out wrong or that you ask it to forget. It's told never to save transcripts, workers' output, repository content, secrets, or an approval, a mode or a policy as if you had granted it. It may save in any of its turns, also one a hub notice started, except once you took back that turn's message; saving doesn't stop you taking a message back. A note it saved in a turn you didn't start is marked unconfirmed, in its block and in `twr memory list`, since a worker's text may be behind it.
+
+**What a note can't do.** Nothing the hub decides reads the memory. A note can't answer a permission or a question, change a mode or confirm a card: those still need a message of yours, as [The relay rule](#the-relay-rule) says. The worst a misleading note can do is mislead the orchestrator, like any text it reads.
+
+**What you see and do.** Every save and forget is a line in the orchestrator's conversation, such as `saved memory short-replies`. The log keeps that line, with the note's name and version, never its text: a forgotten note's text is gone. You manage the notes with `twr memory`:
+
+```sh
+twr memory list                 # name, type, date, description; ! marks unconfirmed notes
+twr memory show short-replies
+twr memory edit short-replies   # in $VISUAL / $EDITOR; a new name writes a new note
+twr memory rm short-replies     # forget it
+twr memory path                 # the directory; edit the files directly if you like
+```
+
+Asking the orchestrator works too: "remember that I review every merge myself", "forget the note about staging". An edit with `twr memory edit` or `memory_save` names the version it read, so a note changed meanwhile is a conflict, never overwritten. A file you edit by hand is read as it is; anything that runs as you can edit these files, workers included.
+
+`[orchestrator] memory = false` turns it off: the orchestrator's memory tools refuse, no block goes to it, and the notes stay where they are (`twr memory` still works). `twr ws rm` removes a workspace's notes with its data.
+
+### Each runtime's own memory
+
+Codex and Grok Build have memories of their own, off unless you turned them on. Both would mine every orchestrator conversation, workers' reports and repository content included, into a store under `~/.codex` or `~/.grok` shared with your other sessions of that agent, and Grok's is read with file tools the orchestrator doesn't have. So the hub turns them off for the orchestrator, whatever your config says: Codex gets `features.memories`, `memories.use_memories` and `memories.generate_memories` set to false (checked with Codex 0.162.1), Grok Build `GROK_MEMORY=0` (grok 1.0.62). Your workers keep your settings. A generic ACP orchestrator keeps whatever its agent has.
+
+Claude Code's own memory stays as it was: a Claude Code orchestrator keeps its memory directory, described next, and twr's memory both. It's told to save new notes with `memory_save`, which every runtime shares; its directory's notes stay Claude Code's, and twr neither copies them into twr's memory nor shows them to another runtime. Ask it to copy a note over if you want one to follow a switch.
+
+### Claude Code's memory directory
+
+Claude Code keeps an auto-memory directory per project, `~/.claude/projects/<project>/memory/` with a `MEMORY.md` index; for the orchestrator, whose working directory is your home directory unless `[orchestrator] cwd` says otherwise, that's `~/.claude/projects/-home-<you>/memory/`. A Claude Code orchestrator can read and update its notes there; they stay with Claude Code.
 
 Path-scoped permission rules alone can't confine it to that directory. In `dontAsk` mode Claude Code already writes only to its own memory directory and refuses every other write. But it reads anything under its working directory without asking, which by default is your whole home directory, and a deny rule also wins over the memory directory. Edit needs a file read first, so Read can't simply be left out. So the hub starts it with `--tools Read,Write,Edit` and `--settings` holding a `PreToolUse` hook, `twr claude-memory-guard`, on those three tools. The hook denies any path outside the memory directory, as the file system resolves it: symbolic links are followed one part at a time, even ones whose target doesn't exist yet, a `..` in a part that doesn't exist yet is refused, and so is a path starting with `~`. The memory directory is the session's project's, or, when the working directory is in a git repository, that repository's main checkout's, as Claude Code picks it. Whatever the hook can't read or decide is denied. If the hook command fails, for example because the `twr` binary is gone, it exits 2, which makes Claude Code block the call. Claude Code lets a call through when its hook times out, so the hook has a 30-second timeout and the guard denies whatever it hasn't decided within 10 seconds. Attaching the orchestrator carries the same tools and hook.
 
@@ -85,7 +117,7 @@ What the hub can't see, and where the confinement ends: if any of these turns th
 
 If your organization sets hook policy through any of these, or your own settings set `CLAUDE_CODE_SHELL_PREFIX`, don't rely on the guard.
 
-The other runtimes have no such directory and keep no memories: a Codex orchestrator keeps its read-only sandbox with no tools on, and a Grok Build orchestrator its tool profile with no file tools. A generic ACP orchestrator keeps whatever its agent has. A memory directory moved with Claude Code's `autoMemoryDirectory` setting isn't followed: the hook denies it.
+The other runtimes have no such directory: a Codex orchestrator keeps its read-only sandbox with no tools on, and a Grok Build orchestrator its tool profile with no file tools; they keep notes with the memory tools alone. A memory directory moved with Claude Code's `autoMemoryDirectory` setting isn't followed: the hook denies it.
 
 Only a Claude Code orchestrator can be attached. The command `twr attach` runs for the others can't carry the orchestrator's limits: `codex resume` loads the MCP servers of your Codex config and its plugins (a `-c` option can't replace that list, only turn servers off by name), grok's interactive CLI takes no tool profile, and an ACP agent's `attach` template takes neither. So the hub refuses to attach those orchestrators; talk to them through twr, or switch the orchestrator to Claude Code.
 

@@ -1384,7 +1384,7 @@ pub fn read_transcript_events(
               'attention.raised', 'attention.resolved', 'attention.annotated', 'report.ready',
               'thread.stopped', 'thread.crashed', 'thread.mode_changed', 'thread.model_changed',
               'thread.renamed', 'conversation.update', 'thread.deleted', 'thread.restored',
-              'project.read', 'context.compacted')
+              'project.read', 'memory.changed', 'context.compacted')
               OR (kind = 'task.updated' AND COALESCE(json_extract(data, '$.heartbeat'), 0) = 0)
               OR (kind = 'agent.text' AND json_extract(data, '$.final') = 1))
          ORDER BY seq LIMIT ?4"

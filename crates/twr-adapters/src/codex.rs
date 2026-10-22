@@ -50,6 +50,7 @@
 //! | `env`                  | process environment                                                  |
 //! | `repo`                 | where the `auto` sandbox's git roots come from, see "The `auto` sandbox" below |
 //! | `codex_auto`           | who answers what the `auto` sandbox does not allow ([`run_policy`]) |
+//! | `native_memory_off`    | [`MEMORY_OFF`] config overrides: Codex's memories feature off |
 //! | `resume_session`       | `thread/resume{threadId}` with every setting passed again (Codex does not keep the permission settings across processes; a model or effort left out keeps the thread's, see [`crate::resume_keeps`]) |
 //!
 //! ## Permission modes
@@ -1018,6 +1019,11 @@ pub fn thread_config(cfg: &SpawnConfig) -> anyhow::Result<Option<Map<String, Val
     if let Some(e) = cfg.effort.as_deref().filter(|e| !e.is_empty()) {
         config.insert("model_reasoning_effort".into(), json!(e));
     }
+    if cfg.native_memory_off {
+        for key in MEMORY_OFF {
+            config.insert((*key).into(), json!(false));
+        }
+    }
     let mcp = mcp_source(cfg)?;
     let servers = match &mcp {
         Some(v) => Some(mcp_servers(v, &cfg.allowed_tools)?),
@@ -1043,6 +1049,19 @@ pub fn thread_config(cfg: &SpawnConfig) -> anyhow::Result<Option<Map<String, Val
     }
     Ok((!config.is_empty()).then_some(config))
 }
+
+/// The config overrides (each `false`) that turn Codex's own memory off for a thread with
+/// [`SpawnConfig::native_memory_off`] (the orchestrator, which keeps twr's memory): the
+/// `memories` feature, and its `use_memories` (memories read into the thread) and
+/// `generate_memories` (the thread mined for memories). Codex 0.162.1 checks all three as
+/// booleans on `thread/start` (an unknown key is ignored, a wrong type fails the thread).
+/// With them on, Codex extracts memories from finished sessions in the background and merges
+/// them into one store under `~/.codex`, shared by every Codex session of the user.
+pub const MEMORY_OFF: &[&str] = &[
+    "features.memories",
+    "memories.use_memories",
+    "memories.generate_memories",
+];
 
 /// The features turned off for a thread with an MCP allowlist (`mcp_config` /
 /// `mcp_config_file`, such as the orchestrator's): plugins and apps (connectors) start MCP
@@ -2591,6 +2610,30 @@ mod tests {
         let note = run_note(&cfg("auto", CodexAuto::Never)).unwrap();
         assert!(note.contains("approvalPolicy never"), "{note}");
         assert_eq!(run_note(&cfg("manual", CodexAuto::Never)), None);
+    }
+
+    /// The orchestrator's Codex runs with Codex's memories off (checked with Codex 0.162.1:
+    /// each key is a boolean it checks); other threads send none of the keys.
+    #[test]
+    fn native_memory_off_turns_codex_memories_off() {
+        let orch = SpawnConfig {
+            mode: "manual".into(),
+            native_memory_off: true,
+            ..Default::default()
+        };
+        let p = thread_params(&orch).unwrap().params;
+        for key in MEMORY_OFF {
+            assert_eq!(p["config"][*key], json!(false), "{key}");
+        }
+        let worker = SpawnConfig {
+            mode: "manual".into(),
+            ..Default::default()
+        };
+        let p = thread_params(&worker).unwrap().params;
+        let config = p.get("config").cloned().unwrap_or_default();
+        for key in MEMORY_OFF {
+            assert!(config.get(*key).is_none(), "{key}");
+        }
     }
 
     /// What `thread/start` carries for each setting: the policy and reviewer, and the sandbox
