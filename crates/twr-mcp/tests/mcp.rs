@@ -440,6 +440,10 @@ const TOOLS: &[&str] = &[
     "list_project_files",
     "read_project_file",
     "search_project",
+    "memory_list",
+    "memory_read",
+    "memory_save",
+    "memory_forget",
 ];
 
 #[tokio::test]

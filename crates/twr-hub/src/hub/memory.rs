@@ -1308,7 +1308,6 @@ impl Hub {
         // news to the orchestrator.
         let mut expected = before.entries.clone();
         expected.insert(note.name.clone(), note.rev.clone());
-        drop(_lock);
         let op = if current.is_some() {
             "updated"
         } else {
@@ -1395,7 +1394,6 @@ impl Hub {
         let after = list_held(&held, &dir).map_err(io_err)?;
         let mut expected = before.entries.clone();
         expected.remove(&p.name);
-        drop(_lock);
         self.memory_record(
             caller,
             thread,
@@ -1469,7 +1467,9 @@ impl Hub {
     }
 
     /// Shows a change on the orchestrator's thread (if there is one) and updates what its
-    /// runtime knows. Failures are logged: the note is changed already.
+    /// runtime knows. Failures are logged: the note is changed already. Called under [`LOCK`],
+    /// so the changes are recorded in the order they were made (the core lock is taken
+    /// inside it; nothing holding the core lock waits for [`LOCK`]).
     #[allow(clippy::too_many_arguments)]
     fn memory_record(
         &self,
