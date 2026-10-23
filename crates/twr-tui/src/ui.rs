@@ -3966,7 +3966,7 @@ fn card_color(t: &ThreadView) -> Color {
     if t.is_orchestrator() {
         target_color(None)
     } else {
-        thread_color(&t.id)
+        thread_color(t)
     }
 }
 
@@ -4247,7 +4247,7 @@ fn thread_box(
     threads: &Threads,
 ) -> Vec<TranscriptRow> {
     let thread = threads.get(name);
-    let frame = Style::default().fg(thread.map_or(Color::DarkGray, |t| thread_color(&t.id)));
+    let frame = Style::default().fg(thread.map_or(Color::DarkGray, thread_color));
     let label = thread.map_or(name, |t| t.name.as_str());
     let mut out = Vec::new();
     if width < BOX_MIN_WIDTH {
@@ -5298,7 +5298,7 @@ fn about_spans(about: Option<&str>, threads: &Threads) -> Vec<Span<'static>> {
     };
     let thread = threads.get(name);
     let label = thread.map_or(name, |t| t.name.as_str()).to_string();
-    let color = thread.map_or(Color::DarkGray, |t| thread_color(&t.id));
+    let color = thread.map_or(Color::DarkGray, thread_color);
     vec![
         Span::styled(label, Style::default().fg(color)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
@@ -5450,10 +5450,8 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
     }
     let dim = Style::default().fg(Color::DarkGray);
     let color = |name: &str| {
-        let id = about
-            .as_deref()
-            .or_else(|| threads.get(name).map(|t| t.id.as_str()));
-        Style::default().fg(id.map_or(Color::Reset, thread_color))
+        let thread = threads.get(about.as_deref().unwrap_or(name));
+        Style::default().fg(thread.map_or(Color::Reset, thread_color))
     };
     match (UpdateShape::of(text), outcome) {
         (
@@ -5571,7 +5569,7 @@ fn named_spans(
     match about {
         Some(id) => {
             if let Some(t) = threads.get(id).filter(|t| t.id == id) {
-                let color = thread_color(&t.id);
+                let color = thread_color(t);
                 for (at, w) in name_words(text) {
                     if w == t.name || t.aliases.iter().chain(&t.former_names).any(|n| n == w) {
                         named.push((at..at + w.len(), color));
@@ -5583,14 +5581,14 @@ fn named_spans(
             let word = text.split([' ', '\n']).next().unwrap_or_default();
             let name = word.strip_suffix("'s").unwrap_or(word);
             if let Some(t) = threads.get(name).filter(|_| !name.is_empty()) {
-                named.push((0..name.len(), thread_color(&t.id)));
+                named.push((0..name.len(), thread_color(t)));
             }
         }
     }
     for at in hub_lists(text) {
         let w = &text[at.clone()];
         if let Some(t) = threads.get(w).filter(|_| !w.is_empty()) {
-            named.push((at, thread_color(&t.id)));
+            named.push((at, thread_color(t)));
         }
     }
     named.sort_by_key(|(r, _)| r.start);
@@ -5842,7 +5840,7 @@ pub fn target_color(dive: Option<&ThreadView>) -> Color {
     match dive {
         None => Color::Cyan,
         Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Magenta,
-        Some(t) => thread_color(&t.id),
+        Some(t) => thread_color(t),
     }
 }
 
@@ -5857,7 +5855,7 @@ pub fn target_fill(dive: Option<&ThreadView>) -> Style {
     let bg = match dive {
         None => Color::Indexed(80),
         Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Indexed(176),
-        Some(t) => thread_color(&t.id),
+        Some(t) => thread_color(t),
     };
     Style::default().fg(crate::color::text_on(bg)).bg(bg)
 }
@@ -6555,10 +6553,8 @@ fn request_detail_rows(state: &AppState, item: &AttentionItem, width: usize) -> 
 }
 
 fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<TranscriptRow> {
-    let name = state
-        .registry
-        .get(&item.thread)
-        .map_or(item.thread.as_str(), |t| t.name.as_str());
+    let thread = state.registry.get(&item.thread);
+    let name = thread.map_or(item.thread.as_str(), |t| t.name.as_str());
     let reason = if item.reason == AttentionReason::Permission {
         "permission"
     } else {
@@ -6575,7 +6571,7 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
     let color = if selected {
         Color::Yellow
     } else {
-        thread_color(&item.thread)
+        thread.map_or(Color::DarkGray, thread_color)
     };
     let frame = Style::default().fg(color);
     let mut rows = thread_box(
@@ -12004,7 +12000,7 @@ mod tests {
         };
         assert_eq!(name(HUB_THREAD).content, "twr");
         assert_eq!(name(HUB_THREAD).style.fg, Some(Color::Yellow));
-        assert_eq!(name("t-w").style.fg, Some(thread_color("t-w")));
+        assert_eq!(name("t-w").style.fg, Some(color_of(&st, "t-w")));
     }
 
     /// [`five_saying_things`], its texts in paragraphs: eps's report and a question of
@@ -15296,13 +15292,13 @@ mod tests {
         let x = col(&lines[row], "╔ beta ")
             .or_else(|| col(&lines[row], "╔ proj · beta "))
             .unwrap() as u16;
-        assert_eq!(buf[(x, row as u16)].fg, thread_color("t-beta"), "{s}");
+        assert_eq!(buf[(x, row as u16)].fg, color_of(&st, "t-beta"), "{s}");
         assert_eq!(
             buf[(0, 0)].bg,
             target_fill(st.dived()).bg.unwrap(),
             "the band: {s}"
         );
-        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"), "the band: {s}");
+        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
         assert_eq!(s.matches('╔').count(), 1, "only the dive's card: {s}");
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
@@ -15504,14 +15500,10 @@ mod tests {
         check(&mut st, target_fill(None), Color::Cyan, " ORCHESTRATOR  ");
         st.dive("t-beta");
         let fill = target_fill(st.dived());
-        check(
-            &mut st,
-            fill,
-            thread_color("t-beta"),
-            " ‹ back  talking to beta  ",
-        );
+        let beta = color_of(&st, "t-beta");
+        check(&mut st, fill, beta, " ‹ back  talking to beta  ");
         assert_ne!(target_fill(None), fill);
-        assert_eq!(fill.bg, Some(thread_color("t-beta")));
+        assert_eq!(fill.bg, Some(color_of(&st, "t-beta")));
         // A working thread's icon leads the band, on the terminal's own background.
         st.dive("t-gamma");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
@@ -15528,7 +15520,7 @@ mod tests {
         st.view.input.set("draft");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
         let input = st.view.panes.get(&PaneId::Input).unwrap().area;
-        assert_eq!(buf[(input.x - 1, input.y)].fg, thread_color("t-gamma"));
+        assert_eq!(buf[(input.x - 1, input.y)].fg, color_of(&st, "t-gamma"));
         assert_eq!(
             buf[(input.x + 1, input.y - 1)].bg,
             target_fill(st.dived()).bg.unwrap()
@@ -15727,7 +15719,7 @@ mod tests {
             "{rows:#?}"
         );
         let (y3, y6) = (a.y + 3, a.y + 6);
-        let color = thread_color("t-alpha");
+        let color = color_of(&st, "t-alpha");
         assert!(THREAD_COLORS.contains(&color));
         assert_eq!(buf[(a.x, y3)].fg, color);
         assert_eq!(buf[(a.x + 3, y3)].fg, color, "the name");
@@ -15759,18 +15751,59 @@ mod tests {
         let rows = transcript_rows(&st, &lines);
         assert!(rows[3].starts_with("╭─ alpha-v2 · running ─"), "{rows:#?}");
         let a = st.view.panes.get(&PaneId::Transcript).unwrap().area;
-        assert_eq!(buf[(a.x, a.y + 3)].fg, thread_color("t-alpha"));
+        assert_eq!(buf[(a.x, a.y + 3)].fg, color_of(&st, "t-alpha"));
     }
 
-    /// Every thread has a color of its own palette, the same every time; the palette has
-    /// none of the orchestrator's cyan, a dive's magenta or the working cursor's orange.
+    /// Thread `id`'s color in `st` ([`thread_color`] of its view, a deleted one's too).
+    fn color_of(st: &AppState, id: &str) -> Color {
+        thread_color(st.thread_named(id).unwrap_or_else(|| panic!("{id}")))
+    }
+
+    /// Threads take the palette's colors in the order they were made, each its own; a deleted
+    /// thread's color goes to the next new thread, and no other card changes color. The
+    /// palette has none of the orchestrator's cyan, a dive's magenta or the working cursor's
+    /// orange.
     #[test]
-    fn thread_colors_are_stable_and_apart_from_the_other_accents() {
-        assert_eq!(thread_color("t-alpha"), thread_color("t-alpha"));
-        let used: HashSet<String> = (0..64)
-            .map(|i| format!("{:?}", thread_color(&format!("t-{i}"))))
-            .collect();
-        assert!(used.len() > 3, "{used:?}");
+    fn threads_have_colors_of_their_own_that_stay() {
+        let mut st = three_threads();
+        let ids = ["t-alpha", "t-beta", "t-gamma"];
+        assert_eq!(
+            ids.map(|id| color_of(&st, id)),
+            [0, 1, 2].map(|i| THREAD_COLORS[i])
+        );
+        let corner = |st: &mut AppState, id: &str| {
+            let buf = crate::app::tests::draw(st, 160, 40);
+            card_corners(st, &buf)
+                .into_iter()
+                .find(|(i, ..)| i == id)
+                .map(|(_, corner, _)| corner.fg)
+        };
+        st.set_focus(None);
+        let before = ids.map(|id| corner(&mut st, id));
+        assert_eq!(before, [0, 1, 2].map(|i| Some(THREAD_COLORS[i])));
+        let mut b = ThreadScript::new("t-beta");
+        let mut d = ThreadScript::new("t-delta");
+        crate::app::tests::control(
+            &mut st,
+            &[
+                b.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: "beta".into(),
+                    ..Default::default()
+                })),
+                d.created("delta"),
+            ],
+        );
+        let delta = color_of(&st, "t-delta");
+        assert_eq!(
+            delta,
+            THREAD_COLORS[usize::from(twr_core::palette::allocate([0, 2]))]
+        );
+        assert!(delta != THREAD_COLORS[0] && delta != THREAD_COLORS[2]);
+        assert_eq!(corner(&mut st, "t-alpha"), before[0]);
+        assert_eq!(corner(&mut st, "t-gamma"), before[2]);
+        assert_eq!(corner(&mut st, "t-delta"), Some(delta));
+        // The deleted thread keeps its color where it is still named.
+        assert_eq!(color_of(&st, "t-beta"), THREAD_COLORS[1]);
         for c in [
             Color::Indexed(80),
             Color::Indexed(176),
@@ -15816,7 +15849,7 @@ mod tests {
             let cards = card_corners(st, &buf);
             assert!(!cards.is_empty(), "{what}: {s}");
             for (id, corner, name) in cards {
-                let color = thread_color(&id);
+                let color = color_of(st, &id);
                 let (shape, fg) = match look(st, &id) {
                     Look::Selected => ("┏", Color::Yellow),
                     Look::Target => ("╔", color),
@@ -15850,7 +15883,7 @@ mod tests {
         // The three threads have colors apart: told apart by them.
         let colors: HashSet<String> = ["t-alpha", "t-beta", "t-gamma"]
             .iter()
-            .map(|id| format!("{:?}", thread_color(id)))
+            .map(|id| format!("{:?}", color_of(&st, id)))
             .collect();
         assert_eq!(colors.len(), 3);
     }
@@ -15869,7 +15902,7 @@ mod tests {
         let buf = crate::app::tests::draw(&mut st, 160, 40);
         let cards = card_corners(&st, &buf);
         let (_, corner, name) = cards.iter().find(|(id, ..)| id == "t-alpha").unwrap();
-        assert_eq!(corner.fg, thread_color("t-alpha"));
+        assert_eq!(corner.fg, color_of(&st, "t-alpha"));
         assert!(corner.modifier.contains(Modifier::DIM));
         assert!(name.modifier.contains(Modifier::DIM | Modifier::BOLD));
         let (_, corner, _) = cards.iter().find(|(id, ..)| id == "t-beta").unwrap();
@@ -15885,7 +15918,7 @@ mod tests {
         for (id, line) in rows {
             let name = &line.spans[0];
             assert_eq!(name.content, st.registry.get(&id).unwrap().name);
-            assert_eq!(name.style.fg, Some(thread_color(&id)), "{id}");
+            assert_eq!(name.style.fg, Some(color_of(&st, &id)), "{id}");
         }
     }
 
@@ -15913,7 +15946,7 @@ mod tests {
             .flat_map(|r| r.0.spans.iter())
             .find(|s| s.content == "alpha")
             .unwrap();
-        assert_eq!(span.style.fg, Some(thread_color("t-alpha")));
+        assert_eq!(span.style.fg, Some(color_of(&st, "t-alpha")));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -15956,9 +15989,9 @@ mod tests {
                 .collect()
         };
         let (a, b, g) = (
-            ("alpha".to_string(), thread_color("t-alpha")),
-            ("beta".to_string(), thread_color("t-beta")),
-            ("gamma".to_string(), thread_color("t-gamma")),
+            ("alpha".to_string(), color_of(&st, "t-alpha")),
+            ("beta".to_string(), color_of(&st, "t-beta")),
+            ("gamma".to_string(), color_of(&st, "t-gamma")),
         );
         for (text, about, want) in [
             (
@@ -16041,7 +16074,7 @@ mod tests {
         let mut st = three_threads();
         for id in ["t-alpha", "t-beta", "t-gamma"] {
             st.dive(id);
-            let color = thread_color(id);
+            let color = color_of(&st, id);
             let buf = crate::app::tests::draw(&mut st, 120, 40);
             assert_eq!(buf[(0, 0)].bg, color, "{id}");
             let back = (0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
@@ -16113,7 +16146,7 @@ mod tests {
         // Full color draws as it always did.
         st.view.colors = crate::color::Depth::Full;
         let buf = crate::app::tests::draw(&mut st, 160, 40);
-        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"));
+        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"));
         // The compact tab bar without colors: the current tab alone is reversed.
         let mut st = three_threads();
         st.view.compact_width = 60;
@@ -17392,8 +17425,8 @@ mod tests {
         );
         let y = |start: &str| all.iter().find(|(_, r)| r.starts_with(start)).unwrap().0;
         let alpha = y("  alpha");
-        assert_eq!(buf[(a.x + 2, alpha)].fg, thread_color("t-alpha"));
-        assert_eq!(buf[(a.x + 2, y("  beta"))].fg, thread_color("t-beta"));
+        assert_eq!(buf[(a.x + 2, alpha)].fg, color_of(&st, "t-alpha"));
+        assert_eq!(buf[(a.x + 2, y("  beta"))].fg, color_of(&st, "t-beta"));
         assert_eq!(buf[(a.x + 8, alpha)].fg, Color::DarkGray, "the rest is dim");
         assert_eq!(
             buf[(a.x + 2, y("  nobody"))].fg,

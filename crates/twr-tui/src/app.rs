@@ -24302,8 +24302,8 @@ pub(crate) mod tests {
                 Value::Null,
             );
             let (alpha, gamma) = (
-                crate::ui::thread_color("t-alpha"),
-                crate::ui::thread_color("t-gamma"),
+                crate::ui::thread_color(st.thread_named("t-alpha").unwrap()),
+                crate::ui::thread_color(st.thread_named("t-gamma").unwrap()),
             );
             let colored = |buf: &ratatui::buffer::Buffer, needle: &str, name: &str, color| {
                 let (x, y) = cell_of(buf, needle).unwrap_or_else(|| panic!("{needle}"));
@@ -24419,7 +24419,9 @@ pub(crate) mod tests {
                 let text = rows(st, 160, 40).join("\n");
                 assert!(!text.contains("t-gamma"), "{when}: {text}");
                 assert!(text.contains("╭─ gamma ──"), "{when}: {text}");
-                let gamma = Some(crate::color::thread_color("t-gamma"));
+                let gamma = Some(crate::color::thread_color(
+                    st.thread_named("t-gamma").unwrap(),
+                ));
                 for lead in ["╭─ gamma", "◦ gamma · ", "· gamma has a note"] {
                     assert_eq!(color_of(st, &buf, lead, "gamma"), gamma, "{when}: {lead}");
                 }
