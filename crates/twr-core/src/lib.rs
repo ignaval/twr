@@ -11,6 +11,7 @@
 //! - [`load`]: how loaded the machine is (pressure stall information, the load average)
 //! - [`paths`], [`config`]: filesystem layout and `config.toml`
 //! - [`notify`]: which control events deserve a user notification
+//! - [`palette`]: the threads' 30 colors and which one a new thread gets
 //! - [`compact`]: the compacted control backlog (`control.subscribe` with `compact`)
 //! - [`proto`], [`client`]: the hub socket protocol and an async client
 //! - [`runner`]: the hub <-> runner WebSocket protocol
@@ -32,6 +33,7 @@ pub mod git;
 pub mod gitremote;
 pub mod load;
 pub mod notify;
+pub mod palette;
 pub mod paths;
 pub mod project_lookup;
 pub mod proto;

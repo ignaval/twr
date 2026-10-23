@@ -1,13 +1,17 @@
 //! The colors of threads and how deep the TUI's colors go.
 //!
 //! Every thread has a color of its own ([`thread_color`]): its card's border and name, its
-//! boxes and name in the orchestrator's conversation, and the header band and input box while
-//! it is dived into. The palette ([`THREAD_COLORS`]) is eight fixed 256-color values of middle
-//! lightness, each at least 3:1 against both black and white (it reads on dark and light
-//! terminals alike), all greens, blues and violets (none in the reds, oranges and yellows that
-//! say an error, work going on or a selection), and none near a color that means something (the
-//! orchestrator's cyan, a dive's magenta, the working icon's orange, the selection's yellow,
-//! red errors, green running, blue done, the muted and dark greys, code's light blue).
+//! boxes and name in the orchestrator's conversation, its requests' boxes, and the header band
+//! and input box while it is dived into. The palette ([`THREAD_COLORS`]) is the 30 fixed
+//! 256-color values of [`twr_core::palette`], and the hub's log decides which one a thread has
+//! ([`twr_core::reduce::ThreadView::color`]): up to 30 threads alive never share one (unless
+//! more than 30 were alive at once since), and a thread keeps its own through renames,
+//! restarts and other threads coming and going. Each
+//! reads on dark and light terminals (3:1 at least against black and a dark grey, 2:1 against
+//! white), and none is near a color that means something (the orchestrator's cyan, a dive's
+//! magenta, the working icon's orange, the selection's yellow, red errors, green running, blue
+//! done, the muted and dark greys, code's light blue), the alarming ones (red, orange, yellow)
+//! least of all: its warm colors are pinks, a brown and muted roses.
 //!
 //! `[tui] colors` ([`ColorMode`]) says how deep the colors go, resolved once at start
 //! ([`resolve`]: `auto` from `NO_COLOR`, `COLORTERM` and `TERM`) into a [`Depth`]. The view is
@@ -20,30 +24,38 @@
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use twr_core::config::ColorMode;
+use twr_core::palette::THREAD_PALETTE;
+use twr_core::reduce::ThreadView;
 
-/// The threads' colors, by hue: a leaf green, a sea green, a teal, a blue, a cornflower, a
-/// blue violet, a violet and a plum. Their numbers are used for nothing else, so a 16-color
-/// terminal can tell a thread's color from any other ([`degrade`]).
-pub const THREAD_COLORS: [Color; 8] = [
-    Color::Indexed(64),
-    Color::Indexed(29),
-    Color::Indexed(31),
-    Color::Indexed(26),
-    Color::Indexed(68),
-    Color::Indexed(99),
-    Color::Indexed(92),
-    Color::Indexed(126),
-];
-
-/// Thread `id`'s color, one of [`THREAD_COLORS`]: the same for the same id on every frame
-/// and every run (FNV-1a of its bytes).
-pub fn thread_color(id: &str) -> Color {
-    let mut h: u32 = 0x811c_9dc5;
-    for b in id.bytes() {
-        h ^= u32::from(b);
-        h = h.wrapping_mul(0x0100_0193);
+/// The threads' colors, [`twr_core::palette::THREAD_PALETTE`] as 256-color values. Their
+/// numbers are used for nothing else, so a 16-color terminal can tell a thread's color from any
+/// other ([`degrade`]).
+pub const THREAD_COLORS: [Color; THREAD_PALETTE.len()] = {
+    let mut colors = [Color::Reset; THREAD_PALETTE.len()];
+    let mut i = 0;
+    while i < colors.len() {
+        colors[i] = Color::Indexed(THREAD_PALETTE[i]);
+        i += 1;
     }
-    THREAD_COLORS[h as usize % THREAD_COLORS.len()]
+    colors
+};
+
+/// Thread `t`'s color: the one of [`THREAD_COLORS`] its view holds
+/// ([`ThreadView::color`]); for a view without one (an orchestrator's, or one no registry
+/// folded), one picked from its id (FNV-1a of its bytes), the same on every frame and run.
+pub fn thread_color(t: &ThreadView) -> Color {
+    let at = t.color.map_or_else(
+        || {
+            let mut h: u32 = 0x811c_9dc5;
+            for b in t.id.bytes() {
+                h ^= u32::from(b);
+                h = h.wrapping_mul(0x0100_0193);
+            }
+            h as usize
+        },
+        usize::from,
+    );
+    THREAD_COLORS[at % THREAD_COLORS.len()]
 }
 
 /// Black or white, whichever reads better on `bg` (the higher contrast): the text of a band
@@ -278,11 +290,13 @@ mod tests {
     const BLACK: (u8, u8, u8) = (0, 0, 0);
     const WHITE: (u8, u8, u8) = (255, 255, 255);
 
-    /// The distance of two colors in RGB.
+    /// How far apart two colors look: their OKLab distance ([`twr_core::palette::oklab`]).
     fn distance(a: Color, b: Color) -> f64 {
-        let (a, b) = (rgb(a).unwrap(), rgb(b).unwrap());
-        let d = |x: u8, y: u8| (f64::from(x) - f64::from(y)).powi(2);
-        (d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)).sqrt()
+        let (a, b) = (
+            twr_core::palette::oklab(rgb(a).unwrap()),
+            twr_core::palette::oklab(rgb(b).unwrap()),
+        );
+        ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2) + (a.2 - b.2).powi(2)).sqrt()
     }
 
     /// The table is xterm's: a few known values from each part.
@@ -299,62 +313,83 @@ mod tests {
         assert!((contrast(BLACK, WHITE) - 21.0).abs() < 1e-9);
     }
 
-    /// The same id gets the same color (a fixed hash, not the process's random one), and ids
-    /// spread over the whole palette.
+    /// The palette is the hub's, cube color for cube color.
     #[test]
-    fn a_threads_color_is_stable_and_ids_spread_over_the_palette() {
-        assert_eq!(thread_color("t-alpha"), thread_color("t-alpha"));
+    fn the_palette_is_the_cores() {
+        for (c, n) in THREAD_COLORS.iter().zip(THREAD_PALETTE) {
+            assert_eq!(*c, Color::Indexed(n));
+            assert_eq!(xterm_rgb(n), twr_core::palette::cube_rgb(n));
+        }
+    }
+
+    /// A thread's color is the one its view holds; a view without one gets one from its id
+    /// (a fixed hash, not the process's random one), and ids spread over the whole palette.
+    #[test]
+    fn a_threads_color_is_the_one_it_holds_or_one_from_its_id() {
+        let view = |id: &str, color: Option<u8>| ThreadView {
+            color,
+            ..ThreadView::new(id)
+        };
+        for at in 0..THREAD_COLORS.len() as u8 {
+            assert_eq!(
+                thread_color(&view("t-alpha", Some(at))),
+                THREAD_COLORS[usize::from(at)]
+            );
+        }
+        assert_eq!(
+            thread_color(&view("t-alpha", Some(200))),
+            THREAD_COLORS[200 % 30]
+        );
+        let alpha = view("t-alpha", None);
+        assert_eq!(thread_color(&alpha), thread_color(&alpha.clone()));
         // FNV-1a pinned: these never change from one run or build to the next.
-        assert_eq!(thread_color("t-alpha"), Color::Indexed(31));
-        assert_eq!(thread_color("t-beta"), Color::Indexed(64));
-        assert_eq!(thread_color("t-gamma"), Color::Indexed(26));
-        let used: HashSet<Color> = (0..200).map(|i| thread_color(&format!("t-{i}"))).collect();
+        assert_eq!(thread_color(&alpha), Color::Indexed(104));
+        assert_eq!(thread_color(&view("t-beta", None)), Color::Indexed(62));
+        let used: HashSet<Color> = (0..400)
+            .map(|i| thread_color(&view(&format!("t-{i}"), None)))
+            .collect();
         assert_eq!(used.len(), THREAD_COLORS.len(), "{used:?}");
     }
 
-    /// Every thread color reads on a dark and on a light terminal: 3:1 at least against
-    /// black and against white.
+    /// Every thread color reads on a dark terminal (3:1 at least against black and against a
+    /// dark grey, `#1e1e1e`) and shows on a light one (2:1 against white): a border and a bold
+    /// name. 3:1 against white too would leave fewer than 30 colors in the cube that are far
+    /// enough apart.
     #[test]
-    fn every_thread_color_reads_on_black_and_on_white() {
+    fn every_thread_color_reads_on_dark_and_shows_on_light() {
         for c in THREAD_COLORS {
             let v = rgb(c).unwrap();
             assert!(contrast(v, BLACK) >= 3.0, "{c:?} on black");
-            assert!(contrast(v, WHITE) >= 3.0, "{c:?} on white");
+            assert!(contrast(v, (30, 30, 30)) >= 3.0, "{c:?} on dark grey");
+            assert!(contrast(v, WHITE) >= 2.0, "{c:?} on white");
         }
     }
 
-    /// The hue of `c` in degrees (0 red, 120 green, 240 blue).
-    fn hue(c: Color) -> f64 {
-        let (r, g, b) = rgb(c).unwrap();
-        let (r, g, b) = (f64::from(r), f64::from(g), f64::from(b));
-        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
-        let d = hi - lo;
-        assert!(d > 0.0, "{c:?} has no hue");
-        let h = if hi == r {
-            60.0 * ((g - b) / d)
-        } else if hi == g {
-            60.0 * ((b - r) / d + 2.0)
-        } else {
-            60.0 * ((r - g) / d + 4.0)
-        };
-        h.rem_euclid(360.0)
-    }
-
-    /// No thread's color is a red, an orange or a yellow (hues 345° to 75°): those say an
-    /// error, work going on, a selection or a wait. Nor a grey: every one has a hue.
+    /// No thread's color is near a color that alarms: red (an error, a permission), the
+    /// working icon's orange, yellow (a question, a selection): 0.12 at least in OKLab. Nor is
+    /// any a grey: every one has a hue.
     #[test]
-    fn no_thread_color_is_a_red_an_orange_or_a_yellow() {
-        assert!(hue(Color::Indexed(173)) < 75.0, "the working icon's orange");
-        assert!(hue(Color::Indexed(220)) < 75.0);
-        assert!(hue(Color::Indexed(161)) > 330.0);
+    fn no_thread_color_is_near_an_alarm_or_a_grey() {
+        let alarm = [
+            Color::Red,
+            Color::LightRed,
+            Color::Indexed(161),
+            crate::icon::ACCENT,
+            Color::Yellow,
+            Color::LightYellow,
+            Color::Indexed(220),
+        ];
         for c in THREAD_COLORS {
-            let h = hue(c);
-            assert!((75.0..345.0).contains(&h), "{c:?}: {h}");
+            for m in alarm {
+                assert!(distance(c, m) >= 0.12, "{c:?} near {m:?}");
+            }
+            let (r, g, b) = rgb(c).unwrap();
+            assert!(r.max(g).max(b) - r.min(g).min(b) >= 40, "{c:?} is a grey");
         }
     }
 
-    /// A thread's color is far from every color that means something, and from the other
-    /// threads' colors.
+    /// A thread's color is far from every color that means something (0.08 in OKLab), and
+    /// from the other threads' colors (0.07: a just noticeable difference is about 0.02).
     #[test]
     fn thread_colors_are_apart_from_the_meaning_colors_and_each_other() {
         let meaning = [
@@ -367,20 +402,22 @@ mod tests {
             Color::Indexed(220),
             Color::Red,
             Color::LightRed,
+            Color::Indexed(161),
             Color::Green,
             Color::Blue,
+            Color::Gray,
             Color::Indexed(246),
             Color::Indexed(153),
             Color::DarkGray,
         ];
         for c in THREAD_COLORS {
             for m in meaning {
-                assert!(distance(c, m) >= 70.0, "{c:?} near {m:?}");
+                assert!(distance(c, m) >= 0.08, "{c:?} near {m:?}");
             }
         }
         for (i, a) in THREAD_COLORS.iter().enumerate() {
             for b in &THREAD_COLORS[i + 1..] {
-                assert!(distance(*a, *b) >= 55.0, "{a:?} near {b:?}");
+                assert!(distance(*a, *b) >= 0.07, "{a:?} near {b:?}");
             }
         }
     }

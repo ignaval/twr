@@ -379,6 +379,14 @@ pub struct ThreadView {
     /// new one. Derived from the log (clients get it as `lifecycle_seq`).
     #[serde(default)]
     pub lifecycle_seq: u64,
+    /// Its color, a place in [`crate::palette::THREAD_PALETTE`]: given by [`Registry::apply`]
+    /// when it folds the thread's first control event (its `thread.created`, as a rule: what a
+    /// client that folds only the control stream sees first too; none for an
+    /// orchestrator, which has a color of its own), and again by a `thread.restored` if a
+    /// thread alive took it meanwhile. Derived from the log, the same on every client; `None`
+    /// for an orchestrator and for a view no registry folded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u8>,
 }
 
 impl ThreadView {
@@ -1058,6 +1066,11 @@ impl Registry {
     /// A `thread.deleted` sets the thread's view aside ([`Registry::deleted_view`]); a later
     /// `thread.restored` of it puts that view back (and applies itself), every other event of
     /// it is dropped.
+    ///
+    /// A thread's first control event (its `thread.created`, as a rule) gives it a color
+    /// ([`ThreadView::color`], [`crate::palette::allocate`]) from those of the threads alive
+    /// then, which an orchestrator's `thread.created` takes back; a restored thread keeps its
+    /// own unless a thread alive took it meanwhile ([`crate::palette::keeps`]).
     pub fn apply(&mut self, ev: &Event) {
         if ev.thread == HUB_THREAD {
             return;
@@ -1067,6 +1080,15 @@ impl Registry {
                 let mut view = view.clone();
                 self.deleted.remove(&ev.thread);
                 view.apply(ev);
+                if !view.is_orchestrator() {
+                    let held = self.held_colors(&ev.thread);
+                    if !view
+                        .color
+                        .is_some_and(|c| crate::palette::keeps(c, held.clone()))
+                    {
+                        view.color = Some(crate::palette::allocate(held));
+                    }
+                }
                 self.threads.insert(ev.thread.clone(), view);
             }
             return;
@@ -1079,13 +1101,22 @@ impl Registry {
             self.deleted.insert(ev.thread.clone(), view);
             return;
         }
+        let created = matches!(ev.body, EventBody::ThreadCreated(_));
+        // Only a control event gives a color: a client folds the control stream alone.
+        let colorless = |t: &ThreadView| t.color.is_none() && !t.is_orchestrator();
+        let held = (ev.is_control() && self.threads.get(&ev.thread).is_none_or(colorless))
+            .then(|| self.held_colors(&ev.thread));
         let view = self
             .threads
             .entry(ev.thread.clone())
             .or_insert_with(|| ThreadView::new(ev.thread.clone()));
         view.apply(ev);
-        let new_orchestrator =
-            matches!(ev.body, EventBody::ThreadCreated(_)) && view.is_orchestrator();
+        if view.is_orchestrator() {
+            view.color = None;
+        } else if let Some(held) = held.filter(|_| view.color.is_none()) {
+            view.color = Some(crate::palette::allocate(held));
+        }
+        let new_orchestrator = created && view.is_orchestrator();
         if new_orchestrator {
             for (id, t) in self.threads.iter_mut() {
                 if *id != ev.thread && t.is_orchestrator() {
@@ -1093,6 +1124,16 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// The colors ([`ThreadView::color`]) the threads alive other than `id` hold, one entry
+    /// per thread.
+    fn held_colors(&self, id: &str) -> Vec<u8> {
+        self.threads
+            .values()
+            .filter(|t| t.id != id)
+            .filter_map(|t| t.color)
+            .collect()
     }
 
     /// The current orchestrator thread (the latest one created), if any.
@@ -1793,6 +1834,14 @@ mod tests {
         v
     }
 
+    /// Thread `id`'s view in a registry folded from `events`, without the color the registry
+    /// gives it ([`ThreadView::color`]): what folding its events into a view alone gives.
+    fn replayed(events: &[Event], id: &str) -> ThreadView {
+        let mut v = Registry::from_events(events).get(id).unwrap().clone();
+        v.color = None;
+        v
+    }
+
     /// Applies events one by one, asserting the status after each.
     fn assert_statuses(steps: &[(Event, ThreadStatus)]) {
         let mut v = ThreadView::new(steps[0].0.thread.clone());
@@ -2308,8 +2357,7 @@ mod tests {
         let v = view(&evs);
         assert_eq!(v.mode, "plan");
         assert!(v.stopped, "a plain stop still stops");
-        let replayed = Registry::from_events(&evs);
-        assert_eq!(replayed.get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
     }
 
     /// The `thread.stopped` of a box switch (`box_upgrade`) folds like a mode restart's: the
@@ -2336,12 +2384,12 @@ mod tests {
         assert!(!v.stopped, "a box upgrade is no stop");
         assert_eq!(v.status(), S::Idle);
         assert_eq!(v.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
         evs.push(s.started("sess-1"));
         evs.push(s.stopped());
         let v = view(&evs);
         assert!(v.stopped, "a plain stop still stops");
-        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
     }
 
     /// The model and effort start as `thread.created`'s `ext.twr.model` / `ext.twr.effort`
@@ -2396,7 +2444,7 @@ mod tests {
                 "after event {n}"
             );
             assert!(!v.stopped, "a model restart is no stop (event {n})");
-            assert_eq!(Registry::from_events(&evs[..=n]).get("t1"), Some(&v));
+            assert_eq!(replayed(&evs[..=n], "t1"), v);
         }
         // A thread object from before efforts reads as the runtime's default.
         let mut j = serde_json::to_value(view(&evs[..1])).unwrap();
@@ -2464,7 +2512,7 @@ mod tests {
         let v = at(8);
         assert_eq!(v.session_id.as_deref(), Some("new"));
         assert!(!v.handoff_pending);
-        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
         // A thread object from before runtime changes has none pending.
         let mut j = serde_json::to_value(at(1)).unwrap();
         j.as_object_mut().unwrap().remove("handoff_pending");
@@ -2642,6 +2690,196 @@ mod tests {
         assert_eq!(r.resolve("api").unwrap().id, "t2");
         assert_eq!(r.list().len(), 1);
         assert_eq!(r.deleted_view("t1").unwrap().name, "api");
+    }
+
+    /// Each thread gets a color of its own when its `thread.created` is folded, from those
+    /// of the threads alive then: in the palette's order while none is freed, none for an
+    /// orchestrator. It keeps it through renames, other threads' deletions and creations, and
+    /// a replay; a deleted thread's view keeps it, and the next thread may take it.
+    #[test]
+    fn a_thread_gets_a_color_of_its_own_and_keeps_it() {
+        let (mut a, mut b, mut c, mut o) = (
+            ThreadScript::new("t-a"),
+            ThreadScript::new("t-b"),
+            ThreadScript::new("t-c"),
+            ThreadScript::new("t-o"),
+        );
+        let mut orch = o.created("orchestrator");
+        if let EventBody::ThreadCreated(p) = &mut orch.body {
+            p.ext = serde_json::json!({"twr": {"role": "orchestrator"}})
+                .as_object()
+                .cloned();
+        }
+        let mut evs = vec![orch, a.created("api"), b.created("web"), c.created("docs")];
+        let colors = |evs: &[Event]| {
+            let r = Registry::from_events(evs);
+            ["t-o", "t-a", "t-b", "t-c"].map(|id| r.get(id).and_then(|t| t.color))
+        };
+        assert_eq!(colors(&evs), [None, Some(0), Some(1), Some(2)]);
+        evs.push(b.event(EventBody::ThreadRenamed(ThreadRenamed {
+            name: "frontend".into(),
+            previous: "web".into(),
+            ..Default::default()
+        })));
+        evs.push(a.event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: "api".into(),
+            ..Default::default()
+        })));
+        assert_eq!(colors(&evs), [None, None, Some(1), Some(2)]);
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.deleted_view("t-a").unwrap().color, Some(0));
+        // The next thread takes a color no thread alive has, the farthest from theirs.
+        let mut d = ThreadScript::new("t-d");
+        evs.push(d.created("api"));
+        let r = Registry::from_events(&evs);
+        let dc = r.get("t-d").unwrap().color.unwrap();
+        assert_eq!(dc, crate::palette::allocate([1, 2]));
+        assert!(dc != 1 && dc != 2);
+        assert_eq!(colors(&evs), [None, None, Some(1), Some(2)]);
+        // Live and on replay alike.
+        let mut live = Registry::new();
+        for e in &evs {
+            live.apply(e);
+        }
+        assert_eq!(live, r);
+    }
+
+    /// A restored thread keeps its color unless a thread alive took it meanwhile; then it gets
+    /// one no thread alive has.
+    #[test]
+    fn a_restored_thread_keeps_its_color_unless_it_was_taken() {
+        let restored = |name: &str| {
+            EventBody::ThreadRestored(ThreadRestored {
+                item: "01J00000000000000000000000".into(),
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        let deleted = |name: &str| {
+            EventBody::ThreadDeleted(ThreadDeleted {
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        let (mut a, mut b) = (ThreadScript::new("t-a"), ThreadScript::new("t-b"));
+        // Nobody took it: kept.
+        let evs = vec![
+            a.created("api"),
+            b.created("web"),
+            a.event(deleted("api")),
+            a.event(restored("api")),
+        ];
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-a").unwrap().color, Some(0));
+        // Threads created meanwhile took it: another one, that no thread alive has.
+        let mut evs = vec![a.created("api"), b.created("web"), a.event(deleted("api"))];
+        for i in 0.. {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+            let r = Registry::from_events(&evs);
+            if r.get(&format!("t-{i}")).unwrap().color == Some(0) {
+                break;
+            }
+            assert!(i < 28);
+        }
+        evs.push(a.event(restored("api")));
+        let r = Registry::from_events(&evs);
+        let ac = r.get("t-a").unwrap().color.unwrap();
+        let others: Vec<u8> = r
+            .list()
+            .iter()
+            .filter(|t| t.id != "t-a")
+            .filter_map(|t| t.color)
+            .collect();
+        assert!(!others.contains(&ac), "{ac} {others:?}");
+        assert_eq!(ac, crate::palette::allocate(others));
+    }
+
+    /// A thread whose `thread.created` the log lacks holds a color from its first control
+    /// event, so later threads don't take it, and the same as a fold of the control stream
+    /// alone gives it (an agent event before it counts for nothing); an orchestrator seen
+    /// before its `thread.created` gives its color back.
+    #[test]
+    fn a_thread_without_its_creation_holds_a_color_too() {
+        let (mut x, mut o, mut y) = (
+            ThreadScript::new("t-x"),
+            ThreadScript::new("t-o"),
+            ThreadScript::new("t-y"),
+        );
+        let mut evs = vec![y.text("hello"), x.turn_started("go"), o.turn_started("hi")];
+        let mut orch = o.created("orchestrator");
+        if let EventBody::ThreadCreated(p) = &mut orch.body {
+            p.ext = serde_json::json!({"twr": {"role": "orchestrator"}})
+                .as_object()
+                .cloned();
+        }
+        evs.push(orch);
+        for i in 0..28 {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+        }
+        evs.push(y.turn_started("go"));
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-x").unwrap().color, Some(0));
+        assert_eq!(r.get("t-o").unwrap().color, None);
+        let held: std::collections::HashSet<u8> = r.list().iter().filter_map(|t| t.color).collect();
+        assert_eq!(held.len(), 30);
+        let control = Registry::from_events(evs.iter().filter(|e| e.is_control()));
+        assert_eq!(control.len(), r.len());
+        for t in r.list() {
+            assert_eq!(control.get(&t.id).unwrap().color, t.color, "{}", t.id);
+        }
+    }
+
+    /// Past 30, deleting threads changes no survivor's color, and the next thread takes a
+    /// freed color, not a shared one; two threads that came to share a color keep it until
+    /// one goes.
+    #[test]
+    fn after_more_than_thirty_deletions_recolor_nobody() {
+        let mut scripts: Vec<ThreadScript> = (0..31)
+            .map(|i| ThreadScript::new(format!("t-{i}")))
+            .collect();
+        let mut evs: Vec<Event> = scripts
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| s.created(&format!("n{i}")))
+            .collect();
+        let before = Registry::from_events(&evs);
+        let shared = before.get("t-30").unwrap().color.unwrap();
+        assert_eq!(shared, 0);
+        // t-5 had a color of its own.
+        evs.push(scripts[5].event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: "n5".into(),
+            ..Default::default()
+        })));
+        let after = Registry::from_events(&evs);
+        for t in after.list() {
+            assert_eq!(t.color, before.get(&t.id).unwrap().color, "{}", t.id);
+        }
+        let mut n = ThreadScript::new("t-new");
+        evs.push(n.created("new"));
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-new").unwrap().color, Some(5));
+        assert_eq!(r.get("t-0").unwrap().color, r.get("t-30").unwrap().color);
+    }
+
+    /// Up to 30 threads alive never share a color; past that, colors are shared evenly.
+    #[test]
+    fn thirty_threads_have_thirty_colors_and_more_share_them_evenly() {
+        let mut evs = Vec::new();
+        for i in 0..45 {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+        }
+        let r = Registry::from_events(&evs[..30]);
+        let held: std::collections::HashSet<u8> = r.list().iter().filter_map(|t| t.color).collect();
+        assert_eq!(held.len(), 30);
+        let r = Registry::from_events(&evs);
+        let mut count = [0usize; 30];
+        for t in r.list() {
+            count[usize::from(t.color.unwrap())] += 1;
+        }
+        assert!(count.iter().all(|&n| n == 1 || n == 2), "{count:?}");
     }
 
     /// A restored thread comes back as it was when deleted, parked, under its new name and
@@ -2880,8 +3118,7 @@ mod tests {
             live.apply(e);
             assert_eq!(live.actual_model.as_deref(), want[i], "after step {i}");
             assert_eq!(live.model.as_deref(), Some("sonnet"));
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(live.shown_model(), Some("sonnet"));
         live.actual_model = Some("claude-sonnet-4-5".into());
@@ -2948,8 +3185,7 @@ mod tests {
         for (i, e) in evs.iter().enumerate() {
             live.apply(e);
             assert_eq!(live.actual_model.as_deref(), want[i], "after step {i}");
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         let pending = view(&evs[..=5]);
         assert_eq!(
@@ -2978,8 +3214,7 @@ mod tests {
             live.apply(e);
             eligibility.push(live.retry_eligible());
             // A hub restarting at any point rebuilds the same view by replay.
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(
             eligibility,
