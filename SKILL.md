@@ -996,7 +996,7 @@ data, raw?}`. `source` is `adapter:<name>`, `hub`, `user:<client>`, `orchestrato
   agent's latest call's input, cache writes and reads; Codex and Grok Build: the last call's
   input and output), never the turn's summed `usage`, and its model's window. A Claude Code
   turn end says where its size came from in `ext.claude.context_from` (`last_call`,
-  `compaction`, or `unknown`: it called the model and reported no call's size, and has no
+  `compaction`, or `unknown`: its latest model call reported no size, and it has no
   `context`); one recorded by an earlier twr has no such key and the turn's summed usage as
   its size, which the thread JSON trusts only for a turn of one call
   (`ext.claude.num_turns: 1`) or none. The thread JSON's `context` is the latest trusted size,

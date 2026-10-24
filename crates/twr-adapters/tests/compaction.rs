@@ -451,17 +451,31 @@ fn claude_context_is_the_latest_calls_input_not_the_turns_spend() {
     assert_eq!(ends[2].context.map(|c| c.tokens), Some(42_003));
 
     // Calls without `usage`: their turn's sum is no context size, and none is said.
+    let bare = |id: &str| {
+        json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+            "id": id, "model": "claude-opus-5-5", "content": [{"type": "text", "text": "."}]}})
+        .to_string()
+    };
     tr.user_message("again", 4);
     feed!(INIT);
-    for id in ["m9", "m10"] {
-        let bare = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
-            "id": id, "model": "claude-opus-5-5", "content": [{"type": "text", "text": "."}]}});
-        feed!(&bare.to_string());
-    }
-    feed!(&result_line(2, [5, 1_000, 90_000], models));
+    feed!(&bare("m9"));
+    feed!(&bare("m10"));
+    feed!(&result_line(2, [5, 1_000, 90_000], models.clone()));
     assert_eq!(ends[3].context, None);
     assert_eq!(context_from(&ends[3]), Some("unknown"));
     assert_eq!(ends[3].usage.as_ref().unwrap().input, 91_005);
+
+    // A call with its size, then one without: not the first one's size. Nor when the `result`
+    // reports no usage at all (an interrupted turn's are zeros).
+    tr.user_message("once more", 5);
+    feed!(INIT);
+    for line in call_lines("m11", "claude-opus-5-5", None, [3, 2_000, 60_000]) {
+        feed!(&line);
+    }
+    feed!(&bare("m12"));
+    feed!(&result_line(2, [0, 0, 0], models));
+    assert_eq!(ends[4].context, None);
+    assert_eq!(context_from(&ends[4]), Some("unknown"));
 }
 
 /// The window is the main agent's model's, not the largest of the turn: a main agent on a
@@ -527,6 +541,24 @@ fn claude_context_window_is_the_main_agents_models() {
     assert_eq!(
         run("claude-opus-5-5", small, [10, 0, 250_000]),
         ctx(250_010, None)
+    );
+    // `m` and `m[1m]` disagree: which one ran is not said.
+    let ambiguous = json!({
+        "claude-opus-5-5": {"contextWindow": 200_000},
+        "claude-opus-5-5[1m]": {"contextWindow": 1_000_000},
+    });
+    assert_eq!(
+        run("claude-opus-5-5", ambiguous, [10, 0, 50_000]),
+        ctx(50_010, None)
+    );
+    // No model said by the call: the window every entry says, not one some leave out.
+    let partial = json!({"main": {}, "child": {"contextWindow": 1_000_000}});
+    assert_eq!(run("", partial, [10, 0, 50_000]), ctx(50_010, None));
+    let shared =
+        json!({"main": {"contextWindow": 1_000_000}, "child": {"contextWindow": 1_000_000}});
+    assert_eq!(
+        run("", shared, [10, 0, 50_000]),
+        ctx(50_010, Some(1_000_000))
     );
     // No `modelUsage` at all: the size without a window.
     assert_eq!(
