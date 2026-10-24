@@ -21,6 +21,9 @@
 //!   the compaction). `compact_resume`: `thread/resume` of a compacted thread.
 //!
 //! Grok Build's compaction has no recording yet (`grok_build.rs`, `synthetic_compaction`).
+//!
+//! How full Claude's context is (`turn.ended` `context`: the main agent's last call, not the
+//! turn's summed usage) is checked on a recording and on lines written here.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -285,6 +288,438 @@ fn claude_resume_after_compaction() {
     );
 }
 
+// --- How full Claude's context is -------------------------------------------------------------
+
+/// The `ext.claude.context_from` of a turn end.
+fn context_from(e: &TurnEnded) -> Option<&str> {
+    e.ext.as_ref()?.get("claude")?.get("context_from")?.as_str()
+}
+
+/// A recorded turn of two model calls: its `result` `usage` sums both (what it spent), its
+/// context is the second call's input alone (8 + 1,849 + 23,010), as Claude's own
+/// `get_context_usage` counts it.
+#[test]
+fn claude_recorded_two_call_turn_reports_the_last_call() {
+    let events = claude("resume_part1");
+    let bodies = claude_bodies(&events);
+    let ends = ended(&bodies);
+    assert_eq!(ends.len(), 1);
+    let usage = ends[0].usage.as_ref().unwrap();
+    assert_eq!(usage.input, 18 + 6_144 + 41_725);
+    assert_eq!(
+        ends[0].context,
+        Some(ContextSize {
+            tokens: 8 + 1_849 + 23_010,
+            window: Some(200_000)
+        })
+    );
+    assert_eq!(context_from(&ends[0]), Some("last_call"));
+}
+
+/// One Claude model call of the main agent (`parent` none) or a subagent's, as `stream-json`
+/// sends it: one `assistant` line per content block, each with the call's `usage`.
+fn call_lines(id: &str, model: &str, parent: Option<&str>, input: [u64; 3]) -> Vec<String> {
+    let usage = json!({"input_tokens": input[0], "cache_creation_input_tokens": input[1],
+        "cache_read_input_tokens": input[2], "output_tokens": 7});
+    ["thinking", "text"]
+        .iter()
+        .map(|kind| {
+            json!({"type": "assistant", "parent_tool_use_id": parent, "session_id": "s",
+                "message": {"id": id, "model": model, "role": "assistant", "usage": usage,
+                    "content": [{"type": kind, "thinking": ".", "text": "."}]}})
+            .to_string()
+        })
+        .collect()
+}
+
+fn result_line(num_turns: u64, input: [u64; 3], model_usage: Value) -> String {
+    json!({"type": "result", "subtype": "success", "is_error": false, "num_turns": num_turns,
+        "stop_reason": "end_turn", "session_id": "s", "total_cost_usd": 1.0,
+        "usage": {"input_tokens": input[0], "cache_creation_input_tokens": input[1],
+            "cache_read_input_tokens": input[2], "output_tokens": 70},
+        "modelUsage": model_usage})
+    .to_string()
+}
+
+const INIT: &str = r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5-5","permissionMode":"default"}"#;
+
+/// The turn of the 693% card, in small: eight calls of the main agent whose inputs add up to
+/// 1.2M tokens of a 1M window, while the last of them held 180k. The context is that last
+/// call's input, and the window its model's (a subagent's model has a smaller one); the turn's
+/// spend stays the sum. A subagent's call, larger than the main agent's, a `<synthetic>`
+/// message reporting zeros and the `message_start` of the last call change nothing. Then a
+/// manual compaction brings it down to what the compaction left, the next call up again, and a
+/// turn whose calls report no size leaves it unknown rather than reading the turn's sum.
+#[test]
+fn claude_context_is_the_latest_calls_input_not_the_turns_spend() {
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    let mut ends = Vec::new();
+    macro_rules! feed {
+        ($line:expr $(,)?) => {
+            for e in tr.translate($line).events {
+                if let EventBody::TurnEnded(t) = e.body {
+                    ends.push(t);
+                }
+            }
+        };
+    }
+    let models = json!({
+        "claude-opus-5-5": {"inputTokens": 16, "contextWindow": 1_000_000},
+        "claude-haiku-4-5-20251001": {"inputTokens": 190_000, "contextWindow": 200_000},
+    });
+
+    tr.user_message("research", 1);
+    feed!(INIT);
+    let mut spent = [0u64; 3];
+    for i in 0..8u64 {
+        let input = [2, 1_000, 109_000 + i * 10_000];
+        if i == 7 {
+            let start = json!({"type": "stream_event", "parent_tool_use_id": null,
+                "event": {"type": "message_start", "message": {"id": "m7",
+                    "model": "claude-opus-5-5", "usage": {"input_tokens": 2,
+                        "cache_creation_input_tokens": 1_000, "cache_read_input_tokens": 179_000,
+                        "output_tokens": 1}}}});
+            feed!(&start.to_string());
+        }
+        for line in call_lines(&format!("m{i}"), "claude-opus-5-5", None, input) {
+            feed!(&line);
+        }
+        if i == 3 {
+            let sub = call_lines(
+                "sub",
+                "claude-haiku-4-5-20251001",
+                Some("toolu_1"),
+                [190_000, 0, 0],
+            );
+            for line in sub {
+                feed!(&line);
+            }
+        }
+        for (s, n) in spent.iter_mut().zip(input) {
+            *s += n;
+        }
+    }
+    let synthetic = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+        "id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "."}],
+        "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "output_tokens": 0}}});
+    feed!(&synthetic.to_string());
+    feed!(&result_line(8, spent, models.clone()));
+
+    let first = &ends[0];
+    let total: u64 = spent.iter().sum();
+    assert!(
+        total > 1_000_000,
+        "the turn's input exceeds the window: {total}"
+    );
+    assert_eq!(first.usage.as_ref().unwrap().input, total);
+    let context = first.context.expect("the last call's size");
+    assert_eq!(
+        context,
+        ContextSize {
+            tokens: 2 + 1_000 + 179_000,
+            window: Some(1_000_000)
+        }
+    );
+    assert_eq!(context.percent(), Some(18));
+    assert_eq!(context_from(first), Some("last_call"));
+
+    // A manual compaction: no call in its turn; the context is what it left.
+    tr.compact_message(2);
+    feed!(r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,);
+    feed!(INIT);
+    feed!(
+        r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":182002,"post_tokens":40000}}"#,
+    );
+    feed!(&result_line(0, [0, 0, 0], models.clone()));
+    assert_eq!(
+        ends[1].context,
+        Some(ContextSize {
+            tokens: 40_000,
+            window: Some(1_000_000)
+        })
+    );
+    assert_eq!(context_from(&ends[1]), Some("compaction"));
+
+    // The next call reads the context again.
+    tr.user_message("more", 3);
+    feed!(INIT);
+    for line in call_lines("m8", "claude-opus-5-5", None, [3, 2_000, 40_000]) {
+        feed!(&line);
+    }
+    feed!(&result_line(1, [3, 2_000, 40_000], models.clone()));
+    assert_eq!(ends[2].context.map(|c| c.tokens), Some(42_003));
+
+    // Calls without `usage`: their turn's sum is no context size, and none is said.
+    let bare = |id: &str| {
+        json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+            "id": id, "model": "claude-opus-5-5", "content": [{"type": "text", "text": "."}]}})
+        .to_string()
+    };
+    tr.user_message("again", 4);
+    feed!(INIT);
+    feed!(&bare("m9"));
+    feed!(&bare("m10"));
+    feed!(&result_line(2, [5, 1_000, 90_000], models.clone()));
+    assert_eq!(ends[3].context, None);
+    assert_eq!(context_from(&ends[3]), Some("unknown"));
+    assert_eq!(ends[3].usage.as_ref().unwrap().input, 91_005);
+
+    // A call with its size, then one without: not the first one's size. Nor when the `result`
+    // reports no usage at all (an interrupted turn's are zeros).
+    tr.user_message("once more", 5);
+    feed!(INIT);
+    for line in call_lines("m11", "claude-opus-5-5", None, [3, 2_000, 60_000]) {
+        feed!(&line);
+    }
+    feed!(&bare("m12"));
+    feed!(&result_line(2, [0, 0, 0], models.clone()));
+    assert_eq!(ends[4].context, None);
+    assert_eq!(context_from(&ends[4]), Some("unknown"));
+
+    // A compaction's size is its turn's: a later turn showing no call reads its own `result`
+    // (one call: that call's input), not what the compaction left.
+    let compact = |tr: &mut claude_code::Translator, turn: u64, post: &str| {
+        tr.compact_message(turn);
+        let boundary = format!(
+            r#"{{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{{"trigger":"manual","pre_tokens":90000{post}}}}}"#
+        );
+        [
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#
+                .to_string(),
+            INIT.to_string(),
+            boundary,
+        ]
+    };
+    for line in compact(&mut tr, 6, r#","post_tokens":30000"#) {
+        feed!(&line);
+    }
+    feed!(&result_line(0, [0, 0, 0], models.clone()));
+    assert_eq!(ends[5].context.map(|c| c.tokens), Some(30_000));
+    tr.user_message("result only", 7);
+    feed!(INIT);
+    feed!(&result_line(1, [5, 0, 80_000], models.clone()));
+    assert_eq!(ends[6].context.map(|c| c.tokens), Some(80_005));
+    assert_eq!(context_from(&ends[6]), Some("last_call"));
+    // A compaction that does not say what it left: unknown, not the size before it; and a
+    // later turn of several calls showing none is unknown too.
+    for line in compact(&mut tr, 8, "") {
+        feed!(&line);
+    }
+    feed!(&result_line(0, [0, 0, 0], models.clone()));
+    assert_eq!(ends[7].context, None);
+    assert_eq!(context_from(&ends[7]), Some("unknown"));
+    tr.user_message("several", 9);
+    feed!(INIT);
+    feed!(&result_line(2, [5, 0, 100_000], models));
+    assert_eq!(ends[8].context, None);
+    assert_eq!(context_from(&ends[8]), Some("unknown"));
+}
+
+/// The window is the main agent's model's, not the largest of the turn: a main agent on a
+/// 200k model with a subagent on a 1M one reads against 200k. With no window said for the main
+/// agent's model, the window is unknown (the size alone), even when the other models share one,
+/// and so it is when the call is larger than the window said.
+#[test]
+fn claude_context_window_is_the_main_agents_models() {
+    let run = |model: &str, model_usage: Value, input: [u64; 3]| {
+        let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+        tr.user_message("go", 1);
+        let mut lines = vec![INIT.to_string()];
+        lines.extend(call_lines("m1", model, None, input));
+        lines.extend(call_lines(
+            "s1",
+            "claude-opus-5-5",
+            Some("toolu_1"),
+            [9, 0, 300_000],
+        ));
+        lines.push(result_line(1, input, model_usage));
+        lines
+            .iter()
+            .flat_map(|l| tr.translate(l).events)
+            .find_map(|e| match e.body {
+                EventBody::TurnEnded(t) => Some(t.context),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let both = json!({
+        "claude-haiku-4-5-20251001": {"contextWindow": 200_000},
+        "claude-opus-5-5[1m]": {"contextWindow": 1_000_000},
+    });
+    let ctx = |tokens, window| Some(ContextSize { tokens, window });
+    assert_eq!(
+        run("claude-haiku-4-5-20251001", both.clone(), [10, 0, 50_000]),
+        ctx(50_010, Some(200_000))
+    );
+    // `[1m]` on the key, not on the call's model.
+    assert_eq!(
+        run("claude-opus-5-5", both.clone(), [10, 0, 50_000]),
+        ctx(50_010, Some(1_000_000))
+    );
+    // By `canonicalModel`.
+    let canonical = json!({
+        "opus": {"contextWindow": 1_000_000, "canonicalModel": "claude-opus-5-5"},
+        "claude-haiku-4-5-20251001": {"contextWindow": 200_000},
+    });
+    assert_eq!(
+        run("claude-opus-5-5", canonical, [10, 0, 50_000]),
+        ctx(50_010, Some(1_000_000))
+    );
+    assert_eq!(
+        run("claude-sonnet-9", both, [10, 0, 50_000]),
+        ctx(50_010, None)
+    );
+    let other = json!({"claude-haiku-4-5-20251001": {"contextWindow": 200_000}});
+    assert_eq!(
+        run("claude-opus-5-5", other, [10, 0, 50_000]),
+        ctx(50_010, None)
+    );
+    let small = json!({"claude-opus-5-5": {"contextWindow": 200_000}});
+    assert_eq!(
+        run("claude-opus-5-5", small, [10, 0, 250_000]),
+        ctx(250_010, None)
+    );
+    // `m` and `m[1m]` disagree: which one ran is not said.
+    let ambiguous = json!({
+        "claude-opus-5-5": {"contextWindow": 200_000},
+        "claude-opus-5-5[1m]": {"contextWindow": 1_000_000},
+    });
+    assert_eq!(
+        run("claude-opus-5-5", ambiguous, [10, 0, 50_000]),
+        ctx(50_010, None)
+    );
+    // No model said by the call: the window every entry says, not one some leave out.
+    let partial = json!({"main": {}, "child": {"contextWindow": 1_000_000}});
+    assert_eq!(run("", partial, [10, 0, 50_000]), ctx(50_010, None));
+    let shared =
+        json!({"main": {"contextWindow": 1_000_000}, "child": {"contextWindow": 1_000_000}});
+    assert_eq!(
+        run("", shared, [10, 0, 50_000]),
+        ctx(50_010, Some(1_000_000))
+    );
+    // No `modelUsage` at all: the size without a window.
+    assert_eq!(
+        run("claude-opus-5-5", Value::Null, [10, 0, 50_000]),
+        ctx(50_010, None)
+    );
+}
+
+/// One translator across turns: a window it knew of the main agent's model does not stand in
+/// when the turn's entries of that model disagree (`m` and `m[1m]`), nor once a call did not
+/// fit it; and a call that does not say its model is not the previous call's model, in its
+/// turn or in a compaction's after it.
+#[test]
+fn claude_context_window_across_turns() {
+    fn window_of(tr: &mut claude_code::Translator, lines: Vec<String>) -> Option<u64> {
+        lines
+            .iter()
+            .flat_map(|l| tr.translate(l).events)
+            .find_map(|e| match e.body {
+                EventBody::TurnEnded(t) => Some(t.context.and_then(|c| c.window)),
+                _ => None,
+            })
+            .unwrap()
+    }
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    let mut turn = 0;
+    let m = "claude-opus-5-5";
+    let calls = |calls: &[(&str, &str, u64)], model_usage: Value| {
+        let mut lines = vec![INIT.to_string()];
+        for (id, model, size) in calls {
+            lines.extend(call_lines(id, model, None, [10, 0, *size]));
+        }
+        lines.push(result_line(
+            calls.len() as u64,
+            [10, 0, 150_000],
+            model_usage,
+        ));
+        lines
+    };
+    let compaction = |model_usage: Value| {
+        vec![
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#
+                .to_string(),
+            INIT.to_string(),
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":150000,"post_tokens":40000}}"#.to_string(),
+            result_line(0, [0, 0, 0], model_usage),
+        ]
+    };
+
+    turn += 1;
+    tr.user_message("go", turn);
+    let w = window_of(
+        &mut tr,
+        calls(
+            &[("a", m, 150_000)],
+            json!({ m: {"contextWindow": 200_000} }),
+        ),
+    );
+    assert_eq!(w, Some(200_000));
+    // Nothing said of the model: the window known.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("b", m, 150_000)], json!({}))),
+        Some(200_000)
+    );
+    // A call larger than the window known: not that window, now or after a compaction.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("c", m, 250_000)], json!({}))),
+        None
+    );
+    turn += 1;
+    tr.compact_message(turn);
+    assert_eq!(window_of(&mut tr, compaction(json!({}))), None);
+    // Entries that disagree: unknown, and not known after either.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(
+            &mut tr,
+            calls(
+                &[("d", m, 150_000)],
+                json!({ m: {"contextWindow": 200_000} })
+            )
+        ),
+        Some(200_000)
+    );
+    let both = json!({ m: {"contextWindow": 200_000}, "claude-opus-5-5[1m]": {"contextWindow": 1_000_000} });
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(window_of(&mut tr, calls(&[("e", m, 150_000)], both)), None);
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("f", m, 150_000)], json!({}))),
+        None
+    );
+    // A later call that names no model: the turn's models' windows disagree, so unknown, and
+    // so in the compaction after it.
+    let two =
+        json!({ m: {"contextWindow": 200_000}, "claude-haiku-5-5": {"contextWindow": 1_000_000} });
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(
+            &mut tr,
+            calls(&[("g", m, 150_000), ("h", "", 150_000)], two.clone())
+        ),
+        None
+    );
+    turn += 1;
+    tr.compact_message(turn);
+    assert_eq!(window_of(&mut tr, compaction(two.clone())), None);
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("i", m, 150_000)], two)),
+        Some(200_000)
+    );
+}
+
 // --- Codex -----------------------------------------------------------------------------------
 
 /// A request of a method the probe never sent (the background inventory, the usage read):
@@ -300,6 +735,11 @@ fn optional(request: &Value) -> bool {
 /// `thread/compact/start` (`compact`) are checked by method and id against the recording
 /// (the probe opened the thread with params of its own).
 fn codex(name: &str) -> Vec<codex::Emitted> {
+    codex_without(name, |_| false)
+}
+
+/// [`codex`], without the lines from Codex that `skip` picks.
+fn codex_without(name: &str, skip: impl Fn(&Value) -> bool) -> Vec<codex::Emitted> {
     let cfg = SpawnConfig {
         thread: "T1".into(),
         cwd: PathBuf::from("/tmp/sandbox-codex"),
@@ -315,6 +755,9 @@ fn codex(name: &str) -> Vec<codex::Emitted> {
     let mut events = Vec::new();
     let mut turn = 1;
     for (dir, line) in fixture("codex", name) {
+        if dir == "<<" && skip(&parse(&line)) {
+            continue;
+        }
         if dir == "<<" {
             let out = tr.translate(&line);
             assert!(out.fatal.is_none(), "fatal at {line}: {:?}", out.fatal);
@@ -407,6 +850,25 @@ fn codex_manual_compaction_is_the_turn_twr_opened() {
             window
         })
     );
+}
+
+/// A compaction Codex sends no estimate for (the recording without it): how full the context
+/// is after it is unknown, not the count before it, until Codex reports usage again.
+#[test]
+fn codex_compaction_without_an_estimate_leaves_the_context_unknown() {
+    let estimate = |v: &Value| {
+        v["method"] == "thread/tokenUsage/updated"
+            && v["params"]["tokenUsage"]["last"]["inputTokens"] == 0
+            && v["params"]["tokenUsage"]["last"]["outputTokens"] == 0
+    };
+    let events = codex_without("compact_manual", estimate);
+    let bodies = codex_bodies(&events);
+    let c = &compacted(&bodies)[0];
+    assert_eq!((c.pre_tokens, c.post_tokens), (Some(18_548), None));
+    let ends = ended(&bodies);
+    assert!(ends[0].context.is_some());
+    assert_eq!(ends[1].context, None);
+    assert_eq!(ends[2].context.map(|c| c.tokens), Some(18_600));
 }
 
 /// Auto-compactions: at a turn's start and after a tool's output, both `auto`, inside the

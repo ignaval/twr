@@ -2578,6 +2578,9 @@ impl Translator {
                         since: (self.clock)(),
                     });
                 let took = ((self.clock)() - c.since).num_milliseconds();
+                // It replaced the context: its estimate after, unknown without one (the count
+                // before is no longer the context; the next usage report gives it again).
+                self.context = c.post;
                 let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
                     trigger: c.trigger.into(),
                     pre_tokens: c.pre,
