@@ -351,6 +351,12 @@ pub struct ThreadView {
     /// until the `context.compacted`, the end of the turn or of the process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<DateTime<Utc>>,
+    /// The size a compaction that worked without saying what it left replaced (its
+    /// `pre_tokens`), until the next turn end. A turn end recorded before twr forgot such a
+    /// size in the adapters (Grok Build's `/compact`, a Codex compaction without its estimate)
+    /// reports that same size again as how full the context is: not believed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_context: Option<u64>,
     /// Client currently attached.
     pub attached: Option<String>,
     /// Parked.
@@ -501,6 +507,7 @@ impl ThreadView {
                 // Another session starts with a context of its own.
                 if p.session_id.is_some() && p.session_id != self.session_id {
                     self.context = None;
+                    self.replaced_context = None;
                 }
                 self.compacting = None;
                 self.set_session(&p.session_id);
@@ -564,6 +571,7 @@ impl ThreadView {
                     self.session_id = None;
                     self.actual_model = None;
                     self.context = None;
+                    self.replaced_context = None;
                     self.handoff_pending = true;
                 }
             }
@@ -639,7 +647,10 @@ impl ThreadView {
                 if let Some(u) = &p.usage {
                     self.spent.add(u);
                 }
-                if let Some(c) = recorded_context(p).filter(|_| !self.handoff_pending) {
+                let replaced = self.replaced_context.take();
+                let recorded = recorded_context(p)
+                    .map(|c| c.filter(|c| replaced.is_none_or(|stale| c.tokens != stale)));
+                if let Some(c) = recorded.filter(|_| !self.handoff_pending) {
                     self.context = c;
                 }
                 self.compacting = None;
@@ -781,6 +792,7 @@ impl ThreadView {
                 if p.error.is_none() && !self.handoff_pending {
                     let window = self.context.and_then(|c| c.window);
                     self.context = p.post_tokens.map(|tokens| ContextSize { tokens, window });
+                    self.replaced_context = p.pre_tokens.filter(|_| p.post_tokens.is_none());
                 }
             }
             _ => {}
@@ -1888,6 +1900,35 @@ mod tests {
         assert_eq!(v.context, Some(size(30_000)));
         v.apply(&t.event(compacted(None, None)));
         assert_eq!(v.context, None);
+        // A compaction turn recorded before the adapters forgot the size it replaced (Grok
+        // Build's `/compact`: no size after, its end repeating the size before): unknown. The
+        // next turn's size counts again.
+        let sized = |t: &mut ThreadScript, tokens: u64| {
+            let mut ev = t.turn_ended(TurnResult::Completed);
+            if let EventBody::TurnEnded(p) = &mut ev.body {
+                p.context = Some(size(tokens));
+            }
+            ev
+        };
+        let before = |pre: u64| {
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                pre_tokens: Some(pre),
+                ..Default::default()
+            })
+        };
+        v.apply(&sized(&mut t, 25_072));
+        v.apply(&t.event(before(25_072)));
+        assert_eq!(v.context, None);
+        assert_eq!(v.replaced_context, Some(25_072));
+        v.apply(&sized(&mut t, 25_072));
+        assert_eq!((v.context, v.replaced_context), (None, None));
+        v.apply(&sized(&mut t, 25_804));
+        assert_eq!(v.context, Some(size(25_804)));
+        // Another size at the compaction's end is a new one.
+        v.apply(&t.event(before(25_804)));
+        v.apply(&sized(&mut t, 12_000));
+        assert_eq!(v.context, Some(size(12_000)));
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else
