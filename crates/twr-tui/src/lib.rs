@@ -4168,6 +4168,74 @@ mod tests {
         assert_eq!(new_asked.lock().unwrap().len(), 4);
     }
 
+    /// Polling preserves aggregate worker activity with an idle orchestrator, for both
+    /// glance-capable and older hubs. Fresh idle answers clear it; unavailable hubs keep
+    /// the useful reply without showing stale work. Fakes::open refuses hub startup.
+    #[tokio::test]
+    async fn polled_worker_activity_reaches_cards_and_clears() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new();
+        for (i, worker) in ["running", "background", "idle"].into_iter().enumerate() {
+            let active = worker != "idle";
+            let glance = json!({
+                "threads": 1, "running": usize::from(active), "active": active,
+                "orchestrator": {"id": "o", "status": "idle", "preview": "Latest reply."},
+            });
+            for (kind, fake) in [
+                ("new", Fake::Glance(glance)),
+                (
+                    "old",
+                    Fake::Old(
+                        json!([
+                            {"id": "o", "role": "orchestrator", "status": "idle"},
+                            {"id": "w", "status": worker},
+                        ]),
+                        json!([]),
+                    ),
+                ),
+            ] {
+                let name = format!("{kind}-{i}");
+                let (socket, _) = fake_hub(dir.path(), &name, fake);
+                let ws = Fakes([(name.clone(), socket)].into_iter().collect());
+                let polled = poll_tabs(&ws, vec![name.clone()]).await;
+                // Merge successive answers into the same card to exercise stale activity.
+                state.merge_poll(
+                    Some(vec!["work".into()]),
+                    polled
+                        .into_iter()
+                        .map(|p| Polled {
+                            name: "work".into(),
+                            ..p
+                        })
+                        .collect(),
+                );
+                let tab = &state.tabs[0];
+                assert_eq!(sidebar::tab_active(&state, "work"), active);
+                assert_eq!(
+                    sidebar::status_text(state.tab_hub(tab), state.tab_glance(tab).as_ref()).0,
+                    if active { "working" } else { "idle" }
+                );
+                if kind == "new" {
+                    assert!(sidebar::card_lines(&state, tab, 25, false)
+                        .iter()
+                        .any(|l| l.to_string().contains("Latest reply.")));
+                }
+                for unavailable in [TabHub::Busy, TabHub::Stopped] {
+                    state.merge_poll(
+                        None,
+                        vec![Polled {
+                            name: "work".into(),
+                            hub: unavailable,
+                            glance: None,
+                        }],
+                    );
+                    assert!(!sidebar::tab_active(&state, "work"));
+                }
+            }
+        }
+    }
+
     /// Every connection to a workspace's socket checks the hub serves that workspace.
     #[tokio::test]
     async fn every_connection_checks_its_workspace() {

@@ -1,9 +1,9 @@
 //! Workspaces (`twr ws`): separate hubs on this machine, which the TUI switches between, one
 //! connected at a time. The workspace sidebar ([`crate::ui`]) lists them all, each with its
-//! orchestrator's status and last reply ([`Glance`]); where it is not drawn, the tab strip lists
-//! them once there is more than `default`. Alt-1..9, Ctrl-PgUp/PgDn, a click on a sidebar card or
-//! a tab and `/ws <name>` switch. A switch keeps the view of the workspace left ([`SavedView`])
-//! and restores it on coming back.
+//! activity and its orchestrator's last reply ([`Glance`]); where it is not drawn, the tab
+//! strip lists them once there is more than `default`. Alt-1..9, Ctrl-PgUp/PgDn, a click on a
+//! sidebar card or a tab and `/ws <name>` switch. A switch keeps the view of the workspace
+//! left ([`SavedView`]) and restores it on coming back.
 //!
 //! The other workspaces' hubs are asked how they are on a clock of their own ([`PollClock`]):
 //! one `hub.glance` each, a running hub every [`POLL_RUNNING`], one stopped or not answering
@@ -1024,7 +1024,7 @@ impl AppState {
         }
         let threads = self.registry.list();
         let active = threads.iter().any(|t| {
-            !t.parked
+            (t.is_current_orchestrator() || !t.parked)
                 && !(t.is_orchestrator() && t.retired)
                 && ((t.current_turn.is_some() && !t.is_blocked()) || t.own_background())
         });
