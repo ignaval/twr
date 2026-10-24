@@ -92,22 +92,25 @@
 //!
 //! How full the context is (`turn.ended` `context`, [`twr_core::event::ContextSize`]): the
 //! input of the main agent's latest model call in the turn, its `message.usage`
-//! `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` (what Claude's own
-//! `get_context_usage` counts as the context's `totalTokens`; the call's output is not in it),
-//! from its `stream_event` `message_start` or its `assistant` message (one per content block,
-//! the same input in each, the same message id). A subagent's calls (`parent_tool_use_id` set)
-//! are in their own context, and a `<synthetic>` message is no call. Not the `result`'s `usage`: that sums
-//! every call of the turn (a turn of 62 calls of about 110k tokens each reads 6.9M), except for
-//! a turn of one call (`num_turns: 1`), when the two are the same. After a compaction with no
-//! call since, the boundary's `post_tokens`. A turn whose latest call reported no size (or
-//! that called the model, `usage` input above 0, with none of these) has no `context` and says
-//! the size is unknown ([`CONTEXT_UNKNOWN`]); a turn that called none says nothing (the context
-//! is as it was). A turn ended for its missing `result` keeps what it saw of the context. The window is the
-//! `modelUsage[].contextWindow` of the main agent's model (the key, or its `canonicalModel`,
-//! with any `[1m]` suffix ignored, when every such entry says the same window; with no model
-//! known, the one window every model of the turn says), else the last one known of that model,
-//! else unknown: a subagent's model may have another window,
-//! and so does a window smaller than the call (a call never exceeds its model's window).
+//! `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` (what Claude's
+//! own `get_context_usage` counts as the context's `totalTokens`; the call's output is not in
+//! it), from its `stream_event` `message_start` or its `assistant` message (one per content
+//! block, the same input and message id in each). A subagent's calls (`parent_tool_use_id`
+//! set) are in their own context, and a `<synthetic>` message is no call. Not the `result`'s
+//! `usage`: that sums every call of the turn (a turn of 62 calls of about 110k tokens each
+//! reads 6.9M), except for a turn of one call (`num_turns: 1`), when the two are the same.
+//! After a compaction in the turn with no call since, the boundary's `post_tokens`. A turn
+//! whose latest call reported no size, whose compaction said none, or that called the model
+//! (`usage` input above 0) with none of these, has no `context` and says the size is unknown
+//! ([`CONTEXT_UNKNOWN`]); a turn that called none says nothing (the context is as it was). A
+//! turn ended for its missing `result` keeps what it saw of the context.
+//!
+//! The window is the `modelUsage[].contextWindow` of the model of that call (else of the
+//! session's latest call): the entries whose key or `canonicalModel` is that model, any `[1m]`
+//! suffix ignored, when they all say the same; with no model known, the one window every entry
+//! says. When the entries say nothing of it, the last window known of that model; when they
+//! disagree, unknown. A subagent's model may have another window, and so does a window smaller
+//! than the call (a call never exceeds its model's window): unknown too.
 //! `ext.claude.context_from` says where the tokens came from; a `turn.ended` written before twr
 //! read the last call has no such key, and its `context` is the `result`'s `usage`
 //! ([`twr_core::reduce::recorded_context`] tells which of those to trust).
@@ -437,14 +440,13 @@ pub struct Translator {
     compact_turns: std::collections::HashSet<u64>,
     /// The trigger of the compaction under way (`system/status` `compacting` seen, no end yet).
     compacting: Option<String>,
-    /// The context a compaction left, until a model call reports another: what a turn that
-    /// ran no agent call (a manual `/compact`'s) ends with.
-    compacted_to: Option<u64>,
-    /// The main agent's latest model call since the last `result` or compaction: its message
-    /// id and, when it reported it, the tokens of its input ([`call_input`]), how full the
-    /// context was when it was made.
-    last_call: Option<(String, Option<u64>)>,
-    /// The main agent's model, as its latest model call said.
+    /// A compaction since the last `result` and the main agent's last model call, with the
+    /// context it left when it said: what a turn that ran no agent call (a manual
+    /// `/compact`'s) ends with.
+    compacted_to: Option<Option<u64>>,
+    /// The main agent's latest model call since the last `result` or compaction.
+    last_call: Option<Call>,
+    /// The main agent's model, as the latest model call that said it did.
     main_model: Option<String>,
     /// The main agent's model and its context window, as the last `result` that said it did.
     context_window: Option<(String, u64)>,
@@ -1247,7 +1249,7 @@ impl Translator {
                     t => t.to_string(),
                 };
                 self.compacting = None;
-                self.compacted_to = n("post_tokens");
+                self.compacted_to = Some(n("post_tokens"));
                 // The call before it is not the context any more.
                 self.last_call = None;
                 let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
@@ -1567,13 +1569,23 @@ impl Translator {
         }
         let id = str_at(message, "id");
         let tokens = call_input(message);
+        let model = Some(model.to_string()).filter(|m| !m.is_empty());
         match &mut self.last_call {
-            Some((last, size)) if !id.is_empty() && last == id => *size = tokens.or(*size),
-            _ => self.last_call = Some((id.to_string(), tokens)),
+            Some(call) if !id.is_empty() && call.id == id => {
+                call.tokens = tokens.or(call.tokens);
+                call.model = model.clone().or(call.model.take());
+            }
+            _ => {
+                self.last_call = Some(Call {
+                    id: id.to_string(),
+                    tokens,
+                    model: model.clone(),
+                })
+            }
         }
         self.compacted_to = None;
-        if !model.is_empty() {
-            self.main_model = Some(model.to_string());
+        if model.is_some() {
+            self.main_model = model;
         }
     }
 
@@ -2072,28 +2084,49 @@ impl Translator {
         // left, else the `result`'s usage when it is one call's. Never the usage of a turn of
         // several calls: their sum is what the turn spent, not what the context holds.
         let one_call = v.get("num_turns").and_then(Value::as_u64) == Some(1) && usage.input > 0;
-        let (from, tokens) = match (self.last_call.take(), self.compacted_to) {
-            (Some((_, Some(tokens))), _) => (CONTEXT_FROM_CALL, Some(tokens)),
+        let call = self.last_call.take();
+        let (from, tokens) = match (&call, self.compacted_to.take()) {
+            (
+                Some(Call {
+                    tokens: Some(t), ..
+                }),
+                _,
+            ) => (CONTEXT_FROM_CALL, Some(*t)),
             (Some(_), _) | (None, None) if one_call => (CONTEXT_FROM_CALL, Some(usage.input)),
             (Some(_), _) => (CONTEXT_UNKNOWN, None),
-            (None, Some(tokens)) => (CONTEXT_FROM_COMPACTION, Some(tokens)),
+            (None, Some(Some(t))) => (CONTEXT_FROM_COMPACTION, Some(t)),
+            (None, Some(None)) => (CONTEXT_UNKNOWN, None),
             (None, None) if usage.input > 0 => (CONTEXT_UNKNOWN, None),
             (None, None) => ("", None),
         };
-        let model = self.main_model.clone().or_else(|| {
+        // The model of the call (a call that did not say has none), else the session's.
+        let model = match call {
+            Some(c) => c.model,
+            None => self.main_model.clone(),
+        }
+        .or_else(|| {
             // One model in the turn's `modelUsage`: the main agent's.
             let models = v["modelUsage"].as_object()?;
             (models.len() == 1).then(|| models.keys().next().cloned())?
         });
-        let window = context_window(&v["modelUsage"], model.as_deref());
-        if let (Some(m), Some(w)) = (&model, window) {
-            self.context_window = Some((m.clone(), w));
-        }
-        // A turn whose `modelUsage` lacks the window: the last one known of the same model.
-        let window = window.or_else(|| {
-            let (m, w) = self.context_window.as_ref()?;
-            (model.as_ref().is_none_or(|x| x == m)).then_some(*w)
-        });
+        let window = match (context_window(&v["modelUsage"], model.as_deref()), &model) {
+            (Window::Said(w), Some(m)) => {
+                self.context_window = Some((m.clone(), w));
+                Some(w)
+            }
+            (Window::Said(w), None) => Some(w),
+            // A turn whose `modelUsage` lacks the window: the last one known of that model.
+            (Window::Unsaid, Some(m)) => self
+                .context_window
+                .as_ref()
+                .filter(|(known, _)| known == m)
+                .map(|(_, w)| *w),
+            (Window::Unsaid, None) => None,
+            (Window::Conflicting, _) => {
+                self.context_window = None;
+                None
+            }
+        };
         let context = tokens.map(|tokens| twr_core::event::ContextSize {
             tokens,
             // A call fits its model's window: a smaller one is another model's.
@@ -2306,11 +2339,34 @@ fn call_input(message: &Value) -> Option<u64> {
     (tokens > 0).then_some(tokens)
 }
 
+/// The main agent's model call the translator saw last.
+#[derive(Debug, Clone)]
+struct Call {
+    /// Its API message id: frames of one call share it.
+    id: String,
+    /// The tokens of its input ([`call_input`]), how full the context was when it was made,
+    /// when it said.
+    tokens: Option<u64>,
+    /// Its model, when it said.
+    model: Option<String>,
+}
+
+/// What a `result`'s `modelUsage` says of a model's context window ([`context_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// This window.
+    Said(u64),
+    /// Nothing: no entry of the model, or none with a window.
+    Unsaid,
+    /// Entries of the model disagree (`m` and `m[1m]`), or only some say one.
+    Conflicting,
+}
+
 /// The context window of `model` in a `result`'s `modelUsage`: the `contextWindow` of the
 /// entries whose key or `canonicalModel` is that model (a `[1m]`-like suffix ignored), when
 /// they all say the same (`m` and `m[1m]` may differ). With no model known, the window every
-/// entry says. None otherwise: another model's (a subagent's) is not the main agent's.
-fn context_window(model_usage: &Value, model: Option<&str>) -> Option<u64> {
+/// entry says: another model's (a subagent's) is not the main agent's.
+fn context_window(model_usage: &Value, model: Option<&str>) -> Window {
     let base = |m: &str| m.split('[').next().unwrap_or(m).trim().to_string();
     let window = |m: &Value| {
         m.get("contextWindow")
@@ -2324,13 +2380,19 @@ fn context_window(model_usage: &Value, model: Option<&str>) -> Option<u64> {
                 .is_some_and(|c| base(c) == model)
     };
     let model = model.map(base);
-    let mut windows = model_usage
-        .as_object()?
-        .iter()
+    let windows: Vec<Option<u64>> = model_usage
+        .as_object()
+        .into_iter()
+        .flatten()
         .filter(|(k, m)| model.as_deref().is_none_or(|model| is(model, k, m)))
-        .map(|(_, m)| window(m));
-    let first = windows.next()??;
-    windows.all(|w| w == Some(first)).then_some(first)
+        .map(|(_, m)| window(m))
+        .collect();
+    match windows.first() {
+        None => Window::Unsaid,
+        _ if windows.iter().all(Option::is_none) => Window::Unsaid,
+        Some(Some(first)) if windows.iter().all(|w| *w == Some(*first)) => Window::Said(*first),
+        Some(_) => Window::Conflicting,
+    }
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {

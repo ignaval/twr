@@ -1000,7 +1000,8 @@ data, raw?}`. `source` is `adapter:<name>`, `hub`, `user:<client>`, `orchestrato
   `context`); one recorded by an earlier twr has no such key and the turn's summed usage as
   its size, which the thread JSON trusts only for a turn of one call
   (`ext.claude.num_turns: 1`) or none. The thread JSON's `context` is the latest trusted size,
-  absent when unknown, updated by a compaction's `post_tokens`. A compaction the user asked for (`thread.compact`) is a turn whose
+  absent when unknown, updated by a compaction's `post_tokens` (unknown after a compaction that
+  does not say). A compaction the user asked for (`thread.compact`) is a turn whose
   `turn.started` has `prompt: "/compact"`, `from: user` and `ext.twr.compact: true`; the thread
   JSON says `current_turn_compact` while it runs, and its end leaves `last_turn` as it was.
 - **Disk**: `worktree.disk{bytes, build_bytes, partial?}` (source `hub`) records what a thread's worktree takes when its box measured it and it moved by more than 50 MB or 5%; `worktree.trimmed{deleted, freed, notes?}` (source: whoever asked) what a trim deleted. The thread JSON's `disk` is the latest measurement less what trims freed since, and `trimmed` `[at, freed]`. A disk card is a question on `hub` with `ext.twr.disk: {box, free, threshold, threads: [{thread, name, build_bytes}]}` and options `Trim` / `Not now`; only the user answers it (`relay_forbidden` for the orchestrator).

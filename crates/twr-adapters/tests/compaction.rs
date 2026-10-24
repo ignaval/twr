@@ -473,9 +473,47 @@ fn claude_context_is_the_latest_calls_input_not_the_turns_spend() {
         feed!(&line);
     }
     feed!(&bare("m12"));
-    feed!(&result_line(2, [0, 0, 0], models));
+    feed!(&result_line(2, [0, 0, 0], models.clone()));
     assert_eq!(ends[4].context, None);
     assert_eq!(context_from(&ends[4]), Some("unknown"));
+
+    // A compaction's size is its turn's: a later turn showing no call reads its own `result`
+    // (one call: that call's input), not what the compaction left.
+    let compact = |tr: &mut claude_code::Translator, turn: u64, post: &str| {
+        tr.compact_message(turn);
+        let boundary = format!(
+            r#"{{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{{"trigger":"manual","pre_tokens":90000{post}}}}}"#
+        );
+        [
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#
+                .to_string(),
+            INIT.to_string(),
+            boundary,
+        ]
+    };
+    for line in compact(&mut tr, 6, r#","post_tokens":30000"#) {
+        feed!(&line);
+    }
+    feed!(&result_line(0, [0, 0, 0], models.clone()));
+    assert_eq!(ends[5].context.map(|c| c.tokens), Some(30_000));
+    tr.user_message("result only", 7);
+    feed!(INIT);
+    feed!(&result_line(1, [5, 0, 80_000], models.clone()));
+    assert_eq!(ends[6].context.map(|c| c.tokens), Some(80_005));
+    assert_eq!(context_from(&ends[6]), Some("last_call"));
+    // A compaction that does not say what it left: unknown, not the size before it; and a
+    // later turn of several calls showing none is unknown too.
+    for line in compact(&mut tr, 8, "") {
+        feed!(&line);
+    }
+    feed!(&result_line(0, [0, 0, 0], models.clone()));
+    assert_eq!(ends[7].context, None);
+    assert_eq!(context_from(&ends[7]), Some("unknown"));
+    tr.user_message("several", 9);
+    feed!(INIT);
+    feed!(&result_line(2, [5, 0, 100_000], models));
+    assert_eq!(ends[8].context, None);
+    assert_eq!(context_from(&ends[8]), Some("unknown"));
 }
 
 /// The window is the main agent's model's, not the largest of the turn: a main agent on a
@@ -565,6 +603,52 @@ fn claude_context_window_is_the_main_agents_models() {
         run("claude-opus-5-5", Value::Null, [10, 0, 50_000]),
         ctx(50_010, None)
     );
+}
+
+/// One translator across turns: a window it knew of the main agent's model does not stand in
+/// when the turn's entries of that model disagree (`m` and `m[1m]`); and a call that does not
+/// say its model is not the previous call's model.
+#[test]
+fn claude_context_window_across_turns() {
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    let mut turn = 0;
+    let mut run = |calls: &[(&str, &str)], model_usage: Value| {
+        turn += 1;
+        tr.user_message("go", turn);
+        let mut lines = vec![INIT.to_string()];
+        for (id, model) in calls {
+            lines.extend(call_lines(id, model, None, [10, 0, 150_000]));
+        }
+        lines.push(result_line(
+            calls.len() as u64,
+            [10, 0, 150_000],
+            model_usage,
+        ));
+        lines
+            .iter()
+            .flat_map(|l| tr.translate(l).events)
+            .find_map(|e| match e.body {
+                EventBody::TurnEnded(t) => Some(t.context.and_then(|c| c.window)),
+                _ => None,
+            })
+            .unwrap()
+    };
+    let m = "claude-opus-5-5";
+    assert_eq!(
+        run(&[("a", m)], json!({ m: {"contextWindow": 200_000} })),
+        Some(200_000)
+    );
+    // Nothing said of the model: the window known.
+    assert_eq!(run(&[("b", m)], json!({})), Some(200_000));
+    // Entries that disagree: unknown, and not known after either.
+    let both = json!({ m: {"contextWindow": 200_000}, "claude-opus-5-5[1m]": {"contextWindow": 1_000_000} });
+    assert_eq!(run(&[("c", m)], both), None);
+    assert_eq!(run(&[("d", m)], json!({})), None);
+    // A later call that names no model: the turn's models' windows disagree, so unknown.
+    let two =
+        json!({ m: {"contextWindow": 200_000}, "claude-haiku-5-5": {"contextWindow": 1_000_000} });
+    assert_eq!(run(&[("e", m), ("f", "")], two.clone()), None);
+    assert_eq!(run(&[("g", m)], two), Some(200_000));
 }
 
 // --- Codex -----------------------------------------------------------------------------------

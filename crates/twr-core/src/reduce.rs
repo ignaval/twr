@@ -340,7 +340,8 @@ pub struct ThreadView {
     #[serde(default, skip_serializing_if = "crate::usage::Spent::is_empty")]
     pub spent: crate::usage::Spent,
     /// How full its session's context is: the latest `turn.ended` `context`, then what a
-    /// compaction since left (`context.compacted` `post_tokens`, the window kept). A new
+    /// compaction since left (`context.compacted` `post_tokens`, the window kept; unknown when
+    /// it did not say). A new
     /// session (a `thread.started` with another session id, a move to another runtime) has
     /// none until its first turn ends, and a turn end whose size cannot be trusted
     /// ([`recorded_context`]) leaves it unknown.
@@ -775,12 +776,11 @@ impl ThreadView {
             EventBody::ContextCompacting(_) => self.compacting = Some(ev.ts),
             EventBody::ContextCompacted(p) => {
                 self.compacting = None;
-                if let (None, Some(post), false) = (&p.error, p.post_tokens, self.handoff_pending) {
+                // A compaction that worked replaced the context: what it left, unknown when it
+                // did not say.
+                if p.error.is_none() && !self.handoff_pending {
                     let window = self.context.and_then(|c| c.window);
-                    self.context = Some(ContextSize {
-                        tokens: post,
-                        window,
-                    });
+                    self.context = p.post_tokens.map(|tokens| ContextSize { tokens, window });
                 }
             }
             _ => {}
@@ -1815,7 +1815,8 @@ mod tests {
     /// usage: trusted for a turn of one call or none (a compaction's), unknown for a turn of
     /// several (the 693% card: 62 calls, 6.9M of a 1M window), whatever the earlier size was. A
     /// turn end that says its size is unknown makes it so; one that says nothing keeps it.
-    /// Other runtimes' sizes are taken as they are.
+    /// Other runtimes' sizes are taken as they are. A compaction that worked sets what it left,
+    /// unknown when it does not say.
     #[test]
     fn a_claude_turns_recorded_sum_is_no_context_size() {
         use serde_json::json;
@@ -1871,6 +1872,22 @@ mod tests {
         // Another runtime's size is its own.
         v.apply(&ended(500_000, Some(120_000), None));
         assert_eq!(v.context, Some(size(120_000)));
+        // A compaction replaces it with what it left, the window kept; one that failed leaves
+        // it; one that worked without saying makes it unknown.
+        let compacted = |post: Option<u64>, error: Option<&str>| {
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                post_tokens: post,
+                error: error.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        v.apply(&t.event(compacted(Some(30_000), None)));
+        assert_eq!(v.context, Some(size(30_000)));
+        v.apply(&t.event(compacted(None, Some("too_few_groups"))));
+        assert_eq!(v.context, Some(size(30_000)));
+        v.apply(&t.event(compacted(None, None)));
+        assert_eq!(v.context, None);
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else
