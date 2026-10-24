@@ -352,9 +352,11 @@ pub struct ThreadView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<DateTime<Utc>>,
     /// The size a compaction that worked without saying what it left replaced (its
-    /// `pre_tokens`), until the next turn end. A turn end recorded before twr forgot such a
-    /// size in the adapters (Grok Build's `/compact`, a Codex compaction without its estimate)
-    /// reports that same size again as how full the context is: not believed.
+    /// `pre_tokens`, else the size known before it), until a size is believed again or the
+    /// session changes. A turn end recorded before twr forgot such a size in the adapters
+    /// (Grok Build's `/compact` and the commands after it, a Codex compaction without its
+    /// estimate) reports that same size again as how full the context is: not believed, unless
+    /// it says it measured a model call (`ext.claude.context_from`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_context: Option<u64>,
     /// Client currently attached.
@@ -647,10 +649,19 @@ impl ThreadView {
                 if let Some(u) = &p.usage {
                     self.spent.add(u);
                 }
-                let replaced = self.replaced_context.take();
-                let recorded = recorded_context(p)
-                    .map(|c| c.filter(|c| replaced.is_none_or(|stale| c.tokens != stale)));
+                let measured = p
+                    .ext
+                    .as_ref()
+                    .and_then(|e| e.get("claude"))
+                    .is_some_and(|c| c.get("context_from").is_some());
+                let stale = |c: &ContextSize| {
+                    !measured && self.replaced_context.is_some_and(|t| t == c.tokens)
+                };
+                let recorded = recorded_context(p).map(|c| c.filter(|c| !stale(c)));
                 if let Some(c) = recorded.filter(|_| !self.handoff_pending) {
+                    if c.is_some() {
+                        self.replaced_context = None;
+                    }
                     self.context = c;
                 }
                 self.compacting = None;
@@ -791,8 +802,9 @@ impl ThreadView {
                 // did not say.
                 if p.error.is_none() && !self.handoff_pending {
                     let window = self.context.and_then(|c| c.window);
+                    let before = p.pre_tokens.or(self.context.map(|c| c.tokens));
                     self.context = p.post_tokens.map(|tokens| ContextSize { tokens, window });
-                    self.replaced_context = p.pre_tokens.filter(|_| p.post_tokens.is_none());
+                    self.replaced_context = before.filter(|_| p.post_tokens.is_none());
                 }
             }
             _ => {}
@@ -1921,14 +1933,35 @@ mod tests {
         v.apply(&t.event(before(25_072)));
         assert_eq!(v.context, None);
         assert_eq!(v.replaced_context, Some(25_072));
+        // Its end, and a command's after it (`/context`), repeat it: still unknown, across a
+        // checkpoint too.
         v.apply(&sized(&mut t, 25_072));
-        assert_eq!((v.context, v.replaced_context), (None, None));
+        v = serde_json::from_value(serde_json::to_value(&v).unwrap()).unwrap();
+        v.apply(&sized(&mut t, 25_072));
+        assert_eq!((v.context, v.replaced_context), (None, Some(25_072)));
         v.apply(&sized(&mut t, 25_804));
-        assert_eq!(v.context, Some(size(25_804)));
+        assert_eq!((v.context, v.replaced_context), (Some(size(25_804)), None));
         // Another size at the compaction's end is a new one.
         v.apply(&t.event(before(25_804)));
         v.apply(&sized(&mut t, 12_000));
         assert_eq!(v.context, Some(size(12_000)));
+        // A compaction that says neither size: the one known before it.
+        v.apply(&t.event(EventBody::ContextCompacted(ContextCompacted {
+            trigger: "manual".into(),
+            ..Default::default()
+        })));
+        assert_eq!(v.replaced_context, Some(12_000));
+        v.apply(&sized(&mut t, 12_000));
+        assert_eq!(v.context, None);
+        // A Claude Code call measured after it may hold that same size.
+        let mut fresh = sized(&mut t, 12_000);
+        if let EventBody::TurnEnded(p) = &mut fresh.body {
+            let mut m = JsonMap::new();
+            m.insert("claude".into(), json!({"context_from": "last_call"}));
+            p.ext = Some(m);
+        }
+        v.apply(&fresh);
+        assert_eq!((v.context, v.replaced_context), (Some(size(12_000)), None));
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else
