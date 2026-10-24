@@ -913,9 +913,9 @@ impl<D: Dialect> Translator<D> {
                 elapsed_ms,
             } => {
                 let (trigger, pre) = self.compacting.take().unwrap_or((trigger, None));
-                if after.is_some() {
-                    self.context = after;
-                }
+                // It replaced the context: what it left, unknown when it did not say (the
+                // size before is no longer the context).
+                self.context = after;
                 EventBody::ContextCompacted(twr_core::event::ContextCompacted {
                     trigger: trigger.into(),
                     pre_tokens: before.or(pre),

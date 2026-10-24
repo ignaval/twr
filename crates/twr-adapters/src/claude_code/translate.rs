@@ -446,7 +446,7 @@ pub struct Translator {
     compacted_to: Option<Option<u64>>,
     /// The main agent's latest model call since the last `result` or compaction.
     last_call: Option<Call>,
-    /// The main agent's model, as the latest model call that said it did.
+    /// The main agent's model, as its latest model call said (none: it did not say).
     main_model: Option<String>,
     /// The main agent's model and its context window, as the last `result` that said it did.
     context_window: Option<(String, u64)>,
@@ -1584,9 +1584,8 @@ impl Translator {
             }
         }
         self.compacted_to = None;
-        if model.is_some() {
-            self.main_model = model;
-        }
+        // The session's model is the latest call's, unknown when it did not say.
+        self.main_model = self.last_call.as_ref().and_then(|c| c.model.clone());
     }
 
     fn on_user(&mut self, v: &Value, line: &str, out: &mut Translated) {
@@ -2109,29 +2108,34 @@ impl Translator {
             let models = v["modelUsage"].as_object()?;
             (models.len() == 1).then(|| models.keys().next().cloned())?
         });
-        let window = match (context_window(&v["modelUsage"], model.as_deref()), &model) {
-            (Window::Said(w), Some(m)) => {
-                self.context_window = Some((m.clone(), w));
-                Some(w)
-            }
-            (Window::Said(w), None) => Some(w),
+        let said = context_window(&v["modelUsage"], model.as_deref());
+        let window = match (said, &model) {
+            (Window::Said(w), _) => Some(w),
             // A turn whose `modelUsage` lacks the window: the last one known of that model.
             (Window::Unsaid, Some(m)) => self
                 .context_window
                 .as_ref()
                 .filter(|(known, _)| known == m)
                 .map(|(_, w)| *w),
-            (Window::Unsaid, None) => None,
-            (Window::Conflicting, _) => {
-                self.context_window = None;
-                None
-            }
+            (Window::Unsaid, None) | (Window::Conflicting, _) => None,
         };
-        let context = tokens.map(|tokens| twr_core::event::ContextSize {
-            tokens,
-            // A call fits its model's window: a smaller one is another model's.
-            window: window.filter(|w| tokens <= *w),
-        });
+        // A call fits its model's window: a smaller one is another model's, never kept.
+        let window = window.filter(|w| tokens.is_none_or(|t| t <= *w));
+        // Entries that disagree, or a window the call did not fit (said now, or the one known
+        // of its model): that model's window is not known any more.
+        let forget = match said {
+            Window::Said(_) => window.is_none(),
+            Window::Conflicting => true,
+            Window::Unsaid => model.is_some() && tokens.is_some() && window.is_none(),
+        };
+        let ours = |(known, _): &(String, u64)| model.as_ref().is_none_or(|m| m == known);
+        if forget && self.context_window.as_ref().is_some_and(ours) {
+            self.context_window = None;
+        }
+        if let (Window::Said(_), Some(w), Some(m)) = (said, window, &model) {
+            self.context_window = Some((m.clone(), w));
+        }
+        let context = tokens.map(|tokens| twr_core::event::ContextSize { tokens, window });
         if let Some(t) = turn {
             self.compact_turns.remove(&t);
         }

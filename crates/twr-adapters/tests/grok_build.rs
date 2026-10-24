@@ -528,8 +528,8 @@ fn real_auto_compaction_is_recorded() {
 
 /// grok 1.0.62's `/compact`: a turn of its own, whose only sign is an
 /// `auto_compact_completed` with counters that do not hold (left unknown: the size before is
-/// the last one known), and a result with `_meta.totalTokens: 0` (no gauge: the context stays
-/// the last one known).
+/// the last one known), and a result with `_meta.totalTokens: 0` (no gauge: how full the
+/// context is after the compaction is unknown, not the size before it).
 #[test]
 fn real_manual_compaction_is_its_own_turn() {
     let r = replay_lines(
@@ -571,7 +571,9 @@ fn real_manual_compaction_is_its_own_turn() {
     assert_eq!(starts[0].trigger.as_deref(), Some("manual"));
     let ends = ended(&r.events);
     assert!(ends.iter().all(|e| e.result == TurnResult::Completed));
-    assert_eq!(ends[1].context, ends[0].context);
+    assert!(ends[0].context.is_some());
+    assert_eq!(ends[1].context, None);
+    assert_eq!(ends[2].context.map(|c| c.tokens), Some(25_804));
 }
 
 /// The compaction prompt is grok's `/compact`; a generic ACP agent has none.

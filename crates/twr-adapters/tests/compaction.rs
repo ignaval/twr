@@ -606,24 +606,12 @@ fn claude_context_window_is_the_main_agents_models() {
 }
 
 /// One translator across turns: a window it knew of the main agent's model does not stand in
-/// when the turn's entries of that model disagree (`m` and `m[1m]`); and a call that does not
-/// say its model is not the previous call's model.
+/// when the turn's entries of that model disagree (`m` and `m[1m]`), nor once a call did not
+/// fit it; and a call that does not say its model is not the previous call's model, in its
+/// turn or in a compaction's after it.
 #[test]
 fn claude_context_window_across_turns() {
-    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
-    let mut turn = 0;
-    let mut run = |calls: &[(&str, &str)], model_usage: Value| {
-        turn += 1;
-        tr.user_message("go", turn);
-        let mut lines = vec![INIT.to_string()];
-        for (id, model) in calls {
-            lines.extend(call_lines(id, model, None, [10, 0, 150_000]));
-        }
-        lines.push(result_line(
-            calls.len() as u64,
-            [10, 0, 150_000],
-            model_usage,
-        ));
+    fn window_of(tr: &mut claude_code::Translator, lines: Vec<String>) -> Option<u64> {
         lines
             .iter()
             .flat_map(|l| tr.translate(l).events)
@@ -632,23 +620,104 @@ fn claude_context_window_across_turns() {
                 _ => None,
             })
             .unwrap()
-    };
+    }
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    let mut turn = 0;
     let m = "claude-opus-5-5";
+    let calls = |calls: &[(&str, &str, u64)], model_usage: Value| {
+        let mut lines = vec![INIT.to_string()];
+        for (id, model, size) in calls {
+            lines.extend(call_lines(id, model, None, [10, 0, *size]));
+        }
+        lines.push(result_line(
+            calls.len() as u64,
+            [10, 0, 150_000],
+            model_usage,
+        ));
+        lines
+    };
+    let compaction = |model_usage: Value| {
+        vec![
+            r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#
+                .to_string(),
+            INIT.to_string(),
+            r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":150000,"post_tokens":40000}}"#.to_string(),
+            result_line(0, [0, 0, 0], model_usage),
+        ]
+    };
+
+    turn += 1;
+    tr.user_message("go", turn);
+    let w = window_of(
+        &mut tr,
+        calls(
+            &[("a", m, 150_000)],
+            json!({ m: {"contextWindow": 200_000} }),
+        ),
+    );
+    assert_eq!(w, Some(200_000));
+    // Nothing said of the model: the window known.
+    turn += 1;
+    tr.user_message("go", turn);
     assert_eq!(
-        run(&[("a", m)], json!({ m: {"contextWindow": 200_000} })),
+        window_of(&mut tr, calls(&[("b", m, 150_000)], json!({}))),
         Some(200_000)
     );
-    // Nothing said of the model: the window known.
-    assert_eq!(run(&[("b", m)], json!({})), Some(200_000));
+    // A call larger than the window known: not that window, now or after a compaction.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("c", m, 250_000)], json!({}))),
+        None
+    );
+    turn += 1;
+    tr.compact_message(turn);
+    assert_eq!(window_of(&mut tr, compaction(json!({}))), None);
     // Entries that disagree: unknown, and not known after either.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(
+            &mut tr,
+            calls(
+                &[("d", m, 150_000)],
+                json!({ m: {"contextWindow": 200_000} })
+            )
+        ),
+        Some(200_000)
+    );
     let both = json!({ m: {"contextWindow": 200_000}, "claude-opus-5-5[1m]": {"contextWindow": 1_000_000} });
-    assert_eq!(run(&[("c", m)], both), None);
-    assert_eq!(run(&[("d", m)], json!({})), None);
-    // A later call that names no model: the turn's models' windows disagree, so unknown.
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(window_of(&mut tr, calls(&[("e", m, 150_000)], both)), None);
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("f", m, 150_000)], json!({}))),
+        None
+    );
+    // A later call that names no model: the turn's models' windows disagree, so unknown, and
+    // so in the compaction after it.
     let two =
         json!({ m: {"contextWindow": 200_000}, "claude-haiku-5-5": {"contextWindow": 1_000_000} });
-    assert_eq!(run(&[("e", m), ("f", "")], two.clone()), None);
-    assert_eq!(run(&[("g", m)], two), Some(200_000));
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(
+            &mut tr,
+            calls(&[("g", m, 150_000), ("h", "", 150_000)], two.clone())
+        ),
+        None
+    );
+    turn += 1;
+    tr.compact_message(turn);
+    assert_eq!(window_of(&mut tr, compaction(two.clone())), None);
+    turn += 1;
+    tr.user_message("go", turn);
+    assert_eq!(
+        window_of(&mut tr, calls(&[("i", m, 150_000)], two)),
+        Some(200_000)
+    );
 }
 
 // --- Codex -----------------------------------------------------------------------------------
@@ -666,6 +735,11 @@ fn optional(request: &Value) -> bool {
 /// `thread/compact/start` (`compact`) are checked by method and id against the recording
 /// (the probe opened the thread with params of its own).
 fn codex(name: &str) -> Vec<codex::Emitted> {
+    codex_without(name, |_| false)
+}
+
+/// [`codex`], without the lines from Codex that `skip` picks.
+fn codex_without(name: &str, skip: impl Fn(&Value) -> bool) -> Vec<codex::Emitted> {
     let cfg = SpawnConfig {
         thread: "T1".into(),
         cwd: PathBuf::from("/tmp/sandbox-codex"),
@@ -681,6 +755,9 @@ fn codex(name: &str) -> Vec<codex::Emitted> {
     let mut events = Vec::new();
     let mut turn = 1;
     for (dir, line) in fixture("codex", name) {
+        if dir == "<<" && skip(&parse(&line)) {
+            continue;
+        }
         if dir == "<<" {
             let out = tr.translate(&line);
             assert!(out.fatal.is_none(), "fatal at {line}: {:?}", out.fatal);
@@ -773,6 +850,25 @@ fn codex_manual_compaction_is_the_turn_twr_opened() {
             window
         })
     );
+}
+
+/// A compaction Codex sends no estimate for (the recording without it): how full the context
+/// is after it is unknown, not the count before it, until Codex reports usage again.
+#[test]
+fn codex_compaction_without_an_estimate_leaves_the_context_unknown() {
+    let estimate = |v: &Value| {
+        v["method"] == "thread/tokenUsage/updated"
+            && v["params"]["tokenUsage"]["last"]["inputTokens"] == 0
+            && v["params"]["tokenUsage"]["last"]["outputTokens"] == 0
+    };
+    let events = codex_without("compact_manual", estimate);
+    let bodies = codex_bodies(&events);
+    let c = &compacted(&bodies)[0];
+    assert_eq!((c.pre_tokens, c.post_tokens), (Some(18_548), None));
+    let ends = ended(&bodies);
+    assert!(ends[0].context.is_some());
+    assert_eq!(ends[1].context, None);
+    assert_eq!(ends[2].context.map(|c| c.tokens), Some(18_600));
 }
 
 /// Auto-compactions: at a turn's start and after a tool's output, both `auto`, inside the
