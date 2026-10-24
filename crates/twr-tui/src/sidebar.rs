@@ -1,5 +1,5 @@
 //! The workspace sidebar: a card per workspace (`default` and every `twr ws` workspace) with
-//! its orchestrator's status and the start of its latest reply ([`crate::workspace::Glance`]),
+//! its activity and the start of its orchestrator's latest reply ([`crate::workspace::Glance`]),
 //! whether anything there works, and the counts the tab strip shows; then `+ New workspace`
 //! and `⚙ Settings`. The current workspace's card is highlighted; a tap on a card switches to
 //! that workspace, as its tab does.
@@ -30,9 +30,6 @@ pub const DOCK_WIDTH: u16 = 26;
 pub const DOCK_MIN_WIDTH: u16 = 120;
 /// Widest the drawer gets.
 const DRAWER_MAX_WIDTH: u16 = 34;
-/// Rows of a workspace's card: its name, its orchestrator's status, two of its reply, and a
-/// blank row after it.
-const CARD_ROWS: usize = 5;
 /// Rows of a card's reply.
 const PREVIEW_ROWS: usize = 2;
 
@@ -129,6 +126,8 @@ pub fn render_list(
         }
     }
     let fit = usize::from(cards_area.height);
+    // In a tiny viewport leave room for the card itself rather than two arrows.
+    let arrows = fit > 2;
     let max = rows.len().saturating_sub(fit);
     let mut start = state.view.ws_scroll.min(max);
     // The card the keys select, else the current one when nothing was scrolled, stays in view;
@@ -147,10 +146,18 @@ pub fn render_list(
             rows.iter().position(|(_, r)| r.as_ref() == Some(&keep)),
             rows.iter().rposition(|(_, r)| r.as_ref() == Some(&keep)),
         ) {
-            if first < start {
-                start = first;
-            } else if last >= start + fit {
-                start = (last + 1).saturating_sub(fit).min(first);
+            // The final row is padding; keep the content, including its name, clear of the
+            // arrows that replace the viewport's edge rows. If it cannot all fit, show its
+            // beginning. Recomputed from the rendered rows on every resize/content change.
+            let last = last.saturating_sub(1).max(first);
+            let head = first.saturating_sub(usize::from(arrows && first > 0));
+            let top = usize::from(arrows && start > 0);
+            let bottom = usize::from(arrows && start + fit < rows.len());
+            if first < start + top {
+                start = head.min(max);
+            } else if last >= start + fit.saturating_sub(bottom) {
+                let after = last + 1 + usize::from(arrows && last + 1 < rows.len());
+                start = after.saturating_sub(fit).min(head).min(max);
             }
         }
     }
@@ -158,7 +165,7 @@ pub fn render_list(
     panes.ws_start = start;
     let mut shown: Vec<ListRow> = rows.iter().skip(start).take(fit).cloned().collect();
     let dim = Style::default().fg(Color::DarkGray);
-    if start > 0 {
+    if arrows && start > 0 {
         if let Some(first) = shown.first_mut() {
             *first = (
                 Line::from(Span::styled(format!("{:^width$}", "↑ more"), dim)),
@@ -166,7 +173,7 @@ pub fn render_list(
             );
         }
     }
-    if start + fit < rows.len() {
+    if arrows && start + fit < rows.len() {
         if let Some(last) = shown.last_mut() {
             *last = (
                 Line::from(Span::styled(format!("{:^width$}", "↓ more"), dim)),
@@ -239,10 +246,11 @@ pub(crate) fn tab_active(state: &AppState, name: &str) -> bool {
     })
 }
 
-/// Workspace `tab`'s card, `width` columns wide, [`CARD_ROWS`] rows: its name with the icon
+/// Workspace `tab`'s card, `width` columns wide: its name with the icon
 /// of what works there (`○` for a stopped hub) and its badges (`⚠2` waiting on you, `●3`
-/// threads running); its orchestrator's status; the start of its latest reply, cut with `…`;
-/// a blank row. The current workspace's name row is reversed, as its tab is, and its other
+/// threads running); its workspace's status, wrapped; the start of its orchestrator's latest
+/// reply on only the rows it needs, cut with `…`; a blank separator. The current workspace's
+/// name row is reversed, as its tab is, and its other
 /// rows marked at their left; the one the keys select (`selected`) is filled as a selected
 /// card is.
 pub fn card_lines(state: &AppState, tab: &Tab, width: usize, selected: bool) -> Vec<Line<'static>> {
@@ -297,22 +305,22 @@ pub fn card_lines(state: &AppState, tab: &Tab, width: usize, selected: bool) -> 
     head.push(Span::styled(" ", name_style));
     let (status, status_style) = status_text(hub, glance.as_ref());
     let text_room = width.saturating_sub(3);
-    let mut lines = vec![
-        Line::from(head),
-        Line::from(vec![
-            mark.clone(),
-            Span::raw("  "),
-            Span::styled(crate::ui::truncate_cells(&status, text_room), status_style),
-        ]),
-    ];
+    let mut lines = vec![Line::from(head)];
+    if text_room > 0 {
+        for line in crate::ui::wrap_line(Line::from(Span::styled(status, status_style)), text_room)
+        {
+            let mut spans = vec![mark.clone(), Span::raw("  ")];
+            spans.extend(line.spans);
+            lines.push(Line::from(spans));
+        }
+    }
     let preview = glance
         .as_ref()
         .and_then(|g| g.orch.as_ref())
         .and_then(|o| o.preview.as_deref())
         .map(|p| preview_rows(p, text_room, PREVIEW_ROWS))
         .unwrap_or_default();
-    for k in 0..PREVIEW_ROWS {
-        let text = preview.get(k).cloned().unwrap_or_default();
+    for text in preview {
         lines.push(Line::from(vec![
             mark.clone(),
             Span::raw("  "),
@@ -320,40 +328,55 @@ pub fn card_lines(state: &AppState, tab: &Tab, width: usize, selected: bool) -> 
         ]));
     }
     lines.push(Line::default());
-    debug_assert_eq!(lines.len(), CARD_ROWS);
     lines
 }
 
-/// What a card says of its workspace's orchestrator, and its style: `hub not running` for a
-/// stopped hub, `not answering`, else its orchestrator's status: `running`, `waiting on you`
-/// (yellow), `failed` (red), `idle`, or `no orchestrator`.
+/// Workspace activity, with waiting and failure indications retained while other work
+/// continues. The glance's activity is authoritative: the running count includes the user's
+/// shell jobs, which do not make the workspace active. An unavailable hub never shows stale
+/// activity, even though its last reply stays on its card.
 pub fn status_text(hub: TabHub, glance: Option<&Glance>) -> (String, Style) {
     let dim = Style::default().fg(Color::DarkGray);
     match hub {
         TabHub::Stopped => return ("hub not running".into(), dim),
         TabHub::Busy => return ("not answering".into(), dim),
-        TabHub::Unknown if glance.is_none() => return ("…".into(), dim),
+        TabHub::Unknown => return ("…".into(), dim),
         _ => {}
     }
-    let Some(orch) = glance.and_then(|g| g.orch.as_ref()) else {
-        return ("no orchestrator".into(), dim);
+    let active = glance.is_some_and(|g| g.active);
+    let orch = glance.and_then(|g| g.orch.as_ref());
+    let status = orch.map(|o| o.status);
+    let with_work = |text: &str| {
+        if active {
+            format!("working · {text}")
+        } else {
+            text.into()
+        }
     };
-    match orch.status {
-        ThreadStatus::Running => ("running".into(), Style::default().fg(Color::Green)),
-        ThreadStatus::Background => (
-            "running in the background".into(),
-            Style::default().fg(Color::Green),
-        ),
-        ThreadStatus::Waiting => (
-            "waiting on you".into(),
+    if hub.waiting() > 0 || status == Some(ThreadStatus::Waiting) {
+        return (
+            with_work("waiting on you"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        ThreadStatus::Error => ("failed".into(), Style::default().fg(Color::Red)),
-        ThreadStatus::Attached => ("attached".into(), Style::default()),
-        ThreadStatus::Parked => ("parked".into(), dim),
-        ThreadStatus::Idle | ThreadStatus::Done => ("idle".into(), dim),
+        );
+    }
+    if status == Some(ThreadStatus::Error) {
+        return (with_work("failed"), Style::default().fg(Color::Red));
+    }
+    if active {
+        let text = match status {
+            Some(ThreadStatus::Running) => "running",
+            Some(ThreadStatus::Background) => "running in the background",
+            _ => "working",
+        };
+        return (text.into(), Style::default().fg(Color::Green));
+    }
+    match status {
+        Some(ThreadStatus::Attached) => ("attached".into(), Style::default()),
+        Some(ThreadStatus::Parked) => ("parked".into(), dim),
+        None => ("no orchestrator".into(), dim),
+        _ => ("idle".into(), dim),
     }
 }
 
@@ -592,6 +615,375 @@ mod tests {
         })
     }
 
+    /// An idle orchestrator does not make its workers' foreground or background work idle.
+    /// The live card and the same workspace seen through a poll say the same thing, and
+    /// neither keeps activity after that work ends.
+    #[test]
+    fn worker_activity_drives_live_and_polled_cards() {
+        use crate::app::tests::{control, orch_events};
+        use twr_core::event::{AttentionReason, EventBody, TaskUpdated, TurnResult};
+        use twr_core::testkit::ThreadScript;
+        let mut st = AppState::new();
+        st.workspace = Some("default".into());
+        st.set_tabs(vec![Tab::new("default")]);
+        let mut o = ThreadScript::new("o");
+        control(&mut st, &orch_events(&mut o, "o"));
+        let mut w = ThreadScript::new("w");
+        control(&mut st, &[w.created("worker")]);
+        let check = |st: &AppState, active, status: &str, running| {
+            let tab = &st.tabs[0];
+            let hub = st.tab_hub(tab);
+            let glance = st.tab_glance(tab).unwrap();
+            assert_eq!(glance.orch.as_ref().unwrap().status, ThreadStatus::Idle);
+            assert_eq!(glance.active, active);
+            assert_eq!(tab_active(st, "default"), active);
+            assert_eq!(status_text(hub, Some(&glance)).0, status);
+            assert!(matches!(hub, TabHub::Running { running: n, .. } if n == running));
+            let mut other = AppState::new();
+            other.merge_poll(
+                Some(vec!["default".into()]),
+                vec![crate::workspace::Polled {
+                    name: "default".into(),
+                    hub,
+                    glance: Some(glance),
+                }],
+            );
+            assert_eq!(tab_active(&other, "default"), active);
+            let text = |lines: Vec<Line<'static>>| {
+                lines
+                    .into_iter()
+                    .map(|l| l.to_string().trim_start_matches(['▌', ' ']).to_string())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                text(card_lines(st, tab, 25, false)),
+                text(card_lines(&other, &other.tabs[0], 25, false))
+            );
+        };
+        check(&st, false, "idle", 0);
+        control(&mut st, &[w.turn_started("work")]);
+        check(&st, true, "working", 1);
+        control(&mut st, &[w.raise("p", AttentionReason::Permission)]);
+        check(&st, false, "waiting on you", 0);
+        control(&mut st, &[w.resolve("p")]);
+        check(&st, true, "working", 1);
+        control(&mut st, &[w.turn_ended(TurnResult::Completed)]);
+        check(&st, false, "idle", 0);
+        for (id, shell) in [("runtime", false), ("job:work", false), ("job:shell", true)] {
+            let task = |running| {
+                EventBody::TaskUpdated(TaskUpdated {
+                    task_id: id.into(),
+                    running,
+                    description: "test work".into(),
+                    ext: shell.then(|| {
+                        serde_json::json!({"twr": {"job": {"shell": true}}})
+                            .as_object()
+                            .unwrap()
+                            .clone()
+                    }),
+                    ..Default::default()
+                })
+            };
+            let mut event = w.event(task(true));
+            if id.starts_with("job:") {
+                event.source = twr_core::Source::Hub;
+            }
+            control(&mut st, &[event]);
+            check(&st, !shell, if shell { "idle" } else { "working" }, 1);
+            if id == "job:work" {
+                control(&mut st, &[w.parked()]);
+                check(&st, false, "idle", 0);
+                control(&mut st, &[w.resumed("s")]);
+                check(&st, true, "working", 1);
+            }
+            control(&mut st, &[w.event(task(false))]);
+            check(&st, false, "idle", 0);
+        }
+    }
+
+    /// Hub jobs survive parking an orchestrator, but replacing it retires its activity.
+    #[test]
+    fn orchestrator_jobs_follow_the_same_lifetime_as_the_hub_glance() {
+        use crate::app::tests::{control, orch_events};
+        use twr_core::event::{EventBody, TaskUpdated};
+        use twr_core::testkit::ThreadScript;
+        let mut st = AppState::new();
+        st.workspace = Some("default".into());
+        st.set_tabs(vec![Tab::new("default")]);
+        let mut o = ThreadScript::new("o");
+        control(&mut st, &orch_events(&mut o, "o"));
+        let mut job = o.event(EventBody::TaskUpdated(TaskUpdated {
+            task_id: "job:o".into(),
+            running: true,
+            ..Default::default()
+        }));
+        job.source = twr_core::Source::Hub;
+        control(&mut st, &[job, o.parked()]);
+        assert!(tab_active(&st, "default"));
+        assert_eq!(
+            status_text(st.tab_hub(&st.tabs[0]), st.tab_glance(&st.tabs[0]).as_ref()).0,
+            "working"
+        );
+        control(&mut st, &[o.resumed("s")]);
+        let mut next = ThreadScript::new("next");
+        control(&mut st, &orch_events(&mut next, "next"));
+        assert!(!tab_active(&st, "default"));
+        assert_eq!(
+            status_text(st.tab_hub(&st.tabs[0]), st.tab_glance(&st.tabs[0]).as_ref()).0,
+            "idle"
+        );
+    }
+
+    /// Cards reserve only their actual status and reply rows, plus a separator. A wrapped
+    /// background status and a two-row preview use the extra space they need.
+    #[test]
+    fn cards_use_only_the_rows_their_content_needs() {
+        let st = AppState::new();
+        let mut tab = Tab {
+            name: "test".into(),
+            hub: TabHub::Running {
+                threads: 0,
+                running: 0,
+                permissions: 0,
+                questions: 0,
+            },
+            glance: Some(Glance {
+                active: false,
+                orch: Some(OrchGlance::default()),
+            }),
+        };
+        assert_eq!(card_lines(&st, &tab, 25, false).len(), 3);
+        tab.glance.as_mut().unwrap().orch.as_mut().unwrap().preview = Some("Done.".into());
+        assert_eq!(card_lines(&st, &tab, 25, false).len(), 4);
+        tab.glance.as_mut().unwrap().orch.as_mut().unwrap().preview =
+            Some("This longer reply wraps across two rows.".into());
+        assert_eq!(card_lines(&st, &tab, 25, false).len(), 5);
+        tab.glance.as_mut().unwrap().active = true;
+        tab.glance.as_mut().unwrap().orch.as_mut().unwrap().status = ThreadStatus::Background;
+        let narrow = card_lines(&st, &tab, 25, false);
+        assert_eq!(narrow.len(), 6);
+        assert!(narrow.iter().any(|l| l.to_string().contains("background")));
+        assert_eq!(card_lines(&st, &tab, 60, false).len(), 4);
+    }
+
+    /// Availability wins over remembered work; waiting (including workers' requests) and
+    /// failures remain distinct while work continues. Counts alone do not imply activity.
+    #[test]
+    fn workspace_status_preserves_attention_failure_and_availability() {
+        let mut hub = TabHub::Running {
+            threads: 2,
+            running: 1,
+            permissions: 0,
+            questions: 0,
+        };
+        let mut g = Glance {
+            active: true,
+            orch: Some(OrchGlance::default()),
+        };
+        for (status, want, color) in [
+            (ThreadStatus::Idle, "working", Color::Green),
+            (ThreadStatus::Running, "running", Color::Green),
+            (
+                ThreadStatus::Background,
+                "running in the background",
+                Color::Green,
+            ),
+            (
+                ThreadStatus::Waiting,
+                "working · waiting on you",
+                Color::Yellow,
+            ),
+            (ThreadStatus::Error, "working · failed", Color::Red),
+        ] {
+            g.orch.as_mut().unwrap().status = status;
+            let (text, style) = status_text(hub, Some(&g));
+            assert_eq!(text, want);
+            assert_eq!(style.fg, Some(color));
+        }
+        for (availability, want) in [
+            (TabHub::Stopped, "hub not running"),
+            (TabHub::Busy, "not answering"),
+            (TabHub::Unknown, "…"),
+        ] {
+            assert_eq!(status_text(availability, Some(&g)).0, want);
+        }
+        g.orch = None;
+        assert_eq!(status_text(hub, Some(&g)).0, "working");
+        g.active = false;
+        assert_eq!(status_text(hub, Some(&g)).0, "no orchestrator");
+        hub = TabHub::Running {
+            threads: 2,
+            running: 1,
+            permissions: 1,
+            questions: 1,
+        };
+        assert_eq!(status_text(hub, Some(&g)).0, "waiting on you");
+        assert_eq!(hub.waiting(), 2);
+        g.active = true;
+        assert_eq!(status_text(hub, Some(&g)).0, "working · waiting on you");
+        g.active = false;
+        g.orch = Some(OrchGlance {
+            status: ThreadStatus::Error,
+            ..Default::default()
+        });
+        // Requests have priority over failures; an idle hub is never inferred from counts.
+        assert_eq!(status_text(hub, Some(&g)).0, "waiting on you");
+        hub = TabHub::Running {
+            threads: 2,
+            running: 0,
+            permissions: 0,
+            questions: 0,
+        };
+        assert_eq!(status_text(hub, Some(&g)).0, "failed");
+    }
+
+    /// Variable cards use the same rendered rows for scrolling and targets. Selecting each
+    /// card keeps its name/status visible across sizes and when its preview grows or shrinks.
+    #[test]
+    fn variable_cards_keep_selection_and_hit_regions_after_resizes() {
+        use crossterm::event::KeyCode;
+        let mut st = in_workspaces("default");
+        for i in 0..8 {
+            st.tabs.push(Tab {
+                name: format!("extra-{i}"),
+                hub: TabHub::Running {
+                    threads: 0,
+                    running: 0,
+                    permissions: 0,
+                    questions: 0,
+                },
+                glance: Some(Glance {
+                    active: false,
+                    orch: Some(OrchGlance {
+                        preview: (i % 2 == 0)
+                            .then(|| "A long reply wrapping across the narrow card.".into()),
+                        ..Default::default()
+                    }),
+                }),
+            });
+        }
+        // Render the list directly so the same assertions exercise dock, drawer and compact
+        // widths, including a viewport too short for the selected card and both arrows.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30)).unwrap();
+        let render = |st: &mut AppState,
+                      term: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+                      width,
+                      height| {
+            let mut panes = Panes::default();
+            term.draw(|f| render_list(f, Rect::new(0, 0, width, height), st, &mut panes, true))
+                .unwrap();
+            st.view.panes = panes;
+        };
+        for (width, height) in [(25, 12), (32, 16), (40, 20), (12, 9), (25, 4)] {
+            for i in (0..st.tabs.len()).chain((0..st.tabs.len()).rev()) {
+                let tab = st.tabs[i].clone();
+                st.view.ws_sel = Some(WsRow::Workspace(tab.name.clone()));
+                st.view.ws_wheeled = false;
+                render(&mut st, &mut term, width, height);
+                let first = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .find(|(_, target)| *target == Target::Workspace(tab.name.clone()))
+                    .map(|(r, _)| *r)
+                    .unwrap();
+                let row: String = (0..width)
+                    .map(|x| term.backend().buffer()[(x, first.y)].symbol())
+                    .collect();
+                let head = card_lines(&st, &tab, usize::from(width), true)[0].to_string();
+                assert_eq!(
+                    row.trim_end(),
+                    head.trim_end(),
+                    "{width}x{height}, {}",
+                    tab.name
+                );
+                assert_eq!(
+                    Some(term.backend().buffer()[(3, first.y)].bg),
+                    crate::ui::selected_fill().bg
+                );
+                let rects: Vec<_> = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::Workspace(tab.name.clone()))
+                    .map(|(r, _)| *r)
+                    .collect();
+                assert!(rects.iter().all(|r| r.width == width && r.y < height - 2));
+                assert!(rects.windows(2).all(|r| r[0].y + 1 == r[1].y));
+                // Carry the actual scroll offset through a resize, as the wheel does.
+                st.view.ws_scroll = st.view.panes.ws_start;
+            }
+        }
+        // Keyboard navigation selects cards, independent of their height; a content change
+        // recomputes both their height and their hit targets on the next frame.
+        st.view.ws_sel = Some(WsRow::Workspace("client-x".into()));
+        st.ws_drawer_key(crate::app::tests::key(KeyCode::Down));
+        assert_eq!(st.ws_selected(), Some(WsRow::Workspace("scratch".into())));
+        st.ws_drawer_key(crate::app::tests::key(KeyCode::Up));
+        for preview in [
+            None,
+            Some("Brief reply."),
+            Some("This is a long reply that wraps onto two rows."),
+        ] {
+            st.tabs[1]
+                .glance
+                .as_mut()
+                .unwrap()
+                .orch
+                .as_mut()
+                .unwrap()
+                .preview = preview.map(str::to_string);
+            render(&mut st, &mut term, 25, 20);
+            let count = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Workspace("client-x".into()))
+                .count();
+            assert_eq!(count, card_lines(&st, &st.tabs[1], 25, true).len());
+        }
+    }
+
+    /// A preview disappearing between mouse down and up moves the next card into that
+    /// position. The release must not switch to that newly exposed workspace.
+    #[test]
+    fn a_card_resized_under_the_finger_does_not_switch() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut st = in_workspaces("default");
+        let card = cells(&mut st, 160, 40, &Target::Workspace("client-x".into()));
+        let at = card[card.len() - 2];
+        let ev = |kind| MouseEvent {
+            kind,
+            column: at.x + 5,
+            row: at.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let screen = crate::app::tests::draw(&mut st, 160, 40);
+        st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left)), &screen);
+        st.tabs[1]
+            .glance
+            .as_mut()
+            .unwrap()
+            .orch
+            .as_mut()
+            .unwrap()
+            .preview = None;
+        let screen = crate::app::tests::draw(&mut st, 160, 40);
+        assert_eq!(
+            st.view.panes.target_at(at.x + 5, at.y),
+            Some(&Target::Workspace("scratch".into()))
+        );
+        let a = st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen);
+        assert!(workspace_action(&a).is_none());
+        assert_eq!(
+            workspace_action(&tap(&mut st, 160, 40, &Target::Workspace("scratch".into()))),
+            Some(("scratch".into(), false))
+        );
+    }
+
     /// From 120 columns the sidebar is docked left of the stack and the grid: a card per
     /// workspace with its orchestrator's status and reply, `○` for a stopped hub with the reply
     /// it last gave, the buttons under them; the tab strip is not drawn then (nor the
@@ -618,7 +1010,7 @@ mod tests {
             for want in [
                 "default",
                 "client-x        ⚠2 ●1",
-                "waiting on you",
+                "working · waiting on",
                 "I need you to approve",
                 "the deploy of the…",
                 "○ scratch",
@@ -636,7 +1028,7 @@ mod tests {
             assert_eq!(text.matches("client-x").count(), 1, "{text}");
             // Every row of a card is its target; the buttons' rows theirs.
             let card = cells(&mut st, 160, 40, &Target::Workspace("client-x".into()));
-            assert_eq!(card.len(), CARD_ROWS, "{card:?}");
+            assert_eq!(card.len(), 6, "{card:?}");
             assert!(card.iter().all(|c| c.width == DOCK_WIDTH - 1));
             assert_eq!(cells(&mut st, 160, 40, &Target::NewWorkspace).len(), 1);
             assert_eq!(cells(&mut st, 160, 40, &Target::Settings).len(), 1);
