@@ -342,7 +342,8 @@ pub struct ThreadView {
     /// How full its session's context is: the latest `turn.ended` `context`, then what a
     /// compaction since left (`context.compacted` `post_tokens`, the window kept). A new
     /// session (a `thread.started` with another session id, a move to another runtime) has
-    /// none until its first turn ends.
+    /// none until its first turn ends, and a turn end whose size cannot be trusted
+    /// ([`recorded_context`]) leaves it unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextSize>,
     /// When its runtime began compacting its context (`context.compacting`), while it does:
@@ -637,8 +638,8 @@ impl ThreadView {
                 if let Some(u) = &p.usage {
                     self.spent.add(u);
                 }
-                if let Some(c) = p.context.filter(|_| !self.handoff_pending) {
-                    self.context = Some(c);
+                if let Some(c) = recorded_context(p).filter(|_| !self.handoff_pending) {
+                    self.context = c;
                 }
                 self.compacting = None;
                 let n = ev.turn.or(self.current_turn).unwrap_or(self.turns);
@@ -1004,6 +1005,33 @@ pub fn reported_model(ext: Option<&JsonMap>) -> Option<&str> {
     ext?.iter()
         .filter(|(k, _)| k.as_str() != "twr")
         .find_map(|(_, v)| v.get("model")?.as_str().filter(|m| !m.trim().is_empty()))
+}
+
+/// What turn end `p` says of its session's context: `None` nothing (the context stays as it
+/// was); `Some(None)` that its size is unknown from then (a Claude Code turn that called the
+/// model without reporting a call's size, `ext.claude.context_from: "unknown"`, or a size that
+/// cannot be trusted, below); `Some(Some(c))` the size.
+///
+/// A Claude Code `turn.ended` (`ext.claude`) recorded before twr read the main agent's last
+/// model call has no `ext.claude.context_from`, and its tokens are the `result`'s `usage`: the
+/// sum of every model call of the turn. That is how full the context was for a turn of one call
+/// (`num_turns: 1`) or of none (`usage` input 0: what a compaction left). For a turn of several
+/// it counts the context once per call (a research turn of 62 calls recorded 6.9M tokens, 693%
+/// of a 1M window, when its last call held 184k), and the event does not have the last call's
+/// size: unknown. Such events stay in the log as they were.
+pub fn recorded_context(p: &TurnEnded) -> Option<Option<ContextSize>> {
+    // `twr_adapters::claude_code::EXT`.
+    let claude = p.ext.as_ref().and_then(|e| e.get("claude"));
+    let from = claude.and_then(|c| c.get("context_from"));
+    let Some(c) = p.context else {
+        return (from.and_then(serde_json::Value::as_str) == Some("unknown")).then_some(None);
+    };
+    let Some(claude) = claude.filter(|_| from.is_none()) else {
+        return Some(Some(c));
+    };
+    let input = p.usage.as_ref().map_or(0, |u| u.input);
+    let calls = claude.get("num_turns").and_then(serde_json::Value::as_u64);
+    Some((input == 0 || calls == Some(1)).then_some(c))
 }
 
 fn retry_of(p: &TurnStarted) -> Option<u64> {
@@ -1780,6 +1808,69 @@ mod tests {
         // Nothing spent is left out of the JSON.
         let fresh = serde_json::to_value(ThreadView::new("t2")).unwrap();
         assert!(fresh.get("spent").is_none());
+    }
+
+    /// How full the context is folds from the turns' ends. A Claude Code turn end recorded
+    /// before twr read the last call (no `ext.claude.context_from`) holds the turn's summed
+    /// usage: trusted for a turn of one call or none (a compaction's), unknown for a turn of
+    /// several (the 693% card: 62 calls, 6.9M of a 1M window), whatever the earlier size was. A
+    /// turn end that says its size is unknown makes it so; one that says nothing keeps it.
+    /// Other runtimes' sizes are taken as they are.
+    #[test]
+    fn a_claude_turns_recorded_sum_is_no_context_size() {
+        use serde_json::json;
+        let mut t = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.created("a"));
+        let size = |tokens| ContextSize {
+            tokens,
+            window: Some(1_000_000),
+        };
+        let mut ended = |input: u64, tokens: Option<u64>, claude: Option<serde_json::Value>| {
+            let mut ev = t.turn_ended(TurnResult::Completed);
+            if let EventBody::TurnEnded(p) = &mut ev.body {
+                p.usage = Some(crate::event::Usage {
+                    input,
+                    output: 1,
+                    cost: None,
+                });
+                p.context = tokens.map(size);
+                p.ext = claude.map(|c| {
+                    let mut m = JsonMap::new();
+                    m.insert("claude".into(), c);
+                    m
+                });
+            }
+            ev
+        };
+        let legacy = |n: u64| json!({"num_turns": n, "subtype": "success"});
+        // One call: its sum is its size.
+        v.apply(&ended(150_000, Some(150_000), Some(legacy(1))));
+        assert_eq!(v.context, Some(size(150_000)));
+        // Several: unknown, not the previous size.
+        v.apply(&ended(6_932_444, Some(6_932_444), Some(legacy(64))));
+        assert_eq!(v.context, None);
+        assert!(serde_json::to_value(&v).unwrap().get("context").is_none());
+        // What a compaction left (no call, usage 0) holds.
+        v.apply(&ended(0, Some(40_000), Some(legacy(0))));
+        assert_eq!(v.context, Some(size(40_000)));
+        // Several calls under the window are no better.
+        v.apply(&ended(300_000, Some(300_000), Some(legacy(3))));
+        assert_eq!(v.context, None);
+        // A turn end of this twr: the last call's size, trusted.
+        let read = |from: &str| json!({"num_turns": 64, "context_from": from});
+        v.apply(&ended(6_932_444, Some(183_861), Some(read("last_call"))));
+        assert_eq!(v.context, Some(size(183_861)));
+        assert_eq!(v.context.unwrap().percent(), Some(18));
+        // Nothing said (no call): kept.
+        v.apply(&ended(0, None, Some(json!({"num_turns": 0}))));
+        assert_eq!(v.context, Some(size(183_861)));
+        // Calls without a size: unknown.
+        v.apply(&ended(90_000, None, Some(read("unknown"))));
+        assert_eq!(v.context, None);
+        // Another runtime's size is its own.
+        v.apply(&ended(500_000, Some(120_000), None));
+        assert_eq!(v.context, Some(size(120_000)));
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else

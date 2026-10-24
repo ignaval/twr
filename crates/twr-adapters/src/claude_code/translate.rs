@@ -16,7 +16,9 @@
 //! - Assistant messages arrive one per content block; `stream_event` wraps the raw API
 //!   stream (`message_start` identifies an autonomous turn; `text_delta` streams text).
 //! - `result` ends a turn. `total_cost_usd` is cumulative per process (per-turn cost is the
-//!   delta); `usage`, `duration_ms` and `num_turns` are per turn. An interrupted turn's cost
+//!   delta); `usage`, `duration_ms` and `num_turns` are per turn (`usage` sums every model
+//!   call of the turn, `num_turns` of them: what it spent, not how full the context is). An
+//!   interrupted turn's cost
 //!   is not included (the total stays put, or reads 0), so it is reported as unknown. A
 //!   `result` with `origin.kind: task-notification` and `num_turns: 0` (Claude 2.1.291: a
 //!   resumed session consuming a notice of a task its previous process left, before the
@@ -86,9 +88,27 @@
 //! A manual compaction is the user message `/compact` ([`Translator::compact_message`]): its
 //! `compacting` comes before the `init` (it opens the queued turn), and its `result` ran no
 //! agent call (`num_turns: 0`, `local_command: compact`, usage all zero; the summary itself is
-//! a model call, billed: the total cost goes up) and ends that turn as any other. A turn's `turn.ended` `context` is its `result` `usage` (input, cache writes
-//! and cache reads: the last call's) and the largest `modelUsage[].contextWindow`; after a
-//! compaction with no call since, the boundary's `post_tokens`.
+//! a model call, billed: the total cost goes up) and ends that turn as any other.
+//!
+//! How full the context is (`turn.ended` `context`, [`twr_core::event::ContextSize`]): the
+//! input of the main agent's latest model call in the turn, its `message.usage`
+//! `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` (what Claude's own
+//! `get_context_usage` counts as the context's `totalTokens`; the call's output is not in it),
+//! from its `stream_event` `message_start` or its `assistant` message (one per content block,
+//! the same input in each). A subagent's calls (`parent_tool_use_id` set) are in their own
+//! context, and a `<synthetic>` message reports no call. Not the `result`'s `usage`: that sums
+//! every call of the turn (a turn of 62 calls of about 110k tokens each reads 6.9M), except for
+//! a turn of one call (`num_turns: 1`), when the two are the same. After a compaction with no
+//! call since, the boundary's `post_tokens`. A turn that called the model (`usage` input above
+//! 0) with none of them has no `context` and says the size is unknown ([`CONTEXT_UNKNOWN`]); a
+//! turn that called none says nothing (the context is as it was). The window is the
+//! `modelUsage[].contextWindow` of the main agent's model (the key, or its `canonicalModel`,
+//! with any `[1m]` suffix ignored; with no model known, the one window every model of the turn
+//! shares), else the last one known of that model, else unknown: a subagent's model may have another window,
+//! and so does a window smaller than the call (a call never exceeds its model's window).
+//! `ext.claude.context_from` says where the tokens came from; a `turn.ended` written before twr
+//! read the last call has no such key, and its `context` is the `result`'s `usage`
+//! ([`twr_core::reduce::recorded_context`] tells which of those to trust).
 //!
 //! Turn stamping: every user message written for turn `n` queues `n`; the first in-turn line
 //! after a `result` (normally the next `system/init`) opens the oldest queued turn, and the
@@ -139,6 +159,18 @@ use twr_core::event::{
 
 /// Key of this runtime's extras (`data.ext.claude`).
 pub const EXT: &str = "claude";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is the input of the main agent's
+/// latest model call in the turn.
+pub const CONTEXT_FROM_CALL: &str = "last_call";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is what a compaction left (no
+/// model call since it).
+pub const CONTEXT_FROM_COMPACTION: &str = "compaction";
+
+/// `ext.claude.context_from` of a `turn.ended` that called the model but reported no call's
+/// size: it has no `context`, and how full the context is is unknown from then.
+pub const CONTEXT_UNKNOWN: &str = "unknown";
 
 /// Tools whose calls always count as risky.
 pub const RISKY_TOOLS: &[&str] = &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
@@ -406,8 +438,13 @@ pub struct Translator {
     /// The context a compaction left, until a model call reports another: what a turn that
     /// ran no agent call (a manual `/compact`'s) ends with.
     compacted_to: Option<u64>,
-    /// The model's context window, as the last `result`'s `modelUsage` said.
-    context_window: Option<u64>,
+    /// The input of the main agent's latest model call since the last `result` or compaction
+    /// ([`call_input`]): how full the context was when it was made.
+    last_call: Option<u64>,
+    /// The main agent's model, as its latest model call said.
+    main_model: Option<String>,
+    /// The main agent's model and its context window, as the last `result` that said it did.
+    context_window: Option<(String, u64)>,
     /// A compaction began in the runtime's turn opened for a notification while its run was
     /// awaited ([`Watch::NoticeRun`]): the wait is held until the compaction ends (at most
     /// [`twr_core::event::COMPACTING_HOLD_SECS`]), then starts again (a compaction can take
@@ -463,6 +500,8 @@ impl Translator {
             compact_turns: Default::default(),
             compacting: None,
             compacted_to: None,
+            last_call: None,
+            main_model: None,
             context_window: None,
             notice_held: false,
             clock: Utc::now,
@@ -1206,6 +1245,8 @@ impl Translator {
                 };
                 self.compacting = None;
                 self.compacted_to = n("post_tokens");
+                // The call before it is not the context any more.
+                self.last_call = None;
                 let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
                     trigger,
                     pre_tokens: n("pre_tokens"),
@@ -1377,6 +1418,7 @@ impl Translator {
         if str_at(ev, "type") == "message_start" {
             // A model call: what a compaction left is no longer the context.
             self.compacted_to = None;
+            self.note_call(&ev["message"]);
             self.model_ran = true;
             self.absorb_result = false;
             self.notice_quiet = false;
@@ -1415,6 +1457,9 @@ impl Translator {
 
     fn on_assistant(&mut self, v: &Value, line: &str, out: &mut Translated) {
         let parent = opt_str(v, "parent_tool_use_id");
+        if parent.is_none() {
+            self.note_call(&v["message"]);
+        }
         if let Some(e) = v.get("error").and_then(Value::as_str) {
             if matches!(e, "rate_limit" | "server_error" | "overloaded") {
                 self.transient_hint = Some(format!("assistant error {e}"));
@@ -1502,6 +1547,18 @@ impl Translator {
                     self.push(out, body, Some(line));
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// Records the main agent's model call `message` (an API message, with its `usage`) as the
+    /// latest, when it reports its input.
+    fn note_call(&mut self, message: &Value) {
+        if let Some(tokens) = call_input(message) {
+            self.compacted_to = None;
+            self.last_call = Some(tokens);
+            if let Some(m) = opt_str(message, "model").filter(|m| !m.is_empty()) {
+                self.main_model = Some(m);
             }
         }
     }
@@ -1996,26 +2053,36 @@ impl Translator {
             output: tok("output_tokens"),
             cost,
         };
-        // How full the context is: the last call's input, else (no call since a compaction,
-        // a manual `/compact`'s turn) what the compaction left.
-        let window = v["modelUsage"]
-            .as_object()
-            .into_iter()
-            .flat_map(|m| m.values())
-            .filter_map(|m| m.get("contextWindow").and_then(Value::as_u64))
-            .max();
-        if window.is_some() {
-            self.context_window = window;
+        // How full the context is (see the module docs): the main agent's latest call's input,
+        // else (no call since a compaction, a manual `/compact`'s turn) what the compaction
+        // left, else the `result`'s usage when it is one call's. Never the usage of a turn of
+        // several calls: their sum is what the turn spent, not what the context holds.
+        let one_call = v.get("num_turns").and_then(Value::as_u64) == Some(1) && usage.input > 0;
+        let (from, tokens) = match (self.last_call.take(), self.compacted_to) {
+            (Some(tokens), _) => (CONTEXT_FROM_CALL, Some(tokens)),
+            (None, Some(tokens)) => (CONTEXT_FROM_COMPACTION, Some(tokens)),
+            (None, None) if one_call => (CONTEXT_FROM_CALL, Some(usage.input)),
+            (None, None) if usage.input > 0 => (CONTEXT_UNKNOWN, None),
+            (None, None) => ("", None),
+        };
+        let model = self.main_model.clone().or_else(|| {
+            // One model in the turn's `modelUsage`: the main agent's.
+            let models = v["modelUsage"].as_object()?;
+            (models.len() == 1).then(|| models.keys().next().cloned())?
+        });
+        let window = context_window(&v["modelUsage"], model.as_deref());
+        if let (Some(m), Some(w)) = (&model, window) {
+            self.context_window = Some((m.clone(), w));
         }
-        let context = if usage.input > 0 {
-            self.compacted_to = None;
-            Some(usage.input)
-        } else {
-            self.compacted_to
-        }
-        .map(|tokens| twr_core::event::ContextSize {
+        // A turn whose `modelUsage` lacks the window: the last one known of the same model.
+        let window = window.or_else(|| {
+            let (m, w) = self.context_window.as_ref()?;
+            (model.as_ref().is_none_or(|x| x == m)).then_some(*w)
+        });
+        let context = tokens.map(|tokens| twr_core::event::ContextSize {
             tokens,
-            window: self.context_window,
+            // A call fits its model's window: a smaller one is another model's.
+            window: window.filter(|w| tokens <= *w),
         });
         if let Some(t) = turn {
             self.compact_turns.remove(&t);
@@ -2039,6 +2106,9 @@ impl Translator {
         }
         for key in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
             claude.insert(key.into(), json!(tok(key)));
+        }
+        if !from.is_empty() {
+            claude.insert("context_from".into(), json!(from));
         }
         if let Some(change) = self.mode_changed.take() {
             claude.insert("mode_changed".into(), change);
@@ -2203,6 +2273,48 @@ impl Steps {
 /// Whether a control request subtype asks the user for input (MCP elicitations).
 fn is_elicitation(subtype: &str) -> bool {
     subtype.to_ascii_lowercase().contains("elicit")
+}
+
+/// The tokens of model call `message`'s input (`usage`: `input_tokens`,
+/// `cache_creation_input_tokens`, `cache_read_input_tokens`), how full the context was when it
+/// was made; none when it reports no input (no `usage`, a `<synthetic>` message's zeros).
+fn call_input(message: &Value) -> Option<u64> {
+    let u = message.get("usage")?;
+    let tokens = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+    .fold(0u64, u64::saturating_add);
+    (tokens > 0).then_some(tokens)
+}
+
+/// The context window of `model` in a `result`'s `modelUsage` (`contextWindow` of the entry
+/// whose key or `canonicalModel` is that model, a `[1m]`-like suffix ignored; none when no entry
+/// is that model's). With no model known, the window every entry shares, none when they
+/// disagree: the largest may be a subagent's model's.
+fn context_window(model_usage: &Value, model: Option<&str>) -> Option<u64> {
+    let base = |m: &str| m.split('[').next().unwrap_or(m).trim().to_string();
+    let entries: Vec<(&String, u64)> = model_usage
+        .as_object()?
+        .iter()
+        .filter_map(|(k, m)| Some((k, m.get("contextWindow").and_then(Value::as_u64)?)))
+        .filter(|(_, w)| *w > 0)
+        .collect();
+    if let Some(model) = model.map(base) {
+        let matching = |(k, _): &&(&String, u64)| {
+            base(k) == model
+                || model_usage[k.as_str()]
+                    .get("canonicalModel")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| base(c) == model)
+        };
+        return entries.iter().find(matching).map(|(_, w)| *w);
+    }
+    let first = entries.first()?.1;
+    entries.iter().all(|(_, w)| *w == first).then_some(first)
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {

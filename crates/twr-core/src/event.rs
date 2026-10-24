@@ -1043,11 +1043,14 @@ pub struct TurnEnded {
     pub extra: JsonMap,
 }
 
-/// How full a session's context is: the tokens of its last model call's input (what the next
-/// call starts from) and the model's context window, when known. Claude Code: the `result`'s
-/// `usage` input, cache writes and cache reads, and `modelUsage[].contextWindow`; Codex:
-/// `thread/tokenUsage/updated` `last.totalTokens` and `modelContextWindow`; Grok Build:
-/// `session/update` `_meta.totalTokens` and the model catalog's `totalContextTokens`.
+/// How full a session's context is: the tokens of its last model call (what the next call
+/// starts from) and the model's context window, when known. One call's, never a sum over the
+/// calls of a turn (that is what the turn spent, [`Usage`]). Claude Code: the main agent's
+/// latest call's `usage` input, cache writes and cache reads (output not included), and its
+/// model's `modelUsage[].contextWindow`; Codex: `thread/tokenUsage/updated` `last.totalTokens`
+/// (input and output) and `modelContextWindow`; Grok Build: the prompt result's
+/// `_meta.totalTokens` (the last call's input and output, not `_meta.usage`, the turn's sum) and
+/// the model catalog's `totalContextTokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextSize {
