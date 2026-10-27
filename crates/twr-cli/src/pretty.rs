@@ -94,7 +94,7 @@ pub fn summary(ev: &Event) -> String {
                 return format!("session={session} (replaced by its new runtime)");
             }
             if reason == Some(twr_core::event::ACCOUNT_RESTART_REASON) {
-                return format!("session={session} (replaced by a session on its new account)");
+                return format!("session={session} (account move)");
             }
             if reason == Some(twr_core::event::TRIM_RESTART_REASON) {
                 return format!(

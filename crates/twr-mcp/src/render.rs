@@ -168,6 +168,13 @@ fn setting_changes(d: &Value) -> Vec<String> {
     .collect()
 }
 
+/// The move resumes a session the thread left earlier (`ext.twr.resume_session`).
+fn resumes_session(d: &Value) -> bool {
+    d.pointer(&format!("/ext/twr/{}", twr_core::event::RESUME_SESSION_KEY))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
 /// `thread.model_changed` `d` as a line, with who changed it: a move to another runtime names
 /// both runtimes and both settings; a move between accounts (`account_changed`) names both
 /// accounts (`work -> personal`), on their runtimes when the runtime changed too
@@ -189,7 +196,12 @@ fn model_changed(d: &Value) -> String {
         if !changes.is_empty() {
             s.push_str(&format!(" ({})", changes.join(", ")));
         }
-        s.push_str("; a new session starts with the next turn, with a handoff");
+        s.push_str(if resumes_session(d) {
+            "; its earlier session on that account resumes with the next turn, told what \
+             happened since"
+        } else {
+            "; a new session starts with the next turn, with a handoff"
+        });
         return s;
     }
     if let Some(r) = runtime {
@@ -201,9 +213,13 @@ fn model_changed(d: &Value) -> String {
         } else {
             (previous_runtime, r.to_string())
         };
+        let next = if resumes_session(d) {
+            format!("its earlier {r} session resumes with the next turn, told what happened since")
+        } else {
+            format!("a new {r} session starts with the next turn, with a handoff")
+        };
         return format!(
-            "runtime changed by {by}: {from} -> {to} (model {} -> {}, effort {} -> {}); a new \
-             {r} session starts with the next turn, with a handoff",
+            "runtime changed by {by}: {from} -> {to} (model {} -> {}, effort {} -> {}); {next}",
             or_default(d.get("previous_model")),
             or_default(d.get("model")),
             or_default(d.get("previous_effort")),
@@ -485,8 +501,8 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
                 .to_string()
         }
         "thread.stopped" if restart_reason(&d) == Some(ACCOUNT_RESTART_REASON) => {
-            "previous session stopped for the move to another account; the new one starts with \
-             the next turn"
+            "previous session stopped for the move to another account; the next turn continues \
+             on that account"
                 .to_string()
         }
         "thread.stopped" if restart_reason(&d) == Some(BOX_UPGRADE_REASON) => {
@@ -1488,6 +1504,20 @@ mod tests {
             s,
             "@7 [t1] account changed by orchestrator: work -> personal; a new session starts \
              with the next turn, with a handoff\n"
+        );
+        // Back to an account the thread left: its earlier session resumes.
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": "opus", "effort": "high", "previous_model": "opus",
+                   "previous_effort": "high", "runtime": "claude-code",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "account": "work", "previous_account": "personal", "by": "user",
+                   "ext": {"twr": {"resume_session": "s0"}}}),
+        );
+        assert_eq!(
+            s,
+            "@7 [t1] account changed by user: personal -> work; its earlier session on that \
+             account resumes with the next turn, told what happened since\n"
         );
         // To the native account, with a new effort.
         let s = control_line(
