@@ -138,6 +138,10 @@ dir = "~/.claude-work"            # its config directory; unset = <data dir>/acc
 [accounts.claude-code.personal]
 native = true                     # names the native account (the runtime's own default directory, no variable set)
 
+[accounts.codex.team-b]
+# sessions = "shared"             # codex only, opt-in, experimental (phase 6): its sessions live in the native
+                                  # home's store; only for accounts of one organization (see "Shared Codex sessions")
+
 [accounts.gemini.team]            # a [runtimes] preset with account_env takes accounts too
 dir = "~/.gemini-team"
 
@@ -167,6 +171,8 @@ balance = "pinned"                # pinned | round-robin | least-busy | most-hea
 failover = "off"                  # off | auto; see "Failover" and the terms caveat before turning it on
 avoid_above = 90                  # balancing skips an account at or above this % of any window
 # move = "handoff"                # handoff | resume (experimental, phase 6)
+# resume_at_reset = false         # true: a turn that hit a usage limit is retried at its reset without asking
+                                  # (phase 2; one account is enough; see "Retry at reset")
 
 [runtimes.gemini]
 acp = "gemini --experimental-acp"
@@ -373,6 +379,8 @@ Accounts should behave the same: same settings, same permission rules, same `CLA
 - `config` (default): settings and instructions, as in the tables below.
 - `all`: `config` plus session transcripts, memory and prompt history. Accounts then remember the same things and can see each other's sessions, which the experimental resume move relies on.
 
+Codex sessions are a separate opt-in on top of these (`sessions = "shared"`, below), because no `share` level is safe for them across organizations.
+
 `config` is the default because it keeps separate purposes apart. A work account and a personal one shouldn't read each other's project memory and transcripts unless the user asks for that. Two accounts that only exist to split load can use `all`.
 
 ### Claude Code
@@ -417,6 +425,19 @@ Claude Code's Write and Edit tools refuse a target that is itself a symlink (`Re
 | `logs_2.sqlite`, `goals_1.sqlite`, `queue_1.sqlite`, `app-server-*`, `installation_id`, `models_cache.json` | own | own |
 
 Codex's sessions stay per account even with `all`. Its rollouts carry organization-bound encrypted reasoning, and its session index lives in SQLite next to state. Codex's memories are different: they're the point of `all`. Codex builds them in a background pipeline when a session starts: it extracts memories from idle past sessions with a model call, records them and leased jobs in `memories_1.sqlite`, and consolidates them into files under `memories/` (`memory_summary.md`, `rollout_summaries/`, ...). Both are linked in `all`. The job table already has worker ids, ownership tokens and leases, because several Codex processes on one home share it. The pipeline runs only with a ChatGPT login and with `[features] memories = true`, which is off by default (tested: a home without a login records no jobs). SQLite 3.10 and later resolve a symbolic link before naming the `-wal` and `-shm` files. Codex 0.160.0 bundles a SQLite built on 2026-03-13 and never opens with no-follow. In a test, two app-servers ran at once on homes sharing one linked `memories_1.sqlite`: neither failed, and no `-wal` or `-shm` file appeared beside the link, so both used the target's write-ahead log. Two homes running the pipeline at the same moment need logged-in sessions to test. If that ever fails, the database stays per account and `all` says so.
+
+#### Shared Codex sessions (opt-in, experimental)
+
+T3 Code (`pingdotgg/t3code` at `1c8e79e`, `apps/server/src/provider/Drivers/CodexHomeLayout.ts`) runs a second Codex login as a "shadow home" over the shared `~/.codex`. It keeps only `auth.json` and `models_cache.json` private and `log/`, `memories/` and `tmp/` local, and links every other entry of the shared home, including `sessions/`, `archived_sessions/`, `session_index.jsonl`, the state and thread-history SQLite files, `config.toml`, `history.jsonl` and `installation_id`. Every shadow home of one shared home gets one continuation key (`codex:home:<shared home>`), and T3's session transition policy (`orchestration-v2/ProviderSessionTransitionPolicy.ts`) restarts and resumes the same Codex thread when a thread moves between instances with equal keys. A Claude instance's key is its own config directory, so a Claude account move in T3 is always a new session with a handoff.
+
+That is evidence that a shared session store works for T3's users in the common case, typically several personal ChatGPT accounts. It is not evidence that resuming across organizations works: T3's server and provider code have no handling of an encrypted-reasoning or organization mismatch (the only `encrypted_content` matches are the generated app-server schema), and the failure that keeps twr's Codex sessions per account (see [Session continuity](#session-continuity)) is an organization mismatch. So twr adds the store as its own opt-in and does not change `all`:
+
+- `[accounts.codex.<name>] sessions = "shared"` (or `twr account add codex <name> --sessions shared`) links `sessions/`, `archived_sessions/`, `session_index.jsonl`, `state_5.sqlite` and `thread_history_1.sqlite` to the native home's real files. The default stays `own`. Only accounts of one person or one organization should use it: a turn written under one organization leaves reasoning the other can't read, in both directions. twr can't check the organization itself (it keeps no organization for an account, per [Decisions](#decisions)); whether `account/read` exposes an organization or workspace id that the hub could compare at link time without storing it is open.
+- Login state stays apart whatever the setting: `auth.json` and the keyring entry are never linked, and `models_cache.json` (per plan) and `installation_id` stay per account. T3 links `installation_id`; twr doesn't, so two accounts don't report one installation.
+- Memory and prompt history follow `share` as before. `sessions = "shared"` never turns them on.
+- **Existing files.** `twr account add` links only what the account doesn't have and never overwrites a file. An account that already has its own sessions or state database is refused for `sessions = "shared"`, with the files named: twr doesn't merge two SQLite stores or move a user's sessions aside. A fresh account directory is the way in.
+- **Lock files.** T3 found that Codex creates `mcp-oauth-locks/` and `.sqlite-maintenance.lock` in a new home before the shared one has them, and at each start it deletes such local copies and links the shared ones. twr keeps "never overwrite" instead: it creates the account's links before the account's first process runs (at `twr account add`, before the login), and a lock entry that still exists as a real file or directory is reported by `twr account status` (`.sqlite-maintenance.lock is not linked`) and replaced only by `twr account relink`, and only for those two lock names, while no runtime, job or login runs on the account (checked under the core lock). Data files are never replaced. Whether `codex login` itself creates either lock before the links exist is untested.
+- Concurrent use is Codex's normal case: several app-servers on one home already share its state database, and a linked SQLite file uses the target's write-ahead log (the memories test above). Two logged-in homes on one linked state database at once is still a test to run.
 
 ### Grok Build
 
@@ -518,10 +539,28 @@ Surfaces: `twr model <thread> --account <a>` (and `--runtime <rt>:<a>`), `/accou
 A session can't follow an account by default, so a move is a handoff. I looked for something better:
 
 - **Claude Code.** Transcripts are plain JSONL under `projects/<cwd-key>/`. With `share = all`, both accounts see the same file, so `--resume <same id>` from the other account could pick it up with nothing copied. With `config`, twr could copy the one file into the target's `projects/<key>/`. The lookup works (tested), and Claude strips thinking signatures and retries when the server refuses them. Still open: whether the first turn succeeds under a second account, and the cost. The resumed session's first turn on the new account reads the whole context with no cache, which on a long session costs far more of the new account's limit than the handoff's 24 KiB. So a resume move is not always better. It is `[account_policy.claude-code] move = "resume"`, experimental, phase 6, only after phase 0 shows it works, and with a fallback to the handoff when the resume fails with "session not found" or an API error on the first turn.
-- **Codex.** A copied rollout resumes locally (tested), but nearly every rollout carries organization-bound encrypted reasoning that has broken the next turn for at least one user, and Codex has no fallback. Handoff only, unless a test with two personal accounts shows they share an organization.
+- **Codex.** A copied rollout resumes locally (tested), but nearly every rollout carries organization-bound encrypted reasoning that has broken the next turn for at least one user, and Codex has no fallback. Handoff by default. A resume move is possible only between accounts that share a session store and an organization (see [Codex resume moves](#codex-resume-moves)).
 - **Grok Build and ACP.** Unknown session formats. Handoff only.
 
 The handoff already carries the first prompt, the worktree and branch, recent reports and the recent turns. The worktree itself never moves: the files the old session wrote are all there.
+
+### Which saved session a thread may resume
+
+The `twr/t3code-exploration` branch (unmerged) adds switch-back resume: a thread moved back to a runtime it used resumes its earlier session of that runtime with a delta handoff, and falls back to a new session with the full handoff when the resume fails. It picks the session by runtime alone (the latest `thread.model_changed` whose `previous_runtime` is the target, and its `ext.twr.previous_session`). With accounts, a runtime has several session stores, so whichever of the two branches merges second must key saved sessions by account too:
+
+- A session's **store** is the real path of the directory the runtime keeps it in: the account's directory (Phase 1 already stamps `account` and the resolved `account_dir` on `thread.started`), the native directory for the native account, and the native home for a Codex account with `sessions = "shared"` (the store is stamped on `thread.started` as `ext.twr.session_store`).
+- Moving back resumes a saved session only when the target `(runtime, account)` is the one the session ran on and the account's directory still resolves to the stamped one. A directory change, a removal and a re-add elsewhere, or a different account of the same runtime means a new session with the full handoff, as Phase 1 does for every account move. Phase 1's account moves already record the session they leave (`ext.twr.previous_session`, next to `previous_account`), so switching back to an account is a switch-back like any other.
+- Returning to the **same account** is safe for Codex too: the reasoning in its own session belongs to its own organization.
+- Resuming under a **different** account is only the opt-in `move = "resume"` below, never a side effect of switch-back resume.
+
+### Codex resume moves
+
+`[account_policy.codex] move = "resume"` (phase 6, experimental, after the tests under [Phase 0 results](#phase-0-results)) applies to a move between two Codex accounts whose sessions share one store (both `sessions = "shared"`, or one of them the native account the others link to). Accounts with their own stores always get the handoff: twr doesn't copy rollouts between homes.
+
+- **Pins and approvals still bind.** The move's target comes from the same rules as any move (the user's choice, or failover inside the pin); `move` only decides how the session continues. A pending permission or question is never answered by a move.
+- **Fallback.** When the first turn on the new account fails before the runtime reported any work (no item started, no tool call), with Codex's encrypted-content or organization error (`invalid_encrypted_content`, `Encrypted content organization_id did not match`; the exact text is recorded by the tests and classified in `codex/translate.rs`) or `thread not found`, twr drops the session and runs the same message once more on a new session with the full handoff, like switch-back resume's fallback. The transcript says so: `the earlier codex session couldn't continue on codex:team-b (its reasoning belongs to another organization); started a new session with the handoff`. A failure after the turn did work isn't redone automatically: it gets the usual error card. The turn records `ext.twr.move: resume | handoff_fallback`.
+- **A failed resume may change the shared session.** If Codex appends the failed turn's message to the rollout, the account that wrote it sees that message on its next resume. Whether it does is a test.
+- **Cost.** A resumed session's first turn on the new account reads the whole context with no prompt cache. On a subscription that counts against the new account's limits, on an API key it's billed as uncached input, and on a long thread it can cost far more than the handoff's 24 KiB. Whether OpenAI's prompt cache is shared between accounts of one organization, and how a ChatGPT plan counts cached against uncached input, are unknown. A resume move of a large thread could offer to compact first, as `twr/t3code-exploration`'s cache-aware compaction does for idle Claude threads; that is open.
 
 ## Limits
 
@@ -565,9 +604,25 @@ api: claude-code:work hit its weekly limit · resets Thu 05:00 (in 13h)
 
 - The card names the account whatever the label rule says. With one account, it reads `api: claude-code hit its weekly limit · resets Thu 05:00` and offers only `w` and `d`.
 - **move** is a manual move, the same as `/account api personal`, chosen by the user. It is offered only for eligible accounts inside the thread's pin, best first by the policy's `balance` (or `most-headroom` when that's `pinned`).
-- **retry at reset** records `turn.retry_scheduled {at}`. The hub starts the retry then, through `start_retry` (`hub/retry.rs:233`), unless the user sent something since. It's useful with a single account too.
+- **retry at reset** records `turn.retry_scheduled {at}`. The hub starts the retry then, through `start_retry` (`hub/retry.rs:233`), unless the user sent something since. It's useful with a single account too. `resume_at_reset = true` arms it without the click (see [Retry at reset](#retry-at-reset)).
 - A prompt sent to a thread whose account is limited is held in the queue, and the card above appears with an extra `[s] send anyway`. A doomed turn would only add another error.
 - The orchestrator gets the card as an urgent notice, like any error today (`orch.rs:1166`), and can relay the user's answer under the relay rule.
+
+### Retry at reset
+
+T3 Code has the same idea built (`apps/server/src/orchestration-v2/UsageLimitRecoveryWorker.ts`, settings `autoResumeLimitedThreads` and `snoozeLimitedThreads`): every thread that hit a usage limit is resumed after the reset with no click. Phase 2 takes the parts that fit twr's held prompts, limit state and timers:
+
+- **Opt-in.** `[account_policy.<rt>] resume_at_reset = true` (or `[threads] resume_at_reset` for every runtime) arms the retry when the limited turn ends, so the card reads `api: claude-code hit its weekly limit · retry at Thu 05:01 (automatic) [c] cancel [d] dismiss`. Off by default: an unattended turn spends the new window. It needs no second account and doesn't switch accounts, so it carries no terms warning.
+- **One schedule per failure.** `turn.retry_scheduled {turn, resets_at, at, by: user | policy}` names the failed turn. The reducer keys a schedule by thread, failed turn and reset time, so a second arm with the same key (a repeated sweep, a replay, a restart) is a no-op, and a hub restart never sends it twice. `turn.retry_cancelled {turn, reason}` ends one. Any later turn on the thread drops the schedule.
+- **No stale resets.** A schedule needs `resets_at` later than the failed turn's end; a reset at or before it (an expired window reported with a fresh failure) arms nothing and the card asks, which stops an immediate-retry loop. Each failed turn gets at most one automatic retry. If that retry hits a limit again, it is a new failed turn and arms again only with a later reset than the one before. `spend` limits and limits with no reset time (Grok's) are never retried automatically.
+- **Checked again when it fires**, under the core lock. It is cancelled, with the reason in the transcript, when: the thread is parked, retired, deleted or trashed; a permission or question card is pending (the retry never answers one); anything was sent to the thread or started on it since the failure (by the user, the orchestrator or a wake); prompts were held for the limited account (they go first: they are what the user asked for since); the thread's runtime, account, model, effort or permission mode changed since; or the account was removed, logged out or paused. If the account is still limited with a later reset (a newer `account.limit`), the schedule moves to that reset.
+- **A normal retry.** It starts through `start_retry` with the retry prompt, `ext.twr.retry_of` and `ext.twr.retry_at_reset: true`, so the transcript says why it started. It is attributed to the policy or to the user who pressed `w` (or the orchestrator relaying the user's answer, under the relay rule), never shown as a message the user typed. It goes through `start_runtime`, so pins, the account checks and the thread's permission mode apply as to any turn.
+- **Survives restarts.** Schedules and `account.limit` live in the log and the reducer. At start the hub sets a timer for each one still pending and runs one whose time passed while it was down, after the checks above.
+- **Prompt cache.** A retry at a reset hours away starts with an expired cache. `twr/t3code-exploration`'s cache-aware compaction offers "compact first" only before a user's or the orchestrator's message; whether an automatic retry should compact first is open.
+
+Tests: the hub restarts between the limit and the reset, and again after the reset passed while it was down; a duplicate arm; a stale reset; a message sent, a park and a pending permission before the reset; a move or `/model` before the reset; a pin that no longer allows the account; a second limit with a later reset.
+
+Without phase 2, a single-account user still gets phase 1's part: the `limited` block kind and the card with the reset time apply to every runtime's own login, so the wasted immediate retry is gone once phase 1 merges.
 
 ### Failover
 
@@ -699,15 +754,23 @@ This is my reading of public terms, not legal advice, and the terms change. The 
 - **Handoffs lose context.** Every move is a fresh session. Failover can lose the thread of a long, subtle task. The handoff is twr's best summary, and phase 6 explores real resumes.
 - **The orchestrator's memories split** across accounts unless twr points every account's orchestrator at the native memory directory (`autoMemoryDirectory`), which `config` sharing does by default. That depends on a Claude Code setting staying as it is.
 - **Provider enforcement.** A provider may act against automated failover regardless of twr's framing. Keeping it opt-in and documented is the mitigation. Removing it would be the stronger one.
+- **Shared Codex sessions across organizations.** `sessions = "shared"` between accounts of two organizations breaks every session either of them resumes after the other wrote to it. twr can't check the organization, so the setting is opt-in, documented for one person or one organization only, and backed by the resume fallback.
+- **Unattended retries spend a window.** `resume_at_reset` starts a turn nobody watched start. It is off by default and cancelled by anything the user does on the thread.
 - **More states for the user to read.** The label rule keeps single-account users free of all of it.
 
 ## Open questions
 
-Every question still open needs a logged-in second account to answer; the user's steps are in `~/files/twr-multi-account/pending.md`, and the tests are listed under [Phase 0 results](#phase-0-results).
+Questions 1 to 8 need logged-in accounts to answer, and 9 is a design choice for phase 2; the user's steps are in `~/files/twr-multi-account/pending.md`, and the tests are listed under [Phase 0 results](#phase-0-results).
 
 1. Does a copied Claude session's first turn succeed under a **different** account? (needs a second Claude login)
 2. Does a copied Codex rollout's first turn succeed under a different ChatGPT account, or fail on encrypted reasoning? (needs a second Codex login)
 3. Do two Codex homes running the memory pipeline at once, through a linked `memories_1.sqlite` and `memories/`, both succeed? (needs two logged-in Codex homes; the same ChatGPT account logged in twice is enough)
+4. Does a Codex session resume under a different account of the **same** organization (two seats of one ChatGPT workspace), and does it fail under a different organization with the error text the fallback should classify? (needs two such logins; two personal accounts cover only the different-organization case)
+5. Do two logged-in Codex homes work on one linked session store at once (`sessions/`, `session_index.jsonl`, `state_5.sqlite`, `thread_history_1.sqlite`), and does Codex create its lock files before the links exist, `codex login` included? (the same account logged in twice is enough)
+6. Does a failed cross-organization resume append to the shared rollout, and does the original account still resume it afterwards?
+7. How much of the new account's limit does a resumed first turn use against a handoff, and does an organization share its prompt cache between accounts? (usage numbers from the tests above)
+8. Can the hub tell two Codex logins' organizations apart without storing them (`account/read`)?
+9. Should an automatic retry at a reset compact an expired-cache context first?
 
 ### Decisions
 
@@ -765,6 +828,7 @@ Still to do, each needing a login (see [Open questions](#open-questions)):
 
 - **With a second Claude login:** the user runs `CLAUDE_CONFIG_DIR=<scratch> claude auth login` with the other subscription. A session made on the native account, with thinking and a tool call, is copied into the scratch directory and resumed with one short turn. Watch for the thinking-signature strip-and-retry in a `--debug-file`, and check that the answer remembers the earlier turns.
 - **With a second Codex login:** the same with `CODEX_HOME=<scratch> codex login` and a copied rollout that carries encrypted reasoning. Watch for "Encrypted content organization_id did not match".
+- **Codex sessions across organizations** (T3 Code's shared session store, 2026-10-27): with the same account logged in twice (no second person needed), link one scratch home's session store into another scratch home's, run both at once, check `PRAGMA integrity_check` on the state databases, list which lock files Codex created before the links, and resume one home's session from the other. With two personal ChatGPT accounts (different organizations), resume a session that has reasoning items under the other account through the shared store: record the exact error, whether the failed turn was appended to the rollout, and whether the first account still resumes it. With two seats of one organization, if the user has them, the same resume should succeed. Record each first turn's input and cached tokens against a handoff of the same thread. No real home is linked into a scratch one: the shared store is a scratch home too.
 - **With two logged-in Codex homes** (the second login above, plus a scratch home logged in to the native account): memories on in both, a few short sessions in each, then both started at once with `memories_1.sqlite` and `memories/` linked from one to the other. Check that every extraction job finishes, that consolidation writes its files, and that `PRAGMA integrity_check` says ok.
 
 Real limit-hit fixtures come from transcripts already on disk where possible (a 429 `rate_limit` line exists locally). The findings also go into `docs/runtimes.md`'s "checked against" table when phase 1 lands.
@@ -789,7 +853,7 @@ Not in phase 1: limit state and timers, retry at reset and held prompts (phase 2
 
 ### Phase 2: limits and usage
 
-`account.usage` and `runtime.limits` already exist on `dev`; phase 1 gives them the account. Phase 2 adds `account.limit` with reset and cooldown timers; the limit card with move, retry at reset and send anyway (`hub/retry.rs`, `hub/attention.rs`); held prompts for limited accounts; `turn.retry_scheduled`; status bar notes; Grok's login status through `grok models`; `twr account pause|resume` and `relink`; copying a new Claude account's user-scope MCP servers through `claude mcp add-json`.
+`account.usage` and `runtime.limits` already exist on `dev`; phase 1 gives them the account. Phase 2 adds `account.limit` with reset and cooldown timers; the limit card with move, retry at reset and send anyway (`hub/retry.rs`, `hub/attention.rs`); held prompts for limited accounts; `turn.retry_scheduled` and the opt-in `resume_at_reset` with its keyed, restart-safe schedules and fire-time checks ([Retry at reset](#retry-at-reset)); status bar notes; Grok's login status through `grok models`; `twr account pause|resume` and `relink`; copying a new Claude account's user-scope MCP servers through `claude mcp add-json`.
 
 ### Phase 3: balancing and richer moves
 
@@ -805,7 +869,7 @@ Not in phase 1: limit state and timers, retry at reset and held prompts (phase 2
 
 ### Phase 6: experiments
 
-The `move = "resume"` session transfer for Claude Code if phase 0 shows it works; Codex rollout resume if it does; device-code logins in the TUI for Codex and Grok; `limit_patterns` and `account_share` for ACP presets.
+The `move = "resume"` session transfer for Claude Code if phase 0 shows it works; for Codex, `sessions = "shared"` and `move = "resume"` between accounts of one store with the handoff fallback ([Codex resume moves](#codex-resume-moves)), if the cross-organization tests show where it works; device-code logins in the TUI for Codex and Grok; `limit_patterns` and `account_share` for ACP presets.
 
 ## Sources
 
@@ -824,4 +888,5 @@ Runtime behaviour was checked with the installed binaries' `--help`, `auth statu
 - OpenAI Terms of Use (effective 2024-12-11; openai.com refused the fetch, text from a mirror): https://open.windriver.com/info/uni-license-list/licenses/openai-tou-20241211.html
 - xAI terms (effective 2026-09-11; x.ai refused the fetch, text from a tracker): https://tostracker.app/document/x
 - ACP authentication and errors: https://agentclientprotocol.com
+- T3 Code at `1c8e79e` (MIT): Codex shadow homes (`apps/server/src/provider/Drivers/CodexHomeLayout.ts`), session transitions (`apps/server/src/orchestration-v2/ProviderSessionTransitionPolicy.ts`), usage-limit recovery (`apps/server/src/orchestration-v2/UsageLimitRecoveryWorker.ts`): https://github.com/pingdotgg/t3code/tree/1c8e79ec18a77dd22cbd7f69e6ecc1d457c0e80d
 - Two Claude Code accounts on one machine (community report on copying sessions): https://dev.to/daksh-gargas/one-brain-two-wallets-two-claude-code-accounts-on-one-machine-5ejb
