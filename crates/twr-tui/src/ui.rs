@@ -14547,7 +14547,7 @@ mod tests {
         st.dive("t-job");
         let (_, detail) = main_title(&st, 64);
         assert_eq!(detail, "default@gpu offline · mode manual · Esc: back");
-        let band = target_fill(true);
+        let band = target_fill(st.dived());
         let (_, spans) = main_title_spans(&st, 64, band);
         let word = spans.iter().find(|s| s.content == " offline").unwrap();
         assert_eq!(word.style.fg, Some(Color::Red));

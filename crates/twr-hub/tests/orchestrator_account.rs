@@ -137,7 +137,7 @@ impl Adapter for OrchAdapter {
                         end.exited(Some(0), "");
                         return;
                     }
-                    AdapterCmd::Respond { .. } => {}
+                    AdapterCmd::Respond { .. } | AdapterCmd::Compact { .. } => {}
                 }
             }
         });

@@ -552,6 +552,7 @@ impl Core {
     /// It starts from the newest checkpoint this build can use (`hub::checkpoint`) and folds
     /// only the events after it; without one, from nothing. Either way the state is the one a
     /// fold of the whole log builds.
+    #[cfg(test)]
     pub(super) fn replay_with(
         db_path: &Path,
         hook: Option<hook::HookFeed>,

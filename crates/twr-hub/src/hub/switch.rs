@@ -444,7 +444,7 @@ impl Core {
         };
         // A move that changed the account names the accounts (`claude-code:work`); one between
         // accounts of one runtime says so.
-        let account_move = moved.as_ref().filter(|m| m.account_changed);
+        let account_move = moved.as_ref().map(|(_, m)| m).filter(|m| m.account_changed);
         let account_only = account_move.is_some_and(|m| m.previous_runtime == m.runtime);
         let with_account = |rt: &str, account: &Option<String>| match account_move {
             Some(_) => format!(
