@@ -14,6 +14,7 @@
 //! - [`palette`]: the threads' 30 colors and which one a new thread gets
 //! - [`compact`]: the compacted control backlog (`control.subscribe` with `compact`)
 //! - [`proto`], [`client`]: the hub socket protocol and an async client
+//! - [`client_state`]: what a client keeps of the control stream, folded (the hub's snapshot)
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
 //! - [`sorted`]: hash sets serialized in a fixed order
@@ -26,6 +27,7 @@ pub mod adapter;
 pub mod b64;
 pub mod blob;
 pub mod client;
+pub mod client_state;
 pub mod compact;
 pub mod config;
 pub mod event;

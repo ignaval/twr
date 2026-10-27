@@ -63,7 +63,8 @@
 //!   a hub start folds only the events after it (`hub::checkpoint`). A cache: written from a
 //!   replay of the log alone, used only by the same build (`build`) with the same settings the
 //!   fold reads (`config`), whose `checksum` (SHA-256 of the row) still holds, and dropped
-//!   without loss. The newest [`CHECKPOINTS_KEPT`] are kept.
+//!   without loss. The newest [`CHECKPOINTS_KEPT`] of each of the [`CHECKPOINT_BUILDS_KEPT`]
+//!   builds with the newest checkpoints are kept.
 //!
 //! Schema 7 changes no table: from it, `events` may hold `turn.started` `from: runtime`, which
 //! a twr before it cannot decode. Such a twr refuses the database as newer than itself rather
@@ -124,8 +125,13 @@ pub const AGENT_KINDS: [&str; 4] = [
     "agent.tool_result",
 ];
 
-/// How many checkpoints are kept (the newest).
+/// How many checkpoints of one build are kept (its newest).
 pub const CHECKPOINTS_KEPT: usize = 2;
+
+/// Of how many builds checkpoints are kept (those whose newest checkpoint is newest): a build
+/// installed next to a running hub writes one for itself before the hub restarts (`twr log
+/// checkpoint`), and the running hub's next one must not drop it.
+pub const CHECKPOINT_BUILDS_KEPT: usize = 3;
 
 const SCHEMA_6: &str = r#"
 CREATE TABLE IF NOT EXISTS spawn_operations (
@@ -1396,6 +1402,22 @@ pub fn read_transcript_events(
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// [`transcript_bounds`]'s start: the seq of `thread`'s latest `turn.started` (of turn `?2`,
+/// when given), read off `events_kind_turn` (the thread's turn starts alone; SQLite would
+/// walk every row of the thread otherwise).
+const TURN_START: &str = "SELECT MAX(seq) FROM events INDEXED BY events_kind_turn
+     WHERE kind = 'turn.started' AND thread = ?1 AND (?2 IS NULL OR turn = ?2)";
+
+/// [`turn_reactions`]: off `events_kind_turn`, three short lookups. SQLite otherwise walks
+/// every row of the thread (`(thread, seq)`), which start-up recovery does for each thread's
+/// last turn: seconds for a long-lived thread whose pages are not in the cache.
+const TURN_REACTIONS: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events INDEXED BY events_kind_turn WHERE thread = ?1 AND turn = ?2
+     AND kind IN ('decision.made', 'report.ready', 'attention.raised') ORDER BY seq"
+);
+
 /// The sequence bounds of a turn, including lifecycle events after its end.
 pub fn transcript_bounds(
     conn: &Connection,
@@ -1403,8 +1425,7 @@ pub fn transcript_bounds(
     turn: Option<u64>,
 ) -> anyhow::Result<(u64, u64, Option<u64>)> {
     let start: Option<i64> = conn.query_row(
-        "SELECT MAX(seq) FROM events WHERE thread = ?1 AND kind = 'turn.started'
-         AND (?2 IS NULL OR turn = ?2)",
+        TURN_START,
         params![thread, turn.map(to_i64).transpose()?],
         |r| r.get(0),
     )?;
@@ -1451,6 +1472,57 @@ pub fn read_control(
          WHERE c.gseq > ?1 ORDER BY c.gseq LIMIT ?2"
     ))?;
     let rows = st.query_map(params![to_i64(since)?, limit as i64], |r| {
+        let gseq: i64 = r.get(0)?;
+        Ok((
+            gseq as u64,
+            RawRow {
+                thread: r.get(1)?,
+                seq: r.get(2)?,
+                id: r.get(3)?,
+                v: r.get(4)?,
+                ts: r.get(5)?,
+                turn: r.get(6)?,
+                source: r.get(7)?,
+                kind: r.get(8)?,
+                data: r.get(9)?,
+                raw: r.get(10)?,
+            },
+        ))
+    })?;
+    rows.map(|r| {
+        let (g, raw) = r?;
+        Ok((g, raw.into_event()?))
+    })
+    .collect()
+}
+
+/// [`read_decisions`]'s query, selecting the events' columns `cols`. (`CROSS JOIN`: the events
+/// of the kind first, whatever the planner would make of the order.)
+fn decisions_sql(cols: &str) -> String {
+    format!(
+        "SELECT c.gseq, {cols} FROM events e CROSS JOIN control c
+         ON c.thread = e.thread AND c.seq = e.seq
+         WHERE e.kind = 'decision.made' AND c.gseq < ?1
+         ORDER BY c.gseq DESC LIMIT ?2"
+    )
+}
+
+/// The newest `limit` `decision.made` control items with `gseq < before`, newest first (as
+/// stored: a capped payload is not hydrated). Read from the kind's rows (`events_kind_turn`),
+/// not the whole control stream: a decision is one item in hundreds.
+pub fn read_decisions(
+    conn: &Connection,
+    before: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Event)>> {
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare_cached(&decisions_sql(&cols))?;
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let rows = st.query_map(params![before, limit as i64], |r| {
         let gseq: i64 = r.get(0)?;
         Ok((
             gseq as u64,
@@ -1645,8 +1717,9 @@ pub fn checkpoint_state(conn: &Connection, id: i64) -> anyhow::Result<Option<Vec
         .optional()?)
 }
 
-/// Records checkpoint `c` and drops all but the newest [`CHECKPOINTS_KEPT`], in one
-/// transaction. Returns its id.
+/// Records checkpoint `c` and drops all but the newest [`CHECKPOINTS_KEPT`] of each of the
+/// [`CHECKPOINT_BUILDS_KEPT`] builds whose newest checkpoint is newest, in one transaction.
+/// Returns its id.
 pub fn insert_checkpoint(conn: &Connection, c: &NewCheckpoint<'_>) -> anyhow::Result<i64> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
@@ -1667,8 +1740,14 @@ pub fn insert_checkpoint(conn: &Connection, c: &NewCheckpoint<'_>) -> anyhow::Re
     let id = tx.last_insert_rowid();
     tx.execute(
         "DELETE FROM checkpoints WHERE id NOT IN
-         (SELECT id FROM checkpoints ORDER BY id DESC LIMIT ?1)",
-        [CHECKPOINTS_KEPT as i64],
+         (SELECT id FROM
+            (SELECT id, build,
+                    ROW_NUMBER() OVER (PARTITION BY build ORDER BY id DESC) AS nth
+             FROM checkpoints)
+          WHERE nth <= ?1
+            AND build IN (SELECT build FROM checkpoints GROUP BY build
+                          ORDER BY MAX(id) DESC LIMIT ?2))",
+        params![CHECKPOINTS_KEPT as i64, CHECKPOINT_BUILDS_KEPT as i64],
     )?;
     tx.commit()?;
     Ok(id)
@@ -1857,10 +1936,7 @@ pub struct TurnReactions {
 
 /// Reads the [`TurnReactions`] of a turn from the log.
 pub fn turn_reactions(conn: &Connection, thread: &str, turn: u64) -> anyhow::Result<TurnReactions> {
-    let mut st = conn.prepare_cached(&format!(
-        "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND turn = ?2
-         AND kind IN ('decision.made', 'report.ready', 'attention.raised') ORDER BY seq"
-    ))?;
+    let mut st = conn.prepare_cached(TURN_REACTIONS)?;
     let rows = st.query_map(params![thread, to_i64(turn)?], row_to_raw)?;
     let mut out = TurnReactions::default();
     for r in rows {
@@ -1893,18 +1969,20 @@ pub fn turn_reactions(conn: &Connection, thread: &str, turn: u64) -> anyhow::Res
     Ok(out)
 }
 
-/// Every `turn.ended` (as stored) of a turn that has no `report.ready`, oldest first, except
-/// on the threads in `skip` (the orchestrators: their turns get no report): the turns whose
-/// reactions startup recovery completes (`Core::recover_turn_reactions`).
-pub fn unreported_turn_ends(conn: &Connection, skip: &[String]) -> anyhow::Result<Vec<Event>> {
+/// Every `turn.ended` (as stored) of a turn that has no `report.ready`, oldest first, of the
+/// threads in `threads` (the live workers: the orchestrators' turns get no report, and a deleted
+/// thread's are never completed): the turns whose reactions startup recovery completes
+/// (`Core::recover_turn_reactions`). Reads only those threads' ends (`events_kind_turn`), not
+/// every thread's history.
+pub fn unreported_turn_ends(conn: &Connection, threads: &[String]) -> anyhow::Result<Vec<Event>> {
     let mut st = conn.prepare(&format!(
-        "SELECT {EVENT_COLS} FROM events e WHERE e.kind = 'turn.ended' AND e.turn IS NOT NULL
+        "SELECT {EVENT_COLS} FROM events e WHERE e.kind = 'turn.ended'
+         AND e.thread IN (SELECT value FROM json_each(?1)) AND e.turn IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM events r WHERE r.kind = 'report.ready'
                          AND r.thread = e.thread AND r.turn = e.turn)
-         AND e.thread NOT IN (SELECT value FROM json_each(?1))
          ORDER BY e.rowid"
     ))?;
-    let rows = st.query_map(params![serde_json::to_string(skip)?], row_to_raw)?;
+    let rows = st.query_map(params![serde_json::to_string(threads)?], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 
@@ -2508,6 +2586,68 @@ mod tests {
         assert_eq!(event_at(c, "t1", 9).unwrap(), None);
     }
 
+    /// `decision.made` items, newest first, before a control position, at most so many; read
+    /// off the kind's rows of `events_kind_turn`, never a walk of the control stream.
+    #[test]
+    fn decisions_are_read_newest_first_from_the_kind_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let decision = |chosen: &str| {
+            EventBody::DecisionMade(twr_core::event::DecisionMade {
+                chosen: chosen.into(),
+                ..Default::default()
+            })
+        };
+        let mut seqs: std::collections::HashMap<&str, u64> = Default::default();
+        let mut put = |s: &mut Store, thread: &'static str, body: EventBody| {
+            let seq = seqs.entry(thread).or_default();
+            *seq += 1;
+            let e = ev(thread, *seq, body);
+            let control = e.is_control();
+            s.append(&e, control, AppendExtras::default()).unwrap()
+        };
+        let mut decided = Vec::new();
+        for i in 0..10 {
+            let thread = if i % 2 == 0 { "t1" } else { "t2" };
+            put(&mut s, thread, text("noise"));
+            put(&mut s, thread, EventBody::TurnEnded(Default::default()));
+            let g = put(&mut s, thread, decision(&format!("d{i}"))).unwrap();
+            decided.push((g, format!("d{i}")));
+        }
+        let read = |before: u64, limit: usize| -> Vec<(u64, String)> {
+            read_decisions(s.conn(), before, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(g, e)| match e.body {
+                    EventBody::DecisionMade(d) => (g, d.chosen),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let newest: Vec<(u64, String)> = decided.iter().rev().cloned().collect();
+        assert_eq!(read(u64::MAX, 100), newest);
+        assert_eq!(read(u64::MAX, 3), newest[..3]);
+        // Strictly before: the decision at `before` is not read.
+        let at = decided[6].0;
+        assert_eq!(read(at, 2), [decided[5].clone(), decided[4].clone()]);
+        assert_eq!(read(decided[0].0, 5), []);
+        let mut st = s
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", decisions_sql("e.id")))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params![1, 1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("USING INDEX events_kind_turn (kind=?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN "), "{plan}");
+    }
+
     /// Every per-kind lookup of one thread goes through `events_kind_turn` (then reads the
     /// events it picked by primary key), never through a walk of the thread's events.
     #[test]
@@ -2522,6 +2662,8 @@ mod tests {
             LATEST_FINAL_TEXT,
             LATEST_OF_KIND,
             SEQS_OF_KIND,
+            TURN_REACTIONS,
+            TURN_START,
         ] {
             let mut st = s
                 .conn()
@@ -3003,9 +3145,10 @@ mod tests {
     }
 
     /// Checkpoints: listed newest first without their state, the newest
-    /// [`CHECKPOINTS_KEPT`] kept, dropped all at once; an event's place found by its id.
+    /// [`CHECKPOINTS_KEPT`] of each of the [`CHECKPOINT_BUILDS_KEPT`] newest builds kept,
+    /// dropped all at once; an event's place found by its id.
     #[test]
-    fn checkpoints_keep_the_newest_two() {
+    fn checkpoints_keep_the_newest_two_of_each_recent_build() {
         let dir = tempfile::tempdir().unwrap();
         let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
         let control = ev("t", 1, text("hi"));
@@ -3050,7 +3193,40 @@ mod tests {
         assert_eq!((kept[0].bytes, kept[0].gseq), (1, 1));
         assert_eq!(checkpoint_state(s.conn(), ids[2]).unwrap(), Some(vec![2]));
         assert_eq!(checkpoint_state(s.conn(), ids[0]).unwrap(), None);
-        assert_eq!(drop_checkpoints(s.conn()).unwrap(), 2);
+        // Per build: another build's checkpoint (one written for a build installed next to a
+        // running hub) outlives the running build's next ones; the build whose newest is
+        // oldest goes once more builds than kept have one.
+        let put = |build: &str| {
+            insert_checkpoint(
+                s.conn(),
+                &NewCheckpoint {
+                    format: 1,
+                    build,
+                    config: "c",
+                    gseq: 1,
+                    last_event: &control.id,
+                    checksum: "x",
+                    state: &[9],
+                },
+            )
+            .unwrap()
+        };
+        let new = put("new");
+        let b3 = put("b");
+        let b4 = put("b");
+        let ids_of = |s: &Store| {
+            checkpoints(s.conn())
+                .unwrap()
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids_of(&s), vec![b4, b3, new]);
+        let x = put("x");
+        let y = put("y");
+        // Builds by newest checkpoint: y, x, b, new: "new" goes.
+        assert_eq!(ids_of(&s), vec![y, x, b4, b3]);
+        assert_eq!(drop_checkpoints(s.conn()).unwrap(), 4);
         assert!(checkpoints(s.conn()).unwrap().is_empty());
     }
 

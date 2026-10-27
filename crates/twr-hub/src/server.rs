@@ -5,7 +5,7 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
@@ -56,7 +56,8 @@
 //! | `thread.events`     | `{thread, since_seq?, limit?}`                      | `{thread, events: [event], last_seq, next, more}` (archived events too; `thread` may be a deleted thread's id) |
 //! | `thread.subscribe`  | `{thread, since_seq?}`                              | ack `{thread, since_seq, head}`, then `{"stream":"thread","event":...}` items |
 //! | `control.read`      | `{since?, limit?}`                                  | `{items: [{"stream":"control","gseq","event"}], head, next, more}` |
-//! | `control.subscribe` | `{since?, compact?}`                                | ack `{since, head}` (with `compact`: `backlog, compacted: true`), then `{"stream":"control","gseq":n,"event":...}` items |
+//! | `control.subscribe` | `{since?, compact?, snapshot?}`                     | ack `{since, head}` (with `compact`: `backlog, compacted: true`; with `snapshot`, from `since` 0 only: `since` the head, `snapshot`, the state at it, and `snapshot_fold`, the fold that made it, else as without it), then `{"stream":"control","gseq":n,"event":...}` items |
+//! | `decisions.list`    | `{before?, limit?}`                                 | `{items: [{gseq, event}], more}`: the newest `decision.made` control items before `before`, newest first, hydrated |
 //! | `blob.get`          | `{ref, offset?, len?}`                              | `{ref, size, offset, encoding: "utf8" \| "base64", data, eof}` |
 //! | `context.read`      | `{project}`                                         | `{project, path, content, hash, bytes, remote, utf8, truncated}` |
 //! | `project.files`     | `{project, path?, thread?}`                         | `{project, commit, branch_of, path, entries: [{name, kind, size, utf8?, secret?}], total, more}`: a directory of a committed tree (`hub::project_read`; not for agents) |
@@ -213,6 +214,15 @@
 //! whether items follow; `next` is the `since_seq` / `since` that continues the read (the last
 //! item's seq / gseq; `last_seq` is the same for `thread.events`). Clients page until `more`
 //! is false.
+//! `control.subscribe` with `snapshot` (and `since` 0) acknowledges with the state a client
+//! folds from every control item up to the head (`snapshot`: a
+//! [`twr_core::client_state::ClientFold`], decisions and all, payloads whole) and `since` set
+//! to the head: the items after it follow. A state larger than [`crate::hub::SNAPSHOT_MAX`] is
+//! not sent: the ack is then the one without `snapshot` (the items from the start, compacted
+//! with `compact`). An older hub refuses `snapshot` (`bad_request`). `decisions.list` reads the
+//! older `decision.made` items a snapshot leaves out: `before` (exclusive; default: all)
+//! pages back by gseq, `limit` defaults to 200, at most [`crate::hub::DECISIONS_MAX`], and the
+//! page is cut at [`PAGE_BYTES`] too; `more` says whether older ones are left.
 //! `usage.get` returns the latest usage the hub knows of each runtime's account (`hub::usage`):
 //! the plan windows that have not reset, `used_pct` the share used, `stale` once the data is
 //! ten minutes old. Runtimes with no data are left out.
@@ -705,6 +715,7 @@ pub const METHODS: &[&str] = &[
     "attach.end",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "context.read",
     "context.set",
@@ -755,6 +766,7 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "attention.annotate",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "report.write",
     "context.read",
@@ -827,6 +839,7 @@ pub const AGENT_METHODS: &[&str] = &[
     "attention.list",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "context.read",
     "trash.list",
@@ -1040,8 +1053,8 @@ async fn connection(
                 match sub_slot(&sub_count, subs.len(), agent)
                     .and_then(|slot| Ok((slot, control_subscribe(&hub, req.params)?)))
                 {
-                    Ok((slot, (since, sub))) => {
-                        subs.spawn(pump_control(writer.clone(), id, since, sub, slot));
+                    Ok((slot, sub)) => {
+                        subs.spawn(pump_control(writer.clone(), id, sub, slot));
                     }
                     Err(e) => {
                         let _ = send(&writer, &Response::err(id, e)).await;
@@ -1317,18 +1330,26 @@ struct Item<'a> {
     event: &'a Event,
 }
 
-/// Serves control subscription `sub` (request `id`, from `since`) until it ends, counted in
-/// the hub's subscriptions (`_slot`) meanwhile. A compacted one is acknowledged once its
-/// backlog is selected, with how many items it has (`backlog`); the selection failing fails
-/// the request.
+/// Serves control subscription `sub` (request `id`) until it ends, counted in the hub's
+/// subscriptions (`_slot`) meanwhile. One with `snapshot` is acknowledged with the state at the
+/// head (serialized here, outside the core lock), or, too large to send, as one without it.
+/// A compacted one is acknowledged once its backlog is selected, with how many items it has
+/// (`backlog`); the selection failing fails the request.
 async fn pump_control(
     w: Writer,
     id: u64,
-    since: u64,
     mut sub: crate::hub::ControlSubscription,
     _slot: SubSlot,
 ) {
-    let mut ack = json!({ "since": since, "head": sub.head() });
+    // (First: one that does not send it falls back to the items from the start.)
+    let snapshot = sub.snapshot();
+    let mut ack = json!({ "since": sub.since(), "head": sub.head() });
+    if let Some(snapshot) = snapshot {
+        ack["snapshot"] = snapshot;
+        // The code that folded it: a client of another build refuses it and asks again without
+        // a snapshot (its own reducers may fold the same items otherwise).
+        ack["snapshot_fold"] = json!(twr_core::client_state::FOLD);
+    }
     if sub.compacted() {
         match sub.compact().await {
             Ok(backlog) => {
@@ -1942,8 +1963,8 @@ struct ControlParams {
     limit: Option<usize>,
 }
 
-/// `control.subscribe`'s parameters. An older hub refuses `compact` (`bad_request`): a client
-/// asks again without it.
+/// `control.subscribe`'s parameters. An older hub refuses `compact` and `snapshot`
+/// (`bad_request`): a client asks again without them.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SubscribeParams {
@@ -1955,7 +1976,23 @@ struct SubscribeParams {
     /// Compact the stored backlog ([`twr_core::compact`]).
     #[serde(default)]
     compact: bool,
+    /// Begin with the state at the head instead of the items up to it (`since` 0 only).
+    #[serde(default)]
+    snapshot: bool,
 }
+
+/// `decisions.list`'s parameters.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionsParams {
+    /// Only items before this control position (default: all).
+    before: Option<u64>,
+    /// At most this many (default [`DECISIONS_LIMIT`], at most [`crate::hub::DECISIONS_MAX`]).
+    limit: Option<usize>,
+}
+
+/// How many `decision.made` items `decisions.list` returns by default.
+const DECISIONS_LIMIT: usize = 200;
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2761,6 +2798,17 @@ fn call(
             let next = page.len().checked_sub(1).map_or(p.since, |i| items[i].0);
             Ok(json!({ "items": page, "head": head, "next": next, "more": more }))
         }
+        "decisions.list" => {
+            let p: DecisionsParams = params(p)?;
+            let limit = p
+                .limit
+                .unwrap_or(DECISIONS_LIMIT)
+                .clamp(1, crate::hub::DECISIONS_MAX);
+            let before = p.before.unwrap_or(u64::MAX);
+            let (items, older) = hub.decisions_list(before, limit).map_err(internal)?;
+            let (page, cut) = page(&items, limit, |(g, ev)| json!({ "gseq": g, "event": ev }))?;
+            Ok(json!({ "items": page, "more": older || cut }))
+        }
         "blob.get" => {
             let p: BlobParams = params(p)?;
             let len = p.len.unwrap_or(BLOB_CHUNK_MAX).clamp(1, BLOB_CHUNK_MAX);
@@ -2803,13 +2851,10 @@ fn call(
     }
 }
 
-/// `control.subscribe`: the subscription, and the `since` it starts after.
-fn control_subscribe(
-    hub: &Hub,
-    p: Value,
-) -> Result<(u64, crate::hub::ControlSubscription), RpcError> {
+/// `control.subscribe`: the subscription (which knows the `since` it starts after).
+fn control_subscribe(hub: &Hub, p: Value) -> Result<crate::hub::ControlSubscription, RpcError> {
     let p: SubscribeParams = params(p)?;
-    Ok((p.since, hub.subscribe_control_with(p.since, p.compact)))
+    hub.subscribe_control_snapshot(p.since, p.compact, p.snapshot)
 }
 
 fn thread_subscribe(

@@ -232,9 +232,10 @@ impl ThreadScript {
 /// kind the selection treats apart comes up: tasks of the runtime's and jobs (with process
 /// groups, members, `!` commands, quiet ones) started, renewed, ended, cut by stops, parks,
 /// crashes, attaches and new runtime starts, and running across reports; deletes and restores
-/// (with events of the deleted thread in between), runtime moves, git snapshots, disk
-/// measurements and trims, usage, attention items and decisions; one worker has no
-/// `thread.created`.
+/// (with events of the deleted thread in between) and purges from the trash (after which the
+/// thread has no event again), turns started from a message's ref, runtime moves, git
+/// snapshots, disk measurements and trims, usage, attention items and decisions; one worker
+/// has no `thread.created`.
 pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
     let mut rng = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut next = move |n: u64| {
@@ -248,6 +249,9 @@ pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
     let mut threads: Vec<(ThreadScript, bool, bool)> = (0..5)
         .map(|i| (ThreadScript::new(format!("t{i}")), false, false))
         .collect();
+    let mut purged = [false; 5];
+    // Each thread's trash items, its last one last.
+    let mut items: Vec<Vec<String>> = vec![Vec::new(); 5];
     let mut out = Vec::new();
     while out.len() < len {
         if next(12) == 0 {
@@ -267,6 +271,12 @@ pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
             continue;
         }
         let i = next(threads.len() as u64) as usize;
+        if purged[i] {
+            if purged.iter().all(|p| *p) {
+                break;
+            }
+            continue;
+        }
         let (s, created, deleted) = &mut threads[i];
         // The last worker has no `thread.created`: its first event is any.
         if !*created && i != 4 {
@@ -292,6 +302,13 @@ pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
                 }
                 if i == 0 && next(2) == 0 {
                     ev.source = Source::User("tui".into());
+                }
+                if next(3) == 0 {
+                    if let EventBody::TurnStarted(p) = &mut ev.body {
+                        p.ext = json!({"twr": {crate::event::MESSAGE_REF_KEY: next(50)}})
+                            .as_object()
+                            .cloned();
+                    }
                 }
                 ev
             }
@@ -374,6 +391,25 @@ pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
                 freed: next(500),
                 ..Default::default()
             })),
+            // A purge of its last trash item: gone for good.
+            34 if i != 0 && *deleted && next(3) == 0 => {
+                purged[i] = true;
+                hub.event(EventBody::TrashPurged(TrashPurged {
+                    item: items[i].last().cloned().unwrap_or_default(),
+                    thread: s.thread.clone(),
+                    gone: next(2) == 0,
+                    ..Default::default()
+                }))
+            }
+            // A purge of an older trash item, from a delete it was restored from.
+            34 if i != 0 && items[i].len() > usize::from(*deleted) && next(3) == 0 => {
+                let old = items[i].len() - 1 - usize::from(*deleted);
+                hub.event(EventBody::TrashPurged(TrashPurged {
+                    item: items[i][next(old as u64 + 1) as usize].clone(),
+                    thread: s.thread.clone(),
+                    ..Default::default()
+                }))
+            }
             34 if i != 0 => {
                 if *deleted {
                     *deleted = false;
@@ -384,8 +420,11 @@ pub fn compaction_log(seed: u64, len: usize) -> Vec<Event> {
                     }))
                 } else {
                     *deleted = true;
+                    let item = format!("item-{i}-{}", items[i].len());
+                    items[i].push(item.clone());
                     s.event(EventBody::ThreadDeleted(ThreadDeleted {
                         name: format!("w{i}"),
+                        trash: Some(item),
                         ..Default::default()
                     }))
                 }

@@ -28,17 +28,37 @@
 //!     comes after its end);
 //! - `git.snapshot`: the latest per thread, none before a `thread.restored` (which clears it);
 //! - `worktree.disk`: the latest per thread (every `worktree.trimmed` is kept);
-//! - `account.usage`: the latest per thread, runtime and account.
+//! - `account.usage`: the latest per thread, runtime and account;
+//! - `conversation.update`: none but a thread's first item (the reducers read nothing of it
+//!   but the time of a thread's first item and [`ThreadView::last_seq`]).
 //!
 //! Events of a thread while it is deleted change nothing of it ([`Registry`] drops them):
 //! none of them is a candidate or the latest of anything.
+//!
+//! A thread purged from the trash (deleted at head, and the trash item of its last delete
+//! purged: a `trash.purged` of an older item, from a delete it was restored from, does not
+//! count) can never come back, and no item names it again. Of its items before that, only those that fold into more than its own
+//! deleted view and its own entries of the notifier's memory are kept: its first item, its
+//! lifecycle (`thread.created`, `thread.renamed`, `thread.deleted`, `thread.restored`: the
+//! colors of the threads created after it are allocated from those alive then), its
+//! `decision.made` (the decision table), its attention items (the requests a turn raised, the
+//! stalls that went on, the notifier's attention keys) and the stops, parks, crashes and
+//! attaches that close its requests, its `turn.started` from a message's ref (the turns a
+//! client's messages started), its jobs' ends (the `!` commands that ended) and anything else
+//! not listed here. Its tasks' updates, git snapshots, disk measurements, reports, other turn
+//! starts, turn ends, runtime starts and resumes, and `conversation.update`s go.
 //!
 //! What it guarantees: folding the kept items in gseq order into [`Registry`],
 //! [`AttentionStack`], [`crate::usage::UsageView`] and [`crate::notify::Policy`] gives the
 //! state folding every item gives, except [`ThreadView::last_activity`],
 //! [`ThreadView::worked_at`] and [`ThreadView::last_seq`], which no client reads from the
-//! control stream. A client that folded the items up to `since` this way gets the same after
-//! `(since, head]`. The tests check it on made-up logs and, by hand, on a real one.
+//! control stream, and, of a purged thread, its deleted view beyond who it was (id, name,
+//! aliases, former names, role, color, creation time) and the notifier's report and reply keys
+//! and reports known of it, which nothing reads again. (So past the notifier's bound on the
+//! keys it remembers, it may still remember older keys of other threads that a full fold let
+//! go: no key it gives can come again, so what it remembers of them changes nothing it gives.) A client that folded the items up to
+//! `since` this way gets the same after `(since, head]`. The tests check it on made-up logs
+//! and, by hand, on a real one.
 //!
 //! [`BackgroundTask`]: crate::reduce::BackgroundTask
 //! [`ThreadView::own_background`]: crate::reduce::ThreadView::own_background
@@ -55,11 +75,17 @@ use std::collections::{HashMap, HashSet};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 
-use crate::event::{Event, EventBody, JOB_TASK_PREFIX};
+use crate::event::{message_ref, Event, EventBody, Source, HUB_THREAD, JOB_TASK_PREFIX};
 use crate::reduce::Registry;
 
 /// The kinds whose `data` [`Row::stored`] reads; of every other kind, the kind is enough.
-pub const DATA_KINDS: &[&str] = &["task.updated", "account.usage"];
+pub const DATA_KINDS: &[&str] = &[
+    "task.updated",
+    "account.usage",
+    "turn.started",
+    "thread.deleted",
+    "trash.purged",
+];
 
 /// One stored control item as [`select`] reads it: its position, its thread and what of it
 /// matters to the selection.
@@ -99,10 +125,19 @@ pub enum Item {
     /// `thread.stopped`, `thread.parked`, `thread.crashed`, `thread.attached`: drops the
     /// runtime's tasks (reading whether it had any) and closes task tracking.
     Cut,
-    /// `turn.started`, `thread.resumed`: reopens task tracking.
+    /// `thread.resumed`: reopens task tracking.
     Reopen,
-    /// `thread.deleted`.
-    Deleted,
+    /// `turn.started`: reopens task tracking. `by_message`: started from a message's ref
+    /// ([`crate::event::message_ref`]).
+    TurnStarted { by_message: bool },
+    /// `turn.ended`.
+    TurnEnded,
+    /// `conversation.update`.
+    ConversationUpdate,
+    /// `trash.purged` of trash `item`, which kept `thread`.
+    Purged { thread: String, item: String },
+    /// `thread.deleted`, `trash`: the trash item it went to.
+    Deleted { trash: Option<String> },
     /// `thread.restored`: back as it was, its runtime's tasks dropped, its git snapshot cleared.
     Restored,
     /// Anything else (always kept).
@@ -151,6 +186,19 @@ impl Row {
                 runtime: p.runtime.clone(),
                 account: p.account.clone(),
             },
+            EventBody::TurnStarted(p) => Item::TurnStarted {
+                by_message: message_ref(p).is_some(),
+            },
+            EventBody::ThreadDeleted(p) => Item::Deleted {
+                trash: p.trash.clone(),
+            },
+            // A purge the hub recorded (on its thread): the only kind it folds (`hub::trash`).
+            EventBody::TrashPurged(p) if ev.thread == HUB_THREAD && ev.source == Source::Hub => {
+                Item::Purged {
+                    thread: p.thread.clone(),
+                    item: p.item.clone(),
+                }
+            }
             _ => Item::of_kind(ev.kind()),
         };
         Row {
@@ -194,7 +242,32 @@ impl Row {
                 },
                 Err(_) => Item::Other,
             },
-            ("task.updated" | "account.usage", None) => Item::Other,
+            ("turn.started", Some(data)) => match serde_json::from_str::<LightTurn>(data) {
+                Ok(t) => Item::TurnStarted {
+                    by_message: t.by_message(),
+                },
+                Err(_) => Item::Other,
+            },
+            ("trash.purged", Some(data)) if thread == HUB_THREAD && source == "hub" => {
+                match serde_json::from_str::<LightPurge>(data) {
+                    Ok(p) => Item::Purged {
+                        thread: p.thread.into_owned(),
+                        item: p.item.into_owned(),
+                    },
+                    Err(_) => Item::Other,
+                }
+            }
+            ("thread.deleted", Some(data)) => match serde_json::from_str::<LightDeleted>(data) {
+                Ok(d) => Item::Deleted {
+                    trash: d.trash.map(Cow::into_owned),
+                },
+                Err(_) => Item::Other,
+            },
+            (
+                "task.updated" | "account.usage" | "turn.started" | "thread.deleted"
+                | "trash.purged",
+                None,
+            ) => Item::Other,
             _ => Item::of_kind(kind),
         };
         Row {
@@ -212,6 +285,30 @@ impl Row {
 }
 
 impl Item {
+    /// Whether an item of a purged thread's folds into nothing but its own deleted view and
+    /// its own entries of the notifier's memory (module docs): one [`select`] drops.
+    fn folds_into_its_view_alone(&self) -> bool {
+        match self {
+            // A job's end stays: the `!` commands that ended (kept before this is asked).
+            Item::Task(_)
+            | Item::GitSnapshot
+            | Item::WorktreeDisk
+            | Item::Report
+            | Item::Started
+            | Item::Reopen
+            | Item::TurnEnded
+            | Item::ConversationUpdate => true,
+            Item::TurnStarted { by_message } => !by_message,
+            // A stop, park or crash closes the thread's requests (`AttentionStack`).
+            Item::Cut
+            | Item::AccountUsage { .. }
+            | Item::Deleted { .. }
+            | Item::Restored
+            | Item::Purged { .. } => false,
+            Item::Other => false,
+        }
+    }
+
     /// The item of a kind whose payload [`select`] does not read.
     fn of_kind(kind: &str) -> Item {
         match kind {
@@ -220,8 +317,10 @@ impl Item {
             "report.ready" => Item::Report,
             "thread.started" => Item::Started,
             "thread.stopped" | "thread.parked" | "thread.crashed" | "thread.attached" => Item::Cut,
-            "turn.started" | "thread.resumed" => Item::Reopen,
-            "thread.deleted" => Item::Deleted,
+            "thread.resumed" => Item::Reopen,
+            "turn.ended" => Item::TurnEnded,
+            "conversation.update" => Item::ConversationUpdate,
+            "thread.deleted" => Item::Deleted { trash: None },
             "thread.restored" => Item::Restored,
             _ => Item::Other,
         }
@@ -268,6 +367,55 @@ struct LightTwr {
 struct LightJob {
     pgid: Option<IgnoredAny>,
     members: Option<IgnoredAny>,
+}
+
+/// A `turn.started`'s data, as much as [`Row::stored`] reads of it: whether a message's ref
+/// started it (`ext.twr.ref`, [`crate::event::MESSAGE_REF_KEY`]).
+/// (Read as loosely as [`crate::event::message_ref`] reads it: any `ext.twr` and `ref`, the
+/// ref counting only as an integer.)
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LightTurn {
+    ext: Option<serde_json::Value>,
+}
+
+impl LightTurn {
+    /// Whether a message's ref started it.
+    fn by_message(&self) -> bool {
+        self.ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get(crate::event::MESSAGE_REF_KEY))
+            .and_then(serde_json::Value::as_i64)
+            .is_some()
+    }
+}
+
+/// A `trash.purged`'s data, as much as [`Row::stored`] reads of it.
+#[derive(Deserialize)]
+#[serde(default)]
+struct LightPurge<'a> {
+    #[serde(borrow)]
+    thread: Cow<'a, str>,
+    #[serde(borrow)]
+    item: Cow<'a, str>,
+}
+
+impl Default for LightPurge<'_> {
+    fn default() -> Self {
+        LightPurge {
+            thread: Cow::Borrowed(""),
+            item: Cow::Borrowed(""),
+        }
+    }
+}
+
+/// A `thread.deleted`'s data, as much as [`Row::stored`] reads of it.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct LightDeleted<'a> {
+    #[serde(borrow)]
+    trash: Option<Cow<'a, str>>,
 }
 
 /// An `account.usage`'s data, as much as [`Row::stored`] reads of it.
@@ -379,9 +527,33 @@ pub fn select(rows: &[Row], since: u64, head: &Head) -> Vec<u64> {
             threads.entry(&r.thread).or_default().deleted = head.deleted.contains(&r.thread);
         }
     }
+    // The threads purged from the trash by head: of their items, what folds into no more
+    // than their own deleted view goes (module docs).
+    // (Purged: deleted at head, and the trash item of its last delete purged since; an older
+    // item, kept from a delete the thread was restored from, says nothing of the thread.)
+    let mut trashed: HashMap<&str, Option<&str>> = HashMap::new();
+    let mut purged: HashSet<&str> = HashSet::new();
+    for r in rows {
+        match &r.item {
+            Item::Deleted { trash } => {
+                trashed.insert(&r.thread, trash.as_deref());
+            }
+            Item::Restored => {
+                trashed.remove(r.thread.as_str());
+                purged.remove(r.thread.as_str());
+            }
+            Item::Purged { thread, item }
+                if trashed.get(thread.as_str()).copied().flatten() == Some(item.as_str()) =>
+            {
+                purged.insert(thread.as_str());
+            }
+            _ => {}
+        }
+    }
+    purged.retain(|t| head.deleted.contains(*t));
     let mut settled: HashSet<&str> = HashSet::new();
     for r in rows {
-        if matches!(r.item, Item::Deleted | Item::Restored) && settled.insert(&r.thread) {
+        if matches!(r.item, Item::Deleted { .. } | Item::Restored) && settled.insert(&r.thread) {
             threads.entry(&r.thread).or_default().deleted = r.item == Item::Restored;
         }
     }
@@ -400,6 +572,9 @@ pub fn select(rows: &[Row], since: u64, head: &Head) -> Vec<u64> {
             if t.job && !t.running {
                 keep[i] = true;
             }
+        }
+        if !keep[i] && purged.contains(thread) && r.item.folds_into_its_view_alone() {
+            continue;
         }
         let t = threads.entry(thread).or_default();
         if t.deleted && r.item != Item::Restored {
@@ -508,16 +683,18 @@ pub fn select(rows: &[Row], since: u64, head: &Head) -> Vec<u64> {
                     t.git = None;
                 }
             }
-            Item::Reopen => {
+            Item::Reopen | Item::TurnStarted { .. } => {
                 keep[i] = true;
                 t.epoch += 1;
             }
-            Item::Deleted => {
+            // Read by no reducer but as a thread's first item (kept above).
+            Item::ConversationUpdate => {}
+            Item::Deleted { .. } => {
                 keep[i] = true;
                 t.deleted = true;
                 t.epoch += 1;
             }
-            Item::Other => keep[i] = true,
+            Item::TurnEnded | Item::Purged { .. } | Item::Other => keep[i] = true,
         }
     }
     for t in threads.values() {
@@ -588,6 +765,35 @@ thread_local! {
     static SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// The threads `events` (control items in log order) purge from the trash, as [`select`] tells
+/// them: deleted at the end, and the trash item of their last delete purged since by the hub
+/// (a `trash.purged` on its thread, of its source: the only one it folds).
+pub fn purged_threads<'a>(events: impl IntoIterator<Item = &'a Event>) -> HashSet<String> {
+    let mut trashed: HashMap<String, Option<String>> = HashMap::new();
+    let mut purged = HashSet::new();
+    for ev in events {
+        match &ev.body {
+            EventBody::ThreadDeleted(d) => {
+                trashed.insert(ev.thread.clone(), d.trash.clone());
+            }
+            EventBody::ThreadRestored(_) => {
+                trashed.remove(&ev.thread);
+                purged.remove(&ev.thread);
+            }
+            EventBody::TrashPurged(p)
+                if ev.thread == HUB_THREAD
+                    && ev.source == Source::Hub
+                    && trashed.get(&p.thread).and_then(Option::as_deref)
+                        == Some(p.item.as_str()) =>
+            {
+                purged.insert(p.thread.clone());
+            }
+            _ => {}
+        }
+    }
+    purged
+}
+
 /// [`select`] over control items as events, with [`Head::of`] the registry they fold into:
 /// what a hub would keep of them. For tests and benchmarks.
 pub fn select_events<'a>(
@@ -644,13 +850,17 @@ mod tests {
                 .recall(ev, Some(gseq), &self.registry, &self.attention);
         }
 
-        /// The thread views, deleted ones after, without what no client reads.
-        fn views(&self) -> (Vec<ThreadView>, Vec<ThreadView>) {
-            let strip = |v: &ThreadView| ThreadView {
-                last_activity: None,
-                worked_at: None,
-                last_seq: 0,
-                ..v.clone()
+        /// The thread views, deleted ones after, without what no client reads: of a purged
+        /// thread (in `purged`), who it was only ([`identity`]).
+        fn views(&self, purged: &HashSet<String>) -> (Vec<ThreadView>, Vec<ThreadView>) {
+            let strip = |v: &ThreadView| match purged.contains(&v.id) {
+                true => identity(v),
+                false => ThreadView {
+                    last_activity: None,
+                    worked_at: None,
+                    last_seq: 0,
+                    ..v.clone()
+                },
             };
             let mut deleted: Vec<ThreadView> = self.registry.deleted_views().map(strip).collect();
             deleted.sort_by(|a, b| a.id.cmp(&b.id));
@@ -661,9 +871,28 @@ mod tests {
         }
     }
 
+    /// Who thread view `v` was: what of a purged thread's deleted view the compacted backlog
+    /// keeps (module docs).
+    pub(crate) fn identity(v: &ThreadView) -> ThreadView {
+        let mut t = ThreadView::new(v.id.clone());
+        t.name.clone_from(&v.name);
+        t.aliases.clone_from(&v.aliases);
+        t.former_names.clone_from(&v.former_names);
+        t.role.clone_from(&v.role);
+        t.color = v.color;
+        t.created_at = v.created_at;
+        t
+    }
+
+    /// The threads `log` purges from the trash ([`purged_threads`]).
+    pub(crate) fn purged_in(log: &[Event]) -> HashSet<String> {
+        purged_threads(log)
+    }
+
     /// Folds `log` in full and compacted after `since` (in full up to it); panics, naming
     /// `what`, where they differ. Returns how many items the compacted backlog has.
     fn check(what: &str, log: &[Event], since: u64) -> usize {
+        let purged = purged_in(log);
         let items: Vec<(u64, &Event)> = log.iter().zip(1..).map(|(e, g)| (g, e)).collect();
         let kept = select_events(items.iter().copied(), since);
         assert!(
@@ -679,13 +908,17 @@ mod tests {
             }
         }
         assert_eq!(
-            full.views(),
-            compacted.views(),
+            full.views(&purged),
+            compacted.views(&purged),
             "{what} (since {since}): views"
         );
         assert_eq!(full.attention, compacted.attention, "{what}: attention");
         assert_eq!(full.usage, compacted.usage, "{what}: usage");
-        assert_eq!(full.policy, compacted.policy, "{what}: notifier");
+        assert_eq!(
+            full.policy.without_threads(&purged),
+            compacted.policy.without_threads(&purged),
+            "{what}: notifier"
+        );
         kept.len()
     }
 
@@ -710,6 +943,168 @@ mod tests {
             }
         }
         assert!(kept < all * 9 / 10, "kept {kept} of {all}");
+    }
+
+    /// Of a thread purged from the trash, what folds into nothing but its own view goes; its
+    /// lifecycle, decisions, requests, message turns and jobs' ends stay, and so does a later
+    /// thread's color. A `conversation.update` goes unless it is its thread's first item.
+    #[test]
+    fn a_purged_thread_keeps_who_it_was_and_what_others_read() {
+        let mut s = crate::testkit::ThreadScript::new("w");
+        let mut hub = crate::testkit::ThreadScript::new(HUB_THREAD);
+        let mut o = crate::testkit::ThreadScript::new("o");
+        let mut ref_turn = s.turn_started("from a message");
+        if let EventBody::TurnStarted(p) = &mut ref_turn.body {
+            p.ext = serde_json::json!({"twr": {"ref": 7}}).as_object().cloned();
+        }
+        let mut job_end = s.event(EventBody::TaskUpdated(TaskUpdated {
+            task_id: format!("{JOB_TASK_PREFIX}j"),
+            running: false,
+            ..Default::default()
+        }));
+        job_end.source = Source::Hub;
+        let log = vec![
+            o.event(EventBody::ConversationUpdate(ConversationUpdate::default())), // 1: first
+            o.event(EventBody::ConversationUpdate(ConversationUpdate::default())), // 2
+            s.created("w"),                                                        // 3
+            s.turn_started("go"),                                                  // 4
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "t".into(),
+                running: true,
+                ..Default::default()
+            })), // 5
+            s.raise("a", AttentionReason::Permission),                             // 6
+            s.event(EventBody::DecisionMade(DecisionMade::default())),             // 7
+            s.git("main", 1),                                                      // 8
+            s.turn_ended(TurnResult::Completed),                                   // 9
+            s.report(Some(1), Grade::Success),                                     // 10
+            ref_turn,                                                              // 11
+            job_end,                                                               // 12
+            s.event(EventBody::ThreadDeleted(ThreadDeleted {
+                name: "w".into(),
+                trash: Some("i".into()),
+                ..Default::default()
+            })), // 13
+            by_hub(hub.event(EventBody::TrashPurged(TrashPurged {
+                item: "i".into(),
+                thread: "w".into(),
+                ..Default::default()
+            }))), // 14
+            crate::testkit::ThreadScript::new("x").created("x"),                   // 15
+        ];
+        let items: Vec<(u64, &Event)> = log.iter().zip(1..).map(|(e, g)| (g, e)).collect();
+        assert_eq!(
+            select_events(items, 0),
+            vec![1, 3, 6, 7, 11, 12, 13, 14, 15]
+        );
+        check("purged", &log, 0);
+        // The stored rows read alike.
+        for (ev, g) in log.iter().zip(1u64..) {
+            let data = ev.body.data().unwrap().to_string();
+            let stored = Row::stored(
+                g,
+                ev.thread.clone(),
+                ev.seq,
+                ev.kind(),
+                &ev.source.to_string(),
+                Row::reads_data(ev.kind()).then_some(data.as_str()),
+            );
+            assert_eq!(stored, Row::of(g, ev), "{}", ev.kind());
+        }
+    }
+
+    /// A purge of an older trash item, from a delete the thread was restored from, says nothing
+    /// of the thread: alive, or deleted again into another item, it keeps its items.
+    #[test]
+    fn a_purge_of_an_older_trash_item_purges_no_thread() {
+        let mut s = crate::testkit::ThreadScript::new("w");
+        let mut hub = crate::testkit::ThreadScript::new(HUB_THREAD);
+        let deleted = |s: &mut crate::testkit::ThreadScript, item: &str| {
+            s.event(EventBody::ThreadDeleted(ThreadDeleted {
+                name: "w".into(),
+                trash: Some(item.into()),
+                ..Default::default()
+            }))
+        };
+        let purge = |hub: &mut crate::testkit::ThreadScript, item: &str| {
+            by_hub(hub.event(EventBody::TrashPurged(TrashPurged {
+                item: item.into(),
+                thread: "w".into(),
+                ..Default::default()
+            })))
+        };
+        let mut log = vec![
+            s.created("w"),
+            deleted(&mut s, "i1"),
+            s.event(EventBody::ThreadRestored(ThreadRestored {
+                item: "i1".into(),
+                name: "w".into(),
+                ..Default::default()
+            })),
+            s.turn_started("go"),
+            purge(&mut hub, "i1"),
+        ];
+        assert!(purged_threads(&log).is_empty());
+        let items: Vec<(u64, &Event)> = log.iter().zip(1..).map(|(e, g)| (g, e)).collect();
+        assert!(select_events(items, 0).contains(&4), "its turn start stays");
+        check("restored, older item purged", &log, 0);
+        log.push(s.turn_ended(TurnResult::Completed));
+        log.push(deleted(&mut s, "i2"));
+        log.push(purge(&mut hub, "i1"));
+        assert!(purged_threads(&log).is_empty());
+        check("deleted again, older item purged", &log, 0);
+        // Not recorded by the hub: the hub folds no such purge, and the thread can come back.
+        let mut forged = purge(&mut hub, "i2");
+        forged.source = Source::User("tui".into());
+        log.push(forged);
+        assert!(purged_threads(&log).is_empty());
+        let g = log.len() as u64;
+        let forged = log.last().unwrap();
+        assert_eq!(stored_row(g, forged).item, Item::Other);
+        assert_eq!(Row::of(g, forged).item, Item::Other);
+        check("deleted again, its item purged by no hub", &log, 0);
+        log.push(purge(&mut hub, "i2"));
+        assert_eq!(purged_threads(&log), HashSet::from(["w".to_string()]));
+        check("deleted again, its item purged", &log, 0);
+    }
+
+    /// A `turn.started` whose `ext.twr` or ref is odd (not an object, a ref that is no integer)
+    /// reads the same from the store as decoded.
+    #[test]
+    fn odd_message_refs_read_alike() {
+        let mut s = crate::testkit::ThreadScript::new("w");
+        for ext in [
+            serde_json::json!({"twr": {"ref": "7"}}),
+            serde_json::json!({"twr": {"ref": 7.5}}),
+            serde_json::json!({"twr": {"ref": 7}}),
+            serde_json::json!({"twr": "x"}),
+            serde_json::json!({"twr": null}),
+        ] {
+            let mut ev = s.turn_started("go");
+            if let EventBody::TurnStarted(p) = &mut ev.body {
+                p.ext = ext.as_object().cloned();
+            }
+            assert_eq!(stored_row(1, &ev), Row::of(1, &ev), "{ext}");
+        }
+    }
+
+    /// A purge recorded by the hub: on its thread, of its source.
+    fn by_hub(mut ev: Event) -> Event {
+        ev.source = Source::Hub;
+        ev
+    }
+
+    /// `ev`'s row at `gseq` as [`Row::stored`] reads it from the store.
+    fn stored_row(g: u64, ev: &Event) -> Row {
+        let data = ev.body.data().unwrap().to_string();
+        Row::stored(
+            g,
+            ev.thread.clone(),
+            ev.seq,
+            ev.kind(),
+            &ev.source.to_string(),
+            Row::reads_data(ev.kind()).then_some(data.as_str()),
+        )
     }
 
     /// A task that ended before anything read it is gone from the backlog, its progress too;

@@ -205,6 +205,14 @@ impl Notifier {
         self.policy.recall(ev, gseq, registry, attention);
     }
 
+    /// Takes `memory` (what a policy wanting every event remembers of the control stream up to
+    /// a snapshot's head, [`twr_core::client_state::ClientFold::policy`]) for its own events,
+    /// instead of recalling the items themselves: it then observes the live items after the
+    /// head as it would after their replay ([`Policy::adopt`]).
+    pub fn adopt(&mut self, memory: &Policy) {
+        self.policy = Policy::adopt(&self.events, memory);
+    }
+
     /// What it remembers of the control stream (the tests compare it).
     #[cfg(test)]
     pub(crate) fn policy(&self) -> &Policy {

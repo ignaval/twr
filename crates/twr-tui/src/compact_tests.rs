@@ -28,25 +28,25 @@ use crate::notify::{Multiplexer, Notifier};
 
 /// What the TUI keeps of the control stream, to compare.
 #[derive(Debug, PartialEq)]
-struct Kept {
-    views: Vec<ThreadView>,
-    deleted: Vec<ThreadView>,
-    attention: AttentionStack,
-    usage: UsageView,
-    decisions: Vec<DecisionRow>,
-    decisions_seen: u64,
-    policy: Policy,
-    last_gseq: u64,
-    seen_gseq: u64,
-    started_refs: VecDeque<(String, i64, u64)>,
-    acted_turns: VecDeque<(String, u64)>,
-    shell_done: VecDeque<String>,
-    went_on: BTreeSet<String>,
-    incomplete: Vec<(String, u64)>,
-    delete_cards: BTreeMap<String, Vec<String>>,
+pub(crate) struct Kept {
+    pub(crate) views: Vec<ThreadView>,
+    pub(crate) deleted: Vec<ThreadView>,
+    pub(crate) attention: AttentionStack,
+    pub(crate) usage: UsageView,
+    pub(crate) decisions: Vec<DecisionRow>,
+    pub(crate) decisions_seen: u64,
+    pub(crate) policy: Policy,
+    pub(crate) last_gseq: u64,
+    pub(crate) seen_gseq: u64,
+    pub(crate) started_refs: VecDeque<(String, i64, u64)>,
+    pub(crate) acted_turns: VecDeque<(String, u64)>,
+    pub(crate) shell_done: VecDeque<String>,
+    pub(crate) went_on: BTreeSet<String>,
+    pub(crate) incomplete: Vec<(String, u64)>,
+    pub(crate) delete_cards: BTreeMap<String, Vec<String>>,
 }
 
-fn kept(st: &AppState, notifier: &Notifier) -> Kept {
+pub(crate) fn kept(st: &AppState, notifier: &Notifier) -> Kept {
     let strip = |v: &ThreadView| ThreadView {
         last_activity: None,
         worked_at: None,
@@ -84,7 +84,7 @@ fn kept(st: &AppState, notifier: &Notifier) -> Kept {
 }
 
 /// A notifier that wants every event (what it remembers depends on what it wants).
-fn notifier() -> Notifier {
+pub(crate) fn notifier() -> Notifier {
     let cfg = TuiNotifyConfig {
         events: vec![
             NotifyEvent::Permission,
@@ -139,12 +139,33 @@ fn selection(items: &[StreamItem]) -> Vec<u64> {
     twr_core::compact::select_events(items.iter().map(|i| (i.gseq.unwrap(), &i.event)), 0)
 }
 
-/// Full and compacted replays of `items` keep the same; returns how many items the compacted
-/// one has.
+/// `k` without what the compacted backlog leaves out of the threads purged from the trash in
+/// `items` ([`twr_core::compact`]): of their deleted views, who they were only, and none of
+/// the notifier's memory of their reports and replies.
+fn without_purged(mut k: Kept, items: &[StreamItem]) -> Kept {
+    let purged = twr_core::compact::purged_threads(items.iter().map(|i| &i.event));
+    for v in &mut k.deleted {
+        if purged.contains(&v.id) {
+            let mut t = ThreadView::new(v.id.clone());
+            t.name.clone_from(&v.name);
+            t.aliases.clone_from(&v.aliases);
+            t.former_names.clone_from(&v.former_names);
+            t.role.clone_from(&v.role);
+            t.color = v.color;
+            t.created_at = v.created_at;
+            *v = t;
+        }
+    }
+    k.policy = k.policy.without_threads(&purged);
+    k
+}
+
+/// Full and compacted replays of `items` keep the same (but what goes of purged threads,
+/// [`without_purged`]); returns how many items the compacted one has.
 fn check(what: &str, items: &[StreamItem]) -> usize {
     let kept_gseqs = selection(items);
-    let full = replay(items, None);
-    let compacted = replay(items, Some(&kept_gseqs));
+    let full = without_purged(replay(items, None), items);
+    let compacted = without_purged(replay(items, Some(&kept_gseqs)), items);
     if full != compacted {
         // The first field that differs, for a readable failure.
         assert_eq!(full.views, compacted.views, "{what}: views");
@@ -157,7 +178,7 @@ fn check(what: &str, items: &[StreamItem]) -> usize {
     kept_gseqs.len()
 }
 
-fn control_items(events: Vec<Event>) -> Vec<StreamItem> {
+pub(crate) fn control_items(events: Vec<Event>) -> Vec<StreamItem> {
     events
         .into_iter()
         .zip(1..)

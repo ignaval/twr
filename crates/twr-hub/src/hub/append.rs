@@ -598,6 +598,8 @@ impl Core {
             }
             let shared = Arc::new(ev.clone());
             if let Some(g) = gseq {
+                // Folded for the snapshots (`hub::subscribe`) before any subscriber has it.
+                self.client.apply(&full, Some(g));
                 let _ = hub.control_tx.send((g, Arc::clone(&shared)));
             }
             let _ = hub.events_tx.send(shared);

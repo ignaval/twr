@@ -11,7 +11,9 @@
 //! background task ([`checkpoint_ticker`]) replays the log on connections of its own: from the
 //! newest checkpoint it can use (or from nothing), it folds the events after it up to the log's
 //! last control event, and records the result in one short transaction ([`write`]), keeping the
-//! newest [`store::CHECKPOINTS_KEPT`]. It looks shortly after the hub opens and then every
+//! newest [`store::CHECKPOINTS_KEPT`] of each recent build ([`store::insert_checkpoint`]). A
+//! build installed next to a running hub writes its own the same way before the hub restarts
+//! (`twr log checkpoint`, [`crate::prewarm_checkpoint`]). It looks shortly after the hub opens and then every
 //! [`CHECKPOINT_TICK`], and writes only once [`CHECKPOINT_EVERY`] events or more came after the
 //! newest checkpoint. It takes no core lock.
 //!
@@ -41,6 +43,7 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use twr_core::client_state::ClientFold;
 use twr_core::config::NotifyConfig;
 use twr_core::notify::Policy;
 use twr_core::reduce::{AttentionStack, Registry};
@@ -53,7 +56,8 @@ use super::{
 use crate::store::{self, CheckpointMeta, NewCheckpoint, Store};
 
 /// The version of [`FoldSnapshot`]'s serialization. A checkpoint of another one is not used.
-pub(super) const FORMAT: i64 = 1;
+/// (2: the state a client keeps of the control stream, `client`.)
+pub(super) const FORMAT: i64 = 2;
 
 /// How many events must come after the newest checkpoint (or be in the log, without one) before
 /// another one is written.
@@ -124,6 +128,8 @@ pub(super) struct FoldSnapshot {
     #[serde(serialize_with = "twr_core::sorted::set")]
     items_deleted: HashSet<String>,
     items_restored: HashMap<String, trash::Restored>,
+    /// What a client keeps of the control stream ([`twr_core::client_state`]).
+    client: ClientFold,
 }
 
 impl FoldSnapshot {
@@ -199,6 +205,7 @@ impl Core {
             draining_boxes: _,
             defer_ack_sync: _,
             usage,
+            client,
             replayed: _,
             // Memory only: what the orchestrator's runtime got of its memory (`hub::memory`).
             memory_seen: _,
@@ -234,6 +241,7 @@ impl Core {
             deleted_rt,
             items_deleted,
             items_restored,
+            client,
         };
         (store, snap)
     }
@@ -276,6 +284,7 @@ impl Core {
             deleted_rt,
             items_deleted,
             items_restored,
+            client,
         } = snap;
         core.registry = registry;
         core.attention = attention;
@@ -308,6 +317,7 @@ impl Core {
         core.deleted_rt = deleted_rt;
         core.items_deleted = items_deleted;
         core.items_restored = items_restored;
+        core.client = client;
         Ok(core)
     }
 }
@@ -317,7 +327,7 @@ impl Core {
 /// (`TWR_FOLD_SOURCES`, made by `build.rs` at build time: development
 /// builds of one commit share a version, and reading the executable to tell them apart would
 /// cost a hub start the read of the whole file).
-pub(super) fn build_key() -> String {
+pub fn build_key() -> String {
     format!("{} src {}", twr_core::version(), env!("TWR_FOLD_SOURCES"))
 }
 
@@ -536,13 +546,34 @@ pub(super) fn write_upto(
     min_events: u64,
     upto: Option<&str>,
 ) -> anyhow::Result<Option<Written>> {
+    write_upto_with(db, notify, min_events, upto, || {})
+}
+
+/// [`write_upto`], calling `between` after the read phase looked at the checkpoints and before
+/// it reads the events (tests: another connection writing then).
+///
+/// Every read, from the checkpoints to the payloads the fold hydrates, is on one connection in
+/// one read transaction: they all see the log as of the first one, whatever another connection
+/// commits meanwhile (events appended, or a `VACUUM` that renumbers the rows a checkpoint's
+/// place was looked up as: `twr log checkpoint` runs next to a hub, without its maintenance
+/// lock). It ends before the checkpoint is recorded.
+fn write_upto_with(
+    db: &Path,
+    notify: &NotifyConfig,
+    min_events: u64,
+    upto: Option<&str>,
+    between: impl FnOnce(),
+) -> anyhow::Result<Option<Written>> {
     let build = build_key();
     let hook = hook::HookFeed::new(notify).map(|(feed, _)| feed);
     let config = config_key(hook.as_ref());
     let store = Store::open_existing(db)?;
+    // (An early return drops the connection, which ends the transaction.)
+    store.conn().execute_batch("BEGIN DEFERRED")?;
     let found = candidates(store.conn(), &config)?;
     let valid = first_valid(store.conn(), &found, &mut Vec::new());
     let after = valid.as_ref().map(|(s, _)| s.row);
+    between();
     if store::events_after(store.conn(), after)? < min_events.max(1) {
         return Ok(None);
     }
@@ -563,6 +594,7 @@ pub(super) fn write_upto(
     let gseq = core.gseq;
     drop(events);
     let (store, snap) = core.into_snapshot();
+    store.conn().execute_batch("COMMIT")?;
     let state = snap.to_bytes()?;
     drop(snap);
     let id = store::insert_checkpoint(
@@ -584,6 +616,58 @@ pub(super) fn write_upto(
         events: last + 1,
         bytes: state.len(),
     }))
+}
+
+/// What [`prewarm`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Prewarm {
+    /// It wrote checkpoint `id`, folding `events` events (past checkpoint `from`, if any), up
+    /// to control position `gseq`, `bytes` of state, in `ms`.
+    Written {
+        id: i64,
+        from: Option<i64>,
+        gseq: u64,
+        events: usize,
+        bytes: usize,
+        ms: u64,
+    },
+    /// This build has a checkpoint a start would use with nothing after it to fold.
+    UpToDate,
+    /// The database's schema is not this build's: its hub's next start migrates it (and folds
+    /// the log then); nothing was written.
+    SchemaDiffers { found: i32, this: i32 },
+}
+
+/// Writes a checkpoint of the log at `db` for this build, when it has none a start would use
+/// with nothing after it: what a build installed next to a running hub of another build runs
+/// before that hub restarts (`twr log checkpoint`), so that its first start folds only the
+/// events since instead of the whole log. Never migrates the database: one of another schema
+/// is left alone ([`Prewarm::SchemaDiffers`]). It reads on connections of its own and writes one
+/// short transaction, so a running hub goes on meanwhile ([`write`] is what the hub's own
+/// ticker runs).
+pub fn prewarm(db: &Path, notify: &NotifyConfig) -> anyhow::Result<Prewarm> {
+    let found = {
+        let conn = store::connect(db)?;
+        conn.pragma_query_value(None, "user_version", |r| r.get::<_, i32>(0))?
+    };
+    if found != store::SCHEMA_VERSION {
+        return Ok(Prewarm::SchemaDiffers {
+            found,
+            this: store::SCHEMA_VERSION,
+        });
+    }
+    let started = std::time::Instant::now();
+    Ok(match write(db, notify, 1)? {
+        Some(w) => Prewarm::Written {
+            id: w.id,
+            from: w.from,
+            gseq: w.gseq,
+            events: w.events,
+            bytes: w.bytes,
+            ms: started.elapsed().as_millis() as u64,
+        },
+        None => Prewarm::UpToDate,
+    })
 }
 
 /// Writes a checkpoint when one is due ([`write`]): first soon after the hub opened, then every
@@ -713,6 +797,36 @@ pub(super) mod tests {
         first_difference(&a, &b, "").unwrap_or_else(|| "same JSON, other bytes".into())
     }
 
+    /// What a client folds from every control item of the log at `db`, each with its payload
+    /// whole ([`ClientFold::apply`], as the TUI's replay does once its fetches came back): what
+    /// the hub's own fold (`Core::client`) and its snapshots must hold.
+    pub(in crate::hub) fn client_fold_of(db: &Path) -> ClientFold {
+        let conn = store::connect(db).unwrap();
+        let mut fold = ClientFold::default();
+        for (ev, g) in store::load_with_gseq(&conn, None).unwrap() {
+            let Some(g) = g else {
+                continue;
+            };
+            let ev = super::super::append::hydrated_whole(&conn, &ev)
+                .unwrap()
+                .unwrap_or(ev);
+            fold.apply(&ev, Some(g));
+        }
+        fold
+    }
+
+    /// Why client folds `a` and `b` differ, as JSON (`None`: they do not).
+    pub(in crate::hub) fn client_difference(a: &ClientFold, b: &ClientFold) -> Option<String> {
+        if a == b {
+            return None;
+        }
+        let (a, b) = (
+            serde_json::to_value(a).unwrap(),
+            serde_json::to_value(b).unwrap(),
+        );
+        Some(first_difference(&a, &b, "").unwrap_or_else(|| "same JSON".into()))
+    }
+
     /// The ids of the control events of the log at `db`, in order.
     pub(in crate::hub) fn control_ids(db: &Path) -> Vec<String> {
         let conn = store::connect(db).unwrap();
@@ -813,6 +927,7 @@ pub(super) mod tests {
             deleted_rt,
             items_deleted,
             items_restored,
+            client,
         } = a;
         let mut out = Vec::new();
         if *registry != b.registry {
@@ -902,6 +1017,9 @@ pub(super) mod tests {
         if *items_restored != b.items_restored {
             out.push("items_restored");
         }
+        if *client != b.client {
+            out.push("client");
+        }
         out
     }
 
@@ -960,7 +1078,8 @@ pub(super) mod tests {
 
     /// The property, on the log at `db` with `notify`'s hook: for each control event `upto` of
     /// `positions` (in log order), a hub start from a checkpoint covering the log up to it
-    /// folds the state a fold of the whole log gives, byte for byte. Each checkpoint is written
+    /// folds the state a fold of the whole log gives, byte for byte (what a client keeps of the
+    /// control stream too, which is what a client folds from the log). Each checkpoint is written
     /// from the one before (the writer's way, after the first), then each from nothing; each
     /// one's state reads back as itself. Returns the states written. The log's checkpoints are
     /// dropped before and after.
@@ -974,6 +1093,9 @@ pub(super) mod tests {
         let set = skipped_set(&core);
         if !set.is_empty() {
             return Err(format!("checkpoints skip what the fold sets: {set:?}"));
+        }
+        if let Some(d) = client_difference(&core.client, &client_fold_of(db)) {
+            return Err(format!("the hub's client fold is not a client's: {d}"));
         }
         let full_views = Views::of(&core);
         let full_snap = core.into_snapshot().1;
@@ -1760,7 +1882,7 @@ pub(super) mod tests {
         let other_gseq = poisoned(&good, Some(meta.gseq + 1));
         type Change = Box<dyn FnOnce(&mut CheckpointMeta)>;
         let cases: Vec<(&str, Change, &[u8])> = vec![
-            ("format 2, not 1", Box::new(|m| m.format = 2), &poison[..]),
+            ("format 1, not 2", Box::new(|m| m.format = 1), &poison[..]),
             (
                 "written by 0.0.0 0",
                 Box::new(|m| m.build = "0.0.0 0".into()),
@@ -1921,6 +2043,78 @@ pub(super) mod tests {
         for ((a, ga), (b, gb)) in before.iter().zip(&after) {
             assert_eq!((&a.id, ga), (&b.id, gb));
         }
+    }
+
+    /// The writer reads the log as of its first read, on one connection: events another
+    /// connection appends meanwhile are not covered, and agent events it deletes then, with a
+    /// `VACUUM` (as `twr log compact` does next to `twr log checkpoint`), are still folded. The
+    /// checkpoint holds what a fold of the log as it was gives.
+    #[test]
+    fn the_writer_reads_one_state_of_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        rich_log(&db, false);
+        let notify = with_hook();
+        let conn = store::connect(&db).unwrap();
+        let ids = control_ids(&db);
+        let expected = {
+            let w = write_at(&db, &notify, ids.last().unwrap())
+                .unwrap()
+                .unwrap();
+            store::checkpoint_state(&conn, w.id).unwrap().unwrap()
+        };
+        store::drop_checkpoints(&conn).unwrap();
+        let first = write_at(&db, &notify, &ids[ids.len() / 2])
+            .unwrap()
+            .unwrap();
+        let head = store::control_head(&conn).unwrap();
+        // The events past the first checkpoint, up to the last control event.
+        let past = {
+            let row = store::event_position(&conn, &ids[ids.len() / 2])
+                .unwrap()
+                .unwrap()
+                .0;
+            let events = store::load_with_gseq(&conn, Some(row)).unwrap();
+            events.iter().rposition(|(_, g)| g.is_some()).unwrap() + 1
+        };
+        let w = write_upto_with(&db, &notify, 1, None, || {
+            let mut l = Log {
+                clock: 10_000,
+                ..Default::default()
+            };
+            for i in 0..3 {
+                l.ev(
+                    "t-extra",
+                    Source::Hub,
+                    EventBody::ContextUpdated(ContextUpdated {
+                        hash: format!("sha256:{i}"),
+                        ext: twr(json!({"project": "other"})),
+                        ..Default::default()
+                    }),
+                );
+            }
+            l.write(&db);
+            let other = store::connect(&db).unwrap();
+            let start = store::event_position(&other, &ids[ids.len() / 2])
+                .unwrap()
+                .unwrap()
+                .0;
+            let gone = other
+                .execute(
+                    "DELETE FROM events WHERE kind LIKE 'agent.%' AND rowid > ?1",
+                    [start],
+                )
+                .unwrap();
+            assert!(gone > 0, "agent events after the first checkpoint");
+            other.execute_batch("VACUUM").unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(w.from, Some(first.id));
+        assert_eq!(w.gseq, head, "what was appended meanwhile is not covered");
+        assert_eq!(w.events, past, "what was deleted meanwhile is folded");
+        let got = store::checkpoint_state(&conn, w.id).unwrap().unwrap();
+        assert!(got == expected, "{}", diff(&got, &expected));
     }
 
     /// The writer counts the events from the checkpoint a start would use: past a newer one
@@ -2254,10 +2448,9 @@ struct NotSerialized {
         hb.shutdown().await;
     }
 
-    /// A hub opened from a checkpoint has not read every event: it reads the compacted
-    /// backlog's rows in the background as it opens, by itself, the rows a whole replay
-    /// builds, and its compacted backlog is what the log's events select. (A subscription
-    /// that comes first reads them itself: `a_reopened_hub_compacts_its_log_alike`.)
+    /// A hub opened from a checkpoint has not read every event, nor does it as it opens: its
+    /// first compacted subscription reads the backlog's rows, the rows a whole replay builds,
+    /// and its compacted backlog is what the log's events select.
     #[tokio::test]
     async fn a_hub_opened_from_a_checkpoint_compacts_its_backlog_alike() {
         let dir = tempfile::tempdir().unwrap();
@@ -2271,20 +2464,8 @@ struct NotSerialized {
         let hub = Hub::open(quiet_options(&db)).await.unwrap();
         assert_eq!(hub.inner.core().replayed.checkpoint, Some(w.id));
         let (stored, head) = hub.control_read(0, 100_000).unwrap();
-        // Nobody subscribes: the hub reads them by itself.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let rows = loop {
-            let rows = hub.inner.compact_rows.lock().unwrap().rows().to_vec();
-            if rows.last().map(|r| r.gseq) == Some(head) || std::time::Instant::now() > deadline {
-                break rows;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        };
-        let replayed: Vec<twr_core::compact::Row> = stored
-            .iter()
-            .map(|(g, e)| twr_core::compact::Row::of(*g, e))
-            .collect();
-        assert_eq!(rows, replayed);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(hub.inner.compact_rows.lock().unwrap().rows().is_empty());
         let kept = twr_core::compact::select_events(stored.iter().map(|(g, e)| (*g, e)), 0);
         let mut sub = hub.subscribe_control_with(0, true);
         assert_eq!(sub.head(), head);
@@ -2293,6 +2474,11 @@ struct NotSerialized {
             .unwrap()
             .unwrap();
         assert_eq!(n, kept.len() as u64);
+        let replayed: Vec<twr_core::compact::Row> = stored
+            .iter()
+            .map(|(g, e)| twr_core::compact::Row::of(*g, e))
+            .collect();
+        assert_eq!(hub.inner.compact_rows.lock().unwrap().rows(), replayed);
         let mut got = Vec::new();
         while got.len() < kept.len() {
             let next = tokio::time::timeout(Duration::from_secs(10), sub.next());
@@ -2300,6 +2486,53 @@ struct NotSerialized {
         }
         assert_eq!(got, kept);
         hub.shutdown().await;
+    }
+
+    /// A control subscription with `snapshot` begins with what a client folds from every
+    /// control item of the log, whether the hub opened from a checkpoint or folded the whole
+    /// log, with `[notify]` set or not; it goes on after the head.
+    #[tokio::test]
+    async fn a_snapshot_is_what_a_client_folds_from_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        rich_log(&db, true);
+        settle(&db).await;
+        let ids = control_ids(&db);
+        for (checkpoint, notify) in [
+            (false, NotifyConfig::default()),
+            (true, NotifyConfig::default()),
+            (true, with_hook()),
+        ] {
+            let conn = store::connect(&db).unwrap();
+            store::drop_checkpoints(&conn).unwrap();
+            if checkpoint {
+                write_at(&db, &notify, &ids[ids.len() / 2])
+                    .unwrap()
+                    .unwrap();
+            }
+            let mut o = quiet_options(&db);
+            o.config.notify = notify.clone();
+            let hub = Hub::open(o).await.unwrap();
+            assert_eq!(
+                hub.inner.core().replayed.checkpoint.is_some(),
+                checkpoint,
+                "{:?}",
+                hub.inner.core().replayed
+            );
+            let expected = client_fold_of(&db);
+            let mut sub = hub.subscribe_control_snapshot(0, true, true).unwrap();
+            let head = sub.head();
+            assert_eq!(expected.last_gseq, head);
+            let snap = sub.snapshot().expect("a snapshot");
+            assert!(sub.snapshot().is_none(), "taken once");
+            assert_eq!((sub.since(), sub.compacted()), (head, false));
+            let got: ClientFold = serde_json::from_value(snap).unwrap();
+            if let Some(d) = client_difference(&got, &expected) {
+                panic!("checkpoint {checkpoint}: {d}");
+            }
+            assert!(!got.registry.list().is_empty());
+            hub.shutdown().await;
+        }
     }
 
     /// The hub writes a checkpoint in the background soon after it opens (here at once: one

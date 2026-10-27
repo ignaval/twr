@@ -2113,6 +2113,30 @@ impl DecisionLog {
         }
     }
 
+    /// The rows of a snapshot of the control stream (oldest first; at most [`DECISIONS_CAP`]
+    /// are kept), of `seen` decisions in all: the log as folding them would leave it.
+    pub fn install(&mut self, rows: impl IntoIterator<Item = DecisionRow>, seen: u64) {
+        self.rows = rows.into_iter().collect();
+        while self.rows.len() > DECISIONS_CAP {
+            self.rows.pop_front();
+        }
+        self.seen = seen;
+    }
+
+    /// Puts `older` (rows older than every kept one, newest first, as `decisions.list` gives
+    /// them) before the kept rows, as many as fit under [`DECISIONS_CAP`]: a kept row is never
+    /// dropped for them. They were counted in [`DecisionLog::seen`] already. Returns how many
+    /// were put.
+    pub fn prepend_older(&mut self, older: impl IntoIterator<Item = DecisionRow>) -> usize {
+        let room = DECISIONS_CAP.saturating_sub(self.rows.len());
+        let mut put = 0;
+        for row in older.into_iter().take(room) {
+            self.rows.push_front(row);
+            put += 1;
+        }
+        put
+    }
+
     /// Rows kept.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -2314,6 +2338,14 @@ pub struct AppState {
     pub catch_up_items: Option<(u64, u64)>,
     /// Recent `decision.made` events for the audit view.
     pub decisions: DecisionLog,
+    /// The decisions older than a snapshot's to read (`decisions.list`): before which control
+    /// position, and how many at most ([`AppState::install_snapshot`]). Taken when the read
+    /// is sent.
+    pub older_decisions: Option<(u64, usize)>,
+    /// A view kept across a switch had this decision selected, at this place of the table,
+    /// and the snapshot's rows do not have it: it is selected again once the older rows have
+    /// it, unless the selection moved meanwhile ([`AppState::older_decisions_came`]).
+    pub pending_decision: Option<(String, usize)>,
     /// The latest usage of each runtime's account, from `account.usage` (the status bar's
     /// usage segment).
     pub usage: twr_core::usage::UsageView,
@@ -2732,6 +2764,11 @@ impl AppState {
             // A new row lands on top: keep a selection below the top on the same row.
             if self.view.decision_sel > 0 && self.view.decision_filter.matches(&row) {
                 self.view.decision_sel = self.view.decision_sel.saturating_add(1);
+                // A selection a kept view waits to find again moves with it: this is no move
+                // of the user's ([`AppState::pending_decision`]).
+                if let Some((_, at)) = self.pending_decision.as_mut() {
+                    *at = at.saturating_add(1);
+                }
             }
             self.decisions.push(row);
         }

@@ -178,8 +178,8 @@ fn replay_bench() {
 
 /// How long selecting a compacted control backlog takes (`control.subscribe` with `compact`,
 /// [`twr_core::compact`]): what the lock holds (the tasks at head), the rows the replay keeps
-/// for it, the selection over them, and reading the rows from the store instead (what a hub
-/// started from a checkpoint does in the background as it opens, `subscribe::warm_up`). Run in release mode on a copy of a real `twr.db`
+/// for it, the selection over them, and reading the rows from the store instead (what the first compacted
+/// subscription to a hub started from a checkpoint does). Run in release mode on a copy of a real `twr.db`
 /// (`TWR_BENCH_DB`, as [`replay_bench`]; a log made up here otherwise):
 ///
 /// ```sh

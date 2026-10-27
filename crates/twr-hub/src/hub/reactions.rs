@@ -444,7 +444,16 @@ impl Core {
                 todo.push((thread.clone(), turn, TurnResult::Error));
             }
         }
-        for ev in store::unreported_turn_ends(self.store.conn(), &orchestrators)? {
+        // Only the live workers' ends: those of a thread the registry does not have (deleted)
+        // are never completed, and reading every thread's would read all history.
+        let workers: Vec<String> = self
+            .registry
+            .list()
+            .into_iter()
+            .filter(|v| !v.is_orchestrator())
+            .map(|v| v.id.clone())
+            .collect();
+        for ev in store::unreported_turn_ends(self.store.conn(), &workers)? {
             let (EventBody::TurnEnded(p), Some(turn)) = (&ev.body, ev.turn) else {
                 continue;
             };
