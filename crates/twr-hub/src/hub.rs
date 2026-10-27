@@ -1005,6 +1005,7 @@ struct ThreadRt {
     /// (`ThreadView::pins_project` is `None`: made for a repository path before pins were
     /// recorded, or before its project was configured), as looked up for its latest move
     /// (`Hub::look_up_pins_project`). Memory only: each move looks it up again.
+    #[serde(skip)]
     looked_up_project: Option<String>,
     /// A runtime exit whose closing sequence is not recorded yet ([`Core::begin_exit`] until
     /// [`Core::finish_exit`]): the thread takes no new turn, and nothing else closes it.
@@ -1123,6 +1124,9 @@ impl PartialEq for ThreadRt {
             resuming,
             pty_command,
             acp_env,
+            account_dir,
+            account_env_dir,
+            looked_up_project,
             exiting,
             taken,
             stop_requested,
@@ -1154,6 +1158,9 @@ impl PartialEq for ThreadRt {
             && *resuming == o.resuming
             && *pty_command == o.pty_command
             && *acp_env == o.acp_env
+            && *account_dir == o.account_dir
+            && *account_env_dir == o.account_env_dir
+            && *looked_up_project == o.looked_up_project
             && *exiting == o.exiting
             && taken.is_some() == o.taken.is_some()
             && *stop_requested == o.stop_requested
@@ -1211,6 +1218,8 @@ impl ThreadRt {
         "resuming",
         "pty_command",
         "acp_env",
+        "account_dir",
+        "account_env_dir",
         "exiting",
         "stop_requested",
         "closed_runtimes",
@@ -1240,6 +1249,7 @@ impl ThreadRt {
             restart_reason,
             compact,
             offer_waived,
+            looked_up_project,
             // In the checkpoint.
             process_live: _,
             pid: _,
@@ -1250,6 +1260,8 @@ impl ThreadRt {
             resuming: _,
             pty_command: _,
             acp_env: _,
+            account_dir: _,
+            account_env_dir: _,
             exiting: _,
             stop_requested: _,
             closed_runtimes: _,
@@ -1273,6 +1285,7 @@ impl ThreadRt {
             ("restart_reason", restart_reason.is_some()),
             ("compact", compact.is_some()),
             ("offer_waived", offer_waived.is_some()),
+            ("looked_up_project", looked_up_project.is_some()),
         ]
         .into_iter()
         .filter_map(|(f, set)| set.then_some(f))
