@@ -96,6 +96,7 @@ disk_warn_gb = 10                 # under this many GB free on a box, a disk car
 job_slots = 0                     # the machine's job slots for `twr job run`; 0 = its CPUs
 # cpu_weight = 20                 # the workers' CPU weight against the rest (systemd: 100); unset = no limit
 # memory_high = "8G"              # each worker's memory before it's slowed (systemd MemoryHigh); unset = none
+idle_compaction = "ask"           # a large context's prompt cache expired: ask before sending; "before_expiry" also compacts idle ones; "off"
 
 [trash]
 keep_days = 7                     # deleted threads stay in the trash this long; 0 = purge at the next check
@@ -217,6 +218,8 @@ The TUI folds a thread's routine updates in the orchestrator conversation (inter
 `job_slots` is how many job slots the machine has: every job (`twr job run`) takes as many as it asks for (1 by default) while it runs, and waits for them in turn. Every twr hub of this home (its workspaces too) shares the pool, a lock file per slot in `<data dir>/job-slots/`. 0, the default, is the machine's CPUs. See [usage.md](usage.md#jobs).
 
 `cpu_weight` and `memory_high` limit the workers on the hub's machine. Both are off by default. See [usage.md](usage.md#resource-limits).
+
+`idle_compaction` is what the hub does when a worker's prompt cache has expired and its context is large (200 000 tokens or more; only Claude Code reports a cache). With `"ask"`, the default, the hub holds your message or the orchestrator's to such a worker and asks you on a card whether to compact its context first: `Compact first`, `Send as is` or `Don't ask for <thread>`. `"before_expiry"` does the same, and also has the hub compact an idle worker's context itself within the 5 minutes before a cache of an hour or more expires, so the compaction reads it from the cache: the one case where the hub compacts a context without being asked each time. `"off"` does neither. `twr compact <thread> --offers on|off` turns the offers on or off for one thread. Any other value is a config error. See [runtimes.md](runtimes.md#the-prompt-cache).
 
 `disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts, and `twr box doctor` warns under it. 0 turns them off. See [worktrees.md](worktrees.md#disk-use).
 

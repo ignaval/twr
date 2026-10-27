@@ -31,6 +31,11 @@
 //! and going back to its default is never refused: its first session is a new one. Neither is
 //! a later clear refused because of a live runtime the thread moved away from (it is replaced,
 //! not resumed); one of the new runtime that has not reported its session yet counts as above.
+//! A move back to a runtime the thread left a session of earlier resumes that session instead
+//! (not for `acp`): a model or effort left out is then the one the thread had when it left it,
+//! and a `default` that runtime keeps a session's value of makes the move start a new session
+//! (with the full handoff) rather than being refused. Until the resumed session starts, a clear
+//! of a setting the runtime keeps is refused as for any session the thread has.
 //!
 //! Unlike a mode change, the orchestrator's change of a model or effort is applied directly,
 //! recorded with `by: orchestrator`: choosing a model is no permission answer (like
@@ -57,7 +62,8 @@ use twr_core::proto::{codes, RpcError};
 
 use super::runtime_spec::RuntimeSpec;
 use super::{
-    append_err, box_agents, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub, Inner,
+    append_err, box_agents, internal, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub,
+    Inner,
 };
 
 /// A checked `thread.set_model` ([`Core::model_change`]).
@@ -106,9 +112,10 @@ impl Hub {
     /// include the thread's (`bad_request`), an attached thread (`conflict`), and for the
     /// orchestrator anything but an agent runtime or a configured preset (`bad_request`).
     ///
-    /// The result also has `runtime`, `previous_runtime` and `runtime_changed`; with a move,
-    /// `message` says that the new runtime's session starts with the next turn, with the
-    /// handoff.
+    /// The result also has `runtime`, `previous_runtime`, `runtime_changed` and `resumes` (the
+    /// session of the new runtime the move resumes, else null); with a move, `message` says
+    /// that the new runtime's session starts (or the earlier one resumes) with the next turn,
+    /// with the handoff.
     pub fn set_runtime_model(
         &self,
         query: &str,
@@ -292,6 +299,26 @@ impl Core {
                 ),
             ));
         }
+        // A move back to a runtime the thread left a session of resumes that session
+        // (`hub::switch`): found before the settings are checked, which then start from the
+        // session's. Unless the call asks the runtime's default for a setting the runtime keeps
+        // on resume: the session would go on with its own, so the move starts a new one.
+        let mut departure = match &switch {
+            Some(new) if new.acp.is_none() && new.runtime != twr_adapters::pty::NAME => {
+                self.departure(&id, &new.runtime).map_err(internal)?
+            }
+            _ => None,
+        };
+        if let Some(d) = &departure {
+            let cleared = [("model", model, &d.model), ("effort", effort, &d.effort)];
+            if cleared.into_iter().any(|(what, given, from)| {
+                given.is_some_and(runtime_spec::is_default)
+                    && runtime_spec::clear_refusal(&target, &view.name, true, what, from, &None)
+                        .is_some()
+            }) {
+                departure = None;
+            }
+        }
         // Its own runtime named alone: nothing changes (reported below).
         let named = runtime.is_some_and(|r| !r.trim().is_empty());
         if model.is_none() && effort.is_none() && switch.is_none() && !named {
@@ -301,9 +328,10 @@ impl Core {
                  or effort to the runtime's own)",
             ));
         }
-        // On another runtime, one left out is the new runtime's default.
+        // On another runtime, one left out is the new runtime's default, or the session's
+        // when the move resumes one.
         let new_model = match model {
-            None if switch.is_some() => None,
+            None if switch.is_some() => departure.as_ref().and_then(|d| d.model.clone()),
             None => view.model.clone(),
             Some(m) if runtime_spec::is_default(m) => None,
             Some(m) => {
@@ -315,7 +343,7 @@ impl Core {
             }
         };
         let new_effort = match effort {
-            None if switch.is_some() => None,
+            None if switch.is_some() => departure.as_ref().and_then(|d| d.effort.clone()),
             None => view.effort.clone(),
             Some(e) => runtime_spec::canonical_effort(e, &target)
                 .map_err(|e| rpc(codes::BAD_REQUEST, e))?,
@@ -380,6 +408,7 @@ impl Core {
             "runtime": target,
             "previous_runtime": view.runtime,
             "runtime_changed": switch.is_some(),
+            "resumes": departure.as_ref().map(|d| &d.session),
         });
         if switch.is_none() && new_model == view.model && new_effort == view.effort {
             // Nothing changes: nothing is recorded, nothing restarts.
@@ -406,12 +435,15 @@ impl Core {
         } else {
             ChangedBy::User
         };
-        // What the new runtime needs (as `thread.created` records it) and the session it
-        // replaces.
+        // What the new runtime needs (as `thread.created` records it), the session it replaces
+        // (one its runtime confirmed, never a pending move's) and the one it resumes.
         let ext = switch.as_ref().and_then(|s| {
             let mut twr = serde_json::Map::new();
             s.record(&mut twr);
-            twr.insert("previous_session".into(), json!(view.session_id));
+            twr.insert("previous_session".into(), json!(view.confirmed_session()));
+            if let Some(d) = &departure {
+                twr.insert(RESUME_SESSION_KEY.into(), json!(d.session));
+            }
             twr_ext_map(Value::Object(twr))
         });
         let event = EventBody::ThreadModelChanged(ThreadModelChanged {
@@ -427,12 +459,19 @@ impl Core {
         });
         out["changed"] = json!(true);
         if switch.is_some() {
-            out["message"] = json!(format!(
-                "{} moves from {} to {target}: a new {target} session starts with its next \
-                 turn, given a handoff of what the previous session did (its task, reports, \
-                 recent turns, worktree and branch)",
-                view.name, view.runtime
-            ));
+            out["message"] = json!(match &departure {
+                Some(d) => format!(
+                    "{} moves from {} back to {target}: its earlier {target} session ({}) \
+                     resumes with its next turn, told what the thread did since it left it",
+                    view.name, view.runtime, d.session
+                ),
+                None => format!(
+                    "{} moves from {} to {target}: a new {target} session starts with its next \
+                     turn, given a handoff of what the previous session did (its task, reports, \
+                     recent turns, worktree and branch)",
+                    view.name, view.runtime
+                ),
+            });
         }
         Ok(ModelChange {
             id,

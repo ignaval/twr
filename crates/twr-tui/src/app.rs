@@ -1246,22 +1246,28 @@ impl Transcript {
                 // The first turn of a thread's new runtime carries a handoff of the previous
                 // session (`ext.twr.runtime_handoff`): marked, never shown (the prompt is the
                 // message as given).
-                let handoff = p
-                    .ext
-                    .as_ref()
-                    .and_then(|m| m.get("twr"))
+                let twr = p.ext.as_ref().and_then(|m| m.get("twr"));
+                let handoff = twr
                     .and_then(|t| t.get(RUNTIME_HANDOFF_KEY))
                     .is_some_and(|h| !h.is_null());
-                if handoff {
+                // A move back resumes the session the thread left that runtime with, told what
+                // the thread did since (`ext.twr.resumes`), with or without a handoff.
+                let resumes = twr
+                    .and_then(|t| t.get("resumes"))
+                    .and_then(|r| r.as_str())
+                    .is_some();
+                if handoff || resumes {
                     let rt = self
                         .runtime
                         .as_deref()
                         .map(|r| format!("{r} "))
                         .unwrap_or_default();
-                    self.notice(
-                        NoticeLevel::Info,
-                        format!("new {rt}session, with a handoff of the previous one"),
-                    );
+                    let what = if resumes {
+                        format!("earlier {rt}session resumed, told what the thread did since")
+                    } else {
+                        format!("new {rt}session, with a handoff of the previous one")
+                    };
+                    self.notice(NoticeLevel::Info, what);
                 }
                 let notice = p.from == TurnFrom::Runtime
                     || p.from == TurnFrom::Orchestrator
@@ -1875,7 +1881,8 @@ pub fn model_changed_notice(p: &ThreadModelChanged) -> String {
 /// runtime reports when that is another (an alias it resolved, or the one it still runs until
 /// it restarts): `api: model fable, effort high (runs claude-fable-5-1)`. A thread that moved
 /// to another runtime and has no session of it yet says so: `api: model default, effort
-/// default; its first codex session starts with its next turn`.
+/// default; its first codex session starts with its next turn` (or, moving back, that its
+/// earlier session resumes).
 pub fn model_show(t: &ThreadView) -> String {
     let mut out = format!(
         "{}: model {}, effort {}",
@@ -1891,10 +1898,16 @@ pub fn model_show(t: &ThreadView) -> String {
         out.push_str(&format!(" (runs {a})"));
     }
     if t.handoff_pending {
-        out.push_str(&format!(
-            "; its first {} session starts with its next turn",
-            t.runtime
-        ));
+        match &t.resume_session {
+            Some(_) => out.push_str(&format!(
+                "; its earlier {} session resumes with its next turn",
+                t.runtime
+            )),
+            None => out.push_str(&format!(
+                "; its first {} session starts with its next turn",
+                t.runtime
+            )),
+        }
     }
     out
 }
@@ -12832,6 +12845,12 @@ pub(crate) mod tests {
         );
         t.model = Some("claude-fable-5-1".into());
         assert_eq!(model_show(&t), "api: model claude-fable-5-1, effort high");
+        t.runtime = "codex".into();
+        t.actual_model = None;
+        t.handoff_pending = true;
+        assert!(model_show(&t).ends_with("; its first codex session starts with its next turn"));
+        t.resume_session = Some("th-1".into());
+        assert!(model_show(&t).ends_with("; its earlier codex session resumes with its next turn"));
     }
 
     /// The popup above the input line: arrows pick, Tab completes, Enter on a partial command

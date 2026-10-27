@@ -50,8 +50,8 @@ use twr_core::reduce::{AttentionStack, Registry};
 use twr_core::usage::UsageView;
 
 use super::{
-    activity, after, delete, disk, hook, orch, proposal, route, stall, trash, wake, Core, HubState,
-    Inner, ThreadRt,
+    activity, after, delete, disk, hook, idle_compact, orch, proposal, route, stall, trash, wake,
+    Core, HubState, Inner, ThreadRt,
 };
 use crate::store::{self, CheckpointMeta, NewCheckpoint, Store};
 
@@ -114,6 +114,7 @@ pub(super) struct FoldSnapshot {
     /// The notification hook's policy (`None` without `[notify] command`).
     hook: Option<Policy>,
     after: after::AfterState,
+    idle_offers: HashMap<String, idle_compact::IdleOffer>,
     card_outcomes: HashMap<String, String>,
     context_hashes: HashMap<String, String>,
     project_contexts: HashMap<String, String>,
@@ -180,6 +181,7 @@ impl Core {
             jobs: _,
             hook,
             after,
+            idle_offers,
             card_outcomes,
             context_hashes,
             project_contexts,
@@ -228,6 +230,7 @@ impl Core {
             disk,
             hook: hook.map(|f| f.policy),
             after,
+            idle_offers,
             card_outcomes,
             context_hashes,
             project_contexts,
@@ -271,6 +274,7 @@ impl Core {
             disk,
             hook,
             after,
+            idle_offers,
             card_outcomes,
             context_hashes,
             project_contexts,
@@ -304,6 +308,7 @@ impl Core {
             feed.policy = policy;
         }
         core.after = after;
+        core.idle_offers = idle_offers;
         core.card_outcomes = card_outcomes;
         core.context_hashes = context_hashes;
         core.project_contexts = project_contexts;
@@ -914,6 +919,7 @@ pub(super) mod tests {
             disk,
             hook,
             after,
+            idle_offers,
             card_outcomes,
             context_hashes,
             project_contexts,
@@ -977,6 +983,9 @@ pub(super) mod tests {
         }
         if *after != b.after {
             out.push("after");
+        }
+        if *idle_offers != b.idle_offers {
+            out.push("idle_offers");
         }
         if *card_outcomes != b.card_outcomes {
             out.push("card_outcomes");
@@ -1550,6 +1559,16 @@ pub(super) mod tests {
             }
         });
         l.with(HUB_THREAD, USER(), |s| s.resolve("d1"));
+        // An offer to compact w2's context before its message goes, left open.
+        l.with(HUB_THREAD, hub.clone(), |s| {
+            s.raise("io1", AttentionReason::Question)
+        });
+        l.edit(|b| {
+            if let EventBody::AttentionRaised(p) = b {
+                p.ext = twr(json!({"idle_offer": {"thread": "t-w2", "session": "s-w2",
+                    "expires_at": "2026-10-27T12:00:00Z", "tokens": 250000}}));
+            }
+        });
         // w3 compacting its context when it is stopped.
         l.with("t-w3", USER(), |s| s.turn_started("/compact"));
         l.edit(|b| {
@@ -2803,6 +2822,7 @@ struct NotSerialized {
             "after.pending",
             "after.cards",
             "after.orphans",
+            "idle_offers",
             "card_outcomes",
             "context_hashes",
             "project_contexts",

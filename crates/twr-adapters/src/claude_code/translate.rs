@@ -115,6 +115,17 @@
 //! read the last call has no such key, and its `context` is the `result`'s `usage`
 //! ([`twr_core::reduce::recorded_context`] tells which of those to trust).
 //!
+//! The prompt cache (`turn.ended` `prompt_cache`, [`twr_core::event::PromptCache`]): a turn
+//! whose context is its latest call's (`context_from: last_call`) also says when that call was
+//! made (the translator's clock when its first frame came) and how long the prompt cache lives:
+//! 3600 s when the call's `message.usage.cache_creation` wrote `ephemeral_1h_input_tokens`
+//! (a subscription), 300 s for `ephemeral_5m_input_tokens`, else what the latest main call of
+//! this process that wrote any said (a call that read its whole prompt from the cache writes
+//! none), else unknown (`ttl_s` absent). Subagent calls and `<synthetic>` messages are no
+//! calls here either. A turn without a call of its own (a manual `/compact`'s, one that asked
+//! the model nothing) has none: the thread keeps the expiry it knew
+//! ([`twr_core::reduce::ThreadView::cache_expires_at`]), and a compaction forgets it.
+//!
 //! Turn stamping: every user message written for turn `n` queues `n`; the first in-turn line
 //! after a `result` (normally the next `system/init`) opens the oldest queued turn, and the
 //! `result` closes it. Claude runs queued user messages as separate turns in order, so FIFO
@@ -158,8 +169,9 @@ use crate::acp::translate::{mode_acceptable, mode_level, ModeLevel};
 use crate::attn::IssuedIds;
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
-    AttentionReason, AttentionResolved, EventBody, JsonMap, ResolvedBy, SessionPayload, TurnEnded,
-    TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY, RUNTIME_TURN_KEY, STEP_KEY,
+    AttentionReason, AttentionResolved, EventBody, JsonMap, PromptCache, ResolvedBy,
+    SessionPayload, TurnEnded, TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY,
+    RUNTIME_TURN_KEY, STEP_KEY,
 };
 
 /// Key of this runtime's extras (`data.ext.claude`).
@@ -448,6 +460,9 @@ pub struct Translator {
     last_call: Option<Call>,
     /// The main agent's model, as its latest model call said (none: it did not say).
     main_model: Option<String>,
+    /// The prompt cache's lifetime in seconds, as the main agent's latest call that wrote the
+    /// cache in this process said ([`cache_ttl`]).
+    cache_ttl: Option<u64>,
     /// The main agent's model and its context window, as the last `result` that said it did.
     context_window: Option<(String, u64)>,
     /// A compaction began in the runtime's turn opened for a notification while its run was
@@ -455,7 +470,7 @@ pub struct Translator {
     /// [`twr_core::event::COMPACTING_HOLD_SECS`]), then starts again (a compaction can take
     /// longer than the wait).
     notice_held: bool,
-    /// The clock usage reads are timed by.
+    /// The clock usage reads, waits and model calls are timed by.
     clock: fn() -> DateTime<Utc>,
 }
 
@@ -507,6 +522,7 @@ impl Translator {
             compacted_to: None,
             last_call: None,
             main_model: None,
+            cache_ttl: None,
             context_window: None,
             notice_held: false,
             clock: Utc::now,
@@ -515,7 +531,8 @@ impl Translator {
         }
     }
 
-    /// Times usage reads by `clock` instead of the system clock (tests).
+    /// Times usage reads, waits and model calls by `clock` instead of the system clock
+    /// (tests).
     pub fn set_clock(&mut self, clock: fn() -> DateTime<Utc>) {
         self.clock = clock;
     }
@@ -1561,7 +1578,8 @@ impl Translator {
     /// Records the main agent's model call `message` (an API message: `id`, `model`, `usage`)
     /// as the latest. Frames of one call (its `message_start`, one `assistant` line per content
     /// block) share its id; a new call without `usage` makes the size unknown, not the one
-    /// before. A `<synthetic>` message is no call.
+    /// before. A new call is timed when its first frame comes. A `<synthetic>` message is no
+    /// call.
     fn note_call(&mut self, message: &Value) {
         let model = str_at(message, "model");
         if !message.is_object() || model == "<synthetic>" {
@@ -1569,19 +1587,26 @@ impl Translator {
         }
         let id = str_at(message, "id");
         let tokens = call_input(message);
+        let ttl = cache_ttl(message);
         let model = Some(model.to_string()).filter(|m| !m.is_empty());
         match &mut self.last_call {
             Some(call) if !id.is_empty() && call.id == id => {
                 call.tokens = tokens.or(call.tokens);
                 call.model = model.clone().or(call.model.take());
+                call.ttl = ttl.or(call.ttl);
             }
             _ => {
                 self.last_call = Some(Call {
                     id: id.to_string(),
                     tokens,
                     model: model.clone(),
+                    called_at: (self.clock)(),
+                    ttl,
                 })
             }
+        }
+        if ttl.is_some() {
+            self.cache_ttl = ttl;
         }
         self.compacted_to = None;
         // The session's model is the latest call's, unknown when it did not say.
@@ -2098,6 +2123,15 @@ impl Translator {
             (None, None) if usage.input > 0 => (CONTEXT_UNKNOWN, None),
             (None, None) => ("", None),
         };
+        // The prompt cache of that call, when the context is its: when it was made, and how
+        // long the cache lives (as it said, else as an earlier call of this process did).
+        let prompt_cache = call
+            .as_ref()
+            .filter(|_| from == CONTEXT_FROM_CALL)
+            .map(|c| PromptCache {
+                called_at: c.called_at,
+                ttl_s: c.ttl.or(self.cache_ttl),
+            });
         // The model of the call (a call that did not say has none), else the session's.
         let model = match call {
             Some(c) => c.model,
@@ -2202,6 +2236,7 @@ impl Translator {
                 usage: Some(usage),
                 duration_ms: v.get("duration_ms").and_then(Value::as_u64),
                 context,
+                prompt_cache,
                 ext,
                 ..Default::default()
             }),
@@ -2343,6 +2378,27 @@ fn call_input(message: &Value) -> Option<u64> {
     (tokens > 0).then_some(tokens)
 }
 
+/// The prompt cache lifetime model call `message` reports, in seconds: its `usage`
+/// `cache_creation` wrote 1-hour entries (`ephemeral_1h_input_tokens` above 0: 3600), else
+/// 5-minute ones (`ephemeral_5m_input_tokens`: 300). `None` when it wrote none (all of its
+/// prompt was read from the cache, or the call did not say).
+fn cache_ttl(message: &Value) -> Option<u64> {
+    let written = |k: &str| {
+        message
+            .pointer("/usage/cache_creation")
+            .and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+    };
+    if written("ephemeral_1h_input_tokens") {
+        Some(3600)
+    } else if written("ephemeral_5m_input_tokens") {
+        Some(300)
+    } else {
+        None
+    }
+}
+
 /// The main agent's model call the translator saw last.
 #[derive(Debug, Clone)]
 struct Call {
@@ -2353,6 +2409,10 @@ struct Call {
     tokens: Option<u64>,
     /// Its model, when it said.
     model: Option<String>,
+    /// When it was made: the translator's clock when its first frame came.
+    called_at: DateTime<Utc>,
+    /// The prompt cache lifetime it reported ([`cache_ttl`]), when it wrote the cache.
+    ttl: Option<u64>,
 }
 
 /// What a `result`'s `modelUsage` says of a model's context window ([`context_window`]).

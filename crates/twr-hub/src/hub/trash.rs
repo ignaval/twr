@@ -1553,7 +1553,12 @@ mod tests {
             None,
         )
         .unwrap();
-        let handoff = hub.inner.core().thread_handoff("t1").unwrap();
+        let handoff = hub
+            .inner
+            .core()
+            .thread_handoff("t1")
+            .unwrap()
+            .expect("a handoff");
         assert!(
             handoff.contains("- branch: twr/new (its own worktree of"),
             "{handoff}"

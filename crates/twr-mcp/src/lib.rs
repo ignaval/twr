@@ -1161,7 +1161,9 @@ impl TwrMcp {
                        run a session only Claude Code's effort can go back to default (the other \
                        runtimes keep a resumed session's model and effort, Claude Code its \
                        model): the hub refuses that, so pick a value instead (moving to another \
-                       runtime is a new session: any default is fine then). A running turn finishes \
+                       runtime is a new session: any default is fine then, except that a move \
+                       back to a runtime the thread left a session of resumes that session, \
+                       where a default it keeps means a new session instead). A running turn finishes \
                        first (the items it waits on stay with it), then the runtime restarts on \
                        the same session with the new settings; an idle one restarts at once; a \
                        parked or stopped one starts with them next time. A model of another \
@@ -1169,10 +1171,13 @@ impl TwrMcp {
                        Claude Code thread is runtime codex, model gpt-6.1-sol, effort xhigh. \
                        `runtime` is claude-code, codex, grok-build or a [runtimes.<name>] preset \
                        the user configured (never a command line); a model or effort left out \
-                       is then the new runtime's default. The thread keeps its name, worktree, \
+                       is then the new runtime's default (on a move back, the one the thread had \
+                       when it left that runtime). The thread keeps its name, worktree, \
                        branch, queue and permission mode; its runtime is stopped (after a \
                        running turn) and its next turn starts a new session of the new runtime, \
-                       given a handoff of what the previous one did. Unless the thread is in \
+                       given a handoff of what the previous one did, or, moving back to a \
+                       runtime it left a session of, resumes that session, told what the \
+                       thread did since (`resumes` names it). Unless the thread is in \
                        plan, read-only or dontAsk mode, a move asks the user first: it returns \
                        {status: \"needs_confirmation\"} and goes on the confirm card with \
                        everything else you proposed this turn (runtimes differ in what one \
@@ -1180,7 +1185,7 @@ impl TwrMcp {
                        confirm.\" and never retry. Tell the user the new \
                        session starts with the thread's next message; if they want it to go on \
                        now, send it a prompt. Returns {thread_name, thread, runtime, \
-                       previous_runtime, runtime_changed, model, effort, previous_model, \
+                       previous_runtime, runtime_changed, resumes, model, effort, previous_model, \
                        previous_effort, changed, applies: now | after_turn | next_start, \
                        message?}. Not for the orchestrator itself, attached threads, or pty \
                        threads (without a new runtime). Tell the user what you changed."

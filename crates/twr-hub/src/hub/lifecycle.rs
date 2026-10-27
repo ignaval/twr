@@ -158,6 +158,15 @@ impl Hub {
                 .checkpoint_events
                 .unwrap_or(checkpoint::CHECKPOINT_EVERY),
             prune_tick: opts.prune_tick.unwrap_or(super::prune::PRUNE_TICK),
+            idle_compaction_tick: opts
+                .idle_compaction_tick
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_TICK),
+            idle_compaction_lead: opts
+                .idle_compaction_lead
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_LEAD),
+            idle_compaction_margin: opts
+                .idle_compaction_margin
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_MARGIN),
             maintenance: Mutex::new(()),
             archive_reader: Mutex::new(None),
             job_slots_dir,
@@ -241,6 +250,19 @@ impl Hub {
         // The remote boxes' own tasks (an SSH box's supervisor dials it from now on).
         for (rbox, ssh) in registered {
             boxes::start_box(&hub.inner, rbox, ssh);
+        }
+        // Compactions before a prompt cache expires, only when the user configured them: once
+        // the previous hub's runtimes are killed and their threads closed (a compaction resumes
+        // a session; one started earlier would run beside its old process and be closed by
+        // the recovery).
+        if !hub.inner.idle_compaction_tick.is_zero()
+            && hub.inner.config.threads.idle_compaction
+                == twr_core::config::IdleCompaction::BeforeExpiry
+        {
+            tokio::spawn(super::idle_compact::idle_compaction_ticker(
+                Arc::downgrade(&hub.inner),
+                hub.inner.idle_compaction_tick,
+            ));
         }
         twr_core::trace::mark("hub: open");
         Ok(hub)
@@ -593,6 +615,7 @@ impl Core {
             jobs: Default::default(),
             hook,
             after: Default::default(),
+            idle_offers: HashMap::new(),
             card_outcomes: HashMap::new(),
             context_hashes: HashMap::new(),
             usage: Default::default(),

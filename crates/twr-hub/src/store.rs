@@ -2111,6 +2111,11 @@ const LATEST_OF_KIND: &str = concat!(
 const SEQS_OF_KIND: &str =
     "SELECT seq FROM events WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC";
 
+/// [`work_turn_seqs_after`].
+const WORK_TURN_SEQS_AFTER: &str = "SELECT seq FROM events WHERE kind = 'turn.started'
+     AND thread = ?1 AND seq > ?2 AND json_extract(data, '$.ext.twr.compact') IS NOT 1
+     ORDER BY +seq DESC";
+
 /// [`event_at`].
 const EVENT_AT: &str = concat!(
     "SELECT ",
@@ -2239,6 +2244,19 @@ pub fn updates_about(
 pub fn seqs_of_kind(conn: &Connection, thread: &str, kind: &str) -> anyhow::Result<Vec<u64>> {
     let mut st = conn.prepare_cached(SEQS_OF_KIND)?;
     let rows = st.query_map(params![kind, thread], |r| r.get::<_, i64>(0))?;
+    rows.map(|s| Ok(u64::try_from(s?)?)).collect()
+}
+
+/// The `seq` of every `turn.started` of `thread` after `after` that is no compaction
+/// (`ext.twr.compact`), newest first: the work turns since then, for reading them one at a
+/// time ([`event_at`]).
+pub fn work_turn_seqs_after(
+    conn: &Connection,
+    thread: &str,
+    after: u64,
+) -> anyhow::Result<Vec<u64>> {
+    let mut st = conn.prepare_cached(WORK_TURN_SEQS_AFTER)?;
+    let rows = st.query_map(params![thread, to_i64(after)?], |r| r.get::<_, i64>(0))?;
     rows.map(|s| Ok(u64::try_from(s?)?)).collect()
 }
 

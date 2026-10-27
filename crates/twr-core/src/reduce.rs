@@ -270,6 +270,28 @@ pub struct ThreadView {
     /// only a `thread.started` of the new runtime ends this.
     #[serde(default)]
     pub handoff_pending: bool,
+    /// The session of the new runtime that a pending move resumes instead of starting a new
+    /// one: the move back to a runtime the thread left earlier recorded the session it left
+    /// then (`thread.model_changed` `ext.twr.resume_session`, [`RESUME_SESSION_KEY`]), and
+    /// [`ThreadView::session_id`] is that session meanwhile (still
+    /// [`ThreadView::handoff_pending`]). Every move clears it before it sets its own; the new
+    /// runtime's start ends it, and so does the failure of the turn that carried it
+    /// ([`ThreadView::resume_failed_turn`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session: Option<String>,
+    /// The turn that carries [`ThreadView::resume_session`]: the work turn whose
+    /// `turn.started` says it resumes that session (`ext.twr.resumes`, [`RESUMES_KEY`]), one
+    /// the hub recorded (whoever it is from: a job's wake is `from: runtime`), never one a
+    /// runtime reported. Cleared with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_turn: Option<u64>,
+    /// The turn whose resume failed: [`ThreadView::resume_turn`] ended `error` or
+    /// `interrupted`, or a crash took it down, before the new runtime started a session. The
+    /// resume is dropped then ([`ThreadView::session_id`] and
+    /// [`ThreadView::resume_session`] `None`, still [`ThreadView::handoff_pending`]): the
+    /// next start is a new session. Cleared by the new runtime's start and by the next move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_failed_turn: Option<u64>,
     /// Highest turn number started.
     pub turns: u64,
     /// Currently open turn.
@@ -351,6 +373,25 @@ pub struct ThreadView {
     /// until the `context.compacted`, the end of the turn or of the process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compacting: Option<DateTime<Utc>>,
+    /// How long its session's prompt cache lives, in seconds: the latest `turn.ended`
+    /// `prompt_cache` `ttl_s` of the session ([`PromptCache`]), kept when a later one does not
+    /// say (a new process of the same session that has not written the cache yet). Cleared
+    /// with [`ThreadView::context`] by a new session (a `thread.started` with another session
+    /// id, a move to another runtime) and by a compaction that worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_s: Option<u64>,
+    /// When its session's prompt cache expires: the latest `turn.ended` `prompt_cache`
+    /// `called_at` plus [`ThreadView::cache_ttl_s`], `None` when no TTL is known. A turn end
+    /// without `prompt_cache` (one that called no model, a compaction's) leaves it; it is
+    /// cleared when [`ThreadView::cache_ttl_s`] is. Claude Code only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<DateTime<Utc>>,
+    /// The user turned the hub's offers to compact its context once the prompt cache expired
+    /// off for this thread: the latest `conversation.update` on it with
+    /// `ext.twr.idle_compaction` ([`IDLE_COMPACTION_KEY`]) said `"off"` (`"on"` turns them
+    /// back on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_compaction_off: bool,
     /// Client currently attached.
     pub attached: Option<String>,
     /// Parked.
@@ -496,11 +537,16 @@ impl ThreadView {
                     return;
                 }
                 self.handoff_pending = false;
+                // The resume, if any, is over: it worked, or its fallback started anew.
+                self.resume_session = None;
+                self.resume_turn = None;
+                self.resume_failed_turn = None;
                 self.cut_tasks();
                 self.task_tracking_closed = false;
-                // Another session starts with a context of its own.
+                // Another session starts with a context (and a prompt cache) of its own.
                 if p.session_id.is_some() && p.session_id != self.session_id {
                     self.context = None;
+                    self.forget_cache();
                 }
                 self.compacting = None;
                 self.set_session(&p.session_id);
@@ -557,19 +603,32 @@ impl ThreadView {
             EventBody::ThreadModelChanged(p) => {
                 self.model = p.model.clone();
                 self.effort = p.effort.clone();
-                // Sessions do not move between runtimes: the next start is a new session.
+                // Sessions do not move between runtimes: the next start is a new session, or
+                // the session the thread left this runtime with earlier, resumed.
                 if let Some(r) = &p.runtime {
                     self.runtime = r.clone();
                     self.acp_command = acp_command(p.ext.as_ref()).cloned();
                     self.session_id = None;
                     self.actual_model = None;
                     self.context = None;
+                    self.forget_cache();
                     self.handoff_pending = true;
+                    self.resume_session = None;
+                    self.resume_turn = None;
+                    self.resume_failed_turn = None;
+                    if let Some(s) = twr_str(p.ext.as_ref(), RESUME_SESSION_KEY) {
+                        self.session_id = Some(s.to_string());
+                        self.resume_session = Some(s.to_string());
+                    }
                 }
             }
             // A turn whose message the user took back is never the crashed one: retrying it
             // would deliver that message again.
             EventBody::ThreadCrashed(_) => {
+                // A crash in the turn that carried a resume: the resume failed.
+                if let Some(t) = self.resume_turn.filter(|t| self.current_turn == Some(*t)) {
+                    self.fail_resume(t);
+                }
                 self.crashed = true;
                 self.crashed_turn = match self.current_turn {
                     // (A compaction is no work to retry.)
@@ -627,6 +686,15 @@ impl ThreadView {
                 if let Some(r) = self.current_turn_retry_of {
                     self.turn_retry_of.insert(n, r);
                 }
+                // The turn that carries the pending resume: one the hub recorded, whoever it is
+                // from (a job's wake is `from: runtime`), never one a runtime reported.
+                if self.handoff_pending
+                    && !matches!(ev.source, Source::Adapter(_))
+                    && self.resume_session.is_some()
+                    && twr_str(p.ext.as_ref(), RESUMES_KEY) == self.resume_session.as_deref()
+                {
+                    self.resume_turn = Some(n);
+                }
                 self.crashed = false;
                 self.crashed_turn = None;
                 self.stopped = false;
@@ -642,8 +710,22 @@ impl ThreadView {
                 if let Some(c) = recorded_context(p).filter(|_| !self.handoff_pending) {
                     self.context = c;
                 }
+                if let Some(cache) = p.prompt_cache.filter(|_| !self.handoff_pending) {
+                    let ttl = cache.ttl_s.or(self.cache_ttl_s);
+                    self.cache_ttl_s = ttl;
+                    self.cache_expires_at = ttl.and_then(|t| {
+                        let t = chrono::Duration::try_seconds(i64::try_from(t).ok()?)?;
+                        cache.called_at.checked_add_signed(t)
+                    });
+                }
                 self.compacting = None;
                 let n = ev.turn.or(self.current_turn).unwrap_or(self.turns);
+                // The turn that carried a resume failed: the next start is a new session.
+                if matches!(p.result, TurnResult::Error | TurnResult::Interrupted)
+                    && self.resume_turn == Some(n)
+                {
+                    self.fail_resume(n);
+                }
                 // The end of a compaction: maintenance, what the last work turn left stays.
                 if self.current_turn == Some(n) && self.current_turn_compact {
                     self.close_turn();
@@ -781,10 +863,51 @@ impl ThreadView {
                 if p.error.is_none() && !self.handoff_pending {
                     let window = self.context.and_then(|c| c.window);
                     self.context = p.post_tokens.map(|tokens| ContextSize { tokens, window });
+                    // Its next call writes the prompt cache anew.
+                    self.forget_cache();
+                }
+            }
+            EventBody::ConversationUpdate(p) => {
+                match twr_str(p.ext.as_ref(), IDLE_COMPACTION_KEY) {
+                    Some("off") => self.idle_compaction_off = true,
+                    Some("on") => self.idle_compaction_off = false,
+                    _ => {}
                 }
             }
             _ => {}
         }
+    }
+
+    /// Its session's prompt cache is not known any more ([`ThreadView::cache_ttl_s`],
+    /// [`ThreadView::cache_expires_at`]).
+    fn forget_cache(&mut self) {
+        self.cache_ttl_s = None;
+        self.cache_expires_at = None;
+    }
+
+    /// The turn `n` that carried a pending resume failed before the new runtime started a
+    /// session: the resume is dropped, and the next start is a new session
+    /// ([`ThreadView::resume_failed_turn`]). The failed process may still report the session
+    /// it was asked to resume; `set_session` ignores it while the move is pending.
+    fn fail_resume(&mut self, n: u64) {
+        if !self.handoff_pending || self.resume_session.is_none() {
+            return;
+        }
+        self.session_id = None;
+        self.resume_session = None;
+        self.resume_turn = None;
+        self.resume_failed_turn = Some(n);
+    }
+
+    /// Its session, unless the thread waits for its new runtime's first session
+    /// ([`ThreadView::handoff_pending`]): then [`ThreadView::session_id`] is none, or the
+    /// session a pending resume asks for ([`ThreadView::resume_session`]), which no runtime
+    /// confirmed yet.
+    pub fn confirmed_session(&self) -> Option<&str> {
+        if self.handoff_pending {
+            return None;
+        }
+        self.session_id.as_deref()
     }
 
     /// Records session id `s`, if given, unless the thread waits for its new runtime's first
@@ -1888,6 +2011,424 @@ mod tests {
         assert_eq!(v.context, Some(size(30_000)));
         v.apply(&t.event(compacted(None, None)));
         assert_eq!(v.context, None);
+    }
+
+    /// `turn.ended` with a prompt cache called `secs` after the test clock's base, of `ttl_s`.
+    fn cache_ended(s: &mut ThreadScript, secs: i64, ttl_s: Option<u64>) -> Event {
+        let mut ev = s.turn_ended(TurnResult::Completed);
+        if let EventBody::TurnEnded(p) = &mut ev.body {
+            p.prompt_cache = Some(PromptCache {
+                called_at: crate::testkit::base_time() + chrono::Duration::seconds(secs),
+                ttl_s,
+            });
+        }
+        ev
+    }
+
+    fn at_secs(secs: i64) -> Option<DateTime<Utc>> {
+        Some(crate::testkit::base_time() + chrono::Duration::seconds(secs))
+    }
+
+    /// `thread.model_changed` moving the thread to `runtime`, resuming `resume` if given.
+    fn moved_to(s: &mut ThreadScript, runtime: &str, resume: Option<&str>) -> Event {
+        let mut p = ThreadModelChanged {
+            runtime: Some(runtime.into()),
+            previous_runtime: Some("fake".into()),
+            ..Default::default()
+        };
+        if let Some(r) = resume {
+            set_twr_ext(&mut p.ext, RESUME_SESSION_KEY, serde_json::json!(r));
+        }
+        s.event(EventBody::ThreadModelChanged(p))
+    }
+
+    /// The prompt cache's expiry folds from the turns' ends: the call's time plus its TTL, the
+    /// TTL known when the end does not say, unknown when neither does. A turn end without a
+    /// prompt cache (no call, a compaction's) keeps it. A compaction that worked, another
+    /// session and a move to another runtime clear both; a failed compaction and a start of the
+    /// same session keep them; the previous runtime's late turn end during a move sets nothing.
+    #[test]
+    fn a_turns_prompt_cache_sets_when_it_expires() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("s1"));
+        // Nothing known: no TTL, no expiry.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 100, None));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 200, Some(3600)));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(3800))
+        );
+        // A turn end without one keeps it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        assert_eq!(v.cache_expires_at, at_secs(3800));
+        // A later call without a TTL of its own: the TTL known.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 500, None));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(4100))
+        );
+        // A 5-minute cache replaces it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 600, Some(300)));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(300), at_secs(900))
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["cache_ttl_s"], 300);
+        assert_eq!(
+            serde_json::from_value::<ThreadView>(json).unwrap(),
+            v,
+            "round trip"
+        );
+        // A failed compaction keeps it; one that worked clears it.
+        let compacted = |error: Option<&str>| {
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                post_tokens: Some(500),
+                error: error.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        v.apply(&s.event(compacted(Some("too_few_groups"))));
+        assert_eq!(v.cache_expires_at, at_secs(900));
+        v.apply(&s.event(compacted(None)));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.get("cache_ttl_s").is_none() && json.get("cache_expires_at").is_none());
+        // A start of the same session keeps it; one of another session clears it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 700, Some(3600)));
+        v.apply(&s.started("s1"));
+        assert_eq!(v.cache_expires_at, at_secs(4300));
+        v.apply(&s.started("s2"));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        // A move to another runtime clears it, and the previous runtime's turn end that comes
+        // after the move sets nothing.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 800, Some(3600)));
+        assert_eq!(v.cache_expires_at, at_secs(4400));
+        v.apply(&s.turn_started("go"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        v.apply(&cache_ended(&mut s, 900, Some(3600)));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        // A thread view from before prompt caches reads as none known.
+        let mut old = serde_json::to_value(&v).unwrap();
+        old.as_object_mut().unwrap().retain(|k, _| {
+            !matches!(
+                k.as_str(),
+                "cache_ttl_s"
+                    | "cache_expires_at"
+                    | "idle_compaction_off"
+                    | "resume_session"
+                    | "resume_turn"
+                    | "resume_failed_turn"
+            )
+        });
+        let back: ThreadView = serde_json::from_value(old).unwrap();
+        assert_eq!(back, v);
+    }
+
+    /// The TTL is the session's: a new process of the same session whose first call wrote no
+    /// cache (its prompt read whole from the cache) does not know it, says none, and the
+    /// thread's expiry still counts the 1 h the session's earlier process said.
+    #[test]
+    fn the_cache_ttl_outlives_a_process_of_its_session() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("s1"));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 100, Some(3600)));
+        v.apply(&s.stopped());
+        v.apply(&s.started("s1"));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 2_000, None));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(5_600))
+        );
+        let events = [
+            s.created("api"),
+            s.started("s1"),
+            s.turn_started("go"),
+            cache_ended(&mut s, 100, Some(3600)),
+            s.parked(),
+            s.resumed("s1"),
+            s.turn_started("go"),
+            cache_ended(&mut s, 2_000, None),
+        ];
+        let v = view(&events);
+        assert_eq!(v.cache_expires_at, at_secs(5_600));
+        assert_eq!(replayed(&events, "t1"), v);
+    }
+
+    /// The user's choice of offers to compact a thread whose cache expired: a
+    /// `conversation.update` on it with `ext.twr.idle_compaction` `off` turns them off, `on`
+    /// back on; any other update leaves the choice.
+    #[test]
+    fn idle_compaction_offers_follow_the_latest_choice() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        let update = |s: &mut ThreadScript, value: Option<&str>| {
+            let mut p = ConversationUpdate {
+                text: "x".into(),
+                ..Default::default()
+            };
+            if let Some(value) = value {
+                set_twr_ext(&mut p.ext, IDLE_COMPACTION_KEY, serde_json::json!(value));
+            }
+            s.event(EventBody::ConversationUpdate(p))
+        };
+        assert!(!v.idle_compaction_off);
+        v.apply(&update(&mut s, Some("off")));
+        assert!(v.idle_compaction_off);
+        assert_eq!(
+            serde_json::to_value(&v).unwrap()["idle_compaction_off"],
+            true
+        );
+        v.apply(&update(&mut s, None));
+        v.apply(&update(&mut s, Some("sometimes")));
+        assert!(v.idle_compaction_off);
+        v.apply(&update(&mut s, Some("on")));
+        assert!(!v.idle_compaction_off);
+        assert!(serde_json::to_value(&v)
+            .unwrap()
+            .get("idle_compaction_off")
+            .is_none());
+    }
+
+    /// `turn.started` of a turn that carries the resume of `session` (the hub's).
+    fn resuming(s: &mut ThreadScript, session: &str) -> Event {
+        let mut ev = s.turn_started("go");
+        ev.source = Source::Hub;
+        if let EventBody::TurnStarted(p) = &mut ev.body {
+            set_twr_ext(&mut p.ext, RESUMES_KEY, serde_json::json!(session));
+        }
+        ev
+    }
+
+    /// `ev`, a `turn.started`, from the runtime (a job's wake, or a runtime's own turn).
+    fn runtime_turn(mut ev: Event) -> Event {
+        if let EventBody::TurnStarted(p) = &mut ev.body {
+            p.from = TurnFrom::Runtime;
+        }
+        ev
+    }
+
+    fn from(mut ev: Event, runtime: &str) -> Event {
+        ev.source = Source::Adapter(runtime.into());
+        ev
+    }
+
+    /// Resume state: (session, resume session, resume turn, resume failed turn, pending).
+    type ResumeState<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<u64>,
+        Option<u64>,
+        bool,
+    );
+
+    fn resume_state(v: &ThreadView) -> ResumeState<'_> {
+        (
+            v.session_id.as_deref(),
+            v.resume_session.as_deref(),
+            v.resume_turn,
+            v.resume_failed_turn,
+            v.handoff_pending,
+        )
+    }
+
+    /// A move back to a runtime the thread left points its session at the session it left
+    /// (still pending: no runtime confirmed it, [`ThreadView::confirmed_session`] says none),
+    /// the turn that carries the resume is noted, and the runtime's start ends it all. Every
+    /// move clears what a pending resume left before it sets its own: A → B → A (pending) → C
+    /// leaves no resume.
+    #[test]
+    fn a_move_back_resumes_the_session_it_left() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("a1"));
+        assert_eq!(v.confirmed_session(), Some("a1"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        assert_eq!(v.confirmed_session(), None);
+        v.apply(&from(s.started("b1"), "codex"));
+        v.apply(&s.turn_started("work on b"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        assert_eq!(resume_state(&v), (Some("b1"), None, None, None, false));
+        // Back to A, resuming a1.
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        assert_eq!(
+            v.confirmed_session(),
+            None,
+            "a pending resume is no session yet"
+        );
+        // A turn that resumes another session is not the resume's; one a runtime reported (its
+        // own turn) never is, whatever it says.
+        v.apply(&resuming(&mut s, "zz"));
+        assert_eq!(v.resume_turn, None);
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&from(runtime_turn(resuming(&mut s, "a1")), "fake"));
+        assert_eq!(v.resume_turn, None);
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        // The hub's turn is, whoever it is from: here a job's wake (`from: runtime`).
+        v.apply(&runtime_turn(resuming(&mut s, "a1")));
+        assert_eq!(v.resume_turn, Some(4));
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            (&json["resume_session"], &json["resume_turn"]),
+            (&serde_json::json!("a1"), &serde_json::json!(4))
+        );
+        assert_eq!(serde_json::from_value::<ThreadView>(json).unwrap(), v);
+        // The resumed start: the session confirmed, the resume over.
+        v.apply(&s.started("a1"));
+        assert_eq!(resume_state(&v), (Some("a1"), None, None, None, false));
+        assert_eq!(v.confirmed_session(), Some("a1"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+
+        // A → B → A (pending) → C: nothing of the resume is left.
+        v.apply(&moved_to(&mut s, "codex", None));
+        v.apply(&from(s.started("b2"), "codex"));
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        v.apply(&resuming(&mut s, "a1"));
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(5), None, true)
+        );
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&moved_to(&mut s, "grok-build", None));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        // A start of the runtime the resume was for, late, is not the new runtime's.
+        v.apply(&s.started("a1"));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        v.apply(&from(s.started("g1"), "grok-build"));
+        assert_eq!(resume_state(&v), (Some("g1"), None, None, None, false));
+    }
+
+    /// The turn that carried a resume fails (ends `error` or `interrupted`, or a crash takes
+    /// it down) before the runtime started a session: the resume is dropped (no session, still
+    /// pending) and the failed turn noted, whatever session the failed process reports. A
+    /// crash after that turn's failed end changes nothing more, nor does a failed end of
+    /// another turn (the previous runtime's, late) or a completed end of the resume's turn. The
+    /// next start (a new session) clears the failure, and so does the next move.
+    #[test]
+    fn a_failed_resume_falls_back_to_a_new_session() {
+        // Thread on A (session a1), moved to B, then back to A resuming a1.
+        let setup = |s: &mut ThreadScript| {
+            vec![
+                s.created("api"),
+                s.started("a1"),
+                moved_to(s, "codex", None),
+                from(s.started("b1"), "codex"),
+                s.turn_started("work on b"),
+                s.turn_ended(TurnResult::Completed),
+                moved_to(s, "fake", Some("a1")),
+            ]
+        };
+        let failed = |result: TurnResult| {
+            let mut s = ThreadScript::new("t1");
+            let mut evs = setup(&mut s);
+            evs.push(resuming(&mut s, "a1"));
+            let mut end = s.turn_ended(result);
+            if let EventBody::TurnEnded(p) = &mut end.body {
+                p.session_id = Some("a1".into());
+            }
+            evs.push(end);
+            (s, evs)
+        };
+        for result in [TurnResult::Error, TurnResult::Interrupted] {
+            let (_, evs) = failed(result);
+            let v = view(&evs);
+            assert_eq!(
+                resume_state(&v),
+                (None, None, None, Some(2), true),
+                "{result:?}"
+            );
+            assert_eq!(replayed(&evs, "t1"), v);
+        }
+        // A job's wake (the hub's, `from: runtime`) that carried the resume and failed drops it
+        // the same way; a runtime's own turn that says it resumes the session is not the
+        // resume's, and its failure drops nothing.
+        for reported in [false, true] {
+            let mut s = ThreadScript::new("t1");
+            let mut evs = setup(&mut s);
+            let wake = runtime_turn(resuming(&mut s, "a1"));
+            evs.push(if reported { from(wake, "fake") } else { wake });
+            evs.push(s.turn_ended(TurnResult::Error));
+            let v = view(&evs);
+            let want: ResumeState = if reported {
+                (Some("a1"), Some("a1"), None, None, true)
+            } else {
+                (None, None, None, Some(2), true)
+            };
+            assert_eq!(
+                resume_state(&v),
+                want,
+                "reported by the runtime: {reported}"
+            );
+            assert_eq!(replayed(&evs, "t1"), v);
+        }
+        // A completed end of the resume's turn is no failure.
+        let v = view(&failed(TurnResult::Completed).1);
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(2), None, true)
+        );
+
+        // A crash in the resume's turn (no end before it).
+        let mut s = ThreadScript::new("t1");
+        let mut evs = setup(&mut s);
+        evs.push(resuming(&mut s, "a1"));
+        evs.push(s.crashed(1));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, Some(2), true));
+        assert_eq!(v.crashed_turn, Some(2));
+        // A crash after its failed end (the hub's closing sequence): the end already counted.
+        let (mut s, mut evs) = failed(TurnResult::Interrupted);
+        evs.push(s.crashed(1));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, Some(2), true));
+
+        // A failed end of another turn (the previous runtime's, late) is not the resume's.
+        let mut s = ThreadScript::new("t1");
+        let mut evs = setup(&mut s);
+        evs.push(resuming(&mut s, "a1"));
+        let mut late = s.event(EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Error,
+            session_id: Some("b1".into()),
+            ..Default::default()
+        }));
+        late.turn = Some(1);
+        evs.push(late);
+        let v = view(&evs);
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(2), None, true)
+        );
+
+        // After the failure: the retry starts a new session, which clears it.
+        let (mut s, mut evs) = failed(TurnResult::Error);
+        evs.push(s.retry_turn_started(2));
+        evs.push(s.started("a2"));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (Some("a2"), None, None, None, false));
+        // ... and so does the next move.
+        let (mut s, mut evs) = failed(TurnResult::Error);
+        evs.push(moved_to(&mut s, "codex", None));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else

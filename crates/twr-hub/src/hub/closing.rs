@@ -142,19 +142,30 @@ impl Core {
                         ..Default::default()
                     }),
                 });
+                // A crash in the turn that carried a resume (one that is no retry itself): the
+                // resume failed, and the turn's automatic retry starts a new session
+                // (`hub::switch`), so no item; one that is not retried after all gets its item
+                // from the failure's reactions (`hub::retry`).
+                let resume_failed = view.handoff_pending
+                    && view.current_turn_retry_of.is_none()
+                    && view
+                        .resume_turn
+                        .is_some_and(|t| view.current_turn == Some(t));
                 // The item belongs to the turn the crash took down, if one was open (an
                 // automatic retry of that turn resolves it, `hub::retry`).
-                plan.push_back(Planned {
-                    turn: view.current_turn,
-                    source: Source::Hub,
-                    body: EventBody::AttentionRaised(AttentionRaised {
-                        attn_id: new_id(),
-                        reason: AttentionReason::Error,
-                        summary,
-                        options: vec!["dismiss".into()],
-                        ..Default::default()
-                    }),
-                });
+                if !resume_failed {
+                    plan.push_back(Planned {
+                        turn: view.current_turn,
+                        source: Source::Hub,
+                        body: EventBody::AttentionRaised(AttentionRaised {
+                            attn_id: new_id(),
+                            reason: AttentionReason::Error,
+                            summary,
+                            options: vec!["dismiss".into()],
+                            ..Default::default()
+                        }),
+                    });
+                }
             }
         }
         Ok(plan)

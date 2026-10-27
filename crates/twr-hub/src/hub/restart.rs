@@ -44,7 +44,8 @@
 //! the session in the new settings, or, after a runtime change, starts the new runtime's first
 //! session with the handoff) and, if nothing did, the runtime starts again on its session
 //! ([`Core::restart_after_settings_change`]; not after a runtime change: the thread has no
-//! session of its new runtime yet, so that one starts with the next prompt). A
+//! session of its new runtime yet, or one it resumes that must first be told what happened
+//! since, so that one starts with the next prompt). A
 //! `thread.stop` meanwhile wins: the thread stays stopped. Nothing is killed but what the stop
 //! machinery kills (identity-checked).
 //!
@@ -374,13 +375,21 @@ impl Core {
     /// After the exit of a runtime stopped for a settings restart was recorded and the queue
     /// had its chance: starts the runtime again on its session (no turn), unless a turn
     /// already started it, the thread was stopped meanwhile, or it cannot take a turn now
-    /// (then the next prompt resumes it, in the new settings). A failure is logged: the thread
-    /// is idle with no runtime, like after a stop.
+    /// (then the next prompt resumes it, in the new settings). Nor while a move to another
+    /// runtime is pending (`ThreadView::handoff_pending`): the new runtime starts with the
+    /// thread's next turn, even when it resumes a session the thread left earlier
+    /// (`hub::switch`): started now, it would end the move before that turn told the session
+    /// what happened since. A failure is logged: the thread is idle with no runtime, like
+    /// after a stop.
     pub(super) fn restart_after_settings_change(&mut self, hub: &Arc<Inner>, thread: &str) {
         let Some(view) = self.registry.get(thread) else {
             return;
         };
-        if view.stopped || view.session_id.is_none() || view.is_orchestrator() {
+        if view.stopped
+            || view.handoff_pending
+            || view.session_id.is_none()
+            || view.is_orchestrator()
+        {
             return;
         }
         if self.rt.get(thread).is_some_and(|r| r.live.is_some()) || !self.may_take_turn(thread) {
@@ -403,6 +412,10 @@ impl Core {
     ) -> &'static str {
         let rt = self.rt.get(thread);
         if !rt.is_some_and(|r| r.live.is_some()) {
+            // No runtime to restart. A card offering to compact the context before a held
+            // message (`hub::idle_compact`) may no longer apply (a move to another runtime):
+            // the queue is looked at again, which closes it and lets the message go.
+            self.recheck_idle_offer(hub, thread);
             return "next_start";
         }
         let running_in_them = match (

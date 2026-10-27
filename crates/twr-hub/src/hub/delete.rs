@@ -2306,9 +2306,9 @@ impl Core {
         }
     }
 
-    /// Step 4 of a deletion: `thread.deleted` with the resolution of the thread's open items
-    /// and of every open delete card whose threads are then all deleted, and the drop of its
-    /// queue, one batch.
+    /// Step 4 of a deletion: `thread.deleted` with the resolution of the thread's open items,
+    /// of every open delete card whose threads are then all deleted and of its offer card
+    /// (`hub::idle_compact`), and the drop of its queue, one batch.
     pub(super) fn record_deleted(
         &mut self,
         hub: &Inner,
@@ -2357,6 +2357,8 @@ impl Core {
                 batch.push(HUB_THREAD, None, Source::Hub, resolved(&attn_id));
             }
         }
+        // An offer to compact its context before its messages go (`hub::idle_compact`).
+        self.stage_idle_offer_close(&mut batch, id);
         batch.push(id, None, source, EventBody::ThreadDeleted(deleted));
         self.append_batch(hub, batch)?;
         Ok(())

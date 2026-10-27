@@ -779,6 +779,22 @@ pub fn is_job_task(source: &Source, body: &EventBody) -> bool {
 /// ([`crate::reduce::ThreadView::handoff_pending`]), and the hub replaces that runtime.
 pub const RUNTIME_MOVED_KEY: &str = "runtime_moved";
 
+/// `ext.twr` key of a `thread.model_changed` that moves the thread back to a runtime it left
+/// earlier: the session of that runtime it left then (a string), which its next start resumes
+/// instead of starting a new one ([`crate::reduce::ThreadView::resume_session`]).
+pub const RESUME_SESSION_KEY: &str = "resume_session";
+
+/// `ext.twr` key of the `turn.started` that carries a pending resume
+/// ([`RESUME_SESSION_KEY`]): the session it resumes (a string). Its failure before the
+/// runtime started a session drops the resume
+/// ([`crate::reduce::ThreadView::resume_failed_turn`]).
+pub const RESUMES_KEY: &str = "resumes";
+
+/// `ext.twr` key of a `conversation.update` on a worker thread that turns the hub's offers to
+/// compact its context once its prompt cache expired off (`"off"`) or back on (`"on"`)
+/// ([`crate::reduce::ThreadView::idle_compaction_off`]).
+pub const IDLE_COMPACTION_KEY: &str = "idle_compaction";
+
 /// `ext.twr` key of an `acp` thread's agent: its argv (a JSON array of strings). On
 /// `thread.created` and on a `thread.model_changed` that moves the thread to an agent, the
 /// agent the thread runs from then on; on a `thread.started` / `thread.resumed`, the agent
@@ -1035,12 +1051,34 @@ pub struct TurnEnded {
     /// ([`ContextSize`]). Logs from before it have none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextSize>,
+    /// When the main agent's latest model call of the turn was made and how long the prompt
+    /// cache it used lives ([`PromptCache`]): only a turn whose context is that call's says.
+    /// Claude Code only; logs from before it have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<PromptCache>,
     /// Runtime-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<JsonMap>,
     /// Unknown keys, including `<field>_ref` blob pointers.
     #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
     pub extra: JsonMap,
+}
+
+/// A session's prompt cache as a turn's end saw it (Claude Code only): the runtime caches the
+/// prompt of each model call for a while, and the next call within that time reads the
+/// context from the cache instead of paying for all of it again. The cache expires
+/// `ttl_s` after `called_at` ([`crate::reduce::ThreadView::cache_expires_at`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptCache {
+    /// When the main agent's latest model call of the turn was made, as the adapter saw it
+    /// (its clock when the call's first frame came).
+    pub called_at: DateTime<Utc>,
+    /// The prompt cache's lifetime in seconds, as that call reported it, else as an earlier
+    /// call of the same process did (Claude Code's `usage.cache_creation`: 3600 for
+    /// `ephemeral_1h_input_tokens`, 300 for `ephemeral_5m_input_tokens`). `None`: no call of
+    /// the process said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_s: Option<u64>,
 }
 
 /// How full a session's context is: the tokens of its last model call (what the next call
@@ -2220,6 +2258,10 @@ mod tests {
                     cost: Some(0.25),
                 }),
                 duration_ms: Some(1500),
+                prompt_cache: Some(PromptCache {
+                    called_at: "2026-10-27T12:00:00Z".parse().unwrap(),
+                    ttl_s: Some(3600),
+                }),
                 ..Default::default()
             }),
             EventBody::TurnWithdrawn(TurnWithdrawn {

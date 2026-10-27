@@ -1,9 +1,19 @@
-//! The user's compaction of a thread's context (`thread.compact`: the TUI's
-//! `/compact-context`, `twr compact`). Only the user asks for one: the method is in neither
-//! the orchestrator's nor an agent's set (`server`), the orchestrator's identity is refused
-//! here as well, and a prompt of anyone else whose first word is `/compact` (which Claude Code
-//! and Grok Build would run as the command) is refused where prompts are queued
-//! ([`refuse_compact_command`]).
+//! Compaction of a thread's context (`thread.compact`: the TUI's `/compact-context`, `twr
+//! compact`). Who asks for one:
+//!
+//! - the user: the method is in neither the orchestrator's nor an agent's set (`server`), the
+//!   orchestrator's identity is refused here as well, and a prompt of anyone else whose first
+//!   word is `/compact` (which Claude Code and Grok Build would run as the command) is refused
+//!   where prompts are queued ([`refuse_compact_command`]);
+//! - the user, through the hub's offer before a message goes to a worker whose prompt cache
+//!   expired (`Compact first`, `hub::idle_compact`): only the user answers that card, and the
+//!   compaction is the user's (their source), recorded with `ext.twr.compact_by: "offer"`;
+//! - the hub itself, only when the user configured `[threads] idle_compaction =
+//!   "before_expiry"`: an idle worker's context just before its prompt cache expires
+//!   (`hub::idle_compact`), with `source: hub` and `ext.twr.compact_by: "idle"`.
+//!
+//! Never the orchestrator or an agent. The user's own `thread.compact` records no
+//! `compact_by` ([`CompactBy::User`]), as before it existed.
 //!
 //! A compaction is a turn of its own: `turn.started {prompt: "/compact", from: user}` with
 //! `ext.twr.compact` ([`COMPACT_TURN_KEY`]), sent to the runtime as [`AdapterCmd::Compact`]
@@ -13,11 +23,14 @@
 //! ask waits in memory ([`CompactAsk`]), so a hub restart before it starts forgets it, and is
 //! checked again when it is due: one asked of a session that is no longer the thread's (a
 //! move to another runtime, a new session) is dropped. It is consumed once its `turn.started`
-//! is recorded.
+//! is recorded. While the hub's offer to compact before a held message is open
+//! (`hub::idle_compact`), the user's `thread.compact` answers it `Compact first` (recorded as
+//! their answer): the compaction then runs before the messages the card held.
 //!
-//! A compaction is maintenance, not work (`ThreadView::current_turn_compact`): no grade,
-//! report or review ([`Core::react_to_compaction_end`]; one that failed, by its turn's end or
-//! its own `context.compacted` `error`, raises an `error` item and is not retried), the thread's last turn and report stay its work's (so watches, `send
+//! A compaction is maintenance, not work (`ThreadView::current_turn_compact`), whoever asked
+//! for it: no grade, report or review ([`Core::react_to_compaction_end`]; one that failed, by
+//! its turn's end or its own `context.compacted` `error`, raises an `error` item and is not
+//! retried), the thread's last turn and report stay its work's (so watches, `send
 //! --after`, wakes and retries count it as nothing, and work that ends while it runs wakes the
 //! worker after it, `hub::wake`, or fires the watch on it going idle, `hub::watches`), it tells
 //! the orchestrator no fact of a message taken back, is no message of the user's, and leaves a
@@ -29,6 +42,10 @@
 //! program and the fake runtime cannot), a thread on a remote box (the runner protocol has no
 //! such command yet), a thread with no session yet or waiting for its new runtime's first one,
 //! and a parked or attached one.
+//!
+//! `thread.compact {thread, offers: "on" | "off"}` (the user only) compacts nothing: it turns
+//! the hub's offers for the thread on or off (`hub::idle_compact`), recorded as a
+//! `conversation.update` on it with `ext.twr.idle_compaction`.
 //!
 //! [`AdapterCmd::Compact`]: twr_core::adapter::AdapterCmd::Compact
 //! [`ThreadHost::compacts`]: crate::host::ThreadHost::compacts
@@ -78,18 +95,47 @@ pub(super) fn refuse_compact_command(prompt: &str, from: TurnFrom) -> Result<(),
     ))
 }
 
-/// A compaction the user asked for that has not started yet ([`super::ThreadRt::compact`]).
+/// `ext.twr` key of a compaction's `turn.started`: why it runs when the user did not ask for
+/// it with `thread.compact` ([`CompactBy`]).
+pub(super) const COMPACT_BY_KEY: &str = "compact_by";
+
+/// What asked for a compaction (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CompactBy {
+    /// The user's `thread.compact`.
+    User,
+    /// The user's `Compact first` on the hub's offer (`hub::idle_compact`).
+    Offer,
+    /// The hub, before the prompt cache expired, under `[threads] idle_compaction =
+    /// "before_expiry"` (`hub::idle_compact`).
+    Idle,
+}
+
+impl CompactBy {
+    /// Its `ext.twr.compact_by`: none for the user's own ask.
+    fn recorded(self) -> Option<&'static str> {
+        match self {
+            CompactBy::User => None,
+            CompactBy::Offer => Some("offer"),
+            CompactBy::Idle => Some("idle"),
+        }
+    }
+}
+
+/// A compaction asked for that has not started yet ([`super::ThreadRt::compact`]).
 #[derive(Debug, Clone)]
 pub(super) struct CompactAsk {
     /// The last queue row when it was asked for: the messages queued before it go first.
-    after: i64,
+    pub(super) after: i64,
     /// Who asked (the turn's source).
-    source: Source,
+    pub(super) source: Source,
     /// The thread's runtime and session when it was asked for: a compaction is of that
     /// session's context, and is dropped when it is no longer the thread's (a move to another
     /// runtime, whose first turn starts a new session, a new session of the same one).
-    runtime: String,
-    session: Option<String>,
+    pub(super) runtime: String,
+    pub(super) session: Option<String>,
+    /// What asked for it.
+    pub(super) by: CompactBy,
 }
 
 impl Hub {
@@ -107,6 +153,37 @@ impl Hub {
         let id = core.resolve(query)?;
         core.compact_locked(&self.inner, &id, caller)
     }
+
+    /// `thread.compact {thread, offers}`: turns the hub's offers to compact thread `query`'s
+    /// context once its prompt cache expired on (`"on"`) or off (`"off"`), compacting nothing
+    /// (`hub::idle_compact`). The user only. Returns `{thread, thread_name, offers}`.
+    pub fn compact_offers(
+        &self,
+        query: &str,
+        offers: &str,
+        caller: &Caller,
+    ) -> Result<Value, RpcError> {
+        if caller.is_orchestrator() {
+            return Err(rpc(
+                codes::UNAUTHORIZED,
+                "only the user turns a thread's offers to compact its context on or off; tell \
+                 the user",
+            ));
+        }
+        let off = match offers {
+            "on" => false,
+            "off" => true,
+            other => {
+                return Err(rpc(
+                    codes::BAD_REQUEST,
+                    format!("offers: {other:?} is neither \"on\" nor \"off\""),
+                ))
+            }
+        };
+        let mut core = self.inner.core();
+        let id = core.resolve(query)?;
+        core.set_idle_offers(&self.inner, &id, off, caller)
+    }
 }
 
 impl Core {
@@ -114,7 +191,11 @@ impl Core {
     /// asks and again when the compaction is due: a thread moved to another runtime meanwhile
     /// (its new runtime's first turn must carry the handoff), parked, attached or gone remote
     /// takes none.
-    fn compaction_refusal(&self, hub: &Inner, id: &str) -> Result<Option<String>, RpcError> {
+    pub(super) fn compaction_refusal(
+        &self,
+        hub: &Inner,
+        id: &str,
+    ) -> Result<Option<String>, RpcError> {
         let view = self.view(id)?;
         let name = &view.name;
         let host = hub.host(&view.box_name);
@@ -177,21 +258,26 @@ impl Core {
         if self.rt.get(id).is_some_and(|r| r.compact.is_some()) {
             return Ok(with(json!({"state": "queued", "already": true})));
         }
-        let after = self
-            .store
-            .pending_list(id, usize::MAX)
-            .map_err(internal)?
-            .last()
-            .map_or(0, |p| p.id);
-        let view = self.view(id)?;
-        let (runtime, session) = (view.runtime.clone(), view.session_id.clone());
-        self.rt(id).compact = Some(CompactAsk {
-            after,
-            source: caller.source(),
-            runtime,
-            session,
-        });
         let before = self.view(id)?.turns;
+        // An offer card holds the queue (`hub::idle_compact`): this answers it `Compact
+        // first`, and the compaction runs before the messages it held.
+        if !self.compact_past_idle_offer(hub, id, caller)? {
+            let after = self
+                .store
+                .pending_list(id, usize::MAX)
+                .map_err(internal)?
+                .last()
+                .map_or(0, |p| p.id);
+            let view = self.view(id)?;
+            let (runtime, session) = (view.runtime.clone(), view.session_id.clone());
+            self.rt(id).compact = Some(CompactAsk {
+                after,
+                source: caller.source(),
+                runtime,
+                session,
+                by: CompactBy::User,
+            });
+        }
         // The user's own ask, like their send, lets a queue a failure held go (`ThreadRt::
         // queue_held`).
         self.release_queue(id);
@@ -284,6 +370,9 @@ impl Core {
         let turn = view.turns + 1;
         let mut twr = Map::new();
         twr.insert(COMPACT_TURN_KEY.into(), json!(true));
+        if let Some(by) = ask.by.recorded() {
+            twr.insert(COMPACT_BY_KEY.into(), json!(by));
+        }
         let mut batch = Batch::default();
         batch.push(
             thread,

@@ -326,6 +326,17 @@ impl Core {
                 .answer_after_card(hub, attn_id, &id, decision.as_deref(), caller)
                 .map(|ev| Relay::Applied(Box::new(ev)));
         }
+        // An offer to compact a worker's context before its message goes: only the user
+        // answers it (`hub::idle_compact`).
+        if let Some(offer) = self.idle_offer(attn_id) {
+            let decision = match response {
+                Response::Dismiss => None,
+                r => Some(answer_of(r, &item, attn_id)?.decision),
+            };
+            return self
+                .answer_idle_offer(hub, &item, &offer, decision.as_deref(), caller)
+                .map(|ev| Relay::Applied(Box::new(ev)));
+        }
         // A hung-turn card: only the user answers it, and Interrupt interrupts the turn
         // (`hub::stall`).
         if self.hung_card(attn_id) {

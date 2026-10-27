@@ -158,7 +158,7 @@ A thread on a remote box has a box token after its runtime, in its card's title:
 
 The TUI asks the hub how its boxes are (`hub.info`) every 10 seconds, and a runner connecting or leaving shows at once. In a card's title the token gives way last, as above: the runtime first, then the model, then the box's name (`@gpu-wo… offline`); the box's state is never cut. `twr box status gpu` and `twr box doctor gpu` say more ([runners.md](runners.md)).
 
-When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column.
+When the hub itself has a question, such as which thread should get a message, it shows up as a `twr asks` card at the top of the column. So does its offer to compact a worker's context before your message goes to it, once the worker's prompt cache has expired: `Compact first`, `Send as is` or `Don't ask for <thread>`, and the message waits for your answer ([runtimes.md](runtimes.md#the-prompt-cache)). `/compact-context` on that thread answers it `Compact first`, and `send now` on the held message `Send as is`.
 
 ### The activity line
 
@@ -266,7 +266,7 @@ A thread's permission mode is on its card and in the dive header. `/mode <mode>`
 
 The transcript records each change, from `twr model`, the orchestrator or `/model`, as `model changed from sonnet to claude-fable-5-1, effort from default to high (by you)`, naming only what changed (`effort changed from high to default (by the orchestrator)`). A runtime that was running restarts on its session, and the transcript says `restarting the runtime with its new settings`, or `restarting the runtime in its new mode` when the mode changed too.
 
-`/model <thread> [model] [--effort <effort>] --runtime <runtime>` moves the thread to another runtime, as `twr model --runtime` does ([usage.md](usage.md#change-a-threads-model-and-effort)); a model or effort left out is the new runtime's default. The status bar says when the new session starts, and the transcript records `runtime claude-code → codex, model gpt-6.1-sol, effort xhigh (by you)`. A runtime that was running stops with `the previous runtime stopped; the next turn starts a session of the new one`, and the thread's next turn is marked `new codex session, with a handoff of the previous one`. Until then `/model <thread>` ends with `its first codex session starts with its next turn`.
+`/model <thread> [model] [--effort <effort>] --runtime <runtime>` moves the thread to another runtime, as `twr model --runtime` does ([usage.md](usage.md#change-a-threads-model-and-effort)); a model or effort left out is the new runtime's default, or, on a move back that resumes the thread's earlier session of that runtime, the one it had then ([runtimes.md](runtimes.md#moving-a-thread-back)). The status bar says when the new session starts, and the transcript records `runtime claude-code → codex, model gpt-6.1-sol, effort xhigh (by you)`. A runtime that was running stops with `the previous runtime stopped; the next turn starts a session of the new one`, and the thread's next turn is marked `new codex session, with a handoff of the previous one` (on a move back, `earlier claude-code session resumed, told what the thread did since`). Until then `/model <thread>` ends with `its first codex session starts with its next turn` (`its earlier claude-code session resumes with its next turn`).
 
 ## Grid view
 
@@ -450,7 +450,7 @@ Each row shows the start of its message, `…` when there is more, and who sent 
 - **Act:** `Enter` on an empty line, or a tap on the selected row, opens its [action popup](#the-action-popup), with the message's text and who sent it, and these rows:
   - `edit: back into the box` (only your own messages; it is picked as the popup opens, so `Enter`, `Enter` edits it);
   - `delete`: takes it out of the queue; the text of a message of yours goes to the history (`↑`), someone else's (the orchestrator's, a `!!` command's output) goes for good, so it can never be sent again as yours;
-  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go.
+  - `send now: interrupts <thread>'s turn` (only the next message to run): the hub interrupts the turn that runs and the message runs next. The interrupted turn keeps what it did; it gets no report, review or retry. A turn on a runtime that can't be interrupted (a `pty:` runtime, a remote box) can't be cut short: the status bar says so, and the message runs when the turn ends. A failure that held the queue lets it go, and so does the hub's offer to compact the thread's context first: `send now` answers it `Send as is`.
   With the mouse, `delete` and `send now` take two taps, as `stop` does.
 
 `Esc` twice, and `/unsend`, still take back the last message you sent, queued or not ([above](#taking-back-a-message)). Deleting or editing takes back with the same `message.withdraw`, so a message whose turn has just started, and hasn't acted yet, is taken back from its turn as `Esc Esc` would.
@@ -665,7 +665,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/new <project> [--runtime r] [--name n]` | start a thread in a configured project, a path, or a repository folder name found under your code folders ([usage](usage.md)) |
 | `/park [thread]`, `/stop [thread]` | park or stop a thread, the one you dived into or the selected one by default; asks `y` |
 | `/resume [thread]` | resume a parked thread |
-| `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). `/compact` is the phone layout |
+| `/compact-context [thread]` | compact a thread's context, as its agent's own `/compact` does: a turn of its own, after the turn that runs and the messages queued before; the one you dived into or the selected one by default ([runtimes.md](runtimes.md#context-compaction)). The hub's offers to compact before a message are turned off for a thread with its card's `Don't ask for <thread>`, and on again with `twr compact <thread> --offers on`. `/compact` is the phone layout |
 | `/trim [thread]` | delete an idle thread's build output (`target/`, `node_modules/`, ...), the one you dived into or the selected one by default ([worktrees.md](worktrees.md#trim)) |
 | `/pin [thread]` | pin or unpin a thread's card, the selected one by default |
 | `/delete <thread>...` | delete one or more threads: their worktrees and branches go to the trash; asks on a delete card |
