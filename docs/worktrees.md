@@ -77,7 +77,7 @@ Ignored files are a separate case. Parking deletes the ones that match `[threads
 
 Prompts sent to a parked thread queue up and wait. A hub restart leaves a parked thread parked.
 
-`twr resume` recreates a removed worktree at the same path from its recorded branch, because runtimes such as Claude Code key their sessions by directory. Then it runs the queued prompts on the same session, or, if the thread moved to another runtime while parked, on a new session of that runtime given the handoff. If the worktree can't be recreated, the thread stays parked.
+`twr resume` recreates a removed worktree at the same path from its recorded branch, because runtimes such as Claude Code key their sessions by directory. Then it runs the queued prompts on the same session, or, if the thread moved to another runtime while parked, on a new session of that runtime given the handoff (on a move back, the earlier session of that runtime, told what happened since: [runtimes.md](runtimes.md#moving-a-thread-back)). If the worktree can't be recreated, the thread stays parked.
 
 In the TUI, the `park` and `resume` rows of a card's action popup park and resume its thread after a `y`. `/park [thread]` and `/resume [thread]` take a thread name. The TUI's cards and `twr thread list` leave parked threads out unless you ask for them: `/parked on` in the TUI, `twr thread list --all` on the command line.
 

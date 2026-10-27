@@ -282,8 +282,10 @@ enum Cmd {
     /// next time. With `--runtime`, the thread moves to that runtime: its current runtime stops
     /// (after the turn it runs), and its next turn starts a new session of the new one, given a
     /// handoff of what the previous session did; a model or effort left out is the new
-    /// runtime's default. Not for the orchestrator (switch it with `twr orchestrator use`); a
-    /// pty thread can only move to another runtime.
+    /// runtime's default. Moving back to a runtime it left a session of resumes that session
+    /// instead, told what the thread did since, with the settings it had (`default` starts a new
+    /// one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can
+    /// only move to another runtime.
     Model {
         /// Thread id, name, alias or unique prefix.
         thread: String,
@@ -295,7 +297,8 @@ enum Cmd {
         effort: Option<String>,
         /// Move the thread to this runtime (`claude-code`, `codex`, `grok-build`, a configured
         /// `[runtimes.<name>]` preset, or `acp:<command>`; not `pty`): the same thread,
-        /// worktree and branch, on a new session.
+        /// worktree and branch, on a new session (or, back on a runtime it left, on the session
+        /// it left there).
         #[arg(long)]
         runtime: Option<String>,
     },
@@ -348,6 +351,11 @@ enum Cmd {
     Compact {
         /// Thread id, name, alias or unique prefix.
         thread: String,
+        /// Instead of compacting: turn the hub's offers to compact this thread's context once
+        /// its prompt cache expired on or off (`[threads] idle_compaction`; a card's "Don't
+        /// ask for <thread>" turns them off).
+        #[arg(long, value_parser = ["on", "off"])]
+        offers: Option<String>,
     },
     /// Delete threads: stop each one's runtime and move its worktree (uncommitted changes too,
     /// or only its record when a park removed it) and its recorded branch (`twr/<its name when
@@ -1949,11 +1957,13 @@ async fn run_simple(
             outln!("{}", resume_outcome(&thread, &r));
             Ok(())
         }
-        Cmd::Compact { thread } => {
+        Cmd::Compact { thread, offers } => {
             let mut c = connect(&socket).await?;
-            let r = c
-                .call("thread.compact", json!({ "thread": thread }))
-                .await?;
+            let mut params = json!({ "thread": thread });
+            if let Some(o) = &offers {
+                params["offers"] = json!(o);
+            }
+            let r = c.call("thread.compact", params).await?;
             outln!("{}", compact_outcome(&thread, &r));
             Ok(())
         }
@@ -2573,9 +2583,16 @@ fn model_show(t: &Value) -> String {
         if t["live"].as_bool() == Some(true) {
             out.push_str("; its previous runtime stops once the current turn ends");
         }
-        out.push_str(&format!(
-            "; its next turn starts a new {runtime} session, given a handoff of the previous one"
-        ));
+        match t["resume_session"].as_str() {
+            Some(s) => out.push_str(&format!(
+                "; its next turn resumes its earlier {runtime} session {s}, told what the thread \
+                 did since"
+            )),
+            None => out.push_str(&format!(
+                "; its next turn starts a new {runtime} session, given a handoff of the previous \
+                 one"
+            )),
+        }
         return out;
     }
     let pending = |k: &str| t.as_object().is_some_and(|o| o.contains_key(k));
@@ -2674,6 +2691,11 @@ fn park_outcome(thread: &str, r: &Value) -> String {
 /// What `twr compact` prints for a `thread.compact` result.
 fn compact_outcome(thread: &str, r: &Value) -> String {
     let name = r["thread_name"].as_str().unwrap_or(thread);
+    if let Some(offers) = r["offers"].as_str() {
+        return format!(
+            "{name}: offers to compact its context once its prompt cache expired are {offers}"
+        );
+    }
     match (r["state"].as_str(), r["turn"].as_u64()) {
         (Some("started"), Some(turn)) => format!("{name}: compacting its context (turn {turn})"),
         _ => format!("{name}: compacts its context after its running turn"),
@@ -8618,7 +8640,19 @@ mod tests {
         let c = Cli::try_parse_from(["twr", "resume", "api"]).unwrap();
         assert!(matches!(c.cmd, Some(Cmd::Resume { ref thread }) if thread == "api"));
         let c = Cli::try_parse_from(["twr", "compact", "api"]).unwrap();
-        assert!(matches!(c.cmd, Some(Cmd::Compact { ref thread }) if thread == "api"));
+        assert!(
+            matches!(c.cmd, Some(Cmd::Compact { ref thread, offers: None }) if thread == "api")
+        );
+        let c = Cli::try_parse_from(["twr", "compact", "api", "--offers", "off"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Compact { ref thread, offers: Some(ref o) }) if thread == "api" && o == "off"
+        ));
+        assert!(Cli::try_parse_from(["twr", "compact", "api", "--offers", "maybe"]).is_err());
+        assert_eq!(
+            compact_outcome("api", &json!({"thread_name": "api", "offers": "on"})),
+            "api: offers to compact its context once its prompt cache expired are on"
+        );
         assert_eq!(
             compact_outcome(
                 "api",
@@ -8963,6 +8997,17 @@ mod tests {
             "api: runtime claude-code, model fable, effort high; its runtime runs model \
              fable, effort (runtime default) until it restarts"
         );
+        let moving = |resume: Value| {
+            model_show(&json!({"name": "api", "runtime": "codex", "model": null,
+                               "effort": null, "handoff_pending": true,
+                               "resume_session": resume}))
+        };
+        assert!(moving(Value::Null).ends_with(
+            "its next turn starts a new codex session, given a handoff of the previous one"
+        ));
+        assert!(moving(json!("th-1")).ends_with(
+            "its next turn resumes its earlier codex session th-1, told what the thread did since"
+        ));
     }
 
     /// `twr hub stop` writes this build's checkpoint first only for a hub of another version

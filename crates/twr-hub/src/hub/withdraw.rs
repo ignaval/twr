@@ -46,6 +46,8 @@
 //!
 //! [`ThreadView`]: twr_core::reduce::ThreadView
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
@@ -267,7 +269,7 @@ impl Core {
 
     fn withdraw_locked(
         &mut self,
-        hub: &Inner,
+        hub: &Arc<Inner>,
         id: &str,
         msg_ref: i64,
         caller: &Caller,
@@ -302,6 +304,8 @@ impl Core {
                 }),
             );
             self.append_batch(hub, batch).map_err(append_err)?;
+            // A card that held it closes when it no longer applies (`hub::idle_compact`).
+            self.recheck_idle_offer(hub, id);
             return Ok(with(
                 base,
                 json!({"withdrawn": true, "state": "queued", "prompt": p.prompt}),

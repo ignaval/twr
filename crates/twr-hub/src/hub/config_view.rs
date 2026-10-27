@@ -85,6 +85,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         job_slots,
         cpu_weight,
         memory_high,
+        idle_compaction,
     } = threads;
     let TrashConfig { keep_days } = trash;
     let LogConfig {
@@ -215,6 +216,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "job_slots": job_slots,
             "cpu_weight": cpu_weight,
             "memory_high": memory_high,
+            "idle_compaction": idle_compaction.as_str(),
         },
         "trash": { "keep_days": keep_days },
         "log": { "retention_days": retention_days, "archive": archive },
@@ -376,5 +378,13 @@ runtime = "acp:remote --key s3cret-box"
             json!(["target/"])
         );
         assert_eq!(v["projects"]["api"]["idle_trim_disposable"], Value::Null);
+        // What the hub does about an expired prompt cache: `ask` unless set.
+        assert_eq!(defaults["threads"]["idle_compaction"], "ask");
+        let mut idle = Config::default();
+        idle.threads.idle_compaction = twr_core::config::IdleCompaction::BeforeExpiry;
+        assert_eq!(
+            config_view(&idle, None)["threads"]["idle_compaction"],
+            "before_expiry"
+        );
     }
 }

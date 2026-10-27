@@ -16,8 +16,10 @@
 //!   user interrupts; it ends `interrupted` whatever its runtime reports, so it gets no
 //!   report, review or retry (`hub::supervisor`), and while it is open each kind of sign that
 //!   its runtime still runs it interrupts it again (`hub::withdraw`). A failure that held the
-//!   queue is released, as the user's own send releases it. Only the next message: the queue
-//!   keeps its order, so a later one would wait behind the others anyway.
+//!   queue is released, as the user's own send releases it, and the hub's offer to compact the
+//!   context before the message (`hub::idle_compact`) is answered `Send as is`, the user's. Only
+//!   the next message: the queue keeps its order, so a later one would wait behind the others
+//!   anyway.
 //!
 //! Users only: the orchestrator and agents get `unauthorized` (the server's method lists, and
 //! the checks here).
@@ -159,6 +161,19 @@ impl Core {
         Ok(())
     }
 
+    /// [`Core::release_for`], and an offer card holding the message (`hub::idle_compact`) is
+    /// answered `Send as is`, by `caller` (the user): sent now, it goes as it is.
+    fn release_now(
+        &mut self,
+        hub: &Arc<Inner>,
+        id: &str,
+        msg_ref: i64,
+        caller: &Caller,
+    ) -> Result<(), RpcError> {
+        self.release_for(id, msg_ref)?;
+        self.send_past_idle_offer(hub, id, caller)
+    }
+
     pub(super) fn send_now_locked(
         &mut self,
         hub: &Arc<Inner>,
@@ -209,7 +224,7 @@ impl Core {
         let view = self.view(id)?.clone();
         if let Some(turn) = view.current_turn {
             if view.current_turn_interrupted || view.current_turn_withdrawn {
-                self.release_for(id, msg_ref)?;
+                self.release_now(hub, id, msg_ref, caller)?;
                 return Ok(with(json!({
                     "sent_now": true, "state": "interrupting", "turn": turn,
                 })));
@@ -239,7 +254,7 @@ impl Core {
                 }),
             );
             self.append_batch(hub, batch).map_err(append_err)?;
-            self.release_for(id, msg_ref)?;
+            self.release_now(hub, id, msg_ref, caller)?;
             if let Some(live) = self.rt.get(id).and_then(|r| r.live.as_ref()) {
                 if live.handle.interrupt().is_err() {
                     // The runtime is exiting: its closing sequence ends the turn.
@@ -250,10 +265,10 @@ impl Core {
                 "sent_now": true, "state": "interrupting", "turn": turn,
             })));
         }
-        // No turn runs: the queue waits on something else (a failure that held it, an attach,
-        // a park, an offline box, a runtime being stopped). The user's ask releases a held
-        // queue; the rest stays in the way.
-        self.release_for(id, msg_ref)?;
+        // No turn runs: the queue waits on something else (a failure that held it, an offer
+        // card, an attach, a park, an offline box, a runtime being stopped). The user's ask
+        // releases a held queue and answers the card; the rest stays in the way.
+        self.release_now(hub, id, msg_ref, caller)?;
         let started = self
             .dispatch_next(hub, id)
             .map_err(|e| rpc(codes::INTERNAL, format!("{e:#}")))?;
@@ -261,14 +276,25 @@ impl Core {
             Some((turn, Some(row))) if row == msg_ref => with(json!({
                 "sent_now": true, "state": "started", "turn": turn,
             })),
-            _ => with(json!({
-                "sent_now": true,
-                "state": "waiting",
-                "message": format!(
-                    "{name} can't start a turn now (parked, attached, its box offline, or its \
-                     runtime stopping or retrying): the message is next"
-                ),
-            })),
+            // (A card raised by this dispatch: another session or cache than the one answered.)
+            _ => match self.idle_offer_waiting(id) {
+                Some(attn_id) => with(json!({
+                    "sent_now": true,
+                    "state": "waiting",
+                    "message": format!(
+                        "the message is next, and waits for your answer to the offer to \
+                         compact {name}'s context first ({attn_id})"
+                    ),
+                })),
+                None => with(json!({
+                    "sent_now": true,
+                    "state": "waiting",
+                    "message": format!(
+                        "{name} can't start a turn now (parked, attached, its box offline, or \
+                         its runtime stopping or retrying): the message is next"
+                    ),
+                })),
+            },
         })
     }
 }

@@ -94,7 +94,18 @@ fn ended(bodies: &[&EventBody]) -> Vec<TurnEnded> {
 /// Replays a Claude fixture: `/compact` is written as the translator's compaction message,
 /// any other user message as a prompt (each checked against the recording), turns from 1.
 fn claude(name: &str) -> Vec<claude_code::Emitted> {
+    claude_timed(name, None)
+}
+
+/// [`claude`], the translator's clock `clock` when given.
+fn claude_timed(
+    name: &str,
+    clock: Option<fn() -> chrono::DateTime<chrono::Utc>>,
+) -> Vec<claude_code::Emitted> {
     let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    if let Some(clock) = clock {
+        tr.set_clock(clock);
+    }
     let mut events = Vec::new();
     let mut turn = 1;
     for (dir, line) in fixture("claude", name) {
@@ -717,6 +728,166 @@ fn claude_context_window_across_turns() {
     assert_eq!(
         window_of(&mut tr, calls(&[("i", m, 150_000)], two)),
         Some(200_000)
+    );
+}
+
+// --- Claude's prompt cache -------------------------------------------------------------------
+
+thread_local! {
+    /// Seconds after [`cache_epoch`] that [`cache_clock`] reads (per test thread).
+    static CACHE_NOW: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+fn cache_epoch() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_793_000_000, 0).unwrap()
+}
+
+/// The translator's clock in the prompt cache tests: [`CACHE_NOW`] seconds after the epoch.
+fn cache_clock() -> chrono::DateTime<chrono::Utc> {
+    cache_epoch() + chrono::Duration::seconds(CACHE_NOW.with(std::cell::Cell::get))
+}
+
+fn cache_at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    cache_epoch() + chrono::Duration::seconds(secs)
+}
+
+/// [`call_lines`] whose `usage` says what the call wrote to the prompt cache
+/// (`cache_creation`: `[ephemeral_1h_input_tokens, ephemeral_5m_input_tokens]`; `None`: the
+/// call does not say).
+fn cached_call_lines(id: &str, parent: Option<&str>, written: Option<[u64; 2]>) -> Vec<String> {
+    call_lines(id, "claude-opus-5-5", parent, [3, 1_000, 150_000])
+        .into_iter()
+        .map(|line| {
+            let mut v = parse(&line);
+            if let Some([h1, m5]) = written {
+                v["message"]["usage"]["cache_creation"] = json!({
+                    "ephemeral_1h_input_tokens": h1, "ephemeral_5m_input_tokens": m5});
+            }
+            v.to_string()
+        })
+        .collect()
+}
+
+/// A turn end's prompt cache says when the main agent's latest call of the turn was made (the
+/// clock at its first frame, not at a later frame of it or at the `result`) and how long the
+/// cache lives: 1 h for a call that wrote 1-hour entries, 5 min for 5-minute ones, else what
+/// an earlier call of the process said, else unknown. A subagent's call, later and writing
+/// another TTL, changes neither; a turn without a call of its own (a compaction's) has none.
+#[test]
+fn claude_prompt_cache_is_the_latest_main_calls() {
+    /// Feeds turn `turn`'s `lines`, the clock at `1000 * turn` s for the first and 10 s later
+    /// for each next one; its end.
+    fn end(tr: &mut claude_code::Translator, turn: u64, lines: Vec<String>) -> TurnEnded {
+        let mut ends = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            CACHE_NOW.with(|c| c.set(1_000 * turn as i64 + 10 * i as i64));
+            for e in tr.translate(line).events {
+                if let EventBody::TurnEnded(t) = e.body {
+                    ends.push(t);
+                }
+            }
+        }
+        assert_eq!(ends.len(), 1, "turn {turn}");
+        ends.remove(0)
+    }
+    /// A model call: its id, its parent tool call (a subagent's), what it wrote to the cache.
+    type CallOf<'a> = (&'a str, Option<&'a str>, Option<[u64; 2]>);
+    /// A turn of `calls`.
+    fn turn_of(calls: &[CallOf]) -> Vec<String> {
+        let models = json!({ "claude-opus-5-5": {"contextWindow": 1_000_000} });
+        let mut lines = vec![INIT.to_string()];
+        for (id, parent, written) in calls {
+            lines.extend(cached_call_lines(id, *parent, *written));
+        }
+        let main = calls.iter().filter(|c| c.1.is_none()).count() as u64;
+        lines.push(result_line(main, [3, 1_000, 150_000], models));
+        lines
+    }
+    let pc = |turn: u64, offset: i64, ttl_s: Option<u64>| {
+        Some(PromptCache {
+            called_at: cache_at(1_000 * turn as i64 + offset),
+            ttl_s,
+        })
+    };
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    tr.set_clock(cache_clock);
+
+    // A process whose calls say nothing of the cache: unknown TTL, the time known.
+    tr.user_message("go", 1);
+    let e = end(&mut tr, 1, turn_of(&[("a", None, None)]));
+    assert_eq!(e.prompt_cache, pc(1, 10, None));
+    // Two calls, the second writing 1-hour entries: the second's time (its first frame), 1 h.
+    // A subagent's call after it, writing 5-minute ones, is not the main agent's.
+    tr.user_message("go", 2);
+    let calls = [
+        ("b", None, Some([0, 0])),
+        ("c", None, Some([1_000, 0])),
+        ("sub", Some("toolu_1"), Some([0, 4_000])),
+    ];
+    let e = end(&mut tr, 2, turn_of(&calls));
+    assert_eq!(e.prompt_cache, pc(2, 30, Some(3600)));
+    // A call that read its whole prompt from the cache (wrote nothing): the TTL an earlier
+    // call of the process said.
+    tr.user_message("go", 3);
+    let e = end(&mut tr, 3, turn_of(&[("d", None, Some([0, 0]))]));
+    assert_eq!(e.prompt_cache, pc(3, 10, Some(3600)));
+    // 5-minute entries: 5 min, and the process's TTL from then.
+    tr.user_message("go", 4);
+    let e = end(&mut tr, 4, turn_of(&[("e", None, Some([0, 1_000]))]));
+    assert_eq!(e.prompt_cache, pc(4, 10, Some(300)));
+    tr.user_message("go", 5);
+    let e = end(&mut tr, 5, turn_of(&[("f", None, None)]));
+    assert_eq!(e.prompt_cache, pc(5, 10, Some(300)));
+
+    // A manual compaction ran no call of the main agent: none.
+    tr.compact_message(6);
+    let lines = vec![
+        r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#
+            .to_string(),
+        INIT.to_string(),
+        r#"{"type":"system","subtype":"compact_boundary","session_id":"s","compact_metadata":{"trigger":"manual","pre_tokens":150000,"post_tokens":40000}}"#.to_string(),
+        result_line(0, [0, 0, 0], Value::Null),
+    ];
+    assert_eq!(end(&mut tr, 6, lines).prompt_cache, None);
+    // Nor does a turn whose only calls are a subagent's and a `<synthetic>` message.
+    tr.user_message("go", 7);
+    let mut lines = turn_of(&[("sub2", Some("toolu_2"), Some([1_000, 0]))]);
+    let synthetic = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+        "id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "."}],
+        "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0, "output_tokens": 0,
+            "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 9}}}});
+    lines.insert(lines.len() - 1, synthetic.to_string());
+    assert_eq!(end(&mut tr, 7, lines).prompt_cache, None);
+
+    // A new process that has not written the cache yet does not know the TTL.
+    let mut tr = claude_code::Translator::new(claude_code::TranslatorOptions::default());
+    tr.set_clock(cache_clock);
+    tr.user_message("go", 8);
+    let e = end(&mut tr, 8, turn_of(&[("g", None, Some([0, 0]))]));
+    assert_eq!(e.prompt_cache, pc(8, 10, None));
+}
+
+/// Recorded sessions (subscription logins) write 1-hour cache entries: each turn that called
+/// the model reports the time of its last call and 1 h; the `/compact` turn reports none.
+#[test]
+fn claude_recorded_turns_report_a_one_hour_cache() {
+    CACHE_NOW.with(|c| c.set(42));
+    let events = claude_timed("compact_manual", Some(cache_clock));
+    let ends = ended(&claude_bodies(&events));
+    assert_eq!(ends.len(), 3);
+    let one_hour = Some(PromptCache {
+        called_at: cache_at(42),
+        ttl_s: Some(3600),
+    });
+    assert_eq!(ends[0].prompt_cache, one_hour);
+    assert_eq!(ends[1].prompt_cache, None, "the compaction's turn");
+    assert_eq!(ends[2].prompt_cache, one_hour);
+    // As stored: the time and the TTL in seconds.
+    let json = serde_json::to_value(&ends[0]).unwrap();
+    assert_eq!(
+        json["prompt_cache"],
+        json!({"called_at": "2026-10-26T07:34:02Z", "ttl_s": 3600})
     );
 }
 

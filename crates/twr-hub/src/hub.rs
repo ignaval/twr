@@ -136,6 +136,7 @@ mod git;
 mod glance;
 mod handoff;
 mod hook;
+mod idle_compact;
 mod jobs;
 mod lifecycle;
 mod limits;
@@ -191,6 +192,10 @@ pub use git::{ParkOutcome, ResumeOutcome, GIT_TICK};
 pub use handoff::{
     is_handoff, SwitchOptions, CONVERSATION_MAX, HANDOFF_REPLY_TIMEOUT, SUMMARY_WAIT,
     SUMMARY_WAIT_MAX,
+};
+pub use idle_compact::{
+    COMPACT_FIRST, DONT_ASK_PREFIX, IDLE_COMPACTION_LEAD, IDLE_COMPACTION_MARGIN,
+    IDLE_COMPACTION_MIN_TOKENS, IDLE_COMPACTION_MIN_TTL_S, IDLE_COMPACTION_TICK, SEND_AS_IS,
 };
 pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
@@ -350,6 +355,18 @@ pub struct HubOptions {
     /// How many events must come after the newest checkpoint before another one is written;
     /// `None` = [`CHECKPOINT_EVERY`] (5 000).
     pub checkpoint_events: Option<u64>,
+    /// How often, under `[threads] idle_compaction = "before_expiry"`, the hub looks for an
+    /// idle worker to compact before its prompt cache expires (`hub::idle_compact`); `None` =
+    /// [`IDLE_COMPACTION_TICK`] (a minute), zero = never.
+    pub idle_compaction_tick: Option<Duration>,
+    /// For tests: how long before a prompt cache expires the hub may compact it; `None` =
+    /// [`IDLE_COMPACTION_LEAD`] (5 minutes).
+    #[doc(hidden)]
+    pub idle_compaction_lead: Option<Duration>,
+    /// For tests: how long before a prompt cache expires the hub no longer starts a
+    /// compaction; `None` = [`IDLE_COMPACTION_MARGIN`] (30 s).
+    #[doc(hidden)]
+    pub idle_compaction_margin: Option<Duration>,
     /// How often the hub looks whether its log has agent events to archive or prune
     /// (`hub::prune`, `[log]`; the first time sooner); `None` = an hour, zero = never on its
     /// own (`log.compact` still does).
@@ -497,6 +514,9 @@ impl HubOptions {
             disk_tick: None,
             checkpoint_tick: None,
             checkpoint_events: None,
+            idle_compaction_tick: None,
+            idle_compaction_lead: None,
+            idle_compaction_margin: None,
             prune_tick: None,
             job_slots_dir: None,
             boxes_lock: None,
@@ -803,6 +823,12 @@ struct Inner {
     checkpoint_events: u64,
     /// [`HubOptions::prune_tick`]; zero = off.
     prune_tick: Duration,
+    /// [`HubOptions::idle_compaction_tick`]; zero = off.
+    idle_compaction_tick: Duration,
+    /// [`HubOptions::idle_compaction_lead`].
+    idle_compaction_lead: Duration,
+    /// [`HubOptions::idle_compaction_margin`].
+    idle_compaction_margin: Duration,
     /// Held while a checkpoint is written or the log is compacted (`hub::checkpoint`,
     /// `hub::prune`): a `VACUUM` renumbers the rows a checkpoint's replay looks up.
     maintenance: Mutex<()>,
@@ -1011,6 +1037,11 @@ struct ThreadRt {
     /// the next turn once the messages queued before it are done. Memory only.
     #[serde(skip)]
     compact: Option<compact::CompactAsk>,
+    /// The session and prompt cache expiry for which the user answered the hub's offer to
+    /// compact the context first (`hub::idle_compact`): not offered again for them. Memory
+    /// only.
+    #[serde(skip)]
+    offer_waived: Option<(String, DateTime<Utc>)>,
 }
 
 /// Equal in every field (tests: a fold from a checkpoint against a fold of the whole log,
@@ -1049,6 +1080,7 @@ impl PartialEq for ThreadRt {
             trimming,
             reinterrupted,
             compact,
+            offer_waived,
         } = self;
         live.is_some() == o.live.is_some()
             && *process_live == o.process_live
@@ -1079,6 +1111,7 @@ impl PartialEq for ThreadRt {
             && *trimming == o.trimming
             && *reinterrupted == o.reinterrupted
             && compact.is_some() == o.compact.is_some()
+            && *offer_waived == o.offer_waived
     }
 }
 
@@ -1146,6 +1179,7 @@ impl ThreadRt {
             after_reap,
             restart_reason,
             compact,
+            offer_waived,
             // In the checkpoint.
             process_live: _,
             pid: _,
@@ -1178,6 +1212,7 @@ impl ThreadRt {
             ("after_reap", *after_reap != AfterReap::Nothing),
             ("restart_reason", restart_reason.is_some()),
             ("compact", compact.is_some()),
+            ("offer_waived", offer_waived.is_some()),
         ]
         .into_iter()
         .filter_map(|(f, set)| set.then_some(f))
@@ -1542,6 +1577,9 @@ struct Core {
     hook: Option<hook::HookFeed>,
     /// Prompts waiting for other threads to finish (`hub::after`).
     after: after::AfterState,
+    /// Open cards offering to compact a worker's context before a message goes to it, by
+    /// attention id (`hub::idle_compact`).
+    idle_offers: HashMap<String, idle_compact::IdleOffer>,
     /// What the user did with each resolved confirm card ("the user confirmed it. Applied:
     /// ..."), so that answering it again reports the original outcome (`hub::proposal`).
     card_outcomes: HashMap<String, String>,
@@ -2164,6 +2202,11 @@ impl Core {
         if self.compaction_due(hub, thread, next.as_ref().map(|p| p.id)) {
             return Ok(Some((self.start_compact_turn(hub, thread)?, None)));
         }
+        // The hub's offer to compact the context first, the user's to answer, when the
+        // thread's prompt cache expired (`hub::idle_compact`): the message waits for it.
+        if self.idle_offer_holds(hub, thread, next.as_ref()) {
+            return Ok(None);
+        }
         let Some(p) = next else {
             return Ok(None);
         };
@@ -2217,15 +2260,26 @@ impl Core {
         let view = self.view(thread).map_err(anyhow::Error::new)?;
         let turn = view.turns + 1;
         // A thread that moved to another runtime: this turn starts that runtime's first
-        // session, which is given what the previous one did (`hub::switch`).
-        let handoff = (view.handoff_pending && !self.orch.is_thread(thread))
-            .then(|| self.thread_handoff_or_note(thread));
+        // session, which is given what the previous one did, or resumes the session the
+        // thread left that runtime with, given what the thread did since, if anything
+        // (`hub::switch`). The turn says which session it resumes: its failure before the
+        // runtime started it drops the resume (`ThreadView::resume_failed_turn`).
+        let moving = view.handoff_pending && !self.orch.is_thread(thread);
+        let resumes = view.resume_session.clone().filter(|_| moving);
+        let handoff = if moving {
+            self.thread_handoff_or_note(thread)
+        } else {
+            None
+        };
         let injected = self.context_for_turn(hub, thread, &mut batch)?;
         if let Some(i) = &injected {
             context::turn_ext(i, &mut twr);
         }
         if let Some(h) = &handoff {
             twr.insert(switch::HANDOFF_KEY.into(), json!(h));
+        }
+        if let Some(s) = resumes {
+            twr.insert(RESUMES_KEY.into(), json!(s));
         }
         if self.is_orch(thread) {
             twr.insert(

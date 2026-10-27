@@ -279,6 +279,21 @@ impl Core {
                 }
             }
             EventBody::TurnStarted(_) => self.rt(&ev.thread).final_text = None,
+            // The turn that carried the resume of a session the thread moved back to failed
+            // (`ThreadView::resume_failed_turn`, `hub::switch`): the runtime that tried has no
+            // session of the thread, whose next turn starts a new one. A live one is replaced
+            // like a runtime the thread moved away from (`hub::restart`), never sent that turn.
+            EventBody::TurnEnded(_) => {
+                let failed = self
+                    .registry
+                    .get(&ev.thread)
+                    .is_some_and(|v| v.resume_failed_turn.is_some_and(|t| ev.turn == Some(t)));
+                if failed {
+                    if let Some(s) = self.rt(&ev.thread).runtime_settings.as_mut() {
+                        s.moved = true;
+                    }
+                }
+            }
             // A trash item gone from its box (`hub::trash`): no longer listed, and when it is
             // the deleted thread's own, the thread is not restorable any more; what its agent
             // did is archived (`hub::prune`), so nothing folded from that is kept.
@@ -343,6 +358,7 @@ impl Core {
         self.track_context(ev);
         self.track_stall(ev);
         self.track_after(ev);
+        self.track_idle_offer(ev);
         self.track_activity(ev);
     }
 

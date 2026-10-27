@@ -29,8 +29,10 @@
 //! - `git.snapshot`: the latest per thread, none before a `thread.restored` (which clears it);
 //! - `worktree.disk`: the latest per thread (every `worktree.trimmed` is kept);
 //! - `account.usage`: the latest per thread, runtime and account;
-//! - `conversation.update`: none but a thread's first item (the reducers read nothing of it
-//!   but the time of a thread's first item and [`ThreadView::last_seq`]).
+//! - `conversation.update`: a thread's first item, and every one that turns the thread's offers
+//!   to compact its context on or off (`ext.twr.idle_compaction`,
+//!   [`ThreadView::idle_compaction_off`]); the reducers read nothing else of them but the time
+//!   of a thread's first item and [`ThreadView::last_seq`].
 //!
 //! Events of a thread while it is deleted change nothing of it ([`Registry`] drops them):
 //! none of them is a candidate or the latest of anything.
@@ -66,6 +68,7 @@
 //! [`ThreadView::last_activity`]: crate::reduce::ThreadView::last_activity
 //! [`ThreadView::worked_at`]: crate::reduce::ThreadView::worked_at
 //! [`ThreadView::last_seq`]: crate::reduce::ThreadView::last_seq
+//! [`ThreadView::idle_compaction_off`]: crate::reduce::ThreadView::idle_compaction_off
 //! [`Registry`]: crate::reduce::Registry
 //! [`AttentionStack`]: crate::reduce::AttentionStack
 
@@ -85,6 +88,7 @@ pub const DATA_KINDS: &[&str] = &[
     "turn.started",
     "thread.deleted",
     "trash.purged",
+    "conversation.update",
 ];
 
 /// One stored control item as [`select`] reads it: its position, its thread and what of it
@@ -132,8 +136,9 @@ pub enum Item {
     TurnStarted { by_message: bool },
     /// `turn.ended`.
     TurnEnded,
-    /// `conversation.update`.
-    ConversationUpdate,
+    /// `conversation.update`. `offers`: it turns the thread's offers to compact its context on
+    /// or off (`ext.twr.idle_compaction`, [`crate::event::IDLE_COMPACTION_KEY`]).
+    ConversationUpdate { offers: bool },
     /// `trash.purged` of trash `item`, which kept `thread`.
     Purged { thread: String, item: String },
     /// `thread.deleted`, `trash`: the trash item it went to.
@@ -191,6 +196,14 @@ impl Row {
             },
             EventBody::ThreadDeleted(p) => Item::Deleted {
                 trash: p.trash.clone(),
+            },
+            EventBody::ConversationUpdate(p) => Item::ConversationUpdate {
+                offers: p
+                    .ext
+                    .as_ref()
+                    .and_then(|e| e.get("twr"))
+                    .and_then(|t| t.get(crate::event::IDLE_COMPACTION_KEY))
+                    .is_some_and(serde_json::Value::is_string),
             },
             // A purge the hub recorded (on its thread): the only kind it folds (`hub::trash`).
             EventBody::TrashPurged(p) if ev.thread == HUB_THREAD && ev.source == Source::Hub => {
@@ -257,6 +270,10 @@ impl Row {
                     Err(_) => Item::Other,
                 }
             }
+            ("conversation.update", Some(data)) => match serde_json::from_str::<LightTurn>(data) {
+                Ok(u) => Item::ConversationUpdate { offers: u.offers() },
+                Err(_) => Item::Other,
+            },
             ("thread.deleted", Some(data)) => match serde_json::from_str::<LightDeleted>(data) {
                 Ok(d) => Item::Deleted {
                     trash: d.trash.map(Cow::into_owned),
@@ -264,8 +281,12 @@ impl Row {
                 Err(_) => Item::Other,
             },
             (
-                "task.updated" | "account.usage" | "turn.started" | "thread.deleted"
-                | "trash.purged",
+                "task.updated"
+                | "account.usage"
+                | "turn.started"
+                | "thread.deleted"
+                | "trash.purged"
+                | "conversation.update",
                 None,
             ) => Item::Other,
             _ => Item::of_kind(kind),
@@ -297,7 +318,7 @@ impl Item {
             | Item::Started
             | Item::Reopen
             | Item::TurnEnded
-            | Item::ConversationUpdate => true,
+            | Item::ConversationUpdate { .. } => true,
             Item::TurnStarted { by_message } => !by_message,
             // A stop, park or crash closes the thread's requests (`AttentionStack`).
             Item::Cut
@@ -319,7 +340,6 @@ impl Item {
             "thread.stopped" | "thread.parked" | "thread.crashed" | "thread.attached" => Item::Cut,
             "thread.resumed" => Item::Reopen,
             "turn.ended" => Item::TurnEnded,
-            "conversation.update" => Item::ConversationUpdate,
             "thread.deleted" => Item::Deleted { trash: None },
             "thread.restored" => Item::Restored,
             _ => Item::Other,
@@ -370,7 +390,8 @@ struct LightJob {
 }
 
 /// A `turn.started`'s data, as much as [`Row::stored`] reads of it: whether a message's ref
-/// started it (`ext.twr.ref`, [`crate::event::MESSAGE_REF_KEY`]).
+/// started it (`ext.twr.ref`, [`crate::event::MESSAGE_REF_KEY`]); and a `conversation.update`'s:
+/// whether it turns the thread's offers to compact on or off.
 /// (Read as loosely as [`crate::event::message_ref`] reads it: any `ext.twr` and `ref`, the
 /// ref counting only as an integer.)
 #[derive(Deserialize, Default)]
@@ -380,6 +401,17 @@ struct LightTurn {
 }
 
 impl LightTurn {
+    /// Whether it turns the thread's offers to compact its context on or off (a
+    /// `conversation.update`'s `ext.twr.idle_compaction`, read as loosely as the reducer reads
+    /// it: any string).
+    fn offers(&self) -> bool {
+        self.ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get(crate::event::IDLE_COMPACTION_KEY))
+            .is_some_and(serde_json::Value::is_string)
+    }
+
     /// Whether a message's ref started it.
     fn by_message(&self) -> bool {
         self.ext
@@ -687,8 +719,13 @@ pub fn select(rows: &[Row], since: u64, head: &Head) -> Vec<u64> {
                 keep[i] = true;
                 t.epoch += 1;
             }
-            // Read by no reducer but as a thread's first item (kept above).
-            Item::ConversationUpdate => {}
+            // One that turns the thread's offers on or off is folded; any other is read by no
+            // reducer but as a thread's first item (kept above).
+            Item::ConversationUpdate { offers } => {
+                if *offers {
+                    keep[i] = true;
+                }
+            }
             Item::Deleted { .. } => {
                 keep[i] = true;
                 t.deleted = true;
@@ -943,6 +980,36 @@ mod tests {
             }
         }
         assert!(kept < all * 9 / 10, "kept {kept} of {all}");
+    }
+
+    /// A `conversation.update` that turns a thread's offers to compact its context off or on is
+    /// folded (`ThreadView::idle_compaction_off`), so it stays, whatever it comes after; any
+    /// other goes unless it is its thread's first item.
+    #[test]
+    fn an_offers_switch_stays() {
+        let mut s = crate::testkit::ThreadScript::new("w");
+        let offers = |s: &mut crate::testkit::ThreadScript, v: &str| {
+            let mut ev = s.event(EventBody::ConversationUpdate(ConversationUpdate::default()));
+            if let EventBody::ConversationUpdate(p) = &mut ev.body {
+                p.ext = serde_json::json!({"twr": {crate::event::IDLE_COMPACTION_KEY: v}})
+                    .as_object()
+                    .cloned();
+            }
+            by_hub(ev)
+        };
+        let log = vec![
+            s.created("w"),                                                        // 1
+            s.event(EventBody::ConversationUpdate(ConversationUpdate::default())), // 2
+            offers(&mut s, "off"),                                                 // 3
+            s.event(EventBody::ConversationUpdate(ConversationUpdate::default())), // 4
+            offers(&mut s, "on"),                                                  // 5
+            offers(&mut s, "off"),                                                 // 6
+        ];
+        let items: Vec<(u64, &Event)> = log.iter().zip(1..).map(|(e, g)| (g, e)).collect();
+        assert_eq!(select_events(items, 0), vec![1, 3, 5, 6]);
+        check("offers", &log, 0);
+        check("offers", &log, 3);
+        check("offers", &log, 5);
     }
 
     /// Of a thread purged from the trash, what folds into nothing but its own view goes; its

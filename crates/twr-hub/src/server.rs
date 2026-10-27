@@ -24,7 +24,7 @@
 //! | `say`               | `{message, focused?, seen_gseq?}`                   | `{action, thread?, thread_name?, ref?, turn?, attn_id?, options?, answer?, decision_ids}` |
 //! | `message.withdraw`  | `{thread, ref}` (users only)                        | `{withdrawn: true, state: "queued" \| "running", thread, thread_name, ref, prompt, turn?}` or `{withdrawn: false, reason: "acted" \| "ended" \| "uninterruptible" \| "withdrawn" \| "unknown", message, thread, thread_name, ref, turn?}` (`hub::withdraw`) |
 //! | `message.send_now`  | `{thread, ref}` (users only)                        | `{sent_now: true, state: "interrupting" \| "started" \| "waiting", thread, thread_name, ref, turn?, message?}` or `{sent_now: false, reason: "unknown" \| "not_next" \| "uninterruptible", message, ...}`: runs the next queued message now, interrupting the turn that runs (`hub::queue`) |
-//! | `thread.compact`    | `{thread}` (users only)                             | `{thread, thread_name, state: "started" \| "queued", turn?, already?}`: compacts the thread's context in a turn of its own, now or after its running turn and the messages queued before (`hub::compact`); refused for a runtime that cannot, a remote box, a thread with no session, parked or attached |
+//! | `thread.compact`    | `{thread, offers?}` (users only)                    | `{thread, thread_name, state: "started" \| "queued", turn?, already?}`: compacts the thread's context in a turn of its own, now or after its running turn and the messages queued before (`hub::compact`); refused for a runtime that cannot, a remote box, a thread with no session, parked or attached. With `offers: "on" \| "off"`, compacts nothing: turns the hub's offers to compact the thread's context once its prompt cache expired on or off (`hub::idle_compact`) and returns `{thread, thread_name, offers}` |
 //! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, newest_mine, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
 //! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
 //! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
@@ -2647,8 +2647,18 @@ fn call(
             hub.send_now(&p.thread, p.msg_ref, caller)
         }
         "thread.compact" => {
-            let p: ThreadRef = params(p)?;
-            hub.compact_thread(&p.thread, caller)
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CompactParams {
+                thread: String,
+                #[serde(default)]
+                offers: Option<String>,
+            }
+            let p: CompactParams = params(p)?;
+            match p.offers.as_deref() {
+                Some(offers) => hub.compact_offers(&p.thread, offers, caller),
+                None => hub.compact_thread(&p.thread, caller),
+            }
         }
         "thread.queue" => {
             let p: ThreadRef = params(p)?;

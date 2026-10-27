@@ -26,6 +26,7 @@
 //! | `!write <file> [text]` | writes `text` plus a newline to `<file>` under the session's `cwd` (relative path without `..`; parent directories created), as a non-risky `Write` `agent.tool_call` + `agent.tool_result` (`ok:false` when it cannot) |
 //! | `!compact [manual] [ms]` | `context.compacting`, a pause of `ms` (commands keep being accepted), then `context.compacted{pre_tokens: 2000, post_tokens: 500}`, trigger `auto` (or `manual`); the turn's end then reports a context of 500 tokens |
 //! | `!context <tokens> [window]` | the turn's end reports a context of `tokens` (window default [`CONTEXT_WINDOW`]) |
+//! | `!cache <ttl_s>\|- [ago_s]` | the turn's end reports a prompt cache ([`PromptCache`]) written `ago_s` seconds ago (default 0) that lives `ttl_s` seconds (`-`: unknown) |
 //!
 //! [`AdapterCmd::Compact`] runs `!compact manual` as the turn, when the adapter was made
 //! [`FakeAdapter::with_compaction`] (it then [`Adapter::compacts`]); otherwise the turn ends
@@ -460,6 +461,7 @@ impl Session {
         let mut result = TurnResult::Completed;
         let mut end_ext: Option<Map<String, Value>> = None;
         let mut context: Option<ContextSize> = None;
+        let mut prompt_cache: Option<PromptCache> = None;
         let owed = {
             let mut left = transient_left();
             match left.get_mut(&self.session_id) {
@@ -503,6 +505,7 @@ impl Session {
                     | "deaf"
                     | "compact"
                     | "context"
+                    | "cache"
             );
             if !known {
                 if !trimmed.is_empty() {
@@ -634,6 +637,14 @@ impl Session {
                         window: Some(window),
                     });
                 }
+                "cache" => {
+                    let (ttl, ago) = split_word(rest);
+                    let ago: i64 = ago.parse().unwrap_or(0);
+                    prompt_cache = Some(PromptCache {
+                        called_at: chrono::Utc::now() - chrono::Duration::seconds(ago),
+                        ttl_s: ttl.parse().ok(),
+                    });
+                }
                 "error" => {
                     result = TurnResult::Error;
                     let msg = if rest.is_empty() { "fake error" } else { rest };
@@ -692,6 +703,7 @@ impl Session {
                 }),
                 duration_ms: Some(slept),
                 context,
+                prompt_cache,
                 ext: end_ext,
                 ..Default::default()
             }),
@@ -1048,6 +1060,32 @@ mod tests {
         let e = ended(&evs);
         assert_eq!(e.result, TurnResult::Error);
         assert_eq!(e.ext.as_ref().unwrap()["fake"]["message"], "rate limited");
+    }
+
+    /// `!cache <ttl_s> [ago_s]`: the turn's end reports a prompt cache written `ago_s` seconds
+    /// before it, living `ttl_s` (`-`: unknown); a turn without it reports none.
+    #[tokio::test]
+    async fn cache_reports_the_prompt_cache() {
+        let before = chrono::Utc::now();
+        let (h, mut rx) = spawn(Some("!cache 3600 600"));
+        started(&mut rx).await;
+        let evs = until_turn_end(&mut rx).await;
+        let after = chrono::Utc::now();
+        let ago = |s| chrono::Duration::seconds(s);
+        let pc = ended(&evs).prompt_cache.expect("a prompt cache");
+        assert_eq!(pc.ttl_s, Some(3600));
+        assert!(
+            before - ago(600) <= pc.called_at && pc.called_at <= after - ago(600),
+            "{pc:?}"
+        );
+        h.send("!cache -", 2).unwrap();
+        let evs = until_turn_end(&mut rx).await;
+        let pc = ended(&evs).prompt_cache.expect("a prompt cache");
+        assert_eq!(pc.ttl_s, None);
+        assert!(pc.called_at <= chrono::Utc::now());
+        h.send("plain", 3).unwrap();
+        let evs = until_turn_end(&mut rx).await;
+        assert_eq!(ended(&evs).prompt_cache, None);
     }
 
     #[tokio::test]

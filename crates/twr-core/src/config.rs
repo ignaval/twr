@@ -76,6 +76,10 @@
 //! idle_trim_disposable = ["target/", "node_modules/"]
 //! worktree = true      # a twr-managed worktree per thread; false = work in the repo checkout
 //! env = { CARGO_INCREMENTAL = "0" }   # added to every worker thread's runtime environment
+//! # A worker's prompt cache expired with a large context: "ask" (default) before a message
+//! # goes to it whether to compact it first; "before_expiry" also compacts an idle one just
+//! # before an hour-long cache expires; "off": neither.
+//! idle_compaction = "ask"
 //!
 //! [trash]
 //! keep_days = 7        # deleted threads stay in the trash this long (`twr trash empty` sooner)
@@ -1263,6 +1267,46 @@ pub struct ThreadsConfig {
     /// and reclaimed hard instead of taking the machine down (systemd's `MemoryHigh` on its
     /// scope: `4G`, `512M`, `20%`). systemd only. `None` (the default): no limit.
     pub memory_high: Option<String>,
+    /// What the hub does about a worker whose prompt cache expires while its context is large
+    /// ([`IdleCompaction`]): ask before a message goes to it (the default), also compact it
+    /// itself just before the cache expires, or neither.
+    pub idle_compaction: IdleCompaction,
+}
+
+/// `[threads] idle_compaction`: what the hub does about a local worker whose runtime caches
+/// its prompt for a while (Claude Code: 1 hour, 5 minutes with an API key) when that cache
+/// expires with a large context (`twr_hub`'s `hub::idle_compact`). A message sent after the
+/// cache expired makes the runtime read all of the context again, uncached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdleCompaction {
+    /// Before a message of the user's or the orchestrator's goes to such a worker, a card
+    /// asks the user whether to compact its context first.
+    #[default]
+    Ask,
+    /// As `Ask`, and the hub compacts an idle worker's context itself shortly before a cache
+    /// of an hour or more expires.
+    BeforeExpiry,
+    /// Neither.
+    Off,
+}
+
+impl IdleCompaction {
+    /// Every value, as `[threads] idle_compaction` spells it.
+    pub const ALL: [IdleCompaction; 3] = [
+        IdleCompaction::Ask,
+        IdleCompaction::BeforeExpiry,
+        IdleCompaction::Off,
+    ];
+
+    /// The config spelling: `ask`, `before_expiry`, `off`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IdleCompaction::Ask => "ask",
+            IdleCompaction::BeforeExpiry => "before_expiry",
+            IdleCompaction::Off => "off",
+        }
+    }
 }
 
 /// The systemd user slice the workers' scopes go in ([`ThreadsConfig::cpu_weight`]): a
@@ -1425,6 +1469,7 @@ impl Default for ThreadsConfig {
             job_slots: 0,
             cpu_weight: None,
             memory_high: None,
+            idle_compaction: IdleCompaction::Ask,
         }
     }
 }
@@ -2178,6 +2223,41 @@ mod tests {
         assert_eq!(c.stall_after_secs, 600);
         assert!(c.tui.mouse);
         assert!(c.tui.animate);
+    }
+
+    /// `[threads] idle_compaction`: `ask` unless set; `before_expiry` and `off` read as such;
+    /// anything else is refused, naming the values it may be.
+    #[test]
+    fn threads_idle_compaction() {
+        assert_eq!(
+            Config::default().threads.idle_compaction,
+            IdleCompaction::Ask
+        );
+        let c = Config::from_toml_str("[threads]\nthinking = true\n").unwrap();
+        assert_eq!(
+            c.threads.idle_compaction,
+            IdleCompaction::Ask,
+            "the default"
+        );
+        for v in IdleCompaction::ALL {
+            let c = Config::from_toml_str(&format!(
+                "[threads]\nidle_compaction = \"{}\"\n",
+                v.as_str()
+            ))
+            .unwrap();
+            assert_eq!(c.threads.idle_compaction, v);
+        }
+        for bad in ["\"never\"", "\"Ask\"", "true", "1"] {
+            let e = Config::from_toml_str(&format!("[threads]\nidle_compaction = {bad}\n"))
+                .unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains("idle_compaction"), "{e}");
+            if bad.starts_with('"') {
+                for v in IdleCompaction::ALL {
+                    assert!(e.contains(v.as_str()), "{e}");
+                }
+            }
+        }
     }
 
     #[test]

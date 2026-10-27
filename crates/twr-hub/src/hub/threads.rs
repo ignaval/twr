@@ -136,9 +136,15 @@ impl Core {
             }
             // Prompts held for it after other threads go with its queue (`hub::after`).
             let held = self.stage_held_drops(&mut batch, &id, "the thread was stopped");
+            // So does a card that held them (`hub::idle_compact`).
+            self.stage_idle_offer_close(&mut batch, &id);
             let dropped = self.append_batch(hub, batch).map_err(append_err)?.dropped + held;
             // Its jobs end with it (`hub::jobs`), once the stop is recorded.
             self.cancel_jobs_of(&id, "cancelled: the thread was stopped");
+            // A transient failure whose retry the stop forestalls gets its item (`hub::retry`).
+            if let Err(e) = self.react_to_stop(hub, &id) {
+                tracing::error!(thread = %id, error = %format!("{e:#}"), "cannot react to the stop");
+            }
             return Ok(json!({
                 "thread": id,
                 "thread_name": self.thread_name(&id),
@@ -164,6 +170,7 @@ impl Core {
             batch.push(&id, None, Source::Hub, why);
         }
         let held = self.stage_held_drops(&mut batch, &id, "the thread was stopped");
+        self.stage_idle_offer_close(&mut batch, &id);
         let dropped = self.append_batch(hub, batch).map_err(append_err)?.dropped + held;
         self.cancel_jobs_of(&id, "cancelled: the thread was stopped");
         // The live session's forwarder issues the stop below under the recorded id. (Not for

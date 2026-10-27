@@ -765,7 +765,10 @@ impl Hub {
                 format!("box {:?} is not available", view.box_name),
             ));
         };
-        let Some(session) = view.session_id.clone() else {
+        // While a move to another runtime is pending, the thread has no session of it yet,
+        // even one the move resumes: its next turn tells that one what happened since
+        // (`hub::switch`).
+        let Some(session) = view.confirmed_session().map(str::to_string) else {
             return Err(rpc(
                 codes::UNSUPPORTED,
                 format!(
@@ -923,7 +926,7 @@ impl Hub {
                 }) {
                     return Err(rpc(codes::CONFLICT, why));
                 }
-                let Some(session) = view.session_id.clone() else {
+                let Some(session) = view.confirmed_session().map(str::to_string) else {
                     return Ok(None);
                 };
                 refuse_session_id(&view, &session)?;

@@ -500,6 +500,10 @@ pub(super) async fn supervise(
                         (hub.core().registry.get(&thread)).and_then(|v| hub.host(&v.box_name));
                     crate::host::stamp_start_time(host, &thread, &mut body).await;
                 }
+                let session = matches!(
+                    body,
+                    EventBody::ThreadStarted(_) | EventBody::ThreadResumed(_)
+                );
                 let ev = (body, raw, turn);
                 let recorded = persist(&hub, &thread, "recording an adapter event", |core| {
                     core.record_adapter_event(
@@ -520,6 +524,11 @@ pub(super) async fn supervise(
                         continue;
                     }
                 };
+                // A runtime started with no turn (a settings restart) may be on another
+                // session than the one an open offer to compact was about (`hub::idle_compact`).
+                if session {
+                    hub.core().recheck_idle_offer(&hub, &thread);
+                }
                 if let Some(t) = ended {
                     let reacted = persist(&hub, &thread, "reacting to the end of a turn", |core| {
                         core.react_to_adapter_turn_end(&hub, &thread, &t)
@@ -658,6 +667,17 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
         .await;
         if let Err(e) = r {
             tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the crash");
+        }
+    }
+    if exit.stopped {
+        // Stopped: a transient failure whose retry the stop forestalls gets its item
+        // (`hub::retry`).
+        let r = persist(hub, thread, "reacting to a stop", |core| {
+            core.react_to_stop(hub, thread)
+        })
+        .await;
+        if let Err(e) = r {
+            tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the stop");
         }
     }
     if dispatch {
