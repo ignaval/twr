@@ -2893,4 +2893,251 @@ struct NotSerialized {
             );
         }
     }
+    /// A log with accounts: a named account recorded, the native account's name recorded
+    /// (`twr account name-native`), login checks of both, usage read in the named account's
+    /// directory and of the native account, a thread on the named account that moves to the
+    /// native one, the named account removed and the usage that removal clears, the account
+    /// added again in another directory, and another runtime's account logged out.
+    fn account_log(db: &Path) {
+        let mut l = Log::default();
+        let hub = Source::Hub;
+        let added = |rt: &str, name: &str, dir: Option<&str>, native: bool| {
+            EventBody::AccountAdded(AccountAdded {
+                runtime: rt.into(),
+                account: name.into(),
+                dir: dir.map(str::to_string),
+                native,
+                ..Default::default()
+            })
+        };
+        let status = |rt: &str, name: &str, native: bool, login: twr_core::account::Login| {
+            EventBody::AccountStatus(AccountStatus {
+                runtime: rt.into(),
+                account: name.into(),
+                native,
+                login,
+                ..Default::default()
+            })
+        };
+        let usage = |account: Option<&str>, dir: Option<&str>, pct: Option<f64>| {
+            EventBody::AccountUsage(AccountUsage {
+                runtime: "claude-code".into(),
+                account: account.map(str::to_string),
+                windows: pct
+                    .map(|p| {
+                        vec![twr_core::usage::UsageWindow {
+                            window: "5h".into(),
+                            used_pct: p,
+                            resets_at: None,
+                            minutes: Some(300),
+                            observed_at: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                source: "event".into(),
+                dir: dir.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        use twr_core::account::Login;
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            added("claude-code", "work", Some("/acc/work"), false),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            added("claude-code", "personal", None, true),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            status("claude-code", "work", false, Login::LoggedIn),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            status("claude-code", "personal", true, Login::LoggedIn),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            usage(Some("work"), Some("/acc/work"), Some(40.0)),
+        );
+        l.ev(HUB_THREAD, hub.clone(), usage(None, None, Some(10.0)));
+        l.ev(
+            "t-a",
+            hub.clone(),
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "a".into(),
+                box_name: "local".into(),
+                runtime: "claude-code".into(),
+                mode: "manual".into(),
+                ext: twr(json!({"account": "work", "account_dir": "/acc/work"})),
+                ..Default::default()
+            }),
+        );
+        l.with("t-a", ADAPTER(), |s| s.started("sa1"));
+        l.with("t-a", USER(), |s| s.turn_started("build it"));
+        l.with("t-a", ADAPTER(), |s| s.turn_ended(TurnResult::Completed));
+        l.ev(
+            "t-a",
+            USER(),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                runtime: Some("claude-code".into()),
+                previous_runtime: Some("claude-code".into()),
+                account_changed: true,
+                account: None,
+                previous_account: Some("work".into()),
+                ext: twr(json!({"previous_session": "sa1"})),
+                ..Default::default()
+            }),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+        );
+        l.ev(HUB_THREAD, hub.clone(), usage(Some("work"), None, None));
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            added("claude-code", "work", Some("/acc/work2"), false),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            added("codex", "team", Some("/acc/team"), false),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            status("codex", "team", false, Login::LoggedOut),
+        );
+        l.write(db);
+    }
+
+    /// From a checkpoint at any control event of a log with accounts (records, a native
+    /// rename, statuses, a removal, the usage it clears, an account added again), a hub start
+    /// folds what a fold of the whole log does, the accounts included; the log's account data
+    /// raised the database to schema 10, which this build checkpoints and starts from.
+    #[test]
+    fn a_start_from_any_checkpoint_folds_the_accounts_the_whole_log_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        account_log(&db);
+        assert_eq!(
+            Store::open(&db).unwrap().schema_version().unwrap(),
+            store::ACCOUNTS_SCHEMA_VERSION
+        );
+        let positions = control_ids(&db);
+        let states = check_log(&db, &NotifyConfig::default(), &positions).unwrap();
+        // The checkpoints held the account events and the account data.
+        assert!(states
+            .iter()
+            .any(|s| s["account_events"].as_array().is_some_and(|a| a.len() > 5)));
+        assert!(states.iter().any(|s| s["account_data"] == true));
+        let (core, _) = Core::replay_with(&db, None).unwrap();
+        assert!(
+            core.replayed.checkpoint.is_none(),
+            "check_log drops them after"
+        );
+        assert!(core.account_data);
+        let work = core.accounts.info("claude-code", Some("work")).unwrap();
+        assert_eq!(work.dir.as_deref(), Some(Path::new("/acc/work2")));
+        assert!(!work.removed);
+        assert_eq!(core.accounts.native_name("claude-code"), "personal");
+    }
+
+    /// The config a start has wins over the records as on a whole replay, whatever config the
+    /// checkpoint was written with (a checkpoint holds the account events, never what config
+    /// made of them, and no config key is part of its settings): a declaration added, a
+    /// native name given, after the checkpoint.
+    #[test]
+    fn a_config_changed_since_the_checkpoint_still_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        account_log(&db);
+        let notify = NotifyConfig::default();
+        let view = |toml: &str| {
+            let c = match toml {
+                "" => Config::default(),
+                t => Config::from_toml_str(t).unwrap(),
+            };
+            twr_core::account::AccountsView::new(&c).with_default_root("/root")
+        };
+        let w = write(&db, &notify, 1).unwrap().expect("a checkpoint");
+        let configs = [
+            "",
+            "[accounts.claude-code.work]\ndir = \"/cfg/work\"\n",
+            "[accounts.claude-code.me]\nnative = true\n[accounts.codex.team]\ndir = \"/cfg/team\"\n",
+        ];
+        for toml in configs {
+            let full = Core::replay_full_accounts(&db, None, view(toml)).unwrap().0;
+            let (core, _) = Core::replay_accounts(&db, None, view(toml)).unwrap();
+            assert_eq!(core.replayed.checkpoint, Some(w.id), "{toml}");
+            assert_eq!(core.accounts, full.accounts, "{toml}");
+            assert_eq!(
+                core.accounts.to_json(true),
+                full.accounts.to_json(true),
+                "{toml}"
+            );
+            assert_eq!(core.account_events, full.account_events, "{toml}");
+        }
+        let (core, _) = Core::replay_accounts(&db, None, view(configs[1])).unwrap();
+        let work = core.accounts.info("claude-code", Some("work")).unwrap();
+        assert_eq!(work.dir.as_deref(), Some(Path::new("/cfg/work")));
+        assert_eq!(work.source, twr_core::account::Source::Both);
+        let (core, _) = Core::replay_accounts(&db, None, view(configs[2])).unwrap();
+        assert_eq!(core.accounts.native_name("claude-code"), "me");
+        let team = core.accounts.info("codex", Some("team")).unwrap();
+        assert_eq!(team.dir.as_deref(), Some(Path::new("/cfg/team")));
+    }
+
+    /// `twr log checkpoint`'s prewarm writes a checkpoint for a database at schema 10 (with
+    /// account data) as for one at 9, and leaves one of a newer schema alone.
+    #[test]
+    fn prewarm_takes_a_database_with_account_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("twr.db");
+        account_log(&db);
+        let notify = NotifyConfig::default();
+        assert!(
+            matches!(prewarm(&db, &notify).unwrap(), Prewarm::Written { .. }),
+            "schema 10 is this build's"
+        );
+        assert_eq!(prewarm(&db, &notify).unwrap(), Prewarm::UpToDate);
+        let (_, replayed) = started(&db);
+        assert!(replayed.checkpoint.is_some(), "{replayed:?}");
+        store::connect(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", store::ACCOUNTS_SCHEMA_VERSION + 1)
+            .unwrap();
+        assert_eq!(
+            prewarm(&db, &notify).unwrap(),
+            Prewarm::SchemaDiffers {
+                found: store::ACCOUNTS_SCHEMA_VERSION + 1,
+                this: store::ACCOUNTS_SCHEMA_VERSION,
+            }
+        );
+        // One without account data stays at 9, this build's too.
+        let plain = dir.path().join("plain.db");
+        drop(Store::open(&plain).unwrap());
+        assert_eq!(
+            Store::open(&plain).unwrap().schema_version().unwrap(),
+            store::SCHEMA_VERSION
+        );
+        assert_ne!(
+            prewarm(&plain, &notify).unwrap(),
+            Prewarm::SchemaDiffers {
+                found: store::SCHEMA_VERSION,
+                this: store::SCHEMA_VERSION,
+            }
+        );
+    }
 }

@@ -1287,8 +1287,9 @@ impl TwrMcp {
                        only when the user asks for one: a move between accounts of one runtime \
                        is applied directly (no card), keeps the model and effort unless given, \
                        and starts a new session with a handoff on the next turn, like a \
-                       runtime move; the result then has account, previous_account and \
-                       account_changed. A project pinned to accounts keeps its threads on them: \
+                       runtime move (back on an account the thread left, its session there \
+                       resumes, `resumes` naming it; never another account's session); the \
+                       result then has account, previous_account and account_changed. A project pinned to accounts keeps its threads on them: \
                        the hub refuses a move off them, and you cannot override that (tell the \
                        user, who can). Not for the orchestrator itself, attached threads, or \
                        pty threads (without a new runtime). Tell the user what you changed."

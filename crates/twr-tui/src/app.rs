@@ -1362,6 +1362,9 @@ pub struct Transcript {
     /// with its runtime ([`moved_label`]: `claude-code:work`): what the line of the stop
     /// that move restarts the runtime with names. `None` before one.
     pub moved_to: Option<String>,
+    /// That move resumes the session the thread left on that account
+    /// (`ext.twr.resume_session`): the stop's line says so instead of a new session.
+    pub moved_resumes: bool,
 }
 
 impl Transcript {
@@ -1653,13 +1656,20 @@ impl Transcript {
                     Some(RUNTIME_RESTART_REASON) => {
                         "the previous runtime stopped; the next turn starts a session of the new one"
                     }
-                    // A move between accounts of one runtime: a new session, as for a runtime.
+                    // A move between accounts of one runtime: a new session, as for a runtime,
+                    // or the session the thread left on that account, resumed.
                     Some(ACCOUNT_RESTART_REASON) => {
-                        on_account = format!(
-                            "the previous session stopped; the next turn starts a new session on \
-                             {}",
-                            self.moved_to.as_deref().unwrap_or("its new account")
-                        );
+                        let to = self.moved_to.as_deref().unwrap_or("its new account");
+                        on_account = match self.moved_resumes {
+                            true => format!(
+                                "the previous session stopped; the next turn resumes the \
+                                 thread's earlier session on {to}"
+                            ),
+                            false => format!(
+                                "the previous session stopped; the next turn starts a new \
+                                 session on {to}"
+                            ),
+                        };
                         on_account.as_str()
                     }
                     Some(twr_core::event::TRIM_RESTART_REASON) => {
@@ -1689,6 +1699,12 @@ impl Transcript {
                 if p.account_changed {
                     let rt = p.runtime.as_deref().or(p.previous_runtime.as_deref());
                     self.moved_to = Some(moved_label(rt.unwrap_or("?"), &p.account, native));
+                    self.moved_resumes = p
+                        .ext
+                        .as_ref()
+                        .and_then(|e| e.get("twr"))
+                        .and_then(|t| t.get(twr_core::event::RESUME_SESSION_KEY))
+                        .is_some();
                 }
                 self.notice(NoticeLevel::Info, model_changed_notice(p, native))
             }
@@ -13368,6 +13384,28 @@ pub(crate) mod tests {
             "runtime claude-code (own login) → codex:team, model opus, effort default (by you)",
             "codex:team",
         );
+        // A move back to an account the thread left resumes its session there: the stop says
+        // so.
+        let mut back = ThreadModelChanged {
+            runtime: opt(Some(cc)),
+            previous_runtime: opt(Some(cc)),
+            account_changed: true,
+            account: opt(Some("work")),
+            previous_account: opt(Some("work2")),
+            ..Default::default()
+        };
+        twr_core::event::set_twr_ext(
+            &mut back.ext,
+            twr_core::event::RESUME_SESSION_KEY,
+            serde_json::json!("s-work"),
+        );
+        tr.apply_named(&s.event(EventBody::ThreadModelChanged(back)), &named);
+        tr.apply(&stop(&mut s));
+        assert_eq!(
+            last(&tr),
+            "the previous session stopped; the next turn resumes the thread's earlier session on \
+             claude-code:work"
+        );
 
         // The main pane's transcript names the native account as the hub lists it now.
         let mut st = AppState::new();
@@ -13513,7 +13551,9 @@ pub(crate) mod tests {
         t.runtime = "codex".into();
         t.actual_model = None;
         t.handoff_pending = true;
-        assert!(model_show(&t, None).ends_with("; its first codex session starts with its next turn"));
+        assert!(
+            model_show(&t, None).ends_with("; its first codex session starts with its next turn")
+        );
         t.resume_session = Some("th-1".into());
         assert!(model_show(&t, None)
             .ends_with("; its earlier codex session resumes with its next turn"));

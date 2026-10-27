@@ -1275,8 +1275,10 @@ mod tests {
         assert!(locks_path(&lock, &path));
     }
 
-    /// A log with account data recorded before the store's fence (schema 8) is raised to
-    /// [`store::ACCOUNTS_SCHEMA_VERSION`] when the hub replays it; one without stays at 8.
+    /// A log with account data recorded before the store's fence (schema 9) is raised to
+    /// [`store::ACCOUNTS_SCHEMA_VERSION`] when the hub replays it; one without stays at 9. So
+    /// is one whose account data only a checkpoint the start uses folded (the events after it
+    /// have none).
     #[test]
     fn replay_fences_account_data_recorded_before_the_fence() {
         let dir = tempfile::tempdir().unwrap();
@@ -1315,6 +1317,38 @@ mod tests {
         assert_eq!(version(&accounts), store::ACCOUNTS_SCHEMA_VERSION);
         drop(Core::replay(&native).unwrap());
         assert_eq!(version(&native), store::SCHEMA_VERSION);
+
+        let from_checkpoint = write(
+            "checkpoint.db",
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "codex".into(),
+                account: "team".into(),
+                ..Default::default()
+            }),
+        );
+        let notify = twr_core::config::NotifyConfig::default();
+        let w = super::super::checkpoint::write(&from_checkpoint, &notify, 1)
+            .unwrap()
+            .expect("a checkpoint");
+        {
+            let mut s = Store::open(&from_checkpoint).unwrap();
+            let ev = Event::new(
+                "t1",
+                1,
+                None,
+                Source::Hub,
+                EventBody::ThreadStarted(SessionPayload::default()),
+            );
+            s.append(&ev, true, Default::default()).unwrap();
+            s.conn()
+                .pragma_update(None, "user_version", store::SCHEMA_VERSION)
+                .unwrap();
+        }
+        let (core, _) = Core::replay(&from_checkpoint).unwrap();
+        assert_eq!(core.replayed.checkpoint, Some(w.id));
+        assert_eq!(core.replayed.events, 1);
+        drop(core);
+        assert_eq!(version(&from_checkpoint), store::ACCOUNTS_SCHEMA_VERSION);
     }
 
     #[test]

@@ -2096,6 +2096,40 @@ mod tests {
         s.event(EventBody::ThreadModelChanged(p))
     }
 
+    /// A move to another account of the thread's runtime is a new session there (or its own
+    /// earlier session on that account, resumed): the prompt cache's expiry is forgotten as on
+    /// a runtime move, and the old account's late turn end sets nothing.
+    #[test]
+    fn an_account_move_forgets_the_prompt_cache() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        for (session, resume) in [("s1", None), ("s2", Some("s0"))] {
+            // (Each move's session reported: the cache folds again.)
+            v.apply(&s.started(session));
+            v.apply(&s.turn_started("go"));
+            v.apply(&cache_ended(&mut s, 800, Some(3600)));
+            assert_eq!(v.cache_expires_at, at_secs(4400));
+            let mut p = ThreadModelChanged {
+                runtime: Some("fake".into()),
+                previous_runtime: Some("fake".into()),
+                account_changed: true,
+                account: Some("work".into()),
+                ..Default::default()
+            };
+            if let Some(r) = resume {
+                set_twr_ext(&mut p.ext, RESUME_SESSION_KEY, serde_json::json!(r));
+            }
+            v.apply(&s.event(EventBody::ThreadModelChanged(p)));
+            assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+            assert_eq!(v.account.as_deref(), Some("work"));
+            assert_eq!(v.resume_session.as_deref(), resume);
+            v.apply(&s.turn_started("go"));
+            v.apply(&cache_ended(&mut s, 900, Some(3600)));
+            assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        }
+    }
+
     /// The prompt cache's expiry folds from the turns' ends: the call's time plus its TTL, the
     /// TTL known when the end does not say, unknown when neither does. A turn end without a
     /// prompt cache (no call, a compaction's) keeps it. A compaction that worked, another

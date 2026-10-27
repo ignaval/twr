@@ -425,11 +425,36 @@ fn view(hub: &Hub, thread: &str) -> Value {
     hub.get_thread(thread).unwrap()
 }
 
+/// The handoff the thread's latest turn carried (`turn.started` `ext.twr.runtime_handoff`).
+fn last_handoff(hub: &Hub, thread: &str) -> Option<String> {
+    events(hub, thread)
+        .iter()
+        .rev()
+        .find_map(|e| match &e.body {
+            EventBody::TurnStarted(p) => Some(
+                p.ext.as_ref()?["twr"]
+                    .get("runtime_handoff")?
+                    .as_str()?
+                    .to_string(),
+            ),
+            _ => None,
+        })
+}
+
+/// The session the thread's view has now.
+fn session(hub: &Hub, thread: &str) -> String {
+    view(hub, thread)["session_id"]
+        .as_str()
+        .expect("a session")
+        .to_string()
+}
+
 /// An idle thread on the native account moves to `work`: its runtime stops (`account_change`),
 /// the next turn spawns a new session (not a resume) with the account's environment and the
 /// handoff naming the previous account, and that start is stamped `ext.twr.account`. Usage is
 /// recorded on the account each session ran on. After a hub restart, the thread resumes its
-/// session on `work`. Back to the native account by name, then the same account again (no move).
+/// session on `work`. Back to the native account by name resumes the session it left there,
+/// told what it did on `work` since; then the same account again (no move).
 #[tokio::test]
 async fn an_idle_thread_moves_to_another_account_with_a_handoff() {
     let env = Env::new();
@@ -536,34 +561,44 @@ async fn an_idle_thread_moves_to_another_account_with_a_handoff() {
         [env.dir("acc/work").as_str()]
     );
 
-    // Back to the native account, by its name.
+    // Back to the native account, by its name: the session it left there resumes (its own
+    // account's), told what the thread did on `work` since.
     let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
     assert_eq!(
         (&r["account"], &r["previous_account"]),
         (&json!("default"), &json!("work"))
     );
+    assert_eq!(r["resumes"], json!(&old_session), "{r}");
     assert_eq!(
         r["message"],
-        json!(
-            "a moves to claude-code:default; its next turn starts a new session there \
-             with a handoff"
-        )
+        json!(format!(
+            "a moves from claude-code:work back to claude-code:default: its earlier \
+             claude-code:default session ({old_session}) resumes with its next turn, told what \
+             the thread did since it left it"
+        ))
     );
     let mv = moves(&events(&hub, &a)).pop().unwrap();
     assert_eq!(
         (mv.account.as_deref(), mv.previous_account.as_deref()),
         (None, Some("work"))
     );
-    assert!(mv.ext.as_ref().unwrap()["twr"].get("account_dir").is_none());
+    let twr = &mv.ext.as_ref().unwrap()["twr"];
+    assert!(twr.get("account_dir").is_none());
+    assert_eq!(twr["resume_session"], json!(&old_session));
     turn(&hub, &a, "hi").await;
     let s = env.last_start(&a);
-    assert!(s.cfg.resume_session.is_none());
+    assert_eq!(s.cfg.resume_session.as_deref(), Some(old_session.as_str()));
     assert!(get(&s.cfg.env, "CLAUDE_CONFIG_DIR").is_empty());
     assert!(s.cfg.env_remove.is_empty());
-    assert!(s
-        .prompt
-        .unwrap()
-        .contains("- previous runtime: claude-code:work (model default"));
+    let handoff = last_handoff(&hub, &a).expect("the resume's handoff");
+    assert!(
+        handoff.starts_with(
+            "[twr handoff] This thread (a) comes back to you: you are its earlier \
+             claude-code:default session, resumed. Since you left it, it ran on \
+             claude-code:work for 2 turns"
+        ),
+        "{handoff}"
+    );
     assert!(start_stamps(&events(&hub, &a))
         .last()
         .unwrap()
@@ -2041,5 +2076,280 @@ async fn a_name_the_native_account_shares_is_the_named_accounts() {
         get(&env.last_start(&a).cfg.env, "CODEX_HOME"),
         [env.dir("acc/xdef").as_str()]
     );
+    hub.shutdown().await;
+}
+
+/// `thread.set_model {runtime}` by the user.
+async fn move_runtime(hub: &Hub, thread: &str, runtime: &str) -> Value {
+    hub.set_thread_model(
+        thread,
+        ModelRequest {
+            runtime: Some(runtime),
+            ..Default::default()
+        },
+        &user(),
+    )
+    .await
+    .unwrap()
+}
+
+/// Switch-back resume keyed by account: a move back to the account a thread left (on the same
+/// runtime) resumes the session it left there, in that account's environment; a move to another
+/// account of the runtime, where the thread never had a session, starts a new one, never
+/// another account's session.
+#[tokio::test]
+async fn a_move_back_resumes_the_session_of_that_account_only() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let t = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "t")
+        },
+    )
+    .await;
+    turn(&hub, &t, "hi").await;
+    let on_work = session(&hub, &t);
+
+    // To work2: a new session there.
+    let r = move_to(&hub, &t, "work2", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert!(s.cfg.resume_session.is_none(), "another account's session");
+    let on_work2 = session(&hub, &t);
+    assert_ne!(on_work2, on_work);
+
+    // Back to work: its session there, in work's environment.
+    let r = move_to(&hub, &t, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&on_work), "{r}");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("t moves from claude-code:work2 back to claude-code:work: its earlier"),
+        "{r}"
+    );
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert_eq!(s.cfg.resume_session.as_deref(), Some(on_work.as_str()));
+    assert_eq!(
+        get(&s.cfg.env, "CLAUDE_CONFIG_DIR"),
+        [env.dir("acc/work").as_str()]
+    );
+    let handoff = last_handoff(&hub, &t).expect("the resume's handoff");
+    assert!(
+        handoff.contains("it ran on claude-code:work2 for 1 turn"),
+        "{handoff}"
+    );
+
+    // And to work2 again: its own session there.
+    let r = move_to(&hub, &t, "work2", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&on_work2), "{r}");
+    turn(&hub, &t, "hi").await;
+    assert_eq!(
+        env.last_start(&t).cfg.resume_session.as_deref(),
+        Some(on_work2.as_str())
+    );
+
+    // The native account, where the thread never ran: a new session with the full handoff.
+    let r = move_to(&hub, &t, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .contains("its next turn starts a new session there with a handoff"),
+        "{r}"
+    );
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert!(s.cfg.resume_session.is_none());
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (t) moved to another account:"));
+    hub.shutdown().await;
+}
+
+/// A move to another runtime and back resumes the session it left only on the account it ran
+/// on: back on the runtime with another account, a new session; on the account it left, its
+/// session there.
+#[tokio::test]
+async fn a_runtime_move_back_resumes_only_on_the_same_account() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let t = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "t")
+        },
+    )
+    .await;
+    turn(&hub, &t, "hi").await;
+    let on_work = session(&hub, &t);
+    let r = move_runtime(&hub, &t, "codex:team").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &t, "hi").await;
+    let on_team = session(&hub, &t);
+
+    // Claude Code, on another account: a new session.
+    let r = move_runtime(&hub, &t, "claude-code:work2").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert_eq!(s.runtime, "claude-code");
+    assert!(s.cfg.resume_session.is_none());
+
+    // Codex on team again: its session there.
+    let r = move_runtime(&hub, &t, "codex:team").await;
+    assert_eq!(r["resumes"], json!(&on_team), "{r}");
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert_eq!(
+        (s.runtime, s.cfg.resume_session.as_deref()),
+        ("codex", Some(on_team.as_str()))
+    );
+    assert_eq!(
+        get(&s.cfg.env, "CODEX_HOME"),
+        [env.dir("acc/team").as_str()]
+    );
+
+    // Claude Code on work, the account it left first: that session.
+    let r = move_runtime(&hub, &t, "claude-code:work").await;
+    assert_eq!(r["resumes"], json!(&on_work), "{r}");
+    turn(&hub, &t, "hi").await;
+    let s = env.last_start(&t);
+    assert_eq!(
+        (s.runtime, s.cfg.resume_session.as_deref()),
+        ("claude-code", Some(on_work.as_str()))
+    );
+    assert_eq!(
+        get(&s.cfg.env, "CLAUDE_CONFIG_DIR"),
+        [env.dir("acc/work").as_str()]
+    );
+    hub.shutdown().await;
+}
+
+/// The session a move left lives in the directory it began in: once the account's name leads
+/// to another directory (config changed), or the account was removed and added again (in the
+/// same directory too: another login there), a move back starts a new session with the full
+/// handoff.
+#[tokio::test]
+async fn a_move_back_after_a_directory_change_or_a_re_add_starts_a_new_session() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let w = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "w")
+        },
+    )
+    .await;
+    turn(&hub, &w, "hi").await;
+    move_to(&hub, &w, "work2", false, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let moved = env.path("acc/work-moved");
+    let hub = env.restart(hub, env.config(Some(&moved))).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    let s = env.last_start(&w);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "a new session in the new directory"
+    );
+    assert_eq!(
+        get(&s.cfg.env, "CLAUDE_CONFIG_DIR"),
+        [env.dir("acc/work-moved").as_str()]
+    );
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (w) moved to another account:"));
+
+    // A recorded account removed and added again, in the same directory.
+    let add = |hub: &Hub| {
+        let added = hub
+            .account_add(
+                AccountAddParams {
+                    runtime: "claude-code".into(),
+                    account: "side".into(),
+                    ..Default::default()
+                },
+                &user(),
+            )
+            .unwrap();
+        let dir = added["dir"].as_str().unwrap().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let side_dir = add(&hub);
+    let s = create(
+        &hub,
+        NewThread {
+            account: Some("side".into()),
+            ..new_thread("api", "s")
+        },
+    )
+    .await;
+    turn(&hub, &s, "hi").await;
+    move_to(&hub, &s, "work2", false, &user()).await.unwrap();
+    turn(&hub, &s, "hi").await;
+    hub.account_remove(
+        AccountRemoveParams {
+            runtime: "claude-code".into(),
+            account: "side".into(),
+            ..Default::default()
+        },
+        &user(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(add(&hub), side_dir);
+    let r = move_to(&hub, &s, "side", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &s, "hi").await;
+    let st = env.last_start(&s);
+    assert!(
+        st.cfg.resume_session.is_none(),
+        "another login in that directory"
+    );
+    assert_eq!(get(&st.cfg.env, "CLAUDE_CONFIG_DIR"), [side_dir.as_str()]);
+    hub.shutdown().await;
+}
+
+/// The native account is the same account under another name: a thread that left it resumes
+/// its session there after `twr account name-native` (an `account.added` of the native
+/// account's name), moved back by the new name.
+#[tokio::test]
+async fn a_renamed_native_account_still_resumes_its_session() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let a = create(&hub, new_thread("api", "a")).await;
+    turn(&hub, &a, "hi").await;
+    let native = session(&hub, &a);
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    hub.account_add(
+        AccountAddParams {
+            runtime: "claude-code".into(),
+            account: "personal".into(),
+            native: true,
+            ..Default::default()
+        },
+        &user(),
+    )
+    .unwrap();
+    let r = move_to(&hub, &a, "personal", false, &user()).await.unwrap();
+    assert_eq!(r["account"], json!("personal"), "{r}");
+    assert_eq!(r["resumes"], json!(&native), "{r}");
+    turn(&hub, &a, "hi").await;
+    let s = env.last_start(&a);
+    assert_eq!(s.cfg.resume_session.as_deref(), Some(native.as_str()));
+    assert!(get(&s.cfg.env, "CLAUDE_CONFIG_DIR").is_empty());
     hub.shutdown().await;
 }

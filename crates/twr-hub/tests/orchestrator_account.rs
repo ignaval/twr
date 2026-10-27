@@ -602,6 +602,52 @@ async fn an_existing_auto_memory_directory_is_kept() {
     hub.shutdown().await;
 }
 
+/// The orchestrator's memory on a named account (dev's persistent memory with accounts):
+/// Claude Code on `work` keeps the native memory directory (`autoMemoryDirectory` and the
+/// guard's `--memory-dir`) while its runtime's own memory switch is the orchestrator's
+/// (`native_memory_off`); a switch to Codex on account `team` runs in that account's
+/// `CODEX_HOME` with Codex's memories still off (its `-c` overrides, `native_memory_off`),
+/// and no Claude Code memory directory or file tools.
+#[tokio::test]
+async fn native_memory_stays_off_and_shared_on_a_named_account() {
+    let mut env = Env::new();
+    std::fs::create_dir_all(env.path("acc/team")).unwrap();
+    let team = env.path("acc/team");
+    let hub = Hub::open(env.opts(|c| {
+        c.orchestrator.account = Some("work".into());
+        c.accounts.entry("codex".into()).or_default().insert(
+            "team".into(),
+            AccountConfig {
+                dir: Some(team.clone()),
+                share: Share::None,
+                ..Default::default()
+            },
+        );
+    }))
+    .await
+    .unwrap();
+    hub.say("hello", None, &tui()).await.unwrap();
+    let mut rt = env.orch().await;
+    assert_on_work(&rt, &env);
+    assert!(rt.cfg.native_memory_off, "the runtime's own memory is off");
+    let memory = env.shared_memory();
+    assert_guarded(&rt, Some(&memory));
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t);
+
+    let r = hub
+        .use_orchestrator("codex:team", None, quick(), &tui())
+        .await
+        .unwrap();
+    assert_eq!(r["account"], "team", "{r}");
+    let codex = env.orch().await;
+    assert_eq!(codex.env("CODEX_HOME"), Some(team.to_str().unwrap()));
+    assert_eq!(codex.env("CLAUDE_CONFIG_DIR"), None, "{:?}", codex.cfg.env);
+    assert!(codex.cfg.native_memory_off, "Codex's memories stay off");
+    assert_eq!(codex.cfg.settings, None);
+    hub.shutdown().await;
+}
+
 /// A native configuration directory reached through a symbolic link: the memory directory
 /// shared is the real one, as `autoMemoryDirectory` and the guard's `--memory-dir` alike
 /// (Claude Code's `dontAsk` refuses a memory write through a link).

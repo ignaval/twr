@@ -5,7 +5,7 @@
 //! (`[accounts.<runtime>.<name>]`, with [`HubOptions::accounts_root`] as the root of the
 //! directories they leave out), and the log's `account.added`, `account.removed` and
 //! `account.status` (hub thread) folded over them, on replay and live ([`Core::apply`]).
-//! Config wins over a record of the same account. The hub never writes `config.toml`.
+//! Config wins over a record of the same account. No account method writes `config.toml`.
 //!
 //! **At start** ([`check_at_start`]) every named account (config's and recorded, not removed)
 //! is checked against each runtime's own directory (the one it uses with no account variable

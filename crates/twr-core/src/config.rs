@@ -1297,6 +1297,32 @@ pub struct AccountPolicy {
     pub default: Option<String>,
 }
 
+/// The account settings the design plans for later versions
+/// (`docs/design/multi-account.md`): `[account_policy.<runtime>]` `balance`, `pool`,
+/// `failover`, `avoid_above`, `move` and `resume_at_reset`, and `[accounts.codex.<name>]`
+/// `sessions`. None is available yet: each is refused as an unknown key, saying so
+/// ([`planned_account_key`]), never accepted and ignored.
+pub const PLANNED_ACCOUNT_KEYS: [&str; 7] = [
+    "balance",
+    "pool",
+    "failover",
+    "avoid_above",
+    "move",
+    "resume_at_reset",
+    "sessions",
+];
+
+/// The planned account key ([`PLANNED_ACCOUNT_KEYS`]) a config parse error `text` refuses as
+/// unknown in `[account_policy.<runtime>]` (whose only key is `default`) or in an account's
+/// table (`dir`, `share`, `native`), if it is one.
+fn planned_account_key(text: &str) -> Option<&'static str> {
+    let in_account_table = text.contains("expected `default`")
+        || text.contains("expected one of `dir`, `share`, `native`");
+    PLANNED_ACCOUNT_KEYS
+        .into_iter()
+        .find(|k| in_account_table && text.contains(&format!("unknown field `{k}`")))
+}
+
 /// `[threads]`
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1561,7 +1587,18 @@ impl Config {
     /// Parses TOML (no environment overrides) and checks values serde cannot
     /// ([`Config::validate`]).
     pub fn from_toml_str(s: &str) -> anyhow::Result<Config> {
-        let mut cfg: Config = toml::from_str(s).context("parsing twr config")?;
+        let mut cfg: Config = toml::from_str(s).map_err(|e| {
+            let why = planned_account_key(&e.to_string()).map_or_else(
+                || "parsing twr config".to_string(),
+                |k| {
+                    format!(
+                        "parsing twr config: `{k}` is planned for a later version of account \
+                         support and is not available yet (docs/accounts.md)"
+                    )
+                },
+            );
+            anyhow::Error::new(e).context(why)
+        })?;
         let home = std::env::var_os("HOME").map(PathBuf::from);
         cfg.expand_account_dirs(home.as_deref());
         cfg.validate()?;
@@ -3082,6 +3119,20 @@ account = "gpu-work"
             ("[accounts.codex.a]\nshare = \"all\"", "unknown variant `all`"),
             ("[accounts.codex.a]\nlogin = \"x\"", "unknown field `login`"),
             ("[account_policy.codex]\nbalance = \"pinned\"", "unknown field `balance`"),
+            // The later phases' keys: refused, saying they are not available yet.
+            (
+                "[account_policy.codex]\nfailover = \"auto\"",
+                "`failover` is planned for a later version of account support and is not available yet",
+            ),
+            (
+                "[account_policy.claude-code]\nresume_at_reset = true",
+                "`resume_at_reset` is planned for a later version",
+            ),
+            ("[account_policy.codex]\nmove = \"resume\"", "`move` is planned for a later version"),
+            (
+                "[accounts.codex.a]\nsessions = \"shared\"",
+                "`sessions` is planned for a later version",
+            ),
             ("[account_policy.gemini]\ndefault = \"a\"", "account_policy.gemini: \"gemini\" does not take accounts"),
             ("[account_policy.codex]\ndefault = \"a b\"", "account_policy.codex.default: \"a b\" is not an account name"),
             ("[orchestrator]\naccount = \"a/b\"", "orchestrator.account: \"a/b\" is not an account name"),

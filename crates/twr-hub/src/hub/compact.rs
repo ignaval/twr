@@ -18,7 +18,10 @@
 //! A compaction is a turn of its own: `turn.started {prompt: "/compact", from: user}` with
 //! `ext.twr.compact` ([`COMPACT_TURN_KEY`]), sent to the runtime as [`AdapterCmd::Compact`]
 //! with nothing prepended (no standing context, handoff or hub facts), and ended by the
-//! runtime as any turn. Like a prompt it starts only between turns (a Codex compaction sent
+//! runtime as any turn, on the thread's account: a runtime it starts for it is started as for
+//! any turn (`Core::spawn_config`: the account's directory in the runtime's variable, the
+//! start refused on a removed account or one whose directory changed). Like a prompt it starts
+//! only between turns (a Codex compaction sent
 //! during a turn would interrupt it), after the messages queued before it was asked for: the
 //! ask waits in memory ([`CompactAsk`]), so a hub restart before it starts forgets it, and is
 //! checked again when it is due: one asked of a session that is no longer the thread's (a
