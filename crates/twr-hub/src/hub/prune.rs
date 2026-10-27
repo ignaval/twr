@@ -1548,7 +1548,14 @@ mod tests {
                 out.insert(format!("{t}/{n}/transcript"), json!(tr));
             }
         }
-        let unreported: Vec<String> = store::unreported_turn_ends(&conn, &["t-o".into()])
+        let workers: Vec<String> = conn
+            .prepare("SELECT DISTINCT thread FROM events WHERE thread != 't-o' ORDER BY thread")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let unreported: Vec<String> = store::unreported_turn_ends(&conn, &workers)
             .unwrap()
             .into_iter()
             .map(|e| e.id)

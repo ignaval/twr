@@ -892,6 +892,20 @@ enum LogCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Write a checkpoint of the hub's folded state for this build of twr, so that its hub's
+    /// next start folds only what comes after it instead of the whole log. Run it after
+    /// installing a new build while a hub of the old one still runs (`docs/tools/
+    /// dev-install.sh` does): checkpoints are kept per build, and a build uses only its own.
+    /// Works whether or not the hub runs, never starts one, and leaves a database of another
+    /// schema alone (the hub's start migrates it).
+    Checkpoint {
+        /// Every workspace of this home, not only this one.
+        #[arg(long)]
+        all: bool,
+        /// Print one JSON object per workspace.
+        #[arg(long)]
+        json: bool,
+    },
     /// Sizes of twr.db, its write-ahead log and archive.db, rows and bytes per kind, blobs,
     /// checkpoints, the control backlog (whole and compacted), and what the next compaction
     /// would move.
@@ -1952,6 +1966,9 @@ async fn run_simple(
             cmd: TrashCmd::List { json },
         } => trash_list(&socket, json).await,
         Cmd::Job { cmd } => job_cmd(&socket, cmd).await,
+        Cmd::Log {
+            cmd: LogCmd::Checkpoint { all, json },
+        } => log_checkpoint(&paths, all, json).await,
         Cmd::Log { cmd } => log_cmd(&socket, cmd).await,
         Cmd::Trash {
             cmd: TrashCmd::Empty { items, all, yes },
@@ -2944,7 +2961,9 @@ fn hub_stop_timeout(socket: &Path, paths: &Paths, timeout: Duration) -> anyhow::
 
 /// Shared shutdown, with an explicit workspace identity for bulk stops (the global
 /// EXPECTED_WORKSPACE belongs to single-workspace commands). One deadline bounds every
-/// phase, including connecting and process-table reads, with the phase's own diagnostics.
+/// phase, including connecting and process-table reads, with the phase's own diagnostics;
+/// it moves on by as long as writing this build's checkpoint took, unless the hub runs this
+/// very build ([`prewarm_for_stop`], between `hub.info` and `hub.shutdown` on one connection).
 async fn hub_stop_result(
     socket: &Path,
     paths: &Paths,
@@ -2952,10 +2971,11 @@ async fn hub_stop_result(
     expected: Option<&str>,
     wait_start: bool,
 ) -> anyhow::Result<Option<String>> {
-    let deadline = tokio::time::Instant::now()
+    let mut deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .context("hub stop timeout is too large")?;
     let mut connection_losses = 0;
+    let mut prewarmed = false;
     let proc = loop {
         let connected = tokio::time::timeout_at(deadline, async {
             loop {
@@ -3002,29 +3022,52 @@ async fn hub_stop_result(
         };
         let mut shutdown_sent = false;
         let mut known_proc = None;
-        let asked = tokio::time::timeout_at(deadline, async {
+        let info = tokio::time::timeout_at(deadline, async {
             let hello = c.hello(json!({ "client": "cli" })).await?;
             if let Some(expected) = expected {
                 check_workspace_name(&hello, socket, expected)?;
             }
-            let info = c.call("hub.info", Value::Null).await?;
-            let pid = info["pid"].as_u64().and_then(|p| u32::try_from(p).ok());
-            // Read while the hub surely runs: once it is gone, the pid may name another process.
-            let start = match pid {
-                Some(pid) => {
-                    tokio::task::spawn_blocking(move || twr_runner::reap::process_start_time(pid))
-                        .await
-                        .ok()
-                        .flatten()
-                }
-                None => None,
-            };
-            known_proc = pid.map(|pid| (pid, start));
-            shutdown_sent = true;
-            c.call("hub.shutdown", Value::Null).await?;
-            anyhow::Ok(known_proc)
+            c.call("hub.info", Value::Null).await
         })
         .await;
+        // The hub's process, read while it surely runs (as it just answered): once it is gone,
+        // the pid may name another process. Before the prewarm below, which may take seconds.
+        let pid = match &info {
+            Ok(Ok(info)) => info["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+            _ => None,
+        };
+        let start = match pid {
+            Some(pid) => tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || twr_runner::reap::process_start_time(pid)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
+            None => None,
+        };
+        if let (Ok(Ok(info)), false) = (&info, prewarmed) {
+            prewarmed = true;
+            let started = tokio::time::Instant::now();
+            if let Some(line) = prewarm_for_stop(info, paths).await {
+                outln!("{line}");
+            }
+            deadline += started.elapsed();
+        }
+        let asked = match info {
+            Ok(Ok(_)) => {
+                tokio::time::timeout_at(deadline, async {
+                    known_proc = pid.map(|pid| (pid, start));
+                    shutdown_sent = true;
+                    c.call("hub.shutdown", Value::Null).await?;
+                    anyhow::Ok(known_proc)
+                })
+                .await
+            }
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(elapsed) => Err(elapsed),
+        };
         let proc = match asked {
             Ok(Err(e))
                 if wait_start
@@ -3081,6 +3124,49 @@ async fn hub_stop_result(
     })
     .await
     .map(Some)
+}
+
+/// Whether `twr hub stop` writes this build's checkpoint of the log at `db` before stopping a
+/// hub that answers `hub.info` with `info` ([`prewarm_for_stop`]): unless that hub runs this
+/// very build (its `checkpoint_build`, the build its checkpoints are for, is `this`), as the
+/// start that follows is likely this build's, which uses only its own checkpoints; on that log.
+/// A hub from before `checkpoint_build` may be another build of the same version (a dirty
+/// checkout's): it gets one too. (A build that has one up to date writes nothing.)
+fn prewarm_wanted(info: &Value, this: &str, db: &Path) -> bool {
+    info.is_object()
+        && info["checkpoint_build"].as_str() != Some(this)
+        && info["db"].as_str().is_none_or(|d| Path::new(d) == db)
+}
+
+/// Before `twr hub stop` asks the hub of workspace `paths` that answered `hub.info` with `info`
+/// to stop: when it runs another version of twr ([`prewarm_wanted`]), writes this build's
+/// checkpoint of its log, as `twr log checkpoint` does ([`twr_hub::prewarm_checkpoint`]), so
+/// that the start that follows on this build folds only what came after it. (A running older
+/// hub keeps only its own newest checkpoints, and may have dropped one written at install.)
+/// Best effort: the line saying what it did, or `None` when it did nothing (the same version,
+/// another log, an agent asking).
+async fn prewarm_for_stop(info: &Value, paths: &Paths) -> Option<String> {
+    // An agent may not stop the hub (the hub refuses it): it writes nothing either.
+    if caller_is_agent() {
+        return None;
+    }
+    let db = paths.db_file();
+    if !prewarm_wanted(info, &twr_hub::checkpoint_build(), &db) {
+        return None;
+    }
+    let name = paths.workspace_name().to_string();
+    let notify = Config::load_from(paths)
+        .map(|c| c.notify)
+        .unwrap_or_default();
+    let done = tokio::task::spawn_blocking(move || twr_hub::prewarm_checkpoint(&db, &notify)).await;
+    Some(match done {
+        Ok(Ok(p)) => prewarm_text(&prewarm_json(&name, &p)),
+        Ok(Err(e)) => format!(
+            "{name}: no checkpoint written for twr {} ({e:#}): its next start folds the whole log",
+            twr_core::version()
+        ),
+        Err(e) => format!("{name}: no checkpoint written ({e})"),
+    })
 }
 
 fn hub_stop_failure(name: &str, e: &anyhow::Error) -> String {
@@ -3268,6 +3354,7 @@ async fn update(
     if !status.success() {
         bail!("the installer failed ({status}); twr was not updated");
     }
+    prewarm_installed(&dir.join("twr")).await;
     hub_version_note(&dir.join("twr"), socket, paths).await;
     Ok(())
 }
@@ -3880,6 +3967,24 @@ async fn hub_version_note(new_exe: &Path, socket: Option<PathBuf>, paths: &Paths
         if bulk_hint {
             outln!("To stop every workspace's hub in this home, use `twr hub stop --all`, then reopen the workspaces you need.");
         }
+    }
+}
+
+/// After `twr update` installed `new_exe`: its checkpoint of each workspace's log (`twr log
+/// checkpoint --all`, run by it: checkpoints are per build), so that the next start of a hub
+/// on it folds only what comes after it. Best effort: a release from before `log checkpoint`
+/// refuses it, and the hub's start then folds the whole log, as before.
+async fn prewarm_installed(new_exe: &Path) {
+    outln!();
+    let prewarm = tokio::process::Command::new(new_exe)
+        .args(["log", "checkpoint", "--all"])
+        .env_remove(twr_core::paths::WORKSPACE_ENV)
+        .status()
+        .await;
+    if !prewarm.is_ok_and(|s| s.success()) {
+        outln!(
+            "(no checkpoint was written for the new build: a hub's first start on it folds the whole log)"
+        );
     }
 }
 
@@ -5366,6 +5471,7 @@ async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
                 out!("{}", log_compact_text(&r));
             }
         }
+        LogCmd::Checkpoint { .. } => unreachable!("`twr log checkpoint` needs no hub"),
         LogCmd::Stats { json } => {
             let r = c.call("log.stats", Value::Null).await?;
             if json {
@@ -5376,6 +5482,91 @@ async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `twr log checkpoint`: a checkpoint for this build in this workspace's log, or in every
+/// workspace's with `all` ([`twr_hub::prewarm_checkpoint`]). A workspace without a log yet is
+/// skipped; one that fails is reported, and the command fails once all were tried.
+async fn log_checkpoint(paths: &Paths, all: bool, json: bool) -> anyhow::Result<()> {
+    let root = paths.root();
+    let names = if all {
+        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+        names.extend(
+            root.named_workspaces()
+                .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
+        );
+        names
+    } else {
+        vec![paths.workspace_name().to_string()]
+    };
+    let mut failed = 0;
+    for name in names {
+        let ws = root.workspace(&name)?;
+        let db = ws.db_file();
+        let r = if !db.exists() {
+            Ok(json!({ "workspace": name, "skipped": "no log yet" }))
+        } else {
+            // The `[notify]` the hub would fold with: part of what a checkpoint is for.
+            let notify = Config::load_from(&ws).map(|c| c.notify).unwrap_or_default();
+            tokio::task::spawn_blocking(move || twr_hub::prewarm_checkpoint(&db, &notify))
+                .await?
+                .map(|p| prewarm_json(&name, &p))
+                .map_err(|e| (name, e))
+        };
+        match r {
+            Ok(v) if json => outln!("{v}"),
+            Ok(v) => outln!("{}", prewarm_text(&v)),
+            Err((name, e)) => {
+                failed += 1;
+                errln!("{name}: {e:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} workspace(s) got no checkpoint");
+    }
+    Ok(())
+}
+
+/// What [`log_checkpoint`] did in workspace `name`, as JSON.
+fn prewarm_json(name: &str, p: &twr_hub::Prewarm) -> Value {
+    match p {
+        twr_hub::Prewarm::Written {
+            id,
+            from,
+            gseq,
+            events,
+            bytes,
+            ms,
+        } => json!({ "workspace": name, "written": id, "from": from, "gseq": gseq,
+                     "events": events, "bytes": bytes, "ms": ms }),
+        twr_hub::Prewarm::UpToDate => json!({ "workspace": name, "up_to_date": true }),
+        twr_hub::Prewarm::SchemaDiffers { found, this } if found > this => {
+            json!({ "workspace": name,
+            "skipped": format!("its schema is {found}, newer than this build's {this}: this build's hub cannot open it") })
+        }
+        twr_hub::Prewarm::SchemaDiffers { found, this } => json!({ "workspace": name,
+            "skipped": format!("its schema is {found}, this build's {this}: the hub's next start migrates it") }),
+    }
+}
+
+/// [`prewarm_json`] as a line.
+fn prewarm_text(v: &Value) -> String {
+    let name = str_of(&v["workspace"]);
+    if let Some(why) = v["skipped"].as_str() {
+        return format!("{name}: skipped ({why})");
+    }
+    if v["up_to_date"] == true {
+        return format!("{name}: up to date (this build has a checkpoint at the log's end)");
+    }
+    format!(
+        "{name}: checkpoint {} written at control position {} ({} events folded, {}, {} ms)",
+        v["written"],
+        v["gseq"],
+        v["events"],
+        twr_core::git::human_bytes(v["bytes"].as_u64().unwrap_or(0)),
+        v["ms"]
+    )
 }
 
 /// Bytes as `twr trash list` shows them.
@@ -8772,6 +8963,36 @@ mod tests {
             "api: runtime claude-code, model fable, effort high; its runtime runs model \
              fable, effort (runtime default) until it restarts"
         );
+    }
+
+    /// `twr hub stop` writes this build's checkpoint first only for a hub of another version
+    /// on the workspace's own log: not for one of this version, one that does not say its
+    /// version, or one on another database.
+    #[test]
+    fn hub_stop_prewarms_only_a_hub_of_another_build_on_this_log() {
+        let db = Path::new("/h/twr.db");
+        let info = |version: Value, at: Option<&str>| {
+            let mut v = json!({ "version": version, "pid": 7 });
+            if let Some(at) = at {
+                v["db"] = json!(at);
+            }
+            v
+        };
+        let (this, build) = ("0.3.0+dev.abc", "0.3.0+dev.abc src 1");
+        let wanted = |info: &Value| prewarm_wanted(info, build, db);
+        // An older hub says its version only: it may be another build of this version (a
+        // dirty checkout's), so it gets one too.
+        assert!(wanted(&info(json!("0.3.0+dev.123"), Some("/h/twr.db"))));
+        assert!(wanted(&info(json!("0.2.9"), None)));
+        assert!(wanted(&info(json!(this), Some("/h/twr.db"))));
+        assert!(!wanted(&Value::Null), "no answer, nothing known");
+        assert!(!wanted(&info(json!("0.2.9"), Some("/other/twr.db"))));
+        // Two builds of one version differ in their checkpoint build.
+        let mut same_version = info(json!(this), Some("/h/twr.db"));
+        same_version["checkpoint_build"] = json!("0.3.0+dev.abc src 2");
+        assert!(wanted(&same_version));
+        same_version["checkpoint_build"] = json!(build);
+        assert!(!wanted(&same_version), "this very build");
     }
 
     /// `twr hub stop` says "stopped" only once the hub's process is seen gone: an unreadable

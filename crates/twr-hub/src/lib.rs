@@ -27,8 +27,9 @@ pub(crate) mod test_support;
 use std::path::PathBuf;
 
 pub use hub::{
-    local_agent, lock_opened, AgentJobBy, AttachGrant, Caller, Hub, HubOptions, HubState, JobStart,
-    NewThread, Relay, SendOutcome, ShellRun, SuggestAsk, SwitchOptions, LOCK_FILE, MEMORY_DIR,
+    checkpoint_build, local_agent, lock_opened, prewarm_checkpoint, AgentJobBy, AttachGrant,
+    Caller, Hub, HubOptions, HubState, JobStart, NewThread, Prewarm, Relay, SendOutcome, ShellRun,
+    SuggestAsk, SwitchOptions, LOCK_FILE, MEMORY_DIR,
 };
 pub use job_gate::job_gate_main;
 

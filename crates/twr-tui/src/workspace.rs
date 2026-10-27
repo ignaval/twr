@@ -1291,10 +1291,15 @@ impl AppState {
                 request: v.request.clone(),
                 card_view: v.card_view.clone(),
                 detail: v.detail.clone(),
-                decision_id: self
-                    .decision_rows()
-                    .get(self.decision_selected())
-                    .map(|r| r.id.clone()),
+                // A selection still waiting for the older rows that have it (a view kept across
+                // an earlier switch, the user not having moved since): that one.
+                decision_id: match &self.pending_decision {
+                    Some((id, at)) if *at == v.decision_sel => Some(id.clone()),
+                    _ => self
+                        .decision_rows()
+                        .get(self.decision_selected())
+                        .map(|r| r.id.clone()),
+                },
                 dive: v.dive.clone(),
                 focus_before_dive: v.focus_before_dive.clone(),
                 scroll: v.scroll,
@@ -1416,8 +1421,13 @@ impl AppState {
         }
         self.view.decision_sel = r.decision_sel;
         if let Some(id) = r.decision_id {
-            if let Some(i) = self.decision_rows().iter().position(|row| row.id == id) {
-                self.view.decision_sel = i;
+            match self.decision_rows().iter().position(|row| row.id == id) {
+                Some(i) => self.view.decision_sel = i,
+                // Older than a snapshot's rows: found once they are read.
+                None if self.older_decisions.is_some() => {
+                    self.pending_decision = Some((id, r.decision_sel));
+                }
+                None => {}
             }
         }
         // The conversation shows from its bottom when the thread dived into is gone.

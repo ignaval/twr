@@ -33,6 +33,9 @@ pub mod settings;
 pub mod shell;
 pub mod sidebar;
 pub mod slash;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
 pub mod suggest;
 pub mod summary;
 pub mod terminal_setup;
@@ -54,6 +57,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
 use twr_core::client::{Client, HubClosed};
+use twr_core::client_state::ClientFold;
 use twr_core::event::EventBody;
 use twr_core::proto::StreamItem;
 
@@ -1505,7 +1509,8 @@ const TAB_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info` and
 /// `orchestrator.show`, the connection for calls, and the control stream with the head its
-/// replay runs up to (and, compacted, how many items the replay has).
+/// replay runs up to (and, compacted, how many items the replay has), or the state at that
+/// head (a snapshot) when the hub gave it: the stream then brings what comes after it.
 struct Session {
     socket: PathBuf,
     calls: Client,
@@ -1514,6 +1519,7 @@ struct Session {
     control: ItemStream,
     head: u64,
     backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
 }
 
 impl Session {
@@ -1540,17 +1546,28 @@ impl Session {
         })
         .await
         .unwrap_or(Value::Null);
-        let (control, backlog) = within(
+        let ControlStart {
+            sub: control,
+            backlog,
+            snapshot,
+        } = within(
             CONNECT_TIMEOUT,
             "subscribing to the control stream",
             subscribe_control(socket),
         )
         .await?;
-        // The replay up to the ack's head is the initial state; focus waits for it.
+        // The replay up to the ack's head (or the snapshot at it) is the initial state; focus
+        // waits for it.
         let head = control.ack()["head"].as_u64().unwrap_or(0);
-        twr_core::trace::mark_with(|| match backlog {
-            Some(n) => format!("tui: control subscribed (head {head}, {n} items compacted)"),
-            None => format!("tui: control subscribed (head {head})"),
+        twr_core::trace::mark_with(|| match (&snapshot, backlog) {
+            (Some(fold), _) => format!(
+                "tui: control subscribed (head {head}, a snapshot of {} threads)",
+                fold.registry.list().len() + fold.registry.deleted_views().count()
+            ),
+            (None, Some(n)) => {
+                format!("tui: control subscribed (head {head}, {n} items compacted)")
+            }
+            (None, None) => format!("tui: control subscribed (head {head})"),
         });
         let blobs = connect(socket).await?;
         let control = read_ahead(hydrating(
@@ -1567,32 +1584,79 @@ impl Session {
             control,
             head,
             backlog,
+            snapshot,
         })
     }
 }
 
-/// Subscribes to the control stream from its start, on a connection of its own, its stored
-/// backlog compacted ([`twr_core::compact`]: what the TUI folds of it, without the updates
-/// that change nothing of that). A hub from before compaction refuses `compact`
-/// (`bad_request`): it is asked again without. Returns the subscription and, when its backlog
-/// is compacted, how many items it has (the ack's `backlog`).
-async fn subscribe_control(
-    socket: &Path,
-) -> anyhow::Result<(twr_core::client::Subscription, Option<u64>)> {
-    let compacted = connect(socket)
-        .await?
-        .subscribe("control.subscribe", json!({"since": 0, "compact": true}))
-        .await;
+/// How the control stream starts ([`subscribe_control`]): the subscription, and either the
+/// state at its head (`snapshot`: the subscription brings what comes after it), or the
+/// backlog to replay, compacted (`backlog`: how many items it has) or not.
+struct ControlStart {
+    sub: twr_core::client::Subscription,
+    backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
+}
+
+/// Subscribes to the control stream from its start, on a connection of its own, asking for
+/// the state at its head ([`ClientFold`], `snapshot`) instead of the items up to it. A hub
+/// may answer with its stored backlog instead, compacted ([`twr_core::compact`]: what the TUI
+/// folds of it, without the updates that change nothing of that; the ack's `backlog` says
+/// how many items it has). A hub from before snapshots refuses `snapshot` (`bad_request`): it
+/// is asked again for a compacted backlog; one from before compaction refuses `compact` too,
+/// and is asked again for the whole log.
+///
+/// A snapshot this TUI cannot read (malformed, or of another version: a hub of another
+/// build) is dropped with its subscription, and the stream is asked for again as from a hub
+/// without snapshots: the TUI then replays the log as before, rather than not starting.
+async fn subscribe_control(socket: &Path) -> anyhow::Result<ControlStart> {
     let refused = |e: &anyhow::Error| {
         e.downcast_ref::<twr_core::proto::RpcError>()
             .is_some_and(|r| r.code == twr_core::proto::codes::BAD_REQUEST)
     };
+    let asked = connect(socket)
+        .await?
+        .subscribe(
+            "control.subscribe",
+            json!({"since": 0, "compact": true, "snapshot": true}),
+        )
+        .await;
+    match asked {
+        Ok(sub) => match read_snapshot(sub.ack()) {
+            Ok(Some(fold)) => {
+                return Ok(ControlStart {
+                    sub,
+                    backlog: None,
+                    snapshot: Some(fold),
+                })
+            }
+            Ok(None) => {
+                let backlog = compacted_backlog(sub.ack());
+                return Ok(ControlStart {
+                    sub,
+                    backlog,
+                    snapshot: None,
+                });
+            }
+            Err(e) => {
+                twr_core::trace::mark_with(|| format!("tui: control snapshot unread: {e:#}"));
+            }
+        },
+        Err(e) if refused(&e) => {}
+        Err(e) => return Err(e).context("subscribing to the control stream"),
+    }
+    let compacted = connect(socket)
+        .await?
+        .subscribe("control.subscribe", json!({"since": 0, "compact": true}))
+        .await;
     match compacted {
         Ok(sub) => {
-            let backlog = (sub.ack()["compacted"] == true)
-                .then(|| sub.ack()["backlog"].as_u64())
-                .flatten();
-            Ok((sub, backlog))
+            let backlog = compacted_backlog(sub.ack());
+            Ok(ControlStart {
+                sub,
+                backlog,
+                snapshot: None,
+            })
         }
         Err(e) if refused(&e) => {
             let sub = connect(socket)
@@ -1600,10 +1664,41 @@ async fn subscribe_control(
                 .subscribe("control.subscribe", json!({"since": 0}))
                 .await
                 .context("subscribing to the control stream")?;
-            Ok((sub, None))
+            Ok(ControlStart {
+                sub,
+                backlog: None,
+                snapshot: None,
+            })
         }
         Err(e) => Err(e).context("subscribing to the control stream"),
     }
+}
+
+/// How many items the compacted backlog a `control.subscribe` `ack` announces has (`None`:
+/// it is not compacted).
+fn compacted_backlog(ack: &Value) -> Option<u64> {
+    (ack["compacted"] == true)
+        .then(|| ack["backlog"].as_u64())
+        .flatten()
+}
+
+/// The snapshot a `control.subscribe` `ack` carries (`None`: it has none, its backlog
+/// follows), or why it can't be read.
+fn read_snapshot(ack: &Value) -> anyhow::Result<Option<ClientFold>> {
+    let Some(snapshot) = ack.get("snapshot").filter(|s| !s.is_null()) else {
+        return Ok(None);
+    };
+    // Folded by this TUI's own code only ([`twr_core::client_state::FOLD`]): a hub of another
+    // build may fold the same items otherwise, and one that does not say its fold is unknown.
+    let fold = ack["snapshot_fold"].as_str();
+    anyhow::ensure!(
+        fold == Some(twr_core::client_state::FOLD),
+        "snapshot folded by {}, not this build's {}",
+        fold.unwrap_or("an unnamed fold"),
+        twr_core::client_state::FOLD
+    );
+    let fold = serde_json::from_value(snapshot.clone()).context("reading the snapshot")?;
+    Ok(Some(fold))
 }
 
 /// Creates workspace `name` when asked, opens its hub and connects to it.
@@ -2451,6 +2546,7 @@ async fn drive(
         control,
         head,
         backlog,
+        snapshot,
     } = session;
     let epoch = ctx.epoch;
     let instance = info["instance"].as_str().map(str::to_string);
@@ -2551,9 +2647,19 @@ async fn drive(
     state.apply_suggest_info(&info);
     // Another workspace's frame may be on screen: the first one starts from a clear screen.
     state.view.repaint = true;
-    match backlog {
-        Some(items) => state.begin_compacted_catch_up(head, items),
-        None => state.begin_catch_up(head),
+    match (snapshot, backlog) {
+        // The state at the head, at once: no replay, no loading frame. The notifier takes what
+        // a replay would have left it with.
+        (Some(fold), _) => {
+            notifier.adopt(&fold.policy);
+            let threads = fold.registry.list().len() + fold.registry.deleted_views().count();
+            state.install_snapshot(fold, head);
+            twr_core::trace::mark_with(|| {
+                format!("tui: control snapshot installed (head {head}, {threads} threads)")
+            });
+        }
+        (None, Some(items)) => state.begin_compacted_catch_up(head, items),
+        (None, None) => state.begin_catch_up(head),
     }
     // The history file is written on a thread of its own, in order: a save waits for the
     // file's lock (another TUI may hold it), and the input loop never does.
@@ -2628,6 +2734,9 @@ async fn drive(
     let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
     // Summary calls' answers, by thread and ask, each call on a connection of its own too.
     let (sum_tx, mut sum_rx) = mpsc::unbounded_channel::<(String, u64, summary::Answer)>();
+    // The decisions older than a snapshot's (`decisions.list`), read once on a connection of
+    // its own.
+    let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Value>();
 
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
@@ -2735,6 +2844,19 @@ async fn drive(
                 if shown.replace(now_showing).is_none() {
                     typed_ahead.start(std::time::Instant::now());
                 }
+            }
+            // The decisions older than the snapshot's, once its first frame is drawn: they
+            // never hold that frame up. A hub without `decisions.list` (or a failed read)
+            // leaves the snapshot's rows, and nothing is said.
+            if let Some((before, limit)) = shown.is_some().then(|| state.older_decisions.take()).flatten() {
+                let (socket, tx) = (socket.clone(), dec_tx.clone());
+                tokio::spawn(async move {
+                    let params = json!({"before": before, "limit": limit});
+                    let r = async { connect(&socket).await?.call("decisions.list", params).await }.await;
+                    if let Ok(r) = r {
+                        let _ = tx.send(r);
+                    }
+                });
             }
             for (attn, revision, raise) in state.hydration_due(std::time::Instant::now()) {
                 let (socket, tx) = (socket.clone(), hyd_tx.clone());
@@ -3026,6 +3148,7 @@ async fn drive(
                     state.expire_unsend(std::time::Instant::now());
                 }
                 Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
+                Some(r) = dec_rx.recv() => state.older_decisions_came(&r),
                 Some((thread, ask, answer)) = sum_rx.recv() => {
                     state.summary_result(&thread, ask, answer, std::time::Instant::now());
                 }
@@ -5865,41 +5988,86 @@ mod tests {
         assert_eq!(second.event.body, finals[1].0);
     }
 
-    /// The TUI asks for a compacted control backlog and takes how many items it has; a hub
-    /// from before compaction refuses the key (`bad_request`, as `deny_unknown_fields` does),
-    /// and is asked again without it: the replay is then a full one.
+    /// The TUI asks for the control stream's snapshot; a hub may answer with its compacted
+    /// backlog instead (a snapshot too big), whose items it counts. A hub from before
+    /// snapshots refuses the key (`bad_request`, as `deny_unknown_fields` does) and is asked
+    /// for the compacted backlog; one from before compaction refuses that too and is asked for
+    /// the whole log. A snapshot the TUI can't read (malformed, another build's fold or one
+    /// that does not say its fold) is dropped: it asks as from a hub without snapshots.
     #[tokio::test]
-    async fn the_control_backlog_is_compacted_unless_the_hub_is_older() {
+    async fn the_control_stream_starts_from_a_snapshot_unless_the_hub_is_older() {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+        let snapshot = serde_json::to_value(ClientFold::default()).unwrap();
+        let fold = twr_core::client_state::FOLD;
+        let both = json!({"since": 0, "compact": true, "snapshot": true});
+        let compact = json!({"since": 0, "compact": true});
+        let full = json!({"since": 0});
         let dir = tempfile::tempdir().unwrap();
-        for old in [false, true] {
-            let sock = dir.path().join(format!("hub-{old}.sock"));
+        // The hub: how it answers a snapshot asked for; whether it knows `snapshot` and
+        // `compact`.
+        let hubs = [
+            (
+                "new",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": fold}),
+            ),
+            (
+                "unnamed",
+                json!({"since": 9, "head": 9, "snapshot": snapshot}),
+            ),
+            (
+                "too big",
+                json!({"since": 0, "head": 9, "backlog": 4, "compacted": true}),
+            ),
+            (
+                "malformed",
+                json!({"since": 9, "head": 9, "snapshot": {"registry": 5}, "snapshot_fold": fold}),
+            ),
+            (
+                "another build",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": "0123"}),
+            ),
+            ("compact only", Value::Null),
+            ("old", Value::Null),
+        ];
+        for (i, (hub, answer)) in hubs.into_iter().enumerate() {
+            let sock = dir.path().join(format!("hub-{i}.sock"));
             let listener = tokio::net::UnixListener::bind(&sock).unwrap();
             let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
             let log = Arc::clone(&asked);
             tokio::spawn(async move {
                 loop {
                     let (stream, _) = listener.accept().await.unwrap();
-                    let log = Arc::clone(&log);
+                    let (log, answer) = (Arc::clone(&log), answer.clone());
                     tokio::spawn(async move {
                         let (r, mut w) = stream.into_split();
                         let mut lines = BufReader::new(r).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
                             let req: Value = serde_json::from_str(&line).unwrap();
                             let params = req["params"].clone();
+                            let unknown = |key: &str| {
+                                json!({"id": req["id"], "error": {"code": "bad_request",
+                                    "message": format!("unknown field `{key}`")}})
+                            };
                             let frame = match req["method"].as_str() {
                                 Some("control.subscribe") => {
                                     log.lock().unwrap().push(params.clone());
-                                    if params.get("compact").is_some() && old {
-                                        json!({"id": req["id"], "error": {"code": "bad_request",
-                                            "message": "unknown field `compact`, expected `since` or `limit`"}})
-                                    } else if params.get("compact").is_some() {
-                                        json!({"id": req["id"], "result": {"since": 0, "head": 9,
+                                    let (snap, compact) = (
+                                        params.get("snapshot").is_some(),
+                                        params.get("compact").is_some(),
+                                    );
+                                    match hub {
+                                        "old" if compact => unknown("compact"),
+                                        "old" | "compact only" if snap => unknown("snapshot"),
+                                        _ if snap => json!({"id": req["id"], "result": answer}),
+                                        _ if compact => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9,
                                             "backlog": 4, "compacted": true}})
-                                    } else {
-                                        json!({"id": req["id"], "result": {"since": 0, "head": 9}})
+                                        }
+                                        _ => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9}})
+                                        }
                                     }
                                 }
                                 _ => json!({"id": req["id"], "result": {}}),
@@ -5909,19 +6077,24 @@ mod tests {
                     });
                 }
             });
-            let (sub, backlog) = subscribe_control(&sock).await.unwrap();
-            assert_eq!(sub.ack()["head"], 9);
+            let start = subscribe_control(&sock).await.unwrap();
+            assert_eq!(start.sub.ack()["head"], 9, "{hub}");
             let asked = asked.lock().unwrap().clone();
-            if old {
-                assert_eq!(backlog, None);
-                assert_eq!(
-                    asked,
-                    [json!({"since": 0, "compact": true}), json!({"since": 0})]
-                );
-            } else {
-                assert_eq!(backlog, Some(4));
-                assert_eq!(asked, [json!({"since": 0, "compact": true})]);
-            }
+            let (snap, backlog, chain) = match hub {
+                "new" => (true, None, vec![both.clone()]),
+                "too big" => (false, Some(4), vec![both.clone()]),
+                "unnamed" | "malformed" | "another build" | "compact only" => {
+                    (false, Some(4), vec![both.clone(), compact.clone()])
+                }
+                _ => (
+                    false,
+                    None,
+                    vec![both.clone(), compact.clone(), full.clone()],
+                ),
+            };
+            assert_eq!(start.snapshot.is_some(), snap, "{hub}");
+            assert_eq!(start.backlog, backlog, "{hub}");
+            assert_eq!(asked, chain, "{hub}");
         }
     }
 

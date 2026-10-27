@@ -295,8 +295,11 @@ twr log stats                     # sizes, rows per kind, checkpoints, what woul
 twr log compact                   # move it now
 twr log compact --vacuum          # then rewrite twr.db to give the space back; the hub waits
                                   # (3 to 18 s for a 475 MB twr.db)
+twr log checkpoint                # this build's checkpoint of the hub's state; --all, --json
 twr events <thread>               # reads archived events too; a deleted thread's by its id
 ```
+
+A hub starts from a checkpoint of its state, written by its own build, and folds only the events after it. `twr log checkpoint` writes one for the `twr` you run, with or without a hub running (it never starts one), so that a new build's first start does not fold the whole log: the development installer and `twr update` run it for every workspace after installing, and `twr hub stop` does before stopping a hub that runs another build (it prints a line saying what it wrote, and its `--timeout` counts from after it).
 
 Transcripts and the TUI's dive show an old turn's final reply but not its tool calls any more; `twr events` has them.
 

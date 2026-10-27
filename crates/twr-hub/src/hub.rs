@@ -118,6 +118,7 @@ mod box_agents;
 mod box_switch;
 mod boxes;
 mod checkpoint;
+pub use checkpoint::{build_key as checkpoint_build, prewarm as prewarm_checkpoint, Prewarm};
 mod closing;
 mod coalesce;
 mod commands;
@@ -200,7 +201,7 @@ pub use runners::SealedEnd;
 pub use shell::ShellRun;
 pub(crate) use subscribe::stream_line;
 pub(crate) use subscribe::wait_state;
-pub use subscribe::{ControlSubscription, ThreadSubscription};
+pub use subscribe::{ControlSubscription, ThreadSubscription, DECISIONS_MAX, SNAPSHOT_MAX};
 pub use supervisor::{adapter_may_emit, runtime_attn_id};
 pub use usage::SpentBy;
 pub use wake::{WAKE_CHAIN_MAX, WAKE_PROMPT_START};
@@ -293,6 +294,9 @@ pub struct HubOptions {
     pub worktree_namespace: Option<String>,
     /// Capacity of the live broadcast channels (subscribers beyond it catch up from SQLite).
     pub broadcast_capacity: usize,
+    /// Most bytes of the state at the head a control subscription sends instead of the items
+    /// ([`subscribe::SNAPSHOT_MAX`]; tests lower it).
+    pub snapshot_max: usize,
     /// How long shutdown waits for adapters to exit.
     pub stop_timeout: Duration,
     /// Runtime lookup for the local box.
@@ -476,6 +480,7 @@ impl HubOptions {
             workspaces_root: None,
             worktree_namespace: None,
             broadcast_capacity: 1024,
+            snapshot_max: subscribe::SNAPSHOT_MAX,
             stop_timeout: STOP_TIMEOUT,
             adapters: builtin_adapters(),
             socket: None,
@@ -697,6 +702,8 @@ struct Inner {
     compact_rows: Arc<Mutex<subscribe::CompactRows>>,
     control_tx: broadcast::Sender<ControlItem>,
     events_tx: broadcast::Sender<Arc<Event>>,
+    /// [`HubOptions::snapshot_max`].
+    snapshot_max: usize,
     live_count: watch::Sender<usize>,
     state: watch::Sender<HubState>,
     /// The boxes: the hub's own and the remote ones (`[boxes.<name>]`), reached only through
@@ -1595,6 +1602,10 @@ struct Core {
     defer_ack_sync: bool,
     /// The latest usage of each runtime's account, from `account.usage` (`hub::usage`).
     usage: twr_core::usage::UsageView,
+    /// What a client keeps of the control stream, folded from every control item with its
+    /// whole payload ([`twr_core::client_state`]): the state at the head a `control.subscribe`
+    /// with `snapshot` hands a client instead of the items (`hub::subscribe`).
+    client: twr_core::client_state::ClientFold,
     /// How the hub's start rebuilt this state (`hub::checkpoint`). Memory only.
     replayed: checkpoint::Replayed,
     /// What the orchestrator's runtime got of its memory (`hub::memory`). Memory only: a
@@ -2593,6 +2604,9 @@ impl Hub {
             "boxes": boxes,
             "agents": agents,
             "version": twr_core::version(),
+            // The build whose checkpoints it uses (`hub::checkpoint`): builds of one version
+            // (a dirty checkout's) differ in it.
+            "checkpoint_build": checkpoint::build_key(),
             "build": build,
             // The runner protocol its boxes' runners must speak (`twr box doctor` compares).
             "runner_protocol": twr_core::runner::PROTOCOL_VERSION,

@@ -1,5 +1,14 @@
-//! Reading the log: `thread.events`, `control.read`, blobs, and the control and thread
-//! subscriptions (live broadcast, with catch-up from SQLite for subscribers that fall behind).
+//! Reading the log: `thread.events`, `control.read`, `decisions.list`, blobs, and the control
+//! and thread subscriptions (live broadcast, with catch-up from SQLite for subscribers that fall
+//! behind).
+//!
+//! A control subscription from the start can begin with the state at the head instead of the
+//! items before it (`snapshot`, [`ControlSubscription::snapshot`]): what a client keeps of the
+//! control stream ([`twr_core::client_state::ClientFold`]), which the hub folds as it commits
+//! each item (`Core::client`), taken with the head under the same core lock as the live
+//! receiver, so that every item after the head comes once, live or from the store, and none
+//! before it. One too large to send ([`SNAPSHOT_MAX`]) is not sent: the subscription then
+//! delivers the items from the start, compacted when asked, as one without it does.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,6 +26,14 @@ const CATCH_UP_BATCH: usize = 512;
 /// Rows a compacted backlog's selection reads per lock of the reader connection
 /// ([`ControlSubscription::compact`]): other readers wait for one read at most.
 const SELECT_BATCH: usize = 4096;
+
+/// Most bytes of a snapshot a control subscription sends in its ack
+/// ([`ControlSubscription::snapshot`]; `HubOptions::snapshot_max`): well under a frame
+/// ([`twr_core::proto::MAX_FRAME`]). A larger one is not sent: the items are, from the start.
+pub const SNAPSHOT_MAX: usize = 4 * 1024 * 1024;
+
+/// Most `decision.made` items one `decisions.list` returns.
+pub const DECISIONS_MAX: usize = 2000;
 
 impl Hub {
     /// Filtered transcript, defaulting to the latest turn when no cursor is supplied.
@@ -85,6 +102,27 @@ impl Hub {
         Ok((items, head))
     }
 
+    /// `decisions.list`: the newest `limit` (at most [`DECISIONS_MAX`]) `decision.made` control
+    /// items with `gseq < before`, newest first, their payloads hydrated (a client folds them
+    /// whole, as a snapshot's), and whether older ones are left.
+    pub fn decisions_list(
+        &self,
+        before: u64,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<(u64, Event)>, bool)> {
+        let limit = limit.min(DECISIONS_MAX);
+        let reader = self.inner.reader();
+        let mut items = store::read_decisions(&reader, before, limit + 1)?;
+        let more = items.len() > limit;
+        items.truncate(limit);
+        for (_, ev) in &mut items {
+            if let Some(full) = super::append::hydrated_from_store(&reader, ev) {
+                *ev = full;
+            }
+        }
+        Ok((items, more))
+    }
+
     /// A whole blob.
     pub fn blob(&self, blob_ref: &str) -> anyhow::Result<Option<Vec<u8>>> {
         // `twr.db` first, then the archive (a blob a compaction moved meanwhile is there).
@@ -130,12 +168,56 @@ impl Hub {
         let rx = self.inner.control_tx.subscribe();
         let head = core.gseq;
         // What the selection needs of the state at the head, taken with it.
-        let compact = compact.then(|| Compact {
-            head,
-            at_head: Some(twr_core::compact::Head::of(&core.registry)),
-            kept: VecDeque::new(),
-        });
+        let compact = compact.then(|| Compact::at(head, &core.registry));
         drop(core);
+        self.control_subscription(rx, since, head, compact, None)
+    }
+
+    /// [`Hub::subscribe_control_with`] that, with `snapshot` (from the start only: `since` 0,
+    /// else a `bad_request`), begins with the state at the head instead of the items up to it
+    /// ([`ControlSubscription::snapshot`]): the subscription goes on after the head. Taken with
+    /// the head and the live receiver under one core lock; so is what it falls back to, the
+    /// items from the start (compacted with `compact`), should the state be too large to send.
+    pub fn subscribe_control_snapshot(
+        &self,
+        since: u64,
+        compact: bool,
+        snapshot: bool,
+    ) -> Result<ControlSubscription, RpcError> {
+        if !snapshot {
+            return Ok(self.subscribe_control_with(since, compact));
+        }
+        if since != 0 {
+            return Err(super::rpc(
+                twr_core::proto::codes::BAD_REQUEST,
+                "a snapshot is of the whole stream: ask for it with since 0",
+            ));
+        }
+        let started = std::time::Instant::now();
+        let core = self.inner.core();
+        let rx = self.inner.control_tx.subscribe();
+        let head = core.gseq;
+        let fold = core.client.clone();
+        let fallback = compact.then(|| Compact::at(head, &core.registry));
+        drop(core);
+        let snap = Snapshot {
+            fold,
+            fallback,
+            taken: started.elapsed(),
+        };
+        Ok(self.control_subscription(rx, head, head, None, Some(snap)))
+    }
+
+    /// A control subscription on `rx` (taken with `head` under the core lock) of the items
+    /// after `since`.
+    fn control_subscription(
+        &self,
+        rx: broadcast::Receiver<ControlItem>,
+        since: u64,
+        head: u64,
+        compact: Option<Compact>,
+        snapshot: Option<Snapshot>,
+    ) -> ControlSubscription {
         ControlSubscription {
             hub: Arc::clone(&self.inner),
             rx,
@@ -146,6 +228,7 @@ impl Hub {
             backlog: VecDeque::new(),
             lines: VecDeque::new(),
             compact,
+            snapshot,
         }
     }
 
@@ -212,6 +295,23 @@ pub(crate) fn stream_line(
     Ok(())
 }
 
+/// How many bytes `v` takes serialized (without writing them anywhere).
+fn json_len(v: &serde_json::Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    let _ = serde_json::to_writer(&mut n, v);
+    n.0
+}
+
 /// Waits until `rx` satisfies `f`, without holding the (non-`Send`) watch guard.
 pub(crate) async fn wait_state(
     rx: &mut watch::Receiver<HubState>,
@@ -267,6 +367,19 @@ pub struct ControlSubscription {
     lines: VecDeque<(u64, Vec<u8>)>,
     /// The compacted backlog still to deliver, when it is one.
     compact: Option<Compact>,
+    /// The state at the head, until [`ControlSubscription::snapshot`] took it.
+    snapshot: Option<Snapshot>,
+}
+
+/// What a subscription with `snapshot` took under the core lock
+/// ([`Hub::subscribe_control_snapshot`]).
+struct Snapshot {
+    /// The state at the head.
+    fold: twr_core::client_state::ClientFold,
+    /// The compacted backlog from the start, should the state not be sent (with `compact`).
+    fallback: Option<Compact>,
+    /// How long taking it took (the core lock waited for and held).
+    taken: std::time::Duration,
 }
 
 /// The control items as the compacted backlog's selection reads them
@@ -311,41 +424,6 @@ impl CompactRows {
     }
 }
 
-/// Reads the compacted backlog's rows up to `head` (the control head as the hub opened) in a
-/// blocking task, when the replay did not (it started from a checkpoint): on a connection of
-/// its own to `db`, in batches, holding only the rows' lock, never the core lock. A selection
-/// that comes meanwhile waits for it and then reads only what came after; one that came
-/// first read them itself, and this reads nothing.
-pub(super) fn warm_up(rows: Arc<std::sync::Mutex<CompactRows>>, db: std::path::PathBuf, head: u64) {
-    tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let mut known = rows
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if known.upto >= head {
-            return;
-        }
-        let read = store::connect(&db).and_then(|conn| {
-            known
-                .upto(head, |after| {
-                    store::read_control_rows(&conn, after, head, SELECT_BATCH)
-                })
-                .map(|r| r.len())
-        });
-        match read {
-            Ok(n) => tracing::debug!(
-                rows = n,
-                ms = started.elapsed().as_millis() as u64,
-                "compacted backlog rows read"
-            ),
-            // The next selection reads them.
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "cannot read the compacted backlog's rows")
-            }
-        }
-    });
-}
-
 /// A compacted backlog ([`ControlSubscription::compact`]).
 struct Compact {
     /// The control head it runs up to: once its items are delivered, the subscription goes
@@ -357,15 +435,74 @@ struct Compact {
     kept: VecDeque<u64>,
 }
 
+impl Compact {
+    /// The backlog up to `head`, with what its selection needs of the state there (`registry`
+    /// at `head`: taken under the same core lock).
+    fn at(head: u64, registry: &twr_core::reduce::Registry) -> Compact {
+        Compact {
+            head,
+            at_head: Some(twr_core::compact::Head::of(registry)),
+            kept: VecDeque::new(),
+        }
+    }
+}
+
 impl ControlSubscription {
     /// The control head when the subscription was made.
     pub fn head(&self) -> u64 {
         self.head
     }
 
-    /// Whether it was made with `compact` ([`Hub::subscribe_control_with`]).
+    /// Whether it was made with `compact` ([`Hub::subscribe_control_with`]), or falls back to
+    /// a compacted backlog ([`ControlSubscription::snapshot`]).
     pub fn compacted(&self) -> bool {
         self.compact.is_some()
+    }
+
+    /// Where it starts: the items after this come (the head, for one that sends a snapshot).
+    pub fn since(&self) -> u64 {
+        self.since
+    }
+
+    /// The state at the head that a subscription with `snapshot` begins with, as JSON, once
+    /// (`None` after, and for one without): serialized here, outside the core lock. One larger
+    /// than `HubOptions::snapshot_max` ([`SNAPSHOT_MAX`]), or that does not serialize, is not
+    /// sent (`None`): the subscription then delivers the items from the start instead, the
+    /// compacted backlog prepared with it when it was asked with `compact`
+    /// ([`ControlSubscription::compact`] selects it), every item otherwise.
+    pub fn snapshot(&mut self) -> Option<serde_json::Value> {
+        let snap = self.snapshot.take()?;
+        let started = std::time::Instant::now();
+        let value = serde_json::to_value(&snap.fold);
+        drop(snap.fold);
+        let bytes = value.as_ref().map_or(0, json_len);
+        let us = (snap.taken + started.elapsed()).as_micros();
+        match value {
+            Ok(v) if bytes <= self.hub.snapshot_max => {
+                twr_core::trace::mark_with(|| format!("hub: snapshot ({bytes} bytes, {us} us)"));
+                Some(v)
+            }
+            r => {
+                match r {
+                    Ok(_) => tracing::info!(
+                        bytes,
+                        max = self.hub.snapshot_max,
+                        "the control snapshot is too large to send; sending the items instead"
+                    ),
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "cannot serialize the control snapshot; sending the items instead"
+                    ),
+                }
+                twr_core::trace::mark_with(|| {
+                    format!("hub: snapshot not sent ({bytes} bytes, {us} us)")
+                });
+                self.since = 0;
+                self.last = 0;
+                self.compact = snap.fallback;
+                None
+            }
+        }
     }
 
     /// Selects the compacted backlog of a subscription made with `compact`, in a blocking

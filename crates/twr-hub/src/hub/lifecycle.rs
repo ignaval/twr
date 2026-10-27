@@ -89,13 +89,13 @@ impl Hub {
             .clone()
             .unwrap_or_else(|| data_dir_of(&opts.db_path).join("job-slots"));
         let compact_rows = Arc::new(Mutex::new(std::mem::take(&mut core.compact_rows)));
-        let control_head = core.gseq;
         let inner = Arc::new(Inner {
             core: Mutex::new(core),
             reader: Mutex::new(reader),
             compact_rows,
             control_tx,
             events_tx,
+            snapshot_max: opts.snapshot_max,
             live_count: watch::Sender::new(0),
             state: watch::Sender::new(HubState::Running),
             boxes: std::sync::RwLock::new(boxes::Boxes::with_local(local)),
@@ -203,13 +203,9 @@ impl Hub {
         }
         twr_core::trace::mark("hub: lost jobs reaped");
         spawn_tasks(&inner, notify_rx);
-        // A hub started from a checkpoint reads the compacted backlog's rows now, so that a
-        // client that subscribes later waits for none of it.
-        super::subscribe::warm_up(
-            Arc::clone(&inner.compact_rows),
-            inner.db_path.clone(),
-            control_head,
-        );
+        // (A hub started from a checkpoint does not read the compacted backlog's rows now: a
+        // client gets the state at the head (`control.subscribe` with `snapshot`), and only an
+        // older one, which asks for the compacted backlog, has them read, then.)
         if let Some(rx) = hook_rx {
             let task = tokio::spawn(hook::hook_task(
                 Arc::downgrade(&inner),
@@ -534,7 +530,7 @@ impl Core {
         twr_core::trace::mark_with(|| format!("hub: {} events loaded", events.len()));
         let gseq = core.store.control_head()?;
         // The compacted backlog's rows, when every event is here (`hub::subscribe`); after a
-        // checkpoint the hub reads them in the background once it is open.
+        // checkpoint the first compacted subscription reads them.
         if after.is_none() {
             let rows = events
                 .iter()
@@ -600,6 +596,7 @@ impl Core {
             card_outcomes: HashMap::new(),
             context_hashes: HashMap::new(),
             usage: Default::default(),
+            client: Default::default(),
             project_contexts: HashMap::new(),
             context_files: context::FileCache::default(),
             context_roots: HashMap::new(),
@@ -676,6 +673,7 @@ impl Core {
             let ev = full.as_ref().unwrap_or(ev);
             self.apply(ev);
             if let Some(g) = g {
+                self.client.apply(ev, Some(*g));
                 self.recall_hook(ev, *g);
             }
             if let (Some(t0), Some(t1)) = (t0, t1) {
@@ -868,22 +866,30 @@ impl Core {
         stale: Vec<Stale>,
         running_attaches: HashMap<String, store::AttachProcess>,
     ) -> anyhow::Result<()> {
+        // `TWR_TRACE_STARTUP`: each step, as start-up recovery reads the log.
+        let mark = |step: &str| twr_core::trace::mark_with(|| format!("hub: recovery: {step}"));
         for (thread, _) in intents {
             self.store.clear_spawn_intent(thread)?;
         }
         self.resolve_idle_turn_attention(inner)?;
+        mark("idle turns' attention resolved");
         // Stalled items left open behind activity by a log from before their resolution
         // was part of the activity's batch.
         self.repair_stalls(inner)?;
+        mark("stalls repaired");
         // Turns that ended before the crash but lost their report (and grade, review).
         self.recover_turn_reactions(inner)?;
+        mark("turn reactions recovered");
         self.release_crash_holds()?;
         self.close_stale_runtimes(inner, stale)?;
+        mark("stale runtimes closed");
         self.settle_attaches(inner, running_attaches)?;
         self.react_to_failures_at_open(inner)?;
+        mark("failures reacted to");
         for thread in self.store.threads_with_pending()? {
             self.try_dispatch(inner, &thread)?;
         }
+        mark("queues dispatched");
         self.autostart_orchestrator(inner);
         // Notices rebuilt from the log wait for the orchestrator like new ones.
         if std::mem::take(&mut self.orch.wake) || !self.orch.notices.is_empty() {

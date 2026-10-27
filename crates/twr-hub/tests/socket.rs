@@ -1479,3 +1479,100 @@ async fn a_compacted_control_subscription_says_its_backlog() {
     th.hub.request_shutdown();
     let _ = timeout(WAIT, th.task).await;
 }
+
+/// `control.subscribe` with `snapshot`: the ack holds the state at the head (what a client
+/// folds from every item up to it) and starts after the head, and the items after it follow;
+/// asked from anywhere but the start, or not as a boolean, it is refused. `decisions.list`
+/// reads the `decision.made` items, newest first, a page at a time back.
+#[tokio::test]
+async fn a_snapshot_subscription_and_the_decisions_before_it() {
+    let th = start().await;
+    let decision = |i: u64| {
+        EventBody::DecisionMade(twr_core::event::DecisionMade {
+            chosen: format!("d{i}"),
+            ..Default::default()
+        })
+    };
+    for i in 0..5 {
+        th.hub
+            .append("w1", None, Source::Hub, decision(i), None)
+            .unwrap();
+        let git = EventBody::GitSnapshot(twr_core::event::GitSnapshot {
+            dirty_files: i,
+            ..Default::default()
+        });
+        th.hub.append("w1", None, Source::Hub, git, None).unwrap();
+    }
+    let mut sub = Client::subscribe_at(
+        &th.socket,
+        "control.subscribe",
+        json!({"since": 0, "compact": true, "snapshot": true}),
+    )
+    .await
+    .unwrap();
+    let ack = sub.ack().clone();
+    assert_eq!(ack["head"], 10, "{ack}");
+    assert_eq!(ack["since"], 10, "{ack}");
+    assert!(ack.get("compacted").is_none() && ack.get("backlog").is_none());
+    assert_eq!(ack["snapshot_fold"], twr_core::client_state::FOLD, "{ack}");
+    let snap: twr_core::client_state::ClientFold =
+        serde_json::from_value(ack["snapshot"].clone()).unwrap();
+    assert_eq!((snap.last_gseq, snap.decisions_seen), (10, 5));
+    assert_eq!(snap.decisions.len(), 5);
+    th.hub
+        .append("w1", None, Source::Hub, decision(5), None)
+        .unwrap();
+    assert_eq!(next_item(&mut sub).await.gseq, Some(11));
+
+    for params in [
+        json!({"since": 3, "snapshot": true}),
+        json!({"since": 0, "snapshot": "yes"}),
+    ] {
+        let e = Client::subscribe_at(&th.socket, "control.subscribe", params.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::BAD_REQUEST, "{params}");
+    }
+
+    let mut c = Client::connect(&th.socket).await.unwrap();
+    c.hello(json!({"client": "itest"})).await.unwrap();
+    let chosen = |r: &Value| -> Vec<(u64, String)> {
+        r["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|it| {
+                let ev: twr_core::event::Event =
+                    serde_json::from_value(it["event"].clone()).unwrap();
+                let EventBody::DecisionMade(d) = ev.body else {
+                    panic!("{it}");
+                };
+                (it["gseq"].as_u64().unwrap(), d.chosen)
+            })
+            .collect()
+    };
+    let r = c.call("decisions.list", json!({"limit": 2})).await.unwrap();
+    assert_eq!(chosen(&r), [(11, "d5".into()), (9, "d4".into())]);
+    assert_eq!(r["more"], true);
+    let r = c
+        .call("decisions.list", json!({"before": 9}))
+        .await
+        .unwrap();
+    assert_eq!(
+        chosen(&r),
+        [
+            (7, "d3".into()),
+            (5, "d2".into()),
+            (3, "d1".into()),
+            (1, "d0".into())
+        ]
+    );
+    assert_eq!(r["more"], false);
+    let e = c
+        .call("decisions.list", json!({"before": "9"}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::BAD_REQUEST);
+    th.hub.request_shutdown();
+    let _ = timeout(WAIT, th.task).await;
+}

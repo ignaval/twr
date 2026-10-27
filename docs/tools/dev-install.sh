@@ -8,7 +8,9 @@
 # staged next to the target, run once, then renamed over the old one (a running twr keeps
 # its binary). `twr --version` then names the commit (e.g. 0.2.0+dev.69988b4, ".dirty" with
 # uncommitted changes).
-# A running hub keeps its old binary until you restart it (`twr hub stop`, then `twr`).
+# A running hub keeps its old binary until you restart it (`twr hub stop`, then `twr`). It
+# writes a checkpoint of each workspace's log for the new build first (`twr log checkpoint
+# --all`), so that the restart does not fold the whole log.
 # The install one-liner goes back to the latest release, and so does `twr update`.
 #
 # Environment:
@@ -64,6 +66,12 @@ case ":${PATH:-}:" in
     *":$dir:"*) ;;
     *) echo "$dir is not on your PATH" ;;
 esac
+# Each workspace's log gets a checkpoint for this build (best effort; one up to date is left
+# alone): the next start of its hub folds only what comes after it, not the whole log.
+# Checkpoints are kept per build, so a running hub of another build keeps its own.
+echo ""
+echo "Writing a checkpoint of each workspace's log for this build..."
+"$dir/twr" log checkpoint --all || echo "dev-install: twr log checkpoint failed (the next hub start folds the whole log)"
 if running=$("$dir/twr" info 2> /dev/null | head -1) && [ -n "$running" ]; then
     case "$running" in
         *"$build"*) ;;

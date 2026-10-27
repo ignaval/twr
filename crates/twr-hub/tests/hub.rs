@@ -462,6 +462,125 @@ async fn compacted_backlogs_go_on_live_without_gaps_or_duplicates() {
     assert_eq!(live, (head + 1..=total).collect::<Vec<_>>());
 }
 
+/// A subscription with `snapshot` begins with the state at its head and then delivers every
+/// item after the head once, in order, and none up to it: those committed right after the
+/// state was taken (before it is serialized or anything read), and those that keep coming
+/// while its subscriber lags. Asked from anywhere but the start, it is refused.
+#[tokio::test]
+async fn a_snapshot_subscription_goes_on_after_its_head_without_gaps_or_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.broadcast_capacity = 2;
+    let hub = Hub::open(o).await.unwrap();
+    let t = new_thread(&hub, dir.path(), "one", "fake").await;
+    for i in 0..30 {
+        hub.append(&t, None, Source::Hub, git(i), None).unwrap();
+    }
+    let mut sub = hub.subscribe_control_snapshot(0, true, true).unwrap();
+    let head = sub.head();
+    assert_eq!(head, hub.control_read(0, 100_000).unwrap().1);
+    assert_eq!((sub.since(), sub.compacted()), (head, false));
+    // Committed once the state was taken: not in it, delivered.
+    for i in 0..5 {
+        hub.append(&t, None, Source::Hub, git(100 + i), None)
+            .unwrap();
+    }
+    let snap: twr_core::client_state::ClientFold =
+        serde_json::from_value(sub.snapshot().unwrap()).unwrap();
+    assert_eq!(snap.last_gseq, head);
+    assert_eq!(snap.registry.get(&t).unwrap().name, "one");
+    let writer = {
+        let (hub, t) = (hub.clone(), t.clone());
+        tokio::spawn(async move {
+            for i in 0..200 {
+                let b = if i % 3 == 0 { text("noise") } else { git(i) };
+                hub.append(&t, None, Source::Hub, b, None).unwrap();
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let mut got = Vec::new();
+    while got.len() < 60 {
+        got.push(timeout(WAIT, sub.next()).await.unwrap().unwrap().unwrap().0);
+        if got.len() % 5 == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+    writer.await.unwrap();
+    let total = hub.control_read(0, 100_000).unwrap().1;
+    assert!(total > head + 60);
+    while got.len() < (total - head) as usize {
+        got.push(timeout(WAIT, sub.next()).await.unwrap().unwrap().unwrap().0);
+    }
+    assert_eq!(got, (head + 1..=total).collect::<Vec<_>>());
+    assert!(
+        timeout(Duration::from_millis(100), sub.next())
+            .await
+            .is_err(),
+        "nothing more"
+    );
+    for since in [1, head] {
+        let e = hub
+            .subscribe_control_snapshot(since, true, true)
+            .err()
+            .unwrap();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{since}");
+    }
+    hub.shutdown().await;
+}
+
+/// A state larger than the hub sends (`snapshot_max`) is not sent: the subscription delivers
+/// what one without `snapshot` does, the compacted backlog from the start with `compact`,
+/// every item without it, then goes on live.
+#[tokio::test]
+async fn a_snapshot_too_large_to_send_falls_back_to_the_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts(dir.path());
+    o.snapshot_max = 64;
+    let hub = Hub::open(o).await.unwrap();
+    let t = new_thread(&hub, dir.path(), "one", "fake").await;
+    for i in 0..50 {
+        hub.append(&t, None, Source::Hub, git(i), None).unwrap();
+    }
+    let mut sub = hub.subscribe_control_snapshot(0, true, true).unwrap();
+    let mut full = hub.subscribe_control_snapshot(0, false, true).unwrap();
+    let head = sub.head();
+    assert!(sub.snapshot().is_none());
+    assert_eq!((sub.since(), sub.compacted()), (0, true));
+    assert!(full.snapshot().is_none());
+    assert_eq!(
+        (full.since(), full.compacted(), full.head()),
+        (0, false, head)
+    );
+    let backlog = timeout(WAIT, sub.compact()).await.unwrap().unwrap();
+    let (stored, _) = hub.control_read(0, 100_000).unwrap();
+    let kept = twr_core::compact::select_events(stored.iter().map(|(g, e)| (*g, e)), 0);
+    assert_eq!(backlog, kept.len() as u64);
+    assert!(kept.len() < stored.len() / 2);
+    let mut got = Vec::new();
+    while got.len() < kept.len() {
+        got.push(timeout(WAIT, sub.next()).await.unwrap().unwrap().unwrap().0);
+    }
+    assert_eq!(got, kept);
+    hub.append(&t, None, Source::Hub, git(7), None).unwrap();
+    assert_eq!(
+        timeout(WAIT, sub.next()).await.unwrap().unwrap().unwrap().0,
+        head + 1
+    );
+    for g in 1..=head + 1 {
+        assert_eq!(
+            timeout(WAIT, full.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .0,
+            g
+        );
+    }
+    hub.shutdown().await;
+}
+
 /// A hub that opens on a log reads the selection's rows from its replay, and those after
 /// it from the store: either way the backlog is what the log's events select.
 #[tokio::test]

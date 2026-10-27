@@ -193,6 +193,38 @@ impl Policy {
         }
     }
 
+    /// A policy for `events` that remembers what `memory` (a policy of any events, folded from
+    /// the same items: a hub's snapshot, `crate::client_state`) does. It then gives for each
+    /// later item what a policy for `events` folded from those items would: keys of events not
+    /// wanted are never looked up (whether an event is wanted is asked first), and no key given
+    /// in a replay can come again (an attention key names the raise that opened the item, a
+    /// report or reply key its turn, and a report known is a revision).
+    pub fn adopt(events: &[NotifyEvent], memory: &Policy) -> Policy {
+        Policy {
+            events: events.iter().copied().collect(),
+            ..memory.clone()
+        }
+    }
+
+    /// This memory without what it keeps of `threads` (gone for good: purged from the trash):
+    /// their reports known and their report and reply keys. What the compacted backlog leaves
+    /// out of a purged thread (`crate::compact`) changes nothing else of it.
+    pub fn without_threads(&self, threads: &HashSet<String>) -> Policy {
+        let theirs = |key: &str| {
+            ["report:", "reply:"].iter().any(|p| {
+                key.strip_prefix(p)
+                    .and_then(|rest| rest.rsplit_once(':'))
+                    .is_some_and(|(t, _)| threads.contains(t))
+            })
+        };
+        let mut p = self.clone();
+        p.reported.retain(|t, _| !threads.contains(t));
+        p.user_turns.retain(|(t, _)| !threads.contains(t));
+        p.given.retain(|k| !theirs(k));
+        p.order.retain(|k| !theirs(k));
+        p
+    }
+
     /// The wanted events, most urgent first.
     pub fn wanted(&self) -> Vec<NotifyEvent> {
         let mut out: Vec<NotifyEvent> = self.events.iter().copied().collect();
