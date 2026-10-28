@@ -2,40 +2,43 @@
 <title>twr on a phone: the compact layout&#x27;s tab bar over the Threads screen&#x27;s cards</title>
 <style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
-<rect x="14" y="14" width="75.6" height="18" fill="#444444"/>
-<rect x="98" y="14" width="75.6" height="18" fill="#444444"/>
-<rect x="182" y="14" width="75.6" height="18" fill="#c9d1d9"/>
-<rect x="266" y="14" width="84" height="18" fill="#444444"/>
-<rect x="14" y="32" width="75.6" height="18" fill="#444444"/>
-<rect x="98" y="32" width="75.6" height="18" fill="#444444"/>
-<rect x="182" y="32" width="75.6" height="18" fill="#c9d1d9"/>
+<rect x="14" y="14" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="14" width="109.2" height="18" fill="#444444"/>
+<rect x="240.8" y="14" width="84" height="18" fill="#c9d1d9"/>
+<rect x="30.8" y="32" width="260.4" height="18" fill="#c9d1d9"/>
+<rect x="291.2" y="32" width="25.2" height="18" fill="#d29922"/>
+<rect x="316.4" y="32" width="25.2" height="18" fill="#c9d1d9"/>
 <rect x="22.4" y="302" width="134.4" height="18" fill="#5fd7d7"/>
-<rect x="22.4" y="74.8" width="8.4" height="11.2" fill="#d7875f"/>
+<rect x="22.4" y="38.8" width="8.4" height="11.2" fill="#d7875f"/>
+<rect x="39.2" y="92.8" width="8.4" height="11.2" fill="#d7875f"/>
 <path d="M18.2 311H22.4M266 311H345.8M18.2 347H345.8M18.2 311V347M345.8 311V347" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M18.2 185H22.4M114.8 185H156.8M282.8 185H291.2M341.6 185H345.8M18.2 293H274.4M341.6 293H345.8M18.2 185V293M345.8 185V293" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M18.2 59H22.4M131.6 59H156.8M282.8 59H291.2M341.6 59H345.8M18.2 167H22.4M89.6 167H345.8M18.2 59V167M345.8 59V167" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
-<text x="30.8" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
-<text x="106.4" y="27.5" fill="#ffd700" class="b" textLength="58.8">Needs 3</text>
-<text x="190.4" y="27.5" fill="#0d1117" class="b" textLength="58.8">Threads</text>
-<text x="266" y="27.5" fill="#d0d0d0" textLength="84">Workspaces</text>
-<text x="30.8" y="63.5" fill="#d29922" class="b" textLength="92.4">checkout-ui</text>
-<text x="165.2" y="63.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="299.6" y="63.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="39.2" y="81.5" fill="#3fb950" class="b" textLength="58.8">running</text>
-<text x="106.4" y="81.5" fill="#6e7681">·</text>
-<text x="123.2" y="81.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
-<text x="22.4" y="153.5" fill="#d29922" textLength="319.2">twr/31… · changes made · +1/−1 vs main</text>
-<text x="22.4" y="171.5" fill="#d29922" textLength="67.2">↑ 3 more</text>
-<text x="30.8" y="189.5" fill="#6e7681" class="b" textLength="75.6">changelog</text>
-<text x="165.2" y="189.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="299.6" y="189.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="22.4" y="207.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
-<text x="81.2" y="207.5" fill="#6e7681" textLength="243.6">· Drafted the 0.5.0 changelog</text>
-<text x="22.4" y="225.5" fill="#6e7681" textLength="302.4">from 37 commits: features, fixes and</text>
-<text x="22.4" y="243.5" fill="#6e7681" textLength="319.2">one breaking change (the --json output</text>
-<text x="22.4" y="261.5" fill="#6e7681" textLength="134.4">of thread list).</text>
-<text x="22.4" y="279.5" fill="#39c5cf" textLength="319.2">twr/31556ead16d4cc24/cha… · +1 vs main</text>
-<text x="274.4" y="297.5" fill="#6e7681" textLength="67.2">↓ 2 more</text>
+<path d="M35 77H39.2M148.4 77H156.8M282.8 77H291.2M341.6 77H345.8M35 131H39.2M106.4 131H274.4M341.6 131H345.8M35 77V131M345.8 77V131" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<text x="47.6" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
+<text x="131.6" y="27.5" fill="#ffd700" class="b" textLength="92.4">Needs you 3</text>
+<text x="266" y="27.5" fill="#0d1117" class="b" textLength="58.8">Threads</text>
+<text x="14" y="45.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="45.5" fill="#0d1117" class="b" textLength="58.8">default</text>
+<text x="299.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠2 ●1</text>
+<text x="14" y="63.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="63.5" fill="#d29922" class="b" textLength="201.6">working · waiting on you</text>
+<text x="14" y="81.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="81.5" fill="#af5f00" class="b" textLength="92.4">checkout-ui</text>
+<text x="165.2" y="81.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="299.6" y="81.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="14" y="99.5" fill="#39c5cf">▌</text>
+<text x="56" y="99.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="123.2" y="99.5" fill="#6e7681">·</text>
+<text x="140" y="99.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="14" y="117.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="117.5" fill="#d29922" textLength="302.4">twr/… · changes made · +1/−1 vs main</text>
+<text x="14" y="135.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="135.5" fill="#d29922" textLength="67.2">↑ 3 more</text>
+<text x="274.4" y="135.5" fill="#d29922" textLength="67.2">↓ 3 more</text>
+<text x="22.4" y="171.5" fill="#6e7681">○</text>
+<text x="39.2" y="171.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
+<text x="39.2" y="189.5" fill="#6e7681" textLength="126">hub not running</text>
+<text x="22.4" y="279.5" fill="#39c5cf" textLength="126">+ New workspace</text>
+<text x="22.4" y="297.5" fill="#39c5cf" textLength="84">⚙ Settings</text>
 <text x="30.8" y="315.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
 <text x="165.2" y="315.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
 <text x="22.4" y="333.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
