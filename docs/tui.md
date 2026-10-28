@@ -127,8 +127,6 @@ A card is framed in its thread's color, and its title says which thread it is an
 └──────────────────────────────────────────────┘
 ```
 
-When its runtime has said how full the thread's context is, the card's bottom border says it on the right, `ctx 34%` (`ctx 35k` without a window), before an edge card's `↓ 3 more`; a grid tile's too ([runtimes.md](runtimes.md#context-compaction)). It is the first to give way to a box's state.
-
 Where the title has no room for all of it, the project gives way first: it is cut with `…` (`orbit… · scroll-follow`), then left out. Then who runs it shortens: the runtime goes (`sonnet-4-5`, or for a remote box `@gpu offline · gpt-5-codex`), the model is cut with `…`, then left out, then the box's name is cut (`@gp… offline`). Only then does the mode go. The name is never cut, and neither is the state of a box that isn't simply online: on a card so narrow that the name leaves the title no room for it, the card's bottom border says it (`└ @gpu offline ──┘`), where the `↓ 3 more` of an edge card gives way to it if it must. The mode stays in the title, the last of the details to go, because it says what the thread may do without asking you: that matters more than which model it runs.
 
 The section starts with the state, then says what is going on, without saying anything twice:
