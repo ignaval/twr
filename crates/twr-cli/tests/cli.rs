@@ -3343,6 +3343,11 @@ fn account_add_sets_up_a_named_account_and_labels_follow() {
         "{out}"
     );
     assert!(out.contains("added claude-code:work ("), "{out}");
+    // Its login is noted under the accounts directory, for every workspace's move back.
+    let root = twr_core::paths::Paths::with_home(&a.home).accounts_dir();
+    assert!(twr_core::account::login_note(&root, &dir)
+        .unwrap()
+        .is_some());
     assert!(out.contains("work: logged in (claude.ai)\n"), "{out}");
     assert!(
         out.ends_with(
@@ -4471,7 +4476,12 @@ fn account_login_notes_threads_on_another_path() {
     drop(hub);
     config(&alias);
     let _hub = a.hub();
+    // Each login writes a new login note of the directory (whatever path names it).
+    let root = twr_core::paths::Paths::with_home(&a.home).accounts_dir();
+    let note = || twr_core::account::login_note(&root, &team).unwrap();
+    assert_eq!(note(), None);
     let out = a.ok(&["account", "login", "claude-code", "team"]);
+    let first = note().expect("a login note");
     assert!(
         out.ends_with(&format!(
             "note: api reaches claude-code:team by another path, which this login may not sign \
@@ -4488,6 +4498,7 @@ fn account_login_notes_threads_on_another_path() {
     );
     let out = a.ok(&["account", "login", "claude-code", "team"]);
     assert!(!out.contains("note:"), "{out}");
+    assert!(note().is_some_and(|n| n != first));
 }
 
 /// An account config.toml declares is set up and logged in in its directory, and twr records
@@ -4830,6 +4841,11 @@ fn account_commands_follow_the_hubs_native_directory() {
             )]
         );
     }
+    // The native login is noted for the hub's directory, not the CLI's.
+    assert!(twr_core::account::login_note(&root, &hub_claude)
+        .unwrap()
+        .is_some());
+    assert_eq!(twr_core::account::login_note(&root, &other).unwrap(), None);
     // The native row's directory is the hub's.
     let out = a.ok(&["account", "list"]);
     let row = out

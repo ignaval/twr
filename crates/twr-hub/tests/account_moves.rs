@@ -2914,3 +2914,263 @@ async fn a_move_back_after_a_login_starts_a_new_session() {
     assert_eq!(last_turn_twr(&hub, &w)["resume_dropped"], json!(&third));
     hub.shutdown().await;
 }
+
+/// A check after a login twr ran that cannot tell whether the account is logged in (its
+/// status command failed, say) still records the login (`after_login`, `unknown`): a move
+/// back to a session from before it starts a new session.
+#[tokio::test]
+async fn a_login_whose_check_cannot_tell_still_starts_a_new_session() {
+    let env = Env::new();
+    env.probe.store(true, Ordering::SeqCst);
+    let hub = env.open(env.config(None)).await;
+    let w = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "w")
+        },
+    )
+    .await;
+    turn(&hub, &w, "hi").await;
+    let first = session(&hub, &w);
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    env.set_login("work", AgentLogin::Unknown);
+    check_work(&hub, true).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    assert!(env.last_start(&w).cfg.resume_session.is_none());
+    assert_ne!(session(&hub, &w), first);
+    hub.shutdown().await;
+}
+
+/// A login `twr account login` or `add` ran in any workspace writes the login note of the
+/// account's directory under the accounts root they all share
+/// (`twr_core::account::note_login`, which the CLI calls; here as another workspace's CLI
+/// would, with this hub seeing no login and no check): a move back to a session from before
+/// it starts a new session with the full handoff, and so does the turn that would resume one
+/// when the login comes between the move and the turn. With no login since, the session
+/// resumes, across a restart too. The native account's note is its session store's; a start
+/// from before notes (no stamp) resumes until a note is written, not after.
+#[tokio::test]
+async fn a_login_in_another_workspace_starts_a_new_session() {
+    let env = Env::new();
+    let root = Paths::with_home(env.home.path()).accounts_dir();
+    let other_login = |dir: &str| twr_core::account::note_login(&root, &env.path(dir)).unwrap();
+    let hub = env.open(env.config(None)).await;
+    let w = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "w")
+        },
+    )
+    .await;
+    turn(&hub, &w, "hi").await;
+    let first = session(&hub, &w);
+    assert!(start_stamps(&events(&hub, &w))[0]
+        .get(LOGIN_NOTE_KEY)
+        .is_none());
+
+    // No login since: the session resumes.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&first), "{r}");
+    turn(&hub, &w, "hi").await;
+    assert_eq!(
+        env.last_start(&w).cfg.resume_session.as_deref(),
+        Some(first.as_str())
+    );
+
+    // Another workspace logs work in: the move back starts a new session.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let note = other_login("acc/work");
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    let s = env.last_start(&w);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "a session from before the login"
+    );
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (w) moved to another account:"));
+    let second = session(&hub, &w);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &w)).pop().unwrap();
+    assert_eq!(stamp[LOGIN_NOTE_KEY], json!(note), "{stamp}");
+    assert!(stamp.get(ACCOUNT_LOGIN_KEY).is_none(), "{stamp}");
+
+    // Under the same note, after a restart: it resumes.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let hub = env.restart(hub, env.config(None)).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    turn(&hub, &w, "hi").await;
+    assert_eq!(
+        env.last_start(&w).cfg.resume_session.as_deref(),
+        Some(second.as_str())
+    );
+
+    // A login elsewhere between the move back and its turn: the turn drops the resume.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    other_login("acc/work");
+    turn(&hub, &w, "go on").await;
+    let s = env.last_start(&w);
+    assert!(s.cfg.resume_session.is_none());
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier claude-code session of this thread \
+             (w): its account was logged in again since that session ran"
+        ),
+        "{prompt}"
+    );
+    assert_eq!(last_turn_twr(&hub, &w)["resume_dropped"], json!(&second));
+
+    // The native account: the note of the runtime's own directory it ran in. A start from
+    // before notes (none stamped) resumes while no note is written since, not once one is.
+    let legacy = |thread: &str, id: &str| {
+        let adapter = Source::Adapter("claude-code".into());
+        for body in [
+            EventBody::ThreadStarted(SessionPayload {
+                session_id: Some(id.into()),
+                ..Default::default()
+            }),
+            EventBody::ThreadStopped(SessionPayload {
+                session_id: Some(id.into()),
+                ext: json!({"twr": {"reason": MODEL_RESTART_REASON}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }),
+        ] {
+            hub.append(thread, None, adapter.clone(), body, None)
+                .unwrap();
+        }
+    };
+    let a = create(&hub, new_thread("api", "a")).await;
+    turn(&hub, &a, "hi").await;
+    let native = session(&hub, &a);
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let b = create(&hub, new_thread("api", "b")).await;
+    legacy(&b, "legacy-1");
+    move_to(&hub, &b, "work", false, &user()).await.unwrap();
+    turn(&hub, &b, "hi").await;
+    let r = move_to(&hub, &b, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!("legacy-1"), "{r}");
+    let c = create(&hub, new_thread("api", "c")).await;
+    legacy(&c, "legacy-2");
+    move_to(&hub, &c, "work", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    other_login("native/claude-code");
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &a, "hi").await;
+    assert!(env.last_start(&a).cfg.resume_session.is_none());
+    assert_ne!(session(&hub, &a), native);
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    hub.shutdown().await;
+}
+
+/// A native session lives in the runtime's own directory as the environment its runtime
+/// starts with selects it: a project's `env` setting `CODEX_HOME` is that directory
+/// (`ext.twr.session_store`; the runtime still gets the variable as configured). After a
+/// restart with the same setting, a move back resumes the session; with the project's
+/// variable naming another directory, it starts a new session, at the move and at the turn
+/// that would resume one.
+#[tokio::test]
+async fn a_native_session_resumes_only_in_the_store_its_environment_selects() {
+    let env = Env::new();
+    let (ca, cb) = (env.path("codex-a"), env.path("codex-b"));
+    for d in [&ca, &cb] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let with = |dir: &Path| {
+        let mut c = env.config(None);
+        c.projects
+            .get_mut("api")
+            .unwrap()
+            .env
+            .insert("CODEX_HOME".into(), dir.to_string_lossy().into_owned());
+        c
+    };
+    let real = |d: &Path| json!(std::fs::canonicalize(d).unwrap());
+    let hub = env.open(with(&ca)).await;
+    let c = create(
+        &hub,
+        NewThread {
+            runtime: Some("codex".into()),
+            ..new_thread("api", "c")
+        },
+    )
+    .await;
+    turn(&hub, &c, "hi").await;
+    let first = session(&hub, &c);
+    let stamp = start_stamps(&events(&hub, &c)).remove(0);
+    assert_eq!(stamp[SESSION_STORE_KEY], real(&ca), "{stamp}");
+    assert_eq!(
+        get(&env.last_start(&c).cfg.env, "CODEX_HOME"),
+        vec![ca.to_str().unwrap()]
+    );
+
+    // The same directory after a restart: it resumes.
+    move_to(&hub, &c, "team", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    let hub = env.restart(hub, with(&ca)).await;
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&first), "{r}");
+    turn(&hub, &c, "hi").await;
+    assert_eq!(
+        env.last_start(&c).cfg.resume_session.as_deref(),
+        Some(first.as_str())
+    );
+
+    // Another directory after a restart: a new session there.
+    move_to(&hub, &c, "team", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    let hub = env.restart(hub, with(&cb)).await;
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &c, "hi").await;
+    let s = env.last_start(&c);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "another directory's session"
+    );
+    assert_eq!(get(&s.cfg.env, "CODEX_HOME"), vec![cb.to_str().unwrap()]);
+    let second = session(&hub, &c);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &c)).pop().unwrap();
+    assert_eq!(stamp[SESSION_STORE_KEY], real(&cb), "{stamp}");
+
+    // Between the move back and its turn: the turn drops the resume.
+    move_to(&hub, &c, "team", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    let hub = env.restart(hub, with(&ca)).await;
+    turn(&hub, &c, "go on").await;
+    let s = env.last_start(&c);
+    assert!(s.cfg.resume_session.is_none());
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier codex session of this thread (c): \
+             the runtime's own directory is not the one that session ran in"
+        ),
+        "{prompt}"
+    );
+    hub.shutdown().await;
+}

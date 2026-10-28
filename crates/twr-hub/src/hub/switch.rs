@@ -97,11 +97,16 @@
 //! binding then: a runtime may key its login on the path, Claude Code's macOS Keychain
 //! entry, so two links to one directory are two logins). On the hub's own box, a native
 //! session's start recorded the runtime's own directory it is now (`ext.twr.session_store`,
-//! the hub's selector variable's: a start from before the stamp is taken to be in it), and
-//! the account was not logged in again since that start (`ext.twr.account_login`, the
-//! account's login generation then: a login `twr account login` or `add` recorded, or a
-//! check that found it logged in after logged out or missing, may be another organization's;
-//! one made outside twr over a login never seen logged out is not seen). So a move back to the account a
+//! as the environment the thread's runtime starts with selects it: its selector variable from
+//! `threads.env`, the project's `env` or the hub's, else under `HOME`; a start from before
+//! the stamp is taken to be in it), and the account was not logged in again since that start:
+//! neither as this hub saw it (`ext.twr.account_login`, the account's login generation then:
+//! a login `twr account login` or `add` recorded, whatever the check after it found, or a
+//! check that found it logged in after logged out or missing), nor as any workspace's `twr
+//! account login` or `add` noted it (`ext.twr.login_note`, the login note of the account's
+//! directory then, `twr_core::account::login_note`, under the accounts root every workspace
+//! shares: a note written since, or one where there was none, may be another organization's).
+//! A login made outside twr over a login never seen logged out is not seen. So a move back to the account a
 //! thread left resumes its session there, and a move to another account of the runtime, to
 //! its account in another directory or by another path, or to an account removed and added
 //! again starts a new session with the full handoff; the turn that would resume checks all
@@ -162,6 +167,10 @@ const OTHER_STORE: &str = "the runtime's own directory is not the one that sessi
 const OTHER_LOGIN: &str =
     "its account was logged in again since that session ran (it may be another login now)";
 
+/// The login note stamped on a start whose note could not be read (`ext.twr.login_note`): no
+/// note twr writes (a ULID) is it, so a move back to that session never resumes it.
+pub(super) const UNREADABLE_NOTE: &str = "unreadable";
+
 /// The runtime start that ran a session a move left, as its stamps say
 /// ([`Core::session_start`]).
 #[derive(Default)]
@@ -173,6 +182,8 @@ struct SessionStart {
     store: Option<PathBuf>,
     /// Its account's login generation (`ext.twr.account_login`; absent: 0).
     login: u64,
+    /// The login note of its directory then (`ext.twr.login_note`; absent: none).
+    note: Option<String>,
     /// Its control position (0: not known).
     since: u64,
 }
@@ -316,6 +327,7 @@ impl Core {
     /// never resumed.
     pub(super) fn departure(
         &self,
+        hub: &Inner,
         thread: &str,
         runtime: &str,
         account: Option<&str>,
@@ -323,7 +335,7 @@ impl Core {
         env: Option<&Path>,
     ) -> anyhow::Result<Option<Departure>> {
         Ok(self
-            .departure_check(thread, runtime, account, dir, env)?
+            .departure_check(hub, thread, runtime, account, dir, env)?
             .ok())
     }
 
@@ -339,13 +351,17 @@ impl Core {
     /// another path than `env` ([`Core::launch_path`]: a runtime may key its login on the
     /// path, Claude Code's macOS Keychain entry). On the hub's own box, also when the native
     /// account's session ran in another directory than the runtime's own now
-    /// (`ext.twr.session_store` against [`Core::session_store`]: the hub's selector variable
-    /// changed; a start without the stamp, from before it, is taken to be in it), or under
-    /// another login generation of the account than its now (`ext.twr.account_login`, absent:
-    /// 0, against `AccountsView::login_generation`: a login recorded since may be another
-    /// organization's).
+    /// (`ext.twr.session_store` against [`Core::session_store`]: the selector variable the
+    /// thread's environment or the hub's gives it changed; a start without the stamp, from
+    /// before it, is taken to be in it), or under another login generation of the account than
+    /// its now (`ext.twr.account_login`, absent: 0, against `AccountsView::login_generation`:
+    /// a login this hub recorded since may be another organization's), or under another login
+    /// note of its directory than the one there now (`ext.twr.login_note`, absent: none,
+    /// against [`Core::login_note`]: `twr account login` or `add` in any workspace wrote one
+    /// since; one that cannot be read is another).
     pub(super) fn departure_check(
         &self,
+        hub: &Inner,
         thread: &str,
         runtime: &str,
         account: Option<&str>,
@@ -376,16 +392,39 @@ impl Core {
         // (a remote box's are its own).
         let view = self.registry.get(thread);
         let local = view.is_some_and(|v| v.box_name == super::LOCAL_BOX);
-        if local && target.is_none() {
-            if let Some(was) = &start.store {
-                let now = view.and_then(|v| self.session_store(v, runtime));
-                if !now.is_some_and(|n| n == *was || super::accounts::same_dir(&n, was)) {
-                    return Ok(Err(OTHER_STORE));
-                }
+        let store = view
+            .filter(|_| local && target.is_none())
+            .and_then(|v| self.session_store(hub, v, runtime));
+        if let (true, Some(was)) = (local && target.is_none(), &start.store) {
+            if !store
+                .as_ref()
+                .is_some_and(|n| n == was || super::accounts::same_dir(n, was))
+            {
+                return Ok(Err(OTHER_STORE));
             }
         }
         if local && start.login != self.accounts.login_generation(runtime, target.as_deref()) {
             return Ok(Err(OTHER_LOGIN));
+        }
+        if local {
+            // The directory its login lives in now: the named account's, or the native
+            // account's store (the one the session ran in, checked above).
+            let login_dir = match &target {
+                Some(_) => dir.map(Path::to_path_buf),
+                None => store,
+            };
+            let now = match login_dir.as_deref().map(|d| self.login_note(d)) {
+                None => Ok(None),
+                Some(read) => read,
+            };
+            match now {
+                Ok(now) if now == start.note => {}
+                Ok(_) => return Ok(Err(OTHER_LOGIN)),
+                Err(e) => {
+                    tracing::warn!(thread, error = %e, "cannot read a login note: not resuming");
+                    return Ok(Err(OTHER_LOGIN));
+                }
+            }
         }
         if target.is_some() && self.launch_path(thread, &moves, i)?.as_deref() != env {
             return Ok(Err(OTHER_PATH));
@@ -436,11 +475,12 @@ impl Core {
     /// the account may have been removed (and added again) since, under the lock the turn's
     /// start holds. `None` when it holds, or no resume is pending. A log that cannot be read
     /// drops the resume too (said so).
-    pub(super) fn resume_dropped(&self, view: &ThreadView) -> Option<String> {
+    pub(super) fn resume_dropped(&self, hub: &Inner, view: &ThreadView) -> Option<String> {
         let session = view.resume_session.as_deref()?;
         let dir = self.account_dir(view);
         let env = self.account_env_dir(view);
         match self.departure_check(
+            hub,
             &view.id,
             &view.runtime,
             view.account.as_deref(),
@@ -517,6 +557,10 @@ impl Core {
                 .and_then(|t| t.get(ACCOUNT_LOGIN_KEY))
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            note: twr
+                .and_then(|t| t.get(LOGIN_NOTE_KEY))
+                .and_then(Value::as_str)
+                .map(str::to_string),
             since: store::event_position(conn, &e.id)?
                 .and_then(|(_, g)| g)
                 .unwrap_or(0),

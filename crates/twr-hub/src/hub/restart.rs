@@ -132,8 +132,9 @@ pub(super) struct RunSettings {
     /// also when not known (a start from before the stamp). Not a setting: no restart.
     pub(super) account_dir: Option<std::path::PathBuf>,
     /// The native account's directory the process was started in: the runtime's own as the
-    /// hub's selector variable has it (`Core::session_store`; the process's environment is
-    /// not changed). Stamped as `ext.twr.session_store` (absent for a named account, and when
+    /// environment it started with selects it (`Core::native_store`: its selector variable
+    /// from `threads.env`, the project's `env` or the hub's, else under `HOME`; the process's
+    /// environment is not changed). Stamped as `ext.twr.session_store` (absent for a named account, and when
     /// not known: a start from before the stamp, or on another box). Not a setting: no
     /// restart; a move back resumes a native session only in it (`hub::switch`).
     #[serde(default)]
@@ -144,6 +145,13 @@ pub(super) struct RunSettings {
     /// a session only under the generation it ran in (`hub::switch`).
     #[serde(default)]
     pub(super) account_login: u64,
+    /// The login note of the directory the process's login lived in when it started (the
+    /// named account's, or the native account's [`RunSettings::session_store`]:
+    /// `twr_core::account::login_note`; on the hub's own box only), `None` when there was
+    /// none. Stamped as `ext.twr.login_note` (absent: none). Not a setting: no restart; a
+    /// move back resumes a session only while the note is the same (`hub::switch`).
+    #[serde(default)]
+    pub(super) login_note: Option<String>,
 }
 
 impl RunSettings {
@@ -161,6 +169,7 @@ impl RunSettings {
             account_dir: None,
             session_store: None,
             account_login: 0,
+            login_note: None,
         }
     }
 
@@ -178,6 +187,7 @@ impl RunSettings {
             account_dir: None,
             session_store: None,
             account_login: 0,
+            login_note: None,
         }
     }
 
@@ -252,8 +262,9 @@ impl RunSettings {
 /// runtime is the one of `source`, the event's; `runtime_moved` is [`RunSettings::moved`];
 /// `acp_command` is [`RunSettings::agent`], missing when not known; `account` is
 /// [`RunSettings::account`], missing for the native account; `account_dir` is
-/// [`RunSettings::account_dir`], `session_store` [`RunSettings::session_store`] and
-/// `account_login` [`RunSettings::account_login`], missing: 0).
+/// [`RunSettings::account_dir`], `session_store` [`RunSettings::session_store`],
+/// `account_login` [`RunSettings::account_login`], missing: 0, and `login_note`
+/// [`RunSettings::login_note`]).
 pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings> {
     let twr = p.ext.as_ref()?.get("twr")?;
     let mode = twr.get("mode")?.as_str()?.to_string();
@@ -292,6 +303,10 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
             .get(ACCOUNT_LOGIN_KEY)
             .and_then(Value::as_u64)
             .unwrap_or(0),
+        login_note: twr
+            .get(LOGIN_NOTE_KEY)
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -303,8 +318,9 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
 /// `ext.twr.account`, the named account it runs on (absent: the native account), and
 /// `ext.twr.account_dir`, its directory ([`RunSettings::account_dir`], when known);
 /// `ext.twr.session_store`, the native account's directory ([`RunSettings::session_store`],
-/// when known), and `ext.twr.account_login`, the account's login generation
-/// ([`RunSettings::account_login`], when not 0).
+/// when known), `ext.twr.account_login`, the account's login generation
+/// ([`RunSettings::account_login`], when not 0), and `ext.twr.login_note`, the login note of
+/// its directory then ([`RunSettings::login_note`], when there was one).
 pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
     let ext = p.ext.get_or_insert_with(JsonMap::new);
     let twr = ext
@@ -338,6 +354,10 @@ pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
         match s.account_login {
             0 => twr.remove(ACCOUNT_LOGIN_KEY),
             n => twr.insert(ACCOUNT_LOGIN_KEY.into(), json!(n)),
+        };
+        match &s.login_note {
+            Some(n) => twr.insert(LOGIN_NOTE_KEY.into(), json!(n)),
+            None => twr.remove(LOGIN_NOTE_KEY),
         };
     }
 }
@@ -594,6 +614,7 @@ mod tests {
                 account_dir: None,
                 session_store: None,
                 account_login: 0,
+                login_note: None,
             };
             stamp(&mut p, &s);
             EventBody::ThreadStarted(p)
@@ -800,6 +821,7 @@ mod tests {
                 // The native account's directory, and a login generation (round trip).
                 session_store: account.is_none().then(|| "/native/claude".into()),
                 account_login: if account.is_some() { 2 } else { 0 },
+                login_note: Some("n1".into()),
             };
             stamp(&mut p, &s);
             assert_eq!(stamped(&p, &Source::Hub), Some(s));
@@ -921,6 +943,7 @@ mod tests {
             account_dir: None,
             session_store: None,
             account_login: 0,
+            login_note: None,
         };
         stamp(&mut p, &started);
         hub.append(
@@ -989,6 +1012,7 @@ mod tests {
             account_dir: None,
             session_store: None,
             account_login: 0,
+            login_note: None,
         };
         assert!(s("claude-code", "auto").narrows_to(&s("claude-code", "plan")));
         assert!(!s("claude-code", "plan").narrows_to(&s("claude-code", "auto")));
@@ -1020,6 +1044,7 @@ mod tests {
             account_dir: None,
             session_store: None,
             account_login: 0,
+            login_note: None,
         };
         let a = || Some(json!(["agent-a"]));
         assert!(s(a()).runs_in(&s(a())));

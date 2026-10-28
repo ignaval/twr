@@ -2391,7 +2391,9 @@ impl Core {
         // which starts a new session with the full handoff instead.
         let moving = view.handoff_pending && !self.orch.is_thread(thread);
         let pending = view.resume_session.clone().filter(|_| moving);
-        let dropped = pending.as_ref().and_then(|_| self.resume_dropped(view));
+        let dropped = pending
+            .as_ref()
+            .and_then(|_| self.resume_dropped(hub, view));
         let resumes = pending.clone().filter(|_| dropped.is_none());
         let handoff = if moving {
             self.thread_handoff_or_note(thread, dropped.as_deref())
@@ -2594,6 +2596,11 @@ impl Core {
             Some(o) => (Some(o.file), Some(o.token)),
             None => (None, None),
         };
+        // The native account's session store as the environment it starts with selects it
+        // (`Core::native_store`), on the hub's own box: stamped on its start below.
+        let store = (view.account.is_none() && view.box_name == LOCAL_BOX)
+            .then(|| self.native_store(&view.runtime, &cfg.env, &cfg.env_remove))
+            .flatten();
         // Its working directory is held from before it starts until it is gone; refused while
         // the directory's worktree is being removed (a park whose caller went away, whose git
         // runs on) or created.
@@ -2674,22 +2681,35 @@ impl Core {
         // The settings it runs in (recorded on its `thread.started`, `hub::restart`).
         // Its account's directory too: what it reports is that directory's (`hub::usage`,
         // `hub::retry`). And what a move back checks a session it resumes against
-        // (`hub::switch`): the native account's directory as the hub's variable has it, and
-        // the account's login generation (an account on the hub's own box only).
+        // (`hub::switch`): the native account's directory as its environment selected it, the
+        // account's login generation, and the login note of the directory its login lives in
+        // (an account on the hub's own box only; a note that cannot be read is stamped as
+        // such, which no note now matches).
         let local = view.box_name == LOCAL_BOX;
+        let account_dir = self.account_dir(&view);
+        let login_dir = match view.account {
+            Some(_) => account_dir.clone(),
+            None => store.clone(),
+        };
+        let login_note = login_dir
+            .filter(|_| local)
+            .and_then(|d| match self.login_note(&d) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(thread, error = %e, dir = %d.display(), "cannot read a login note");
+                    Some(switch::UNREADABLE_NOTE.to_string())
+                }
+            });
         let settings = restart::RunSettings {
-            account_dir: self.account_dir(&view),
-            session_store: view
-                .account
-                .is_none()
-                .then(|| self.session_store(&view, &view.runtime))
-                .flatten(),
+            account_dir,
+            session_store: store,
             account_login: if local {
                 self.accounts
                     .login_generation(&view.runtime, view.account.as_deref())
             } else {
                 0
             },
+            login_note,
             ..restart::RunSettings::of(&view)
         };
         self.rt(thread).runtime_settings = Some(settings);

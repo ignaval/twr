@@ -1018,9 +1018,9 @@ async fn the_orchestrator_lists_accounts_only() {
 /// in and out flips them), a missing CLI or directory is `missing`, `account.add` checks the
 /// new account, and a restart keeps the states.
 /// A check after a login twr ran (`account.status {refresh, after_login}`, what `twr account
-/// login` and `add` ask) is recorded when it finds the account logged in, unchanged too, with
-/// `after_login`; one that finds it logged out is recorded only as a change. It needs the
-/// account and `refresh`.
+/// login` and `add` ask) is recorded whatever it finds, unchanged too, with `after_login`: a
+/// login also when the check found it logged out or could not tell. It needs the account and
+/// `refresh`.
 #[tokio::test]
 async fn a_check_after_a_login_is_recorded_as_one() {
     let home = tempfile::tempdir().unwrap();
@@ -1049,12 +1049,24 @@ async fn a_check_after_a_login_is_recorded_as_one() {
     // A plain check that finds the same records nothing, and its status has no `after_login`.
     refresh(&mut c).await;
     assert_eq!(control_of(&mut c, "account.status").await.len(), before + 1);
-    // A login that did not end logged in: recorded as the change it is, not as a login.
+    // A login whose check found it logged out, or could not tell: recorded, as a login.
     logins.set("claude-code:work", true, AgentLogin::LoggedOut);
+    c.call("account.status", after_login.clone()).await.unwrap();
+    logins.set("claude-code:work", true, AgentLogin::Unknown);
+    c.call("account.status", after_login.clone()).await.unwrap();
     c.call("account.status", after_login).await.unwrap();
     let st = control_of(&mut c, "account.status").await;
-    assert_eq!(st.len(), before + 2);
-    assert!(st.last().unwrap()["data"].get("after_login").is_none());
+    assert_eq!(st.len(), before + 4, "{st:?}");
+    for (s, login) in st[before + 1..]
+        .iter()
+        .zip(["logged_out", "unknown", "unknown"])
+    {
+        assert_eq!(
+            (&s["data"]["login"], &s["data"]["after_login"]),
+            (&json!(login), &json!(true)),
+            "{s}"
+        );
+    }
     for bad in [
         json!({"runtime": "claude-code", "refresh": true, "after_login": true}),
         json!({"runtime": "claude-code", "account": "work", "after_login": true}),

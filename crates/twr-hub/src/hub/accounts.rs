@@ -49,8 +49,12 @@
 //! for, at most [`REFRESH_WAIT`]). One check runs at a time; what it found is recorded as
 //! `account.status` only when it differs from the account's last state (login, method,
 //! note), or when it follows a login twr ran and found it logged in (`account.status
-//! {refresh, after_login}`, `twr account login` / `add`: `after_login`, which raises the
-//! account's login generation). A check that finds no CLI, or no directory, says `missing`.
+//! {refresh, after_login}`, `twr account login` / `add`: `after_login`, recorded whatever the
+//! check found, which raises the account's login generation; a check that outlasts the wait
+//! goes on and records then). A check that finds no CLI, or no directory, says `missing`.
+//! Those logins also write the login note of the account's directory under the accounts root
+//! (`twr_core::account::note_login`), which every workspace's hub reads at a start and a move
+//! back (`hub::switch`): the generation is this hub's own, the note every workspace's.
 //!
 //! [`HubOptions::accounts_root`]: crate::HubOptions::accounts_root
 //! [`HubOptions::native_dir`]: crate::HubOptions::native_dir
@@ -501,8 +505,8 @@ pub struct AccountStatusParams {
     /// Check the logins again now (waited for, at most [`REFRESH_WAIT`]).
     pub refresh: bool,
     /// A login twr ran of `runtime`'s `account` just ended successfully (`twr account login`,
-    /// `twr account add`; with `refresh`): a check that finds it logged in is recorded even
-    /// when the state is unchanged, `after_login`, which raises the account's login generation
+    /// `twr account add`; with `refresh`): the check is recorded whatever it finds, unchanged
+    /// too, `after_login`, which raises the account's login generation
     /// (`AccountsView::login_generation`: a session from before it is not resumed by a move
     /// back, `hub::switch`).
     pub after_login: bool,
@@ -868,8 +872,9 @@ impl Core {
     }
 
     /// Records what the checks found (`results`), each only when it differs from its
-    /// account's last state, or, `after_login` (the checks follow a login twr ran), when it
-    /// found the account logged in (`AccountStatus::after_login`). A result is of the
+    /// account's last state, or, `after_login` (the checks follow a login twr ran), whatever
+    /// it found (`AccountStatus::after_login`: a login, also when the check could not tell or
+    /// found it logged out). A result is of the
     /// directory it checked: one whose account is
     /// gone meanwhile (removed, renamed), or is no longer that directory (removed and added
     /// again elsewhere, its name now the native account's), is dropped. An error says whose
@@ -898,7 +903,8 @@ impl Core {
                 continue;
             }
             let login = login_of(&info);
-            let after_login = after_login && login == Login::LoggedIn;
+            // After a login twr ran: recorded whatever the check found (one that could not
+            // tell too), as the login it is.
             if !after_login
                 && current.login == Some(login)
                 && current.method == info.method
@@ -1092,8 +1098,9 @@ impl Hub {
     /// `account.status {runtime?, account?, refresh?, after_login?}` (users only):
     /// `account.list`'s answer, after checking the logins again with `refresh` (`runtime`'s
     /// `account`, else `runtime`'s accounts, else every runtime's that has a named one; waited
-    /// for at most [`REFRESH_WAIT`]); `after_login`: the check follows a login twr ran of that
-    /// account, recorded when it finds it logged in ([`AccountStatusParams::after_login`]).
+    /// for at most [`REFRESH_WAIT`]; checks that outlast it go on and record what they find);
+    /// `after_login`: the check follows a login twr ran of that account, recorded whatever it
+    /// finds ([`AccountStatusParams::after_login`]).
     /// `internal` when what the checks found could not be recorded.
     pub async fn account_status(
         &self,
@@ -1130,12 +1137,24 @@ impl Hub {
                 }
                 core.probe_targets(p.runtime.as_deref(), p.account.as_deref())
             };
-            match tokio::time::timeout(REFRESH_WAIT, probe(&self.inner, targets, p.after_login))
-                .await
-            {
-                Ok(recorded) => recorded.map_err(|why| rpc(codes::INTERNAL, why))?,
+            // In a task of its own: a check that outlasts the wait still records what it finds
+            // (after a login, the login: `after_login`).
+            let inner = Arc::clone(&self.inner);
+            let after_login = p.after_login;
+            let checks = tokio::spawn(async move { probe(&inner, targets, after_login).await });
+            match tokio::time::timeout(REFRESH_WAIT, checks).await {
+                Ok(Ok(recorded)) => recorded.map_err(|why| rpc(codes::INTERNAL, why))?,
+                Ok(Err(e)) => {
+                    return Err(rpc(
+                        codes::INTERNAL,
+                        format!("the login checks failed: {e}"),
+                    ))
+                }
                 Err(_) => {
-                    tracing::info!("the accounts' login checks took longer than {REFRESH_WAIT:?}");
+                    tracing::info!(
+                        "the accounts' login checks took longer than {REFRESH_WAIT:?} (they go \
+                         on, and record what they find)"
+                    );
                 }
             }
         }

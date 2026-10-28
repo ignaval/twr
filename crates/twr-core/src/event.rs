@@ -858,6 +858,13 @@ pub const SESSION_STORE_KEY: &str = "session_store";
 /// session only under the generation it ran in: a login recorded since may be another
 /// organization's.
 pub const ACCOUNT_LOGIN_KEY: &str = "account_login";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps on its own box (a
+/// string): the login note of the directory that process's login lives in when it started
+/// ([`crate::account::login_note`]: the named account's directory, or the native account's
+/// session store), absent when there was none. `twr account login` and `add` write a new note
+/// after each login they run, in any workspace (the accounts root is shared): a move back
+/// resumes a session only while the note is the one it started under (absent: none since).
+pub const LOGIN_NOTE_KEY: &str = "login_note";
 
 /// `ext.twr` key of a thread's own account pin on `thread.created` (a string, the pin's
 /// items comma-separated, [`crate::account::Pin`]): what the thread was asked to run on.
@@ -1991,8 +1998,8 @@ pub struct AccountStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// The check ran after a login twr ran ended successfully (`twr account login`, `twr
-    /// account add`) and found it logged in: recorded even when the state is unchanged, it
-    /// raises the account's login generation
+    /// account add`), whatever it found (also `unknown`): recorded even when the state is
+    /// unchanged, it raises the account's login generation
     /// ([`crate::account::AccountsView::login_generation`]). Written only when true.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub after_login: bool,

@@ -358,23 +358,22 @@ struct Status {
 /// ([`AccountsView::login_generation`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Logins {
-    /// How many logins were seen: a status recorded after a login twr ran (`after_login`), or
-    /// one logged in after one logged out or missing.
+    /// How many logins were seen: a status recorded after a login twr ran (`after_login`,
+    /// whatever its check found), or one logged in after one logged out or missing.
     generation: u64,
     /// The last state known (not [`Login::Unknown`]) was logged out or missing.
     out: bool,
 }
 
 impl Logins {
-    /// Folds status `login` (`after_login`: recorded after a login twr ran).
+    /// Folds status `login` (`after_login`: recorded after a login twr ran, which is a login
+    /// whatever the check after it found: one that could not tell, `unknown`, too).
     fn apply(&mut self, login: Login, after_login: bool) {
+        if after_login || (login == Login::LoggedIn && self.out) {
+            self.generation += 1;
+        }
         match login {
-            Login::LoggedIn => {
-                if after_login || self.out {
-                    self.generation += 1;
-                }
-                self.out = false;
-            }
+            Login::LoggedIn => self.out = false,
             Login::LoggedOut | Login::Missing => self.out = true,
             Login::Unknown => {}
         }
@@ -439,6 +438,13 @@ impl AccountsView {
     pub fn with_default_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.default_root = Some(root.into());
         self
+    }
+
+    /// The root of the directories of named accounts declared without one
+    /// ([`AccountsView::with_default_root`]), where twr keeps its login notes too
+    /// ([`login_note`]); `None` when not given.
+    pub fn default_root(&self) -> Option<&Path> {
+        self.default_root.as_deref()
     }
 
     /// Folds one event: `account.added`, `account.removed` and `account.status` on the hub
@@ -828,6 +834,63 @@ impl AccountsView {
             shadowed: false,
         })
     }
+}
+
+/// Where twr keeps its login notes, under the accounts root ([`login_note`]).
+pub const LOGINS_DIR: &str = ".logins";
+
+/// The login note of account directory `dir` (a named account's, or a runtime's own) under the
+/// accounts root `root`: `<root>/.logins/<hex SHA-256 of dir, links followed>`. The root is
+/// every workspace's ([`crate::paths::Paths::accounts_dir`]), so is the note.
+pub fn login_note_path(root: &Path, dir: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::ffi::OsStrExt;
+    let real = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let hash = Sha256::digest(real.as_os_str().as_bytes());
+    root.join(LOGINS_DIR).join(hex::encode(hash))
+}
+
+/// Notes that a login twr ran in account directory `dir` ended successfully (`twr account
+/// login`, `twr account add`): a new random note (a ULID; no secret, nothing of the login)
+/// replaces the directory's ([`login_note_path`]; written to a temporary file, mode 600, then
+/// renamed over it, `<root>/.logins` made mode 700 when missing). Nothing is written in `dir`
+/// itself. A session that started under another note (or none) is not the login's: a move
+/// back does not resume it (`hub::switch`), in whichever workspace it ran. The note written.
+pub fn note_login(root: &Path, dir: &Path) -> std::io::Result<String> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let path = login_note_path(root, dir);
+    let parent = path.parent().unwrap_or(root);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)?;
+    let note = crate::event::new_id();
+    let tmp = parent.join(format!(".{note}.tmp"));
+    let written = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(note.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(note)
+}
+
+/// The login note of account directory `dir` under the accounts root `root`
+/// ([`note_login`]), read without blocking and within bounds (`crate::fsread::read_note`):
+/// `None` when there is none (no login twr ran there since notes were kept). An error when
+/// something else is in its place.
+pub fn login_note(root: &Path, dir: &Path) -> std::io::Result<Option<String>> {
+    let note = crate::fsread::read_note(&login_note_path(root, dir))?;
+    Ok(note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()))
 }
 
 /// The directory of named account `name` of `runtime` declared without one:
@@ -1605,10 +1668,50 @@ mod tests {
         );
     }
 
-    /// A login generation is raised by a status recorded after a login twr ran that found it
-    /// logged in, and by logged in after logged out or missing (an unknown check between them
-    /// changes nothing); never by checks that keep finding it logged in. The native account's
-    /// is the runtime's, whatever its name.
+    /// A login note is kept per directory (links followed) under the root, outside the
+    /// directory itself, private; each login replaces it with a new one; none before any.
+    #[test]
+    fn login_notes_are_per_directory_and_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("accounts");
+        let (a, b) = (t.path().join("a"), t.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let link = t.path().join("a-link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert_eq!(login_note(&root, &a).unwrap(), None);
+        let first = note_login(&root, &a).unwrap();
+        assert_eq!(
+            login_note(&root, &a).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            login_note(&root, &link).unwrap().as_deref(),
+            Some(first.as_str())
+        );
+        assert_eq!(login_note(&root, &b).unwrap(), None);
+        let second = note_login(&root, &link).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(login_note(&root, &a).unwrap(), Some(second));
+        assert_eq!(
+            std::fs::read_dir(&a).unwrap().count(),
+            0,
+            "nothing in the directory"
+        );
+        let path = login_note_path(&root, &a);
+        assert!(path.starts_with(root.join(LOGINS_DIR)));
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&root.join(LOGINS_DIR)), 0o700);
+        // Only the note is there (no temporary file left).
+        assert_eq!(std::fs::read_dir(root.join(LOGINS_DIR)).unwrap().count(), 1);
+    }
+
+    /// A login generation is raised by a status recorded after a login twr ran, whatever its
+    /// check found (a check that could not tell too), and by logged in after logged out or
+    /// missing (an unknown check between them changes nothing); never by checks that keep
+    /// finding it logged in. The native account's is the runtime's, whatever its name.
     #[test]
     fn logins_raise_the_login_generation() {
         let mut v = AccountsView::new(&Config::default());
@@ -1629,18 +1732,20 @@ mod tests {
         assert_eq!(v.login_generation("codex", Some("work")), 0);
         v.apply(&after("codex", "work", false, Login::LoggedIn));
         assert_eq!(v.login_generation("codex", Some("work")), 1);
-        // A login that did not end logged in raises nothing.
+        // A login whose check could not tell (or found it logged out) is a login too.
+        v.apply(&after("codex", "work", false, Login::Unknown));
+        assert_eq!(v.login_generation("codex", Some("work")), 2);
         v.apply(&after("codex", "work", false, Login::LoggedOut));
         v.apply(&status("codex", "work", Login::Unknown));
-        assert_eq!(v.login_generation("codex", Some("work")), 1);
+        assert_eq!(v.login_generation("codex", Some("work")), 3);
         // Logged in again after logged out (and an unknown check): another login.
         v.apply(&status("codex", "work", Login::LoggedIn));
-        assert_eq!(v.login_generation("codex", Some("work")), 2);
+        assert_eq!(v.login_generation("codex", Some("work")), 4);
         v.apply(&status("codex", "work", Login::Missing));
         v.apply(&after("codex", "work", false, Login::LoggedIn));
         assert_eq!(
             v.login_generation("codex", Some("work")),
-            3,
+            5,
             "one login, once"
         );
         // The native account's, by any name it has.

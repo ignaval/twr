@@ -416,6 +416,7 @@ impl Core {
         let mut departure = match &switch {
             Some(s) if s.spec.acp.is_none() && s.spec.runtime != twr_adapters::pty::NAME => self
                 .departure(
+                    hub,
                     &id,
                     &s.spec.runtime,
                     target_account.as_deref(),

@@ -964,7 +964,9 @@ async fn add(paths: &Paths, socket: &Path, mut req: AddRequest) -> anyhow::Resul
     if !req.no_login {
         let ran = run_login(&rt, &name, Some(&dir), req.device, &req.login_args, &own).await?;
         login_end = Some(Utc::now());
-        if !ran.success() {
+        if ran.success() {
+            note_login(&root, &rt, &name, Some(&dir));
+        } else {
             let finish = if config || existing {
                 format!("`twr{} account login {rt} {name}`", workspace_hint())
             } else {
@@ -1346,6 +1348,29 @@ async fn probe_here(runtime: &str, dir: Option<&Path>, own: &Native) -> AgentInf
     .await
 }
 
+/// After a login twr ran in directory `dir` (`None`: none is known) ended successfully: its
+/// login note under the accounts root `root` (`twr_core::account::note_login`), written before
+/// and whatever the hub's check finds, so that no session from before the login is resumed by
+/// a move back, in any workspace (they share the root), its hub running or not. One that
+/// cannot be written is said (the hub's own record of the login still counts in its
+/// workspace).
+fn note_login(root: &Path, runtime: &str, name: &str, dir: Option<&Path>) {
+    let Some(dir) = dir else {
+        errln!(
+            "twr: {runtime}:{name}'s directory is not known, so the login is not noted for \
+             other workspaces: a move back there may resume a session from before it"
+        );
+        return;
+    };
+    if let Err(e) = twr_core::account::note_login(root, dir) {
+        errln!(
+            "twr: cannot note {runtime}:{name}'s login in {} ({e}): a move back in another \
+             workspace may resume a session from before it",
+            tilde(&twr_core::account::login_note_path(root, dir))
+        );
+    }
+}
+
 /// After a login: has the hub check account `name` again and prints what it found (`work:
 /// logged in (claude.ai)`), then whether `runtime`'s threads show their account now. The
 /// hub's state counts only while it is of what was logged in ([`hub_state_of`]: the account
@@ -1509,6 +1534,9 @@ async fn login(
     if !ran.success() {
         bail!("{}'s login {}", program(runtime), ended(&ran));
     }
+    // The native account's login is in its directory as the hub has it.
+    let logged_in = dir.clone().or_else(|| own.dir.clone());
+    note_login(&paths.accounts_dir(), runtime, name, logged_in.as_deref());
     after_login(socket, runtime, name, dir.as_deref(), Some(end), &own).await?;
     if let Some(note) = retained_note(runtime, name, a) {
         outln!("{note}");

@@ -990,17 +990,69 @@ impl Core {
     }
 
     /// The directory a runtime `runtime` of thread `view` on the native account keeps its
-    /// sessions in: the runtime's own as the hub's selector variable has it
-    /// (`HubOptions::native_dir`: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ... when set, else the
-    /// runtime's default in `$HOME`), links followed where it exists. Stamped on the native
-    /// account's starts (`RunSettings::session_store`), the process's environment unchanged.
-    /// `None` on another box (its own environment decides), or when not known.
-    pub(super) fn session_store(&self, view: &ThreadView, runtime: &str) -> Option<PathBuf> {
+    /// sessions in, as the environment it would start with selects it ([`Core::native_store`]
+    /// of [`super::spawn_config`]'s, with no account: `threads.env` and the project's `env`
+    /// over the hub's own). Stamped on the native account's starts
+    /// (`RunSettings::session_store`, from the start's own environment), and what a move back
+    /// compares it with (`hub::switch`). `None` on another box (its own environment decides),
+    /// or when not known.
+    pub(super) fn session_store(
+        &self,
+        hub: &Inner,
+        view: &ThreadView,
+        runtime: &str,
+    ) -> Option<PathBuf> {
         if view.box_name != LOCAL_BOX {
             return None;
         }
-        let dir = (self.account_native_dir)(runtime)?;
+        let cfg = super::spawn_config(hub, view, None);
+        self.native_store(runtime, &cfg.env, &cfg.env_remove)
+    }
+
+    /// The directory runtime `runtime` on the native account keeps its sessions in when it
+    /// starts with `env` set and `remove` removed over the hub's own environment (how the
+    /// hub's runtimes start): its selector variable (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+    /// `GROK_HOME`) as that environment has it, else its default under that environment's
+    /// `HOME` (`twr_adapters::account::native_dir`), links followed where it exists. When
+    /// `env` and `remove` touch neither the variable nor `HOME`, the hub's own selection
+    /// (`HubOptions::native_dir`). The process's environment is not changed.
+    pub(super) fn native_store(
+        &self,
+        runtime: &str,
+        env: &[(String, String)],
+        remove: &[String],
+    ) -> Option<PathBuf> {
+        let selector = twr_adapters::account::support(runtime)?.var;
+        let touched = |k: &str| env.iter().any(|(n, _)| n == k) || remove.iter().any(|r| r == k);
+        let dir = if touched(selector) || touched("HOME") {
+            // As the runtime's process gets it: a name in `remove` is removed (also when `env`
+            // sets it), else `env`'s last value, else the hub's.
+            let var = |k: &str| -> Option<std::ffi::OsString> {
+                if remove.iter().any(|r| r == k) {
+                    return None;
+                }
+                match env.iter().rev().find(|(n, _)| n == k) {
+                    Some((_, v)) => Some(v.into()),
+                    None => (self.account_native_var)(k),
+                }
+            };
+            let home = twr_adapters::account::user_home(var, twr_adapters::account::passwd_home);
+            twr_adapters::account::native_dir(runtime, var, home.as_deref())?
+        } else {
+            (self.account_native_dir)(runtime)?
+        };
         Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    }
+
+    /// The login note of the directory a session's login lives in (`dir`: a named account's,
+    /// or the native account's session store, [`Core::session_store`]) under the accounts root
+    /// (`twr_core::account::login_note`, every workspace's): `Ok(None)` when there is none, or
+    /// no root is known. An error says why it cannot be read.
+    pub(super) fn login_note(&self, dir: &Path) -> std::io::Result<Option<String>> {
+        match self.accounts.default_root() {
+            Some(root) => twr_core::account::login_note(root, dir),
+            None => Ok(None),
+        }
     }
 
     /// The directory thread `view`'s runtimes get as their named account's

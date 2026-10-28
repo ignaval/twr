@@ -15,6 +15,9 @@ pub const SETTINGS_MAX: u64 = 1 << 20;
 /// line naming a path as long as Linux allows (`PATH_MAX`, 4 KiB).
 pub const GIT_FILE_MAX: u64 = 8 << 10;
 
+/// The largest login note [`read_note`] reads: 1 KiB (twr writes a ULID).
+pub const NOTE_MAX: u64 = 1 << 10;
+
 /// The text of settings file `path`, its links followed: `None` when there is none (nothing
 /// there, or a link to nothing). Read without blocking and within [`SETTINGS_MAX`]: the path
 /// is resolved first, then opened with `O_NOFOLLOW | O_NONBLOCK` (a link swapped in since
@@ -32,6 +35,13 @@ pub fn read_settings(path: &Path) -> io::Result<Option<String>> {
 /// agent's to write.
 pub fn read_git_file(path: &Path) -> io::Result<Option<String>> {
     read_bounded(path, GIT_FILE_MAX)
+}
+
+/// The text of a note twr keeps in a directory other programs may write to (a login note under
+/// the accounts root, `crate::account::login_note`), read as [`read_settings`] reads but
+/// within [`NOTE_MAX`]: the hub reads it under its core lock (a spawn, a move back).
+pub fn read_note(path: &Path) -> io::Result<Option<String>> {
+    read_bounded(path, NOTE_MAX)
 }
 
 /// [`read_settings`] with a cap of `max` bytes.
