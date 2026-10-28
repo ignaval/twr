@@ -159,6 +159,8 @@ mod runners;
 mod runtime_spec;
 mod shell;
 mod spawn;
+mod speech;
+pub use speech::SpeechAttachment;
 mod stall;
 mod subscribe;
 mod suggest;
@@ -850,6 +852,8 @@ struct Inner {
     suggestions: Mutex<suggest::Suggestions>,
     /// Thread summaries asked and answered (`hub::summary`).
     summaries: Mutex<summary::Summaries>,
+    /// The speakers attached (`hub::speech`). Memory only.
+    speech: Mutex<speech::Speakers>,
     /// [`HubOptions::claude_policy`].
     claude_policy: twr_adapters::claude_code::guard::PolicySources,
     /// Wakes the notifier task ([`orch::notifier`]).

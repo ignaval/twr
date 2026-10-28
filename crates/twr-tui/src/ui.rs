@@ -420,6 +420,10 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
         "show or hide tool calls (the orchestrator's, or in a dive the thread's) and the hub's \
          updates",
     ),
+    (
+        "Ctrl-R",
+        "while a speaker reads aloud, stop it (/read stop); otherwise say how to start (/read)",
+    ),
     ("Ctrl-L", "repaint the whole screen"),
     (
         "?",
@@ -6939,6 +6943,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         state: Some(state),
     };
     let (mut rows, spans) = transcript_view_spans(entries, inner.width, &collapse, &threads);
+    mark_read_aloud(&mut rows, &spans, entries, state);
     if entries.is_empty() && state.selected_request().is_none() {
         rows.extend(
             main_hint(state)
@@ -7121,6 +7126,73 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         let row = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         render_below(frame, row, rows.len() - end, state);
         panes.target(row, Target::Follow);
+    }
+}
+
+/// The marker of the message a speaker reads aloud ([`mark_read_aloud`]), and its form with
+/// `[tui] colors = "none"`.
+pub const READING_MARK: &str = "▶ ";
+/// [`READING_MARK`] without colors.
+pub const READING_MARK_PLAIN: &str = "> ";
+
+/// Puts [`READING_MARK`] before each message of the shown conversation a speaker reads now
+/// ([`crate::speech::SpeechView::playing_in`], by the seq of its final text): in place of the
+/// `● ` of its first row (or the indentation of its first indented row, should it start with
+/// a thread box), in the selected block's yellow. Those cells are the row's gutter
+/// ([`Edge::Gutter`]), so nothing moves or wraps anew when the marker comes and goes, and a
+/// copy leaves it out. A message too narrow for an indentation gets none.
+fn mark_read_aloud(rows: &mut [TranscriptRow], spans: &Spans, entries: &[Entry], state: &AppState) {
+    let Some(t) = state.transcript.as_ref() else {
+        return;
+    };
+    let seqs = state.speech.playing_in(&t.thread);
+    if seqs.is_empty() {
+        return;
+    }
+    let mark = if state.view.colors == crate::color::Depth::None {
+        READING_MARK_PLAIN
+    } else {
+        READING_MARK
+    };
+    let style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    for (i, e) in entries.iter().enumerate() {
+        let Entry::Text {
+            final_seq: Some(seq),
+            ..
+        } = e
+        else {
+            continue;
+        };
+        let Some(range) = spans.entries.get(i).filter(|_| seqs.contains(seq)) else {
+            continue;
+        };
+        let leads = |row: &TranscriptRow, lead: &str| {
+            matches!(row.3, Edge::Gutter(n) if n >= 2)
+                && row
+                    .0
+                    .spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(lead))
+        };
+        // The bullet's row, else the first indented one.
+        let Some((at, lead)) = ["● ", "  "].into_iter().find_map(|lead| {
+            rows.get(range.clone())?
+                .iter()
+                .position(|row| leads(row, lead))
+                .map(|at| (range.start + at, lead))
+        }) else {
+            continue;
+        };
+        let row = &mut rows[at].0;
+        let first = row.spans.remove(0);
+        let after = first.content[lead.len()..].to_string();
+        let mut marked = vec![Span::styled(mark, style)];
+        if !after.is_empty() {
+            marked.push(Span::styled(after, first.style));
+        }
+        row.spans.splice(0..0, marked);
     }
 }
 
@@ -8840,6 +8912,9 @@ where
 /// cards have no room for it); each with what a tap on it does ([`Target`]).
 fn status_note_parts(state: &AppState, parked: Option<String>) -> Vec<(String, Option<Target>)> {
     let mut notes = Vec::new();
+    // What the hub's speakers read ([`crate::speech`]).
+    let plain = state.view.colors == crate::color::Depth::None;
+    notes.extend(state.speech.note(plain).map(|n| (n, None)));
     let background: usize = state
         .registry
         .list()
@@ -10391,6 +10466,142 @@ mod tests {
         transcript_rows(st, &lines)
     }
 
+    /// The poll's answer: `laptop` in `state`.
+    fn speech_polled(st: &mut AppState, state: twr_core::speech::SpeechStateParams) {
+        use crate::speech::tests::{polled, speaker};
+        st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
+    }
+
+    /// While a speaker reads a message of the conversation shown, `▶` takes the place of its
+    /// `●` (`>` without colors), in its gutter: nothing else moves, and a copy leaves it out.
+    /// Another message gets none, nor does a message of another thread that has its seq.
+    #[test]
+    fn the_message_read_aloud_is_marked() {
+        use crate::speech::tests::playing;
+        let text = |seq: u64, final_seq: u64, t: &str| Entry::Text {
+            seq,
+            text: t.into(),
+            open: false,
+            final_seq: Some(final_seq),
+        };
+        let mut st = orch_working(vec![
+            prompt("hi"),
+            text(3, 4, "first reply"),
+            prompt("more"),
+            text(6, 7, "second reply\nwith a second line"),
+        ]);
+        let before = drawn_rows(&mut st);
+        let row = |rows: &[String], word: &str| {
+            rows.iter()
+                .position(|r| r.contains(word))
+                .unwrap_or_else(|| panic!("{word}: {rows:#?}"))
+        };
+        assert!(before[row(&before, "second reply")].starts_with("● second reply"));
+        let reading = |thread: &str, seq: u64| twr_core::speech::SpeechStateParams {
+            playing: playing(thread, seq),
+            ..Default::default()
+        };
+        speech_polled(&mut st, reading("t-orch", 7));
+        let rows = drawn_rows(&mut st);
+        let at = row(&rows, "second reply");
+        assert_eq!(rows[at], "▶ second reply", "{rows:#?}");
+        assert_eq!(rows[at + 1], "  with a second line");
+        assert!(rows[row(&rows, "first reply")].starts_with("● first reply"));
+        // The same rows otherwise.
+        let mut unmarked = rows.clone();
+        unmarked[at] = before[at].clone();
+        assert_eq!(unmarked, before);
+        // Its cells are the gutter's: left out of a copy.
+        let pane = st.view.panes.get(&PaneId::Transcript).unwrap();
+        let y = pane.area.y + u16::try_from(at).unwrap();
+        let cell = Rect::new(pane.area.x, y, 1, 1);
+        assert!(
+            pane.skip.iter().any(|r| r.intersection(cell) == cell),
+            "{:?}",
+            pane.skip
+        );
+        // Without colors: `>`.
+        st.view.colors = crate::color::Depth::None;
+        let rows = drawn_rows(&mut st);
+        assert_eq!(rows[at], "> second reply");
+        st.view.colors = crate::color::Depth::Full;
+        // A message of another thread with that seq: no marker; nothing read: none.
+        speech_polled(&mut st, reading("t-gamma", 7));
+        assert_eq!(drawn_rows(&mut st), before);
+        speech_polled(&mut st, Default::default());
+        assert_eq!(drawn_rows(&mut st), before);
+    }
+
+    /// The status bar's note of reading aloud: what reads (its place in a `/read N`), paused,
+    /// live mode on while idle; `[read]` for `🔊` without colors; nothing with no speaker.
+    #[test]
+    fn the_status_bar_says_what_is_read_aloud() {
+        use crate::speech::tests::playing;
+        use twr_core::speech::SpeechStateParams;
+        let mut st = orch_working(vec![prompt("hi")]);
+        // (A wide character's second cell draws as a space.)
+        let bar = |st: &mut AppState| draw_panes(st, 120, 30).pop().unwrap().replace("🔊 ", "🔊");
+        assert!(!bar(&mut st).contains("read"), "{}", bar(&mut st));
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                queued: 2,
+                batch: Some((2, 5)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 reading 2/5 · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        st.view.colors = crate::color::Depth::None;
+        assert!(
+            bar(&mut st).contains("[read] reading 2/5 · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        st.view.colors = crate::color::Depth::Full;
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 reading · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                paused: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 paused · /read resume"),
+            "{}",
+            bar(&mut st)
+        );
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                live: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("read aloud on (laptop)"),
+            "{}",
+            bar(&mut st)
+        );
+    }
+
     /// While the orchestrator works, the accent cursor alone waits below the last line of the
     /// conversation: on the clock's frame, out of copied text, keeping the clock ticking.
     #[test]
@@ -10432,6 +10643,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open: true,
+            final_seq: None,
         };
         let mut st = orch_working(vec![prompt("hi"), text("hello")]);
         st.view.animate = false;
@@ -10485,6 +10697,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open,
+            final_seq: None,
         };
         let epoch = std::time::Instant::now();
         for entries in [
@@ -10593,6 +10806,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open,
+            final_seq: None,
         };
         let mut st = orch_working(vec![prompt("hi"), text("Checking the threads", true)]);
         let lines = draw_panes(&mut st, 120, 30);
@@ -16154,6 +16368,7 @@ mod tests {
                 seq: 0,
                 text: text.into(),
                 open,
+                final_seq: None,
             },
         ]);
         st
@@ -16945,6 +17160,7 @@ mod tests {
                 seq: 0,
                 text: "## Plan\n- **one** step".into(),
                 open: false,
+                final_seq: None,
             },
             tool("c1", "Bash", "ls"),
             tool("c2", "Bash", "cat x"),
@@ -16953,6 +17169,7 @@ mod tests {
                 seq: 0,
                 text: "done".into(),
                 open: false,
+                final_seq: None,
             },
             Entry::TurnEnd {
                 result: TurnResult::Completed,
@@ -17113,6 +17330,7 @@ mod tests {
                     seq: 0,
                     text: "between".into(),
                     open: false,
+                    final_seq: None,
                 });
             }
             let mut e = update("api needs permission: x", id, Some("answered: allow"));
@@ -17189,6 +17407,7 @@ mod tests {
                 seq: 0,
                 text: quote.clone(),
                 open: false,
+                final_seq: None,
             }],
             36,
             &Collapse::default(),
@@ -17367,6 +17586,7 @@ mod tests {
                 seq: 0,
                 text: format!("<thread name=\"日本語の長い名前alpha\">\n{body}\n</thread>"),
                 open: false,
+                final_seq: None,
             }];
             for w in 8..=40u16 {
                 let rows = transcript_view(&entries, w, &Collapse::default(), &threads);
@@ -17414,6 +17634,7 @@ mod tests {
                 seq: 0,
                 text: "<thread name=\"alpha\">\nalpha is still at it".into(),
                 open: true,
+                final_seq: None,
             },
         ]);
         let rows = drawn_rows(&mut st);
@@ -17429,6 +17650,7 @@ mod tests {
             seq: 0,
             text: "<thread name=\"alpha\">\n".into(),
             open: true,
+            final_seq: None,
         };
         let rows = drawn_rows(&mut st);
         assert!(rows[2].starts_with("╭─ alpha"), "{rows:#?}");
@@ -17441,6 +17663,7 @@ mod tests {
             seq: 0,
             text: "<thread name=\"alpha\">\nalpha is done".into(),
             open: false,
+            final_seq: None,
         };
         let rows = drawn_rows(&mut st);
         assert!(rows[4].starts_with('╰'), "{rows:#?}");
@@ -17532,6 +17755,7 @@ mod tests {
                 seq: 21,
                 text: long_body(100),
                 open: false,
+                final_seq: None,
             },
             Entry::TurnStart {
                 seq: 22,
@@ -17600,6 +17824,7 @@ mod tests {
                     seq: 301,
                     text: format!("<thread name=\"alpha\">\n{body}"),
                     open: true,
+                    final_seq: None,
                 },
             ]);
             st.view.sidebar_hidden = true;
@@ -17854,6 +18079,7 @@ mod tests {
                 seq: 0,
                 text: "one".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c3", "send", "{}", Some("t-alpha")),
             twr_call("c4", "set_mode", "{}", Some("beta")),
@@ -17861,6 +18087,7 @@ mod tests {
                 seq: 0,
                 text: "two".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c5", "list_threads", "{}", None),
             twr_call("c6", "send", "{}", Some("alpha")),
@@ -17868,6 +18095,7 @@ mod tests {
                 seq: 0,
                 text: "three".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c7", "respond_attention", r#"{"answer":"allow","attn_id":"pm9"}"#, None),
             notice(2, &["- thread=gamma report turn=1 grade=success summary=\"y\"", "- thread=alpha report turn=2 grade=success summary=\"z\""]),
@@ -17984,6 +18212,7 @@ mod tests {
                     "Here:\n\n```\n{code}\n```\n\n- a list item {words}\n\n> a quote {words}"
                 ),
                 open: false,
+                final_seq: None,
             },
             Entry::Tool {
                 call_id: "c1".into(),
@@ -17996,6 +18225,7 @@ mod tests {
                 seq: 0,
                 text: format!("<thread name=\"web\">\n{words}\n</thread>\nafter"),
                 open: false,
+                final_seq: None,
             },
         ];
         let ids: Vec<u64> = (10..10 + entries.len() as u64).collect();

@@ -18,6 +18,8 @@ twr-hub = { path = "crates/twr-hub" }
 twr-mcp = { path = "crates/twr-mcp" }
 twr-tui = { path = "crates/twr-tui" }
 twr-docs = { path = "crates/twr-docs" }
+twr-avspeech = { path = "crates/twr-avspeech" }
+twr-speech = { path = "crates/twr-speech" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -58,6 +60,11 @@ libc = "0.2"
 signal-hook-registry = "1.4"
 # `twr update` checks the release's Ed25519 signatures: the ring rustls already builds.
 ring = "0.17.14"
+# twr-avspeech (macOS only): AVFAudio's AVSpeechSynthesizer through objc2's bindings, with
+# only the features it uses.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSObject"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVSpeechSynthesis"] }
 
 # Dev and test builds (`test` inherits `dev`) keep only line tables: panics and backtraces still
 # name file and line, and debuggers can step by line, but the variables and types of full

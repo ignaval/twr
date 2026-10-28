@@ -217,6 +217,9 @@ pub struct Config {
     pub notify: NotifyConfig,
     /// Terminal UI settings (read by the TUI when it starts, not by the hub).
     pub tui: TuiConfig,
+    /// Reading messages aloud (`[speech]`): read by the speaker on the machine you listen on
+    /// (`twr speak`, the TUI's own), not by the hub.
+    pub speech: SpeechConfig,
     /// Folders `thread.new` searches for a project given by its repository folder name (a
     /// plain name that is neither a configured project nor an absolute path): `<root>/<name>`
     /// and `<root>/*/<name>`, a git repository. A leading `~` is the home directory. `None`:
@@ -270,6 +273,7 @@ impl Default for Config {
             codex: CodexConfig::default(),
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
+            speech: SpeechConfig::default(),
             project_roots: None,
             accounts: BTreeMap::new(),
             account_policy: BTreeMap::new(),
@@ -513,6 +517,121 @@ pub enum CardOrder {
     Stable,
     /// The most recently active thread first, every move at once.
     Attention,
+}
+
+/// `[speech] engine`: what speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeechEngine {
+    /// `say` on macOS, `spd` on Linux when `spd-say` is installed, else none.
+    #[default]
+    Auto,
+    /// macOS's `say`.
+    Say,
+    /// macOS's AVSpeechSynthesizer, in-process.
+    Avspeech,
+    /// speech-dispatcher's `spd-say` (Linux).
+    Spd,
+    /// `[speech] command`: a program of yours, the text on its stdin.
+    Command,
+}
+
+/// `[speech] local`: whether the TUI speaks by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeechLocal {
+    /// When the TUI runs on your own machine: not under SSH or mosh.
+    #[default]
+    Auto,
+    /// Always (a TUI on a remote machine then speaks out of that machine's speakers).
+    On,
+    /// Never: only `twr speak` speaks.
+    Off,
+}
+
+/// `[speech]`: reading messages aloud (`docs/read-aloud.md`). Read on the machine you listen
+/// on, by `twr speak` and by a TUI's own speaker; the hub reads none of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpeechConfig {
+    /// What speaks ([`SpeechEngine`]).
+    pub engine: SpeechEngine,
+    /// The engine's voice; empty: the system's default.
+    pub voice: String,
+    /// Words per minute; 0: the engine's default.
+    pub rate: u32,
+    /// Volume, 0.0 to 1.0, where the engine has one.
+    pub volume: f32,
+    /// Which texts are read: `replies` (a turn's last text), `commentary` (texts before it).
+    pub read: Vec<crate::speech::ReadKind>,
+    /// Whose turns: `all`, or `mine` (the turns you started).
+    pub turn_from: crate::speech::TurnsRead,
+    /// Code blocks: `announce`, `read` or `skip`.
+    pub code: crate::speech::CodeMode,
+    /// Paths: `short` (the last two parts) or `full`.
+    pub paths: crate::speech::PathMode,
+    /// Messages said more than this many seconds ago while the speaker was away are counted,
+    /// not read.
+    pub catchup_secs: u64,
+    /// Whether the TUI speaks by itself ([`SpeechLocal`]).
+    pub local: SpeechLocal,
+    /// `engine = "command"`: the program and its arguments, run without a shell, the text of
+    /// each utterance on its stdin.
+    pub command: Vec<String>,
+}
+
+impl Default for SpeechConfig {
+    fn default() -> Self {
+        SpeechConfig {
+            engine: SpeechEngine::Auto,
+            voice: String::new(),
+            rate: 0,
+            volume: 1.0,
+            read: crate::speech::default_read(),
+            turn_from: crate::speech::TurnsRead::All,
+            code: crate::speech::CodeMode::Announce,
+            paths: crate::speech::PathMode::Short,
+            catchup_secs: crate::speech::default_catchup(),
+            local: SpeechLocal::Auto,
+            command: Vec::new(),
+        }
+    }
+}
+
+impl SpeechConfig {
+    /// Checks what the types allow but a speaker can't use.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.engine == SpeechEngine::Command
+            && self.command.first().is_none_or(|p| p.trim().is_empty())
+        {
+            anyhow::bail!("speech.command: engine = \"command\" needs a program to run");
+        }
+        if !(0.0..=1.0).contains(&self.volume) {
+            anyhow::bail!("speech.volume: {} is not between 0.0 and 1.0", self.volume);
+        }
+        if self.rate != 0 && !(80..=500).contains(&self.rate) {
+            anyhow::bail!(
+                "speech.rate: {} is not 0 (the default) or 80 to 500 words per minute",
+                self.rate
+            );
+        }
+        if self.read.is_empty() {
+            anyhow::bail!("speech.read: name at least one of \"replies\", \"commentary\"");
+        }
+        if self.catchup_secs > crate::speech::CATCHUP_MAX {
+            anyhow::bail!(
+                "speech.catchup_secs: at most {} (a day)",
+                crate::speech::CATCHUP_MAX
+            );
+        }
+        if let Some(e) = (!self.voice.is_empty())
+            .then(|| crate::speech::name_error("speech.voice", &self.voice, 128))
+            .flatten()
+        {
+            anyhow::bail!(e);
+        }
+        Ok(())
+    }
 }
 
 impl Default for TuiConfig {
@@ -1640,6 +1759,7 @@ impl Config {
         for (name, b) in &self.boxes {
             b.check(name)?;
         }
+        self.speech.validate()?;
         match parse_span(&self.tui.summary_every_span) {
             Some(d) if d >= MIN_SUMMARY_EVERY => {}
             _ => anyhow::bail!(
@@ -2361,6 +2481,32 @@ fn redact_long_spans(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_defaults_and_checks() {
+        let c = Config::from_toml_str("").unwrap();
+        assert_eq!(c.speech, SpeechConfig::default());
+        assert_eq!(c.speech.catchup_secs, 120);
+        assert_eq!(c.speech.read.len(), 2);
+        let c = Config::from_toml_str(
+            "[speech]\nengine = \"command\"\ncommand = [\"/usr/bin/my-tts\", \"--fast\"]\nread = [\"replies\"]\nturn_from = \"mine\"\ncode = \"skip\"\npaths = \"full\"\nlocal = \"off\"\nrate = 200\nvolume = 0.5\n",
+        )
+        .unwrap();
+        assert_eq!(c.speech.engine, SpeechEngine::Command);
+        assert_eq!(c.speech.local, SpeechLocal::Off);
+        assert_eq!(c.speech.read, vec![crate::speech::ReadKind::Replies]);
+        for bad in [
+            "[speech]\nengine = \"command\"\n",
+            "[speech]\nvolume = 2.0\n",
+            "[speech]\nrate = 20\n",
+            "[speech]\nread = []\n",
+            "[speech]\ncatchup_secs = 999999\n",
+            "[speech]\nengine = \"festival\"\n",
+            "[speech]\nunknown = 1\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "{bad}");
+        }
+    }
 
     /// An error loading the files that leaves the hub holds no value of theirs: a token on a
     /// line TOML can't parse, one in a refused value, in either file; where and what stay.

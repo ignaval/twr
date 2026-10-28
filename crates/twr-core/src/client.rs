@@ -2,7 +2,9 @@
 //!
 //! One [`Client`] carries sequential request/response calls. Subscriptions use a dedicated
 //! connection: [`Client::subscribe`] consumes the client, waits for the acknowledgement and
-//! then yields [`StreamItem`]s.
+//! then yields [`StreamItem`]s. A speaker's connection ([`SpeechLink`]) goes both ways: it
+//! reads `speech` items and reports its state on the same connection; [`Client::into_raw`]
+//! hands over the connection's lines as they are (`twr speech feed`'s proxy).
 
 use std::path::Path;
 
@@ -411,6 +413,164 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The connection's line halves, as they are: each line the hub sends as JSON, and lines
+    /// of yours written as given. For a proxy that passes lines on (`twr speech feed`).
+    pub fn into_raw(self) -> (RawReader, RawWriter) {
+        (RawReader(self.reader), RawWriter(self.writer))
+    }
+}
+
+/// The hub's side of a connection, line by line ([`Client::into_raw`]).
+pub struct RawReader(Reader);
+
+impl RawReader {
+    /// The next line the hub sent, as JSON; `Ok(None)` when it closed the connection.
+    pub async fn next(&mut self) -> anyhow::Result<Option<Value>> {
+        crate::proto::read_frame(&mut self.0)
+            .await
+            .context("reading from hub")
+    }
+}
+
+/// Your side of a connection, line by line ([`Client::into_raw`]).
+pub struct RawWriter(Writer);
+
+impl RawWriter {
+    /// Writes `line` as one line.
+    pub async fn send(&mut self, line: &Value) -> anyhow::Result<()> {
+        let text = encode_line(line).context("encoding request")?;
+        self.0
+            .write_all(text.as_bytes())
+            .await
+            .context("writing to hub")?;
+        self.0.flush().await.context("writing to hub")
+    }
+}
+
+/// A speaker's connection to a hub (`speech.attach`): the `speech` items it gets, and its
+/// state reported back on the same connection (`speech.state`). Dropping it closes the
+/// connection, which detaches the speaker.
+pub struct SpeechLink {
+    items: tokio::sync::mpsc::Receiver<anyhow::Result<crate::speech::SpeechItem>>,
+    writer: std::sync::Arc<tokio::sync::Mutex<RawWriter>>,
+    next_id: std::sync::atomic::AtomicU64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for SpeechLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeechLink").finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpeechLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SpeechLink {
+    /// Attaches a speaker on `client`'s connection (after its `hello`): `speech.attach` with
+    /// `params`, its ack, then the link. The hub's error (`conflict`: another speaker of
+    /// this device is attached) is an [`RpcError`].
+    pub async fn attach(
+        client: Client,
+        params: &crate::speech::SpeechAttachParams,
+    ) -> anyhow::Result<(crate::speech::SpeechAttachAck, SpeechLink)> {
+        let (mut reader, mut writer) = client.into_raw();
+        writer
+            .send(&serde_json::json!({
+                "id": 1, "method": "speech.attach", "params": params,
+            }))
+            .await?;
+        let ack = loop {
+            let Some(line) = reader.next().await? else {
+                anyhow::bail!("the hub closed the connection before it attached the speaker");
+            };
+            if line.get("stream").is_some() {
+                continue;
+            }
+            let id = line.get("id").and_then(Value::as_u64);
+            if let Some(err) = line.get("error") {
+                let e: RpcError = serde_json::from_value(err.clone())
+                    .unwrap_or_else(|_| RpcError::new(codes::INTERNAL, err.to_string()));
+                return Err(anyhow::Error::new(e));
+            }
+            if id == Some(1) {
+                break serde_json::from_value(line.get("result").cloned().unwrap_or(Value::Null))
+                    .context("reading the hub's speech.attach ack")?;
+            }
+        };
+        let (tx, items) = tokio::sync::mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            loop {
+                let line = match reader.next().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if line.get("stream").and_then(Value::as_str) == Some("speech") {
+                    let item =
+                        serde_json::from_value(line.get("item").cloned().unwrap_or(Value::Null));
+                    match item {
+                        Ok(item) => {
+                            if tx.send(Ok(item)).await.is_err() {
+                                return;
+                            }
+                        }
+                        // An item of a newer hub: skipped.
+                        Err(e) => tracing::debug!("skipping a speech item: {e}"),
+                    }
+                    continue;
+                }
+                // The hub's error for the connection, which it closes next.
+                if line.get("id").and_then(Value::as_u64) == Some(0) {
+                    if let Some(err) = line.get("error") {
+                        let _ = tx
+                            .send(Err(anyhow!("the hub closed the connection: {err}")))
+                            .await;
+                        return;
+                    }
+                }
+                if let Some(err) = line.get("error") {
+                    tracing::debug!("speech.state refused: {err}");
+                }
+            }
+        });
+        Ok((
+            ack,
+            SpeechLink {
+                items,
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
+                next_id: std::sync::atomic::AtomicU64::new(2),
+                task,
+            },
+        ))
+    }
+
+    /// The next item; `None` once the connection ended (the hub went away), `Some(Err)` when
+    /// it failed.
+    pub async fn next(&mut self) -> Option<anyhow::Result<crate::speech::SpeechItem>> {
+        self.items.recv().await
+    }
+
+    /// Reports the speaker's state (`speech.state`), without waiting for the answer.
+    pub async fn state(&self, state: &crate::speech::SpeechStateParams) -> anyhow::Result<()> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.writer
+            .lock()
+            .await
+            .send(&serde_json::json!({"id": id, "method": "speech.state", "params": state}))
+            .await
+    }
+}
+
 impl BlobFetch for Client {
     fn fetch(
         &mut self,
@@ -481,6 +641,84 @@ mod tests {
     use futures::StreamExt;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A speaker's link reads its items and reports its state on the same connection, the
+    /// two interleaved; a refused attach is the hub's error.
+    #[tokio::test]
+    async fn speech_link_goes_both_ways() {
+        use crate::speech::*;
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let client = Client::from_io(ours);
+        let server = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let req: Value = read_frame(&mut r).await.unwrap().unwrap();
+            assert_eq!(req["method"], "speech.attach");
+            assert_eq!(req["params"]["device"], "dev1");
+            let line = |v: Value| format!("{v}\n");
+            w.write_all(
+                line(json!({"id": 1, "result": {"orchestrator": "o1", "head": 7}})).as_bytes(),
+            )
+            .await
+            .unwrap();
+            let item = json!({"stream": "speech", "item": {"item": "ctl", "op": "stop"}});
+            w.write_all(line(item.clone()).as_bytes()).await.unwrap();
+            // The state request comes in while items go out.
+            let st: Value = read_frame(&mut r).await.unwrap().unwrap();
+            assert_eq!(st["method"], "speech.state");
+            assert_eq!(st["params"]["queued"], 2);
+            w.write_all(line(json!({"id": st["id"], "result": {}})).as_bytes())
+                .await
+                .unwrap();
+            let unknown = json!({"stream": "speech", "item": {"item": "future-kind"}});
+            w.write_all(line(unknown).as_bytes()).await.unwrap();
+            w.write_all(line(item).as_bytes()).await.unwrap();
+        });
+        let params = SpeechAttachParams {
+            device: "dev1".into(),
+            name: "test".into(),
+            engine: "fake".into(),
+            voice: None,
+            live: true,
+            read: default_read(),
+            turn_from: TurnsRead::All,
+            watermarks: Default::default(),
+            catchup_secs: 120,
+        };
+        let (ack, mut link) = SpeechLink::attach(client, &params).await.unwrap();
+        assert_eq!(ack.orchestrator.as_deref(), Some("o1"));
+        assert_eq!(ack.head, 7);
+        let stop = SpeechItem::Ctl {
+            op: CtlOp::Stop,
+            value: None,
+        };
+        assert_eq!(link.next().await.unwrap().unwrap(), stop);
+        link.state(&SpeechStateParams {
+            queued: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The unknown item is skipped; the next one comes.
+        assert_eq!(link.next().await.unwrap().unwrap(), stop);
+        server.await.unwrap();
+        assert!(link.next().await.is_none());
+
+        let (ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let _: Value = read_frame(&mut r).await.unwrap().unwrap();
+            let refused = json!({"id": 1, "error": {"code": "conflict", "message": "another"}});
+            w.write_all(format!("{refused}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let e = SpeechLink::attach(Client::from_io(ours), &params)
+            .await
+            .unwrap_err();
+        assert_eq!(e.downcast_ref::<RpcError>().unwrap().code, codes::CONFLICT);
+    }
 
     /// A release client never reads the test token file, let alone sends it; a debug one
     /// sends what the file holds, trimmed.

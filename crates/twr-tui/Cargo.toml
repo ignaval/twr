@@ -10,6 +10,8 @@ description = "twr terminal UI: stack and grid views, attention cards, transcrip
 
 [dependencies]
 twr-core.workspace = true
+# The TUI's own speaker ([speech] local): reads aloud on the machine you listen on.
+twr-speech.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }

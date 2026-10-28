@@ -516,6 +516,7 @@ The popup is what an answer reads: it answers or dismisses only an item it, or t
 | Ctrl-T | show or hide the [workspace sidebar](#workspaces); narrower than 120 columns, open or close it as a drawer; in the compact layout, the Workspaces screen or back to the conversation |
 | Ctrl-F | toggle Focus mode: working threads and anything needing you |
 | Ctrl-L | repaint the whole screen |
+| Ctrl-R | while a speaker [reads aloud](read-aloud.md): stop, as `/read stop`; otherwise it says how to start (`/read on`, `/read N`) |
 | Alt-1..9, Ctrl-PgUp, Ctrl-PgDn | with more than one [workspace](#workspaces): switch to the workspace at that place, or the previous / next one |
 | ? | typed on an empty line: help, commands and keys (and what a card's rows say), wrapped to the screen's width (below 70 columns each command or key on a row of its own, what it does indented under it). Taller than the screen, it scrolls with ↑↓, PgUp/PgDn, Home/End and the wheel, and its bottom border says `↓ more` while there is more below; Esc or any other key closes it, and so does a click outside it or on the `✕` of its top border. After text, `?` is a character |
 | Ctrl-C | stop the newest [`!` command](#shell-commands) you started on the thread you see, while one runs; otherwise quit (also `/quit`); the TUI clears the screen it drew on |
@@ -625,6 +626,10 @@ Each tab is a filled block an equal share of the screen wide (a quarter with the
 
 Over mosh on a slow link, `mosh --predict-overwrite` keeps its predictive typing echo from shifting what's on screen. With the hub's [notification command](notifications.md) pushing to your phone, a phone running mosh covers answering and following threads without a server or an app.
 
+## Reading aloud
+
+`/read on` reads the orchestrator's messages aloud as they come, and `/read N` the last N. A TUI on the machine you listen on speaks by itself. For a TUI on a server over SSH or mosh, run `twr speak --ssh <server>` on your laptop, or open the session with `twr remote <server>`: your laptop then speaks, and nothing plays on the server. While a speaker reads, the status bar says `🔊 reading 2/5 · Ctrl-R stop`, and `Ctrl-R` stops it. [read-aloud.md](read-aloud.md) has the rest: what is read, the controls, speakers, engines and `[speech]`.
+
 ## Notifications
 
 The TUI can alert the terminal it runs in when something needs you. It's off until you pick a way in the [configuration](configuration.md):
@@ -638,7 +643,7 @@ terminal = "osc9"    # off (default) | bell | osc9 | osc777
 - `osc9` sends the OSC 9 escape sequence, which iTerm2, WezTerm, Ghostty and kitty show as a desktop notification with the text, such as `twr: api needs permission: Bash cargo test`.
 - `osc777` sends OSC 777 `notify`, with a title and a body, for urxvt, foot, WezTerm, Ghostty and the VTE terminals that support it.
 
-A terminal that doesn't know the sequence ignores it. Windows Terminal doesn't show OSC 9. Its 1.26 Preview shows OSC 777 once you set `compatibility.allowOSC777` to `true` in the profile. Otherwise use `bell`: with the profile's `bellStyle` set to `taskbar` or `all`, the bell flashes the taskbar icon.
+A terminal that doesn't know the sequence ignores it. mosh passes neither on: it forwards only the bell (once per screen update) and a few other sequences (titles, the clipboard), so over mosh use `bell`, or the hub's [notification command](notifications.md). Windows Terminal doesn't show OSC 9. Its 1.26 Preview shows OSC 777 once you set `compatibility.allowOSC777` to `true` in the profile. Otherwise use `bell`: with the profile's `bellStyle` set to `taskbar` or `all`, the bell flashes the taskbar icon.
 
 Over SSH the sequence reaches the terminal on your own machine, so the notification shows there. Inside tmux the TUI wraps OSC 9 and OSC 777 for tmux's passthrough, which needs `set -g allow-passthrough on`. Inside GNU screen it wraps them for screen's passthrough, which needs no setting. Screen passes at most 767 bytes, so the TUI shortens a long notification there. Nested tmux and screen aren't supported for OSC 9 and OSC 777: the TUI can't tell which one runs inside the other, so it rings the bell instead.
 
@@ -686,6 +691,7 @@ Only an open TUI notifies this way, and each open TUI notifies on its own. For n
 | `/decisions` | the decision audit table, over the view you are in; `Esc` closes it |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal; no argument toggles |
 | `/suggest [on\|off]` | [suggest your next message](#suggestions) after a turn (`[tui] suggest`); no argument toggles |
+| `/read [on\|off\|N\|this\|status \| stop\|pause\|resume\|skip]` | [read aloud](read-aloud.md): `on`/`off` live reading of the orchestrator's messages on every speaker of this hub, `N` (1-50; alone, 1) the last N messages (in a dive the thread's; `--orch` the orchestrator's, `--on <speaker>` one speaker), `this` the long message selected, and the controls; `voice <name>` and `rate <wpm>` set the speakers' voice and speed |
 | `/summaries [on\|off]` | [summaries](#routine-updates-and-summaries) of the threads' folded routine updates (`[tui] summaries`), with the calls and cost so far; no argument toggles |
 | `/ws [name]` | list the [workspaces](#workspaces), or switch to one; a new name asks `y` to create it; alias `/workspace` |
 | `/ws new [name]` | create a workspace and switch to it; without a name, ask for it |

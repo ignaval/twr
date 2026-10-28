@@ -176,6 +176,7 @@ impl Hub {
             }),
             suggestions: Mutex::default(),
             summaries: Mutex::default(),
+            speech: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,
             stall_after: opts.stall_after.unwrap_or(Duration::from_secs(stall_secs)),

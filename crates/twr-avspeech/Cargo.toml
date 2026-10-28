@@ -1,0 +1,16 @@
+[package]
+name = "twr-avspeech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr's `avspeech` voice: macOS's AVSpeechSynthesizer, in-process (an empty shell on other systems)"
+
+# AVFAudio's speech synthesizer through objc2's generated bindings (MIT, Zlib/Apache-2.0/MIT):
+# only on macOS, where they link the system frameworks; nothing is built from C.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-avf-audio.workspace = true

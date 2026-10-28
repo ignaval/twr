@@ -155,6 +155,19 @@ terminal = "off"                  # bell | osc9 | osc777: alert the terminal whe
 when = "unfocused"                # always: also while the terminal has focus
 events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 
+[speech]                          # reading aloud, on the machine you listen on; see read-aloud.md
+engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux) | command; auto: say, else spd if installed
+voice = ""                        # the engine's voice; empty = the system's default
+rate = 0                          # words per minute, 80-500; 0 = the engine's default
+volume = 1.0                      # 0.0-1.0 (avspeech, spd)
+read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it
+turn_from = "all"                 # mine: only the turns you started
+code = "announce"                 # read | skip: what a code block reads as
+paths = "short"                   # full: paths as written
+catchup_secs = 120                # after a disconnect, messages older than this are counted, not read
+local = "auto"                    # on | off: the TUI speaks by itself (auto: not under SSH or mosh)
+command = []                      # engine = "command": a program and its arguments (no shell), text on stdin
+
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"
 attach = "gemini --resume {session}"  # optional: what `twr attach` runs; also takes {mode}

@@ -37,6 +37,8 @@ pub mod slash;
 mod snapshot;
 #[cfg(test)]
 mod snapshot_tests;
+pub mod speaker;
+pub mod speech;
 pub mod suggest;
 pub mod summary;
 pub mod terminal_setup;
@@ -461,6 +463,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::SettingsFile
         | Action::TerminalSetup { .. } => None,
         Action::ConfigShow => Some(("config.show", Value::Null)),
+        Action::Speech { method, params } => Some((*method, params.clone())),
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -770,6 +773,10 @@ fn save_setting(change: &settings::Change) -> Result<String, String> {
 
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
 const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
+
+/// How often the current workspace's hub is asked what its speakers read (`speech.status`,
+/// [`speech`]): the status bar's note and the conversation's `▶` follow it.
+pub const SPEECH_EVERY: Duration = Duration::from_secs(2);
 
 /// How long quitting waits for the input history's last lines to be written.
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
@@ -2230,6 +2237,9 @@ async fn serve_calls(
         };
         let named = params["ref"].clone();
         let named_job = params["job"].clone();
+        // What a `speech.*` call asked goes with its answer: the words for what it did need
+        // it ([`speech::SpeechView::answered`]).
+        let asked = method.starts_with("speech.").then(|| params.clone());
         let answer = calls.call(method, params).await;
         if let (Some(n), Ok(r)) = (launch, &answer) {
             if !r["job"].is_null() {
@@ -2238,6 +2248,17 @@ async fn serve_calls(
                     launched.pop_front();
                 }
             }
+        }
+        if let Some(asked) = asked {
+            let said = results.view.send((method, speech::answer(asked, &answer)));
+            // The view that asked is gone (a switch): a failure is said where the TUI is now,
+            // naming the workspace, as other calls' are; a poll's says nothing.
+            if let (Err(_), Err(e)) = (said, &answer) {
+                if method != "speech.status" {
+                    status.send((error_status(method, &format!("{e:#}")), false));
+                }
+            }
+            continue;
         }
         match answer {
             // What a message did ("sent to the orchestrator") is news only for a moment.
@@ -2360,6 +2381,9 @@ struct Shared {
     asking: Asks,
     /// The summary asks on their way, of every workspace shown ([`Asks`]).
     summarizing: Asks,
+    /// The TUI's own speaker, once per process whichever workspace shows
+    /// ([`speaker::OwnSpeaker`]).
+    speaker: speaker::OwnSpeaker,
 }
 
 /// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
@@ -2397,7 +2421,7 @@ impl Drop for Asks {
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
-    run_with(socket, None, None, None).await
+    run_with(socket, None, None, None, None).await
 }
 
 /// The `[tui]` settings: `given` (what the CLI read from the config of the workspace it
@@ -2414,12 +2438,14 @@ pub fn tui_config(given: Option<twr_core::config::TuiConfig>) -> twr_core::confi
 /// Runs the TUI against the hub listening on `socket` until the user quits; with `switching`,
 /// on the workspace it names, with a tab per workspace to switch to ([`workspace`]). `tui`:
 /// the `[tui]` settings ([`tui_config`]). `agent`: the thread's agent this TUI runs for, if
-/// it does (it then offers to change nothing of the user's terminal).
+/// it does (it then offers to change nothing of the user's terminal). `speech`: what the
+/// TUI's own speaker needs ([`speaker`]; `None`: it has none).
 pub async fn run_with(
     socket: PathBuf,
     switching: Option<Switching>,
     tui: Option<twr_core::config::TuiConfig>,
     agent: Option<String>,
+    speech: Option<speaker::LocalSpeech>,
 ) -> anyhow::Result<()> {
     let tui = tui_config(tui);
     // Connect before touching the terminal so connection errors print normally.
@@ -2445,6 +2471,10 @@ pub async fn run_with(
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)
         .context("enabling bracketed paste")?;
     let mut keys = enhance_keyboard();
+    // (`keys.mosh` is not looked for where the terminal speaks the keyboard protocol, which
+    // mosh does not pass on.)
+    let remote = terminal_setup::place(keys.mosh).remote.is_some();
+    let agent_tui = is_agent_tui(agent.as_deref());
     // What was told in earlier runs, and the Shift-Enter offer (only where it can be
     // remembered: it must not come back every start).
     let seen_file = firstrun::state_file();
@@ -2460,10 +2490,7 @@ pub async fn run_with(
             })
         } else {
             let place = terminal_setup::place(keys.mosh);
-            let agent = agent.is_some()
-                // (A thread's processes carry `TWR_AGENT`, `twr_runner::reap::AGENT_ENV`.)
-                || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty());
-            firstrun::terminal_offer(&keys, &place, agent, &seen, terminal_setup::prepare)
+            firstrun::terminal_offer(&keys, &place, agent_tui, &seen, terminal_setup::prepare)
         };
         // Remembered, the startup notices are told once (the mosh one among the offers).
         keys.notice = None;
@@ -2487,6 +2514,12 @@ pub async fn run_with(
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
     let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
     let (saves, settings_writer) = spawn_settings_writer(saved_tx);
+    let own = speaker::Place {
+        remote,
+        agent: agent_tui,
+        socket_only: switching.is_none(),
+    };
+    let speaker = speaker::OwnSpeaker::start(speech, own, late_tx.clone());
     let mut ctx = Shared {
         callers: std::collections::HashMap::new(),
         all_callers: Vec::new(),
@@ -2512,6 +2545,7 @@ pub async fn run_with(
         offer,
         asking: Asks::default(),
         summarizing: Asks::default(),
+        speaker,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2570,10 +2604,12 @@ pub async fn run_with(
             Err(e) => break (Err(e), writer),
         }
     };
-    // Nothing is sent once the user quit, from any workspace: no suggestion asked either.
+    // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
+    // and nothing more read aloud.
     abort_all(&mut ctx.all_callers);
     ctx.asking.settle(false);
     ctx.summarizing.settle(false);
+    ctx.speaker.stop();
 
     // Nothing reads the terminal once it is the user's again.
     drop(input);
@@ -2586,6 +2622,12 @@ pub async fn run_with(
     drop(ctx.saves.take());
     flush_history(settings_writer);
     result
+}
+
+/// Whether this is a thread's agent's TUI: `agent` given, or the process carries `TWR_AGENT`
+/// (a thread's processes do, `twr_runner::reap::AGENT_ENV`).
+fn is_agent_tui(agent: Option<&str>) -> bool {
+    agent.is_some() || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty())
 }
 
 /// Waits for the history writer (or the settings writer) to finish, at most
@@ -2759,6 +2801,9 @@ async fn drive(
     });
     let mut activity_poll = tokio::time::interval(ACTIVITY_EVERY);
     activity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What this hub's speakers read: asked now, then every [`SPEECH_EVERY`].
+    let mut speech_poll = tokio::time::interval(SPEECH_EVERY);
+    speech_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The other workspaces' tabs: asked now, then every [`TABS_EVERY`].
     let mut tab_poll = tokio::time::interval(TABS_EVERY);
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3288,6 +3333,14 @@ async fn drive(
                         let _ = call_tx.send(("thread.activity", Value::Null));
                     }
                 }
+                // Not asked of a hub from before reading aloud, until a `/read` it answers;
+                // never by a thread's agent's TUI, which the hub refuses `speech.*`.
+                _ = speech_poll.tick(), if !state.speech.unsupported && state.agent.is_none() => {
+                    if !state.speech.pending {
+                        state.speech.pending = true;
+                        let _ = call_tx.send(("speech.status", json!({})));
+                    }
+                }
                 // Read off the loop: a few small files, but a `sysctl` on macOS.
                 _ = load_poll.tick(), if !load_pending && !hide_load => {
                     load_pending = true;
@@ -3531,6 +3584,12 @@ mod tests {
                         )))
                     }
                     "account.list" => Ok(serde_json::json!({"runtimes": {}})),
+                    // A hub from before reading aloud.
+                    "speech.status" => Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                        twr_core::proto::codes::METHOD_NOT_FOUND,
+                        "unknown method speech.status",
+                    ))),
+                    "speech.request" => Ok(serde_json::json!({"count": 2, "speakers": 1})),
                     _ => Ok(serde_json::Value::Null),
                 }
             })
@@ -3613,6 +3672,52 @@ mod tests {
             ),
             "{shown}"
         );
+    }
+
+    /// A `speech.*` answer goes to the view with what was asked, for the words that say what
+    /// it did ([`speech::SpeechView::answered`]); a hub without the method is told apart, and
+    /// nothing of either goes to the status bar from here.
+    #[tokio::test]
+    async fn speech_answers_go_to_the_view_with_what_was_asked() {
+        use serde_json::json;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        tx.send(("speech.request", json!({"last": 2}))).unwrap();
+        tx.send(("speech.status", json!({}))).unwrap();
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        super::serve_calls(
+            Recording(seen.clone(), None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["speech.request", "speech.status"]);
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            (
+                "speech.request",
+                json!({"asked": {"last": 2}, "result": {"count": 2, "speakers": 1}})
+            )
+        );
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            ("speech.status", json!({"asked": {}, "unsupported": true}))
+        );
+        assert!(status_rx.try_recv().is_err());
     }
 
     /// Calls asked for before a switch are still sent once the view that asked is gone, and

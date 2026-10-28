@@ -20,6 +20,7 @@
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
 //! - [`sorted`]: hash sets serialized in a fixed order
+//! - [`speech`]: reading messages aloud: which turns speak, Markdown to sentences, `speech.*` types
 //! - [`testkit`]: event-sequence builders for tests
 //! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
@@ -48,6 +49,7 @@ pub mod runner;
 pub mod sealed;
 pub mod shell;
 pub mod sorted;
+pub mod speech;
 pub mod testkit;
 pub mod trace;
 pub mod usage;
