@@ -322,10 +322,13 @@ impl Adapter for PtyAdapter {
         // Only the program may hold the terminal's slave side, or reads never see EOF.
         drop(pair.slave);
         let pid = child.process_id();
-        let reader = AsyncFd::new(std::fs::File::from(
-            nonblocking_dup(&*pair.master).context("pty reader")?,
-        ))
-        .context("pty reader")?;
+        let reader = std::fs::File::from(nonblocking_dup(&*pair.master).context("pty reader")?);
+        // SAFETY: the `File` owns the duplicate (open, and closed only when the `AsyncFd`
+        // drops it); [`read_task`] only reads through it, so the descriptor stays the same
+        // open file for the `AsyncFd`'s whole life.
+        let reader = unsafe { AsyncFd::register(reader) }
+            .map_err(std::io::Error::from)
+            .context("pty reader")?;
         let writer = pair.master.take_writer().context("pty writer")?;
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();

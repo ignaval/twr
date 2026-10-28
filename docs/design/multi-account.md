@@ -764,7 +764,7 @@ This is my reading of public terms, not legal advice, and the terms change. The 
 
 ## Open questions
 
-Questions 1 to 8 need logged-in accounts to answer, and 9 is a design choice for phase 2; the user's steps are in `~/files/twr-multi-account/pending.md`, and the tests are listed under [Phase 0 results](#phase-0-results).
+Questions 1 to 8 need logged-in accounts to answer, and 9 is a design choice for phase 2; the tests that answer them are listed under [Phase 0 results](#phase-0-results).
 
 1. Does a copied Claude session's first turn succeed under a **different** account? (needs a second Claude login)
 2. Does a copied Codex rollout's first turn succeed under a different ChatGPT account, or fail on encrypted reasoning? (needs a second Codex login)
@@ -797,7 +797,7 @@ Each phase is shippable on its own and documented as it lands (`docs/accounts.md
 
 ### Phase 0: checks before code (no shipped code)
 
-The checks that need no login were run on 2026-10-08 (scratch directories under `/tmp`) and again on 2026-10-20 with Claude Code 2.1.304, Codex 0.162.1 and grok 1.0.50 (scratch directories under `~/files/twr-multi-account/phase0/`, every file operation traced with `strace`). No real config directory was changed, no login was completed, and no credential was read.
+The checks that need no login were run on 2026-10-08 (scratch directories under `/tmp`) and again on 2026-10-20 with Claude Code 2.1.304, Codex 0.162.1 and grok 1.0.50 (scratch directories of their own, every file operation traced with `strace`). No real config directory was changed, no login was completed, and no credential was read.
 
 #### Phase 0 results
 
