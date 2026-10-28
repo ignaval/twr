@@ -1119,7 +1119,7 @@ async fn connection(
             // (Dispatched by `call_async`: its own arm there is the method's.)
             method @ ("suggest.next" | "summary.thread") => {
                 let result = tokio::select! {
-                    r = call_async(&hub, &caller, method, req.params) => r,
+                    r = call_async(&hub, &caller, method, req.params, None) => r,
                     () = hung_up(&mut reader) => break,
                 };
                 let resp = match result {
@@ -1137,7 +1137,8 @@ async fn connection(
             | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
             | "box.projects" | "box.token" | "account.status" | "account.remove"
             | "thread.set_model" => {
-                let result = call_async(&hub, &caller, &req.method, req.params).await;
+                let result =
+                    call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -2037,8 +2038,16 @@ struct ParkParams {
     force: bool,
 }
 
-/// Methods that wait on git or on a runtime's exit.
-async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Result<Value, RpcError> {
+/// Methods that wait on git or on a runtime's exit. The orchestrator's `thread.new` and
+/// `thread.set_model` are bound to the call as admitted (`received`, [`Hub::orchestrator_acts`]):
+/// checked again after what they wait on.
+async fn call_async(
+    hub: &Hub,
+    caller: &Caller,
+    method: &str,
+    p: Value,
+    received: Option<&crate::hub::OrchCall>,
+) -> Result<Value, RpcError> {
     match method {
         // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
@@ -2046,7 +2055,7 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
         "thread.new" => {
             let p: NewThread = params(p)?;
-            hub.new_thread_by(p, caller).await
+            hub.new_thread_bound(p, caller, received).await
         }
         "thread.park" => {
             let p: ParkParams = params(p)?;
@@ -2199,7 +2208,8 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
                 model: p.model.as_deref(),
                 effort: p.effort.as_deref(),
             };
-            hub.set_thread_model(&p.thread, req, caller).await
+            hub.set_thread_model_bound(&p.thread, req, caller, received)
+                .await
         }
         "context.set" => {
             let p: ContextSetParams = params(p)?;

@@ -15,8 +15,8 @@ use twr_core::proto::{codes, RpcError};
 use super::lifecycle::data_dir_of;
 use super::{
     append_err, box_agents, find_project, git, internal, orch, project_read, rpc, runtime_spec,
-    thread_account, twr_ext_map, Batch, BatchPrompt, Caller, Core, Exit, Hub, Inner, NewThread,
-    Planned, SendOutcome, LOCAL_BOX, MAX_ALIASES,
+    thread_account, twr_ext_map, withdraw::OrchCall, Batch, BatchPrompt, Caller, Core, Exit, Hub,
+    Inner, NewThread, Planned, SendOutcome, LOCAL_BOX, MAX_ALIASES,
 };
 use crate::host::ThreadHost;
 use crate::remote::BoxOp;
@@ -227,8 +227,33 @@ impl Hub {
     /// it cannot have refuses it before its workspace is made, and an explicit account on
     /// another box than the hub's own before that box is asked; an account removed while the
     /// workspace was made refuses it under the lock it would be recorded with.
+    ///
+    /// The orchestrator's call is bound to the orchestrator as it is when the call begins
+    /// ([`Hub::new_thread_bound`]).
     pub async fn new_thread_by(&self, req: NewThread, caller: &Caller) -> Result<Value, RpcError> {
+        self.new_thread_bound(req, caller, None).await
+    }
+
+    /// [`Hub::new_thread_by`] of the orchestrator's call admitted as `bound`
+    /// ([`Hub::orchestrator_acts`]: the server's, as the request came in; `None`: the
+    /// orchestrator as it is now). Checked again, as admission checked it, under the lock the
+    /// thread is recorded with (its project and workspace are looked up and made meanwhile):
+    /// refused (`unauthorized`) when that orchestrator was replaced or restarted since, and
+    /// (`relay_forbidden`) when the user took its turn's message back; the workspace made is
+    /// removed again.
+    pub async fn new_thread_bound(
+        &self,
+        req: NewThread,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<Value, RpcError> {
         let cfg = &self.inner.config;
+        let bound = match caller.is_orchestrator() {
+            true => bound
+                .cloned()
+                .or_else(|| self.inner.core().orchestrator_call()),
+            false => None,
+        };
         if let Some(p) = &req.first_prompt {
             super::compact::refuse_compact_command(p, caller.from())?;
         }
@@ -301,16 +326,22 @@ impl Hub {
             workspace.discard(&self.inner, &box_name, &host, op.take());
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
         }
-        // Again with the repository git found (the top level, symlinks resolved), under the
-        // lock the thread is recorded with.
-        let refused = [&workspace.repo, &workspace.worktree]
-            .into_iter()
-            .try_for_each(|d| {
-                core.refuse_managed_worktree(&box_name, Path::new(d), local)?;
-                match local {
-                    true => self.refuse_other_workspace(Path::new(d)),
-                    false => Ok(()),
-                }
+        // The orchestrator's call as it was admitted; then, again with the repository git
+        // found (the top level, symlinks resolved), under the lock the thread is recorded with.
+        let admitted = bound.as_ref().map_or(Ok(()), |b| {
+            core.orchestrator_admitted("thread.new", Some(b)).map(drop)
+        });
+        let refused = admitted
+            .and_then(|()| {
+                [&workspace.repo, &workspace.worktree]
+                    .into_iter()
+                    .try_for_each(|d| {
+                        core.refuse_managed_worktree(&box_name, Path::new(d), local)?;
+                        match local {
+                            true => self.refuse_other_workspace(Path::new(d)),
+                            false => Ok(()),
+                        }
+                    })
             })
             // The account, as the registry has it now and as a start would check it.
             .and_then(|()| core.recheck_account(&account, &runtime, &box_name))

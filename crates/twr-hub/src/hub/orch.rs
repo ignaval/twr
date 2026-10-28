@@ -3209,10 +3209,29 @@ impl Core {
     /// runtime (`hub::model`), which then always goes on the confirm card: a user turn whose
     /// message is the user's latest, for a thread that existed (and the user had seen) when it
     /// arrived, once per thread per turn, not after the user changed that thread's mode since.
-    /// `relay_forbidden` otherwise.
-    pub(super) fn move_check(&self, thread: &str) -> Result<(), RpcError> {
+    /// With `bound` (the call as admitted, [`Core::orchestrator_admitted`]), that turn is the
+    /// one the call came in: one that ended since (another may have begun) has no say, nor
+    /// has a call that came in between turns. `relay_forbidden` otherwise.
+    pub(super) fn move_check(
+        &self,
+        thread: &str,
+        bound: Option<&super::withdraw::OrchCall>,
+    ) -> Result<(), RpcError> {
         let forbid = |m: String| Err(rpc(codes::RELAY_FORBIDDEN, m));
         let name = self.thread_name(thread);
+        if let Some(b) = bound {
+            let now = self.orch.turn.as_ref().map(|t| t.turn);
+            match b.turn {
+                None => return forbid("the orchestrator has no turn in progress".into()),
+                Some(t) if now != Some(t) => {
+                    return forbid(format!(
+                        "the turn this call came in has ended: it cannot move {name} to another \
+                         runtime; ask the user"
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
         let t = self.user_turn(&format!("move {name} to another runtime"))?;
         let Some(said) = t.said_after else {
             return forbid(format!(

@@ -76,6 +76,7 @@ use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 
 use super::switch::Switch;
+use super::withdraw::OrchCall;
 use super::{
     append_err, box_agents, internal, rpc, runtime_spec, twr_ext_map, Batch, Caller, Core, Hub,
     Inner,
@@ -165,7 +166,7 @@ impl Hub {
             ..Default::default()
         };
         let mut core = self.inner.core();
-        core.set_model_locked(&self.inner, query, &req, caller)
+        core.set_model_locked(&self.inner, query, &req, caller, None)
     }
 
     /// `thread.set_model {thread, runtime?, account?, outside_pin?, model?, effort?}`:
@@ -187,36 +188,68 @@ impl Hub {
     ///
     /// The result also has `account`, `previous_account` (names: the native account's current
     /// name for the native one) and `account_changed`.
+    ///
+    /// The orchestrator's call is bound to the orchestrator as it is when the call begins
+    /// ([`Hub::set_thread_model_bound`]).
     pub async fn set_thread_model(
         &self,
         query: &str,
         req: ModelRequest<'_>,
         caller: &Caller,
     ) -> Result<Value, RpcError> {
+        self.set_thread_model_bound(query, req, caller, None).await
+    }
+
+    /// [`Hub::set_thread_model`] of the orchestrator's call admitted as `bound`
+    /// ([`Hub::orchestrator_acts`]: the server's, as the request came in; `None`: the
+    /// orchestrator as it is now). A move that looks the thread's project up first is checked
+    /// again once the core is locked after the lookup, as admission checked it: refused
+    /// (`unauthorized`) when that orchestrator was replaced or restarted meanwhile, and
+    /// (`relay_forbidden`) when the user took its turn's message back. The `set_mode` gate of
+    /// its runtime move is that of the turn the call came in: refused when that turn ended
+    /// (another one may have begun meanwhile; its message is not this call's).
+    pub async fn set_thread_model_bound(
+        &self,
+        query: &str,
+        req: ModelRequest<'_>,
+        caller: &Caller,
+        bound: Option<&OrchCall>,
+    ) -> Result<Value, RpcError> {
         let moves = req.account.is_some() || req.runtime.is_some_and(|r| !r.trim().is_empty());
-        if !moves {
+        let (id, bound) = {
             let mut core = self.inner.core();
-            return core.set_model_locked(&self.inner, query, &req, caller);
-        }
-        let id = self.inner.core().resolve(query)?;
+            let bound = match caller.is_orchestrator() {
+                true => bound.cloned().or_else(|| core.orchestrator_call()),
+                false => None,
+            };
+            if !moves {
+                return core.set_model_locked(&self.inner, query, &req, caller, bound.as_ref());
+            }
+            (core.resolve(query)?, bound)
+        };
         self.look_up_pins_project(&id).await;
         let mut core = self.inner.core();
+        if let Some(b) = &bound {
+            core.orchestrator_admitted("thread.set_model", Some(b))?;
+        }
         // The thread looked up, by its id (which resolves to it alone).
         core.view(&id)?;
-        core.set_model_locked(&self.inner, &id, &req, caller)
+        core.set_model_locked(&self.inner, &id, &req, caller, bound.as_ref())
     }
 }
 
 impl Core {
     /// [`Hub::set_runtime_model`] under the core lock. The orchestrator's move to another
     /// runtime goes on the confirm card unless the thread's mode is restricted there (module
-    /// docs).
+    /// docs), its gate that of the turn of `bound` (the call as admitted, when known:
+    /// [`Core::move_check`]).
     fn set_model_locked(
         &mut self,
         hub: &Arc<Inner>,
         query: &str,
         req: &ModelRequest<'_>,
         caller: &Caller,
+        bound: Option<&OrchCall>,
     ) -> Result<Value, RpcError> {
         let change = self.model_change(hub, query, req, None, caller)?;
         let ModelChange {
@@ -243,7 +276,7 @@ impl Core {
             .filter(|s| s.runtime_changed && caller.is_orchestrator());
         if let Some(new) = runtime_move {
             if self.move_needs_card(&id, &new.spec.runtime) {
-                self.move_check(&id)?;
+                self.move_check(&id, bound)?;
                 let spec = req.runtime.map(str::trim).unwrap_or_default();
                 // The card's move names the account it was checked with, as `<runtime>:<account>`.
                 let spec = match req.account.map(str::trim).filter(|a| !a.is_empty()) {
