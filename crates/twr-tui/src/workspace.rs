@@ -443,7 +443,7 @@ impl AppState {
 
     /// Whether the tab strip is drawn: there are workspaces to switch to, and nothing else
     /// lists them: the workspace sidebar is not docked, and the compact layout, whose
-    /// Workspaces screen lists them, is not on.
+    /// Threads screen lists them, is not on.
     pub fn tabs_shown(&self) -> bool {
         self.switchable() && !self.ws_docked() && !self.compact()
     }
@@ -497,11 +497,39 @@ impl AppState {
         self.view.ws_drawer && self.workspace.is_some() && !self.compact() && !self.ws_docked()
     }
 
-    /// Whether the compact layout's Workspaces screen shows.
+    /// Whether the compact layout's Threads screen shows the workspaces, the current one's
+    /// cards nested under its card ([`crate::sidebar::Place::Screen`]): a TUI opened on a
+    /// workspace (not a socket).
     pub fn ws_screen(&self) -> bool {
         self.compact()
-            && self.view.compact_pane == crate::app::CompactPane::Workspaces
+            && self.workspace.is_some()
+            && self.view.compact_pane == crate::app::CompactPane::Threads
             && self.view.screen != Screen::Decisions
+    }
+
+    /// The workspace the sidebar and the compact Threads screen keep in view when they cut
+    /// workspaces ([`crate::sidebar::Dock`]): the one the keys or a tap on `more` chose, while
+    /// it is listed; else the current one's neighbors are kept.
+    pub fn ws_anchor(&self) -> Option<WsRow> {
+        self.view
+            .ws_sel
+            .clone()
+            .filter(|r| matches!(r, WsRow::Workspace(n) if self.tabs.iter().any(|t| &t.name == n)))
+    }
+
+    /// The workspace's card or the button the keys select on that screen, while no thread's
+    /// card is: the arrows move from the cards to the workspaces and back
+    /// ([`AppState::ws_screen_key`]).
+    pub fn ws_keyed(&self) -> Option<WsRow> {
+        let listed = |r: &WsRow| match r {
+            WsRow::Workspace(name) => self.tabs.iter().any(|t| &t.name == name),
+            WsRow::New | WsRow::Settings => true,
+        };
+        self.view
+            .ws_sel
+            .clone()
+            .filter(listed)
+            .filter(|_| self.view.focus.is_none())
     }
 
     /// The instance label the views draw (`[name]`): none while the tab strip or the
@@ -556,7 +584,7 @@ impl AppState {
     }
 
     /// Ctrl-T, `/spaces`, a tap on the tab strip's `≡` or the sidebar's `‹`: in the compact
-    /// layout, the Workspaces screen (or back to the conversation from it); where the sidebar
+    /// layout, the Threads screen, which lists them (or back to the conversation from it); where the sidebar
     /// docks, shows or hides it (kept across runs); on a narrower screen, opens or closes the
     /// drawer.
     pub fn toggle_workspaces(&mut self) -> Vec<Action> {
@@ -566,14 +594,15 @@ impl AppState {
             return Vec::new();
         }
         if self.compact() {
-            // From the decisions overlay, which hides every screen: to the Workspaces one.
+            // From the decisions overlay, which hides every screen: to the Threads one, which
+            // lists the workspaces.
             let pane = if self.view.screen == Screen::Decisions {
                 self.toggle_decisions();
-                crate::app::CompactPane::Workspaces
-            } else if self.view.compact_pane == crate::app::CompactPane::Workspaces {
+                crate::app::CompactPane::Threads
+            } else if self.view.compact_pane == crate::app::CompactPane::Threads {
                 crate::app::CompactPane::Chat
             } else {
-                crate::app::CompactPane::Workspaces
+                crate::app::CompactPane::Threads
             };
             self.show_pane(pane);
             return Vec::new();
@@ -586,7 +615,7 @@ impl AppState {
     }
 
     /// `/spaces on|off`: the workspace sidebar shown or hidden (kept across runs), and where it
-    /// does not dock, its drawer (or the compact Workspaces screen) opened or closed with it.
+    /// does not dock, its drawer (or the compact Threads screen) opened or closed with it.
     pub fn spaces(&mut self, on: Option<bool>) -> Vec<Action> {
         let Some(on) = on else {
             return self.toggle_workspaces();
@@ -604,7 +633,7 @@ impl AppState {
             let shown = self.ws_screen();
             if on != shown {
                 self.show_pane(if on {
-                    crate::app::CompactPane::Workspaces
+                    crate::app::CompactPane::Threads
                 } else {
                     crate::app::CompactPane::Chat
                 });
@@ -673,23 +702,70 @@ impl AppState {
         Some(Vec::new())
     }
 
-    /// The compact layout's Workspaces screen's keys, on an empty line: ↑↓ select a row,
-    /// Enter acts on it. `None` for the rest.
+    /// The compact Threads screen's keys with the workspaces on it ([`AppState::ws_screen`]),
+    /// on an empty line: ↑↓ step through what it lists, as drawn: each workspace's card, the
+    /// current one's followed by its threads' cards, then the buttons ([`AppState::ws_keyed`]
+    /// on a workspace or a button, the selected card on a thread). Enter on a workspace or a
+    /// button acts on it; on a card it goes on to open its popup, as anywhere. `None` for the
+    /// rest.
     pub(crate) fn ws_screen_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !self.ws_screen() || !self.view.input.is_empty() {
             return None;
         }
         let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         match key.code {
-            KeyCode::Up if plain => self.step_ws_sel(-1),
-            KeyCode::Down if plain => self.step_ws_sel(1),
+            KeyCode::Up if plain => self.step_screen(-1),
+            KeyCode::Down if plain => self.step_screen(1),
             KeyCode::Enter if key.modifiers.is_empty() => {
-                let row = self.ws_selected()?;
+                let row = self.ws_keyed()?;
                 return Some(self.ws_activate(row));
             }
             _ => return None,
         }
         Some(Vec::new())
+    }
+
+    /// Moves the compact Threads screen's selection `delta` rows through the workspaces, the
+    /// current one's cards and the buttons ([`AppState::ws_screen_key`]), stopping at its
+    /// ends. With nothing selected it starts from the current workspace's card.
+    fn step_screen(&mut self, delta: isize) {
+        let cards = self.compact_threads();
+        let mut rows: Vec<Result<WsRow, String>> = Vec::new();
+        let mut nested = false;
+        for tab in &self.tabs {
+            rows.push(Ok(WsRow::Workspace(tab.name.clone())));
+            if self.workspace.as_deref() == Some(tab.name.as_str()) {
+                rows.extend(cards.iter().cloned().map(Err));
+                nested = true;
+            }
+        }
+        if !nested {
+            rows.extend(cards.iter().cloned().map(Err));
+        }
+        rows.push(Ok(WsRow::New));
+        rows.push(Ok(WsRow::Settings));
+        let at = match (self.ws_keyed(), self.view.focus.clone()) {
+            (Some(row), _) => rows.iter().position(|r| r.as_ref() == Ok(&row)),
+            (None, Some(card)) => rows.iter().position(|r| r.as_ref() == Err(&card)),
+            (None, None) => None,
+        }
+        .or_else(|| {
+            let current = WsRow::Workspace(self.workspace.clone()?);
+            rows.iter().position(|r| r.as_ref() == Ok(&current))
+        })
+        .unwrap_or(0);
+        let to = at.saturating_add_signed(delta).min(rows.len() - 1);
+        match rows[to].clone() {
+            Ok(row) => {
+                self.set_focus(None);
+                self.view.ws_sel = Some(row);
+            }
+            Err(card) => {
+                self.view.ws_sel = None;
+                self.view.main_focus = false;
+                self.set_focus(Some(card));
+            }
+        }
     }
 
     /// Enter on a row of the workspace list, or a tap on it: a workspace's card switches to

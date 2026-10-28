@@ -51,7 +51,8 @@ pub const EMPTY_STATE: &str = "no worker threads — /new <project>, or ask the 
 
 /// Width of the side column of cards at terminal width `width`.
 pub fn side_width(width: u16) -> u16 {
-    (width * 3 / 10).clamp(34, 48)
+    let side = (u32::from(width) * 3 / 10).clamp(34, 48);
+    u16::try_from(side).unwrap_or(48)
 }
 
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
@@ -105,19 +106,24 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     // it covers a view. The workspaces are drawn after the overlays, which stay right of
     // them: their cards stay on screen and tappable, as the strip's tabs do.
     let dock_width = state.dock_width_at(body.width);
-    let (dock, body) = if dock_width > 0 && body.width > dock_width {
+    let (mut dock, body) = if dock_width > 0 && body.width > dock_width {
         let [dock, rest] =
             Layout::horizontal([Constraint::Length(dock_width), Constraint::Min(0)]).areas(body);
         let cards = state.cards_docked_at(area.width);
-        let dock = crate::sidebar::Dock::new(state, dock, cards, |w| column_needed(state, w));
+        let dock =
+            crate::sidebar::Dock::new(state, dock, crate::sidebar::Place::Docked, cards, |w| {
+                column_needed(state, w)
+            });
         (Some(dock), rest)
     } else {
         (None, body)
     };
-    let docked = dock
-        .as_ref()
-        .and_then(|d| d.cards)
-        .map(|cards| render_card_column(frame, cards, state, &mut panes));
+    let docked = dock.as_mut().and_then(|d| {
+        let cards = d.cards?;
+        let noted = render_card_column(frame, cards, state, &mut panes);
+        d.fit_cards(state, cards_bottom(&mut panes, cards));
+        Some(noted)
+    });
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
         // A phone: one screen at a time.
@@ -420,7 +426,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     (
         "Ctrl-T",
         "show or hide the workspaces in the sidebar (/spaces); on a narrower screen open them \
-         as a drawer (↑↓ Enter, Esc closes), in the compact layout the Workspaces screen",
+         as a drawer (↑↓ Enter, Esc closes), in the compact layout the Threads screen, which \
+         lists them",
     ),
     (
         "Ctrl-F",
@@ -512,7 +519,7 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
         "controls",
         "a workspace's card in the sidebar, or a thread under another workspace's card, \
          switches to it, + New workspace asks for a name, ⚙ Settings opens the settings, the \
-         sidebar's ‹ hides the workspaces and the tab strip's ≡ shows them; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
+         sidebar's ‹ hides the workspaces and the tab strip's ≡ shows them; the Chat, Needs you and Threads tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
@@ -554,8 +561,9 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread), Threads (the cards) and Workspaces, switched with /c, \
-         /n, /t and /w or a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter \
+         Needs you (a line per thread) and Threads (the workspaces, the current one's cards \
+         nested under it, the others' threads a row each), switched with /c, /n and /t (/w) or \
+         a tap on their tabs; ↑↓ on an empty line pick a row, a workspace or a card, Enter \
          opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
@@ -1029,16 +1037,13 @@ fn render_stack(
 }
 
 /// The compact layout (a phone): a tab bar naming its screens, `Chat · Needs you 2 · Threads`,
-/// the current one highlighted ([`render_tab_bar`]), over that screen: the conversation alone,
-/// what needs the user (one line per thread), or the threads' cards, each list with the input
-/// box and status bar under it.
+/// the current one highlighted ([`render_tab_bar`]), a row tall, over that screen: the
+/// conversation alone, what needs the user (one line per thread), or the threads' cards
+/// (nested under the current workspace's card among the workspaces', [`render_compact_threads`]),
+/// each list with the input box and status bar under it.
 fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
-    let [bar, rest] = Layout::vertical([
-        Constraint::Length(tab_bar_height(area.height)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     render_tab_bar(frame, bar, state, panes);
     let pane = state.view.compact_pane;
     if pane == CompactPane::Chat {
@@ -1054,41 +1059,19 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
-    } else if pane == CompactPane::Workspaces {
-        crate::sidebar::render_screen(frame, list, state, panes);
     } else {
-        render_compact_cards(frame, list, state, panes);
+        render_compact_threads(frame, list, state, panes);
     }
     render_input(frame, input, state, panes);
     render_status(frame, status, state, panes, None);
 }
 
-/// Rows of the compact layout's tab bar on a screen `height` rows tall: 3 (its names on the
-/// middle one) from [`TAB_BAR_TALL_FROM`] rows, 2 from [`TAB_BAR_SHORT_FROM`] (a phone with its
-/// keyboard up has about 20), and 1 on a shorter one, which keeps its rows for the screen
-/// itself.
-pub fn tab_bar_height(height: u16) -> u16 {
-    if height >= TAB_BAR_TALL_FROM {
-        3
-    } else if height >= TAB_BAR_SHORT_FROM {
-        2
-    } else {
-        1
-    }
-}
-
-/// From this many rows the compact layout's tab bar is 3 rows tall ([`tab_bar_height`]).
-pub const TAB_BAR_TALL_FROM: u16 = 24;
-/// From this many rows (and up to [`TAB_BAR_TALL_FROM`]) it is 2 rows tall.
-pub const TAB_BAR_SHORT_FROM: u16 = 14;
-
-/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2`, `Threads` and, when the TUI
-/// can switch workspaces, `Workspaces` (`⚠2`: what waits on the user in the others), each a
-/// filled tab an equal share of the width wide and the bar's height tall, its name centered
-/// (`Needs 2`, `Spaces`, then cut, where it does not fit), the current one reversed and bold,
-/// `Needs you` and `Workspaces` yellow while something waits. A tap anywhere in a tab's share
-/// (the gap after it included) shows its screen, as `/c`, `/n`, `/t` and `/w` do: the whole bar
-/// is tappable.
+/// The compact layout's tab bar over `bar` (a row): `Chat`, `Needs you 2` and `Threads` (`⚠2`:
+/// what waits on the user in the other workspaces, which it lists too), each a filled tab an
+/// equal share of the width wide, its name centered (`Needs 2`, `Thr ⚠2`, then cut, where it
+/// does not fit), the current one reversed and bold, `Needs you` and `Threads` yellow while
+/// something waits. A tap anywhere in a tab's share (the gap after it included) shows its
+/// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
 fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let pane = state.view.compact_pane;
@@ -1104,26 +1087,19 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             (CompactPane::Needs, "Needs you".into(), "Needs".into())
         },
-        (CompactPane::Threads, "Threads".into(), "Threads".into()),
     ];
-    // The workspaces, with what waits on the user in the others (a TUI opened on a socket
-    // has none to show).
+    // The threads, with what waits on the user in the other workspaces it lists (a TUI opened
+    // on a socket has none).
     let elsewhere = other_waiting(state);
-    if state.workspace.is_some() {
-        names.push(if elsewhere > 0 {
-            (
-                CompactPane::Workspaces,
-                format!("Workspaces ⚠{elsewhere}"),
-                format!("Spaces ⚠{elsewhere}"),
-            )
-        } else {
-            (
-                CompactPane::Workspaces,
-                "Workspaces".into(),
-                "Spaces".into(),
-            )
-        });
-    }
+    names.push(if elsewhere > 0 {
+        (
+            CompactPane::Threads,
+            format!("Threads ⚠{elsewhere}"),
+            format!("Thr ⚠{elsewhere}"),
+        )
+    } else {
+        (CompactPane::Threads, "Threads".into(), "Threads".into())
+    });
     panes.add(PaneId::Text, bar);
     // Fixed 256-color values, like the header band's ([`target_fill`]): legible on dark and
     // light terminals alike. Without colors, unfilled: a fill is drawn reversed then
@@ -1151,7 +1127,7 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         let style = if *p == pane {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else if (*p == CompactPane::Needs && needs > 0)
-            || (*p == CompactPane::Workspaces && elsewhere > 0)
+            || (*p == CompactPane::Threads && elsewhere > 0)
         {
             off.fg(Color::Indexed(220)).add_modifier(Modifier::BOLD)
         } else {
@@ -1165,10 +1141,8 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             truncate_cells(short, room)
         };
-        let mut rows = vec![Line::default(); usize::from(tab.height.saturating_sub(1) / 2)];
-        rows.push(Line::from(label));
         frame.render_widget(
-            Paragraph::new(rows)
+            Paragraph::new(Line::from(label))
                 .alignment(Alignment::Center)
                 .style(style),
             tab,
@@ -1187,10 +1161,61 @@ fn other_waiting(state: &AppState) -> usize {
         .sum()
 }
 
-/// The compact layout's Threads screen: the threads' cards, as the stack view draws them, in a
-/// column as wide as the screen ([`render_column`]), the orchestrator's first while it asks.
-/// Scrolled like the column, by the wheel, else as little as the selection takes; a tap
-/// selects a card, and a tap on the selected one opens its action popup.
+/// The compact layout's Threads screen over `area`: in a TUI opened on a workspace, laid out as
+/// the sidebar is ([`crate::sidebar::Dock`], [`crate::sidebar::Place::Screen`]): each
+/// workspace's card, the current one's cards nested under it ([`render_compact_cards`]), the
+/// others' threads a row each, the buttons under them; on a socket, the cards alone.
+fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
+    use crate::sidebar::{Dock, Place};
+    let mut dock = Dock::new(state, area, Place::Screen, true, |w| {
+        compact_needed(state, w)
+    });
+    if let Some(cards) = dock.cards {
+        render_compact_cards(frame, cards, state, panes);
+        dock.fit_cards(state, cards_bottom(panes, cards));
+    }
+    dock.render(frame, state, panes);
+}
+
+/// The row after the last card drawn in the column over `area`, which the list of cards then
+/// takes up to ([`crate::sidebar::Dock::fit_cards`]); its bottom when anything else is drawn
+/// there (the empty pane, the note on hidden parked threads), which keeps its rows.
+fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
+    let mut bottom = area.y;
+    for p in panes.panes.iter().filter(|p| p.area.intersects(area)) {
+        match p.id {
+            // (A card's pane is its inside: its bottom border is the row under it.)
+            PaneId::Thread(_) => bottom = bottom.max(p.area.bottom() + 1),
+            _ => return area.bottom(),
+        }
+    }
+    let bottom = bottom.min(area.bottom());
+    if let Some(list) = panes.list.as_mut().filter(|l| l.area == area) {
+        list.area.height = bottom - area.y;
+    }
+    bottom
+}
+
+/// The rows the compact Threads screen's cards ([`render_compact_cards`]) take `width` columns
+/// wide when they all show, or its empty note's.
+fn compact_needed(state: &AppState, width: u16) -> u16 {
+    let order = state.compact_threads();
+    if order.is_empty() {
+        return u16::try_from(wrap(EMPTY_STATE, usize::from(width).max(1)).len()).unwrap_or(1);
+    }
+    let layout = ListLayout::Compact(crate::app::CompactPane::Threads);
+    let mut scratch = Panes::default();
+    let rows: u32 = order
+        .iter()
+        .map(|id| u32::from(card_height(state, &mut scratch, id, layout, width)))
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// The compact layout's Threads screen's cards: as the stack view draws them, in a column as
+/// wide as `area` ([`render_column`]), the orchestrator's first while it asks. Scrolled like
+/// the column, by the wheel, else as little as the selection takes; a tap selects a card, and
+/// a tap on the selected one opens its action popup.
 fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let order = state.compact_threads();
@@ -13276,26 +13301,18 @@ mod tests {
         }
     }
 
-    /// The compact layout's tab bar is 3 rows tall from [`TAB_BAR_TALL_FROM`] rows, 2 from
-    /// [`TAB_BAR_SHORT_FROM`] (a phone with its keyboard up, about 20) and 1 on a shorter
-    /// screen; each name is centered in its third of the width, on the middle row (the first
-    /// of two), the current one reversed. Where `Needs you 2` does not fit its third, it says
-    /// `Needs 2`; the screen under the bar keeps the rest.
+    /// The compact layout's tab bar is a row tall on any screen, so the screen under it keeps
+    /// the rest; each name is centered in its third of the width, the current one reversed.
+    /// Where `Needs you 2` does not fit its third, it says `Needs 2`.
     #[test]
     fn the_compact_tab_bar_fits_the_screen() {
-        assert_eq!(tab_bar_height(40), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM - 1), 2);
-        assert_eq!(tab_bar_height(20), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM - 1), 1);
-        assert_eq!(tab_bar_height(8), 1);
-        for (w, h, rows, names) in [
-            (40u16, 30u16, 3u16, ["Chat", "Needs you 2", "Threads"]),
-            (40, 20, 2, ["Chat", "Needs you 2", "Threads"]),
-            (40, 12, 1, ["Chat", "Needs you 2", "Threads"]),
-            (30, 20, 2, ["Chat", "Needs 2", "Threads"]),
-            (59, 20, 2, ["Chat", "Needs you 2", "Threads"]),
+        let rows = 1u16;
+        for (w, h, names) in [
+            (40u16, 30u16, ["Chat", "Needs you 2", "Threads"]),
+            (40, 20, ["Chat", "Needs you 2", "Threads"]),
+            (40, 12, ["Chat", "Needs you 2", "Threads"]),
+            (30, 20, ["Chat", "Needs 2", "Threads"]),
+            (59, 20, ["Chat", "Needs you 2", "Threads"]),
         ] {
             let mut st = crate::app::tests::three_threads();
             st.view.compact_width = 60;
@@ -13303,7 +13320,7 @@ mod tests {
             let buf = crate::app::tests::draw(&mut st, w, h);
             let lines = buffer_lines(&buf);
             let what = format!("{w}x{h}:\n{}", screen(&lines));
-            let middle = usize::from((rows - 1) / 2);
+            let middle = 0;
             let words: Vec<&str> = lines[middle].split_whitespace().collect();
             assert_eq!(words.join(" "), names.join(" "), "{what}");
             // Centered in its tab: its third of the width, but the column after it (the last

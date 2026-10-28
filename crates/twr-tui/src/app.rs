@@ -130,10 +130,10 @@ pub enum CompactPane {
     Chat,
     /// What waits on the user, one line per item; Enter opens one in its action popup.
     Needs,
-    /// The threads, one per line.
+    /// The threads' cards; in a TUI opened on a workspace, nested under its card among the
+    /// other workspaces', which list their threads, and the buttons under them
+    /// ([`crate::sidebar::Place::Screen`]).
     Threads,
-    /// The workspaces, a card each, and the buttons under them ([`crate::sidebar`]).
-    Workspaces,
 }
 
 /// A row of the workspace list the keys select (in its drawer and the compact layout's
@@ -3924,11 +3924,9 @@ impl AppState {
 
     /// Shows compact screen `pane`, its list's selection kept when it is in it.
     pub(crate) fn show_pane(&mut self, pane: CompactPane) {
-        if pane == CompactPane::Workspaces {
-            // Its selection starts on the current workspace.
+        if pane == CompactPane::Threads {
+            // No workspace's card selected: the arrows start from the current one.
             self.view.ws_sel = None;
-            self.view.ws_scroll = 0;
-            self.view.ws_wheeled = false;
         }
         self.view.compact_pane = pane;
         self.view.action = None;
@@ -4156,8 +4154,6 @@ impl AppState {
             match self.view.compact_pane {
                 CompactPane::Needs => return self.needs_order(),
                 CompactPane::Threads => return self.compact_threads(),
-                // Its rows are workspaces, which the keys select apart from the cards.
-                CompactPane::Workspaces => return Vec::new(),
                 CompactPane::Chat => {}
             }
         }
@@ -5145,10 +5141,6 @@ impl AppState {
                     "full layout (/compact on: one screen at a time)".into()
                 });
                 self.ensure_focus();
-            }
-            Slash::Pane(crate::app::CompactPane::Workspaces) if self.workspace.is_none() => {
-                self.view.status =
-                    Some("workspaces: not here (this TUI was opened on a socket)".into());
             }
             Slash::Pane(pane) => {
                 if self.compact() {
@@ -8023,6 +8015,13 @@ impl AppState {
             }
             Target::Close => return self.close_top(),
             Target::Workspace(name) => return self.ws_activate(WsRow::Workspace(name)),
+            // Brought into view: chosen as the keys would, the cards' selection let go there.
+            Target::WsMore(name) => {
+                if self.ws_screen() {
+                    self.set_focus(None);
+                }
+                self.view.ws_sel = Some(WsRow::Workspace(name));
+            }
             Target::NewWorkspace => return self.ws_activate(WsRow::New),
             Target::Settings => return self.ws_activate(WsRow::Settings),
             Target::WsSidebar => return self.toggle_workspaces(),
@@ -9147,7 +9146,7 @@ pub(crate) mod tests {
         st.view.compact_width = 60;
         let lines = rows(&mut st, 50, 24);
         assert!(st.compact());
-        let names: Vec<&str> = lines[1].split_whitespace().collect();
+        let names: Vec<&str> = lines[0].split_whitespace().collect();
         assert_eq!(
             names,
             ["Chat", "Needs", "you", "2", "Threads"],
@@ -9192,7 +9191,8 @@ pub(crate) mod tests {
         assert_eq!(st.focused(), Some("t-gamma"));
         let text = rows(&mut st, 50, 24).join("\n");
         assert!(text.contains("┏ proj · gamma "), "{text}");
-        assert!(text.contains("↑ 2 more"), "{text}");
+        // (The one-row tab bar leaves alpha room above it.)
+        assert!(text.contains("↑ 1 more"), "{text}");
         // The conversation: Enter on its empty line opens the oldest item waiting.
         type_line(&mut st, "/c");
         rows(&mut st, 50, 24);
@@ -9435,9 +9435,9 @@ pub(crate) mod tests {
         type_line(&mut st, "/compact on");
         let lines = rows(&mut st, 120, 30);
         assert!(st.compact());
-        // The tab bar's names, on its middle row.
+        // The tab bar's names, on its row.
         assert!(
-            lines[1].contains("Chat") && lines[1].contains("Needs you 2"),
+            lines[0].contains("Chat") && lines[0].contains("Needs you 2"),
             "{lines:#?}"
         );
         type_line(&mut st, "/compact off");
@@ -22111,12 +22111,12 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone, the tab bar switches screens: every cell of its rows (3 on a tall
-        /// screen, 2 at 40x20, 1 on a short one) is the tab of the third of the width it is
-        /// in, the gap after a tab included, and a tap anywhere in it shows that screen.
+        /// On a phone, the tab bar switches screens: every cell of its row (a row on any
+        /// screen) is the tab of the third of the width it is in, the gap after a tab
+        /// included, and a tap anywhere in it shows that screen.
         #[test]
         fn the_compact_tab_bar_switches_screens_by_thirds() {
-            for (w, h, rows) in [(40u16, 20u16, 2u16), (40, 30, 3), (40, 12, 1), (30, 20, 2)] {
+            for (w, h, rows) in [(40u16, 20u16, 1u16), (40, 30, 1), (40, 12, 1), (30, 20, 1)] {
                 let mut st = compact();
                 frame(&mut st, w, h);
                 assert!(st.compact(), "{w}x{h}");

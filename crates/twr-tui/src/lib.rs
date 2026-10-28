@@ -1856,14 +1856,6 @@ async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<wor
         let hello = c.hello(json!({ "client": CLIENT_NAME })).await?;
         check_hub_workspace(&hello, name, socket)?;
         match c.call("hub.glance", Value::Null).await {
-            // A hub that predates its `workers` names them in `thread.list`, read-only too.
-            // (Its counts stand without them.)
-            Ok(mut g) if g.is_object() && g["workers"].is_null() => {
-                if let Ok(threads) = c.call("thread.list", Value::Null).await {
-                    g["workers"] = threads;
-                }
-                anyhow::Ok(Ok(g))
-            }
             Ok(g) => anyhow::Ok(Ok(g)),
             Err(e)
                 if e.downcast_ref::<twr_core::proto::RpcError>()
@@ -1877,9 +1869,19 @@ async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<wor
         }
     })
     .await;
-    let Ok(Ok(answer)) = answer else {
+    let Ok(Ok(mut answer)) = answer else {
         return (TabHub::Busy, None);
     };
+    // A hub that predates the glance's `workers` names them in `thread.list`, read-only too,
+    // asked on a clock of its own: its glance stands without them.
+    if let Ok(g) = &mut answer {
+        if g.is_object() && g["workers"].is_null() {
+            let list = tokio::time::timeout(TAB_TIMEOUT, c.call("thread.list", Value::Null)).await;
+            if let Ok(Ok(threads)) = list {
+                g["workers"] = threads;
+            }
+        }
+    }
     let count = |v: &Value| {
         v.as_u64()
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))

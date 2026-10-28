@@ -23,7 +23,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use twr_core::reduce::ThreadStatus;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::app::{AppState, WsRow};
 use crate::icon;
@@ -60,10 +60,10 @@ type ListRow = (Line<'static>, Option<WsRow>);
 /// [`NEST`] under the current workspace's card when the workspaces are too (`ws`); the
 /// workspaces alone [`DOCK_WIDTH`]; 0 for neither.
 pub fn dock_width(width: u16, cards: bool, ws: bool) -> u16 {
-    let side = crate::ui::side_width(width) + 1;
+    let side = || crate::ui::side_width(width) + 1;
     match (cards, ws) {
-        (true, true) => side + NEST,
-        (true, false) => side,
+        (true, true) => side() + NEST,
+        (true, false) => side(),
         (false, true) => DOCK_WIDTH,
         (false, false) => 0,
     }
@@ -73,14 +73,22 @@ pub fn dock_width(width: u16, cards: bool, ws: bool) -> u16 {
 /// need the room ([`Dock::new`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Detail {
-    /// Its name, its status, its orchestrator's reply and its threads ([`WORKER_ROWS`]).
+    /// Its name, its status, its orchestrator's reply and its threads ([`WORKER_ROWS`]), a
+    /// blank row after it.
     Full,
-    /// Its name, its status and fewer threads ([`WORKER_ROWS_SHORT`]).
+    /// Its name, its status and fewer threads ([`WORKER_ROWS_SHORT`]), a blank row after it.
     Short,
-    /// Its name and its status.
-    Status,
+    /// Its name and those threads (its name row says how it is, in brief).
+    Threads,
     /// Its name.
     Name,
+}
+
+impl Detail {
+    /// Whether a blank row follows the card.
+    fn spaced(self) -> bool {
+        matches!(self, Detail::Full | Detail::Short)
+    }
 }
 
 /// The sidebar over `area` (its right column a border), laid out before anything is drawn, so
@@ -96,10 +104,18 @@ enum Detail {
 /// at last, a row each still too many, the ones furthest from the current workspace give way
 /// to `↑ more` / `↓ more`. Without the cards in the column, the workspaces are a list that
 /// scrolls on its own ([`render_list`]); without the workspaces, the column is the cards.
+///
+/// The compact layout's Threads screen is laid out the same way ([`Place::Screen`]): the
+/// whole screen, without the border and the header, the cards always on it, a workspace's
+/// card or a button the keys select there ([`AppState::ws_keyed`]) filled.
 #[derive(Debug, Clone)]
 pub struct Dock {
     /// The column, its border included.
     area: Rect,
+    /// Where it is.
+    place: Place,
+    /// The row the keys select, on the compact screen.
+    keyed: Option<WsRow>,
     /// The workspaces' header row.
     header: Option<Rect>,
     /// The workspaces as a list of their own ([`render_list`]), without the cards.
@@ -112,37 +128,75 @@ pub struct Dock {
     pub cards: Option<Rect>,
     /// The buttons under the workspaces.
     buttons: Option<Rect>,
+    /// The `↑ more` / `↓ more` rows where workspaces were cut, each with the workspace a tap
+    /// brings into view ([`Target::WsMore`]).
+    more: Vec<(Rect, String)>,
+    /// How much of the workspaces' cards after the current one shows ([`Dock::fit_cards`]),
+    /// and the rows they are drawn on (`None`: they were cut, and stay as laid out).
+    after: Option<(Detail, Rect)>,
+}
+
+/// Where a [`Dock`] is laid out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    /// The sidebar left of the views: a border on its right, a header when it has the
+    /// workspaces ([`AppState::ws_docked`]).
+    Docked,
+    /// The compact layout's Threads screen: all of it, the workspaces on it when the TUI shows
+    /// workspaces (not opened on a socket).
+    Screen,
 }
 
 impl Dock {
-    /// The sidebar over `area`, the cards in it when `cards` ([`AppState::cards_docked`]),
-    /// `needed(width)` the rows the cards take at that width when they all show.
-    pub fn new(state: &AppState, area: Rect, cards: bool, needed: impl FnOnce(u16) -> u16) -> Dock {
-        let inner = Rect {
-            width: area.width.saturating_sub(1),
-            ..area
+    /// The sidebar over `area` (or the compact Threads screen, `place`), the cards in it when
+    /// `cards` ([`AppState::cards_docked`]), `needed(width)` the rows the cards take at that
+    /// width when they all show.
+    pub fn new(
+        state: &AppState,
+        area: Rect,
+        place: Place,
+        cards: bool,
+        needed: impl FnOnce(u16) -> u16,
+    ) -> Dock {
+        let (inner, ws) = match place {
+            Place::Docked => (
+                Rect {
+                    width: area.width.saturating_sub(1),
+                    ..area
+                },
+                state.ws_docked(),
+            ),
+            Place::Screen => (area, state.workspace.is_some()),
         };
         let mut dock = Dock {
             area,
+            place,
+            keyed: (place == Place::Screen).then(|| state.ws_keyed()).flatten(),
             header: None,
             list: None,
             rows: Vec::new(),
             marks: None,
             cards: None,
             buttons: None,
+            more: Vec::new(),
+            after: None,
         };
-        if !state.ws_docked() {
+        if !ws {
             dock.cards = cards.then_some(inner).filter(|r| !r.is_empty());
             return dock;
         }
         if inner.width < 3 || inner.height < 2 {
             return dock;
         }
-        dock.header = Some(Rect { height: 1, ..inner });
-        let list = Rect {
-            y: inner.y + 1,
-            height: inner.height - 1,
-            ..inner
+        let list = if place == Place::Docked {
+            dock.header = Some(Rect { height: 1, ..inner });
+            Rect {
+                y: inner.y + 1,
+                height: inner.height - 1,
+                ..inner
+            }
+        } else {
+            inner
         };
         if !cards {
             dock.list = Some(list);
@@ -159,33 +213,41 @@ impl Dock {
         let cards_w = list.width.saturating_sub(NEST);
         let needed = usize::from(needed(cards_w));
         let want = needed.min(avail * CARDS_SHARE.0 / CARDS_SHARE.1);
-        let mut laid = groups(state, width, Detail::Full);
-        for detail in [Detail::Short, Detail::Status, Detail::Name] {
+        let keyed = dock.keyed.as_ref();
+        let mut detail = Detail::Full;
+        let mut laid = groups(state, width, &|_| detail, keyed);
+        for less in [Detail::Short, Detail::Threads, Detail::Name] {
             if avail >= laid.len() + want {
                 break;
             }
-            laid = groups(state, width, detail);
+            detail = less;
+            laid = groups(state, width, &|_| detail, keyed);
         }
         let Groups {
             mut before,
-            current,
+            mut current,
             mut after,
         } = laid;
+        // (Its name row at least, as the rows allow.)
+        current.truncate(avail);
         let fixed = before.len() + current.len() + after.len();
         let room = avail.saturating_sub(fixed);
-        let region = if room >= want {
-            needed.min(room)
+        let clipped = fixed + want > avail;
+        let (region, cut) = if !clipped {
+            (needed.min(room), Cut::default())
         } else {
             // Still too many rows: the cards get their share, the current workspace's card
-            // its own rows, and the others what is left, those nearest it first.
+            // its own rows, and the others what is left, those nearest it first, or the one
+            // the keys or a tap on `more` chose ([`AppState::ws_anchor`]).
             let region = want.min(avail.saturating_sub(current.len()));
-            clip(
+            let cut = clip(
                 &mut before,
                 &mut after,
-                avail - region - current.len(),
+                avail.saturating_sub(region + current.len()),
                 width,
+                state.ws_anchor().as_ref(),
             );
-            region
+            (region, cut)
         };
         let mut y = list.y;
         let mut place = |rows: Vec<ListRow>, y: &mut u16| {
@@ -203,8 +265,94 @@ impl Dock {
             dock.marks = Some(Rect::new(list.x, y, 1, region));
         }
         y += region;
+        let after_y = y;
         place(after, &mut y);
+        if !clipped {
+            let height = (list.bottom() - buttons_h).saturating_sub(after_y);
+            dock.after = Some((detail, Rect::new(list.x, after_y, list.width, height)));
+        }
+        // The rows where workspaces were cut, before the cards and after them.
+        let row = |top: u16, i: usize| {
+            let y = top.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+            Rect::new(list.x, y, list.width, 1).intersection(list)
+        };
+        for (i, name) in cut.before {
+            dock.more.push((row(list.y, i), name));
+        }
+        for (i, name) in cut.after {
+            dock.more.push((row(after_y, i), name));
+        }
         dock
+    }
+
+    /// Gives back the rows the nested cards left blank under them (the next card did not fit
+    /// whole): the workspaces under the cards move up, and the current workspace's mark stops
+    /// with them. `bottom`: the row after the last one the cards were drawn on.
+    ///
+    /// The workspaces after the current one then show as much as those rows allow: their
+    /// replies and threads back, when the room the cards wanted had taken them.
+    pub fn fit_cards(&mut self, state: &AppState, bottom: u16) {
+        let (Some(cards), Some(marks)) = (self.cards.as_mut(), self.marks.as_mut()) else {
+            return;
+        };
+        let end = cards.bottom();
+        let shift = end - bottom.clamp(cards.y, end);
+        if shift == 0 {
+            return;
+        }
+        cards.height -= shift;
+        marks.height -= shift;
+        for (r, _) in &mut self.rows {
+            if r.y >= end {
+                r.y -= shift;
+            }
+        }
+        let Some((uniform, rows)) = self.after else {
+            return;
+        };
+        let rows = Rect {
+            y: rows.y - shift,
+            height: rows.height + shift,
+            ..rows
+        };
+        let room = usize::from(rows.height);
+        let width = usize::from(rows.width);
+        let keyed = self.keyed.as_ref();
+        // Nearest first, each workspace after the current one shows the most the rows left
+        // allow.
+        let at = state
+            .tabs
+            .iter()
+            .position(|t| state.workspace.as_deref() == Some(t.name.as_str()));
+        let mut levels: HashMap<String, Detail> = HashMap::new();
+        let level = |levels: &HashMap<String, Detail>, t: &Tab| {
+            levels.get(&t.name).copied().unwrap_or(uniform)
+        };
+        for tab in state.tabs.iter().skip(at.map_or(usize::MAX, |a| a + 1)) {
+            for richer in [Detail::Full, Detail::Short, Detail::Threads] {
+                if richer >= level(&levels, tab) {
+                    break;
+                }
+                let mut trial = levels.clone();
+                trial.insert(tab.name.clone(), richer);
+                let rows = groups(state, width, &|t| level(&trial, t), keyed).after;
+                if rows.len() <= room {
+                    levels = trial;
+                    break;
+                }
+            }
+        }
+        if levels.is_empty() {
+            return;
+        }
+        let after = groups(state, width, &|t| level(&levels, t), keyed).after;
+        let (top, area) = (rows.y, rows);
+        self.rows.retain(|(r, _)| r.y < top);
+        for (i, row) in after.into_iter().enumerate() {
+            let y = top + u16::try_from(i).unwrap_or(u16::MAX);
+            self.rows
+                .push((Rect::new(area.x, y, area.width, 1).intersection(area), row));
+        }
     }
 
     /// Draws the sidebar but its cards ([`Dock::cards`], drawn with the views): its border,
@@ -216,10 +364,12 @@ impl Dock {
         if area.width < 3 || area.height < 2 {
             return;
         }
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(block, area);
+        if self.place == Place::Docked {
+            let block = Block::default()
+                .borders(Borders::RIGHT)
+                .border_style(Style::default().fg(Color::DarkGray));
+            frame.render_widget(block, area);
+        }
         if let Some(head) = self.header {
             let dim = Style::default().fg(Color::DarkGray);
             let room = usize::from(head.width);
@@ -266,12 +416,15 @@ impl Dock {
                 panes.moves(Rect::new(rect.x + 1, rect.y, 1, 1).intersection(*rect));
             }
         }
+        for (rect, name) in &self.more {
+            panes.target(*rect, Target::WsMore(name.clone()));
+        }
         if let Some(marks) = self.marks {
             let mark = Line::from(Span::styled("▌", Style::default().fg(Color::Cyan)));
             frame.render_widget(Paragraph::new(vec![mark; usize::from(marks.height)]), marks);
         }
         if let Some(buttons) = self.buttons {
-            render_buttons(frame, buttons, panes, None);
+            render_buttons(frame, buttons, panes, self.keyed.as_ref());
         }
     }
 }
@@ -291,37 +444,47 @@ impl Groups {
     }
 }
 
-/// The workspaces' rows `width` columns wide at `detail` ([`Groups`]): their cards
-/// ([`card_rows`]), the other workspaces' threads under theirs, a blank row after each but
-/// the current one's, whose cards come before its blank row, and none at [`Detail::Name`].
-fn groups(state: &AppState, width: usize, detail: Detail) -> Groups {
+/// The workspaces' rows `width` columns wide, each at its `detail` ([`Groups`]): their cards
+/// ([`card_rows`]), the other workspaces' threads under theirs, a blank row after each
+/// [`Detail::spaced`] one but the current one's, whose cards come before its blank row (when
+/// the card after them is spaced); the card the keys select (`keyed`) filled.
+fn groups(
+    state: &AppState,
+    width: usize,
+    detail: &dyn Fn(&Tab) -> Detail,
+    keyed: Option<&WsRow>,
+) -> Groups {
     let mut groups = Groups {
         before: Vec::new(),
         current: Vec::new(),
         after: Vec::new(),
     };
-    let blank = detail != Detail::Name;
     let at = state
         .tabs
         .iter()
         .position(|t| state.workspace.as_deref() == Some(t.name.as_str()));
-    if blank && at.is_some_and(|at| at + 1 < state.tabs.len()) {
+    if at
+        .and_then(|at| state.tabs.get(at + 1))
+        .is_some_and(|next| detail(next).spaced())
+    {
         groups.after.push((Line::default(), None));
     }
     for (i, tab) in state.tabs.iter().enumerate() {
+        let detail = detail(tab);
         let row = Some(WsRow::Workspace(tab.name.clone()));
-        let mut lines = card_rows(state, tab, width, false, detail);
+        let sel = keyed == row.as_ref();
+        let mut lines = card_rows(state, tab, width, sel, detail);
         if Some(i) == at {
             groups.current = lines.into_iter().map(|l| (l, row.clone())).collect();
             continue;
         }
         let max = match detail {
             Detail::Full => WORKER_ROWS,
-            Detail::Short => WORKER_ROWS_SHORT,
-            Detail::Status | Detail::Name => 0,
+            Detail::Short | Detail::Threads => WORKER_ROWS_SHORT,
+            Detail::Name => 0,
         };
         lines.extend(worker_rows(state, tab, width, max));
-        if blank {
+        if detail.spaced() {
             lines.push(Line::default());
         }
         let rows = lines.into_iter().map(|l| (l, row.clone()));
@@ -334,15 +497,91 @@ fn groups(state: &AppState, width: usize, detail: Detail) -> Groups {
     groups
 }
 
-/// Keeps `budget` of the rows `before` and `after` the current workspace's, those nearest it
-/// first: half the budget each, the rest to the other where one needs less. The row at a cut
-/// edge says there is more (`↑ more`, `↓ more`).
-fn clip(before: &mut Vec<ListRow>, after: &mut Vec<ListRow>, budget: usize, width: usize) {
+/// The `↑ more` / `↓ more` rows a [`clip`] left, by their place among the rows before the
+/// cards and among those after them, each with the workspace a tap on it brings into view.
+#[derive(Debug, Default)]
+struct Cut {
+    before: Vec<(usize, String)>,
+    after: Vec<(usize, String)>,
+}
+
+/// Keeps `budget` of the rows `before` and `after` the current workspace's: those nearest it,
+/// half the budget each, the rest to the other where one needs less; or, when the keys or a
+/// tap on `more` chose workspace `anchor` ([`AppState::ws_anchor`]), as many as fit on its
+/// side, slid to show its card's name row. Where rows are cut, the row at the edge says so
+/// (`↑ more`, `↓ more`, [`window`]).
+fn clip(
+    before: &mut Vec<ListRow>,
+    after: &mut Vec<ListRow>,
+    budget: usize,
+    width: usize,
+    anchor: Option<&WsRow>,
+) -> Cut {
     if before.len() + after.len() <= budget {
-        return;
+        return Cut::default();
     }
-    let keep_after = after.len().min(budget - before.len().min(budget / 2));
-    let keep_before = before.len().min(budget - keep_after);
+    let at = |rows: &[ListRow]| {
+        anchor.and_then(|a| rows.iter().position(|(_, r)| r.as_ref() == Some(a)))
+    };
+    let (in_before, in_after) = (at(before), at(after));
+    let (keep_before, keep_after) = match (in_before, in_after) {
+        (Some(_), _) => {
+            let b = before.len().min(budget);
+            (b, after.len().min(budget - b))
+        }
+        (None, Some(_)) => {
+            let a = after.len().min(budget);
+            (before.len().min(budget - a), a)
+        }
+        (None, None) => {
+            let a = after.len().min(budget - before.len().min(budget / 2));
+            (before.len().min(budget - a), a)
+        }
+    };
+    // Before the cards the rows nearest them, after them the first, unless the anchor is
+    // further: then from the row above it (the arrow's), or so that it is the last but one.
+    let start_before = match in_before {
+        Some(a) => a.saturating_sub(1).min(before.len() - keep_before),
+        None => before.len() - keep_before,
+    };
+    let start_after = match in_after {
+        Some(a) if a + 2 > keep_after => (a + 2 - keep_after).min(after.len() - keep_after),
+        _ => 0,
+    };
+    Cut {
+        before: window(before, start_before, keep_before, width),
+        after: window(after, start_after, keep_after, width),
+    }
+}
+
+/// Keeps `keep` of `rows` from `start`: where rows were cut above the first one kept, it says
+/// `↑ more`, and where they were cut below the last one, `↓ more`. Returns those rows' places
+/// and the workspace each brings into view: the one of the row it took the place of, else the
+/// nearest one cut beyond it.
+fn window(
+    rows: &mut Vec<ListRow>,
+    start: usize,
+    keep: usize,
+    width: usize,
+) -> Vec<(usize, String)> {
+    let len = rows.len();
+    let end = start + keep;
+    if keep == 0 || (start == 0 && end >= len) {
+        rows.truncate(keep);
+        return Vec::new();
+    }
+    let name = |row: Option<&ListRow>| match row {
+        Some((_, Some(WsRow::Workspace(n)))) => Some(n.clone()),
+        _ => None,
+    };
+    let up = (start > 0)
+        .then(|| (0..=start).rev().find_map(|i| name(rows.get(i))))
+        .flatten();
+    let down = (end < len)
+        .then(|| (end - 1..len).find_map(|i| name(rows.get(i))))
+        .flatten();
+    rows.truncate(end);
+    rows.drain(..start);
     let dim = Style::default().fg(Color::DarkGray);
     let arrow = |text: &str| {
         (
@@ -350,18 +589,17 @@ fn clip(before: &mut Vec<ListRow>, after: &mut Vec<ListRow>, budget: usize, widt
             None,
         )
     };
-    if keep_before < before.len() {
-        before.drain(..before.len() - keep_before);
-        if let Some(first) = before.first_mut() {
-            *first = arrow("↑ more");
-        }
+    let mut cut = Vec::new();
+    if start > 0 {
+        rows[0] = arrow("↑ more");
+        cut.extend(up.map(|n| (0, n)));
     }
-    if keep_after < after.len() {
-        after.truncate(keep_after);
-        if let Some(last) = after.last_mut() {
-            *last = arrow("↓ more");
-        }
+    if end < len {
+        let last = rows.len() - 1;
+        rows[last] = arrow("↓ more");
+        cut.extend(down.map(|n| (last, n)));
     }
+    cut
 }
 
 /// The drawer over the left of `area` (Ctrl-T where the column does not fit): the list in a
@@ -384,15 +622,11 @@ pub fn render_drawer(frame: &mut Frame, area: Rect, state: &AppState, panes: &mu
     render_list(frame, inner, state, panes, true);
 }
 
-/// The compact layout's Workspaces screen over `area`: the list as wide as the screen.
-pub fn render_screen(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
-    render_list(frame, area, state, panes, true);
-}
-
-/// The list over `area`: the workspaces' cards ([`card_lines`]), scrolled to keep the one the
-/// keys select in view (`keyed`: the drawer and the compact screen, where ↑↓ select) or as
-/// the wheel left it, `↑ more` / `↓ more` at its edges when there is more; then the buttons
-/// on its last two rows. Every row of a card is its tap target, and each button's row its own.
+/// The list over `area`: the workspaces' cards ([`card_lines`]), the other workspaces'
+/// threads under theirs unless the cards are hidden ([`worker_rows`]), scrolled to keep the
+/// one the keys select in view (`keyed`: the drawer, where ↑↓ select) or as the wheel left it,
+/// `↑ more` / `↓ more` at its edges when there is more; then the buttons on its last two rows.
+/// Every row of a card is its tap target, and each button's row its own.
 pub fn render_list(
     frame: &mut Frame,
     area: Rect,
@@ -411,8 +645,8 @@ pub fn render_list(
         ..area
     };
     let mut rows: Vec<ListRow> = Vec::new();
-    // Docked, the other workspaces' threads under their cards, unless the cards are hidden.
-    let nest = !keyed && !state.view.sidebar_hidden;
+    // The other workspaces' threads under their cards, unless the cards are hidden.
+    let nest = !state.view.sidebar_hidden;
     for tab in &state.tabs {
         let sel = selected.as_ref() == Some(&WsRow::Workspace(tab.name.clone()));
         let mut lines = card_rows(state, tab, width, sel, Detail::Full);
@@ -570,7 +804,8 @@ pub fn card_lines(state: &AppState, tab: &Tab, width: usize, selected: bool) -> 
 }
 
 /// The rows of workspace `tab`'s card ([`card_lines`]) at `detail`, without its blank
-/// separator: its name row; its status from [`Detail::Status`]; its reply at [`Detail::Full`].
+/// separator: its name row; its status at [`Detail::Short`] and more; its reply at
+/// [`Detail::Full`].
 fn card_rows(
     state: &AppState,
     tab: &Tab,
@@ -630,7 +865,7 @@ fn card_rows(
     let (status, status_style) = status_text(hub, glance.as_ref());
     let text_room = width.saturating_sub(3);
     let mut lines = vec![Line::from(head)];
-    if detail == Detail::Name {
+    if matches!(detail, Detail::Threads | Detail::Name) {
         return lines;
     }
     if text_room > 0 {
@@ -1654,46 +1889,78 @@ mod tests {
         assert_eq!(st.view.input.as_str(), "h");
     }
 
-    /// In the compact layout the workspaces are a fourth screen, `Workspaces` (`Spaces` on a
-    /// phone, with what waits in the others); the tab strip is gone. ↑↓ on an empty line
-    /// select a row, Enter switches; a tap on a card switches too.
+    /// In the compact layout the workspaces are on the Threads screen, as in the sidebar: each
+    /// workspace's card, the current one's thread cards nested under it, the others' threads
+    /// a row each, the buttons; its tab says what waits in the others, and the tab strip is
+    /// gone. ↑↓ on an empty line step through the workspaces, the cards and the buttons as
+    /// drawn; Enter on a workspace switches; a tap on its card switches too.
     #[test]
-    fn the_compact_layout_has_a_workspaces_screen() {
-        let mut st = in_workspaces("default");
+    fn the_compact_threads_screen_lists_the_workspaces() {
+        use crossterm::event::KeyCode;
+        let mut st = with_workers(in_workspaces("default"));
         let r = rows(&mut st, 40, 20);
         assert!(st.compact() && !st.tabs_shown());
-        assert!(r[0].contains("Spaces ⚠2"), "{}", r.join("\n"));
+        assert!(r[0].contains("Threads ⚠2"), "{}", r.join("\n"));
         assert!(!r.join("\n").contains("≡"));
-        // Its tab, its whole share of the bar.
-        let tab = cells(
-            &mut st,
-            40,
-            20,
-            &Target::Screen(crate::app::CompactPane::Workspaces),
-        );
+        // Its tab, a row tall, its whole share of the bar.
+        let screen = Target::Screen(crate::app::CompactPane::Threads);
+        let tab = cells(&mut st, 40, 20, &screen);
         assert_eq!(tab.len(), 1);
-        assert_eq!((tab[0].x, tab[0].width), (30, 10));
-        tap(
-            &mut st,
-            40,
-            20,
-            &Target::Screen(crate::app::CompactPane::Workspaces),
-        );
+        assert_eq!((tab[0].right(), tab[0].y, tab[0].height), (40, 0, 1));
+        tap(&mut st, 40, 20, &screen);
         assert!(st.ws_screen());
-        let r = rows(&mut st, 40, 20).join("\n");
+        let r = rows(&mut st, 40, 20);
+        let text = r.join("\n");
         assert!(
-            r.contains("client-x") && r.contains("+ New workspace"),
-            "{r}"
+            text.contains("client-x") && text.contains("+ New workspace"),
+            "{text}"
         );
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
-        assert_eq!(st.ws_selected(), Some(WsRow::Workspace("scratch".into())));
-        let a = st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
-        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+        assert!(text.contains("├ deploy · waiting on you"), "{text}");
+        let cards: Vec<Rect> = st
+            .view
+            .panes
+            .panes
+            .iter()
+            .filter(|p| matches!(p.id, PaneId::Thread(_)))
+            .map(|p| p.area)
+            .collect();
+        assert!(!cards.is_empty(), "{text}");
+        assert!(cards.iter().all(|c| c.x == NEST + 1), "nested: {text}");
+        // Down from the current workspace: its cards, then the next workspace.
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let first = st.focused().map(str::to_string);
+        assert!(first.is_some() && st.ws_keyed().is_none());
+        let mut steps = 0;
+        while st.ws_keyed().is_none() && steps < 20 {
+            st.handle_key(crate::app::tests::key(KeyCode::Down));
+            steps += 1;
+        }
+        assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("client-x".into())));
+        assert!(st.focused().is_none(), "one selection at a time");
+        let r = rows(&mut st, 40, 20);
+        let y = r.iter().position(|l| l.contains("client-x")).unwrap();
+        let buf = crate::app::tests::draw(&mut st, 40, 20);
+        let x = r[y]
+            .find("client-x")
+            .map(|b| r[y][..b].chars().count())
+            .unwrap();
+        let cell = &buf[(u16::try_from(x).unwrap(), u16::try_from(y).unwrap())];
+        assert_eq!(
+            cell.bg,
+            crate::ui::selected_fill().bg.unwrap(),
+            "filled: {}",
+            r.join("\n")
+        );
+        // Up: back on the last card.
+        st.handle_key(crate::app::tests::key(KeyCode::Up));
+        assert!(st.focused().is_some() && st.ws_keyed().is_none());
+        st.handle_key(crate::app::tests::key(KeyCode::Down));
+        let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
+        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
         // A tap on a card switches.
         st.switching = None;
-        let a = tap(&mut st, 40, 20, &Target::Workspace("client-x".into()));
-        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
+        let a = tap(&mut st, 40, 20, &Target::Workspace("scratch".into()));
+        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
         // Ctrl-T and /w show it too, and Ctrl-T on it goes back to the conversation.
         let mut st = in_workspaces("default");
         rows(&mut st, 40, 20);
@@ -1702,8 +1969,54 @@ mod tests {
         st.handle_key(crate::app::tests::ctrl('t'));
         assert_eq!(st.view.compact_pane, crate::app::CompactPane::Chat);
         st.view.input.set("/w");
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Enter));
+        st.handle_key(crate::app::tests::key(KeyCode::Enter));
         assert!(st.ws_screen());
+    }
+
+    /// On a phone's sizes, portrait and landscape, the compact Threads screen keeps its tab bar
+    /// a row, every workspace named, the buttons, and a card in view; turned from one to the
+    /// other, or past the compact width and back, it is laid out again at once.
+    #[test]
+    fn the_compact_threads_screen_fits_a_phone() {
+        let mut st = with_workers(in_workspaces("default"));
+        st.view.compact_width = 120;
+        st.show_pane(crate::app::CompactPane::Threads);
+        for (w, h) in [(40, 20), (50, 30), (60, 18), (100, 14), (40, 12), (100, 24)] {
+            let r = rows(&mut st, w, h);
+            let text = r.join("\n");
+            assert!(st.compact() && st.ws_screen(), "{w}x{h}");
+            assert!(
+                r[0].contains("Chat") && r[0].contains("Threads"),
+                "{w}x{h}: {text}"
+            );
+            assert!(!r[1].contains("Chat"), "one row: {w}x{h}: {text}");
+            for name in ["default", "+ New workspace", "⚙ Settings"] {
+                assert!(text.contains(name), "{name} at {w}x{h}: {text}");
+            }
+            assert!(
+                text.contains("client-x") || text.contains("↓ more"),
+                "{w}x{h}: {text}"
+            );
+            let cards = st
+                .view
+                .panes
+                .panes
+                .iter()
+                .filter(|p| matches!(p.id, PaneId::Thread(_)))
+                .count();
+            assert!(cards >= 1, "{w}x{h}: {text}");
+        }
+        // Widened past the compact layout: the sidebar, the same hierarchy; narrowed again,
+        // the Threads screen as it was.
+        let r = rows(&mut st, 160, 40);
+        assert!(!st.compact() && st.ws_docked() && st.cards_docked());
+        assert!(r[0].contains("WORKSPACES"), "{}", r.join("\n"));
+        let r = rows(&mut st, 40, 20);
+        assert!(
+            st.ws_screen() && r[0].contains("Threads"),
+            "{}",
+            r.join("\n")
+        );
     }
 
     /// A tap on a card switches to that workspace, as its tab does; on the current one it
@@ -2137,11 +2450,11 @@ mod tests {
         assert_eq!(g.orch.unwrap().preview.as_deref(), Some("new reply"));
     }
 
-    /// The wheel scrolls the list away from the selected card, and it stays there until a
-    /// key moves the selection.
+    /// More workspaces than the compact Threads screen has rows for: those furthest from the
+    /// current one give way to `↓ more`, and a tap on it brings the next into view, as the
+    /// arrows do, step by step to the last; the cards keep their share meanwhile.
     #[test]
-    fn the_wheel_scrolls_past_the_selection() {
-        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+    fn the_compact_screen_reveals_the_workspaces_it_cut() {
         let mut st = in_workspaces("default");
         let mut tabs = st.tabs.clone();
         for i in 0..8 {
@@ -2152,29 +2465,50 @@ mod tests {
         st.handle_key(crate::app::tests::ctrl('t'));
         let first = rows(&mut st, 40, 20).join("\n");
         assert!(
-            first.contains("default") && !first.contains("more-7"),
+            first.contains("default") && first.contains("↓ more") && !first.contains("more-7"),
             "{first}"
         );
-        let list = st.view.panes.get(&PaneId::Workspaces).unwrap().area;
-        let screen = crate::app::tests::draw(&mut st, 40, 20);
-        for _ in 0..60 {
-            st.handle_mouse(
-                MouseEvent {
-                    kind: MouseEventKind::ScrollDown,
-                    column: list.x + 1,
-                    row: list.y + 1,
-                    modifiers: KeyModifiers::NONE,
-                },
-                &screen,
-            );
-            rows(&mut st, 40, 20);
+        // Each tap on `↓ more` brings the next one cut into view.
+        for _ in 0..12 {
+            let text = rows(&mut st, 40, 20).join("\n");
+            if text.contains("more-7") {
+                break;
+            }
+            let Some((r, _)) = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .rev()
+                .find(|(_, t)| matches!(t, Target::WsMore(_)))
+                .cloned()
+            else {
+                panic!("{text}");
+            };
+            tap_at(&mut st, 40, 20, r.x + 1, r.y);
         }
         let end = rows(&mut st, 40, 20).join("\n");
-        assert!(end.contains("more-7") && !end.contains("▌"), "{end}");
-        // A key brings the selection back into view.
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
-        let back = rows(&mut st, 40, 20).join("\n");
-        assert!(back.contains("client-x"), "{back}");
+        assert!(end.contains("more-7") && end.contains("default"), "{end}");
+        assert!(st.view.panes.list.is_some(), "the cards still show: {end}");
+        // The arrows reach them too: back up to the current workspace's cards.
+        let mut st = in_workspaces("default");
+        let mut tabs = st.tabs.clone();
+        for i in 0..8 {
+            tabs.push(Tab::new(format!("more-{i}")));
+        }
+        st.set_tabs(tabs);
+        rows(&mut st, 40, 20);
+        st.handle_key(crate::app::tests::ctrl('t'));
+        for _ in 0..30 {
+            st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+            rows(&mut st, 40, 20);
+        }
+        assert_eq!(st.ws_keyed(), Some(WsRow::Settings));
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
+        let text = rows(&mut st, 40, 20).join("\n");
+        assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("more-7".into())));
+        assert!(text.contains("more-7"), "{text}");
     }
 
     /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:
@@ -2688,9 +3022,9 @@ mod tests {
         st.view.ws_drawer = true;
         st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
         check(&mut st, 100, 30, "drawer");
-        // The compact Workspaces screen.
+        // The compact Threads screen, the workspaces on it.
         let mut st = in_workspaces("default");
-        st.show_pane(crate::app::CompactPane::Workspaces);
+        st.show_pane(crate::app::CompactPane::Threads);
         check(&mut st, 40, 20, "compact");
     }
 

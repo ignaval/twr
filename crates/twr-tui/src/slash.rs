@@ -501,7 +501,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[],
     ),
     ("/t", "/t", "compact layout: the threads", &[]),
-    ("/w", "/w", "compact layout: the workspaces", &[]),
+    (
+        "/w",
+        "/w",
+        "compact layout: the workspaces and their threads (as /t)",
+        &[],
+    ),
     (
         "/focus",
         "/focus [on|off]",
@@ -894,7 +899,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/c" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Chat)),
         "/n" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Needs)),
         "/t" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Threads)),
-        "/w" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Workspaces)),
+        "/w" if args.is_empty() => Ok(Slash::Pane(crate::app::CompactPane::Threads)),
         "/settings" if args.is_empty() => Ok(Slash::Settings),
         "/decisions" if args.is_empty() => Ok(Slash::Decisions),
         "/quit" if args.is_empty() => Ok(Slash::Quit),
@@ -1575,7 +1580,7 @@ mod tests {
         assert_eq!(parse("/ws api"), Ok(Slash::Ws(Some("api".into()))));
         assert_eq!(
             parse("/w"),
-            Ok(Slash::Pane(crate::app::CompactPane::Workspaces))
+            Ok(Slash::Pane(crate::app::CompactPane::Threads))
         );
         assert_eq!(parse("/sidebar on"), Ok(Slash::Sidebar(Some(true))));
         assert_eq!(parse("/sidebar off"), Ok(Slash::Sidebar(Some(false))));
