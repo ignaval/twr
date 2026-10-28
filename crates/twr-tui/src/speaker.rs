@@ -252,10 +252,12 @@ mod tests {
                 config: SpeechConfig::default(),
             };
             let mut speaker = OwnSpeaker::start_with(Some(speech), HERE, tx, |_| true, fake);
-            let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-                .await
-                .expect("the speaker never connected")
-                .unwrap();
+            let Ok(accepted) =
+                tokio::time::timeout(Duration::from_secs(10), listener.accept()).await
+            else {
+                panic!("the speaker never connected: {:?}", rx.try_recv());
+            };
+            let (stream, _) = accepted.unwrap();
             let (r, mut w) = stream.into_split();
             let mut lines = BufReader::new(r).lines();
             let hello = next(&mut lines).await.unwrap();
