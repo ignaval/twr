@@ -197,6 +197,8 @@ Ask it to move a thread to another runtime, as in "use gpt 6.1 sol on xhigh for 
 
 `twr model <thread> [MODEL] [--effort E] [--runtime R]` does the same from the command line ([usage.md](usage.md#change-a-threads-model-and-effort)).
 
+With several [accounts](accounts.md) on a runtime, ask for one, as in "open the api thread on my work account" or "move web to personal", and it passes `account` to `spawn_thread` or `set_model`, directly, like a model. A move to another account is a new session with a handoff, keeping the model and effort. It never puts a thread outside its project's pinned accounts (the hub refuses), it can't use `--outside-pin`, and it doesn't bring up accounts on a runtime that has one. `list_accounts` shows them, without their directories. Its own account is `[orchestrator] account`, or `twr orchestrator use claude-code:work`.
+
 ## Deleting threads
 
 Ask it to delete threads, or their leftover branches, as in "delete the parked threads", and it calls `delete_thread` once with all of them, parked and stopped ones included (up to 32 threads a card; more take one card per 32). It's told never to spawn a worker to run git for it. Nothing is deleted yet: the hub raises one delete card that says what goes with each thread, its runtime, its worktree and how many uncommitted files it holds, its branch and how many commits are on no other branch, tag or remote, and its queued prompts. The orchestrator tells you what the card says. Only you answer it, with Delete or Cancel; the orchestrator can't answer or annotate it. In the TUI it sits at the top of the conversation, titled `confirm deleting <threads>` ([tui.md](tui.md#deleting-threads)). `twr delete` asks for the same card from the command line ([usage.md](usage.md#delete-threads)).

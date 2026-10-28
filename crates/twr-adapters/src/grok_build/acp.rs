@@ -79,6 +79,9 @@
 //!   result's `_meta.totalTokens` (0, ignored, for a turn that called no model, `/compact`'s);
 //!   the window: the model catalog's `totalContextTokens` (`initialize`
 //!   `_meta.modelState`).
+//! - Limits: a prompt error saying "usage limit" is a usage limit, one saying "spending cap" a
+//!   spending one ([`limit_kind`]): the turn carries `ext.twr.limit` with no reset time and
+//!   is not transient.
 //! - Everything else grok sends under `_x.ai/*` / `x.ai/*` (setup phases, queue, usage, hooks,
 //!   MCP status, ...) is ignored.
 //! - `thread.started` `ext.grok` adds `verified_with`, the profile's `tools` and the
@@ -93,6 +96,7 @@ pub use crate::acp::translate::{
     OVERSIZED_ERROR, PLAN_MAX, PROTOCOL_VERSION, RISKY_KINDS,
 };
 use crate::acp::translate::{Compaction, Dialect, ExtRequest, SessionCtx, ToolMeta};
+use crate::usage::LimitKind;
 #[cfg(test)]
 use twr_core::event::{EventBody, TurnResult};
 
@@ -540,6 +544,27 @@ impl Dialect for Grok {
 
     fn auth_hint(&self) -> &str {
         " (sign in with `grok login`, or set XAI_API_KEY)"
+    }
+
+    fn limit_kind(&self, text: &str) -> Option<LimitKind> {
+        limit_kind(text)
+    }
+}
+
+/// The limit a grok prompt error's text says the account hit: a usage limit ("You've reached
+/// your free Grok Build usage limit", `UsageLimitReached`, `UsagePoolExhausted`; no reset time
+/// is given) or its spending cap. The "rate limit" text stays transient.
+pub fn limit_kind(text: &str) -> Option<LimitKind> {
+    let t = text.to_lowercase();
+    if t.contains("spending cap") {
+        Some(LimitKind::Spend)
+    } else if ["usage limit", "usagelimitreached", "usagepoolexhausted"]
+        .iter()
+        .any(|p| t.contains(p))
+    {
+        Some(LimitKind::Usage)
+    } else {
+        None
     }
 }
 

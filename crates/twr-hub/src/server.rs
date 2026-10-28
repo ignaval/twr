@@ -5,7 +5,7 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, client, identity, warnings}` (the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, warnings}` (`accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
 //! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
 //! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
 //! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
@@ -40,7 +40,7 @@
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
 //! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
 //! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
-//! | `orchestrator.show` | -                                                   | `{available, runtime, model, thread, name, status, live, configured: {runtime, model}, retired, runtimes}` |
+//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed) |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
 //! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
 //! | `thread.park`       | `{thread, keep?, force?}`                           | `{thread, parked: true, worktree?, worktree_removed, kept_dirty, dirty_files?, kept_reason?, kept, worktree_missing?, worktree_error?, pending}` |
@@ -69,6 +69,10 @@
 //! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
 //! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
 //! | `usage.get`         | -                                                   | `{now, runtimes: [{runtime, account, label, plan, windows: [{window, label, used_pct, resets_at, minutes}], observed_at, age_secs, stale, source}]}` |
+//! | `account.list`      | `{runtime?}` (not agents)                           | `{runtimes: {<runtime>: {shown, native, native_dir?, native_var?, accounts: [{runtime, name, native, dir, share, source, login, method, note, checked_at, removed, threads, conflict?, shared_credentials?, retained_paths?}]}}, now}`: every runtime that takes accounts (or `runtime`), the native account first (`hub::accounts`); `native_dir` (the runtime's own directory as the hub has it, `null` when none) and `native_var` (`{name, set, value?}`: its selector variable in the hub's environment) for each runtime that takes accounts; the orchestrator gets no `dir`, `native_dir`, `native_var`, `shared_credentials` nor `retained_paths` (`[{thread, path}]`: its threads given its directory by a path it is no longer configured with) |
+//! | `account.add`       | `{runtime, account, dir?, share?, native?, dry_run?, after_native_name?}` (users only) | `{runtime, account, native, dir, share, source, config, existing, recorded}`: records `account.added` unless config.toml declares it or a live record says the same; `dry_run` records nothing; `after_native_name` (a named account's dry run only) answers as if the native account were named that first, that rename checked too |
+//! | `account.remove`    | `{runtime, account, move_to?, force?}` (users only)  | `{runtime, account, native, dir, removed, config, threads, moved, running, message, dispatch_error?}`: records `account.removed`; refused for a config account without a record, and while threads run on it unless `move_to` or `force`; `running`: `[{thread, thread_name}]` whose runtime process still runs on the removed login (their thread objects say `runtime_account_removed` `{runtime, account, dir?}` until it stops; `dir`, the directory it was started in, for users only) |
+//! | `account.status`    | `{runtime?, account?, refresh?}` (users only)        | as `account.list`, after checking the logins again with `refresh` |
 //!
 //! Identity: a connection is `user:<client>` (source of what it does; its
 //! turns are `from: user`, whatever `thread.send` `from` says) unless its `hello` carried the
@@ -667,6 +671,10 @@ pub const METHODS: &[&str] = &[
     "notify.looking",
     "usage.get",
     "usage.threads",
+    "account.list",
+    "account.add",
+    "account.remove",
+    "account.status",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -747,6 +755,8 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "thread.activity",
     "usage.get",
     "usage.threads",
+    // Without the accounts' directories (`hub::accounts`).
+    "account.list",
     "thread.get",
     "thread.send",
     "thread.send_cancel",
@@ -1109,7 +1119,7 @@ async fn connection(
             // (Dispatched by `call_async`: its own arm there is the method's.)
             method @ ("suggest.next" | "summary.thread") => {
                 let result = tokio::select! {
-                    r = call_async(&hub, &caller, method, req.params) => r,
+                    r = call_async(&hub, &caller, method, req.params, None) => r,
                     () = hung_up(&mut reader) => break,
                 };
                 let resp = match result {
@@ -1125,8 +1135,10 @@ async fn connection(
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
             | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
             | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
-            | "box.projects" | "box.token" => {
-                let result = call_async(&hub, &caller, &req.method, req.params).await;
+            | "box.projects" | "box.token" | "account.status" | "account.remove"
+            | "thread.set_model" => {
+                let result =
+                    call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -1847,12 +1859,16 @@ struct SetModeParams {
     mode: String,
 }
 
-/// `thread.set_model` params: a missing `model` / `effort` keeps the thread's.
+/// `thread.set_model` params: a missing `model` / `effort` keeps the thread's (or, on a move
+/// to another runtime, is the new runtime's default).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetModelParams {
     thread: String,
     runtime: Option<String>,
+    account: Option<String>,
+    #[serde(default)]
+    outside_pin: bool,
     model: Option<String>,
     effort: Option<String>,
 }
@@ -2022,8 +2038,16 @@ struct ParkParams {
     force: bool,
 }
 
-/// Methods that wait on git or on a runtime's exit.
-async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Result<Value, RpcError> {
+/// Methods that wait on git or on a runtime's exit. The orchestrator's `thread.new` and
+/// `thread.set_model` are bound to the call as admitted (`received`, [`Hub::orchestrator_acts`]):
+/// checked again after what they wait on.
+async fn call_async(
+    hub: &Hub,
+    caller: &Caller,
+    method: &str,
+    p: Value,
+    received: Option<&crate::hub::OrchCall>,
+) -> Result<Value, RpcError> {
     match method {
         // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
@@ -2031,7 +2055,7 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
         "thread.new" => {
             let p: NewThread = params(p)?;
-            hub.new_thread_by(p, caller).await
+            hub.new_thread_bound(p, caller, received).await
         }
         "thread.park" => {
             let p: ParkParams = params(p)?;
@@ -2170,6 +2194,23 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "memory.read" => hub.memory_read(params(p)?, caller).await,
         "memory.save" => hub.memory_save(params(p)?, caller, None).await,
         "memory.forget" => hub.memory_forget(params(p)?, caller, None).await,
+        // Checks the logins again first with `refresh` (`hub::accounts`).
+        "account.status" => hub.account_status(params(p)?, caller).await,
+        // A move looks the thread's project up first when its log does not say it, as git
+        // has it (`hub::thread_account`).
+        "account.remove" => hub.account_remove(params(p)?, caller).await,
+        "thread.set_model" => {
+            let p: SetModelParams = params(p)?;
+            let req = crate::hub::ModelRequest {
+                runtime: p.runtime.as_deref(),
+                account: p.account.as_deref(),
+                outside_pin: p.outside_pin,
+                model: p.model.as_deref(),
+                effort: p.effort.as_deref(),
+            };
+            hub.set_thread_model_bound(&p.thread, req, caller, received)
+                .await
+        }
         "context.set" => {
             let p: ContextSetParams = params(p)?;
             hub.context_set(&p.project, &p.content, p.expect_hash.as_deref(), caller)
@@ -2524,6 +2565,17 @@ fn box_view(conn: &Conn, caller: &Caller) -> BoxView {
     }
 }
 
+/// Takes the directory out of thread object `t`'s `runtime_account_removed` (a caller that
+/// sees no account directories: [`box_view`]).
+fn hide_removed_login_dir(t: &mut Value) {
+    if let Some(on) = t
+        .get_mut("runtime_account_removed")
+        .and_then(Value::as_object_mut)
+    {
+        on.remove("dir");
+    }
+}
+
 /// `box.agents {box, refresh?}` for `caller` on `conn` (`refresh`: users only).
 async fn box_agents(hub: &Hub, conn: &Conn, caller: &Caller, p: Value) -> Result<Value, RpcError> {
     #[derive(Default, Deserialize)]
@@ -2577,10 +2629,30 @@ fn call(
             let p: StatusParams = params(p)?;
             hub.spawn_status(&p.operation_id, caller)
         }
-        "thread.list" => Ok(Value::Array(hub.list_threads())),
+        // A removed login's directory (`runtime_account_removed.dir`) is the user's only, as
+        // the accounts' directories are.
+        "thread.list" => {
+            let mut threads = hub.list_threads();
+            if box_view(conn, caller) != BoxView::Full {
+                threads.iter_mut().for_each(hide_removed_login_dir);
+            }
+            Ok(Value::Array(threads))
+        }
         "thread.activity" => Ok(hub.thread_activity()),
         "hub.glance" => hub.glance(),
         "usage.get" => Ok(hub.usage()),
+        // The accounts (`hub::accounts`): the orchestrator sees no directories.
+        "account.list" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct AccountListParams {
+                runtime: Option<String>,
+            }
+            let p: AccountListParams = params(p)?;
+            let full = box_view(conn, caller) == BoxView::Full;
+            hub.account_list(p.runtime.as_deref(), full)
+        }
+        "account.add" => hub.account_add(params(p)?, caller),
         // A user's TUI: whether the user looks at it, so the notification hook keeps quiet
         // meanwhile (`hub::hook`).
         "notify.looking" => {
@@ -2615,7 +2687,11 @@ fn call(
         }
         "thread.get" => {
             let p: ThreadRef = params(p)?;
-            hub.get_thread(&p.thread)
+            let mut t = hub.get_thread(&p.thread)?;
+            if box_view(conn, caller) != BoxView::Full {
+                hide_removed_login_dir(&mut t);
+            }
+            Ok(t)
         }
         "thread.send" => {
             let p: SendParams = params(p)?;
@@ -2683,16 +2759,6 @@ fn call(
         "thread.set_mode" => {
             let p: SetModeParams = params(p)?;
             hub.set_mode(&p.thread, &p.mode, caller)
-        }
-        "thread.set_model" => {
-            let p: SetModelParams = params(p)?;
-            hub.set_runtime_model(
-                &p.thread,
-                p.runtime.as_deref(),
-                p.model.as_deref(),
-                p.effort.as_deref(),
-                caller,
-            )
         }
         "thread.rename" => {
             let p: RenameParams = params(p)?;

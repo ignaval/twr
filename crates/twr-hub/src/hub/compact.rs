@@ -18,7 +18,10 @@
 //! A compaction is a turn of its own: `turn.started {prompt: "/compact", from: user}` with
 //! `ext.twr.compact` ([`COMPACT_TURN_KEY`]), sent to the runtime as [`AdapterCmd::Compact`]
 //! with nothing prepended (no standing context, handoff or hub facts), and ended by the
-//! runtime as any turn. Like a prompt it starts only between turns (a Codex compaction sent
+//! runtime as any turn, on the thread's account: a runtime it starts for it is started as for
+//! any turn (`Core::spawn_config`: the account's directory in the runtime's variable, the
+//! start refused on a removed account or one whose directory changed). Like a prompt it starts
+//! only between turns (a Codex compaction sent
 //! during a turn would interrupt it), after the messages queued before it was asked for: the
 //! ask waits in memory ([`CompactAsk`]), so a hub restart before it starts forgets it, and is
 //! checked again when it is due: one asked of a session that is no longer the thread's (a
@@ -412,8 +415,10 @@ impl Core {
 
     /// The hub's reaction to the end of compaction turn `turn` of `thread` (`hub::reactions`):
     /// maintenance, so no grade, report or review (what the last work turn reported stays the
-    /// thread's report). A failed one raises an `error` item saying why, once; nothing retries
-    /// it.
+    /// thread's report). A failed one raises an `error` item saying why, once, as a failed
+    /// turn's card says it (`Core::failure_words`: a limit names the account and its reset
+    /// with `ext.twr.limit`, a sign-in failure on a named account says `twr account login
+    /// <runtime> <account>` and has its login checked); nothing retries it.
     pub(super) fn react_to_compaction_end(
         &mut self,
         hub: &Inner,
@@ -438,17 +443,38 @@ impl Core {
             return Ok(());
         }
         let name = self.thread_name(thread);
-        let detail = match self.stored_event(thread, Some(turn), "turn.ended")? {
+        let ended = match self.stored_event(thread, Some(turn), "turn.ended")? {
             Some(Event {
                 body: EventBody::TurnEnded(p),
                 ..
-            }) => super::retry::failure_detail(&p),
+            }) => Some(p),
             _ => None,
-        }
-        .or(compaction_error);
-        let summary = match detail {
-            Some(d) => format!("{name}: compacting its context failed: {d}"),
-            None => format!("{name}: compacting its context failed"),
+        };
+        // As a failed turn's card says it (`hub::retry`): a limit names the account and its
+        // reset, a sign-in failure on a named account how to sign that one in (and has its
+        // login checked); never retried.
+        let limited = ended.as_ref().is_some_and(super::retry::limit_failure);
+        let mut twr = json!({});
+        let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
+        let failed = format!("{name}: compacting its context failed");
+        let summary = match self.failure_words(hub, &view, turn, ended.as_ref(), limited, &mut twr)
+        {
+            super::retry::FailureWords::Limit(card) => {
+                // `{name}: {who} hit its ...`, after what failed.
+                let card = card
+                    .strip_prefix(&format!("{name}: "))
+                    .map_or(card.clone(), str::to_string);
+                format!("{failed}: {card}")
+            }
+            super::retry::FailureWords::Detail(d) => match d.or(compaction_error) {
+                Some(d) => format!("{failed}: {d}"),
+                None => failed,
+            },
+        };
+        let ext = if twr.as_object().is_some_and(|o| o.is_empty()) {
+            None
+        } else {
+            twr_ext_map(twr)
         };
         let mut batch = Batch::default();
         batch.push(
@@ -460,6 +486,7 @@ impl Core {
                 reason: AttentionReason::Error,
                 summary,
                 options: vec!["dismiss".into()],
+                ext,
                 ..Default::default()
             }),
         );

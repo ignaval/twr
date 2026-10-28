@@ -477,8 +477,8 @@ impl ClaudeCodeAdapter {
         if let Some(e) = effort {
             cmd.args([cli::EFFORT, e]);
         }
-        cmd.args(tool_args(cfg)).envs(process::attach_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(tool_args(cfg));
+        process::apply_env_std(&mut cmd, process::attach_env(cfg), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }
@@ -578,13 +578,12 @@ impl Start {
         let plan = cli::plan(bin, help.support(), self.mode, &full).map_err(anyhow::Error::msg)?;
         let mut cmd = process::wrapped(&cfg.wrap, bin);
         cmd.args(build_args_with(cfg, &session_id, plan))
-            .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         process::new_session(&mut cmd);
-        process::scrub(&mut cmd);
+        process::apply_env(&mut cmd, cfg.env.iter().cloned(), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }

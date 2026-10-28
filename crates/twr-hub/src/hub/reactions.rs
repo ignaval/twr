@@ -256,12 +256,14 @@ impl Core {
     /// turns get no grade, report or review (its replies go to the user, who talks to it
     /// directly; a report would only point back at it). A failed one raises an `error` item
     /// quoting the failure (`turn.ended` `ext.twr.error`, e.g. a runtime that cannot start),
-    /// unless the log has one for the turn. The item replaces the open hub `error` items of the
-    /// thread's earlier turns (resolved `by: timeout`, `ext.twr.superseded_by`, in the same
-    /// batch), so an orchestrator failing again (the next notice, each hub restart) leaves one
-    /// item, its latest failure. Derived from the log only: startup recovery runs it for every
-    /// failed orchestrator turn without its item, oldest first
-    /// ([`Core::recover_turn_reactions`]), and ends the same way.
+    /// unless the log has one for the turn; account-aware as a worker's
+    /// ([`Core::failure_words`]: a limit card with `ext.twr.limit` and `ext.twr.account`, a
+    /// named account's sign-in hint, its login checked), and never retried. The item replaces
+    /// the open hub `error` items of the thread's earlier turns (resolved `by: timeout`,
+    /// `ext.twr.superseded_by`, in the same batch), so an orchestrator failing again (the next
+    /// notice, each hub restart) leaves one item, its latest failure. Derived from the log
+    /// only: startup recovery runs it for every failed orchestrator turn without its item,
+    /// oldest first ([`Core::recover_turn_reactions`]), and ends the same way.
     fn react_to_orchestrator_turn_end(
         &mut self,
         hub: &Inner,
@@ -273,17 +275,32 @@ impl Core {
         if result != TurnResult::Error || done.errored {
             return Ok(());
         }
-        let name = self.view(thread).map_err(anyhow::Error::new)?.name.clone();
-        let detail = match self.stored_event(thread, Some(turn), "turn.ended")? {
+        let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
+        let name = view.name.clone();
+        let ended = match self.stored_event(thread, Some(turn), "turn.ended")? {
             Some(Event {
                 body: EventBody::TurnEnded(p),
                 ..
-            }) => retry::failure_detail(&p),
+            }) => Some(p),
             _ => None,
         };
-        let summary = match detail {
-            Some(d) => format!("{name}: turn {turn} failed: {d}"),
-            None => format!("{name}: turn {turn} failed"),
+        // As a worker's card says it (`hub::retry`): a limit names the account and its reset,
+        // a sign-in failure on a named account how to sign that one in (and its login is
+        // checked); never retried.
+        let limited = ended.as_ref().is_some_and(retry::limit_failure);
+        let mut twr = json!({});
+        let summary = match self.failure_words(hub, &view, turn, ended.as_ref(), limited, &mut twr)
+        {
+            retry::FailureWords::Limit(summary) => summary,
+            retry::FailureWords::Detail(detail) => match detail {
+                Some(d) => format!("{name}: turn {turn} failed: {d}"),
+                None => format!("{name}: turn {turn} failed"),
+            },
+        };
+        let ext = if twr.as_object().is_some_and(|o| o.is_empty()) {
+            None
+        } else {
+            twr_ext_map(twr)
         };
         let attn_id = new_id();
         let mut older: Vec<String> = self
@@ -317,6 +334,7 @@ impl Core {
                 reason: AttentionReason::Error,
                 summary,
                 options: vec!["dismiss".into()],
+                ext,
                 ..Default::default()
             }),
         );

@@ -16,8 +16,8 @@ use twr_core::reduce::ThreadView;
 use twr_runner::workdirs::WorkdirUse;
 
 use super::{
-    append_err, git, internal, rpc, runtime_spec, spawn_config, twr_ext_map, AttachLease, Core,
-    Exit, Hub, HubState, Inner, Live, RuntimeExiting, ThreadRt, ATTACH_QUIESCE_TIMEOUT, LOCAL_BOX,
+    append_err, git, internal, rpc, runtime_spec, twr_ext_map, AttachLease, Core, Exit, Hub,
+    HubState, Inner, Live, RuntimeExiting, ThreadRt, ATTACH_QUIESCE_TIMEOUT, LOCAL_BOX,
 };
 use crate::host::{ThreadHost, AGENT_ENV, ATTACH_ENV};
 use crate::store;
@@ -204,16 +204,18 @@ impl Core {
     }
 
     /// The runtime configuration thread `id`'s (`view`) interactive command is made from: its
-    /// start configuration ([`spawn_config`]: mode, model, effort, directory), an `acp`
-    /// thread's preset attach command (`TWR_ACP_ATTACH`), and the current orchestrator's
-    /// restrictions (or the attach is refused).
+    /// start configuration ([`Core::spawn_config`]: mode, model, effort, directory, its
+    /// account's environment), an `acp` thread's preset attach command (`TWR_ACP_ATTACH`), and
+    /// the current orchestrator's restrictions (or the attach is refused). Refused too on an
+    /// account that cannot run its session ([`Core::refuse_account`]).
     fn attach_config(
         &self,
         hub: &Inner,
         id: &str,
         view: &ThreadView,
     ) -> Result<SpawnConfig, RpcError> {
-        let mut cfg = spawn_config(hub, view);
+        self.refuse_account(view)?;
+        let mut cfg = self.spawn_config(hub, view);
         if let Some(r) = self.rt.get(id) {
             cfg.env.extend(r.acp_env.iter().cloned());
         }

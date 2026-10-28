@@ -294,12 +294,24 @@ impl Core {
         // settings restart replaces.
         if let EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) = &mut body {
             use super::restart::{stamp, stamped, RunSettings};
-            let settings = self
+            let mut settings = self
                 .rt
                 .get(thread)
                 .and_then(|r| r.runtime_settings.clone())
                 .or_else(|| stamped(p, source))
                 .unwrap_or_else(RunSettings::unknown);
+            // On the hub's own box, a start of a session an earlier start named carries the
+            // login that session began under (`Core::carry_login`). A start that names no
+            // session resumed the thread's (a spawn is only for a thread with none).
+            let view = self.registry.get(thread);
+            let session = p
+                .session_id
+                .clone()
+                .or_else(|| view.and_then(|v| v.session_id.clone()));
+            if let (Some(session), true) = (session, view.is_some_and(|v| v.box_name == LOCAL_BOX))
+            {
+                self.carry_login(thread, &session, &mut settings);
+            }
             stamp(p, &settings);
         }
         let fallback = match &body {

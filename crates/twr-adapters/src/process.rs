@@ -106,6 +106,58 @@ pub fn scrub_pty(cmd: &mut portable_pty::CommandBuilder) {
     }
 }
 
+/// A runtime command's environment: `env` added, then each of `remove`
+/// ([`twr_core::adapter::SpawnConfig::env_remove`]: a name in both is removed), then
+/// [`scrub`].
+pub fn apply_env<K, V>(
+    cmd: &mut tokio::process::Command,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    cmd.envs(env);
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub(cmd);
+}
+
+/// [`apply_env`] for a `std` command (`attach`).
+pub fn apply_env_std<K, V>(
+    cmd: &mut std::process::Command,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    cmd.envs(env);
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub_std(cmd);
+}
+
+/// [`apply_env`] for a PTY command.
+pub fn apply_env_pty<K, V>(
+    cmd: &mut portable_pty::CommandBuilder,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub_pty(cmd);
+}
+
 /// Why runtime program `program` (an argv[0]) cannot be run, when it cannot: a bare name
 /// (`claude`) that is on no directory of `path` (a `PATH` value) as an executable file, or a
 /// path (`./bin/agent`, `/opt/agent`; a relative one from `cwd`, where the program starts)
@@ -1127,5 +1179,32 @@ mod tests {
             Some(std::ffi::OsStr::new("1"))
         )));
         assert!(is_scrubbed("TWR_RUNNER_TOKEN") && !is_scrubbed("TWR_THREAD"));
+    }
+
+    /// `apply_env`: the variables set, then the removals (a name in both is removed), then
+    /// twr's secrets.
+    #[test]
+    fn apply_env_sets_then_removes() {
+        use std::ffi::OsStr;
+        let env = [("CLAUDE_CONFIG_DIR", "/a"), ("ANTHROPIC_API_KEY", "set")];
+        let remove = ["ANTHROPIC_API_KEY".to_string(), "OTHER".to_string()];
+        let want = |envs: &[(&OsStr, Option<&OsStr>)]| {
+            assert!(envs.contains(&(OsStr::new("CLAUDE_CONFIG_DIR"), Some(OsStr::new("/a")))));
+            for k in ["ANTHROPIC_API_KEY", "OTHER"].iter().chain(SCRUBBED_ENV) {
+                assert!(envs.contains(&(OsStr::new(k), None)), "{k}: {envs:?}");
+            }
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        apply_env(&mut cmd, env, &remove);
+        want(&cmd.as_std().get_envs().collect::<Vec<_>>());
+        let mut cmd = std::process::Command::new("true");
+        apply_env_std(&mut cmd, env, &remove);
+        want(&cmd.get_envs().collect::<Vec<_>>());
+        let mut cmd = portable_pty::CommandBuilder::new("true");
+        apply_env_pty(&mut cmd, env, &remove);
+        assert_eq!(cmd.get_env("CLAUDE_CONFIG_DIR"), Some(OsStr::new("/a")));
+        for k in ["ANTHROPIC_API_KEY", "OTHER"].iter().chain(SCRUBBED_ENV) {
+            assert_eq!(cmd.get_env(k), None, "{k}");
+        }
     }
 }

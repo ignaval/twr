@@ -10,7 +10,8 @@
 
 use serde_json::Value;
 use twr_core::event::{
-    BOX_UPGRADE_REASON, MODEL_RESTART_REASON, MODE_RESTART_REASON, RUNTIME_RESTART_REASON,
+    ACCOUNT_DIR_KEY, ACCOUNT_KEY, ACCOUNT_RESTART_REASON, BOX_UPGRADE_REASON, MODEL_RESTART_REASON,
+    MODE_RESTART_REASON, RESUME_DROPPED_KEY, RESUME_DROPPED_WHY_KEY, RUNTIME_RESTART_REASON,
 };
 
 /// Output cap for one tool result, in bytes.
@@ -121,35 +122,52 @@ fn or_default(v: Option<&Value>) -> String {
 }
 
 /// ` (with the handoff from its previous runtime)` for the turn that started a thread's new
-/// runtime (`turn.started` `ext.twr.runtime_handoff`), else empty.
-fn handoff_note(d: &Value) -> &'static str {
-    if d.pointer("/ext/twr/runtime_handoff")
+/// runtime (`turn.started` `ext.twr.runtime_handoff`), else empty; with why the turn did not
+/// resume the earlier session its move back named, when it dropped that resume
+/// (`ext.twr.resume_dropped`).
+fn handoff_note(d: &Value) -> String {
+    let dropped = d
+        .pointer(&format!("/ext/twr/{RESUME_DROPPED_KEY}"))
+        .and_then(Value::as_str)
+        .map(|s| {
+            let why = d
+                .pointer(&format!("/ext/twr/{RESUME_DROPPED_WHY_KEY}"))
+                .and_then(Value::as_str)
+                .unwrap_or("it no longer holds");
+            format!(" (a new session: earlier session {s} not resumed, {why})")
+        })
+        .unwrap_or_default();
+    let handoff = if d
+        .pointer("/ext/twr/runtime_handoff")
         .is_some_and(|h| !h.is_null())
     {
         " (with the handoff from its previous runtime)"
     } else {
         ""
+    };
+    format!("{dropped}{handoff}")
+}
+
+/// An account of a `thread.model_changed` (`account` or `previous_account`): its name, or
+/// `(own login)` for the runtime's native account (the event names none: `null`).
+fn account_of(d: &Value, key: &str) -> String {
+    d.get(key)
+        .and_then(Value::as_str)
+        .map_or_else(|| "(own login)".to_string(), str::to_string)
+}
+
+/// `runtime` on account `key` of `d` ([`account_of`]): `codex:team`, or `codex (own login)`.
+fn runtime_account(runtime: &str, d: &Value, key: &str) -> String {
+    match d.get(key).and_then(Value::as_str) {
+        Some(a) => format!("{runtime}:{a}"),
+        None => format!("{runtime} (own login)"),
     }
 }
 
-/// `thread.model_changed` `d` as a line, with who changed it: a move to another runtime names
-/// both runtimes and both settings; otherwise what changed, each from its value before
-/// (`default`: the runtime's own), like `thread.mode_changed`. One that changes neither (the
-/// hub records none) reads `model kept at M, effort at E by B`.
-fn model_changed(d: &Value) -> String {
-    let by = str_of(d, "by");
-    if let Some(r) = d.get("runtime").and_then(Value::as_str) {
-        return format!(
-            "runtime changed by {by}: {} -> {r} (model {} -> {}, effort {} -> {}); a new {r} \
-             session starts with the next turn, with a handoff",
-            or_default(d.get("previous_runtime")),
-            or_default(d.get("previous_model")),
-            or_default(d.get("model")),
-            or_default(d.get("previous_effort")),
-            or_default(d.get("effort"))
-        );
-    }
-    let changes: Vec<String> = [
+/// The model and effort changes of `thread.model_changed` `d`, each from its value before
+/// (`default`: the runtime's own).
+fn setting_changes(d: &Value) -> Vec<String> {
+    [
         ("model", "previous_model", "model"),
         ("effort", "previous_effort", "effort"),
     ]
@@ -162,7 +180,68 @@ fn model_changed(d: &Value) -> String {
             or_default(d.get(now))
         )
     })
-    .collect();
+    .collect()
+}
+
+/// The move resumes a session the thread left earlier (`ext.twr.resume_session`).
+fn resumes_session(d: &Value) -> bool {
+    d.pointer(&format!("/ext/twr/{}", twr_core::event::RESUME_SESSION_KEY))
+        .and_then(Value::as_str)
+        .is_some()
+}
+
+/// `thread.model_changed` `d` as a line, with who changed it: a move to another runtime names
+/// both runtimes and both settings; a move between accounts (`account_changed`) names both
+/// accounts (`work -> personal`), on their runtimes when the runtime changed too
+/// (`codex:team -> claude-code:work`); otherwise what changed, each from its value before
+/// (`default`: the runtime's own), like `thread.mode_changed`. One that changes neither (the
+/// hub records none) reads `model kept at M, effort at E by B`.
+fn model_changed(d: &Value) -> String {
+    let by = str_of(d, "by");
+    let account_changed = d.get("account_changed").and_then(Value::as_bool) == Some(true);
+    let runtime = d.get("runtime").and_then(Value::as_str);
+    let previous_runtime = or_default(d.get("previous_runtime"));
+    if account_changed && runtime.is_none_or(|r| r == previous_runtime) {
+        let mut s = format!(
+            "account changed by {by}: {} -> {}",
+            account_of(d, "previous_account"),
+            account_of(d, "account")
+        );
+        let changes = setting_changes(d);
+        if !changes.is_empty() {
+            s.push_str(&format!(" ({})", changes.join(", ")));
+        }
+        s.push_str(if resumes_session(d) {
+            "; its earlier session on that account resumes with the next turn, told what \
+             happened since"
+        } else {
+            "; a new session starts with the next turn, with a handoff"
+        });
+        return s;
+    }
+    if let Some(r) = runtime {
+        let (from, to) = if account_changed {
+            (
+                runtime_account(&previous_runtime, d, "previous_account"),
+                runtime_account(r, d, "account"),
+            )
+        } else {
+            (previous_runtime, r.to_string())
+        };
+        let next = if resumes_session(d) {
+            format!("its earlier {r} session resumes with the next turn, told what happened since")
+        } else {
+            format!("a new {r} session starts with the next turn, with a handoff")
+        };
+        return format!(
+            "runtime changed by {by}: {from} -> {to} (model {} -> {}, effort {} -> {}); {next}",
+            or_default(d.get("previous_model")),
+            or_default(d.get("model")),
+            or_default(d.get("previous_effort")),
+            or_default(d.get("effort"))
+        );
+    }
+    let changes = setting_changes(d);
     if changes.is_empty() {
         return format!(
             "model kept at {}, effort at {} by {by}",
@@ -436,6 +515,11 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
              the next turn"
                 .to_string()
         }
+        "thread.stopped" if restart_reason(&d) == Some(ACCOUNT_RESTART_REASON) => {
+            "previous session stopped for the move to another account; the next turn continues \
+             on that account"
+                .to_string()
+        }
         "thread.stopped" if restart_reason(&d) == Some(BOX_UPGRADE_REASON) => {
             "runtime restarting on the box's new twr build; the next prompt resumes its session"
                 .to_string()
@@ -461,12 +545,21 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
             }
             s
         }
-        "thread.created" => format!(
-            "thread created: name={} project={} runtime={}",
-            str_of(&d, "name"),
-            d.get("project").and_then(Value::as_str).unwrap_or("-"),
-            str_of(&d, "runtime")
-        ),
+        "thread.created" => {
+            let mut s = format!(
+                "thread created: name={} project={} runtime={}",
+                str_of(&d, "name"),
+                d.get("project").and_then(Value::as_str).unwrap_or("-"),
+                str_of(&d, "runtime")
+            );
+            if let Some(a) = d
+                .pointer(&format!("/ext/twr/{ACCOUNT_KEY}"))
+                .and_then(Value::as_str)
+            {
+                s.push_str(&format!(" account={a}"));
+            }
+            s
+        }
         "turn.started" => format!(
             "turn {} started (from {}){}: {}",
             turn_of(ev),
@@ -499,7 +592,42 @@ fn control_line(ev: &Value, clip: &mut Clip) -> String {
                 .get("account")
                 .and_then(Value::as_str)
                 .map_or(String::new(), |a| format!(":{a}"));
-            format!("usage {label}{account}: {} left", windows.join(" · "))
+            if windows.is_empty() {
+                // What the hub records when the account's directory changed.
+                format!("usage {label}{account}: nothing known (its directory changed)")
+            } else {
+                format!("usage {label}{account}: {} left", windows.join(" · "))
+            }
+        }
+        "account.added" => {
+            let own = if d.get("native").and_then(Value::as_bool) == Some(true) {
+                " (the runtime's own login)"
+            } else {
+                ""
+            };
+            format!(
+                "account {}:{} added{own}",
+                str_of(&d, "runtime"),
+                str_of(&d, "account")
+            )
+        }
+        "account.removed" => format!(
+            "account {}:{} removed",
+            str_of(&d, "runtime"),
+            str_of(&d, "account")
+        ),
+        "account.status" => {
+            let login = match str_of(&d, "login") {
+                "logged_in" => "logged in",
+                "logged_out" => "logged out",
+                "missing" => "its directory is missing",
+                _ => "login state unknown",
+            };
+            format!(
+                "account {}:{}: {login}",
+                str_of(&d, "runtime"),
+                str_of(&d, "account")
+            )
         }
         other => other.to_string(),
     }
@@ -602,7 +730,8 @@ pub fn transcript(result: &Value, since_seq: u64, limit: Option<usize>, cap: usi
 /// on the compact line; attention.resolved: the answer's decision and message. Other kinds (or
 /// a missing field): `data` as pretty JSON.
 fn main_text(ev: &Value) -> (&'static str, String) {
-    let d = ev.get("data").cloned().unwrap_or(Value::Null);
+    let mut d = ev.get("data").cloned().unwrap_or(Value::Null);
+    hide_account_dirs(str_of(ev, "kind"), &mut d);
     let field = |k: &'static str| Some((k, d.get(k)?.as_str()?.to_string()));
     let found = match str_of(ev, "kind") {
         "agent.text" => field("text"),
@@ -622,6 +751,23 @@ fn main_text(ev: &Value) -> (&'static str, String) {
             serde_json::to_string_pretty(&d).unwrap_or_else(|e| format!("<unserializable: {e}>")),
         )
     })
+}
+
+/// Takes the account directories out of event data `d` of kind `kind` (an account move's or a
+/// new thread's `ext.twr.account_dir`, a native start's `ext.twr.session_store` and
+/// `ext.twr.native_selector`, an `account.added`'s `dir`): they go to neither the orchestrator
+/// nor thread agents.
+fn hide_account_dirs(kind: &str, d: &mut Value) {
+    if let Some(twr) = d.pointer_mut("/ext/twr").and_then(Value::as_object_mut) {
+        twr.remove(ACCOUNT_DIR_KEY);
+        twr.remove(twr_core::event::SESSION_STORE_KEY);
+        twr.remove(twr_core::event::NATIVE_SELECTOR_KEY);
+    }
+    if kind.starts_with("account.") {
+        if let Some(o) = d.as_object_mut() {
+            o.remove("dir");
+        }
+    }
 }
 
 /// attention.raised `d` for [`main_text`]: its summary, then (when it has options) an
@@ -740,8 +886,70 @@ pub fn control_items(items: &[Value], since: u64, cap: usize) -> (String, u64, b
     (buf.into_string(), next, cut)
 }
 
-/// A `usage.get` result for the orchestrator: one line per runtime (and account), with each
-/// window's remaining share and reset and the data's age.
+/// One runtime of [`accounts`].
+#[derive(serde::Serialize)]
+struct RuntimeAccounts<'a> {
+    runtime: &'a str,
+    /// The runtime shows account labels (`shown`: two or more logged-in accounts).
+    several: bool,
+    accounts: Vec<AccountLine<'a>>,
+}
+
+/// One account of [`RuntimeAccounts`]: no directory, method or note.
+#[derive(serde::Serialize)]
+struct AccountLine<'a> {
+    name: &'a str,
+    native: bool,
+    source: &'a str,
+    /// `unknown` when it was never checked.
+    login: &'a str,
+    threads: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    removed: bool,
+    /// The native account whose name a named account has too: the name picks that one.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    shadowed: bool,
+}
+
+/// An `account.list` result for the orchestrator (`list_accounts`): compact JSON
+/// `{runtimes: [{runtime, several, accounts: [{name, native, source, login, threads,
+/// removed?, shadowed?}]}]}`, runtimes by name, accounts as the hub lists them (the native one
+/// first).
+/// Only those fields: a directory the hub sends anyway, a method or a note never shows.
+pub fn accounts(r: &Value) -> String {
+    let runtimes: Vec<RuntimeAccounts> = r
+        .get("runtimes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(runtime, e)| RuntimeAccounts {
+            runtime,
+            several: e.get("shown").and_then(Value::as_bool).unwrap_or(false),
+            accounts: e
+                .get("accounts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|a| AccountLine {
+                    name: str_of(a, "name"),
+                    native: a.get("native").and_then(Value::as_bool).unwrap_or(false),
+                    source: str_of(a, "source"),
+                    login: a.get("login").and_then(Value::as_str).unwrap_or("unknown"),
+                    threads: a.get("threads").and_then(Value::as_u64).unwrap_or(0),
+                    removed: a.get("removed").and_then(Value::as_bool).unwrap_or(false),
+                    shadowed: a.get("shadowed").and_then(Value::as_bool).unwrap_or(false),
+                })
+                .collect(),
+        })
+        .collect();
+    #[derive(serde::Serialize)]
+    struct Accounts<'a> {
+        runtimes: Vec<RuntimeAccounts<'a>>,
+    }
+    serde_json::to_string(&Accounts { runtimes })
+        .unwrap_or_else(|e| format!("<unserializable result: {e}>"))
+}
+
 /// What threads spent (`usage.threads`), the `top` that spent most: `What threads spent in
 /// the last 7 days: api 1.2M tok $3.40 (4 turns); web 85k tok (1 turn); total 1.3M tok $3.40
 /// over 5 turns.`
@@ -789,6 +997,8 @@ pub fn spent(r: &Value, top: usize) -> String {
     )
 }
 
+/// A `usage.get` result for the orchestrator: one line per runtime (and account), with each
+/// window's remaining share and reset and the data's age.
 pub fn usage(r: &Value) -> String {
     let runtimes: Vec<&Value> = r
         .get("runtimes")
@@ -1185,6 +1395,14 @@ mod tests {
             ),
             "@7 [t1] usage GPT: 5h 8% · wk 59% left\n"
         );
+        // The record that clears an account whose directory changed.
+        assert_eq!(
+            control_line(
+                "account.usage",
+                json!({"runtime": "codex", "account": "work", "source": "event", "windows": []})
+            ),
+            "@7 [t1] usage GPT:work: nothing known (its directory changed)\n"
+        );
     }
 
     #[test]
@@ -1287,6 +1505,155 @@ mod tests {
                    "previous_effort": "low", "by": "user"}),
         );
         assert_eq!(s, "@7 [t1] model kept at sonnet, effort at low by user\n");
+    }
+
+    /// A move between accounts names both (`(own login)`: the runtime's native account, which
+    /// the event leaves unnamed); with a runtime move, as `runtime:account`.
+    #[test]
+    fn account_moves_name_both_accounts() {
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": "opus", "effort": "high", "previous_model": "opus",
+                   "previous_effort": "high", "runtime": "claude-code",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "account": "personal", "previous_account": "work", "by": "orchestrator"}),
+        );
+        assert_eq!(
+            s,
+            "@7 [t1] account changed by orchestrator: work -> personal; a new session starts \
+             with the next turn, with a handoff\n"
+        );
+        // Back to an account the thread left: its earlier session resumes.
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": "opus", "effort": "high", "previous_model": "opus",
+                   "previous_effort": "high", "runtime": "claude-code",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "account": "work", "previous_account": "personal", "by": "user",
+                   "ext": {"twr": {"resume_session": "s0"}}}),
+        );
+        assert_eq!(
+            s,
+            "@7 [t1] account changed by user: personal -> work; its earlier session on that \
+             account resumes with the next turn, told what happened since\n"
+        );
+        // To the native account, with a new effort.
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": "opus", "effort": "max", "previous_model": "opus",
+                   "previous_effort": "high", "runtime": "claude-code",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "previous_account": "work", "by": "user"}),
+        );
+        assert_eq!(
+            s,
+            "@7 [t1] account changed by user: work -> (own login) (effort high -> max); a new \
+             session starts with the next turn, with a handoff\n"
+        );
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": null, "effort": null, "previous_model": "gpt-6.1-sol",
+                   "previous_effort": "xhigh", "runtime": "claude-code",
+                   "previous_runtime": "codex", "account_changed": true, "account": "work",
+                   "previous_account": "team", "by": "user"}),
+        );
+        assert_eq!(
+            s,
+            "@7 [t1] runtime changed by user: codex:team -> claude-code:work (model \
+             gpt-6.1-sol -> default, effort xhigh -> default); a new claude-code session \
+             starts with the next turn, with a handoff\n"
+        );
+        let s = control_line(
+            "thread.model_changed",
+            json!({"model": null, "effort": null, "previous_model": null,
+                   "previous_effort": null, "runtime": "codex",
+                   "previous_runtime": "claude-code", "account_changed": true,
+                   "previous_account": "work", "by": "orchestrator"}),
+        );
+        assert!(
+            s.starts_with(
+                "@7 [t1] runtime changed by orchestrator: claude-code:work -> codex (own login) \
+                 (model"
+            ),
+            "{s}"
+        );
+        assert!(control_line(
+            "thread.stopped",
+            json!({"session_id": "s1", "ext": {"twr": {"reason": ACCOUNT_RESTART_REASON}}}),
+        )
+        .contains("move to another account"));
+    }
+
+    /// New threads name their account; account events read as lines, never with a directory.
+    #[test]
+    fn account_events_read_as_lines() {
+        assert_eq!(
+            control_line(
+                "thread.created",
+                json!({"name": "api", "project": null, "runtime": "codex"}),
+            ),
+            "@7 [t1] thread created: name=api project=- runtime=codex\n"
+        );
+        assert_eq!(
+            control_line(
+                "thread.created",
+                json!({"name": "api", "project": "twr", "runtime": "codex",
+                       "ext": {"twr": {"account": "team", "account_dir": "/a/team"}}}),
+            ),
+            "@7 [t1] thread created: name=api project=twr runtime=codex account=team\n"
+        );
+        assert_eq!(
+            control_line(
+                "account.added",
+                json!({"runtime": "codex", "account": "personal", "native": true,
+                       "share": "config", "by": "user"}),
+            ),
+            "@7 [t1] account codex:personal added (the runtime's own login)\n"
+        );
+        assert_eq!(
+            control_line(
+                "account.added",
+                json!({"runtime": "claude-code", "account": "work", "dir": "/a/work",
+                       "share": "config", "by": "user"}),
+            ),
+            "@7 [t1] account claude-code:work added\n"
+        );
+        for (login, want) in [
+            ("logged_in", "logged in"),
+            ("logged_out", "logged out"),
+            ("missing", "its directory is missing"),
+            ("unknown", "login state unknown"),
+        ] {
+            assert_eq!(
+                control_line(
+                    "account.status",
+                    json!({"runtime": "claude-code", "account": "work", "login": login}),
+                ),
+                format!("@7 [t1] account claude-code:work: {want}\n")
+            );
+        }
+        // read_transcript seq= shows such an event as JSON, without the directories.
+        for (kind, data) in [
+            (
+                "thread.created",
+                json!({"name": "api", "runtime": "codex",
+                       "ext": {"twr": {"account": "team", "account_dir": "/a/team"}}}),
+            ),
+            (
+                "thread.model_changed",
+                json!({"account_changed": true, "account": "team",
+                       "ext": {"twr": {"account_dir": "/a/team"}}}),
+            ),
+            (
+                "account.added",
+                json!({"runtime": "codex", "account": "team", "dir": "/a/team"}),
+            ),
+        ] {
+            let ev = json!({"seq": 3, "turn": null, "kind": kind, "data": data});
+            let page = event_page("T1", &ev, 0, TEXT_PAGE, None).unwrap();
+            assert!(!page.contains("/a/team"), "{page}");
+            assert!(page.contains("team"), "{page}");
+        }
     }
 
     /// The settings-restart reasons read as a restart on the session, not a stop.
@@ -1746,6 +2113,15 @@ mod tests {
         assert_eq!(
             transcript_line(&started).unwrap(),
             "turn 4 started (from user) (with the handoff from its previous runtime): go on"
+        );
+        let dropped = json!({"thread": "T1", "turn": 5, "kind": "turn.started", "data": {
+            "prompt": "go on", "from": "user",
+            "ext": {"twr": {"runtime_handoff": "<twr-handoff>...</twr-handoff>",
+                "resume_dropped": "s1", "resume_dropped_why": "its account was removed"}}}});
+        assert_eq!(
+            transcript_line(&dropped).unwrap(),
+            "turn 5 started (from user) (a new session: earlier session s1 not resumed, its \
+             account was removed) (with the handoff from its previous runtime): go on"
         );
     }
 }

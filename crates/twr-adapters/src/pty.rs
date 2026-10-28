@@ -307,10 +307,7 @@ impl Adapter for PtyAdapter {
                 .collect(),
         );
         cmd.cwd(&cwd);
-        for (k, v) in program_env(&cfg) {
-            cmd.env(k, v);
-        }
-        crate::process::scrub_pty(&mut cmd);
+        crate::process::apply_env_pty(&mut cmd, program_env(&cfg), &cfg.env_remove);
         // portable-pty's own error for a missing program lists every PATH entry it tried.
         let path = std::env::var_os("PATH");
         if let Some(why) =

@@ -14,9 +14,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 use twr_core::config::{
-    BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig, LogConfig, NotifyConfig,
-    OrchestratorConfig, ProjectConfig, RuntimePreset, ThreadsConfig, TrashConfig, TuiConfig,
-    TuiNotifyConfig, DEFAULT_PROJECT_ROOTS,
+    AccountConfig, AccountPolicy, BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig,
+    LogConfig, NotifyConfig, OrchestratorConfig, ProjectConfig, RuntimePreset, ThreadsConfig,
+    TrashConfig, TuiConfig, TuiNotifyConfig, DEFAULT_PROJECT_ROOTS,
 };
 
 /// A runtime as `config.show` shows it: a name as it is, a command line (`acp:<command>`,
@@ -48,6 +48,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         notify: hook,
         tui,
         project_roots,
+        accounts,
+        account_policy,
     } = config;
     let CodexConfig { auto: codex_auto } = codex;
     // The command often holds a secret (an ntfy topic, a webhook's URL): whether it is set.
@@ -66,6 +68,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         project_reads,
         read_deny,
         memory,
+        account: orch_account,
     } = orchestrator;
     let HubConfig {
         socket,
@@ -126,6 +129,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
                 trim_idle_after,
                 idle_trim_disposable,
                 codex_auto,
+                account,
+                accounts,
+                exclude_accounts,
             } = p;
             (
                 name.clone(),
@@ -139,6 +145,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
                     "idle_trim_disposable": idle_trim_disposable,
                     "codex_auto": codex_auto.map(|a| a.as_str()),
                     "env_names": env.keys().collect::<Vec<_>>(),
+                    "account": account,
+                    "accounts": accounts,
+                    "exclude_accounts": exclude_accounts,
                 }),
             )
         })
@@ -161,9 +170,28 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             let projects: Map<String, Value> = projects
                 .iter()
                 .map(|(name, p)| {
-                    let BoxProjectConfig { repo, runtime } = p;
+                    let BoxProjectConfig {
+                        repo,
+                        runtime,
+                        account,
+                        accounts,
+                        exclude_accounts,
+                    } = p;
                     let runtime = runtime.as_deref().map(runtime_shown);
-                    (name.clone(), json!({ "repo": repo, "runtime": runtime }))
+                    let mut shown = json!({ "repo": repo, "runtime": runtime });
+                    // A box project's account keys only when set: most have none.
+                    if let Some(o) = shown.as_object_mut() {
+                        if let Some(a) = account {
+                            o.insert("account".into(), json!(a));
+                        }
+                        if !accounts.is_empty() {
+                            o.insert("accounts".into(), json!(accounts));
+                        }
+                        if let Some(x) = exclude_accounts {
+                            o.insert("exclude_accounts".into(), json!(x));
+                        }
+                    }
+                    (name.clone(), shown)
                 })
                 .collect();
             (
@@ -174,6 +202,30 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
                     "projects": projects,
                 }),
             )
+        })
+        .collect();
+    // Accounts and their directories (not secrets: no credential is in config.toml).
+    let accounts: Map<String, Value> = accounts
+        .iter()
+        .map(|(rt, names)| {
+            let names: Map<String, Value> = names
+                .iter()
+                .map(|(name, a)| {
+                    let AccountConfig { dir, share, native } = a;
+                    (
+                        name.clone(),
+                        json!({ "dir": dir, "share": share, "native": native }),
+                    )
+                })
+                .collect();
+            (rt.clone(), Value::Object(names))
+        })
+        .collect();
+    let account_policy: Map<String, Value> = account_policy
+        .iter()
+        .map(|(rt, p)| {
+            let AccountPolicy { default } = p;
+            (rt.clone(), json!({ "default": default }))
         })
         .collect();
     let presets: Vec<&String> = runtimes
@@ -203,6 +255,7 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "project_reads": project_reads,
             "read_deny": read_deny,
             "memory": memory,
+            "account": orch_account,
         },
         "threads": {
             "default_mode": default_mode,
@@ -228,6 +281,8 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
             "timeout_secs": hook_timeout,
         },
         "projects": projects,
+        "accounts": accounts,
+        "account_policy": account_policy,
         "runtimes": presets,
         "boxes": boxes,
         "hub": {
@@ -386,5 +441,65 @@ runtime = "acp:remote --key s3cret-box"
             config_view(&idle, None)["threads"]["idle_compaction"],
             "before_expiry"
         );
+    }
+
+    #[test]
+    fn accounts_and_pins_show() {
+        let config = Config::from_toml_str(
+            r#"
+[orchestrator]
+account = "work"
+
+[accounts.claude-code.work]
+dir = "/home/me/.claude-work"
+share = "none"
+
+[accounts.claude-code.me]
+native = true
+
+[account_policy.claude-code]
+default = "me"
+
+[projects.api]
+repo = "/r/api"
+account = "work"
+accounts = { codex = ["team", "max-*"] }
+exclude_accounts = "old"
+
+[boxes.gpu]
+ssh = "me@gpu"
+transport = "ssh"
+
+[boxes.gpu.projects.api]
+repo = "/srv/api"
+account = "gpu-*"
+"#,
+        )
+        .unwrap();
+        let v = config_view(&config, None);
+        assert_eq!(v["orchestrator"]["account"], "work");
+        assert_eq!(
+            v["accounts"]["claude-code"]["work"],
+            json!({"dir": "/home/me/.claude-work", "share": "none", "native": false})
+        );
+        assert_eq!(
+            v["accounts"]["claude-code"]["me"],
+            json!({"dir": null, "share": "config", "native": true})
+        );
+        assert_eq!(v["account_policy"]["claude-code"]["default"], "me");
+        assert_eq!(v["projects"]["api"]["account"], "work");
+        assert_eq!(
+            v["projects"]["api"]["accounts"],
+            json!({"codex": ["team", "max-*"]})
+        );
+        assert_eq!(v["projects"]["api"]["exclude_accounts"], "old");
+        assert_eq!(v["boxes"]["gpu"]["projects"]["api"]["account"], "gpu-*");
+        assert_eq!(
+            v["boxes"]["gpu"]["projects"]["api"]["exclude_accounts"],
+            Value::Null
+        );
+        let defaults = config_view(&Config::default(), None);
+        assert_eq!(defaults["accounts"], json!({}));
+        assert_eq!(defaults["orchestrator"]["account"], Value::Null);
     }
 }

@@ -234,9 +234,8 @@ impl Adapter for FakeAdapter {
             "eval \"${TWR_FAKE_ATTACH:-exit 0}\"",
             "twr-fake-attach",
             session_id,
-        ])
-        .envs(crate::process::attach_env(cfg));
-        crate::process::scrub_std(&mut cmd);
+        ]);
+        crate::process::apply_env_std(&mut cmd, crate::process::attach_env(cfg), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }

@@ -64,7 +64,29 @@ impl Hub {
                 super::limits::Limits::prepare(&threads, &run, &ctl)
             })
         };
-        let (mut core, reader) = Core::replay_with(&opts.db_path, feed)?;
+        // Accounts: the config's, then the log's records folded over them, then checked
+        // (`hub::accounts`): a config account in a runtime's own directory, or two config
+        // accounts in one, stop the hub like a config error; a recorded account that collides
+        // is a warning, and refused at use until `twr account remove` (or the environment)
+        // fixes it.
+        let accounts_root = opts
+            .accounts_root
+            .clone()
+            .unwrap_or_else(|| data_dir_of(&opts.db_path).join("accounts"));
+        let native_dir = opts
+            .native_dir
+            .clone()
+            .unwrap_or_else(super::accounts::own_native_dir);
+        let view =
+            twr_core::account::AccountsView::new(&opts.config).with_default_root(&accounts_root);
+        let (mut core, reader) = Core::replay_accounts(&opts.db_path, feed, view)?;
+        let account_warnings =
+            super::accounts::check_at_start(&core.accounts, &opts.config, &native_dir)?;
+        core.account_native_dir = Arc::clone(&native_dir);
+        core.account_native_var = opts
+            .native_var
+            .clone()
+            .unwrap_or_else(super::accounts::own_native_var);
         core.wake.after = chrono::Duration::from_std(
             opts.wake_after
                 .unwrap_or(Duration::from_secs(opts.config.wake_after_secs)),
@@ -79,7 +101,8 @@ impl Hub {
         let stall_secs = opts.config.stall_after_secs;
         let limits = limits.await.unwrap_or_default();
         twr_core::trace::mark("hub: limits prepared");
-        let warnings = opts.config.warnings(opts.config_file.as_deref());
+        let mut warnings = opts.config.warnings(opts.config_file.as_deref());
+        warnings.extend(account_warnings);
         for w in &warnings {
             tracing::warn!("{w}");
         }
@@ -105,10 +128,16 @@ impl Hub {
             box_switch: opts.box_switch,
             box_files_lock: tokio::sync::Mutex::new(()),
             box_files_read_hook: opts.box_files_read_hook,
+            pins_lookup_hook: opts.pins_lookup_hook,
             socket_removed_hook: opts.socket_removed_hook,
             box_dialer: opts.box_dialer,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
+            accounts: super::accounts::AccountsRt::new(
+                opts.account_probe,
+                accounts_root,
+                native_dir,
+            ),
             worktree_namespace: opts.worktree_namespace,
             listening: Default::default(),
             box_key: Default::default(),
@@ -264,6 +293,8 @@ impl Hub {
                 hub.inner.idle_compaction_tick,
             ));
         }
+        // The accounts' login checks, in the background from now on (`hub::accounts`).
+        super::accounts::start_probes(&hub.inner);
         twr_core::trace::mark("hub: open");
         Ok(hub)
     }
@@ -515,15 +546,28 @@ impl Core {
     /// reducers, and the `thread.stop`s still waiting for their runtime's exit. Returns it with
     /// a reader connection. With the notification hook's feed ([`hook::HookFeed`]), its
     /// policy recalls each replayed control event as it is folded, and gives nothing for them.
+    /// The log's account events fold over no declaration ([`Core::replay_accounts`] gives
+    /// the config's).
     ///
     /// It starts from the newest checkpoint this build can use (`hub::checkpoint`) and folds
     /// only the events after it; without one, from nothing. Either way the state is the one a
     /// fold of the whole log builds.
+    #[cfg(test)]
     pub(super) fn replay_with(
         db_path: &Path,
         hook: Option<hook::HookFeed>,
     ) -> anyhow::Result<(Core, Connection)> {
-        Self::replay_from(db_path, hook, true)
+        Self::replay_from(db_path, hook, true, Default::default())
+    }
+
+    /// [`Core::replay_with`] whose account events fold over `accounts` (the config's
+    /// declarations, `hub::accounts`): what a hub's start replays.
+    pub(super) fn replay_accounts(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        accounts: twr_core::account::AccountsView,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, true, accounts)
     }
 
     /// [`Core::replay_with`] that folds the whole log, whatever checkpoints it has.
@@ -532,13 +576,24 @@ impl Core {
         db_path: &Path,
         hook: Option<hook::HookFeed>,
     ) -> anyhow::Result<(Core, Connection)> {
-        Self::replay_from(db_path, hook, false)
+        Self::replay_from(db_path, hook, false, Default::default())
+    }
+
+    /// [`Core::replay_full`] whose account events fold over `accounts`.
+    #[cfg(test)]
+    pub(super) fn replay_full_accounts(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        accounts: twr_core::account::AccountsView,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, false, accounts)
     }
 
     fn replay_from(
         db_path: &Path,
         hook: Option<hook::HookFeed>,
         checkpoints: bool,
+        accounts: twr_core::account::AccountsView,
     ) -> anyhow::Result<(Core, Connection)> {
         let store = Store::open(db_path)?;
         twr_core::trace::mark("hub: store opened");
@@ -548,6 +603,13 @@ impl Core {
             true => checkpoint::start(store, hook, &mut refused)?,
             false => (Core::empty(store, hook)?, None),
         };
+        // The accounts: the config's declarations, with the account events a checkpoint
+        // folded (none without one) folded over them again, as a whole replay folds them
+        // (`hub::checkpoint`: a checkpoint keeps the events, never what config made of them).
+        core.accounts = accounts;
+        for (_, ev) in &core.account_events {
+            core.accounts.apply(ev);
+        }
         let events = store::load_with_gseq(core.store.conn(), after.as_ref().map(|c| c.row))?;
         twr_core::trace::mark_with(|| format!("hub: {} events loaded", events.len()));
         let gseq = core.store.control_head()?;
@@ -575,6 +637,12 @@ impl Core {
         };
         core.gseq = gseq;
         drop(events);
+        // Account data recorded before the store raised the schema version with it (the
+        // checkpoint's events count too): raise it now, so a twr before accounts refuses this
+        // database (`crate::store`).
+        if core.account_data {
+            core.store.fence_accounts()?;
+        }
         // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).
         // (Only for threads the log has: a deleted one has none, `hub::delete`.)
         for thread in core.store.stop_requests()? {
@@ -620,6 +688,11 @@ impl Core {
             context_hashes: HashMap::new(),
             usage: Default::default(),
             client: Default::default(),
+            accounts: Default::default(),
+            account_events: Vec::new(),
+            account_data: false,
+            account_native_dir: Arc::new(|_: &str| None),
+            account_native_var: Arc::new(|_: &str| None),
             project_contexts: HashMap::new(),
             context_files: context::FileCache::default(),
             context_roots: HashMap::new(),
@@ -694,6 +767,7 @@ impl Core {
             };
             let t1 = timed.then(std::time::Instant::now);
             let ev = full.as_ref().unwrap_or(ev);
+            self.account_data |= store::account_dependent(ev);
             self.apply(ev);
             if let Some(g) = g {
                 self.client.apply(ev, Some(*g));
@@ -900,6 +974,8 @@ impl Core {
         // was part of the activity's batch.
         self.repair_stalls(inner)?;
         mark("stalls repaired");
+        // Usage read in a directory an account no longer has (config names another one now).
+        self.clear_moved_usage(inner)?;
         // Turns that ended before the crash but lost their report (and grade, review).
         self.recover_turn_reactions(inner)?;
         mark("turn reactions recovered");
@@ -1198,6 +1274,82 @@ mod tests {
         let db = data.join("twr.db");
         let lock = try_lock_data_dir(&db).unwrap().unwrap();
         assert!(locks_path(&lock, &path));
+    }
+
+    /// A log with account data recorded before the store's fence (schema 9) is raised to
+    /// [`store::ACCOUNTS_SCHEMA_VERSION`] when the hub replays it; one without stays at 9. So
+    /// is one whose account data only a checkpoint the start uses folded (the events after it
+    /// have none).
+    #[test]
+    fn replay_fences_account_data_recorded_before_the_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: EventBody| {
+            let db = dir.path().join(name);
+            let mut s = Store::open(&db).unwrap();
+            let ev = Event::new(HUB_THREAD, 1, None, Source::Hub, body);
+            s.append(&ev, true, Default::default()).unwrap();
+            // As a build before the fence left it.
+            s.conn()
+                .pragma_update(None, "user_version", store::SCHEMA_VERSION)
+                .unwrap();
+            db
+        };
+        let version = |db: &Path| -> i32 {
+            store::connect(db)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        let accounts = write(
+            "accounts.db",
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                dir: Some("/acc/work".into()),
+                ..Default::default()
+            }),
+        );
+        let native = write(
+            "native.db",
+            EventBody::ThreadStarted(SessionPayload::default()),
+        );
+        assert_eq!(version(&accounts), store::SCHEMA_VERSION);
+        drop(Core::replay(&accounts).unwrap());
+        assert_eq!(version(&accounts), store::ACCOUNTS_SCHEMA_VERSION);
+        drop(Core::replay(&native).unwrap());
+        assert_eq!(version(&native), store::SCHEMA_VERSION);
+
+        let from_checkpoint = write(
+            "checkpoint.db",
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "codex".into(),
+                account: "team".into(),
+                ..Default::default()
+            }),
+        );
+        let notify = twr_core::config::NotifyConfig::default();
+        let w = super::super::checkpoint::write(&from_checkpoint, &notify, 1)
+            .unwrap()
+            .expect("a checkpoint");
+        {
+            let mut s = Store::open(&from_checkpoint).unwrap();
+            let ev = Event::new(
+                "t1",
+                1,
+                None,
+                Source::Hub,
+                EventBody::ThreadStarted(SessionPayload::default()),
+            );
+            s.append(&ev, true, Default::default()).unwrap();
+            s.conn()
+                .pragma_update(None, "user_version", store::SCHEMA_VERSION)
+                .unwrap();
+        }
+        let (core, _) = Core::replay(&from_checkpoint).unwrap();
+        assert_eq!(core.replayed.checkpoint, Some(w.id));
+        assert_eq!(core.replayed.events, 1);
+        drop(core);
+        assert_eq!(version(&from_checkpoint), store::ACCOUNTS_SCHEMA_VERSION);
     }
 
     #[test]

@@ -3499,6 +3499,9 @@ mod tests {
             twr_core::config::BoxProjectConfig {
                 repo: "/h/api".into(),
                 runtime: None,
+                account: None,
+                accounts: Default::default(),
+                exclude_accounts: None,
             },
         );
         save(with_project.clone());
@@ -3539,6 +3542,9 @@ mod tests {
             twr_core::config::BoxProjectConfig {
                 repo: "/h/api".into(),
                 runtime: None,
+                account: None,
+                accounts: Default::default(),
+                exclude_accounts: None,
             },
         );
         save(&more);

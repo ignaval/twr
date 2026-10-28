@@ -825,13 +825,20 @@ fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes
 }
 
 /// The orchestrator picker's lines: what it is for, one row per runtime (installed or not,
-/// the configured default marked, or for a switch the current one), the keys.
+/// the configured default marked, or for a switch the current one), the keys. A row shows
+/// its spec as [`crate::app::orch_label`] says (the runtime alone while it hides account
+/// labels), whatever account choosing it sends.
 pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(p) = &state.view.picker else {
         return Vec::new();
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let name_width = p.runtimes.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+    let shown: Vec<String> = p
+        .runtimes
+        .iter()
+        .map(|(r, _)| crate::app::orch_label(r, &state.accounts))
+        .collect();
+    let name_width = shown.iter().map(|r| r.chars().count()).max().unwrap_or(0);
     let (title, note) = if p.switch {
         (
             "Switch the orchestrator to",
@@ -851,7 +858,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
         Line::from(Span::styled(note, dim)),
         Line::from(""),
     ];
-    for (i, (runtime, installed)) in p.runtimes.iter().enumerate() {
+    for (i, ((runtime, installed), label)) in p.runtimes.iter().zip(&shown).enumerate() {
         let chosen = i == p.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
@@ -862,7 +869,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{runtime:<name_width$}  "),
+                format!("{label:<name_width$}  "),
                 if chosen {
                     Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
                 } else {
@@ -1895,7 +1902,8 @@ fn card_border(block: Block<'static>, look: Look, color: Color) -> Block<'static
 /// `claude-code · sonnet-4-5`, with the box token of a remote box) and its permission mode,
 /// apart (`─ auto`). Where they do not all fit, the project gives way first: cut with `…` to
 /// the room the rest leaves ([`title_project`]), then left out; then who runs it shortens
-/// (the runtime goes, the model is cut, then left out, then the box's name is cut); then the
+/// (the runtime goes, the model is cut, then left out, then the account, then the box's name
+/// is cut); then the
 /// mode goes, before the state of a box not simply online would. The name is never cut (only the border can clip it). Also
 /// returns whether a box not simply online has its state left out for want of room (the
 /// bottom border then says it, [`card_bottom`]).
@@ -2910,16 +2918,21 @@ fn box_token(state: &AppState, t: &ThreadView) -> Option<BoxToken> {
 }
 
 /// Who runs `t`, as its card's or tile's title says it at its right ([`card_block`]), in the
-/// first of these that fits `room` cells: `runtime@box[ state] · model`; the runtime left out
-/// (`@box[ state] · model`, a local thread's model alone); the model cut with `…` (to 3 of its
-/// cells at least); then left out (`@box state`; nothing for a local thread); then the box's
-/// name cut (`@g… offline`, [`BoxToken::fit`]). The box's state is never cut. Dim, but for the
+/// first of these that fits `room` cells: `runtime[:account]@box[ state] · model`; the runtime
+/// left out, its account kept (`[account]@box[ state] · model`, a local thread's `[account ·
+/// ]model`); the model cut with `…` (to 3 of its cells at least); then left out
+/// (`[account]@box state`, a local thread's account alone); then the account left out (`@box
+/// state`; nothing for a local thread); then the box's name cut (`@g… offline`,
+/// [`BoxToken::fit`]). The account is there only when its runtime shows account labels, or it
+/// was removed ([`AppState::account_label`]). The box's state is never cut. Dim, but for the
 /// state's own color ([`box_word_style`]). None when not even that fits.
 fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'static>>> {
     let cells = crate::edit::width;
     let dim = Style::default().fg(Color::DarkGray);
     let token = box_token(state, t);
     let model = model_label(t);
+    let label = state.account_label(t);
+    let account = label.is_some();
     let whole: Vec<Span<'static>> = token
         .as_ref()
         .map(|k| k.fit(usize::MAX))
@@ -2933,10 +2946,14 @@ fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'st
             }
         })
         .collect();
-    let form = |runtime: bool, model: Option<String>| {
+    let form = |runtime: bool, account: bool, model: Option<String>| {
         let mut spans = Vec::new();
         if runtime {
             spans.push(Span::styled(runtime_name(t).to_string(), dim));
+        }
+        if let Some(a) = label.as_ref().filter(|_| account) {
+            let a = if runtime { format!(":{a}") } else { a.clone() };
+            spans.push(Span::styled(a, dim));
         }
         spans.extend(whole.iter().cloned());
         if let Some(m) = model {
@@ -2949,16 +2966,24 @@ fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'st
     };
     let width = |spans: &[Span<'static>]| Line::from(spans.to_vec()).width();
     let mut forms = vec![
-        form(true, Some(model.clone())),
-        form(false, Some(model.clone())),
+        form(true, account, Some(model.clone())),
+        form(false, account, Some(model.clone())),
     ];
-    // The model cut to the room the token leaves it.
-    let used = width(&form(false, None)) + if whole.is_empty() { 0 } else { 3 };
+    // The model cut to the room the account and the token leave it.
+    let before = form(false, account, None);
+    let used = width(&before) + if before.is_empty() { 0 } else { 3 };
     if room >= used + 4 && cells(&model) > room - used {
-        forms.push(form(false, Some(truncate_cells(&model, room - used))));
+        forms.push(form(
+            false,
+            account,
+            Some(truncate_cells(&model, room - used)),
+        ));
+    }
+    if account {
+        forms.push(before);
     }
     if let Some(token) = &token {
-        forms.push(form(false, None));
+        forms.push(form(false, false, None));
         if room >= token.min_width() {
             forms.push(
                 token
@@ -5168,6 +5193,7 @@ fn tool_phrase(tool: &str) -> (&'static str, &'static str) {
             "delete_thread" => ("asked to delete", "thread"),
             "list_trash" => ("listed the trash", ""),
             "get_usage" => ("checked the usage", ""),
+            "list_accounts" => ("listed the accounts", ""),
             "stop" => ("stopped", "thread"),
             "read_transcript" => ("read", "transcript"),
             "subscribe_control" => ("watched the hub", ""),
@@ -5864,8 +5890,8 @@ pub fn target_fill(dive: Option<&ThreadView>) -> Style {
 /// `talking to <name>`, and the details that fit after it (two columns apart): in a dive the
 /// runtime with the box token ([`box_token`]), model, mode and what Esc does ([`esc_words`]:
 /// how to get back, when the next Esc leaves the dive), shortened as needed ([`dive_title`]);
-/// in the orchestrator conversation the runtime and the full model id the runtime reports,
-/// cut to fit. Before an orchestrator thread exists, the one the hub would start, which starts
+/// in the orchestrator conversation the runtime (with its account while it shows account
+/// labels: `claude-code:personal`) and the full model id the runtime reports, cut to fit. Before an orchestrator thread exists, the one the hub would start, which starts
 /// with the first message. A label wider than `width` is cut, with no details.
 pub fn main_title(state: &AppState, width: usize) -> (String, String) {
     if let Some(t) = state.dived() {
@@ -5877,20 +5903,29 @@ pub fn main_title(state: &AppState, width: usize) -> (String, String) {
         return (truncate_cells(&label, width), String::new());
     }
     let room = width.saturating_sub(used + 2);
+    // The runtime with its account while it shows account labels: `claude-code:personal`.
+    let labelled = |rt: &str, account: Option<String>| match account {
+        Some(a) => format!("{rt}:{a}"),
+        None => rt.to_string(),
+    };
     let full = match (state.orchestrator(), &state.view.orch_default) {
         (Some(o), _) => format!(
             "{} · {}",
-            if o.runtime.is_empty() {
-                "?"
-            } else {
-                &o.runtime
-            },
+            labelled(runtime_name(o), state.account_label(o)),
             model_full(o)
         ),
-        (None, Some((rt, model))) => format!(
-            "{rt} · {} · starts with your first message",
-            model.as_deref().unwrap_or("default model")
-        ),
+        (None, Some((rt, model))) => {
+            // A configured `claude-code:work` is the runtime and its account, labelled only
+            // while the runtime shows account labels.
+            let (base, named) = twr_core::account::split_runtime(rt);
+            let account = state.view.orch_default_account.as_deref().or(named);
+            let label = state.accounts.label(base, account);
+            format!(
+                "{} · {} · starts with your first message",
+                labelled(base, label),
+                model.as_deref().unwrap_or("default model")
+            )
+        }
         (None, None) => "starts with your first message".to_string(),
     };
     let detail = if room >= 6 {
@@ -5961,9 +5996,11 @@ enum TokenShown {
 }
 
 /// [`main_title`] in a dive into `t`, `width` cells wide (measured in display cells):
-/// `talking to <name>` and the first of these that fits: runtime with the box token, model,
-/// mode and what Esc does (long, then short); for a box not simply online, the token with the
-/// mode, then the token alone, each with `Esc: back`; then the mode, then `Esc: back` alone. A
+/// `talking to <name>` and the first of these that fits: runtime (with its account when it
+/// shows account labels, [`AppState::account_label`]: `claude-code:work`) with the box token,
+/// model, mode and what Esc does (long, then short); for a box not simply online, the account
+/// and the token with the mode, then the account and the token alone, each with `Esc: back`;
+/// then the mode, then `Esc: back` alone. A
 /// box's state (R9) comes before the label: when no detail with the token fits after `talking
 /// to <name>`, the label becomes the name, cut as needed, with the token and `Esc: back`, then
 /// the token alone, then the token with its box's name cut (`@gp… offline`, the two names
@@ -5973,7 +6010,13 @@ fn dive_header(state: &AppState, t: &ThreadView, width: usize) -> DiveHeader {
     let cells = crate::edit::width;
     let label = format!("talking to {}", t.name);
     let (esc_long, back) = esc_words(state);
-    let rt = runtime_name(t);
+    // The account when its runtime shows labels (or it was removed): `claude-code:work`, and
+    // `work` where the runtime gives way.
+    let account = state.account_label(t).unwrap_or_default();
+    let rt = match account.as_str() {
+        "" => runtime_name(t).to_string(),
+        a => format!("{}:{a}", runtime_name(t)),
+    };
     let token = box_token(state, t);
     let whole = token
         .as_ref()
@@ -6008,8 +6051,8 @@ fn dive_header(state: &AppState, t: &ThreadView, width: usize) -> DiveHeader {
     let with_token: Vec<String> = [
         Some(format!("{rt}{whole} · {model}{mode} · {esc_long}")),
         Some(format!("{rt}{whole} · {model}{mode} · {back}")),
-        not_online.then(|| format!("{whole}{mode} · {back}")),
-        not_online.then(|| format!("{whole} · {back}")),
+        not_online.then(|| format!("{account}{whole}{mode} · {back}")),
+        not_online.then(|| format!("{account}{whole} · {back}")),
     ]
     .into_iter()
     .flatten()
@@ -8714,7 +8757,9 @@ where
     Tz::Offset: std::fmt::Display,
 {
     use twr_core::usage::{segment, Form, Level, Part};
-    let shown = state.usage.shown(now);
+    // Accounts named as threads' labels name them (the hub's rule; an older hub's: by the
+    // entries).
+    let shown = state.accounts.usage_shown(&state.usage, now);
     let calls = state.summary.stats.calls;
     let summaries = if calls > 0 {
         vec![
@@ -11127,6 +11172,33 @@ mod tests {
         assert_eq!(text(&st, 200, 30).as_deref(), Some("summaries 2 · $0.0004"));
         let last = draw(&st, 160, 24).pop().unwrap();
         assert!(last.starts_with("summaries 2 · $0.0004 "), "{last}");
+    }
+
+    /// The usage line names accounts by the hub's label rule (`account.list`'s `shown` and
+    /// `native`), not by which accounts reported: the native account's one report is named
+    /// while a second account is usable, under its current name, and nothing is named once
+    /// the second one is logged out or removed. With no accounts listed (an older hub): the
+    /// old rule, nothing named for one report.
+    #[test]
+    fn usage_labels_follow_the_accounts() {
+        let mut st = with_usage(three_threads(), 22.0, 44.0);
+        let text = |st: &AppState| -> String {
+            usage_spans(st, 94, 200, chrono::Utc::now(), &chrono::Utc)
+                .unwrap()
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
+        st.accounts = crate::accounts::Accounts::from_list(&crate::accounts::tests::list(true));
+        assert_eq!(text(&st), "C:personal 78%/56% | G 58%");
+        st.accounts = crate::accounts::Accounts::from_list(&crate::accounts::tests::list(false));
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
+        let mut l = crate::accounts::tests::list(true);
+        l["runtimes"]["claude-code"]["shown"] = serde_json::json!(false);
+        l["runtimes"]["claude-code"]["accounts"][1]["removed"] = serde_json::json!(true);
+        st.accounts = crate::accounts::Accounts::from_list(&l);
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
     }
 
     /// A window with 25% left or less is yellow and one with 10% or less red and bold, with
@@ -14096,6 +14168,411 @@ mod tests {
         assert_eq!(text(who_fit(&st, loc, 3)), None);
     }
 
+    /// [`model_threads`] plus `job`, a claude-code worker on account `work` like `ops`, with
+    /// the accounts as `account.list` answered `list` (none: a hub older than accounts).
+    fn account_threads(list: Option<Value>) -> AppState {
+        let mut st = model_threads();
+        let mut j = ThreadScript::new("t-job");
+        j.at(60);
+        let mut created = j.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "claude-code".into();
+            p.ext = serde_json::json!({"twr": {"model": "opus", "account": "work"}})
+                .as_object()
+                .cloned();
+        }
+        let mut started = j.started("s");
+        if let EventBody::ThreadStarted(p) = &mut started.body {
+            p.ext = serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805"}})
+                .as_object()
+                .cloned();
+        }
+        crate::app::tests::control(&mut st, &[created, started]);
+        if let Some(list) = list {
+            st.apply_result("account.list", &list);
+        }
+        st.set_focus(Some("t-ops".into()));
+        st
+    }
+
+    /// The title row of card `id` as last drawn.
+    fn card_title(st: &AppState, lines: &[String], id: &str) -> String {
+        pane_text(st, lines, &card(id))
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// While a runtime has one account logged in, nothing names an account: cards, tiles,
+    /// the dive header and the orchestrator's header are as they were before accounts.
+    #[test]
+    fn one_logged_in_account_shows_no_labels() {
+        use crate::accounts::tests::list;
+        let mut before = account_threads(None);
+        let mut hidden = account_threads(Some(list(false)));
+        assert!(!hidden.accounts.runtimes.is_empty());
+        for (w, h) in [(160u16, 40u16), (30, 24), (60, 30)] {
+            assert_eq!(
+                draw_panes(&mut hidden, w, h),
+                draw_panes(&mut before, w, h),
+                "{w}x{h}"
+            );
+        }
+        for st in [&mut before, &mut hidden] {
+            st.view.screen = Screen::Grid;
+        }
+        for w in [180u16, 28] {
+            assert_eq!(draw(&hidden, w, 30), draw(&before, w, 30), "grid {w}");
+        }
+        for st in [&mut before, &mut hidden] {
+            st.view.screen = Screen::Stack;
+            st.dive("t-job");
+        }
+        for w in [160u16, 50, 30] {
+            assert_eq!(draw(&hidden, w, 30), draw(&before, w, 30), "dive {w}");
+        }
+        let lines = draw(&hidden, 160, 30);
+        assert!(
+            screen(&lines).contains("talking to job  claude-code · opus-4-1 · mode manual"),
+            "{}",
+            screen(&lines)
+        );
+    }
+
+    /// With two claude-code accounts logged in, claude-code threads name theirs (the native
+    /// one under its name) on cards and tiles, in the dive header and the orchestrator's;
+    /// codex, with one, names none. Narrow, the runtime goes and the account stays, then the
+    /// model goes, then the account.
+    #[test]
+    fn two_logged_in_accounts_label_cards_tiles_and_headers() {
+        use crate::accounts::tests::list;
+        let mut st = account_threads(Some(list(true)));
+        let lines = draw_panes(&mut st, 160, 40);
+        // (`ops`'s title has no room for its runtime beside its account and model.)
+        for (id, want) in [
+            ("t-ops", "personal · opus-4-1"),
+            ("t-job", "claude-code:work · opus-4-1"),
+            ("t-api", "codex · gpt-5-codex"),
+            ("t-web", "claude-code:personal · sonnet"),
+            ("t-sh", "pty · default model"),
+        ] {
+            let title = card_title(&st, &lines, id);
+            assert!(title.contains(&format!(" {want} ")), "{title}");
+            if id == "t-ops" {
+                assert!(!title.contains("claude-code"), "{title}");
+            }
+        }
+        let s = screen(&lines);
+        assert!(
+            s.contains("ORCHESTRATOR  claude-code:personal · claude-opus-4-1-20250805"),
+            "{s}"
+        );
+        // Narrow cards: the account without the runtime, then without the model.
+        st.set_focus(Some("t-job".into()));
+        let lines = draw(&st, 40, 24);
+        assert_eq!(
+            lines[0],
+            "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
+            "{}",
+            screen(&lines)
+        );
+        st.set_focus(Some("t-ops".into()));
+        let lines = draw(&st, 30, 24);
+        assert_eq!(
+            lines[0],
+            "┏ ops ━━━━ personal ━ manual ┓",
+            "{}",
+            screen(&lines)
+        );
+        // Tiles (too narrow for the runtime beside the account).
+        st.view.screen = Screen::Grid;
+        let s = screen(&draw(&st, 180, 30));
+        assert!(s.contains(" work · opus-4-1 "), "{s}");
+        assert!(s.contains(" personal · opus-4-1 "), "{s}");
+        assert!(s.contains(" personal · sonnet "), "{s}");
+        assert!(s.contains(" codex · gpt-5-codex "), "{s}");
+        // The dive header.
+        st.view.screen = Screen::Stack;
+        st.dive("t-job");
+        assert_eq!(
+            main_title(&st, 160),
+            (
+                "talking to job".into(),
+                "claude-code:work · opus-4-1 · mode manual · Esc returns to the orchestrator"
+                    .into()
+            )
+        );
+        st.back();
+        // Before an orchestrator exists: the one the hub would start, on its account.
+        let mut fresh = AppState::new();
+        fresh.apply_result("account.list", &list(true));
+        fresh.view.orch_default = Some(("claude-code".into(), Some("opus".into())));
+        fresh.view.orch_default_account = Some("work".into());
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code:work · opus · starts with your first message"
+        );
+        fresh.view.orch_default = Some(("claude-code:work".into(), None));
+        fresh.view.orch_default_account = None;
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code:work · default model · starts with your first message"
+        );
+        fresh.apply_result("account.list", &list(false));
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code · default model · starts with your first message",
+            "a configured account is labelled only while the runtime shows labels"
+        );
+        fresh.view.orch_default = Some(("claude-code".into(), None));
+        fresh.view.orch_default_account = Some("personal".into());
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code · default model · starts with your first message"
+        );
+    }
+
+    /// Labels follow the accounts: a second account's login (`account.status`) asks for the
+    /// accounts again (one call at a time; an event meanwhile asks once more after it), and
+    /// its answer labels the cards; a logout takes them away; a thread on a removed account
+    /// says so whatever the rule. The replay's events ask nothing (the answer asked for on
+    /// connecting has them), nor does usage.
+    #[test]
+    fn labels_follow_logins_logouts_and_removals() {
+        use crate::accounts::tests::list;
+        use twr_core::event::{AccountStatus, AccountUsage};
+        let mut st = account_threads(Some(list(false)));
+        let title = |st: &mut AppState, id: &str| {
+            let lines = draw_panes(st, 160, 40);
+            card_title(st, &lines, id)
+        };
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let status = |hub: &mut ThreadScript, login| {
+            hub.event(EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                login,
+                ..Default::default()
+            }))
+        };
+        let usage = hub.event(EventBody::AccountUsage(AccountUsage::default()));
+        crate::app::tests::control(&mut st, &[usage]);
+        assert!(!st.send_accounts(), "usage changes no account");
+        let login = status(&mut hub, twr_core::account::Login::LoggedIn);
+        crate::app::tests::control(&mut st, std::slice::from_ref(&login));
+        assert!(st.send_accounts());
+        assert!(!st.send_accounts(), "one at a time");
+        crate::app::tests::control(&mut st, &[login]);
+        assert!(!st.send_accounts(), "one at a time");
+        st.apply_result("account.list", &list(true));
+        assert!(st.send_accounts(), "the event meanwhile asks again");
+        st.apply_result("account.list", &list(true));
+        assert!(!st.send_accounts());
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-ops").contains(" personal · opus-4-1 "));
+        // An older hub's answer (null) keeps what was known; a failure keeps it too, and is
+        // asked for again (`a_failed_account_list_is_asked_for_again_with_a_backoff`).
+        let logout = status(&mut hub, twr_core::account::Login::LoggedOut);
+        crate::app::tests::control(&mut st, &[logout]);
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &Value::Null);
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &list(false));
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        // Removed: `job` names its account, `ops` nothing.
+        let mut removed = list(false);
+        removed["runtimes"]["claude-code"]["accounts"][1]["removed"] = true.into();
+        st.apply_result("account.list", &removed);
+        let job = title(&mut st, "t-job");
+        assert!(job.contains(" work (removed) · opus-4-1 "), "{job}");
+        assert!(title(&mut st, "t-ops").contains(" claude-code · opus-4-1 "));
+        // The replay asks nothing.
+        let mut st = account_threads(None);
+        st.begin_catch_up(st.last_gseq + 5);
+        let again = status(&mut hub, twr_core::account::Login::LoggedIn);
+        crate::app::tests::control(&mut st, &[again]);
+        assert!(!st.send_accounts());
+    }
+
+    /// A failed `account.list` (not an older hub's unknown method) is asked for again after
+    /// 5s, 30s, then every 60s, keeping what was known meanwhile, until one answers: the
+    /// labels recover without an `account.*` event. The one on connecting too. An older hub's
+    /// answer (null) asks nothing again: no labels, as before.
+    #[test]
+    fn a_failed_account_list_is_asked_for_again_with_a_backoff() {
+        use crate::accounts::tests::list;
+        let failed = serde_json::json!({"failed": true});
+        let title = |st: &mut AppState, id: &str| {
+            let lines = draw_panes(st, 160, 40);
+            card_title(st, &lines, id)
+        };
+        let t0 = std::time::Instant::now();
+        let secs = |s: u64| t0 + std::time::Duration::from_secs(s);
+        // On connecting: nothing known yet, asked again 5s later.
+        let mut st = account_threads(None);
+        st.accounts_answered(&failed, t0);
+        assert_eq!(st.accounts_retry, Some(secs(5)));
+        st.accounts_retry_due(secs(4));
+        assert!(!st.send_accounts(), "not yet");
+        st.accounts_retry_due(secs(5));
+        assert!(st.send_accounts());
+        assert_eq!(st.accounts_retry, None);
+        // It fails again: 30s, then 60s, then 60s.
+        st.accounts_answered(&failed, secs(5));
+        assert_eq!(st.accounts_retry, Some(secs(35)));
+        st.accounts_retry_due(secs(35));
+        assert!(st.send_accounts());
+        st.accounts_answered(&failed, secs(35));
+        assert_eq!(st.accounts_retry, Some(secs(95)));
+        st.accounts_retry_due(secs(95));
+        assert!(st.send_accounts());
+        st.accounts_answered(&failed, secs(95));
+        assert_eq!(st.accounts_retry, Some(secs(155)));
+        // An `account.*` event's call meanwhile is the retry.
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        assert_eq!(st.accounts_retry, None);
+        // Answered: the labels are back, and nothing waits.
+        st.accounts_answered(&list(true), secs(100));
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert_eq!((st.accounts_retry, st.accounts_failures), (None, 0));
+        // A later failure keeps the labels and starts the backoff over (through
+        // `apply_result`, as the calls' answers arrive).
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &failed);
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert_eq!(st.accounts_failures, 1);
+        let at = st.accounts_retry.expect("a retry");
+        assert!(at <= std::time::Instant::now() + std::time::Duration::from_secs(5));
+        st.accounts_retry_due(at);
+        assert!(st.send_accounts());
+        // An older hub (its unknown method, null): nothing is asked again.
+        let mut old = account_threads(None);
+        old.accounts_answered(&Value::Null, t0);
+        assert_eq!(old.accounts_retry, None);
+        old.accounts_retry_due(secs(3600));
+        assert!(!old.send_accounts());
+        assert!(title(&mut old, "t-job").contains(" claude-code · opus-4-1 "));
+    }
+
+    /// Before an orchestrator exists, an `account.*` event asks for the orchestrator the hub
+    /// would start again (`orchestrator.show`) with the accounts, and the header follows its
+    /// answer: the native account renamed from `default` to `personal` no longer shows as
+    /// `default (removed)`. A failed answer keeps what was known; once an orchestrator
+    /// exists, only the accounts are asked for.
+    #[test]
+    fn the_pending_orchestrators_account_follows_account_changes() {
+        use crate::accounts::tests::list;
+        use twr_core::event::AccountStatus;
+        let mut before = list(true);
+        before["runtimes"]["claude-code"]["native"] = "default".into();
+        before["runtimes"]["claude-code"]["accounts"][0]["name"] = "default".into();
+        let mut st = AppState::new();
+        st.apply_result("account.list", &before);
+        st.view.orch_default = Some(("claude-code".into(), None));
+        st.view.orch_default_account = Some("default".into());
+        let pending = |account: &str| {
+            format!("claude-code:{account} · default model · starts with your first message")
+        };
+        assert_eq!(main_title(&st, 120).1, pending("default"));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let event = hub.event(EventBody::AccountStatus(AccountStatus {
+            runtime: "claude-code".into(),
+            account: "personal".into(),
+            ..Default::default()
+        }));
+        crate::app::tests::control(&mut st, std::slice::from_ref(&event));
+        assert_eq!(st.account_calls(), ["account.list", "orchestrator.show"]);
+        assert!(st.account_calls().is_empty(), "one at a time");
+        st.apply_result("account.list", &list(true));
+        assert_eq!(main_title(&st, 120).1, pending("default (removed)"));
+        st.apply_result(
+            "orchestrator.show",
+            &serde_json::json!({"runtime": "claude-code", "model": null, "account": "personal"}),
+        );
+        assert_eq!(main_title(&st, 120).1, pending("personal"));
+        // A failed call keeps what was known.
+        st.apply_result("orchestrator.show", &Value::Null);
+        assert_eq!(main_title(&st, 120).1, pending("personal"));
+        // A pool's choice changed: its answer names the other account.
+        crate::app::tests::control(&mut st, std::slice::from_ref(&event));
+        assert_eq!(st.account_calls(), ["account.list", "orchestrator.show"]);
+        st.apply_result("account.list", &list(true));
+        st.apply_result(
+            "orchestrator.show",
+            &serde_json::json!({"runtime": "claude-code", "model": "opus", "account": "work"}),
+        );
+        assert_eq!(
+            main_title(&st, 120).1,
+            "claude-code:work · opus · starts with your first message"
+        );
+        // With an orchestrator thread, the accounts only.
+        let mut st = account_threads(Some(list(true)));
+        assert!(st.orchestrator().is_some());
+        crate::app::tests::control(&mut st, &[event]);
+        assert_eq!(st.account_calls(), ["account.list"]);
+    }
+
+    /// On a remote box the account joins the runtime before the box token
+    /// (`codex:team@gpu`); narrow, the runtime goes first, the model next, then the account,
+    /// then the box's name is cut, never its state. The dive header keeps the account with
+    /// the token, and still colors the token's state.
+    #[test]
+    fn the_account_gives_way_after_the_model() {
+        use crate::app::tests::info_box;
+        let text = |w: Option<Vec<Span<'static>>>| w.map(|w| Line::from(w).to_string());
+        let two = serde_json::json!({"runtimes": {"codex": {"shown": true, "native": "default",
+            "accounts": [{"name": "default", "native": true, "login": "logged_in"},
+                         {"name": "team", "native": false, "login": "logged_in"}]}}});
+        let mut st = on_box("job", "gpu", info_box("gpu", "online"), |_| Vec::new());
+        st.apply_result("account.list", &two);
+        let job = st.registry.get("t-job").unwrap().clone();
+        let fit = |st: &AppState, room| text(who_fit(st, &job, room)).unwrap_or_default();
+        assert_eq!(fit(&st, 60), "codex:default@gpu · gpt-5-codex");
+        assert_eq!(fit(&st, 26), "default@gpu · gpt-5-codex");
+        assert_eq!(fit(&st, 20), "default@gpu · gpt-5…");
+        assert_eq!(fit(&st, 14), "default@gpu");
+        assert_eq!(fit(&st, 8), "@gpu");
+        assert_eq!(fit(&st, 3), "@g…");
+        let mut st = on_box("job", "gpu", info_box("gpu", "offline"), |_| Vec::new());
+        st.apply_result("account.list", &two);
+        assert_eq!(fit(&st, 40), "codex:default@gpu offline · gpt-5-codex");
+        assert_eq!(fit(&st, 22), "default@gpu offline");
+        assert_eq!(fit(&st, 16), "@gpu offline");
+        st.dive("t-job");
+        let (_, detail) = main_title(&st, 64);
+        assert_eq!(detail, "default@gpu offline · mode manual · Esc: back");
+        let band = target_fill(st.dived());
+        let (_, spans) = main_title_spans(&st, 64, band);
+        let word = spans.iter().find(|s| s.content == " offline").unwrap();
+        assert_eq!(word.style.fg, Some(Color::Red));
+        assert_eq!(spans[0].content, "default");
+        assert_eq!(spans[1].content, "@gpu");
+        // A local thread: its account and model, then the account alone.
+        let mut st = box_threads(info_box("gpu", "online"));
+        st.apply_result("account.list", &crate::accounts::tests::list(true));
+        let loc = st.registry.get("t-loc").unwrap();
+        assert_eq!(
+            text(who_fit(&st, loc, 40)).as_deref(),
+            Some("claude-code:personal · sonnet")
+        );
+        assert_eq!(
+            text(who_fit(&st, loc, 20)).as_deref(),
+            Some("personal · sonnet")
+        );
+        assert_eq!(
+            text(who_fit(&st, loc, 15)).as_deref(),
+            Some("personal · son…")
+        );
+        assert_eq!(text(who_fit(&st, loc, 10)).as_deref(), Some("personal"));
+        assert_eq!(text(who_fit(&st, loc, 7)), None);
+    }
+
     /// The same, drawn: a card at its narrowest (30 columns), in the side column (34), a
     /// 30-column tile and a tile at its narrowest (40) show the box's state whole whatever the
     /// box's name, and the card keeps its height.
@@ -14533,12 +15010,15 @@ mod tests {
     #[test]
     fn the_first_run_picker_is_drawn_over_the_view() {
         let mut st = three_threads();
-        st.view.picker = crate::app::Picker::from_show(&serde_json::json!({
-            "thread": null, "retired": 0,
-            "configured": {"runtime": "codex", "explicit": false},
-            "runtimes": ["claude-code", "codex", "gemini"],
-            "installed": {"claude-code": true, "codex": false},
-        }));
+        st.view.picker = crate::app::Picker::from_show(
+            &serde_json::json!({
+                "thread": null, "retired": 0,
+                "configured": {"runtime": "codex", "explicit": false},
+                "runtimes": ["claude-code", "codex", "gemini"],
+                "installed": {"claude-code": true, "codex": false},
+            }),
+            &Default::default(),
+        );
         let lines = draw(&st, 120, 30);
         let s = screen(&lines);
         for part in [

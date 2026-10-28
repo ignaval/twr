@@ -77,6 +77,12 @@
 //!   stay those of the recordings); an error answer stops the reads. The
 //!   `account/rateLimits/updated` notification (sparse: a window it leaves null is unknown,
 //!   not gone) is the passive report. Both become `runtime.limits`.
+//! - Limits: a failed turn with `codexErrorInfo` `usageLimitExceeded` carries
+//!   `ext.twr.limit` ([`crate::usage::Limit`], [`limit_of`]) and is not transient: usage, with
+//!   the window of the latest reports at 100% (else the one that resets first) and its reset;
+//!   spend when the last snapshot's `rateLimitReachedType` says credits are depleted. That
+//!   snapshot only tells spend from usage: any other failure names no limit.
+//!   `rateLimitExceeded` stays transient.
 //! - Tokens: `thread/tokenUsage/updated` after every model call; `total` is cumulative for the
 //!   thread (a resumed thread first replays its old total), so a turn's usage is the growth of
 //!   `total` over the turn. There is no USD cost. `last.totalTokens` is how full the context
@@ -100,6 +106,7 @@ use twr_core::adapter::Answer;
 use twr_core::usage::UsageWindow;
 
 use crate::claude_code::translate::{error_line, mark_visible, render_command, FULL_INPUT_KEY};
+use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
     AttentionReason, AttentionResolved, EventBody, JsonMap, ResolvedBy, SessionPayload, TurnEnded,
@@ -438,6 +445,12 @@ pub struct Translator {
     cwd: Option<String>,
     /// When to read the plan's usage again (`account/rateLimits/read`).
     usage: crate::usage::Reads,
+    /// The rate-limit windows of the reports so far, merged (a report leaving a window out
+    /// does not forget it), for the limit a failed turn hit ([`limit_of`]).
+    limit_windows: Vec<UsageWindow>,
+    /// The last snapshot's `rateLimitReachedType` (each snapshot replaces it, so one that no
+    /// longer reports it clears it).
+    limit_reached: Option<String>,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
     /// Reviewer decisions too long to read so far, naming those without a readable id.
@@ -483,6 +496,8 @@ impl Translator {
             pending: Vec::new(),
             used_attn_ids: Recent::new(ATTN_IDS_KEPT),
             usage: crate::usage::Reads::default(),
+            limit_windows: Vec::new(),
+            limit_reached: None,
             clock: Utc::now,
             unread_reviews: 0,
         }
@@ -509,6 +524,9 @@ impl Translator {
     /// covers every window the last read had.
     fn usage_report(&mut self, snapshot: &Value, source: &str, out: &mut Translated) {
         let windows = rate_limit_windows(snapshot);
+        self.limit_reached = opt_str(snapshot, "rateLimitReachedType");
+        self.limit_windows =
+            twr_core::usage::merge_windows(&self.limit_windows, &windows, (self.clock)());
         if source == "read" {
             self.usage.answered(&windows);
         } else {
@@ -2753,17 +2771,24 @@ impl Translator {
             codex.insert("error".into(), err.clone());
         }
         // Every failed turn says why (`ext.twr.error`, what the hub quotes): the turn's error,
-        // else its last `error` notification. Not signed in (or the login expired): said with
-        // what to do, and never transient (Codex reports it as a failed connection, which
-        // otherwise is).
-        let auth = result == TurnResult::Error && auth_failure(&t["error"]);
+        // else its last `error` notification, which is then also what says whether it was not
+        // signed in or hit a limit (whether it is transient stays the turn's error's). Not
+        // signed in (or the login expired): said with what to do, and never transient (Codex
+        // reports it as a failed connection, which otherwise is).
+        let noted = cur
+            .as_ref()
+            .and_then(|c| c.last_error.as_ref())
+            .or_else(|| own_turn.as_ref().and_then(|o| o.last_error.as_ref()))
+            .map(|(e, _)| e);
+        let cause = t
+            .get("error")
+            .filter(|e| !e.is_null())
+            .or(noted)
+            .unwrap_or(&Value::Null);
+        let auth = result == TurnResult::Error && auth_failure(cause);
         let twr_error = (result == TurnResult::Error).then(|| {
-            let noted = cur
-                .as_ref()
-                .and_then(|c| c.last_error.as_ref())
-                .or_else(|| own_turn.as_ref().and_then(|o| o.last_error.as_ref()));
             let text = error_text(&t["error"])
-                .or_else(|| noted.and_then(|(e, _)| error_text(e)))
+                .or_else(|| noted.and_then(error_text))
                 .unwrap_or_else(|| match status {
                     "" => "Codex ended the turn without a status".to_string(),
                     s => format!("Codex ended the turn with status {s}"),
@@ -2774,9 +2799,21 @@ impl Translator {
                 error_line(&text)
             }
         });
+        let mut limit = None;
         if auth {
             codex.insert("auth_failed".into(), json!(true));
             codex.insert("transient".into(), json!(false));
+        } else if let Some(l) = twr_error.as_deref().and_then(|message| {
+            limit_of(
+                cause,
+                &self.limit_windows,
+                self.limit_reached.as_deref(),
+                message,
+            )
+        }) {
+            // Retrying before the reset cannot help.
+            codex.insert("transient".into(), json!(false));
+            limit = Some(l);
         } else if result == TurnResult::Error {
             let reason = transient_reason(&t["error"]);
             codex.insert("transient".into(), json!(reason.is_some()));
@@ -2812,6 +2849,9 @@ impl Translator {
         if let Some(e) = twr_error {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": e }));
+        }
+        if let Some(l) = limit {
+            set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
         }
         // Codex's own turn: its end carries its id, so it closes only the turn its start opened.
         if turn.is_none() {
@@ -3806,17 +3846,60 @@ fn with_auth_hint(text: String) -> String {
     }
 }
 
+/// The variant of a turn error's `codexErrorInfo` (`"usageLimitExceeded"`,
+/// `{"httpConnectionFailed": {...}}` → `httpConnectionFailed`).
+fn error_info_name(error: &Value) -> Option<&str> {
+    match error.get("codexErrorInfo")? {
+        Value::String(s) => Some(s),
+        Value::Object(m) => m.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
 /// Why a failed turn looks transient (`turn.error.codexErrorInfo`), if it does.
 pub fn transient_reason(error: &Value) -> Option<String> {
-    let info = error.get("codexErrorInfo")?;
-    let name = match info {
-        Value::String(s) => s.clone(),
-        Value::Object(m) => m.keys().next()?.clone(),
-        _ => return None,
-    };
+    let name = error_info_name(error)?;
     TRANSIENT_ERRORS
-        .contains(&name.as_str())
+        .contains(&name)
         .then(|| format!("codexErrorInfo {name}"))
+}
+
+/// The limit a failed turn (its `error`) hit, in the runtime's words `message`, given the
+/// rate-limit windows reported so far and the last snapshot's `rateLimitReachedType`
+/// `reached`. Only a `usageLimitExceeded` error names a limit: spend when `reached` says
+/// credits are depleted (`workspace_*_credits_depleted`), else usage, with the first window
+/// at 100% or more (else the one that resets first) and its reset time. None for any other
+/// error, whatever the snapshot says (`contextWindowExceeded` stays itself,
+/// `rateLimitExceeded` transient).
+pub fn limit_of(
+    error: &Value,
+    windows: &[UsageWindow],
+    reached: Option<&str>,
+    message: &str,
+) -> Option<Limit> {
+    if error_info_name(error) != Some("usageLimitExceeded") {
+        return None;
+    }
+    if reached.is_some_and(|r| r.contains("credits_depleted")) {
+        return Some(Limit {
+            kind: LimitKind::Spend,
+            window: None,
+            resets_at: None,
+            message: message.to_string(),
+        });
+    }
+    let window = windows.iter().find(|w| w.used_pct >= 100.0).or_else(|| {
+        windows
+            .iter()
+            .filter(|w| w.resets_at.is_some())
+            .min_by_key(|w| w.resets_at)
+    });
+    Some(Limit {
+        kind: LimitKind::Usage,
+        window: window.map(|w| w.window.clone()),
+        resets_at: window.and_then(|w| w.resets_at),
+        message: message.to_string(),
+    })
 }
 
 /// The text of one answer to a question with option `labels`, or None to decline.

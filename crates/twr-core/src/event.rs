@@ -682,6 +682,11 @@ pub struct ThreadModeChanged {
 /// [`crate::reduce::ThreadView::handoff_pending`]). `ext.twr` holds what the new runtime
 /// needs (`acp_command`, `acp_attach`, `acp_preset`, as on `thread.created`) and the previous
 /// session's id (`previous_session`).
+///
+/// A move to another account (`account_changed`) sets `account` and `previous_account`
+/// (`None`: the native account), and also `runtime` and `previous_runtime` (equal when only
+/// the account changes): a session does not move between accounts either, so the same
+/// handoff follows.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThreadModelChanged {
@@ -701,6 +706,15 @@ pub struct ThreadModelChanged {
     /// The runtime before, with `runtime`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_runtime: Option<String>,
+    /// The thread moved to another account (`account`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub account_changed: bool,
+    /// The new account, with `account_changed` (`None`: the native account).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The account before, with `account_changed` (`None`: the native account).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_account: Option<String>,
     /// Who changed them.
     pub by: ChangedBy,
     /// Runtime-specific extras.
@@ -749,6 +763,12 @@ pub const MODEL_RESTART_REASON: &str = "model_change";
 /// stopped; its next turn starts a new session of the new runtime, with a handoff.
 pub const RUNTIME_RESTART_REASON: &str = "runtime_change";
 
+/// `ext.twr.reason` of the `thread.stopped` that closes a runtime the hub replaces with the
+/// same or another runtime on another account (`thread.model_changed` with
+/// `account_changed`). Like [`RUNTIME_RESTART_REASON`], the thread does not count as stopped;
+/// its next turn starts a new session on the new account, with a handoff.
+pub const ACCOUNT_RESTART_REASON: &str = "account_change";
+
 /// `ext.twr.reason` of the `thread.stopped` that closes an idle runtime the hub stops to trim
 /// its thread's worktree (`thread.trim`): its build output goes while no runtime works in it.
 /// The thread does not count as stopped; its next prompt resumes the session.
@@ -790,10 +810,88 @@ pub const RESUME_SESSION_KEY: &str = "resume_session";
 /// ([`crate::reduce::ThreadView::resume_failed_turn`]).
 pub const RESUMES_KEY: &str = "resumes";
 
+/// `ext.twr` key of the `turn.started` that would have carried a pending resume
+/// ([`RESUME_SESSION_KEY`]) but drops it: the session no longer holds when the turn starts
+/// (its account was removed since, or is in another directory or reached by another path:
+/// `hub::switch`), so the turn starts a new session with the full handoff instead. The
+/// session it drops (a string); the fold clears the resume and keeps the move pending
+/// ([`crate::reduce::ThreadView::resume_session`]).
+pub const RESUME_DROPPED_KEY: &str = "resume_dropped";
+
+/// `ext.twr` key next to [`RESUME_DROPPED_KEY`]: why the resume was dropped (a string, for
+/// the transcript).
+pub const RESUME_DROPPED_WHY_KEY: &str = "resume_dropped_why";
+
 /// `ext.twr` key of a `conversation.update` on a worker thread that turns the hub's offers to
 /// compact its context once its prompt cache expired off (`"off"`) or back on (`"on"`)
 /// ([`crate::reduce::ThreadView::idle_compaction_off`]).
 pub const IDLE_COMPACTION_KEY: &str = "idle_compaction";
+
+/// `ext.twr` key of a thread's account (a string; absent: the native account). On
+/// `thread.created` and on a `thread.model_changed` that moves the thread to an account, the
+/// account it runs on from then on; on a `thread.started`, the account that process runs
+/// (stamped by the hub, next to `runtime`): a start of another account than the one the
+/// thread moved to is not the new session ([`crate::reduce::ThreadView::handoff_pending`]).
+pub const ACCOUNT_KEY: &str = "account";
+
+/// `ext.twr` key of a named account's config directory (a string), next to
+/// [`ACCOUNT_KEY`] on `thread.created` and on an account move: the directory the session
+/// began in; on a `thread.started` / `thread.resumed` the hub stamps, the one that process
+/// runs in.
+pub const ACCOUNT_DIR_KEY: &str = "account_dir";
+/// `ext.twr` key: the path a named account's runtimes get as its directory
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...), as configured when the thread got the account;
+/// [`ACCOUNT_DIR_KEY`] is the same directory with links followed. A runtime may key what it
+/// keeps elsewhere on that path (Claude Code's macOS Keychain entry hashes it), so the thread
+/// keeps using it while it still leads to that directory.
+pub const ACCOUNT_ENV_DIR_KEY: &str = "account_env_dir";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps for the native
+/// account (a string): the runtime's own directory that process ran in, as the hub's selector
+/// variable has it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...; unset: the runtime's default in
+/// `$HOME`), links followed where it exists. Only stamped: the process's environment is not
+/// changed. A move back resumes a native session only in that directory; a start without it
+/// (from before the key, or on another box) is taken to be in it.
+pub const SESSION_STORE_KEY: &str = "session_store";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps for the native
+/// account on its own box, with [`SESSION_STORE_KEY`]: the runtime's selector variable
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) as that process got it, `null` when it was not set
+/// (or empty). A relative value is made absolute under the directory the process started in;
+/// links are not followed: a runtime may key its login on the variable's spelling (Claude
+/// Code's macOS Keychain entry: none when unset, a hash of the path when set), so two paths to
+/// one directory, or the default directory spelled out, are two logins. A move back resumes a
+/// native session only with the variable as it was; a start without the key (from before it)
+/// is taken to have had it so.
+pub const NATIVE_SELECTOR_KEY: &str = "native_selector";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps (a number): the login
+/// generation of the account that process ran on
+/// ([`crate::account::AccountsView::login_generation`]), absent when 0. A move back resumes a
+/// session only under the generation it ran in: a login recorded since may be another
+/// organization's.
+pub const ACCOUNT_LOGIN_KEY: &str = "account_login";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps on its own box (a
+/// string): the login note of the directory that process's login lives in when it started
+/// ([`crate::account::login_note`]: the named account's directory, or the native account's
+/// session store), absent when there was none. `twr account login` and `add` write a new note
+/// after each login they run, in any workspace (the accounts root is shared): a move back
+/// resumes a session only while the note is the one it started under (absent: none since).
+pub const LOGIN_NOTE_KEY: &str = "login_note";
+
+/// `ext.twr` key of a thread's own account pin on `thread.created` (a string, the pin's
+/// items comma-separated, [`crate::account::Pin`]): what the thread was asked to run on.
+pub const ACCOUNT_PIN_KEY: &str = "account_pin";
+
+/// `ext.twr` key of the configured project whose account pins and exclusions apply to a
+/// thread made for a repository path (a string, on `thread.created`): the project of that
+/// repository (the same git repository, however the path names it: an alias, a subdirectory,
+/// another worktree of it). Absent when the thread was made for the configured project by
+/// name (`configured_project`: that project's pins apply) or for a repository no configured
+/// project has. [`crate::reduce::ThreadView::pins_project`].
+pub const ACCOUNT_PROJECT_KEY: &str = "account_project";
+
+/// `ext.twr` key of why a thread got its account (a string: `explicit`, `project`,
+/// `default`, `config` for the orchestrator's configured account, or `override` when the user
+/// moved it outside its pin). Absent for the native account nothing else chose.
+pub const ACCOUNT_REASON_KEY: &str = "account_reason";
 
 /// `ext.twr` key of an `acp` thread's agent: its argv (a JSON array of strings). On
 /// `thread.created` and on a `thread.model_changed` that moves the thread to an agent, the
@@ -859,7 +957,7 @@ pub fn set_twr_ext(ext: &mut Option<JsonMap>, key: &str, value: Value) {
 
 /// Whether `thread.stopped` `p` closed a runtime the hub restarts in new settings
 /// ([`MODE_RESTART_REASON`], [`MODEL_RESTART_REASON`], [`RUNTIME_RESTART_REASON`],
-/// [`TRIM_RESTART_REASON`] or [`BOX_UPGRADE_REASON`]).
+/// [`ACCOUNT_RESTART_REASON`], [`TRIM_RESTART_REASON`] or [`BOX_UPGRADE_REASON`]).
 pub fn is_settings_restart(p: &SessionPayload) -> bool {
     matches!(
         p.ext
@@ -871,6 +969,7 @@ pub fn is_settings_restart(p: &SessionPayload) -> bool {
             MODE_RESTART_REASON
                 | MODEL_RESTART_REASON
                 | RUNTIME_RESTART_REASON
+                | ACCOUNT_RESTART_REASON
                 | TRIM_RESTART_REASON
                 | BOX_UPGRADE_REASON
         )
@@ -1810,6 +1909,110 @@ pub struct AccountUsage {
     /// in order and may be later). Absent: the event's `ts`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<DateTime<Utc>>,
+    /// The named account's directory the reporting session ran in (links followed): the
+    /// windows are that directory's login's. Absent for the native account, for a record that
+    /// clears the entry (no windows: the account's directory changed), and in records older
+    /// than this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `account.added` (hub thread): twr recorded an account of a runtime (`twr account add`), or
+/// a name for the runtime's native account (`native`). Config declarations are never recorded;
+/// an account in both is the config's ([`crate::account::AccountsView`]). A later one of the
+/// same name replaces it, and one after its `account.removed` adds it again.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountAdded {
+    /// Runtime name.
+    pub runtime: String,
+    /// Account name ([`crate::account::check_name`]).
+    pub account: String,
+    /// Its config directory; absent for the native account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+    /// What it shares with the native account.
+    pub share: crate::account::Share,
+    /// This names the native account (no directory of its own).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
+    /// Who added it.
+    pub by: ChangedBy,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `account.removed` (hub thread): twr's record of an account is gone (`twr account
+/// remove`); with `native`, the native account itself is removed (threads on it cannot start
+/// until they move, or an `account.added` with `native` brings it back), whatever it is named
+/// when this is replayed: it removed the native login, not a name. A config account stays,
+/// from config alone (config's native declaration too).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountRemoved {
+    /// Runtime name.
+    pub runtime: String,
+    /// Account name.
+    pub account: String,
+    /// The account is the native one (under the name it had); for `record_only`, the record
+    /// removed is the native account's.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
+    /// Only twr's record went: config.toml declared the account when it was removed (as the
+    /// native account or a named one, whatever kind the record is), so the account itself
+    /// stayed. Folded the same whatever config says later: a native record removed so never
+    /// removes the native account ([`crate::account::AccountsView`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub record_only: bool,
+    /// Who removed it.
+    pub by: ChangedBy,
+    /// Runtime-specific extras.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ext: Option<JsonMap>,
+    /// Unknown keys, including `<field>_ref` blob pointers.
+    #[serde(flatten, default, skip_serializing_if = "JsonMap::is_empty")]
+    pub extra: JsonMap,
+}
+
+/// `account.status` (hub thread): a status check of an account (the native one under its
+/// name then) found `login`, recorded when it differs from the last one, or when it follows a
+/// login twr ran (`after_login`). No email, organization or plan is kept.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountStatus {
+    /// Runtime name.
+    pub runtime: String,
+    /// Account name.
+    pub account: String,
+    /// It is the native account's (under its name then). Without it, the name says: the
+    /// native account's when the native account has that name then and no live named account
+    /// has it too ([`crate::account::AccountsView`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
+    /// What the check found.
+    pub login: crate::account::Login,
+    /// How it is signed in, when the runtime says (`claude.ai`, `api-key`, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Why, when the state is not plain (a check that failed, say).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The check ran after a login twr ran ended successfully (`twr account login`, `twr
+    /// account add`), whatever it found (also `unknown`): recorded even when the state is
+    /// unchanged, it raises the account's login generation
+    /// ([`crate::account::AccountsView::login_generation`]). Written only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub after_login: bool,
     /// Runtime-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<JsonMap>,
@@ -2056,6 +2259,12 @@ event_body! {
     RuntimeLimits(RuntimeLimits) => "runtime.limits",
     /// `account.usage`
     AccountUsage(AccountUsage) => "account.usage",
+    /// `account.added`
+    AccountAdded(AccountAdded) => "account.added",
+    /// `account.removed`
+    AccountRemoved(AccountRemoved) => "account.removed",
+    /// `account.status`
+    AccountStatus(AccountStatus) => "account.status",
     /// `project.read`
     ProjectRead(ProjectRead) => "project.read",
     /// `memory.changed`
@@ -2088,10 +2297,10 @@ impl EventBody {
 /// `report.*`, `decision.*`, and the small hub-relevant kinds `git.snapshot`, `runner.*`,
 /// `context.updated`, `context.compacting` and `context.compacted` (a runtime compacting its
 /// context: a few per session at most, and cards show it), `conversation.update`, `account.*`
-/// (the hub's `account.usage`), `project.read` (an orchestrator read, shown to the user),
-/// `memory.changed` (a note of the orchestrator's memory saved or forgotten, shown too),
-/// `worktree.*` and `trash.*` (the hub's `trash.purged`). `agent.*` never goes on the control
-/// stream.
+/// (the hub's `account.usage`, `account.added`, `account.removed`, `account.status`),
+/// `project.read` (an orchestrator read, shown to the user), `memory.changed` (a note of the
+/// orchestrator's memory saved or forgotten, shown too), `worktree.*` and `trash.*` (the hub's
+/// `trash.purged`). `agent.*` never goes on the control stream.
 pub fn is_control_kind(kind: &str) -> bool {
     kind.starts_with("thread.")
         || kind == "turn.started"
@@ -2406,6 +2615,26 @@ mod tests {
                 plan: Some("pro".into()),
                 ..Default::default()
             }),
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                dir: Some("/home/me/.claude-work".into()),
+                share: crate::account::Share::None,
+                ..Default::default()
+            }),
+            EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "me".into(),
+                native: true,
+                ..Default::default()
+            }),
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "codex".into(),
+                account: "team".into(),
+                login: crate::account::Login::LoggedIn,
+                method: Some("chatgpt".into()),
+                ..Default::default()
+            }),
             EventBody::ProjectRead(ProjectRead {
                 tool: "read".into(),
                 project: "api".into(),
@@ -2707,6 +2936,7 @@ mod tests {
             MODEL_RESTART_REASON,
             TRIM_RESTART_REASON,
             RUNTIME_RESTART_REASON,
+            ACCOUNT_RESTART_REASON,
             BOX_UPGRADE_REASON,
         ] {
             let mut ext = JsonMap::new();
@@ -2853,6 +3083,9 @@ mod tests {
             "context.compacting",
             "context.compacted",
             "account.usage",
+            "account.added",
+            "account.removed",
+            "account.status",
             "worktree.disk",
             "worktree.trimmed",
             "trash.purged",
@@ -2883,6 +3116,55 @@ mod tests {
                 body.kind()
             );
         }
+    }
+
+    /// Account events and an account move: what they write, and that a move without an
+    /// account (every log from before accounts) writes none of the account keys.
+    #[test]
+    fn account_events_and_moves_serialize() {
+        let added = EventBody::AccountAdded(AccountAdded {
+            runtime: "claude-code".into(),
+            account: "work".into(),
+            dir: Some("/w".into()),
+            ..Default::default()
+        });
+        assert_eq!(
+            added.data().unwrap(),
+            json!({"runtime": "claude-code", "account": "work", "dir": "/w", "share": "config",
+                "by": "user"})
+        );
+        let status = EventBody::from_kind_data(
+            "account.status",
+            json!({"runtime": "codex", "account": "team", "login": "logged_out"}),
+        )
+        .unwrap();
+        let EventBody::AccountStatus(p) = &status else {
+            panic!("wrong variant")
+        };
+        assert_eq!(p.login, crate::account::Login::LoggedOut);
+        let plain = ThreadModelChanged {
+            model: Some("m".into()),
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&plain).unwrap();
+        for k in ["account_changed", "account", "previous_account"] {
+            assert!(j.get(k).is_none(), "{k} in {j}");
+        }
+        let moved = ThreadModelChanged {
+            runtime: Some("claude-code".into()),
+            previous_runtime: Some("claude-code".into()),
+            account_changed: true,
+            account: Some("work".into()),
+            ..Default::default()
+        };
+        let j = serde_json::to_value(&moved).unwrap();
+        assert_eq!(j["account_changed"], json!(true));
+        assert_eq!(j["account"], json!("work"));
+        assert!(j.get("previous_account").is_none());
+        assert_eq!(
+            serde_json::from_value::<ThreadModelChanged>(j).unwrap(),
+            moved
+        );
     }
 
     #[test]

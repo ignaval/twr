@@ -25,12 +25,19 @@
 //! the hub raises one delete card for all the threads named, which only the user answers;
 //! confirmed, the threads go to the trash. `list_trash` lists the trash (read only: only the
 //! user restores or purges items). `get_usage` says how much of each subscription's usage
-//! windows is left (`usage.get`, read only).
+//! windows is left (`usage.get`, read only). `list_accounts` lists the runtimes' accounts
+//! (`account.list`, which gives the orchestrator no directories; read only), and
+//! `spawn_thread` and `set_model` take an `account` (never `outside_pin`: the orchestrator
+//! cannot leave a project's account pin). The thread views (`list_threads`, `get_thread`, a
+//! spawned thread) keep a thread's `account` only while its runtime shows account labels or
+//! the account was removed (`thread_view`): with one account, the orchestrator sees none.
 //!
 //! `read_docs` answers from twr's own docs compiled into this binary (`twr_docs`, plus the
 //! pages the caller adds: `twr mcp` adds every command's `--help` as `cli`) without a hub
-//! call, so it works while the hub connection is down. `hub_info` is `hub.info`, `show_config`
-//! `config.show` (an allowlisted view of the configuration: no secrets).
+//! call, so it works while the hub connection is down. `hub_info` is `hub.info` without its
+//! `accounts` (`list_accounts` shows them), its `orchestrator` under the thread views' account
+//! rule (`hub_info_view`), `show_config` `config.show` (an allowlisted view of the
+//! configuration: no secrets).
 //! `list_project_files`, `read_project_file` and `search_project` read a project's committed
 //! files through the hub (`project.files`, `project.read`, `project.search`), which refuses
 //! secrets, caps sizes and records every call on the orchestrator's thread; their text starts
@@ -189,10 +196,16 @@ pub struct SpawnThreadParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     /// Runtime, only when the user asks for one: `claude-code`, `codex`, `grok-build` or a
-    /// `[runtimes.<name>]` preset the user configured (never a command line). Defaults to the
-    /// project's runtime.
+    /// `[runtimes.<name>]` preset the user configured (never a command line), optionally with
+    /// an account (`claude-code:work`). Defaults to the project's runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// The runtime's account, only when the user asks for one: a name list_accounts shows
+    /// (or a glob or comma-separated list of them). Defaults to the project's account, else
+    /// the runtime's own login. A project pinned to accounts keeps its threads on them: the hub
+    /// refuses any other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// Model, the runtime's own id or alias (defaults to the configured one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -279,9 +292,17 @@ pub struct SetModelParams {
     /// `[runtimes.<name>]` preset the user configured (never a command line). The thread keeps
     /// its name, worktree, branch, queue and permission mode; its next turn starts a new
     /// session of that runtime, given a handoff of what the previous one did. A model or
-    /// effort left out is then the new runtime's default. Omit to keep the thread's runtime.
+    /// effort left out is then the new runtime's default. `claude-code:work` names an
+    /// account too. Omit to keep the thread's runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<String>,
+    /// Another account of the thread's (new) runtime to move it to, only when the user asks:
+    /// a name list_accounts shows. Applied directly; like a runtime move, its next turn
+    /// starts a new session there with a handoff; model and effort stay unless given. A
+    /// project pinned to accounts keeps its threads on them: the hub refuses any other. Omit
+    /// to keep the thread's account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     /// The model, as the thread's (new) runtime names it: an alias or a full id (Claude Code:
     /// `fable`, `opus`, `sonnet` or e.g. `claude-fable-5-1`; Codex: OpenAI ids such as
     /// `gpt-6.1-sol`). `default` returns to the runtime's default: with a new runtime always,
@@ -731,6 +752,64 @@ impl<'a> AboutThread<'a> {
     }
 }
 
+/// A thread object (`thread.list`, `thread.get`, a spawned thread) as MCP shows it: its
+/// `account` only while it says something, that is while the thread's runtime shows account
+/// labels (`account_shown`: two or more logged-in accounts) or its account was removed
+/// (`account_removed`). `account_shown` itself always goes (an `account` there is shown), and
+/// so does a false `account_removed`; so does the account directory of
+/// `runtime_account_removed` (`dir`: directories go to neither the orchestrator nor thread
+/// agents). Anything else is left as it is.
+fn thread_view(thread: &mut Value) {
+    let Some(obj) = thread.as_object_mut() else {
+        return;
+    };
+    if let Some(on) = obj
+        .get_mut("runtime_account_removed")
+        .and_then(Value::as_object_mut)
+    {
+        on.remove("dir");
+    }
+    let shown = obj
+        .remove("account_shown")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let removed = obj.get("account_removed").and_then(Value::as_bool) == Some(true);
+    if !removed {
+        obj.remove("account_removed");
+    }
+    if !shown && !removed {
+        obj.remove("account");
+    }
+}
+
+/// A `hub.info` answer as MCP shows it (`hub_info`): without `accounts` (with their
+/// directories: list_accounts' to show), and its `orchestrator` with the thread views'
+/// account rule ([`thread_view`]): its `account` only while its runtime shows account labels
+/// or its account was removed, never `account_shown`.
+fn hub_info_view(info: &mut Value) {
+    let Some(o) = info.as_object_mut() else {
+        return;
+    };
+    o.remove("accounts");
+    if let Some(orch) = o.get_mut("orchestrator") {
+        thread_view(orch);
+    }
+}
+
+/// A `thread.set_model` result as MCP shows it: its `account`, `previous_account` and
+/// `account_changed` only when the account changed (the thread views' [`thread_view`] rule:
+/// a model change on a runtime with one account names none).
+fn set_model_view(result: &mut Value) {
+    let Some(obj) = result.as_object_mut() else {
+        return;
+    };
+    if obj.get("account_changed").and_then(Value::as_bool) != Some(true) {
+        for key in ["account", "previous_account", "account_changed"] {
+            obj.remove(key);
+        }
+    }
+}
+
 fn spawn_result(result: &Value) -> Result<String, String> {
     if result["status"] == "error" {
         let error = serde_json::from_value::<RpcError>(result["error"].clone()).map_err(|_| {
@@ -749,13 +828,15 @@ fn spawn_result(result: &Value) -> Result<String, String> {
         .get("thread")
         .filter(|_| result["status"] == "complete")
     {
+        let mut thread = thread.clone();
+        thread_view(&mut thread);
         let mut rest = AboutThread::rest(result.as_object().unwrap());
         if let Some(send) = thread.get("send") {
             rest.insert("send", send);
         }
         Ok(AboutThread {
-            thread_name: Some(AboutThread::name_of(thread)),
-            thread: Some(thread),
+            thread_name: Some(AboutThread::name_of(&thread)),
+            thread: Some(&thread),
             rest,
         }
         .to_json())
@@ -1012,25 +1093,33 @@ impl TwrMcp {
         description = "List all threads (workers and the orchestrator) with status, activity \
                        (one line on what it is doing now, e.g. `implementing X · running tests`, \
                        `waiting for permission: …`, `done: …`), project, runtime, queued \
-                       prompts, background_task_count and background_tasks, and open attention. Status background means the turn ended but work remains. JSON.",
+                       prompts, background_task_count and background_tasks, and open attention. Status background means the turn ended but work remains. \
+                       `account` only on a runtime with several logged-in accounts \
+                       (list_accounts), or with account_removed: true when the thread's \
+                       account was removed (it cannot start until it moves to another one). JSON.",
         annotations(read_only_hint = true)
     )]
     async fn list_threads(&self) -> Result<String, String> {
-        self.call_text("thread.list", json!({})).await
+        let mut threads = self.call("thread.list", json!({})).await?;
+        if let Some(all) = threads.as_array_mut() {
+            all.iter_mut().for_each(thread_view);
+        }
+        Ok(compact(&threads))
     }
 
     #[tool(
         description = "Get one thread's full state, including status, activity (one line on \
                        what it is doing now), background_task_count, \
                        background_tasks and its open attention items \
-                       (attn_id, reason, summary, options). JSON, led by thread_name and \
-                       thread (its id).",
+                       (attn_id, reason, summary, options), and its `account` as list_threads \
+                       shows it. JSON, led by thread_name and thread (its id).",
         annotations(read_only_hint = true)
     )]
     async fn get_thread(&self, Parameters(p): Parameters<ThreadParam>) -> Result<String, String> {
-        self.call("thread.get", to_params(&p)?)
-            .await
-            .map(|t| AboutThread::thread(&t))
+        self.call("thread.get", to_params(&p)?).await.map(|mut t| {
+            thread_view(&mut t);
+            AboutThread::thread(&t)
+        })
     }
 
     #[tool(
@@ -1061,7 +1150,13 @@ impl TwrMcp {
                           online and whose agents show the runtime found and logged_in. A box \
                           that is not configured or not online is `box_offline`. Without `box`: \
                           the project's box, else local. A `warning` in the result means the \
-                          box reports the runtime's CLI missing: tell the user."
+                          box reports the runtime's CLI missing: tell the user. `account` (or \
+                          `runtime` written claude-code:work) picks one of the runtime's \
+                          accounts (list_accounts): name one only when the user asks for it. \
+                          Without one the thread gets the project's account, else the \
+                          runtime's own login. A project pinned to accounts keeps its threads \
+                          on them: the hub refuses another one, and you cannot override that \
+                          (tell the user, who can)."
     )]
     async fn spawn_thread(
         &self,
@@ -1187,11 +1282,25 @@ impl TwrMcp {
                        now, send it a prompt. Returns {thread_name, thread, runtime, \
                        previous_runtime, runtime_changed, resumes, model, effort, previous_model, \
                        previous_effort, changed, applies: now | after_turn | next_start, \
-                       message?}. Not for the orchestrator itself, attached threads, or pty \
-                       threads (without a new runtime). Tell the user what you changed."
+                       message?}. `account` moves the thread to another account of its \
+                       runtime (list_accounts; `runtime` written claude-code:work moves both), \
+                       only when the user asks for one: a move between accounts of one runtime \
+                       is applied directly (no card), keeps the model and effort unless given, \
+                       and starts a new session with a handoff on the next turn, like a \
+                       runtime move (back on an account the thread left, its session there \
+                       resumes, `resumes` naming it; never another account's session); the \
+                       result then has account, previous_account and account_changed. A project pinned to accounts keeps its threads on them: \
+                       the hub refuses a move off them, and you cannot override that (tell the \
+                       user, who can). Not for the orchestrator itself, attached threads, or \
+                       pty threads (without a new runtime). Tell the user what you changed."
     )]
     async fn set_model(&self, Parameters(p): Parameters<SetModelParams>) -> Result<String, String> {
-        self.call_thread("thread.set_model", to_params(&p)?).await
+        self.call("thread.set_model", to_params(&p)?)
+            .await
+            .map(|mut r| {
+                set_model_view(&mut r);
+                AboutThread::result(&r)
+            })
     }
 
     #[tool(
@@ -1328,6 +1437,33 @@ impl TwrMcp {
             out.push_str(&render::spent(&spent, 5));
         }
         Ok(out)
+    }
+
+    #[tool(
+        description = "List the runtimes' accounts. An account is one login of a runtime (a \
+                       subscription, such as a work and a personal one); every runtime has its \
+                       own login (native), named default unless the user named it. Returns \
+                       {runtimes: [{runtime, several, accounts: [{name, native, source, login, \
+                       threads, removed?, shadowed?}]}]}: source is where the user declared \
+                       it (config, recorded by twr account add, both, or native when nothing \
+                       names it), login is logged_in, logged_out, missing or unknown, threads \
+                       how many threads are on it, removed (twr account remove) means its \
+                       threads cannot start until they move, and shadowed marks the native \
+                       account when a named account has its name: that name picks the named \
+                       one. several is true when the runtime has two \
+                       or more logged-in accounts: only then do list_threads and get_thread \
+                       show a thread's `account` (and a thread on a removed account), and \
+                       only then are accounts worth mentioning to the user. Read only: only \
+                       the user adds, signs in to or removes accounts (twr account). Pick or \
+                       change a thread's account (spawn_thread or set_model `account`) only \
+                       when the user asks for one, never on your own (not to get past a usage \
+                       limit either).",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_accounts(&self) -> Result<String, String> {
+        self.call("account.list", json!({}))
+            .await
+            .map(|r| render::accounts(&r))
     }
 
     #[tool(
@@ -1567,7 +1703,9 @@ impl TwrMcp {
         annotations(read_only_hint = true)
     )]
     async fn hub_info(&self) -> Result<String, String> {
-        self.call_text("hub.info", json!({})).await
+        let mut info = self.call("hub.info", json!({})).await?;
+        hub_info_view(&mut info);
+        Ok(compact(&info))
     }
 
     #[tool(
@@ -1852,6 +1990,115 @@ mod tests {
             let v: Value = serde_json::from_str(&AboutThread::result(&r)).unwrap();
             assert_eq!(v["warning"], w, "{v}");
         }
+    }
+
+    /// A `thread.set_model` result names the accounts only when the account changed.
+    #[test]
+    fn set_model_results_name_accounts_only_on_an_account_move() {
+        let mut r = json!({"thread_name": "w1", "thread": "T1", "effort": "high",
+                           "account": "default", "previous_account": "default",
+                           "account_changed": false, "changed": true});
+        set_model_view(&mut r);
+        assert_eq!(
+            r,
+            json!({"thread_name": "w1", "thread": "T1", "effort": "high", "changed": true})
+        );
+        let moved = json!({"thread_name": "w1", "thread": "T1", "account": "personal",
+                           "previous_account": "work", "account_changed": true});
+        let mut r = moved.clone();
+        set_model_view(&mut r);
+        assert_eq!(r, moved);
+        // A card (needs_confirmation) has none of them: unchanged.
+        let card = json!({"status": "needs_confirmation", "attn_id": "A1"});
+        let mut r = card.clone();
+        set_model_view(&mut r);
+        assert_eq!(r, card);
+    }
+
+    /// `hub_info` drops `accounts`, and applies the thread views' account rule to the
+    /// orchestrator `hub.info` reports (its shape as `hub::orch` makes it): no `account` on a
+    /// runtime with the native account alone, the account while labels show or once it was
+    /// removed; never `account_shown`. The configured account stays (the user's config).
+    #[test]
+    fn hub_info_shows_the_orchestrators_account_only_when_it_matters() {
+        let info = |account: &str, shown: bool, removed: bool| {
+            let mut orch = json!({
+                "available": true, "runtime": "claude-code", "model": null,
+                "account": account, "account_shown": shown,
+                "model_actual": "claude-opus", "effort": null, "thread": "T0",
+                "name": "orchestrator", "status": "idle", "background_task_count": 0,
+                "live": true,
+                "configured": {"runtime": "claude-code", "model": null, "effort": null,
+                               "account": null, "explicit": true},
+                "retired": 0, "runtimes": ["claude-code"],
+            });
+            if removed {
+                orch["account_removed"] = json!(true);
+            }
+            json!({"version": "0.1.0", "orchestrator": orch,
+                   "accounts": {"claude-code": {"shown": shown, "native": "default",
+                                                "accounts": []}}})
+        };
+        let orch_of = |mut v: Value| {
+            hub_info_view(&mut v);
+            assert!(v.get("accounts").is_none(), "{v}");
+            v["orchestrator"].clone()
+        };
+        let o = orch_of(info("default", false, false));
+        assert!(o.get("account").is_none(), "{o}");
+        assert!(o.get("account_shown").is_none(), "{o}");
+        assert!(o.get("account_removed").is_none(), "{o}");
+        assert_eq!(o["configured"]["account"], Value::Null);
+        assert_eq!(o["runtime"], "claude-code");
+        assert_eq!(o["thread"], "T0");
+        let o = orch_of(info("work", true, false));
+        assert_eq!(o["account"], "work");
+        assert!(o.get("account_shown").is_none(), "{o}");
+        let o = orch_of(info("old", false, true));
+        assert_eq!(
+            (&o["account"], &o["account_removed"]),
+            (&json!("old"), &json!(true))
+        );
+        assert!(o.get("account_shown").is_none(), "{o}");
+        // No orchestrator object, or none at all: as it is.
+        let mut v = json!({"version": "0.1.0"});
+        hub_info_view(&mut v);
+        assert_eq!(v, json!({"version": "0.1.0"}));
+        let mut v = json!("not an object");
+        hub_info_view(&mut v);
+        assert_eq!(v, json!("not an object"));
+    }
+
+    /// A thread view drops `account_shown`, a false `account_removed`, `account` unless it
+    /// is shown or removed, and `runtime_account_removed`'s directory.
+    #[test]
+    fn thread_views_drop_hidden_accounts() {
+        let mut t = json!({"id": "T1", "account": "default", "account_shown": false,
+                           "account_removed": false});
+        thread_view(&mut t);
+        assert_eq!(t, json!({"id": "T1"}));
+        let mut t = json!({"id": "T1", "account": "work", "account_shown": true});
+        thread_view(&mut t);
+        assert_eq!(t, json!({"id": "T1", "account": "work"}));
+        let mut t = json!({"id": "T1", "account": "old", "account_shown": false,
+                           "account_removed": true});
+        thread_view(&mut t);
+        assert_eq!(
+            t,
+            json!({"id": "T1", "account": "old", "account_removed": true})
+        );
+        let mut t = json!("not a thread");
+        thread_view(&mut t);
+        assert_eq!(t, json!("not a thread"));
+        // A removed login's directory is the user's only.
+        let mut t = json!({"id": "T1", "runtime_account_removed":
+                           {"runtime": "claude-code", "account": "work", "dir": "/a/work"}});
+        thread_view(&mut t);
+        assert_eq!(
+            t,
+            json!({"id": "T1", "runtime_account_removed":
+                   {"runtime": "claude-code", "account": "work"}})
+        );
     }
 
     #[tokio::test]

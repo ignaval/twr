@@ -168,6 +168,7 @@ use twr_core::adapter::{
     Adapter, AdapterCmd, AdapterEnd, AdapterEvent, AdapterHandle, AdapterInfo, AttachApplies,
     CodexAuto, SpawnConfig, Tier,
 };
+use twr_core::fsread::read_git_file;
 
 pub use translate::{Emitted, Open, Translated, Translator, TranslatorOptions};
 
@@ -780,8 +781,9 @@ fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
         if !std::fs::metadata(record.path()).ok()?.is_dir() {
             continue;
         }
-        // A record whose `gitdir` can't be read hides where its worktree is.
-        let text = std::fs::read_to_string(record.path().join("gitdir")).ok()?;
+        // A record whose `gitdir` can't be read (without blocking and within a cap,
+        // [`read_git_file`]) hides where its worktree is.
+        let text = read_git_file(&record.path().join("gitdir")).ok()??;
         let named = record.path().join(text.trim_end_matches(['\n', '\r']));
         // One that is gone is kept out by its path, should it come back.
         out.push(resolved(named.parent()?)?);
@@ -801,9 +803,11 @@ fn checkouts(repo: &Path, common: &Path) -> Option<Vec<PathBuf>> {
 /// `.git` at or above `cwd` (as git finds it) is a regular file, not a link, naming that
 /// record (through no symbolic link: canonical, it is `<common>/worktrees/<name>`), and the
 /// record's `commondir` leads back to the common dir. So a `.git` repointed at a sibling's
-/// record, or linked to a sibling's `.git`, grants nothing. None for a main checkout (`.git`
-/// is a directory), a submodule, a worktree of another repository, any pointer that
-/// disagrees, or no repository.
+/// record, or linked to a sibling's `.git`, grants nothing. The pointers are read without
+/// blocking and within a cap ([`read_git_file`]): the hub works them out under its core lock
+/// (an attach), and an agent can put a FIFO in their place; one that can't be read so grants
+/// nothing. None for a main checkout (`.git` is a directory), a submodule, a worktree of
+/// another repository, any pointer that disagrees or can't be read, or no repository.
 fn linked_worktree_git_dirs(cwd: &Path, repo: &Path) -> Option<(PathBuf, PathBuf)> {
     let cwd = cwd.canonicalize().ok()?;
     let common = common_dir_of(repo, Some(&cwd))?;
@@ -815,14 +819,14 @@ fn linked_worktree_git_dirs(cwd: &Path, repo: &Path) -> Option<(PathBuf, PathBuf
         return None;
     }
     let record = worktree_record(&common, &dot_git)?;
-    let text = std::fs::read_to_string(&dot_git).ok()?;
+    let text = read_git_file(&dot_git).ok()??;
     let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
     let git_dir = dot_git.parent()?.join(target).canonicalize().ok()?;
     let name = git_dir.file_name()?;
     if git_dir != record || git_dir != common.join("worktrees").join(name) {
         return None;
     }
-    let back = std::fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let back = read_git_file(&git_dir.join("commondir")).ok()??;
     let back = git_dir.join(back.trim()).canonicalize().ok()?;
     (back == common).then_some((git_dir, common))
 }
@@ -838,7 +842,7 @@ fn worktree_record(common: &Path, dot_git: &Path) -> Option<PathBuf> {
             continue;
         }
         let record = entry.path();
-        let Ok(text) = std::fs::read_to_string(record.join("gitdir")) else {
+        let Ok(Some(text)) = read_git_file(&record.join("gitdir")) else {
             continue;
         };
         let named = record.join(text.trim_end_matches(['\n', '\r']));
@@ -872,15 +876,15 @@ fn common_dir_of(repo: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
             if inside(&dot_git) {
                 return None;
             }
-            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let text = read_git_file(&dot_git).ok()??;
             let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
             let git_dir = repo.join(target).canonicalize().ok()?;
             if inside(&git_dir) {
                 return None;
             }
-            match std::fs::read_to_string(git_dir.join("commondir")) {
-                Ok(c) => git_dir.join(c.trim()).canonicalize().ok()?,
-                Err(_) => git_dir,
+            match read_git_file(&git_dir.join("commondir")).ok()? {
+                Some(c) => git_dir.join(c.trim()).canonicalize().ok()?,
+                None => git_dir,
             }
         }
         Ok(_) => return None,
@@ -1203,8 +1207,7 @@ impl CodexAdapter {
                 format!("model_reasoning_effort={}", json!(e)),
             ]);
         }
-        cmd.envs(process::attach_env(cfg));
-        process::scrub_std(&mut cmd);
+        process::apply_env_std(&mut cmd, process::attach_env(cfg), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }
@@ -1235,13 +1238,12 @@ impl Adapter for CodexAdapter {
         let open = thread_params(&cfg)?;
         let mut cmd = process::wrapped(&cfg.wrap, &bin);
         cmd.args(build_args())
-            .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         process::new_session(&mut cmd);
-        process::scrub(&mut cmd);
+        process::apply_env(&mut cmd, cfg.env.iter().cloned(), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }
@@ -1920,6 +1922,41 @@ mod tests {
         let roots = git_roots(&wt, repo);
         assert_eq!(roots.len(), 3, "{roots:?}");
         assert!(!roots.contains(&home.canonicalize().unwrap()));
+    }
+
+    /// A worktree pointer that is a FIFO (no writer: a blocking read would wait forever; the
+    /// hub works these out under its core lock at an attach) grants nothing, at once: the git
+    /// dir's `commondir`, or the worktree record's `gitdir`. Run on a thread of its own, so a
+    /// read that blocks fails the test instead of hanging it. (Without the shared memory
+    /// folder, [`roots`]: the git roots alone.)
+    #[test]
+    fn worktree_pointers_that_are_fifos_grant_nothing_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wt, common) = worktree(dir.path(), false);
+        let main = dir.path().join("main");
+        let git_dir = common.join("worktrees/wt");
+        assert_eq!(roots(&wt, Some(&main), no_env).len(), 4);
+        let mkfifo = |p: &Path| {
+            std::fs::remove_file(p).unwrap();
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        };
+        let roots_soon = |wt: &Path, main: &Path| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (wt, main) = (wt.to_path_buf(), main.to_path_buf());
+            std::thread::spawn(move || {
+                let _ = tx.send(roots(&wt, Some(&main), no_env));
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("reading a FIFO in git's files blocked")
+        };
+        mkfifo(&git_dir.join("commondir"));
+        assert!(roots_soon(&wt, &main).is_empty());
+        std::fs::remove_file(git_dir.join("commondir")).unwrap();
+        std::fs::write(git_dir.join("commondir"), "../..\n").unwrap();
+        assert_eq!(roots_soon(&wt, &main).len(), 4);
+        mkfifo(&git_dir.join("gitdir"));
+        assert!(roots_soon(&wt, &main).is_empty());
     }
 
     /// Two worktrees of one repository, made by git: a worktree's `.git` repointed at its

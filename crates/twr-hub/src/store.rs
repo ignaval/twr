@@ -72,6 +72,19 @@
 //! `checkpoints` and lets agent events be deleted (`events_no_delete` becomes
 //! `events_delete_agent_only`).
 //!
+//! Schema 10 ([`ACCOUNTS_SCHEMA_VERSION`]) changes no table either: it marks a database that
+//! holds account data. A twr before accounts would ignore `account.*` events and a thread's
+//! account (`ext.twr.account`), and start a named account's threads on the native login. The
+//! first transaction that records account data ([`account_dependent`]: an `account.added`,
+//! `account.removed` or `account.status`, a `thread.created` with an account, a
+//! `thread.model_changed` that moves a thread between accounts) raises the version to 10 in
+//! that same transaction, so such a twr refuses the database as newer than itself. A database
+//! without account data stays at 9 (one that has some from before this fence is raised when
+//! the hub replays it, [`Store::fence_accounts`]): until an account is added, an older twr can
+//! still open it. This twr opens both, and so do its checkpoints ([`is_own_schema`]). (A
+//! development build of accounts made before schema 9 marked account data with 9: such a
+//! database has no `checkpoints`, and gets them when it is opened.)
+//!
 //! Every append (event row, control row, blobs, dequeued prompt) is one transaction, and so is
 //! every [`AppendBatch`]: several events plus queued prompts that make up one logical operation.
 
@@ -88,7 +101,7 @@ use twr_core::blob::{blob_ref, BlobStore};
 use twr_core::event::{AttentionReason, DecisionSite, EventBody, Grade, TurnFrom};
 use twr_core::{Event, Source};
 
-/// Current schema version (`PRAGMA user_version`).
+/// Current schema version (`PRAGMA user_version`) of a database without account data.
 pub const SCHEMA_VERSION: i32 = 9;
 
 /// Schema 9: checkpoints of the hub's folded state (`hub::checkpoint`).
@@ -132,6 +145,56 @@ pub const CHECKPOINTS_KEPT: usize = 2;
 /// installed next to a running hub writes one for itself before the hub restarts (`twr log
 /// checkpoint`), and the running hub's next one must not drop it.
 pub const CHECKPOINT_BUILDS_KEPT: usize = 3;
+
+/// Schema version of a database that holds account data (see the module docs): the newest
+/// this twr knows. Same tables as [`SCHEMA_VERSION`].
+pub const ACCOUNTS_SCHEMA_VERSION: i32 = 10;
+
+/// Whether schema `version` is one this twr writes ([`SCHEMA_VERSION`], or
+/// [`ACCOUNTS_SCHEMA_VERSION`] once the database holds account data): a database at it needs
+/// no migration (`hub::checkpoint`'s prewarm writes a checkpoint for it).
+pub fn is_own_schema(version: i32) -> bool {
+    version == SCHEMA_VERSION || version == ACCOUNTS_SCHEMA_VERSION
+}
+
+/// Whether recording `ev` makes the database one a twr before accounts must refuse
+/// ([`ACCOUNTS_SCHEMA_VERSION`]): an `account.added` / `account.removed` / `account.status`,
+/// a `thread.created` with an account (`ext.twr.account`), or a `thread.model_changed` that
+/// moves the thread between accounts (`account_changed`).
+pub fn account_dependent(ev: &Event) -> bool {
+    match &ev.body {
+        EventBody::AccountAdded(_) | EventBody::AccountRemoved(_) | EventBody::AccountStatus(_) => {
+            true
+        }
+        EventBody::ThreadCreated(c) => c
+            .ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get(twr_core::event::ACCOUNT_KEY))
+            .is_some_and(|a| !a.is_null()),
+        EventBody::ThreadModelChanged(m) => m.account_changed,
+        _ => false,
+    }
+}
+
+/// Refuses a database whose schema `version` is newer than `known` (the newest version this
+/// twr knows).
+fn check_version(version: i32, known: i32) -> anyhow::Result<()> {
+    if version > known {
+        bail!("database schema version {version} is newer than this twr ({known})");
+    }
+    Ok(())
+}
+
+/// Raises the schema version to [`ACCOUNTS_SCHEMA_VERSION`] within `conn`'s transaction
+/// (once: a no-op when it is there already).
+fn fence_accounts(conn: &Connection) -> anyhow::Result<()> {
+    let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version < ACCOUNTS_SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", ACCOUNTS_SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
 
 const SCHEMA_6: &str = r#"
 CREATE TABLE IF NOT EXISTS spawn_operations (
@@ -255,20 +318,26 @@ pub fn connect(path: &Path) -> anyhow::Result<Connection> {
 /// Creates or checks the schema.
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version > SCHEMA_VERSION {
-        bail!("database schema version {version} is newer than this twr ({SCHEMA_VERSION})");
-    }
-    if version == SCHEMA_VERSION {
+    check_version(version, ACCOUNTS_SCHEMA_VERSION)?;
+    // (10 has 9's tables: only its account data is new.)
+    if version >= SCHEMA_VERSION {
         // A database a development build of schema 9 made before agent events could be
-        // deleted: its trigger is replaced.
+        // deleted: its trigger is replaced. One a development build of accounts raised from 8
+        // to 9 when 9 marked account data has no `checkpoints`: it gets 9's tables.
         let old: bool = conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger'
              AND name = 'events_no_delete')",
             [],
             |r| r.get(0),
         )?;
-        if old {
-            conn.execute_batch(&format!("BEGIN; {SCHEMA_9_PRUNE} COMMIT;"))?;
+        let checkpoints: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name = 'checkpoints')",
+            [],
+            |r| r.get(0),
+        )?;
+        if old || !checkpoints {
+            conn.execute_batch(&format!("BEGIN; {SCHEMA_9} {SCHEMA_9_PRUNE} COMMIT;"))?;
         }
         return Ok(());
     }
@@ -507,6 +576,23 @@ impl Store {
         })
     }
 
+    /// Raises the schema version to [`ACCOUNTS_SCHEMA_VERSION`] if it is not there: for a
+    /// database whose account data was recorded before the fence (the hub's replay finds it,
+    /// [`account_dependent`]). Appends raise it themselves.
+    pub fn fence_accounts(&mut self) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        fence_accounts(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The schema version recorded in the database (`PRAGMA user_version`).
+    pub fn schema_version(&self) -> anyhow::Result<i32> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
     /// The underlying connection (reads).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -577,6 +663,11 @@ impl Store {
             if n != 1 {
                 bail!("pending prompt {id} is gone");
             }
+        }
+        // Account data raises the schema version before it is written, in the same
+        // transaction (the module docs).
+        if batch.events.iter().any(|(ev, _)| account_dependent(ev)) {
+            fence_accounts(&tx)?;
         }
         let mut out = BatchCommit::default();
         for thread in batch.drop_queues {
@@ -2107,6 +2198,40 @@ const LATEST_OF_KIND: &str = concat!(
      WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC LIMIT ?3) ORDER BY seq DESC"
 );
 
+/// [`newest_runtime_start`]: through the kind index (`+seq`, as [`UPDATES_ABOUT`]), every
+/// predicate applied before the limit.
+const NEWEST_RUNTIME_START: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1
+     AND seq < ?2 AND source LIKE 'adapter:%'
+     AND (json_extract(data, '$.session_id') = ?3
+          OR (?4 AND json_extract(data, '$.session_id') IS NULL))
+     ORDER BY +seq DESC LIMIT 1"
+);
+
+/// [`has_stamped_start`].
+const HAS_STAMPED_START: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1 AND seq < ?2
+     AND source LIKE 'adapter:%' AND json_extract(data, '$.ext.twr.mode') IS NOT NULL)";
+
+/// [`latest_runtime_moves`]: the runtime moves only, filtered before the limit.
+const LATEST_RUNTIME_MOVES: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1
+     AND json_extract(data, '$.runtime') IS NOT NULL ORDER BY +seq DESC LIMIT ?2"
+);
+
+/// [`newest_account_move`].
+const NEWEST_ACCOUNT_MOVE: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1 AND seq < ?2
+     AND json_extract(data, '$.runtime') IS NOT NULL
+     AND json_extract(data, '$.account_changed') = 1 ORDER BY +seq DESC LIMIT 1"
+);
+
 /// [`seqs_of_kind`].
 const SEQS_OF_KIND: &str =
     "SELECT seq FROM events WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC";
@@ -2223,6 +2348,64 @@ pub fn latest_of_kind(
     let mut st = conn.prepare_cached(LATEST_OF_KIND)?;
     let rows = st.query_map(params![kind, thread, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
+}
+
+/// The newest `thread.started` / `thread.resumed` of `thread` before `before` that a runtime
+/// reported (`source` `adapter:<runtime>`: not a park's or a user's resume the hub recorded)
+/// naming session `session`, or, with `or_none`, naming none; as stored (possibly capped: a
+/// session id is never moved to a blob). However many other starts came after it.
+pub fn newest_runtime_start(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+    session: &str,
+    or_none: bool,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_RUNTIME_START)?
+        .query_row(params![thread, before, session, or_none], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// Whether `thread` has a `thread.started` / `thread.resumed` before `before` a runtime
+/// reported that the hub (or a runner) stamped with the settings it ran in (`ext.twr.mode`,
+/// `hub::restart`).
+pub fn has_stamped_start(conn: &Connection, thread: &str, before: u64) -> anyhow::Result<bool> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    Ok(conn
+        .prepare_cached(HAS_STAMPED_START)?
+        .query_row(params![thread, before], |r| r.get(0))?)
+}
+
+/// The latest `limit` runtime moves of `thread` (`thread.model_changed` with a `runtime`),
+/// newest first, as stored (possibly capped): however many model or effort changes came
+/// after them.
+pub fn latest_runtime_moves(
+    conn: &Connection,
+    thread: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(LATEST_RUNTIME_MOVES)?;
+    let rows = st.query_map(params![thread, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The newest runtime move of `thread` before `before` that changed the account
+/// (`thread.model_changed` with a `runtime` and `account_changed`), as stored (possibly
+/// capped): however many other moves came after it.
+pub fn newest_account_move(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_ACCOUNT_MOVE)?
+        .query_row(params![thread, before], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
 }
 
 /// The latest `limit` `conversation.update`s of `thread` about thread `about`
@@ -2799,6 +2982,36 @@ mod tests {
         assert_eq!(seqs, [1, 3, 4]);
     }
 
+    /// A database a development build of accounts marked with 9 when 9 meant account data
+    /// (schema 8's tables, no `checkpoints`) gets 9's tables when it is opened, and stays at
+    /// 9 until its replay finds the account data (`Store::fence_accounts`).
+    #[test]
+    fn an_early_accounts_database_at_9_gets_the_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        {
+            let conn = connect(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for schema in [REMOTE_OUTBOX, SCHEMA_4, SCHEMA_5, SCHEMA_6] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert!(checkpoints(s.conn()).unwrap().is_empty());
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        s.append(&ev("t1", 1, text("a")), false, AppendExtras::default())
+            .unwrap();
+        assert_eq!(s.conn().execute("DELETE FROM events", []).unwrap(), 1);
+        s.fence_accounts().unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), ACCOUNTS_SCHEMA_VERSION);
+        assert!(checkpoints(s.conn()).unwrap().is_empty());
+        assert!(is_own_schema(SCHEMA_VERSION) && is_own_schema(ACCOUNTS_SCHEMA_VERSION));
+        assert!(!is_own_schema(SCHEMA_VERSION - 1) && !is_own_schema(ACCOUNTS_SCHEMA_VERSION + 1));
+    }
+
     /// A schema 9 database made before agent events could be deleted gets the new trigger
     /// when it is opened.
     #[test]
@@ -3066,6 +3279,153 @@ mod tests {
         assert!(s.user_sent_since("t1", 9).unwrap());
         assert!(!s.mark_user_sent(sent.queued[0], 5).unwrap());
         assert!(s.user_sent_since("t1", 9).unwrap());
+    }
+
+    fn user_version(s: &Store) -> i32 {
+        s.schema_version().unwrap()
+    }
+
+    fn created(account: Option<&str>) -> EventBody {
+        let twr = match account {
+            Some(a) => serde_json::json!({ "role": "worker", "account": a }),
+            None => serde_json::json!({ "role": "worker" }),
+        };
+        let mut ext = serde_json::Map::new();
+        ext.insert("twr".into(), twr);
+        EventBody::ThreadCreated(twr_core::event::ThreadCreated {
+            name: "w".into(),
+            box_name: "local".into(),
+            runtime: "claude-code".into(),
+            ext: Some(ext),
+            ..Default::default()
+        })
+    }
+
+    /// A database without account data keeps schema 9 (an older twr still opens it); the
+    /// first event with account data raises it to 10 in its own transaction, which a twr that
+    /// knows only 9 refuses. A failed append raises nothing.
+    #[test]
+    fn account_data_raises_the_schema_version() {
+        use twr_core::event::{AccountAdded, AccountRemoved, AccountStatus, ThreadModelChanged};
+        // What raises it, and what does not.
+        let at = |body: EventBody| ev("t1", 1, body);
+        for body in [
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            created(Some("work")),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                account_changed: true,
+                account: None,
+                previous_account: Some("work".into()),
+                ..Default::default()
+            }),
+        ] {
+            assert!(account_dependent(&at(body.clone())), "{body:?}");
+        }
+        for body in [
+            created(None),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                model: Some("opus".into()),
+                ..Default::default()
+            }),
+            EventBody::ThreadStarted(SessionPayload::default()),
+            text("account"),
+        ] {
+            assert!(!account_dependent(&at(body.clone())), "{body:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A native-only log: still 9.
+        s.append(&ev("t1", 1, created(None)), true, Default::default())
+            .unwrap();
+        s.append(&ev("t1", 2, text("hi")), false, Default::default())
+            .unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A batch whose account event fails to commit (a duplicate seq after it) leaves the
+        // version alone with the rest of the batch.
+        let dup = ev("t1", 2, text("again"));
+        let named = ev("t2", 1, created(Some("work")));
+        assert!(s
+            .append_batch(AppendBatch {
+                events: vec![(&named, true), (&dup, false)],
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A thread on a named account raises it, with the event.
+        s.append(&named, true, Default::default()).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        drop(s);
+        // This twr opens it again; one that knows only 9 refuses it.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        assert_eq!(s.load_all().unwrap().len(), 3);
+        drop(s);
+        let e = check_version(ACCOUNTS_SCHEMA_VERSION, SCHEMA_VERSION).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "database schema version 10 is newer than this twr (9)"
+        );
+        assert!(check_version(SCHEMA_VERSION, SCHEMA_VERSION).is_ok());
+        // ...as a 9-only twr's `migrate` does on the real file.
+        let v: i32 = connect(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert!(check_version(v, SCHEMA_VERSION).is_err());
+        // A version newer than this twr knows is refused at open.
+        connect(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", ACCOUNTS_SCHEMA_VERSION + 1)
+            .unwrap();
+        let e = Store::open(&path).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("database schema version 11 is newer than this twr (10)"),
+            "{e:#}"
+        );
+
+        // An account event alone raises it too, and so does an explicit fence (the hub's
+        // replay of account data recorded before the fence); both only ever raise it.
+        let path = dir.path().join("b.db");
+        let mut s = Store::open(&path).unwrap();
+        let added = ev(
+            "hub",
+            1,
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "codex".into(),
+                account: "side".into(),
+                dir: Some("/acc/side".into()),
+                ..Default::default()
+            }),
+        );
+        s.append(&added, true, Default::default()).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        s.fence_accounts().unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        let path = dir.path().join("c.db");
+        let mut s = Store::open(&path).unwrap();
+        s.fence_accounts().unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
     }
 
     #[test]

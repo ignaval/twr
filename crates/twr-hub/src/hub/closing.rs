@@ -93,24 +93,20 @@ impl Core {
             // The log needs the stop (the process is gone); one the hub's shutdown asked for,
             // not the user, says so (`ext.twr.reason`), so viewers can fold those away, and so
             // does one the hub asked for to restart the runtime in new settings (`hub::restart`:
-            // `mode_change`, `model_change` or `runtime_change`; the thread does not count as
-            // stopped). A restart begun for a mode or model whose thread moved to another
-            // runtime meanwhile is that move's: the runtime is replaced, not restarted.
+            // `mode_change`, `model_change`, `runtime_change` or `account_change`; the thread
+            // does not count as stopped). A restart begun for a mode or model whose thread
+            // moved to another runtime or account meanwhile is that move's: the runtime is
+            // replaced, not restarted.
             Exit::Stopped => {
                 let rt = self.rt.get(thread);
                 let shutdown = self.shutting_down && !rt.is_some_and(|r| r.stop_requested);
                 let moved_away = rt
                     .and_then(|r| r.runtime_settings.as_ref())
-                    .is_some_and(|s| !s.is_runtime_of(view));
+                    .filter(|s| !s.is_runtime_of(view))
+                    .map(|s| s.restart_reason(&super::restart::RunSettings::of(view)));
                 let reason = rt
                     .and_then(|r| r.restart_reason)
-                    .map(|why| {
-                        if moved_away {
-                            RUNTIME_RESTART_REASON
-                        } else {
-                            why
-                        }
-                    })
+                    .map(|why| moved_away.unwrap_or(why))
                     .or(shutdown.then_some(HUB_SHUTDOWN));
                 plan.push_back(Planned {
                     turn: None,

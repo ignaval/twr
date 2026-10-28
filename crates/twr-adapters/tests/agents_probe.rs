@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use twr_adapters::agents::{probe_with, COMMAND_TIMEOUT};
+use twr_adapters::agents::{probe_account, probe_with, COMMAND_TIMEOUT};
 use twr_adapters::claude_code::ClaudeCodeAdapter;
 use twr_adapters::resolve::{with_login_path, LoginPath};
 use twr_core::adapter::{Adapter, AdapterEvent, SpawnConfig};
@@ -372,4 +372,109 @@ async fn the_probe_and_the_spawn_get_the_same_binary() {
         );
         drop(h);
     }
+}
+
+/// An account's probe runs that runtime's commands alone, with the account's variables set and
+/// the stray credentials removed: a `claude` that says it is signed in only in the expected
+/// directory and with no `ANTHROPIC_API_KEY`, a `codex` signed in only with `CODEX_HOME` set.
+/// Grok Build stays unknown.
+#[tokio::test]
+async fn an_account_probe_runs_with_the_accounts_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let acct = dir.path().join("acct");
+    cli(
+        dir.path(),
+        "claude",
+        "2.1.304 (Claude Code)",
+        &format!(
+            "if [ \"$1 $2\" = 'auth status' ] && [ \"$CLAUDE_CONFIG_DIR\" = '{}' ] \
+             && [ -z \"${{ANTHROPIC_API_KEY+set}}\" ]; then \
+             echo '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\"}}'; exit 0; fi\n\
+             echo '{{\"loggedIn\":false,\"authMethod\":\"none\"}}'; exit 1",
+            acct.display()
+        ),
+    );
+    cli(
+        dir.path(),
+        "codex",
+        "codex-cli 0.162.1",
+        "[ \"$1 $2\" = 'login status' ] && [ -n \"$CODEX_HOME\" ] && exit 0; exit 1",
+    );
+    cli(dir.path(), "grok", "grok 1.0.50", "exit 0");
+    let path = env_of(dir.path());
+    let with = |extra: &[(&str, &str)]| {
+        let mut env = path.clone();
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        env
+    };
+    let acct_s = acct.to_str().unwrap();
+    let (claude_env, claude_remove) =
+        twr_adapters::account::account_env("claude-code", &acct).unwrap();
+    let mut env = path.clone();
+    env.extend(claude_env.clone());
+    let a = probe_account("claude-code", &env, &claude_remove, no_var, COMMAND_TIMEOUT).await;
+    assert_eq!(
+        (a.runtime.as_str(), a.found, a.login, a.method.as_deref()),
+        ("claude-code", true, AgentLogin::LoggedIn, Some("claude.ai"))
+    );
+    assert_eq!(a.version.as_deref(), Some("2.1.304 (Claude Code)"));
+    // A stray key in the environment: removed, still signed in; not removed, it is not.
+    let stray = with(&[
+        ("CLAUDE_CONFIG_DIR", acct_s),
+        ("ANTHROPIC_API_KEY", "sk-stray"),
+    ]);
+    let a = probe_account(
+        "claude-code",
+        &stray,
+        &claude_remove,
+        no_var,
+        COMMAND_TIMEOUT,
+    )
+    .await;
+    assert_eq!(a.login, AgentLogin::LoggedIn);
+    let a = probe_account("claude-code", &stray, &[], no_var, COMMAND_TIMEOUT).await;
+    assert_eq!(a.login, AgentLogin::LoggedOut);
+    // Another directory: not this account's login.
+    let other = with(&[("CLAUDE_CONFIG_DIR", "/elsewhere")]);
+    let a = probe_account(
+        "claude-code",
+        &other,
+        &claude_remove,
+        no_var,
+        COMMAND_TIMEOUT,
+    )
+    .await;
+    assert_eq!(a.login, AgentLogin::LoggedOut);
+
+    let (codex_env, codex_remove) = twr_adapters::account::account_env("codex", &acct).unwrap();
+    let mut env = path.clone();
+    env.extend(codex_env);
+    let c = probe_account("codex", &env, &codex_remove, no_var, COMMAND_TIMEOUT).await;
+    assert_eq!(
+        (c.runtime.as_str(), c.login),
+        ("codex", AgentLogin::LoggedIn)
+    );
+    // (`CODEX_HOME` removed: this test's own environment may set one.)
+    let unset = ["CODEX_HOME".to_string()];
+    let c = probe_account("codex", &path, &unset, no_var, COMMAND_TIMEOUT).await;
+    assert_eq!(c.login, AgentLogin::LoggedOut);
+
+    let g = probe_account(
+        "grok-build",
+        &with(&[("GROK_HOME", acct_s)]),
+        &[],
+        no_var,
+        COMMAND_TIMEOUT,
+    )
+    .await;
+    assert_eq!(g.login, AgentLogin::Unknown);
+    assert_eq!(g.version.as_deref(), Some("grok 1.0.50"));
+    assert_eq!(g.note.as_deref(), Some("it has no login status command"));
+
+    // The box-wide probe of the same CLIs is unchanged: no account variables, signed out.
+    let agents = probe_with(&path, no_var, COMMAND_TIMEOUT).await;
+    assert_eq!(
+        by_runtime(&agents, "claude-code").login,
+        AgentLogin::LoggedOut
+    );
 }

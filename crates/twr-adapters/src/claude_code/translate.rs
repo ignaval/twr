@@ -77,6 +77,13 @@
 //!   `errors` (`error_max_turns`, `error_max_budget_usd`, `error_during_execution`), else
 //!   `api_error_status` with the turn's API error message (an `assistant` message carrying
 //!   `error`), else `terminal_reason` / the subtype.
+//! - A failed turn that hit a usage or spending limit carries `ext.twr.limit`
+//!   ([`crate::usage::Limit`], [`limit_of`]) and is not transient: the latest
+//!   `rate_limit_event` since the last `result` was `rejected` for a window type (usage, with
+//!   its `resetsAt`) or for `overage` (spend), or said `errorCode: credits_required` (spend);
+//!   else an `assistant` `error: rate_limit` message whose text names a limit it hit ("You've
+//!   hit your weekly limit · resets 5am (UTC)": usage, no time). A plain 429 or overload
+//!   stays transient.
 //!
 //! Context compaction (Claude Code 2.1.304, see the recorded fixtures): `system/status`
 //! `status: "compacting"` starts one (`context.compacting`; Claude says nothing else until it
@@ -167,6 +174,7 @@ use twr_core::usage::{UsageWindow, FIVE_HOUR, SEVEN_DAY};
 
 use crate::acp::translate::{mode_acceptable, mode_level, ModeLevel};
 use crate::attn::IssuedIds;
+use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
     AttentionReason, AttentionResolved, EventBody, JsonMap, PromptCache, ResolvedBy,
@@ -415,6 +423,11 @@ pub struct Translator {
     /// The running turn carried Claude's `[Request interrupted by user]` user text.
     interrupted_marker: bool,
     transient_hint: Option<String>,
+    /// The `rate_limit_info` of the latest `rate_limit_event` since the last `result`.
+    rate_limit_info: Option<Value>,
+    /// The running turn's `assistant` `error: rate_limit` text that names a limit it hit
+    /// ([`is_limit_text`]).
+    limit_text: Option<String>,
     /// The running turn reported an authentication failure (an `assistant` or `api_retry`
     /// message with `error: authentication_failed`).
     auth_failed: bool,
@@ -501,6 +514,8 @@ impl Translator {
             interrupts_sent: 0,
             interrupted_marker: false,
             transient_hint: None,
+            rate_limit_info: None,
+            limit_text: None,
             auth_failed: false,
             api_error: None,
             allowed_mode: match opts.mode.trim() {
@@ -881,6 +896,7 @@ impl Translator {
                 if status == "rejected" {
                     self.transient_hint = Some("rate_limit_event status rejected".into());
                 }
+                self.rate_limit_info = Some(v["rate_limit_info"].clone());
                 let windows = rate_limit_windows(&v["rate_limit_info"]);
                 if !windows.is_empty() {
                     self.usage.heard((self.clock)(), &windows);
@@ -1039,6 +1055,7 @@ impl Translator {
             self.active = true;
             self.turn = self.queued.pop_front();
             self.transient_hint = None;
+            self.limit_text = None;
             self.auth_failed = false;
             self.api_error = None;
             self.interrupted_marker = false;
@@ -1504,6 +1521,9 @@ impl Translator {
             // A subagent's own API error is not the turn's cause.
             if !text.is_empty() && parent.is_none() {
                 self.in_turn();
+                if e == "rate_limit" && is_limit_text(&text) {
+                    self.limit_text = Some(text.clone());
+                }
                 self.api_error = Some(text);
             }
         }
@@ -2062,6 +2082,8 @@ impl Translator {
         let interrupted = std::mem::take(&mut self.interrupt_requested);
         let marker = std::mem::take(&mut self.interrupted_marker);
         let hint = self.transient_hint.take();
+        let rate_limit_info = self.rate_limit_info.take();
+        let limit_text = self.limit_text.take();
         let auth_failed = std::mem::take(&mut self.auth_failed);
         let api_error = self.api_error.take();
 
@@ -2204,6 +2226,7 @@ impl Translator {
         // the login expired): said with what to do, and never transient (retrying cannot help
         // until the user signs in).
         let mut twr_error = None;
+        let mut limit = None;
         if result == TurnResult::Error && (auth_failed || auth_failure(v)) {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code could not authenticate".into());
@@ -2214,16 +2237,25 @@ impl Translator {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code reported an error without details".into());
             twr_error = Some(error_line(&text));
-            let reason = transient_reason(v).or(hint);
-            claude.insert("transient".into(), json!(reason.is_some()));
-            if let Some(r) = reason {
-                claude.insert("transient_reason".into(), json!(r));
+            limit = limit_of(rate_limit_info.as_ref(), limit_text.as_deref(), &text);
+            if limit.is_some() {
+                // Retrying before the reset cannot help.
+                claude.insert("transient".into(), json!(false));
+            } else {
+                let reason = transient_reason(v).or(hint);
+                claude.insert("transient".into(), json!(reason.is_some()));
+                if let Some(r) = reason {
+                    claude.insert("transient_reason".into(), json!(r));
+                }
             }
         }
         let mut ext = ext_of(claude);
         if let Some(e) = twr_error {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": e }));
+        }
+        if let Some(l) = limit {
+            set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
         }
         if let Some(id) = runtime_turn {
             set_twr_ext(&mut ext, RUNTIME_TURN_KEY, json!(id.to_string()));
@@ -2970,6 +3002,58 @@ pub fn transient_reason(v: &Value) -> Option<String> {
             .iter()
             .find(|p| t.contains(*p))
             .map(|p| format!("error text matches {p:?}"))
+    })
+}
+
+/// `rateLimitType`s of a `rejected` `rate_limit_event` that mean a usage window is used up.
+const USAGE_LIMIT_TYPES: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_overage_included",
+];
+
+/// Whether an `assistant` `error: rate_limit` message's text says a limit was hit rather than
+/// the API throttling: it names a limit and says when it resets or that "you hit your" limit
+/// ("You've hit your weekly limit · resets 5am (UTC)").
+pub fn is_limit_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("limit") && (t.contains("resets") || t.contains("hit your"))
+}
+
+/// The limit a failed turn hit, from the latest `rate_limit_event`'s `rate_limit_info` of
+/// the turn (`info`) and its limit-naming `rate_limit` error text (`text`, [`is_limit_text`]),
+/// in the runtime's words `message`: `rejected` with a [`USAGE_LIMIT_TYPES`] type is usage
+/// (that window, its `resetsAt`); `rejected` `overage` or `errorCode: credits_required` is
+/// spend; else such a text is usage with no window or time. None otherwise (a plain 429 or
+/// overload).
+pub fn limit_of(info: Option<&Value>, text: Option<&str>, message: &str) -> Option<Limit> {
+    if let Some(info) = info {
+        let rejected = str_at(info, "status") == "rejected";
+        let kind = str_at(info, "rateLimitType");
+        if str_at(info, "errorCode") == "credits_required" || (rejected && kind == "overage") {
+            return Some(Limit {
+                kind: LimitKind::Spend,
+                window: None,
+                resets_at: None,
+                message: message.to_string(),
+            });
+        }
+        if rejected && USAGE_LIMIT_TYPES.contains(&kind) {
+            return Some(Limit {
+                kind: LimitKind::Usage,
+                window: Some(kind.to_string()),
+                resets_at: crate::usage::epoch(&info["resetsAt"]),
+                message: message.to_string(),
+            });
+        }
+    }
+    text.map(|t| Limit {
+        kind: LimitKind::Usage,
+        window: None,
+        resets_at: None,
+        message: t.to_string(),
     })
 }
 

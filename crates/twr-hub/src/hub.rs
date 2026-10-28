@@ -105,6 +105,7 @@
 //!
 //! [`ATTACH_ENV`]: crate::host::ATTACH_ENV
 
+mod accounts;
 mod activity;
 mod after;
 mod agents;
@@ -166,6 +167,7 @@ mod summary;
 pub use summary::HOURLY_MAX as SUMMARY_HOURLY_MAX;
 mod supervisor;
 mod switch;
+mod thread_account;
 mod threads;
 mod trash;
 mod updates;
@@ -174,6 +176,10 @@ mod wake;
 mod watches;
 mod withdraw;
 
+pub use accounts::{
+    own_account_probe, own_native_dir, own_native_var, AccountAddParams, AccountProbe,
+    AccountRemoveParams, AccountStatusParams, NativeDirFn, NativeVarFn,
+};
 pub use agents::{
     local_agent, AgentPeer, AgentWhy, PeerWalk, RuntimeRef, Started, StartedKind, StartedTable,
 };
@@ -200,6 +206,7 @@ pub use idle_compact::{
 pub use jobs::{AgentJobBy, JobStart, ShellJob, SlotPool};
 pub(crate) use lifecycle::lock_data_dir;
 pub use lifecycle::lock_opened;
+pub use model::ModelRequest;
 pub use project_read::{ReadParams, Tool as ReadTool};
 pub use retry::RETRY_PROMPT;
 pub use runners::SealedEnd;
@@ -325,7 +332,8 @@ pub struct HubOptions {
     /// give a script, or a path that doesn't exist.
     pub suggest_codex_bin: Option<PathBuf>,
     /// The Codex home whose global instructions keep Codex from answering suggestions
-    /// (`hub::suggest`): `None` uses `$CODEX_HOME`, else `~/.codex`. Tests give a folder.
+    /// (`hub::suggest`): `None` uses the native Codex account's directory
+    /// ([`HubOptions::native_dir`]: `$CODEX_HOME`, else `~/.codex`). Tests give a folder.
     pub suggest_codex_home: Option<PathBuf>,
     /// Where Claude Code's managed policy is read, to tell whether a Claude Code orchestrator's
     /// memory guard would run (`orch::restrict`); defaults to this system's locations (tests
@@ -454,6 +462,11 @@ pub struct HubOptions {
     /// Never set outside tests.
     #[doc(hidden)]
     pub box_files_read_hook: Option<BoxFilesReadHook>,
+    /// Test hook: awaited with the thread's id by a move's project lookup
+    /// (`Hub::look_up_pins_project`, `thread.set_model`, `account.remove {move_to}`) before it
+    /// looks anything up (a slow lookup). Never set outside tests.
+    #[doc(hidden)]
+    pub pins_lookup_hook: Option<BoxFilesReadHook>,
     /// Test hook: awaited by [`crate::server::serve`] once the hub's socket is removed, before
     /// it stops its runtimes (a slow shutdown, its runner listener still up). Never set
     /// outside tests.
@@ -466,13 +479,28 @@ pub struct HubOptions {
     /// When the hub asks the remote boxes for their agent CLIs, and probes its own again
     /// ([`AgentsPoll::default`]; tests shorten it).
     pub agents_poll: AgentsPoll,
+    /// Where named accounts declared without a directory live (`<root>/<runtime>/<name>`,
+    /// [`twr_core::account::default_dir`]): `twr` passes the home's root's
+    /// [`twr_core::paths::Paths::accounts_dir`]; `None` = `accounts` beside the database.
+    pub accounts_root: Option<PathBuf>,
+    /// How the hub checks an account's login (`account.status`, `hub::accounts`):
+    /// [`own_account_probe`] for `twr hub`; `None` (the default, and tests): it checks none.
+    pub account_probe: Option<AccountProbe>,
+    /// The directory each runtime uses with no account variable set (`hub::accounts`: no
+    /// account may use it); `None` = the hub's own environment ([`own_native_dir`]). Tests give
+    /// their own.
+    pub native_dir: Option<NativeDirFn>,
+    /// How the hub reads its environment's variables for `account.list`'s `native_var` (each
+    /// runtime's selector variable as the hub has it, which `twr account` reproduces for the
+    /// native account's login); `None` = its own ([`own_native_var`]). Tests give their own.
+    pub native_var: Option<NativeVarFn>,
 }
 
 /// [`HubOptions::marker_read_hook`].
 #[doc(hidden)]
 pub type MarkerReadHook = Arc<dyn Fn(u32) + Send + Sync>;
 
-/// [`HubOptions::box_files_read_hook`].
+/// [`HubOptions::box_files_read_hook`] and [`HubOptions::pins_lookup_hook`].
 #[doc(hidden)]
 pub type BoxFilesReadHook =
     Arc<dyn Fn(&str) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
@@ -539,9 +567,14 @@ impl HubOptions {
             job_members_hook: None,
             box_dialer: None,
             box_files_read_hook: None,
+            pins_lookup_hook: None,
             socket_removed_hook: None,
             agent_probe: None,
             agents_poll: AgentsPoll::default(),
+            accounts_root: None,
+            account_probe: None,
+            native_dir: None,
+            native_var: None,
         }
     }
 }
@@ -593,8 +626,18 @@ pub struct NewThread {
     /// folder name of a git repository under `project_roots` (`hub::find_project`; not on a
     /// remote box), then taken as its absolute path.
     pub project: String,
-    /// Runtime; defaults to the project's, then `default_runtime`.
+    /// Runtime; defaults to the project's, then `default_runtime`. `<runtime>:<account>`
+    /// also picks the account, like `account` (`hub::runtime_spec`).
     pub runtime: Option<String>,
+    /// The account to run on: a name, a glob (`work-*`) or a comma-separated list, the first
+    /// usable match winning (`hub::thread_account`); default: the project's pin, else the
+    /// runtime's `[account_policy.<runtime>] default`, else the native account. Recorded as
+    /// `thread.created` `ext.twr.account_pin`.
+    pub account: Option<String>,
+    /// Open the thread on `account` although it is outside the project's pin or inside its
+    /// exclusions (the user only: refused for the orchestrator). Recorded as
+    /// `ext.twr.account_reason: "override"`.
+    pub outside_pin: bool,
     /// Unique name; generated when absent.
     pub name: Option<String>,
     /// Permission mode; defaults to `threads.default_mode`. The orchestrator may only omit it
@@ -744,6 +787,8 @@ struct Inner {
     box_files_lock: tokio::sync::Mutex<()>,
     /// [`HubOptions::box_files_read_hook`].
     box_files_read_hook: Option<BoxFilesReadHook>,
+    /// [`HubOptions::pins_lookup_hook`].
+    pins_lookup_hook: Option<BoxFilesReadHook>,
     /// [`HubOptions::socket_removed_hook`].
     socket_removed_hook: Option<SocketRemovedHook>,
     /// [`HubOptions::box_switch`].
@@ -754,6 +799,8 @@ struct Inner {
     local_agents: Arc<box_agents::LocalAgents>,
     /// [`HubOptions::agents_poll`].
     agents_poll: AgentsPoll,
+    /// The account probe, the accounts root and the native directories (`hub::accounts`).
+    accounts: accounts::AccountsRt,
     /// [`HubOptions::worktree_namespace`]: the branch namespace of the hub's own box, also the
     /// SSH boxes' ([`crate::remote`]).
     worktree_namespace: Option<String>,
@@ -946,6 +993,20 @@ struct ThreadRt {
     /// An `acp` thread's `TWR_ACP_COMMAND` / `TWR_ACP_ATTACH` (`ext.twr.acp_command` /
     /// `acp_attach`, see `hub::runtime_spec`).
     acp_env: Vec<(String, String)>,
+    /// A thread on a named account: that account's directory, as recorded when the thread
+    /// got it (`ext.twr.account_dir` of `thread.created` or of its latest account move). Its
+    /// environment is made from it (`hub::spawn_config`), and a start is refused while the
+    /// account's directory is another one (`hub::thread_account`).
+    account_dir: Option<PathBuf>,
+    /// The same directory as the account's runtimes get it (`ext.twr.account_env_dir`):
+    /// the configured path, kept while it leads to `account_dir` (`Core::account_env_dir`).
+    account_env_dir: Option<PathBuf>,
+    /// The configured project whose account pins apply to a thread whose log does not say
+    /// (`ThreadView::pins_project` is `None`: made for a repository path before pins were
+    /// recorded, or before its project was configured), as looked up for its latest move
+    /// (`Hub::look_up_pins_project`). Memory only: each move looks it up again.
+    #[serde(skip)]
+    looked_up_project: Option<String>,
     /// A runtime exit whose closing sequence is not recorded yet ([`Core::begin_exit`] until
     /// [`Core::finish_exit`]): the thread takes no new turn, and nothing else closes it.
     exiting: bool,
@@ -1063,6 +1124,9 @@ impl PartialEq for ThreadRt {
             resuming,
             pty_command,
             acp_env,
+            account_dir,
+            account_env_dir,
+            looked_up_project,
             exiting,
             taken,
             stop_requested,
@@ -1094,6 +1158,9 @@ impl PartialEq for ThreadRt {
             && *resuming == o.resuming
             && *pty_command == o.pty_command
             && *acp_env == o.acp_env
+            && *account_dir == o.account_dir
+            && *account_env_dir == o.account_env_dir
+            && *looked_up_project == o.looked_up_project
             && *exiting == o.exiting
             && taken.is_some() == o.taken.is_some()
             && *stop_requested == o.stop_requested
@@ -1151,6 +1218,8 @@ impl ThreadRt {
         "resuming",
         "pty_command",
         "acp_env",
+        "account_dir",
+        "account_env_dir",
         "exiting",
         "stop_requested",
         "closed_runtimes",
@@ -1180,6 +1249,7 @@ impl ThreadRt {
             restart_reason,
             compact,
             offer_waived,
+            looked_up_project,
             // In the checkpoint.
             process_live: _,
             pid: _,
@@ -1190,6 +1260,8 @@ impl ThreadRt {
             resuming: _,
             pty_command: _,
             acp_env: _,
+            account_dir: _,
+            account_env_dir: _,
             exiting: _,
             stop_requested: _,
             closed_runtimes: _,
@@ -1213,6 +1285,7 @@ impl ThreadRt {
             ("restart_reason", restart_reason.is_some()),
             ("compact", compact.is_some()),
             ("offer_waived", offer_waived.is_some()),
+            ("looked_up_project", looked_up_project.is_some()),
         ]
         .into_iter()
         .filter_map(|(f, set)| set.then_some(f))
@@ -1652,6 +1725,28 @@ struct Core {
     /// The orchestrators' memory tool calls, by thread and call id, whose results and
     /// progress are recorded without their text (`hub::memory`). Memory only.
     memory_calls: HashSet<(String, String)>,
+    /// Every runtime's accounts: the config's and the log's records and statuses
+    /// (`hub::accounts`). Rebuilt at start from the config and [`Core::account_events`],
+    /// never kept in a checkpoint (config wins over records, and config may change between a
+    /// checkpoint and a start).
+    accounts: twr_core::account::AccountsView,
+    /// The hub thread's `account.added`, `account.removed` and `account.status` folded so far,
+    /// each with its control position, in log order (a few: a status is recorded only when it
+    /// changes): what a checkpoint keeps of the accounts, folded over the config's
+    /// declarations at start (`hub::checkpoint`), and what says whether an account was
+    /// removed since a session began (`Core::departure`).
+    account_events: Vec<(u64, Event)>,
+    /// Whether an event folded so far needs a twr that knows accounts
+    /// (`store::account_dependent`): the replay then raises the schema version
+    /// (`Store::fence_accounts`), in case the event was recorded before the fence.
+    account_data: bool,
+    /// Each runtime's own directory in the hub's environment
+    /// ([`crate::HubOptions::native_dir`]), for the use-time checks of recorded accounts that
+    /// collide with one (`accounts::conflict`); none known until the hub opens.
+    account_native_dir: accounts::NativeDirFn,
+    /// The hub's environment's variables ([`crate::HubOptions::native_var`]), for
+    /// `account.list`'s `native_var`.
+    account_native_var: accounts::NativeVarFn,
 }
 
 fn rpc(code: &str, msg: impl Into<String>) -> RpcError {
@@ -1817,6 +1912,32 @@ impl Core {
                 m.insert("pty_command".into(), argv);
             }
             // (An `acp` thread's `acp_command` is the view's own, `ThreadView::acp_command`.)
+            // Its account, always: the native one under its current name when the thread
+            // records none (`hub::accounts`).
+            let (account, shown, removed) = self.thread_account_json(v);
+            m.insert("account".into(), json!(account));
+            m.insert("account_shown".into(), json!(shown));
+            if removed {
+                m.insert("account_removed".into(), json!(true));
+            }
+            // Its runtime process still runs on a login that was removed (a move finishing
+            // its turn there, a removal with `force`): `twr account remove` waits for that
+            // before logging the login out or deleting it. `dir`: the directory the process was
+            // started in (links followed, `RunSettings::account_dir`; absent when not known),
+            // which another workspace's `--logout` and `--purge` check as it is, whatever
+            // directory the account's name leads to now (removed and added again elsewhere).
+            if let Some((runtime, account)) = self.runtime_on_removed_account(v) {
+                let mut on = json!({ "runtime": runtime, "account": account });
+                let dir = self
+                    .rt
+                    .get(&v.id)
+                    .and_then(|r| r.runtime_settings.as_ref())
+                    .and_then(|s| s.account_dir.as_deref());
+                if let Some(d) = dir {
+                    on["dir"] = json!(d.to_string_lossy());
+                }
+                m.insert("runtime_account_removed".into(), on);
+            }
         }
         j
     }
@@ -2264,13 +2385,26 @@ impl Core {
         // thread left that runtime with, given what the thread did since, if anything
         // (`hub::switch`). The turn says which session it resumes: its failure before the
         // runtime started it drops the resume (`ThreadView::resume_failed_turn`).
+        // The session it resumes is checked again now, under the lock the turn starts in, as
+        // the move checked it: its account may have been removed (and added again) since. One
+        // that no longer holds is dropped by this turn (`ext.twr.resume_dropped`, with why),
+        // which starts a new session with the full handoff instead.
         let moving = view.handoff_pending && !self.orch.is_thread(thread);
-        let resumes = view.resume_session.clone().filter(|_| moving);
+        let pending = view.resume_session.clone().filter(|_| moving);
+        let dropped = pending
+            .as_ref()
+            .and_then(|_| self.resume_dropped(hub, view));
+        let resumes = pending.clone().filter(|_| dropped.is_none());
         let handoff = if moving {
-            self.thread_handoff_or_note(thread)
+            self.thread_handoff_or_note(thread, dropped.as_deref())
         } else {
             None
         };
+        if let (Some(s), Some(why)) = (&pending, &dropped) {
+            tracing::info!(thread, session = %s, why = %why, "a pending resume no longer holds: a new session");
+            twr.insert(RESUME_DROPPED_KEY.into(), json!(s));
+            twr.insert(RESUME_DROPPED_WHY_KEY.into(), json!(why));
+        }
         let injected = self.context_for_turn(hub, thread, &mut batch)?;
         if let Some(i) = &injected {
             context::turn_ext(i, &mut twr);
@@ -2412,6 +2546,10 @@ impl Core {
         if !view.is_orchestrator() {
             self.refuse_unreaped(thread).map_err(anyhow::Error::new)?;
         }
+        // Nor on an account that was removed, or whose directory changed since the thread got
+        // it (`hub::thread_account`): said on the turn's error card.
+        self.refuse_account(&view)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         // Taken whether or not the start succeeds: a failed start's processes (if any) never
         // share a generation marker with a later runtime.
         self.generation += 1;
@@ -2421,7 +2559,7 @@ impl Core {
         // (`hub::agents`).
         let mut cfg = SpawnConfig {
             prompt_turn: first.as_ref().map(|(_, t)| *t),
-            ..spawn_config(hub, &view)
+            ..self.spawn_config(hub, &view)
         };
         cfg.env.splice(
             0..0,
@@ -2443,7 +2581,7 @@ impl Core {
         }
         // Removed on drop: when this runtime exits, or right away if it cannot start.
         let orch_spawn = if self.orch.is_thread(thread) {
-            self.orchestrator_spawn_config(hub, &view.runtime, &mut cfg)?
+            self.orchestrator_spawn_config(hub, &view, &mut cfg)?
         } else {
             None
         };
@@ -2458,6 +2596,17 @@ impl Core {
             Some(o) => (Some(o.file), Some(o.token)),
             None => (None, None),
         };
+        // The native account's session store as the environment it starts with selects it
+        // (`Core::native_store`), on the hub's own box: stamped on its start below.
+        // Its selector variable too (`Core::native_selector`): a runtime may key its login on
+        // how the variable spells the directory.
+        let native = view.account.is_none() && view.box_name == LOCAL_BOX;
+        let store = native
+            .then(|| self.native_store(&view.runtime, &cfg.env, &cfg.env_remove, &cfg.cwd))
+            .flatten();
+        let native_selector = native
+            .then(|| self.native_selector(&view.runtime, &cfg.env, &cfg.env_remove, &cfg.cwd))
+            .flatten();
         // Its working directory is held from before it starts until it is gone; refused while
         // the directory's worktree is being removed (a park whose caller went away, whose git
         // runs on) or created.
@@ -2536,7 +2685,42 @@ impl Core {
         self.rt(thread).queue_held = false;
         self.rt(thread).crash_hold = None;
         // The settings it runs in (recorded on its `thread.started`, `hub::restart`).
-        self.rt(thread).runtime_settings = Some(restart::RunSettings::of(&view));
+        // Its account's directory too: what it reports is that directory's (`hub::usage`,
+        // `hub::retry`). And what a move back checks a session it resumes against
+        // (`hub::switch`): the native account's directory as its environment selected it, the
+        // account's login generation, and the login note of the directory its login lives in
+        // (an account on the hub's own box only; a note that cannot be read is stamped as
+        // such, which no note now matches). A start that resumes a session takes the session's
+        // login instead when it is recorded (`Core::carry_login`).
+        let local = view.box_name == LOCAL_BOX;
+        let account_dir = self.account_dir(&view);
+        let login_dir = match view.account {
+            Some(_) => account_dir.clone(),
+            None => store.clone(),
+        };
+        let login_note = login_dir
+            .filter(|_| local)
+            .and_then(|d| match self.login_note(&d) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(thread, error = %e, dir = %d.display(), "cannot read a login note");
+                    Some(switch::UNREADABLE_NOTE.to_string())
+                }
+            });
+        let settings = restart::RunSettings {
+            account_dir,
+            session_store: store,
+            native_selector,
+            account_login: if local {
+                self.accounts
+                    .login_generation(&view.runtime, view.account.as_deref())
+            } else {
+                0
+            },
+            login_note,
+            ..restart::RunSettings::of(&view)
+        };
+        self.rt(thread).runtime_settings = Some(settings);
         tokio::spawn(supervise(
             Arc::clone(hub),
             thread.to_string(),
@@ -2550,10 +2734,22 @@ impl Core {
 
 /// The runtime configuration of `view` (no turn; of the environment only the configured
 /// variables of a worker thread, [`Config::thread_env`], its project's only when it was made
-/// for that configured project): what `deliver` spawns with and what `attach.begin` builds the
-/// interactive command from.
-fn spawn_config(hub: &Inner, view: &ThreadView) -> SpawnConfig {
-    let (cwd, env) = if view.is_orchestrator() {
+/// for that configured project, then its account's): what `deliver` spawns with, what
+/// `attach.begin` builds the interactive command from, and what a job runs with
+/// ([`Core::spawn_config`] gives `account_dir`).
+///
+/// A thread on a named account (`view.account`) of a runtime that takes accounts, the
+/// orchestrator too, gets that account's variables (`twr_adapters::account::account_env` of
+/// `account_dir`, the directory recorded when it got the account) last, replacing any of the
+/// same name the configuration set, and `env_remove` the stray-credential variables the
+/// account's process must not inherit (none of them is in `env` either). The native account
+/// changes nothing.
+fn spawn_config(
+    hub: &Inner,
+    view: &ThreadView,
+    account_dir: Option<&std::path::Path>,
+) -> SpawnConfig {
+    let (cwd, mut env) = if view.is_orchestrator() {
         (orch::orchestrator_cwd(&hub.config), Vec::new())
     } else {
         let cwd = view.worktree.clone().or(view.repo.clone());
@@ -2563,10 +2759,20 @@ fn spawn_config(hub: &Inner, view: &ThreadView) -> SpawnConfig {
                 .thread_env(view.project.as_deref().filter(|_| view.configured_project)),
         )
     };
+    let mut env_remove = Vec::new();
+    let account_env = account_dir
+        .filter(|_| view.account.is_some())
+        .and_then(|dir| twr_adapters::account::account_env(&view.runtime, dir));
+    if let Some((set, remove)) = account_env {
+        env.retain(|(k, _)| !set.iter().any(|(s, _)| s == k) && !remove.contains(k));
+        env.extend(set);
+        env_remove = remove;
+    }
     SpawnConfig {
         thread: view.id.clone(),
         cwd,
         env,
+        env_remove,
         mode: view.mode.clone(),
         model: view.model.clone(),
         effort: view.effort.clone(),
@@ -2688,6 +2894,8 @@ impl Hub {
             "worker_limits": self.inner.limits.by(),
             "warnings": self.inner.warnings(),
             "suggest": {"unavailable": suggest_unavailable},
+            // Every runtime's accounts, without their directories (`hub::accounts`).
+            "accounts": core.accounts.to_json(false),
         })
     }
 

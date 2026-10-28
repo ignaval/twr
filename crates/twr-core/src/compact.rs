@@ -982,6 +982,86 @@ mod tests {
         assert!(kept < all * 9 / 10, "kept {kept} of {all}");
     }
 
+    /// Every `account.added`, `account.removed` and `account.status` stays (the accounts are
+    /// folded from them, `crate::account::AccountsView`, which the hub's `account.list` hands a
+    /// client), and of a runtime's account's `account.usage` the latest, a clear (no windows,
+    /// from a removal) included: the usage view and the accounts fold alike from either.
+    #[test]
+    fn account_events_stay_with_their_latest_usage() {
+        use crate::account::{AccountsView, Login};
+        let mut h = crate::testkit::ThreadScript::new(HUB_THREAD);
+        let mut ev = |body: EventBody| by_hub(h.event(body));
+        let added = |name: &str, dir: Option<&str>, native: bool| {
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: name.into(),
+                dir: dir.map(str::to_string),
+                native,
+                ..Default::default()
+            })
+        };
+        let usage = |pct: Option<f64>, dir: Option<&str>| {
+            EventBody::AccountUsage(AccountUsage {
+                runtime: "claude-code".into(),
+                account: Some("work".into()),
+                windows: pct
+                    .map(|p| {
+                        vec![crate::usage::UsageWindow {
+                            window: "5h".into(),
+                            used_pct: p,
+                            resets_at: None,
+                            minutes: Some(300),
+                            observed_at: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                source: "event".into(),
+                dir: dir.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        let status = |login: Login| {
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                login,
+                ..Default::default()
+            })
+        };
+        let log = vec![
+            ev(added("work", Some("/a/work"), false)), // 1
+            ev(usage(Some(40.0), Some("/a/work"))),    // 2
+            ev(status(Login::LoggedIn)),               // 3
+            ev(usage(Some(50.0), Some("/a/work"))),    // 4
+            ev(EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            })), // 5
+            ev(usage(None, None)),                     // 6
+            ev(added("work", Some("/a/work2"), false)), // 7
+            ev(status(Login::LoggedOut)),              // 8
+            ev(added("personal", None, true)),         // 9
+        ];
+        let items: Vec<(u64, &Event)> = log.iter().zip(1..).map(|(e, g)| (g, e)).collect();
+        let kept = select_events(items.iter().copied(), 0);
+        assert_eq!(kept, vec![1, 3, 5, 6, 7, 8, 9]);
+        for since in 0..log.len() as u64 {
+            check("accounts", &log, since);
+            let kept = select_events(items.iter().copied(), since);
+            let fold = |all: bool| {
+                let mut v = AccountsView::default();
+                for &(g, e) in &items {
+                    if all || g <= since || kept.binary_search(&g).is_ok() {
+                        v.apply(e);
+                    }
+                }
+                v
+            };
+            assert_eq!(fold(true), fold(false), "accounts (since {since})");
+        }
+    }
+
     /// A `conversation.update` that turns a thread's offers to compact its context off or on is
     /// folded (`ThreadView::idle_compaction_off`), so it stays, whatever it comes after; any
     /// other goes unless it is its thread's first item.

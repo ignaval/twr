@@ -13,8 +13,10 @@
 //! Stored percentages are the share of the window **used** (0 to 100, more when a runtime
 //! lets usage run past the cap), as every runtime reports it. Human-facing text shows the
 //! share left ([`remaining_pct`]), clamped to 0–100. Accounts: `account` is `None` for the
-//! runtime's own login (the only one today); a runtime with entries for more than one account
-//! shows the account in its label ([`UsageView::shown`]), one with a single entry never does.
+//! runtime's own login (the native account). Labels name the account as threads' do: while
+//! the runtime shows account labels in the accounts' registry ([`UsageView::shown_for`],
+//! [`UsageView::shown_by`]); without the registry (an older hub), while the runtime has
+//! entries for more than one account ([`UsageView::shown`]).
 
 use std::collections::BTreeMap;
 
@@ -210,6 +212,11 @@ pub struct UsageEntry {
     pub source: String,
     /// The plan, when the runtime says (`max`, `pro`, ...).
     pub plan: Option<String>,
+    /// The named account's directory its windows were read in (`AccountUsage::dir`); `None`
+    /// for the native account, a cleared entry, and an older hub's record.
+    ///
+    /// [`AccountUsage::dir`]: crate::event::AccountUsage::dir
+    pub dir: Option<String>,
 }
 
 /// One runtime's usage as clients show it ([`UsageView::shown`]).
@@ -291,7 +298,9 @@ impl From<UsageView> for Vec<UsageEntry> {
 }
 
 impl UsageView {
-    /// Folds one event: an `account.usage` on the hub thread replaces its entry.
+    /// Folds one event: an `account.usage` on the hub thread replaces its entry (one with no
+    /// windows, as the hub records when the account's directory changed, leaves nothing to
+    /// show).
     pub fn apply(&mut self, ev: &Event) {
         if ev.thread != HUB_THREAD {
             return;
@@ -309,6 +318,7 @@ impl UsageView {
                     observed_at: p.observed_at.unwrap_or(ev.ts),
                     source: p.source.clone(),
                     plan: p.plan.clone(),
+                    dir: p.dir.clone(),
                 },
             );
         }
@@ -325,11 +335,64 @@ impl UsageView {
         self.entries.values()
     }
 
+    /// Keeps only the entries `keep` says to.
+    pub fn retain(&mut self, mut keep: impl FnMut(&UsageEntry) -> bool) {
+        self.entries.retain(|_, e| keep(e));
+    }
+
     /// What clients show at `now`: per runtime and account, the windows that have not reset
     /// (an entry left with none is not shown), Claude first, then Codex, Grok and the rest by
-    /// name. A runtime with more than one entry shows each account in its label, also while
-    /// some of them have nothing to show.
+    /// name. Without the accounts' registry (an older hub's client): a runtime with more than
+    /// one entry shows each account in its label (the native one as `default`), also while
+    /// some of them have nothing to show because their windows reset (an entry cleared, with
+    /// no windows at all, does not count). With it, [`UsageView::shown_for`] /
+    /// [`UsageView::shown_by`] say it instead.
     pub fn shown(&self, now: DateTime<Utc>) -> Vec<Shown> {
+        let several = |runtime: &str| {
+            self.entries
+                .values()
+                .filter(|e| e.runtime == runtime && !e.windows.is_empty())
+                .count()
+                > 1
+        };
+        self.shown_by(now, |runtime| {
+            several(runtime).then(|| crate::account::NATIVE_DEFAULT_NAME.to_string())
+        })
+    }
+
+    /// [`UsageView::shown`] as the accounts' registry `accounts` labels them: a runtime's
+    /// entries name their account while it shows labels ([`AccountsView::shows_labels`]: two
+    /// or more of its accounts registered and not logged out, whatever has reported usage),
+    /// the native account under its current name ([`AccountsView::native_name`]).
+    ///
+    /// [`AccountsView::shows_labels`]: crate::account::AccountsView::shows_labels
+    /// [`AccountsView::native_name`]: crate::account::AccountsView::native_name
+    pub fn shown_for(
+        &self,
+        now: DateTime<Utc>,
+        accounts: &crate::account::AccountsView,
+    ) -> Vec<Shown> {
+        let shown = self.shown_by(now, |runtime| {
+            accounts
+                .shows_labels(runtime)
+                .then(|| accounts.native_name(runtime))
+        });
+        one_unlabeled(shown, |runtime, account| {
+            accounts
+                .info(runtime, account)
+                .is_some_and(|a| !a.removed && a.login.is_none_or(crate::account::Login::counts))
+        })
+    }
+
+    /// [`UsageView::shown`] with labels by `labels`: for a runtime, `Some(<its native
+    /// account's name>)` when its entries name their account (`Claude:work`, the native one's
+    /// `Claude:<that name>`), `None` when they do not (`Claude`). What a client that knows the
+    /// accounts as the hub lists them (`account.list`'s `shown` and `native`) uses.
+    pub fn shown_by(
+        &self,
+        now: DateTime<Utc>,
+        labels: impl Fn(&str) -> Option<String>,
+    ) -> Vec<Shown> {
         let mut out: Vec<Shown> = Vec::new();
         for e in self.entries.values() {
             let windows: Vec<UsageWindow> = e
@@ -361,16 +424,13 @@ impl UsageView {
                 plan: e.plan.clone(),
             });
         }
-        let several = |runtime: &str| {
-            self.entries
-                .keys()
-                .filter(|(r, _)| r.as_str() == runtime)
-                .count()
-                > 1
-        };
+        let mut named: BTreeMap<String, Option<String>> = BTreeMap::new();
         for s in &mut out {
-            if several(&s.runtime) {
-                let account = s.account.as_deref().unwrap_or("default");
+            let native = named
+                .entry(s.runtime.clone())
+                .or_insert_with(|| labels(&s.runtime));
+            if let Some(native) = native {
+                let account = s.account.as_deref().unwrap_or(native.as_str());
                 s.label = format!("{}:{account}", s.label);
                 s.short = format!("{}:{account}", s.short);
             }
@@ -630,6 +690,38 @@ pub fn cost_text(c: f64) -> String {
     }
 }
 
+/// `shown` with at most one entry per runtime that names no account: a runtime that shows no
+/// account labels but has entries of several accounts (a second one logged out or removed
+/// since it reported) keeps the entry of the account that is still usable (`usable(runtime,
+/// account)`), else the most recent one, so the line never shows two `Claude`s that can't be
+/// told apart.
+pub fn one_unlabeled(shown: Vec<Shown>, usable: impl Fn(&str, Option<&str>) -> bool) -> Vec<Shown> {
+    let unlabeled = |s: &Shown| !s.label.contains(':');
+    let mut keep: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, s) in shown.iter().enumerate().filter(|(_, s)| unlabeled(s)) {
+        let better = |j: usize| {
+            let o = &shown[j];
+            let (a, b) = (
+                usable(&s.runtime, s.account.as_deref()),
+                usable(&o.runtime, o.account.as_deref()),
+            );
+            a && !b || (a == b && s.age < o.age)
+        };
+        match keep.get(&s.runtime) {
+            Some(&j) if !better(j) => {}
+            _ => {
+                keep.insert(s.runtime.clone(), i);
+            }
+        }
+    }
+    shown
+        .into_iter()
+        .enumerate()
+        .filter(|(i, s)| !unlabeled(s) || keep.get(&s.runtime) == Some(i))
+        .map(|(_, s)| s)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -863,6 +955,124 @@ mod tests {
         assert_eq!(labels, ["Claude:work"]);
     }
 
+    /// A record with no windows (the hub's when the account's directory changed) replaces the
+    /// entry, directory included: nothing of it is shown, and it no longer counts as one of the
+    /// runtime's accounts for the labels.
+    #[test]
+    fn a_cleared_entry_shows_nothing() {
+        let mut v = view();
+        let mut work = usage_event(
+            "claude-code",
+            Some("work"),
+            vec![win(SEVEN_DAY, 10.0, Some("2026-10-14T05:00:00Z"))],
+            "2026-10-09T11:59:00Z",
+        );
+        if let EventBody::AccountUsage(p) = &mut work.body {
+            p.dir = Some("/acc/a".into());
+        }
+        v.apply(&work);
+        let e = v.get("claude-code", Some("work")).unwrap();
+        assert_eq!(e.dir.as_deref(), Some("/acc/a"));
+        v.apply(&usage_event(
+            "claude-code",
+            Some("work"),
+            vec![],
+            "2026-10-09T11:59:30Z",
+        ));
+        let e = v.get("claude-code", Some("work")).unwrap();
+        assert!(e.windows.is_empty() && e.dir.is_none(), "{e:?}");
+        let shown = v.shown(at(NOW));
+        let labels: Vec<&str> = shown.iter().map(|s| s.label.as_str()).collect();
+        assert_eq!(labels, ["Claude", "GPT"]);
+    }
+
+    /// With the accounts' registry, labels follow its rule, not the entries: one report while
+    /// two accounts are usable names its account; a second account removed or logged out names
+    /// none, whatever reported; the native account goes by its current name.
+    #[test]
+    fn labels_follow_the_accounts_registry() {
+        use crate::account::{AccountsView, Login};
+        use crate::event::{AccountAdded, AccountRemoved, AccountStatus};
+        let hub_event =
+            |seq: u64, body: EventBody| Event::new(HUB_THREAD, seq, None, Source::Hub, body);
+        let added = |seq: u64, name: &str, native: bool| {
+            hub_event(
+                seq,
+                EventBody::AccountAdded(AccountAdded {
+                    runtime: "claude-code".into(),
+                    account: name.into(),
+                    dir: (!native).then(|| format!("/acc/{name}")),
+                    native,
+                    ..Default::default()
+                }),
+            )
+        };
+        let mut accounts = AccountsView::new(&crate::config::Config::default());
+        accounts.apply(&added(1, "work", false));
+        let now = at(NOW);
+        let labels = |v: &UsageView, a: &AccountsView| -> Vec<String> {
+            v.shown_for(now, a).into_iter().map(|s| s.label).collect()
+        };
+        // One report (the native account's) while two accounts are usable: named.
+        let v = view();
+        assert_eq!(labels(&v, &accounts), ["Claude:default", "GPT"]);
+        assert_eq!(
+            segment_text(&v.shown_for(now, &accounts), Form::Compact, now, &Utc),
+            "C:default 78%/56% | G 58%"
+        );
+        // The old rule (no registry) names nothing for one report.
+        let old: Vec<String> = v.shown(now).into_iter().map(|s| s.label).collect();
+        assert_eq!(old, ["Claude", "GPT"]);
+        // Both reported, then work logged out: nothing named, though two reported.
+        let mut both = view();
+        both.apply(&usage_event(
+            "claude-code",
+            Some("work"),
+            vec![win(SEVEN_DAY, 10.0, Some("2026-10-14T05:00:00Z"))],
+            "2026-10-09T11:59:00Z",
+        ));
+        assert_eq!(
+            labels(&both, &accounts),
+            ["Claude:default", "Claude:work", "GPT"]
+        );
+        let mut out = accounts.clone();
+        out.apply(&hub_event(
+            2,
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                login: Login::LoggedOut,
+                ..Default::default()
+            }),
+        ));
+        // One unlabeled Claude entry: the native one, still usable ([`one_unlabeled`]).
+        assert_eq!(labels(&both, &out), ["Claude", "GPT"]);
+        // Removed: likewise.
+        let mut removed = accounts.clone();
+        removed.apply(&hub_event(
+            2,
+            EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+        ));
+        assert_eq!(labels(&both, &removed), ["Claude", "GPT"]);
+        // The native account renamed: its name, not `default`.
+        let mut renamed = accounts.clone();
+        renamed.apply(&added(3, "personal", true));
+        assert_eq!(
+            labels(&both, &renamed),
+            ["Claude:personal", "Claude:work", "GPT"]
+        );
+        let shorts: Vec<String> = both
+            .shown_for(now, &renamed)
+            .into_iter()
+            .map(|s| s.short)
+            .collect();
+        assert_eq!(shorts, ["C:personal", "C:work", "G"]);
+    }
+
     /// The observation time a record carries (a runner's capture time) wins over its `ts`.
     #[test]
     fn the_observation_time_is_the_reports() {
@@ -1032,5 +1242,41 @@ mod tests {
         assert_eq!(cost_text(0.424), "$0.42");
         assert_eq!(cost_text(12.3), "$12.30");
         assert_eq!(cost_text(1234.4), "$1234");
+    }
+
+    /// A runtime that shows no labels keeps one unlabeled entry: the usable account's, else
+    /// the most recent; labeled entries and other runtimes are left alone.
+    #[test]
+    fn one_unlabeled_entry_per_runtime() {
+        let now = Utc::now();
+        let entry = |rt: &str, account: Option<&str>, label: &str, age_mins: i64| Shown {
+            runtime: rt.into(),
+            account: account.map(str::to_string),
+            label: label.into(),
+            short: label.into(),
+            windows: Vec::new(),
+            observed_at: now,
+            age: TimeDelta::minutes(age_mins),
+            stale: false,
+            source: "event".into(),
+            plan: None,
+        };
+        let shown = vec![
+            entry("claude-code", None, "Claude", 5),
+            entry("claude-code", Some("work"), "Claude", 1),
+            entry("codex", None, "GPT:default", 3),
+            entry("codex", Some("team"), "GPT:team", 2),
+        ];
+        let names = |v: &[Shown]| {
+            v.iter()
+                .map(|s| format!("{}/{}", s.runtime, s.account.as_deref().unwrap_or("-")))
+                .collect::<Vec<_>>()
+        };
+        // work was logged out: the native's entry stays although it is older.
+        let kept = one_unlabeled(shown.clone(), |_, a| a.is_none());
+        assert_eq!(names(&kept), ["claude-code/-", "codex/-", "codex/team"]);
+        // Neither usable (or both): the most recent.
+        let kept = one_unlabeled(shown, |_, _| false);
+        assert_eq!(names(&kept), ["claude-code/work", "codex/-", "codex/team"]);
     }
 }

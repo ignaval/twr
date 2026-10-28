@@ -15,6 +15,7 @@
 //! cwd = "~"
 //! autostart = false
 //! model = "sonnet"          # unset = threads.model, else the runtime's default
+//! account = "work"          # the first orchestrator's account; unset = the policy's default
 //!
 //! [hub]
 //! socket = "/run/user/1000/twr/hub.sock"   # defaults to the resolved path
@@ -57,12 +58,30 @@
 //! # Added to the environment of this project's runtimes, over threads.env.
 //! env = { CARGO_TARGET_DIR = "/home/me/.cache/api-target" }
 //! codex_auto = "ask"   # overrides [codex] auto for this project's threads
+//! # Its threads' account on every runtime: a name, a glob ("work-*") or a list (a pool).
+//! # A runtime with no usable account it matches refuses the thread.
+//! account = "work"
+//! # accounts = { codex = "team" }       # per runtime; replaces `account` there
+//! # exclude_accounts = ["personal"]     # never these, on any runtime
 //!
 //! [codex]
 //! # What a Codex thread in `auto` does with a command its sandbox does not allow: let Codex's
 //! # "auto_review" agent decide (the default: it runs what it approves outside the sandbox,
 //! # without asking you), "ask" you, or "never" run it.
 //! auto = "auto_review"
+//!
+//! # Accounts: more logins of a runtime (claude-code, codex, grok-build), each a config
+//! # directory (`twr account add` records one instead of declaring it here).
+//! [accounts.claude-code.work]
+//! dir = "~/.claude-work"    # unset = <data dir>/accounts/claude-code/work
+//! share = "config"          # none | config (default): settings, skills... linked from the native
+//!
+//! [accounts.claude-code.personal]
+//! native = true             # names the native account (the runtime's own directory, no
+//!                           # variable set; "default" until named)
+//!
+//! [account_policy.claude-code]
+//! default = "personal"      # the account of a thread nothing pins; unset = the native account
 //!
 //! [threads]
 //! thinking = false
@@ -126,6 +145,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
+use crate::account::{check_name, split_runtime, takes_accounts, Pin, Share};
 use crate::adapter::CodexAuto;
 use crate::notify::NotifyEvent;
 use crate::paths::Paths;
@@ -202,6 +222,11 @@ pub struct Config {
     /// and `<root>/*/<name>`, a git repository. A leading `~` is the home directory. `None`:
     /// [`DEFAULT_PROJECT_ROOTS`]; empty: no lookup.
     pub project_roots: Option<Vec<PathBuf>>,
+    /// Accounts declared here (`[accounts.<runtime>.<name>]`), by runtime, then name
+    /// ([`crate::account`]; `twr account add` records them in the log instead).
+    pub accounts: BTreeMap<String, BTreeMap<String, AccountConfig>>,
+    /// Per-runtime account policy (`[account_policy.<runtime>]`).
+    pub account_policy: BTreeMap<String, AccountPolicy>,
 }
 
 /// Default `project_roots`: common code folders (the ones that do not exist are skipped).
@@ -246,6 +271,8 @@ impl Default for Config {
             notify: NotifyConfig::default(),
             tui: TuiConfig::default(),
             project_roots: None,
+            accounts: BTreeMap::new(),
+            account_policy: BTreeMap::new(),
         }
     }
 }
@@ -276,6 +303,11 @@ pub struct OrchestratorConfig {
     /// (`<data dir>/memory/`, `hub::memory`; default `true`). `false`: its memory tools refuse,
     /// nothing is loaded into its sessions, and the notes stay where they are.
     pub memory: bool,
+    /// The first orchestrator's account: a pin of its runtime's accounts, as a project's
+    /// `account` takes it (a name, a glob, a list, or a comma-separated string; the first of
+    /// them that can be used); `None`: the policy's default, else the native account. `twr
+    /// orchestrator use <runtime>:<account>` switches it (the switch is kept in the log).
+    pub account: Option<Pin>,
 }
 
 impl Default for OrchestratorConfig {
@@ -289,6 +321,7 @@ impl Default for OrchestratorConfig {
             project_reads: true,
             read_deny: Vec::new(),
             memory: true,
+            account: None,
         }
     }
 }
@@ -1045,6 +1078,16 @@ pub struct BoxProjectConfig {
     pub repo: PathBuf,
     /// Runtime override for this project's threads on the box.
     pub runtime: Option<String>,
+    /// The account pin of this project's threads on the box, on every runtime; with
+    /// `accounts` and `exclude_accounts`, it replaces the project's ([`Config::account_pin`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<Pin>,
+    /// Per-runtime account pins, by runtime; one replaces `account` on its runtime.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, Pin>,
+    /// Accounts this project's threads on the box never use, on any runtime.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_accounts: Option<Pin>,
 }
 
 /// `[projects.<name>]`
@@ -1079,6 +1122,18 @@ pub struct ProjectConfig {
     /// What this project's Codex threads in `auto` do with a command their sandbox does not
     /// allow, over `[codex] auto` ([`Config::codex_auto`]).
     pub codex_auto: Option<CodexAuto>,
+    /// The account pin of this project's threads, on every runtime: a name, a glob
+    /// (`work-*`) or a list of them, a pool in order ([`Config::account_pin`]). A thread on a
+    /// runtime with no usable account it matches is refused (the hub).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<Pin>,
+    /// Per-runtime account pins, by runtime; one replaces `account` on its runtime.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub accounts: BTreeMap<String, Pin>,
+    /// Accounts this project's threads never use, on any runtime, pin or not (applied after
+    /// the pin).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclude_accounts: Option<Pin>,
 }
 
 /// `[codex]`: settings of the Codex runtime.
@@ -1212,6 +1267,60 @@ impl RuntimePreset {
         }
         Ok(())
     }
+}
+
+/// `[accounts.<runtime>.<name>]`: an account of a runtime that takes accounts
+/// ([`crate::account::ACCOUNT_RUNTIMES`]), declared in config. Read when the hub starts.
+/// [`Config::validate`] checks what it can; whether `dir` is the runtime's own default
+/// directory (which must be `native = true` instead: setting `CLAUDE_CONFIG_DIR=~/.claude` is
+/// not the same as leaving it unset) needs the adapters' knowledge, so the hub checks that.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountConfig {
+    /// Its config directory, absolute or under `~` (expanded when the config is read);
+    /// `None`: `<data dir>/accounts/<runtime>/<name>` ([`crate::account::default_dir`]).
+    /// Never set on the native account.
+    pub dir: Option<PathBuf>,
+    /// What it shares with the native account.
+    pub share: Share,
+    /// This names the native account (the runtime's own default directory, no variable
+    /// set) instead of declaring another one. At most one per runtime.
+    pub native: bool,
+}
+
+/// `[account_policy.<runtime>]`: how a runtime's accounts are picked.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountPolicy {
+    /// The account of a thread nothing pins (on the hub's own box); `None`: the native
+    /// account.
+    pub default: Option<String>,
+}
+
+/// The account settings the design plans for later versions
+/// (`docs/design/multi-account.md`): `[account_policy.<runtime>]` `balance`, `pool`,
+/// `failover`, `avoid_above`, `move` and `resume_at_reset`, and `[accounts.codex.<name>]`
+/// `sessions`. None is available yet: each is refused as an unknown key, saying so
+/// ([`planned_account_key`]), never accepted and ignored.
+pub const PLANNED_ACCOUNT_KEYS: [&str; 7] = [
+    "balance",
+    "pool",
+    "failover",
+    "avoid_above",
+    "move",
+    "resume_at_reset",
+    "sessions",
+];
+
+/// The planned account key ([`PLANNED_ACCOUNT_KEYS`]) a config parse error `text` refuses as
+/// unknown in `[account_policy.<runtime>]` (whose only key is `default`) or in an account's
+/// table (`dir`, `share`, `native`), if it is one.
+fn planned_account_key(text: &str) -> Option<&'static str> {
+    let in_account_table = text.contains("expected `default`")
+        || text.contains("expected one of `dir`, `share`, `native`");
+    PLANNED_ACCOUNT_KEYS
+        .into_iter()
+        .find(|k| in_account_table && text.contains(&format!("unknown field `{k}`")))
 }
 
 /// `[threads]`
@@ -1478,9 +1587,34 @@ impl Config {
     /// Parses TOML (no environment overrides) and checks values serde cannot
     /// ([`Config::validate`]).
     pub fn from_toml_str(s: &str) -> anyhow::Result<Config> {
-        let cfg: Config = toml::from_str(s).context("parsing twr config")?;
+        let mut cfg: Config = toml::from_str(s).map_err(|e| {
+            let why = planned_account_key(&e.to_string()).map_or_else(
+                || "parsing twr config".to_string(),
+                |k| {
+                    format!(
+                        "parsing twr config: `{k}` is planned for a later version of account \
+                         support and is not available yet (docs/accounts.md)"
+                    )
+                },
+            );
+            anyhow::Error::new(e).context(why)
+        })?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        cfg.expand_account_dirs(home.as_deref());
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Expands a leading `~` of every account `dir` with `home` ([`expand_home`]); one under
+    /// `~` stays as it is when `home` is unknown (and [`Config::validate`] refuses it).
+    pub fn expand_account_dirs(&mut self, home: Option<&Path>) {
+        for a in self.accounts.values_mut().flat_map(|m| m.values_mut()) {
+            if let Some(d) = &a.dir {
+                if let Some(e) = expand_home(d, home) {
+                    a.dir = Some(e);
+                }
+            }
+        }
     }
 
     /// Checks values the types allow but twr does not: runtime presets
@@ -1575,6 +1709,152 @@ impl Config {
                     "project_roots: {} is neither an absolute path nor under ~ (e.g. \"~/code\")",
                     root.display()
                 );
+            }
+        }
+        self.validate_accounts()
+    }
+
+    /// The account keys of [`Config::validate`]: `[accounts]` runtimes that take accounts,
+    /// valid names, at most one native account per runtime and no `dir` on it, absolute
+    /// directories (after `~` expansion) that no two accounts share, valid pins and
+    /// exclusions, `[account_policy]` runtimes and defaults, and `orchestrator.account`. (A
+    /// named account called `default` while nothing names the native account, whose name that
+    /// is then, is checked at the hub's start, with twr's records:
+    /// [`crate::account::AccountsView::check_config_default`].)
+    fn validate_accounts(&self) -> anyhow::Result<()> {
+        let check_runtime = |key: &str, rt: &str| -> anyhow::Result<()> {
+            if takes_accounts(rt) {
+                Ok(())
+            } else if self.runtimes.contains_key(rt) {
+                anyhow::bail!(
+                    "{key}: accounts for [runtimes] presets come in a later version of twr"
+                )
+            } else {
+                anyhow::bail!(
+                    "{key}: {rt:?} does not take accounts (claude-code, codex or grok-build do)"
+                )
+            }
+        };
+        let mut dirs: BTreeMap<&Path, String> = BTreeMap::new();
+        for (rt, names) in &self.accounts {
+            check_runtime(&format!("accounts.{rt}"), rt)?;
+            let natives: Vec<&String> = names
+                .iter()
+                .filter(|(_, a)| a.native)
+                .map(|(n, _)| n)
+                .collect();
+            if let [a, b, ..] = natives.as_slice() {
+                anyhow::bail!(
+                    "accounts.{rt}: {a} and {b} are both `native = true`; one account is the native one"
+                );
+            }
+            for (name, a) in names {
+                let key = format!("accounts.{rt}.{name}");
+                check_name(name).map_err(|e| anyhow::anyhow!("{key}: {e}"))?;
+                let Some(dir) = &a.dir else {
+                    continue;
+                };
+                if a.native {
+                    anyhow::bail!(
+                        "{key}: a `native = true` account has no `dir` (it is the runtime's own \
+                         default directory)"
+                    );
+                }
+                if !dir.is_absolute() {
+                    anyhow::bail!(
+                        "{key}.dir: {} is not an absolute path (or under ~ with HOME set)",
+                        dir.display()
+                    );
+                }
+                if let Some(other) = dirs.insert(dir.as_path(), key.clone()) {
+                    anyhow::bail!(
+                        "{key}.dir: {} is also {other}'s directory; each account has its own",
+                        dir.display()
+                    );
+                }
+            }
+        }
+        let pin = |key: String, p: &Pin| p.validate().map_err(|e| anyhow::anyhow!("{key}: {e}"));
+        let projects = self.projects.iter().map(|(name, p)| {
+            (
+                format!("projects.{name}"),
+                &p.account,
+                &p.accounts,
+                &p.exclude_accounts,
+            )
+        });
+        let box_projects = self.boxes.iter().flat_map(|(b, bc)| {
+            bc.projects.iter().map(move |(name, p)| {
+                (
+                    format!("boxes.{b}.projects.{name}"),
+                    &p.account,
+                    &p.accounts,
+                    &p.exclude_accounts,
+                )
+            })
+        });
+        for (table, account, accounts, exclude) in projects.chain(box_projects) {
+            if let Some(p) = account {
+                pin(format!("{table}.account"), p)?;
+            }
+            for (rt, p) in accounts {
+                let key = format!("{table}.accounts.{rt}");
+                check_runtime(&key, rt)?;
+                pin(key, p)?;
+            }
+            if let Some(p) = exclude {
+                pin(format!("{table}.exclude_accounts"), p)?;
+            }
+        }
+        for (rt, policy) in &self.account_policy {
+            check_runtime(&format!("account_policy.{rt}"), rt)?;
+            if let Some(d) = &policy.default {
+                check_name(d).map_err(|e| anyhow::anyhow!("account_policy.{rt}.default: {e}"))?;
+            }
+        }
+        if let Some(p) = &self.orchestrator.account {
+            pin("orchestrator.account".into(), p)?;
+        }
+        self.refuse_runtime_accounts()
+    }
+
+    /// Refuses an account part (`claude-code:work`) in `default_runtime`, a project's
+    /// `runtime` and a box project's `runtime`: there it would act as a pin of every thread
+    /// it reaches, outranking the project's own pins. A project's pin
+    /// (`accounts.<runtime>`) or `[account_policy.<runtime>] default` says it. Only
+    /// `[orchestrator] runtime` takes one (the orchestrator's account).
+    fn refuse_runtime_accounts(&self) -> anyhow::Result<()> {
+        let refuse = |key: &str, spec: &str, rt: &str, instead: String| {
+            anyhow::anyhow!(
+                "{key}: {spec:?} names an account: write the runtime alone ({rt:?}) and the \
+                 account {instead}"
+            )
+        };
+        let policy =
+            |rt: &str, account: &str| format!("as [account_policy.{rt}] default = {account:?}");
+        let spec = self.default_runtime.as_str();
+        if let (rt, Some(account)) = split_runtime(spec) {
+            return Err(refuse("default_runtime", spec, rt, policy(rt, account)));
+        }
+        let projects = self
+            .projects
+            .iter()
+            .map(|(name, p)| (format!("projects.{name}"), &p.runtime));
+        let box_projects = self.boxes.iter().flat_map(|(b, bc)| {
+            bc.projects
+                .iter()
+                .map(move |(name, p)| (format!("boxes.{b}.projects.{name}"), &p.runtime))
+        });
+        for (table, runtime) in projects.chain(box_projects) {
+            let Some(spec) = runtime else {
+                continue;
+            };
+            if let (rt, Some(account)) = split_runtime(spec) {
+                let instead = format!(
+                    "as this project's pin ({table}.accounts.{rt} = {account:?}) or {}",
+                    policy(rt, account)
+                );
+                return Err(refuse(&format!("{table}.runtime"), spec, rt, instead));
             }
         }
         Ok(())
@@ -1769,6 +2049,41 @@ impl Config {
             .runtime
             .as_deref()
             .unwrap_or(&self.default_runtime)
+    }
+
+    /// The account pin of a thread of `project` on `box_name` running `runtime`, and the
+    /// accounts it must not use: (pin, exclusions). The pin is the box project's
+    /// `accounts.<runtime>`, else its `account`, else the project's `accounts.<runtime>`,
+    /// else its `account`; the exclusions are the box project's `exclude_accounts`, else the
+    /// project's. `(None, None)`: nothing pins the thread.
+    pub fn account_pin(
+        &self,
+        project: Option<&str>,
+        box_name: Option<&str>,
+        runtime: &str,
+    ) -> (Option<Pin>, Option<Pin>) {
+        let Some(project) = project else {
+            return (None, None);
+        };
+        let p = self.projects.get(project);
+        let bp = box_name
+            .and_then(|b| self.boxes.get(b))
+            .and_then(|b| b.projects.get(project));
+        let pin = bp
+            .and_then(|b| b.accounts.get(runtime).or(b.account.as_ref()))
+            .or_else(|| p.and_then(|p| p.accounts.get(runtime).or(p.account.as_ref())))
+            .cloned();
+        let exclude = bp
+            .and_then(|b| b.exclude_accounts.as_ref())
+            .or_else(|| p.and_then(|p| p.exclude_accounts.as_ref()))
+            .cloned();
+        (pin, exclude)
+    }
+
+    /// The first orchestrator's account pin: `orchestrator.account` (`None`: the policy's
+    /// default, else the native account).
+    pub fn orchestrator_account(&self) -> Option<&Pin> {
+        self.orchestrator.account.as_ref()
     }
 
     /// The orchestrator's model: `orchestrator.model`, else `threads.model` (`None`: the
@@ -2661,6 +2976,259 @@ mod tests {
         }
     }
 
+    /// The module doc's example is a config that loads.
+    #[test]
+    fn the_doc_example_loads() {
+        let src = include_str!("config.rs");
+        let start = src.find("//! ```toml\n").unwrap() + "//! ```toml\n".len();
+        let end = start + src[start..].find("//! ```\n").unwrap();
+        let toml: String = src[start..end]
+            .lines()
+            .map(|l| l.strip_prefix("//!").unwrap_or(l))
+            .map(|l| l.strip_prefix(' ').unwrap_or(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let c = Config::from_toml_str(&toml).unwrap();
+        assert!(c.accounts["claude-code"]["personal"].native);
+        assert_eq!(
+            c.account_policy["claude-code"].default.as_deref(),
+            Some("personal")
+        );
+        assert_eq!(c.orchestrator_account(), Some(&Pin::parse("work")));
+    }
+
+    #[test]
+    fn accounts_pins_and_policy_parse() {
+        let c = Config::from_toml_str(
+            r#"
+[accounts.claude-code.work]
+dir = "/home/me/.claude-work"
+share = "none"
+
+[accounts.claude-code.personal]
+native = true
+
+[accounts.codex.team]
+
+[account_policy.codex]
+default = "team"
+
+[orchestrator]
+account = "personal"
+
+[projects.api]
+repo = "/r/api"
+account = "work"
+accounts = { codex = ["team", "max-*"] }
+exclude_accounts = "personal,old-*"
+
+[projects.blog]
+repo = "/r/blog"
+exclude_accounts = ["work*"]
+
+[boxes.gpu]
+ssh = "me@gpu"
+transport = "ssh"
+
+[boxes.gpu.projects.api]
+repo = "/srv/api"
+account = "gpu-work"
+"#,
+        )
+        .unwrap();
+        let work = &c.accounts["claude-code"]["work"];
+        assert_eq!(
+            (work.dir.as_deref(), work.share, work.native),
+            (Some(Path::new("/home/me/.claude-work")), Share::None, false)
+        );
+        assert_eq!(c.accounts["claude-code"]["personal"].dir, None);
+        assert_eq!(c.accounts["codex"]["team"], AccountConfig::default());
+        assert_eq!(c.accounts["codex"]["team"].share, Share::Config);
+        assert_eq!(c.account_policy["codex"].default.as_deref(), Some("team"));
+        assert_eq!(c.orchestrator_account(), Some(&Pin::parse("personal")));
+        let pin = |p: &[&str]| Some(Pin(p.iter().map(|s| s.to_string()).collect()));
+        // Project: `accounts.<rt>` over `account`; exclusions on every runtime.
+        assert_eq!(
+            c.account_pin(Some("api"), None, "claude-code"),
+            (pin(&["work"]), pin(&["personal", "old-*"]))
+        );
+        assert_eq!(
+            c.account_pin(Some("api"), Some("local"), "codex"),
+            (pin(&["team", "max-*"]), pin(&["personal", "old-*"]))
+        );
+        // The box project's keys replace the project's, its `account` over the project's
+        // `accounts.<rt>`; without exclusions of its own, the project's apply.
+        assert_eq!(
+            c.account_pin(Some("api"), Some("gpu"), "codex"),
+            (pin(&["gpu-work"]), pin(&["personal", "old-*"]))
+        );
+        assert_eq!(
+            c.account_pin(Some("blog"), None, "codex"),
+            (None, pin(&["work*"]))
+        );
+        assert_eq!(c.account_pin(Some("nope"), None, "codex"), (None, None));
+        assert_eq!(c.account_pin(None, Some("gpu"), "codex"), (None, None));
+        // Box projects keep no empty account keys when boxes.toml is written.
+        let text = toml::to_string(&c.boxes["gpu"]).unwrap();
+        assert!(
+            !text.contains("accounts") && !text.contains("exclude"),
+            "{text}"
+        );
+        // Nothing set: no accounts, no pins.
+        let d = Config::from_toml_str("").unwrap();
+        assert!(d.accounts.is_empty() && d.account_policy.is_empty());
+        assert_eq!(d.orchestrator_account(), None);
+    }
+
+    /// `[orchestrator] account` takes a pin as a project's `account` does: a name, a glob, a
+    /// list, a comma-separated string.
+    #[test]
+    fn the_orchestrators_account_is_a_pin() {
+        for (toml, want) in [
+            ("account = \"work\"", vec!["work"]),
+            ("account = \"work-*\"", vec!["work-*"]),
+            ("account = \"work-a, work-b\"", vec!["work-a", "work-b"]),
+            ("account = [\"max-*\", \"work\"]", vec!["max-*", "work"]),
+        ] {
+            let c = Config::from_toml_str(&format!("[orchestrator]\n{toml}")).unwrap();
+            let want = Pin(want.into_iter().map(str::to_string).collect());
+            assert_eq!(c.orchestrator_account(), Some(&want), "{toml}");
+        }
+    }
+
+    #[test]
+    fn account_validation_errors() {
+        let cases = [
+            ("[accounts.gemini.a]\ndir = \"/a\"", "accounts.gemini: \"gemini\" does not take accounts"),
+            (
+                "[runtimes.gemini]\nacp = \"gemini --acp\"\n[accounts.gemini.a]\ndir = \"/a\"",
+                "accounts for [runtimes] presets come in a later version",
+            ),
+            ("[accounts.codex.\"..\"]\ndir = \"/a\"", "accounts.codex...: \"..\" is not an account name"),
+            ("[accounts.codex.\"-x\"]\ndir = \"/a\"", "is not an account name"),
+            ("[accounts.codex.a]\nnative = true\ndir = \"/a\"", "accounts.codex.a: a `native = true` account has no `dir`"),
+            (
+                "[accounts.codex.a]\nnative = true\n[accounts.codex.b]\nnative = true",
+                "accounts.codex: a and b are both `native = true`",
+            ),
+            ("[accounts.codex.a]\ndir = \"rel/dir\"", "accounts.codex.a.dir: rel/dir is not an absolute path"),
+            (
+                "[accounts.codex.a]\ndir = \"/same\"\n[accounts.claude-code.b]\ndir = \"/same/\"",
+                "is also accounts.claude-code.b's directory",
+            ),
+            ("[accounts.codex.a]\nshare = \"all\"", "unknown variant `all`"),
+            ("[accounts.codex.a]\nlogin = \"x\"", "unknown field `login`"),
+            ("[account_policy.codex]\nbalance = \"pinned\"", "unknown field `balance`"),
+            // The later phases' keys: refused, saying they are not available yet.
+            (
+                "[account_policy.codex]\nfailover = \"auto\"",
+                "`failover` is planned for a later version of account support and is not available yet",
+            ),
+            (
+                "[account_policy.claude-code]\nresume_at_reset = true",
+                "`resume_at_reset` is planned for a later version",
+            ),
+            ("[account_policy.codex]\nmove = \"resume\"", "`move` is planned for a later version"),
+            (
+                "[accounts.codex.a]\nsessions = \"shared\"",
+                "`sessions` is planned for a later version",
+            ),
+            ("[account_policy.gemini]\ndefault = \"a\"", "account_policy.gemini: \"gemini\" does not take accounts"),
+            ("[account_policy.codex]\ndefault = \"a b\"", "account_policy.codex.default: \"a b\" is not an account name"),
+            ("[orchestrator]\naccount = \"a/b\"", "orchestrator.account: \"a/b\" is not an account name"),
+            ("[orchestrator]\naccount = []", "orchestrator.account: a pin names at least one account"),
+            ("[orchestrator]\naccount = \" , \"", "orchestrator.account: a pin names at least one account"),
+            ("[orchestrator]\naccount = [\"ok\", \"..\"]", "orchestrator.account: \"..\""),
+            ("[projects.p]\nrepo = \"/r\"\naccount = \"a/b\"", "projects.p.account: \"a/b\" is not an account name or glob"),
+            ("[projects.p]\nrepo = \"/r\"\naccount = []", "projects.p.account: a pin names at least one account"),
+            ("[projects.p]\nrepo = \"/r\"\naccounts = { pty = \"a\" }", "projects.p.accounts.pty: \"pty\" does not take accounts"),
+            ("[projects.p]\nrepo = \"/r\"\naccounts = { codex = \"..\" }", "projects.p.accounts.codex: \"..\""),
+            ("[projects.p]\nrepo = \"/r\"\nexclude_accounts = [\"-x\"]", "projects.p.exclude_accounts: \"-x\""),
+            (
+                "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"me@gpu\"\n[boxes.gpu.projects.p]\nrepo = \"/r\"\naccount = \"a:b\"",
+                "boxes.gpu.projects.p.account: \"a:b\"",
+            ),
+            // An account part where it would pin every thread it reaches.
+            (
+                "default_runtime = \"claude-code:work\"",
+                "default_runtime: \"claude-code:work\" names an account: write the runtime \
+                 alone (\"claude-code\") and the account as [account_policy.claude-code] \
+                 default = \"work\"",
+            ),
+            (
+                "[projects.p]\nrepo = \"/r\"\nruntime = \"codex:team\"",
+                "projects.p.runtime: \"codex:team\" names an account: write the runtime alone \
+                 (\"codex\") and the account as this project's pin (projects.p.accounts.codex \
+                 = \"team\") or as [account_policy.codex] default = \"team\"",
+            ),
+            (
+                "[boxes.gpu]\ntransport = \"ssh\"\nssh = \"me@gpu\"\n[boxes.gpu.projects.p]\nrepo = \"/r\"\nruntime = \"codex:team\"",
+                "boxes.gpu.projects.p.runtime: \"codex:team\" names an account",
+            ),
+        ];
+        for (toml, want) in cases {
+            let e = format!("{:#}", Config::from_toml_str(toml).unwrap_err());
+            assert!(e.contains(want), "{toml}\n=> {e}\nwanted {want}");
+        }
+        // Allowed: `default` named while another account is the native one, globs, a
+        // native account without a dir, a named one without a dir (twr's default).
+        // `default` named with no native account in config too: a record may name the native
+        // one (`twr account name-native`), so that is the hub's start's check, with records
+        // (`AccountsView::check_config_default`).
+        Config::from_toml_str("[accounts.codex.default]\ndir = \"/a\"").unwrap();
+        Config::from_toml_str(
+            "[accounts.codex.default]\ndir = \"/d\"\n[accounts.codex.me]\nnative = true\n\
+             [accounts.codex.team]\n[projects.p]\nrepo = \"/r\"\naccount = [\"*\", \"w?rk\"]",
+        )
+        .unwrap();
+        // The orchestrator's runtime takes an account part; ACP and pty specs are no accounts.
+        let c = Config::from_toml_str(
+            "default_runtime = \"acp:gemini --acp\"\n[orchestrator]\nruntime = \
+             \"claude-code:work\"\n[projects.p]\nrepo = \"/r\"\nruntime = \"pty:bash -l\"",
+        )
+        .unwrap();
+        assert_eq!(c.orchestrator.runtime.as_deref(), Some("claude-code:work"));
+    }
+
+    #[test]
+    fn account_dirs_expand_home() {
+        let mut c: Config =
+            toml::from_str("[accounts.codex.a]\ndir = \"~/.codex-a\"\n[accounts.codex.b]\ndir = \"/b\"\n[accounts.codex.c]\n")
+                .unwrap();
+        let unexpanded = c.clone();
+        c.expand_account_dirs(Some(Path::new("/home/me")));
+        assert_eq!(
+            c.accounts["codex"]["a"].dir.as_deref(),
+            Some(Path::new("/home/me/.codex-a"))
+        );
+        assert_eq!(
+            c.accounts["codex"]["b"].dir.as_deref(),
+            Some(Path::new("/b"))
+        );
+        assert_eq!(c.accounts["codex"]["c"].dir, None);
+        c.validate().unwrap();
+        // Without a home, `~` stays and is refused.
+        let mut u = unexpanded;
+        u.expand_account_dirs(None);
+        assert_eq!(
+            u.accounts["codex"]["a"].dir.as_deref(),
+            Some(Path::new("~/.codex-a"))
+        );
+        let e = format!("{:#}", u.validate().unwrap_err());
+        assert!(
+            e.contains("accounts.codex.a.dir: ~/.codex-a is not an absolute path"),
+            "{e}"
+        );
+        // Loading expands with $HOME.
+        if let Some(home) = std::env::var_os("HOME").filter(|h| Path::new(h).is_absolute()) {
+            let c = Config::from_toml_str("[accounts.codex.a]\ndir = \"~/x\"\n").unwrap();
+            assert_eq!(
+                c.accounts["codex"]["a"].dir.as_deref(),
+                Some(Path::new(&home).join("x").as_path())
+            );
+        }
+    }
+
     #[test]
     fn project_roots_default_explicit_and_off() {
         let home = Path::new("/home/me");
@@ -3211,6 +3779,9 @@ mod tests {
             BoxProjectConfig {
                 repo: "/srv/api".into(),
                 runtime: None,
+                account: None,
+                accounts: BTreeMap::new(),
+                exclude_accounts: None,
             },
         );
         file.boxes.insert("far".into(), far);
