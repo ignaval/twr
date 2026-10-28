@@ -279,6 +279,12 @@ impl Env {
         let native = self.path(&self.native.lock().unwrap());
         let native: NativeDirFn = Arc::new(move |rt: &str| Some(native.join(rt)));
         o.native_dir = Some(native);
+        // The hub's own selector variables are not set (whatever this process has), so a
+        // start's `ext.twr.native_selector` is what the test's configuration says.
+        o.native_var = Some(Arc::new(|k: &str| match k {
+            "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "GROK_HOME" => None,
+            _ => std::env::var_os(k),
+        }));
         if self.probe.load(Ordering::SeqCst) {
             o.account_probe = Some(self.account_probe());
         }
@@ -3335,6 +3341,211 @@ async fn a_relative_selector_is_the_runtimes_working_directorys() {
              the runtime's own directory is not the one that session ran in"
         ),
         "{prompt}"
+    );
+    hub.shutdown().await;
+}
+
+/// A native session ran with the runtime's selector variable as its start recorded it
+/// (`ext.twr.native_selector`: `null` when not set, else the path as given, links not
+/// followed): a runtime may key its login on that spelling (Claude Code's macOS Keychain
+/// entry), so with `CLAUDE_CONFIG_DIR` unset and then naming the runtime's default directory,
+/// the same directory, a move back starts a new session; spelled as it was, it resumes; and
+/// through a link to that directory, the turn that would resume drops the resume.
+#[tokio::test]
+async fn a_native_session_resumes_only_with_its_selector_spelled_as_it_was() {
+    let env = Env::new();
+    let native = env.path("native/claude-code");
+    std::fs::create_dir_all(&native).unwrap();
+    let alias = env.path("alias");
+    std::os::unix::fs::symlink(&native, &alias).unwrap();
+    let with = |dir: Option<&Path>| {
+        let mut c = env.config(None);
+        if let Some(d) = dir {
+            c.projects
+                .get_mut("api")
+                .unwrap()
+                .env
+                .insert("CLAUDE_CONFIG_DIR".into(), d.to_string_lossy().into_owned());
+        }
+        c
+    };
+    let real = json!(std::fs::canonicalize(&native).unwrap());
+    let hub = env.open(with(None)).await;
+    let a = create(&hub, new_thread("api", "a")).await;
+    turn(&hub, &a, "hi").await;
+    let first = session(&hub, &a);
+    let stamp = start_stamps(&events(&hub, &a)).remove(0);
+    assert_eq!(stamp[SESSION_STORE_KEY], real, "{stamp}");
+    assert_eq!(
+        stamp.get(NATIVE_SELECTOR_KEY),
+        Some(&Value::Null),
+        "{stamp}"
+    );
+
+    // The default directory spelled out: the same directory, another selector.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let hub = env.restart(hub, with(Some(&native))).await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &a, "hi").await;
+    let s = env.last_start(&a);
+    assert!(s.cfg.resume_session.is_none(), "another selector's session");
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (a) moved to another account:"));
+    let second = session(&hub, &a);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &a)).pop().unwrap();
+    assert_eq!(stamp[SESSION_STORE_KEY], real, "{stamp}");
+    assert_eq!(stamp[NATIVE_SELECTOR_KEY], json!(native), "{stamp}");
+
+    // Spelled as it was: it resumes.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    turn(&hub, &a, "hi").await;
+    assert_eq!(
+        env.last_start(&a).cfg.resume_session.as_deref(),
+        Some(second.as_str())
+    );
+
+    // A link to the same directory between the move back and its turn: the turn drops it.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    let hub = env.restart(hub, with(Some(&alias))).await;
+    turn(&hub, &a, "go on").await;
+    let s = env.last_start(&a);
+    assert!(s.cfg.resume_session.is_none(), "another selector's session");
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier claude-code session of this thread \
+             (a): the runtime is given its own directory by another path than the one that \
+             session ran through"
+        ),
+        "{prompt}"
+    );
+    let stamp = start_stamps(&events(&hub, &a)).pop().unwrap();
+    assert_eq!(stamp[SESSION_STORE_KEY], real, "{stamp}");
+    assert_eq!(stamp[NATIVE_SELECTOR_KEY], json!(alias), "{stamp}");
+    hub.shutdown().await;
+}
+
+/// The start that ran a session a move left is found however many runtime starts came after
+/// it (here more than 200 on another runtime): a move back checks its stamps, so with the
+/// runtime's own directory changed since, it starts a new session.
+#[tokio::test]
+async fn a_sessions_start_is_found_past_many_later_starts() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let a = create(&hub, new_thread("api", "a")).await;
+    turn(&hub, &a, "hi").await;
+    let first = session(&hub, &a);
+    let r = move_runtime(&hub, &a, "codex").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &a, "hi").await;
+    let on_codex = session(&hub, &a);
+    *env.native.lock().unwrap() = "native2".into();
+    let hub = env.restart(hub, env.config(None)).await;
+    // Codex's runtime started again and again (restarts in other settings, hub restarts).
+    for _ in 0..205 {
+        hub.append(
+            &a,
+            None,
+            Source::Adapter("codex".into()),
+            EventBody::ThreadStarted(SessionPayload {
+                session_id: Some(on_codex.clone()),
+                ext: json!({"twr": {"runtime": "codex", "mode": "default"}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+    }
+    let r = move_runtime(&hub, &a, "claude-code").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &a, "hi").await;
+    let s = env.last_start(&a);
+    assert_eq!(s.runtime, "claude-code");
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "another directory's session"
+    );
+    assert_ne!(session(&hub, &a), first);
+    hub.shutdown().await;
+}
+
+/// A session no start in the log names (its start is not there to check) is not resumed when
+/// the thread had a start the hub stamped before the move that left it: a move back starts a
+/// new session. On a thread whose starts until then are from before the stamps, it resumes as
+/// before.
+#[tokio::test]
+async fn a_session_whose_start_is_not_found_is_resumed_only_on_an_unstamped_log() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let adapter = Source::Adapter("claude-code".into());
+    let staged = |stamped: bool, started: &str, left: &str| {
+        let name = if stamped { "c" } else { "d" };
+        let hub = &hub;
+        let adapter = adapter.clone();
+        let (started, left) = (started.to_string(), left.to_string());
+        async move {
+            let t = create(hub, new_thread("api", name)).await;
+            let ext = stamped
+                .then(|| json!({"twr": {"runtime": "claude-code", "mode": "default"}}))
+                .and_then(|v| v.as_object().cloned());
+            hub.append(
+                &t,
+                None,
+                adapter.clone(),
+                EventBody::ThreadStarted(SessionPayload {
+                    session_id: Some(started),
+                    ext,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+            // The session it left is one no start named.
+            hub.append(
+                &t,
+                None,
+                adapter,
+                EventBody::ThreadStopped(SessionPayload {
+                    session_id: Some(left),
+                    ext: json!({"twr": {"reason": MODEL_RESTART_REASON}})
+                        .as_object()
+                        .cloned(),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+            move_to(hub, &t, "work", false, &user()).await.unwrap();
+            turn(hub, &t, "hi").await;
+            t
+        }
+    };
+    let c = staged(true, "c-1", "c-2").await;
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &c, "hi").await;
+    assert!(env.last_start(&c).cfg.resume_session.is_none());
+
+    let d = staged(false, "d-1", "d-2").await;
+    let r = move_to(&hub, &d, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!("d-2"), "{r}");
+    turn(&hub, &d, "hi").await;
+    assert_eq!(
+        env.last_start(&d).cfg.resume_session.as_deref(),
+        Some("d-2")
     );
     hub.shutdown().await;
 }

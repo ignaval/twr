@@ -2598,8 +2598,14 @@ impl Core {
         };
         // The native account's session store as the environment it starts with selects it
         // (`Core::native_store`), on the hub's own box: stamped on its start below.
-        let store = (view.account.is_none() && view.box_name == LOCAL_BOX)
+        // Its selector variable too (`Core::native_selector`): a runtime may key its login on
+        // how the variable spells the directory.
+        let native = view.account.is_none() && view.box_name == LOCAL_BOX;
+        let store = native
             .then(|| self.native_store(&view.runtime, &cfg.env, &cfg.env_remove, &cfg.cwd))
+            .flatten();
+        let native_selector = native
+            .then(|| self.native_selector(&view.runtime, &cfg.env, &cfg.env_remove, &cfg.cwd))
             .flatten();
         // Its working directory is held from before it starts until it is gone; refused while
         // the directory's worktree is being removed (a park whose caller went away, whose git
@@ -2704,6 +2710,7 @@ impl Core {
         let settings = restart::RunSettings {
             account_dir,
             session_store: store,
+            native_selector,
             account_login: if local {
                 self.accounts
                     .login_generation(&view.runtime, view.account.as_deref())

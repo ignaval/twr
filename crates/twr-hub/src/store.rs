@@ -2198,6 +2198,40 @@ const LATEST_OF_KIND: &str = concat!(
      WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC LIMIT ?3) ORDER BY seq DESC"
 );
 
+/// [`newest_runtime_start`]: through the kind index (`+seq`, as [`UPDATES_ABOUT`]), every
+/// predicate applied before the limit.
+const NEWEST_RUNTIME_START: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1
+     AND seq < ?2 AND source LIKE 'adapter:%'
+     AND (json_extract(data, '$.session_id') = ?3
+          OR (?4 AND json_extract(data, '$.session_id') IS NULL))
+     ORDER BY +seq DESC LIMIT 1"
+);
+
+/// [`has_stamped_start`].
+const HAS_STAMPED_START: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1 AND seq < ?2
+     AND source LIKE 'adapter:%' AND json_extract(data, '$.ext.twr.mode') IS NOT NULL)";
+
+/// [`latest_runtime_moves`]: the runtime moves only, filtered before the limit.
+const LATEST_RUNTIME_MOVES: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1
+     AND json_extract(data, '$.runtime') IS NOT NULL ORDER BY +seq DESC LIMIT ?2"
+);
+
+/// [`newest_account_move`].
+const NEWEST_ACCOUNT_MOVE: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1 AND seq < ?2
+     AND json_extract(data, '$.runtime') IS NOT NULL
+     AND json_extract(data, '$.account_changed') = 1 ORDER BY +seq DESC LIMIT 1"
+);
+
 /// [`seqs_of_kind`].
 const SEQS_OF_KIND: &str =
     "SELECT seq FROM events WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC";
@@ -2314,6 +2348,64 @@ pub fn latest_of_kind(
     let mut st = conn.prepare_cached(LATEST_OF_KIND)?;
     let rows = st.query_map(params![kind, thread, limit as i64], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
+}
+
+/// The newest `thread.started` / `thread.resumed` of `thread` before `before` that a runtime
+/// reported (`source` `adapter:<runtime>`: not a park's or a user's resume the hub recorded)
+/// naming session `session`, or, with `or_none`, naming none; as stored (possibly capped: a
+/// session id is never moved to a blob). However many other starts came after it.
+pub fn newest_runtime_start(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+    session: &str,
+    or_none: bool,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_RUNTIME_START)?
+        .query_row(params![thread, before, session, or_none], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// Whether `thread` has a `thread.started` / `thread.resumed` before `before` a runtime
+/// reported that the hub (or a runner) stamped with the settings it ran in (`ext.twr.mode`,
+/// `hub::restart`).
+pub fn has_stamped_start(conn: &Connection, thread: &str, before: u64) -> anyhow::Result<bool> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    Ok(conn
+        .prepare_cached(HAS_STAMPED_START)?
+        .query_row(params![thread, before], |r| r.get(0))?)
+}
+
+/// The latest `limit` runtime moves of `thread` (`thread.model_changed` with a `runtime`),
+/// newest first, as stored (possibly capped): however many model or effort changes came
+/// after them.
+pub fn latest_runtime_moves(
+    conn: &Connection,
+    thread: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(LATEST_RUNTIME_MOVES)?;
+    let rows = st.query_map(params![thread, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The newest runtime move of `thread` before `before` that changed the account
+/// (`thread.model_changed` with a `runtime` and `account_changed`), as stored (possibly
+/// capped): however many other moves came after it.
+pub fn newest_account_move(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_ACCOUNT_MOVE)?
+        .query_row(params![thread, before], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
 }
 
 /// The latest `limit` `conversation.update`s of `thread` about thread `about`

@@ -20,8 +20,8 @@
 //!
 //!    A move back to a runtime the thread left a session of (any runtime but `acp`, whose
 //!    agent is a command line, and `pty`) resumes that session ([`Core::departure`]: of the
-//!    thread's latest [`MOVES_MAX`] moves, the newest away from that runtime that recorded a
-//!    session). The move records it as `ext.twr.`[`RESUME_SESSION_KEY`], and the thread's
+//!    thread's latest [`MOVES_MAX`] runtime moves, model and effort changes aside, the newest
+//!    away from that runtime that recorded a session). The move records it as `ext.twr.`[`RESUME_SESSION_KEY`], and the thread's
 //!    session is that one meanwhile (`ThreadView::resume_session`, still pending). A model or
 //!    effort left out is then the one the thread had when it left the session (the
 //!    session's; on a move between accounts of one runtime, the thread's own, kept); one
@@ -91,7 +91,10 @@
 //! A move back resumes a session only on the account it ran on ([`Core::departure`]): the
 //! move that left it was away from the same runtime and the same account (the native account
 //! whatever it is called now; a named one by name, not removed), the runtime start that ran it
-//! recorded the directory the account has now (`ext.twr.account_dir`, links followed), the
+//! (the newest a runtime reported before that move naming the session or none, however many
+//! starts came after it; when the log has none, the session is not resumed on a thread that
+//! had a start the hub stamped before that move, and is taken to have been unstamped on one
+//! from before the stamps) recorded the directory the account has now (`ext.twr.account_dir`, links followed), the
 //! account was not removed since that start, and a named account's runtime was given its
 //! directory by the path the move gives it now (`ext.twr.account_env_dir` of the account's
 //! binding then: a runtime may key its login on the path, Claude Code's macOS Keychain
@@ -99,7 +102,12 @@
 //! session's start recorded the runtime's own directory it is now (`ext.twr.session_store`,
 //! as the environment the thread's runtime starts with selects it: its selector variable from
 //! `threads.env`, the project's `env` or the hub's, else under `HOME`; a start from before
-//! the stamp is taken to be in it), and the account was not logged in again since the session
+//! the stamp is taken to be in it) and the selector variable as the runtime gets it now
+//! (`ext.twr.native_selector`: unset, or its value made absolute under the runtime's working
+//! directory, links not followed; a runtime may key its login on the spelling, Claude Code's
+//! macOS Keychain entry: none when unset, a hash of the path when set, so the variable unset
+//! and naming the default directory, or two links to one directory, are two logins; a start
+//! from before the stamp is taken to have had it so), and the account was not logged in again since the session
 //! began (a start that resumes a session carries the login stamps of the session's earlier
 //! start forward, [`Core::carry_login`], so a settings restart or a hub restart after a login
 //! does not make an older session look newer): neither as this hub saw it (`ext.twr.account_login`, the account's login generation then:
@@ -127,6 +135,7 @@ use twr_core::reduce::ThreadView;
 
 use super::handoff::defuse;
 use super::orch::{self, cut};
+use super::restart::NativeSelector;
 use super::runtime_spec::{self, RuntimeSpec};
 use super::thread_account::AccountChoice;
 use super::{rpc, twr_ext, Caller, Core, Inner};
@@ -143,10 +152,6 @@ const ENTRY_MAX: usize = 4 * 1024;
 
 /// Most runtime moves read back for the session a thread left ([`Core::departure`]).
 const MOVES_MAX: usize = 100;
-
-/// Most runtime starts of each kind read back for the one that ran a session a move left
-/// ([`Core::departure`]).
-const STARTS_MAX: usize = 200;
 
 /// Most reports listed, and the longest one quoted, in bytes.
 const REPORTS_MAX: usize = 10;
@@ -166,6 +171,9 @@ const OTHER_PATH: &str =
     "its account is reached by another path than the one that session ran through";
 
 const OTHER_STORE: &str = "the runtime's own directory is not the one that session ran in";
+const OTHER_SELECTOR: &str =
+    "the runtime is given its own directory by another path than the one that session ran through";
+const NO_START: &str = "twr no longer finds the runtime start that ran that session";
 const OTHER_LOGIN: &str =
     "its account was logged in again since that session ran (it may be another login now)";
 
@@ -182,6 +190,9 @@ struct SessionStart {
     /// The native account's directory it ran in (`ext.twr.session_store`; `None`: a start
     /// from before the stamp, or on another box).
     store: Option<PathBuf>,
+    /// The native account's selector variable it ran with (`ext.twr.native_selector`;
+    /// `None`: a start from before the stamp, or on another box).
+    selector: Option<NativeSelector>,
     /// Its account's login generation (`ext.twr.account_login`; absent: 0).
     login: u64,
     /// The login note of its directory then (`ext.twr.login_note`; absent: none).
@@ -342,11 +353,13 @@ impl Core {
     }
 
     /// [`Core::departure`], or why there is no session to resume (see the module docs): of
-    /// the thread's latest [`MOVES_MAX`] moves, the newest away from `runtime` and that same
+    /// the thread's latest [`MOVES_MAX`] runtime moves, the newest away from `runtime` and that same
     /// account ([`Core::account_identity`]: the native account whatever its name is now, a
     /// named one that is not removed) that recorded the session it left
     /// (`ext.twr.previous_session`: only a session the runtime had confirmed, never one a
-    /// pending move only asked for). It no longer holds when that session began in another
+    /// pending move only asked for). It no longer holds when the start that ran it is not in
+    /// the log on a thread that had a start the hub stamped before the move
+    /// ([`Core::session_start`]), when that session began in another
     /// directory than `dir` or the account was removed since it began ([`Core::session_in`]:
     /// the session lives in the directory it began in, and another login there is not the
     /// one it ran on), or, on a named account, when its runtime was given that directory by
@@ -355,7 +368,10 @@ impl Core {
     /// account's session ran in another directory than the runtime's own now
     /// (`ext.twr.session_store` against [`Core::session_store`]: the selector variable the
     /// thread's environment or the hub's gives it changed; a start without the stamp, from
-    /// before it, is taken to be in it), or under another login generation of the account than
+    /// before it, is taken to be in it), or with that variable set otherwise than the runtime
+    /// would get it now (`ext.twr.native_selector` against [`Core::native_selector`]: set or
+    /// not, and spelled as it was, links not followed; a start without the stamp is taken to
+    /// have had it so), or under another login generation of the account than
     /// its now (`ext.twr.account_login`, absent: 0, against `AccountsView::login_generation`:
     /// a login this hub recorded since may be another organization's), or under another login
     /// note of its directory than the one there now (`ext.twr.login_note`, absent: none,
@@ -375,19 +391,22 @@ impl Core {
             return Ok(Err(GONE));
         };
         let moves = self.moves(thread)?;
-        let found = moves.iter().enumerate().find_map(|(i, (seq, m))| {
+        let found = moves.iter().find_map(|(seq, m)| {
             if m.previous_runtime.as_deref() != Some(runtime)
                 || self.account_identity(runtime, left_account(m)).as_ref() != Some(&target)
             {
                 return None;
             }
             let session = left_session(m)?.to_string();
-            Some((i, *seq, session, m))
+            Some((*seq, session, m))
         });
-        let Some((i, seq, session, m)) = found else {
+        let Some((seq, session, m)) = found else {
             return Ok(Err(NO_SESSION));
         };
-        let start = self.session_start(thread, seq, &session)?;
+        let start = match self.session_start(thread, seq, &session)? {
+            Ok(start) => start,
+            Err(why) => return Ok(Err(why)),
+        };
         if let Err(why) = self.session_in(&start, runtime, left_account(m), dir) {
             return Ok(Err(why));
         }
@@ -395,15 +414,22 @@ impl Core {
         // (a remote box's are its own).
         let view = self.registry.get(thread);
         let local = view.is_some_and(|v| v.box_name == super::LOCAL_BOX);
-        let store = view
+        let (store, selector) = view
             .filter(|_| local && target.is_none())
-            .and_then(|v| self.session_store(hub, v, runtime));
+            .map_or((None, None), |v| self.session_store(hub, v, runtime));
         if let (true, Some(was)) = (local && target.is_none(), &start.store) {
             if !store
                 .as_ref()
                 .is_some_and(|n| n == was || super::accounts::same_dir(n, was))
             {
                 return Ok(Err(OTHER_STORE));
+            }
+        }
+        // And the selector variable as the runtime would get it, spelled as it was (a runtime
+        // may key its login on the spelling: Claude Code's macOS Keychain entry).
+        if let (true, Some(was)) = (local && target.is_none(), &start.selector) {
+            if !selector.as_ref().is_some_and(|n| same_selector(n, was)) {
+                return Ok(Err(OTHER_SELECTOR));
             }
         }
         if local && start.login != self.accounts.login_generation(runtime, target.as_deref()) {
@@ -429,7 +455,7 @@ impl Core {
                 }
             }
         }
-        if target.is_some() && self.launch_path(thread, &moves, i)?.as_deref() != env {
+        if target.is_some() && self.launch_path(thread, seq)?.as_deref() != env {
             return Ok(Err(OTHER_PATH));
         }
         Ok(Ok(Departure {
@@ -439,18 +465,12 @@ impl Core {
         }))
     }
 
-    /// The path the runtime of the session that move `moves[i]` (of thread `thread`'s, newest
-    /// first) left was given as its named account's directory: `ext.twr.account_env_dir` of
-    /// the account's binding then, the newest move before it that changed the account (as
-    /// `hub::append` tracks it), else the thread's `thread.created`. `None` when that records
-    /// none (the native account, or a binding from before the key) or the moves read back do
-    /// not reach it.
-    fn launch_path(
-        &self,
-        thread: &str,
-        moves: &[(u64, ThreadModelChanged)],
-        i: usize,
-    ) -> anyhow::Result<Option<PathBuf>> {
+    /// The path the runtime of the session that thread `thread`'s move at `seq` left was given
+    /// as its named account's directory: `ext.twr.account_env_dir` of the account's binding
+    /// then, the newest move before it that changed the account (as `hub::append` tracks it;
+    /// however many other moves came between), else the thread's `thread.created`. `None` when
+    /// that records none (the native account, or a binding from before the key).
+    fn launch_path(&self, thread: &str, seq: u64) -> anyhow::Result<Option<PathBuf>> {
         let path = |ext: &Option<JsonMap>| {
             twr_ext(ext)
                 .and_then(|t| t.get(ACCOUNT_ENV_DIR_KEY))
@@ -458,15 +478,13 @@ impl Core {
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from)
         };
-        if let Some((_, m)) = moves[i + 1..].iter().find(|(_, m)| m.account_changed) {
-            return Ok(path(&m.ext));
-        }
-        if moves.len() >= MOVES_MAX {
-            return Ok(None);
-        }
-        let created = store::first_of_kind(self.store.conn(), thread, "thread.created")?
-            .map(|e| self.full(e));
-        Ok(match created.map(|e| e.body) {
+        let conn = self.store.conn();
+        let bound = match store::newest_account_move(conn, thread, seq)? {
+            Some(e) => Some(self.full(e)),
+            None => store::first_of_kind(conn, thread, "thread.created")?.map(|e| self.full(e)),
+        };
+        Ok(match bound.map(|e| e.body) {
+            Some(EventBody::ThreadModelChanged(m)) => path(&m.ext),
             Some(EventBody::ThreadCreated(p)) => path(&p.ext),
             _ => None,
         })
@@ -518,12 +536,24 @@ impl Core {
     /// The runtime start that ran session `session` of thread `thread`, which the move at
     /// `seq` left: the newest `thread.started` / `thread.resumed` a runtime reported before the
     /// move that names that session or none (a park's or a user's resume the hub recorded is
-    /// no start, as `hub::retry` reads them), as its stamps say. A start the log does not have
-    /// counts as one in no directory, unstamped, from the log's beginning.
-    fn session_start(&self, thread: &str, seq: u64, session: &str) -> anyhow::Result<SessionStart> {
-        let found = self.newest_start(thread, seq, |s| s.is_none_or(|s| s == session))?;
+    /// no start, as `hub::retry` reads them; however many starts came after it), as its stamps
+    /// say. A start the log does not have cannot be checked: when the thread has a start before
+    /// the move that the hub stamped (`store::has_stamped_start`: every start this hub and its
+    /// runners record), the session ran under stamps and is not resumed (`Err`, why); a thread
+    /// whose starts until then are all from before the stamps counts it as one in no
+    /// directory, unstamped, from the log's beginning (as such a start found would).
+    fn session_start(
+        &self,
+        thread: &str,
+        seq: u64,
+        session: &str,
+    ) -> anyhow::Result<Result<SessionStart, &'static str>> {
+        let found = self.newest_start(thread, seq, session, true)?;
         let Some(e) = &found else {
-            return Ok(SessionStart::default());
+            if store::has_stamped_start(self.store.conn(), thread, seq)? {
+                return Ok(Err(NO_START));
+            }
+            return Ok(Ok(SessionStart::default()));
         };
         let twr = match &e.body {
             EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => twr_ext(&p.ext),
@@ -536,46 +566,34 @@ impl Core {
                 .map(PathBuf::from)
         };
         let (login, note) = login_stamps(twr);
-        Ok(SessionStart {
+        Ok(Ok(SessionStart {
             began_in: path(ACCOUNT_DIR_KEY),
             store: path(SESSION_STORE_KEY),
+            selector: twr
+                .and_then(|t| t.get(NATIVE_SELECTOR_KEY))
+                .and_then(NativeSelector::from_json),
             login,
             note,
             since: store::event_position(self.store.conn(), &e.id)?
                 .and_then(|(_, g)| g)
                 .unwrap_or(0),
-        })
+        }))
     }
 
-    /// Of thread `thread`'s latest [`STARTS_MAX`] `thread.started` and `thread.resumed` each
-    /// that a runtime reported (`Source::Adapter`) before `seq`, the newest whose session
-    /// `names` takes.
+    /// Of thread `thread`'s `thread.started` and `thread.resumed` that a runtime reported
+    /// (`Source::Adapter`) before `seq`, the newest that names session `session` (or, with
+    /// `or_none`, names none): `store::newest_runtime_start`, every condition applied in the
+    /// query, so no number of later starts (settings restarts, a hub restart's, another
+    /// runtime's) hides it.
     fn newest_start(
         &self,
         thread: &str,
         seq: u64,
-        names: impl Fn(Option<&str>) -> bool,
+        session: &str,
+        or_none: bool,
     ) -> anyhow::Result<Option<Event>> {
-        let conn = self.store.conn();
-        let mut start: Option<Event> = None;
-        for kind in ["thread.started", "thread.resumed"] {
-            let found = store::latest_of_kind(conn, thread, kind, STARTS_MAX)?
-                .into_iter()
-                .filter(|e| e.seq < seq && matches!(e.source, Source::Adapter(_)))
-                .map(|e| self.full(e))
-                .find(|e| match &e.body {
-                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
-                        names(p.session_id.as_deref())
-                    }
-                    _ => false,
-                });
-            if let Some(e) = found {
-                if start.as_ref().is_none_or(|s| s.seq < e.seq) {
-                    start = Some(e);
-                }
-            }
-        }
-        Ok(start)
+        let found = store::newest_runtime_start(self.store.conn(), thread, seq, session, or_none)?;
+        Ok(found.map(|e| self.full(e)))
     }
 
     /// The login a start of thread `thread`'s session `session` (on the hub's own box) that
@@ -587,15 +605,16 @@ impl Core {
     /// A session no earlier start named is a new one: the account's login now, as stamped
     /// when it started, stays. A log that cannot be read stamps a note no login has
     /// ([`UNREADABLE_NOTE`]): a move back never resumes that session. The native account's
-    /// directory (`RunSettings::session_store`) is not carried: it is where this process
-    /// looks for the session, and a move back compares that with the directory now.
+    /// directory (`RunSettings::session_store`) and selector variable
+    /// (`RunSettings::native_selector`) are not carried: they are where and how this process
+    /// looks for the session, and a move back compares them with the runtime's now.
     pub(super) fn carry_login(
         &self,
         thread: &str,
         session: &str,
         settings: &mut super::restart::RunSettings,
     ) {
-        match self.newest_start(thread, u64::MAX, |s| s == Some(session)) {
+        match self.newest_start(thread, u64::MAX, session, false) {
             Ok(None) => {}
             Ok(Some(e)) => {
                 let twr = match &e.body {
@@ -659,19 +678,18 @@ impl Core {
     }
 
     /// The latest [`MOVES_MAX`] runtime moves of `thread` (`thread.model_changed` with a
-    /// `runtime`), newest first, each with its `seq`.
+    /// `runtime`; model and effort changes, however many, are not read), newest first, each
+    /// with its `seq`.
     fn moves(&self, thread: &str) -> anyhow::Result<Vec<(u64, ThreadModelChanged)>> {
         let conn = self.store.conn();
-        Ok(
-            store::latest_of_kind(conn, thread, "thread.model_changed", MOVES_MAX)?
-                .into_iter()
-                .map(|e| self.full(e))
-                .filter_map(|e| match e.body {
-                    EventBody::ThreadModelChanged(p) if p.runtime.is_some() => Some((e.seq, p)),
-                    _ => None,
-                })
-                .collect(),
-        )
+        Ok(store::latest_runtime_moves(conn, thread, MOVES_MAX)?
+            .into_iter()
+            .map(|e| self.full(e))
+            .filter_map(|e| match e.body {
+                EventBody::ThreadModelChanged(p) if p.runtime.is_some() => Some((e.seq, p)),
+                _ => None,
+            })
+            .collect())
     }
 
     /// The handoff for the turn now starting on thread `thread`, whose move to another
@@ -1077,6 +1095,18 @@ impl Core {
                 )
             })
         })
+    }
+}
+
+/// Whether selector variables `a` and `b` ([`NativeSelector`]) are the same: both unset, or
+/// both set to the same spelling (links not followed: a runtime may key its login on it).
+fn same_selector(a: &NativeSelector, b: &NativeSelector) -> bool {
+    match (a, b) {
+        (NativeSelector::Unset, NativeSelector::Unset) => true,
+        (NativeSelector::Set(a), NativeSelector::Set(b)) => {
+            a.as_os_str().to_string_lossy() == b.as_os_str().to_string_lossy()
+        }
+        _ => false,
     }
 }
 

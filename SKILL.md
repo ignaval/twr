@@ -1006,11 +1006,13 @@ Details:
   when only the account changed. `thread.started` carries `ext.twr.account` (absent: native),
   `ext.twr.session_store` (a native start: the runtime's own directory its start environment
   selected: the selector variable from `threads.env`, the project's `env` or the hub's, else
-  under `HOME`), `ext.twr.account_login` (the account's login generation, absent when 0) and
+  under `HOME`), `ext.twr.native_selector` (with it: that selector variable as the runtime
+  got it, `null` when not set, else the path made absolute, links not followed),
+  `ext.twr.account_login` (the account's login generation, absent when 0) and
   `ext.twr.login_note` (the login note of the account's directory, or of the native store,
   under `<root data>/accounts/.logins/`: a random id `twr account login` / `add` writes after
   each login in any workspace; absent: none); a move back resumes a session only with all
-  three unchanged.
+  four unchanged.
   A turn that ended on a usage or spending limit has `ext.twr.limit {kind: usage|spend,
   window?, resets_at?, message}` and is never retried (block kind `limited`).
 - **Subscription usage**: adapters report their runtime's usage windows as

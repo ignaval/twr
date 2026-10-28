@@ -97,6 +97,38 @@ use super::{AdapterScope, Batch, Core, Inner};
 /// it differs from every setting, so the runtime is restarted in the thread's.
 pub(super) const UNKNOWN: &str = "unknown";
 
+/// The selector variable of a native account's runtime (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+/// ...) as its process got it ([`RunSettings::native_selector`], `ext.twr.native_selector`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum NativeSelector {
+    /// Not set (or empty): the runtime's default directory, unnamed.
+    Unset,
+    /// Set to this path: absolute (a relative value under the directory the process started
+    /// in), links not followed.
+    Set(std::path::PathBuf),
+}
+
+impl NativeSelector {
+    /// As `ext.twr.native_selector` has it: `null` when not set, else the path.
+    pub(super) fn to_json(&self) -> Value {
+        match self {
+            NativeSelector::Unset => Value::Null,
+            NativeSelector::Set(p) => json!(p.to_string_lossy()),
+        }
+    }
+
+    /// `ext.twr.native_selector` value `v` (`null` or an empty string: not set); `None` when it
+    /// is neither null nor a string.
+    pub(super) fn from_json(v: &Value) -> Option<NativeSelector> {
+        match v {
+            Value::Null => Some(NativeSelector::Unset),
+            Value::String(s) if s.is_empty() => Some(NativeSelector::Unset),
+            Value::String(s) => Some(NativeSelector::Set(s.into())),
+            _ => None,
+        }
+    }
+}
+
 /// What a runtime process was started with.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct RunSettings {
@@ -139,6 +171,13 @@ pub(super) struct RunSettings {
     /// restart; a move back resumes a native session only in it (`hub::switch`).
     #[serde(default)]
     pub(super) session_store: Option<std::path::PathBuf>,
+    /// The native account's selector variable as the process got it, with
+    /// [`RunSettings::session_store`] (`Core::native_selector`). Stamped as
+    /// `ext.twr.native_selector` (`null`: not set; absent for a named account, and when not
+    /// known). Not a setting: no restart; a move back resumes a native session only with the
+    /// variable as it was (`hub::switch`): a runtime may key its login on its spelling.
+    #[serde(default)]
+    pub(super) native_selector: Option<NativeSelector>,
     /// The login generation of the account the process was started on
     /// (`AccountsView::login_generation`; 0 on another box), or, for a process that resumes a
     /// session an earlier start named, that start's: the login the session began under
@@ -171,6 +210,7 @@ impl RunSettings {
             account_moved: false,
             account_dir: None,
             session_store: None,
+            native_selector: None,
             account_login: 0,
             login_note: None,
         }
@@ -189,6 +229,7 @@ impl RunSettings {
             account_moved: false,
             account_dir: None,
             session_store: None,
+            native_selector: None,
             account_login: 0,
             login_note: None,
         }
@@ -266,6 +307,7 @@ impl RunSettings {
 /// `acp_command` is [`RunSettings::agent`], missing when not known; `account` is
 /// [`RunSettings::account`], missing for the native account; `account_dir` is
 /// [`RunSettings::account_dir`], `session_store` [`RunSettings::session_store`],
+/// `native_selector` [`RunSettings::native_selector`] (missing: not known),
 /// `account_login` [`RunSettings::account_login`], missing: 0, and `login_note`
 /// [`RunSettings::login_note`]).
 pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings> {
@@ -302,6 +344,9 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
             .and_then(Value::as_str)
             .filter(|d| !d.is_empty())
             .map(std::path::PathBuf::from),
+        native_selector: twr
+            .get(NATIVE_SELECTOR_KEY)
+            .and_then(NativeSelector::from_json),
         account_login: twr
             .get(ACCOUNT_LOGIN_KEY)
             .and_then(Value::as_u64)
@@ -321,7 +366,8 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
 /// `ext.twr.account`, the named account it runs on (absent: the native account), and
 /// `ext.twr.account_dir`, its directory ([`RunSettings::account_dir`], when known);
 /// `ext.twr.session_store`, the native account's directory ([`RunSettings::session_store`],
-/// when known), `ext.twr.account_login`, the account's login generation
+/// when known) and `ext.twr.native_selector`, its selector variable then
+/// ([`RunSettings::native_selector`], when known), `ext.twr.account_login`, the account's login generation
 /// ([`RunSettings::account_login`], when not 0), and `ext.twr.login_note`, the login note of
 /// its directory then ([`RunSettings::login_note`], when there was one).
 pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
@@ -353,6 +399,10 @@ pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
         match s.session_store.as_ref().filter(|_| s.account.is_none()) {
             Some(d) => twr.insert(SESSION_STORE_KEY.into(), json!(d.to_string_lossy())),
             None => twr.remove(SESSION_STORE_KEY),
+        };
+        match s.native_selector.as_ref().filter(|_| s.account.is_none()) {
+            Some(n) => twr.insert(NATIVE_SELECTOR_KEY.into(), n.to_json()),
+            None => twr.remove(NATIVE_SELECTOR_KEY),
         };
         match s.account_login {
             0 => twr.remove(ACCOUNT_LOGIN_KEY),
@@ -616,6 +666,7 @@ mod tests {
                 account_moved: false,
                 account_dir: None,
                 session_store: None,
+                native_selector: None,
                 account_login: 0,
                 login_note: None,
             };
@@ -823,6 +874,7 @@ mod tests {
                 account_dir: None,
                 // The native account's directory, and a login generation (round trip).
                 session_store: account.is_none().then(|| "/native/claude".into()),
+                native_selector: None,
                 account_login: if account.is_some() { 2 } else { 0 },
                 login_note: Some("n1".into()),
             };
@@ -945,6 +997,7 @@ mod tests {
             account_moved: false,
             account_dir: None,
             session_store: None,
+            native_selector: None,
             account_login: 0,
             login_note: None,
         };
@@ -1014,6 +1067,7 @@ mod tests {
             account_moved: false,
             account_dir: None,
             session_store: None,
+            native_selector: None,
             account_login: 0,
             login_note: None,
         };
@@ -1046,6 +1100,7 @@ mod tests {
             account_moved: false,
             account_dir: None,
             session_store: None,
+            native_selector: None,
             account_login: 0,
             login_note: None,
         };

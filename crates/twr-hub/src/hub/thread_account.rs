@@ -82,6 +82,7 @@ use twr_core::proto::{codes, RpcError};
 use twr_core::reduce::ThreadView;
 
 use super::accounts::same_dir;
+use super::restart::NativeSelector;
 use super::{rpc, Core, Inner, LOCAL_BOX};
 
 /// `account_reason` of an account the thread asked for.
@@ -992,21 +993,76 @@ impl Core {
     /// The directory a runtime `runtime` of thread `view` on the native account keeps its
     /// sessions in, as the environment it would start with selects it ([`Core::native_store`]
     /// of [`super::spawn_config`]'s, with no account: `threads.env` and the project's `env`
-    /// over the hub's own). Stamped on the native account's starts
-    /// (`RunSettings::session_store`, from the start's own environment), and what a move back
-    /// compares it with (`hub::switch`). `None` on another box (its own environment decides),
-    /// or when not known.
+    /// over the hub's own), and its selector variable in that environment
+    /// ([`Core::native_selector`]). Stamped on the native account's starts
+    /// (`RunSettings::session_store` and `native_selector`, from the start's own environment),
+    /// and what a move back compares them with (`hub::switch`). `None` each on another box (its
+    /// own environment decides), or when not known.
     pub(super) fn session_store(
         &self,
         hub: &Inner,
         view: &ThreadView,
         runtime: &str,
-    ) -> Option<PathBuf> {
+    ) -> (Option<PathBuf>, Option<NativeSelector>) {
         if view.box_name != LOCAL_BOX {
-            return None;
+            return (None, None);
         }
         let cfg = super::spawn_config(hub, view, None);
-        self.native_store(runtime, &cfg.env, &cfg.env_remove, &cfg.cwd)
+        (
+            self.native_store(runtime, &cfg.env, &cfg.env_remove, &cfg.cwd),
+            self.native_selector(runtime, &cfg.env, &cfg.env_remove, &cfg.cwd),
+        )
+    }
+
+    /// Variable `k` as a runtime's process gets it when it starts with `env` set and `remove`
+    /// removed over the hub's own environment: a name in `remove` is removed (also when `env`
+    /// sets it), else `env`'s last value, else the hub's.
+    fn spawn_var(
+        &self,
+        k: &str,
+        env: &[(String, String)],
+        remove: &[String],
+    ) -> Option<std::ffi::OsString> {
+        if remove.iter().any(|r| r == k) {
+            return None;
+        }
+        match env.iter().rev().find(|(n, _)| n == k) {
+            Some((_, v)) => Some(v.into()),
+            None => (self.account_native_var)(k),
+        }
+    }
+
+    /// The selector variable of runtime `runtime` on the native account (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`, `GROK_HOME`) as its process gets it when it starts with `env` set and
+    /// `remove` removed over the hub's own environment, in directory `cwd`
+    /// ([`Core::native_store`]'s): [`NativeSelector::Unset`] when it is not set or empty, else
+    /// its value, under `cwd` when relative, links not followed. The spelling is the identity:
+    /// a runtime may key its login on it (Claude Code's macOS Keychain entry: none when unset,
+    /// a hash of the path when set), so the default directory spelled out, or another link to
+    /// the same directory, may be another login. `None` for a runtime that takes no accounts.
+    pub(super) fn native_selector(
+        &self,
+        runtime: &str,
+        env: &[(String, String)],
+        remove: &[String],
+        cwd: &Path,
+    ) -> Option<NativeSelector> {
+        let selector = twr_adapters::account::support(runtime)?.var;
+        Some(
+            match self
+                .spawn_var(selector, env, remove)
+                .filter(|v| !v.is_empty())
+            {
+                None => NativeSelector::Unset,
+                Some(v) => {
+                    let p = PathBuf::from(v);
+                    NativeSelector::Set(match p.is_relative() && !cwd.as_os_str().is_empty() {
+                        true => cwd.join(p),
+                        false => p,
+                    })
+                }
+            },
+        )
     }
 
     /// The directory runtime `runtime` on the native account keeps its sessions in when it
@@ -1029,17 +1085,8 @@ impl Core {
         let selector = twr_adapters::account::support(runtime)?.var;
         let touched = |k: &str| env.iter().any(|(n, _)| n == k) || remove.iter().any(|r| r == k);
         let dir = if touched(selector) || touched("HOME") {
-            // As the runtime's process gets it: a name in `remove` is removed (also when `env`
-            // sets it), else `env`'s last value, else the hub's.
-            let var = |k: &str| -> Option<std::ffi::OsString> {
-                if remove.iter().any(|r| r == k) {
-                    return None;
-                }
-                match env.iter().rev().find(|(n, _)| n == k) {
-                    Some((_, v)) => Some(v.into()),
-                    None => (self.account_native_var)(k),
-                }
-            };
+            // As the runtime's process gets it.
+            let var = |k: &str| self.spawn_var(k, env, remove);
             let home = twr_adapters::account::user_home(var, twr_adapters::account::passwd_home);
             twr_adapters::account::native_dir(runtime, var, home.as_deref())?
         } else {

@@ -852,6 +852,16 @@ pub const ACCOUNT_ENV_DIR_KEY: &str = "account_env_dir";
 /// changed. A move back resumes a native session only in that directory; a start without it
 /// (from before the key, or on another box) is taken to be in it.
 pub const SESSION_STORE_KEY: &str = "session_store";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps for the native
+/// account on its own box, with [`SESSION_STORE_KEY`]: the runtime's selector variable
+/// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...) as that process got it, `null` when it was not set
+/// (or empty). A relative value is made absolute under the directory the process started in;
+/// links are not followed: a runtime may key its login on the variable's spelling (Claude
+/// Code's macOS Keychain entry: none when unset, a hash of the path when set), so two paths to
+/// one directory, or the default directory spelled out, are two logins. A move back resumes a
+/// native session only with the variable as it was; a start without the key (from before it)
+/// is taken to have had it so.
+pub const NATIVE_SELECTOR_KEY: &str = "native_selector";
 /// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps (a number): the login
 /// generation of the account that process ran on
 /// ([`crate::account::AccountsView::login_generation`]), absent when 0. A move back resumes a
