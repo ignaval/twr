@@ -110,10 +110,7 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         let [dock, rest] =
             Layout::horizontal([Constraint::Length(dock_width), Constraint::Min(0)]).areas(body);
         let cards = state.cards_docked_at(area.width);
-        let dock =
-            crate::sidebar::Dock::new(state, dock, crate::sidebar::Place::Docked, cards, |w| {
-                column_needed(state, w)
-            });
+        let dock = crate::sidebar::Dock::new(state, dock, cards, |w| column_needed(state, w));
         (Some(dock), rest)
     } else {
         (None, body)
@@ -562,9 +559,10 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread) and Threads (the workspaces, the current one's cards \
-         nested under it, the others' threads a row each), switched with /c, /n and /t (/w) or \
-         a tap on their tabs; ↑↓ on an empty line pick a row, a workspace or a card, Enter \
+         Needs you (a row per thread) and Threads (the workspaces, the current one's cards \
+         nested under it, the others' threads, one list that scrolls), switched with /c, /n and \
+         /t (/w) or a tap on their tabs; every control two rows tall, either row a tap on it; \
+         ↑↓ on an empty line pick a row, a workspace or a card, Enter \
          opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
@@ -1037,14 +1035,21 @@ fn render_stack(
     render_status(frame, status, state, panes, parked);
 }
 
+/// Rows of the compact layout's tab bar, and of each control a phone taps on its screens
+/// ([`crate::sidebar::render_phone`], the Needs you list's rows): two, as tall as a finger.
+pub const TAB_BAR_ROWS: u16 = 2;
+/// Rows of a control on the compact layout's screens: as tall as the tab bar's.
+pub const TAP_ROWS: u16 = TAB_BAR_ROWS;
+
 /// The compact layout (a phone): a tab bar naming its screens, `Chat · Needs you 2 · Threads`,
-/// the current one highlighted ([`render_tab_bar`]), a row tall, over that screen: the
+/// the current one highlighted ([`render_tab_bar`]), [`TAB_BAR_ROWS`] tall, over that screen: the
 /// conversation alone, what needs the user (one line per thread), or the threads' cards
 /// (nested under the current workspace's card among the workspaces', [`render_compact_threads`]),
 /// each list with the input box and status bar under it.
 fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
-    let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    let [bar, rest] =
+        Layout::vertical([Constraint::Length(TAB_BAR_ROWS), Constraint::Min(0)]).areas(area);
     render_tab_bar(frame, bar, state, panes);
     let pane = state.view.compact_pane;
     if pane == CompactPane::Chat {
@@ -1067,9 +1072,10 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     render_status(frame, status, state, panes, None);
 }
 
-/// The compact layout's tab bar over `bar` (a row): `Chat`, `Needs you 2` and `Threads` (`⚠2`:
+/// The compact layout's tab bar over `bar` ([`TAB_BAR_ROWS`]): `Chat`, `Needs you 2` and `Threads` (`⚠2`:
 /// what waits on the user in the other workspaces, which it lists too), each a filled tab an
-/// equal share of the width wide, its name centered (`Needs 2`, `Thr ⚠2`, then cut, where it
+/// equal share of the width wide and the bar's rows tall, its name centered on its first row
+/// (`Needs 2`, `Thr ⚠2`, then cut, where it
 /// does not fit), the current one reversed and bold, `Needs you` and `Threads` yellow while
 /// something waits. A tap anywhere in a tab's share (the gap after it included) shows its
 /// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
@@ -1162,21 +1168,15 @@ fn other_waiting(state: &AppState) -> usize {
         .sum()
 }
 
-/// The compact layout's Threads screen over `area`: in a TUI opened on a workspace, laid out as
-/// the sidebar is ([`crate::sidebar::Dock`], [`crate::sidebar::Place::Screen`]): each
-/// workspace's card, the current one's cards nested under it ([`render_compact_cards`]), the
-/// others' threads a row each, the buttons under them; on a socket, the cards alone.
+/// The compact layout's Threads screen over `area`: in a TUI opened on a workspace, the
+/// workspaces with their threads, the current one's cards nested under its card, as one list
+/// that scrolls ([`crate::sidebar::render_phone`]); on a socket, the cards alone.
 fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
-    use crate::sidebar::{Dock, Place};
-    let mut dock = Dock::new(state, area, Place::Screen, true, |w| {
-        compact_needed(state, w)
-    });
-    if let Some(cards) = dock.cards {
-        render_compact_cards(frame, cards, state, panes);
-        dock.fit_cards(state, cards_bottom(panes, cards));
+    if state.workspace.is_some() {
+        crate::sidebar::render_phone(frame, area, state, panes);
+    } else {
+        render_compact_cards(frame, area, state, panes);
     }
-    panes.no_cards = panes.list.is_none() && !state.compact_threads().is_empty();
-    dock.render(frame, state, panes);
 }
 
 /// The row after the last card drawn in the column over `area`, which the list of cards then
@@ -1203,22 +1203,6 @@ fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
     bottom
 }
 
-/// The rows the compact Threads screen's cards ([`render_compact_cards`]) take `width` columns
-/// wide when they all show, or its empty note's.
-fn compact_needed(state: &AppState, width: u16) -> u16 {
-    let order = state.compact_threads();
-    if order.is_empty() {
-        return u16::try_from(wrap(EMPTY_STATE, usize::from(width).max(1)).len()).unwrap_or(1);
-    }
-    let layout = ListLayout::Compact(crate::app::CompactPane::Threads);
-    let mut scratch = Panes::default();
-    let rows: u32 = order
-        .iter()
-        .map(|id| u32::from(card_height(state, &mut scratch, id, layout, width)))
-        .sum();
-    u16::try_from(rows).unwrap_or(u16::MAX)
-}
-
 /// The compact layout's Threads screen's cards: as the stack view draws them, in a column as
 /// wide as `area` ([`render_column`]), the orchestrator's first while it asks. Scrolled like
 /// the column, by the wheel, else as little as the selection takes; a tap selects a card, and
@@ -1237,12 +1221,13 @@ fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: 
     render_column(frame, area, area, state, panes, &order, focus, layout);
 }
 
-/// A compact list's rows: the card each is about, and its line.
-type CompactRows = Vec<(String, Line<'static>)>;
+/// A compact list's rows: the card each is about, and its lines ([`TAP_ROWS`]).
+type CompactRows = Vec<(String, Vec<Line<'static>>)>;
 
-/// "Needs you": one line per card that waits on the user, its most urgent item,
-/// `api · permission · Bash: git push` (the name in its card's color, [`card_color`]), and
-/// `(+2 more)` when it has more (answering one shows the next), most urgent first.
+/// "Needs you": a row per card that waits on the user, its most urgent item, on two lines:
+/// `api · permission` (the name in its card's color, [`card_color`]) and `(+2 more)` when it
+/// has more (answering one shows the next), then what it asks, `  Bash: git push`; most urgent
+/// first.
 fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
     use twr_core::event::AttentionReason;
     let mut rows = Vec::new();
@@ -1293,9 +1278,15 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        spans.push(Span::raw(" · "));
-        spans.push(Span::raw(summary));
-        rows.push((id, Line::from(cut_spans(spans, width))));
+        // What it asks on the row under it: each row as tall as a control on a phone.
+        let ask = vec![Span::raw("  "), Span::raw(summary)];
+        rows.push((
+            id,
+            vec![
+                Line::from(cut_spans(spans, width)),
+                Line::from(cut_spans(ask, width)),
+            ],
+        ));
     }
     rows
 }
@@ -1337,7 +1328,9 @@ fn render_compact_rows(
         );
         return;
     }
-    let height = usize::from(area.height).max(1);
+    // Each row as tall as a control on a phone ([`TAP_ROWS`]): how many of them fit.
+    let tall = usize::from(TAP_ROWS);
+    let height = (usize::from(area.height) / tall).max(1);
     let focus = state.focused();
     // Scrolled like the cards: by the wheel, else as little as the selection takes.
     let order: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
@@ -1354,18 +1347,23 @@ fn render_compact_rows(
         start,
         max,
     });
+    let width = usize::from(area.width);
     for (i, (id, line)) in rows.into_iter().skip(start).take(height).enumerate() {
-        let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
-        let mut line = line;
+        let y = area.y + u16::try_from(i * tall).unwrap_or(u16::MAX);
+        let rect = Rect::new(area.x, y, area.width, TAP_ROWS).intersection(area);
+        let mut lines = line;
+        lines.resize(tall, Line::default());
         if Some(id.as_str()) == focus {
-            let pad = usize::from(area.width).saturating_sub(line.width());
-            line.spans.push(Span::raw(" ".repeat(pad)));
-            for span in &mut line.spans {
-                span.style = span.style.add_modifier(Modifier::REVERSED);
+            for line in &mut lines {
+                let pad = width.saturating_sub(line.width());
+                line.spans.push(Span::raw(" ".repeat(pad)));
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
             }
         }
         panes.add(PaneId::Thread(id), rect);
-        frame.render_widget(Paragraph::new(line), rect);
+        frame.render_widget(Paragraph::new(lines), rect);
     }
 }
 
@@ -1559,7 +1557,7 @@ pub fn parked_note(state: &AppState) -> Option<String> {
 
 /// The card of `id` (a worker or [`HUB_THREAD`]) at `slot`, with the `more` labels on its
 /// bottom border (left, right). The card's pane is recorded for the mouse.
-fn draw_card(
+pub(crate) fn draw_card(
     frame: &mut Frame,
     slot: Rect,
     state: &AppState,
@@ -1723,7 +1721,7 @@ fn card_cap(state: &AppState, id: &str, layout: ListLayout) -> u16 {
 /// there (its rows, [`card_rows`], within the list's most, [`card_cap`], and its borders; at
 /// least 3), or taller while it waits to shrink ([`crate::order::drawn_height`]). What it
 /// measured is recorded for the next frame ([`Panes::fits`]).
-fn card_height(
+pub(crate) fn card_height(
     state: &AppState,
     panes: &mut Panes,
     id: &str,
@@ -12344,7 +12342,7 @@ mod tests {
         let name = |id: &str| {
             rows.iter()
                 .find(|(i, _)| i == id)
-                .map(|(_, l)| l.spans[0].clone())
+                .map(|(_, l)| l[0].spans[0].clone())
                 .unwrap()
         };
         assert_eq!(name(HUB_THREAD).content, "twr");
@@ -13308,12 +13306,13 @@ mod tests {
         }
     }
 
-    /// The compact layout's tab bar is a row tall on any screen, so the screen under it keeps
-    /// the rest; each name is centered in its third of the width, the current one reversed.
+    /// The compact layout's tab bar is two rows tall on any screen, each tab filling both, as
+    /// tall as a finger; each name is centered in its third of the width on its first row, the
+    /// current one reversed.
     /// Where `Needs you 2` does not fit its third, it says `Needs 2`.
     #[test]
     fn the_compact_tab_bar_fits_the_screen() {
-        let rows = 1u16;
+        let rows = TAB_BAR_ROWS;
         for (w, h, names) in [
             (40u16, 30u16, ["Chat", "Needs you 2", "Threads"]),
             (40, 20, ["Chat", "Needs you 2", "Threads"]),
@@ -16637,7 +16636,7 @@ mod tests {
         let rows = compact_needs_rows(&st, 60);
         assert!(!rows.is_empty());
         for (id, line) in rows {
-            let name = &line.spans[0];
+            let name = &line[0].spans[0];
             assert_eq!(name.content, st.registry.get(&id).unwrap().name);
             assert_eq!(name.style.fg, Some(color_of(&st, &id)), "{id}");
         }

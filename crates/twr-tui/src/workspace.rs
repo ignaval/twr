@@ -743,6 +743,8 @@ impl AppState {
     /// current one's cards and the buttons ([`AppState::ws_screen_key`]), stopping at its
     /// ends. With nothing selected it starts from the current workspace's card.
     fn step_screen(&mut self, delta: isize) {
+        // The list follows the selection again, not where the wheel left it.
+        self.view.ws_wheeled = false;
         // The cards as the last frame drew them: none where it had no room for one.
         let cards = if !self.view.panes.no_cards {
             self.compact_threads()

@@ -298,6 +298,10 @@ pub struct Panes {
     /// The column of cards (the sidebar's, the compact Threads screen's) had cards to show
     /// but no room for one: none of them is selectable ([`crate::app::AppState::nav_order`]).
     pub no_cards: bool,
+    /// The compact Threads screen's list as drawn ([`crate::sidebar::render_phone`]): the wheel
+    /// over it scrolls it; and what it kept in view, selected then (a key of it).
+    pub phone: Option<Rect>,
+    pub phone_sel: Option<String>,
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the
     /// list keeps showing it first rather than the card now at its index.
     pub list_first: Option<String>,

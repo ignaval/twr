@@ -8570,6 +8570,17 @@ impl AppState {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
             return;
         }
+        // The compact Threads screen scrolls as one list, its cards with it.
+        if self.ws_screen()
+            && self
+                .view
+                .panes
+                .phone
+                .is_some_and(|r| r.contains((x, y).into()))
+        {
+            self.ws_wheel(up);
+            return;
+        }
         let arrow = KeyEvent::new(
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
@@ -9185,13 +9196,14 @@ pub(crate) mod tests {
         type_line(&mut st, "/n");
         let lines = rows(&mut st, 50, 24);
         let text = lines.join("\n");
-        let perm = lines
-            .iter()
-            .position(|l| l.contains("beta · permission · Bash: rm -rf"));
-        let review = lines
-            .iter()
-            .position(|l| l.contains("alpha · review · turn gave up"));
+        // Two rows each: who and what, then what it asks.
+        let perm = lines.iter().position(|l| l.contains("beta · permission"));
+        let review = lines.iter().position(|l| l.contains("alpha · review"));
         assert!(perm.is_some() && review.is_some(), "{text}");
+        let (perm, review) = (perm.unwrap(), review.unwrap());
+        assert!(lines[perm + 1].contains("Bash: rm -rf"), "{text}");
+        assert!(lines[review + 1].contains("turn gave up"), "{text}");
+        assert_eq!(review, perm + 2, "{text}");
         assert_eq!(st.focused(), Some("t-beta"));
         st.handle_key(key(KeyCode::Down));
         assert_eq!(st.focused(), Some("t-alpha"));
@@ -22140,12 +22152,40 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone, the tab bar switches screens: every cell of its row (a row on any
-        /// screen) is the tab of the third of the width it is in, the gap after a tab
-        /// included, and a tap anywhere in it shows that screen.
+        /// On a phone each Needs you row is two rows tall, both of them its own: a tap on its
+        /// second row selects it as one on its first does, and the next row starts under it.
+        #[test]
+        fn a_needs_row_is_two_rows_both_tapped() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Needs);
+            frame(&mut st, 40, 20);
+            let rows: Vec<(String, ratatui::layout::Rect)> = st
+                .view
+                .panes
+                .panes
+                .iter()
+                .filter_map(|p| match &p.id {
+                    PaneId::Thread(id) => Some((id.clone(), p.area)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{rows:?}");
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].1.height, 2, "{pair:?}");
+                assert_eq!(pair[1].1.y, pair[0].1.bottom(), "{pair:?}");
+            }
+            let (id, area) = rows[1].clone();
+            tap_at(&mut st, 40, 20, 5, area.y + 1);
+            assert_eq!(st.focused(), Some(id.as_str()));
+        }
+
+        /// On a phone, the tab bar switches screens: every cell of its two rows is the tab of
+        /// the third of the width it is in, the gap after a tab included, and a tap anywhere in
+        /// it, its second row too, shows that screen.
         #[test]
         fn the_compact_tab_bar_switches_screens_by_thirds() {
-            for (w, h, rows) in [(40u16, 20u16, 1u16), (40, 30, 1), (40, 12, 1), (30, 20, 1)] {
+            let rows = crate::ui::TAB_BAR_ROWS;
+            for (w, h) in [(40u16, 20u16), (40, 30), (40, 12), (30, 20)] {
                 let mut st = compact();
                 frame(&mut st, w, h);
                 assert!(st.compact(), "{w}x{h}");

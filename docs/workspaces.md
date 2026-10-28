@@ -52,7 +52,7 @@ Each card has the workspace's name, its activity and the start of the orchestrat
  ≡  default ⚠1 ●2 │ client-x ●1 │ scratch ○
 ```
 
-The `≡` at its left shows the workspaces in the sidebar, or on a narrower screen opens them as a drawer over the view (so does `Ctrl-T`); `↑`/`↓` and `Enter` pick a card or a button there, and `Esc` or a click outside closes it. In the [compact layout](tui.md#on-a-phone) the workspaces are on its `Threads` screen, laid out as in the sidebar, the current one's thread cards nested under its card. Switch with:
+The `≡` at its left shows the workspaces in the sidebar, or on a narrower screen opens them as a drawer over the view (so does `Ctrl-T`); `↑`/`↓` and `Enter` pick a card or a button there, and `Esc` or a click outside closes it. In the [compact layout](tui.md#on-a-phone) the workspaces are on its `Threads` screen, as in the sidebar, the current one's thread cards nested under its card, in a list that scrolls, every control on it two rows tall. Switch with:
 
 - a click on a card, a thread under another workspace's card, or a tab;
 - `Alt-1` to `Alt-9` for the workspace at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
