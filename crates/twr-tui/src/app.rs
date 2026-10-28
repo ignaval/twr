@@ -4149,6 +4149,21 @@ impl AppState {
     /// Selection order of the current screen: what it draws that can be selected. The
     /// decisions screen draws no card: nothing.
     pub fn nav_order(&self) -> Vec<String> {
+        let mut nav = self.nav_listed();
+        // A column of cards too short for one (as last drawn): none of its cards.
+        if self.view.panes.no_cards {
+            let column = if self.compact() {
+                self.compact_threads()
+            } else {
+                self.order()
+            };
+            nav.retain(|id| !column.contains(id));
+        }
+        nav
+    }
+
+    /// [`AppState::nav_order`] by what the screen lists, drawn or not.
+    fn nav_listed(&self) -> Vec<String> {
         // The compact layout's lists are what its keys move through.
         if self.compact() && self.view.screen != Screen::Decisions {
             match self.view.compact_pane {
@@ -7592,6 +7607,20 @@ impl AppState {
             && self.detail_card().is_none()
         {
             self.view.focus = self.view.dive.clone();
+        }
+        // No room for a card (a column too short for one): none stays selected out of sight,
+        // nor its popup open.
+        if self.view.panes.no_cards && self.detail_card().is_none() && !self.dive_hides_cards() {
+            let nav = self.nav_order();
+            if let Some(card) = self.view.focus.clone().filter(|f| !nav.contains(f)) {
+                if matches!(
+                    self.view.action.as_ref().map(|p| &p.target),
+                    Some(ActionTarget::Card(c)) if *c == card
+                ) {
+                    self.view.action = None;
+                }
+                self.set_focus(None);
+            }
         }
         if let Some(p) = self.view.panes.get(&PaneId::Transcript) {
             self.view.scroll = p.scroll;

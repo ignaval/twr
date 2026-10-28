@@ -295,6 +295,9 @@ pub struct Panes {
     pub drawer: Option<Rect>,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,
+    /// The column of cards (the sidebar's, the compact Threads screen's) had cards to show
+    /// but no room for one: none of them is selectable ([`crate::app::AppState::nav_order`]).
+    pub no_cards: bool,
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the
     /// list keeps showing it first rather than the card now at its index.
     pub list_first: Option<String>,

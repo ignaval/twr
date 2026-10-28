@@ -122,6 +122,7 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         let cards = d.cards?;
         let noted = render_card_column(frame, cards, state, &mut panes);
         d.fit_cards(state, cards_bottom(&mut panes, cards));
+        panes.no_cards = panes.list.is_none() && !state.order().is_empty();
         Some(noted)
     });
     match state.view.screen {
@@ -1174,6 +1175,7 @@ fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes
         render_compact_cards(frame, cards, state, panes);
         dock.fit_cards(state, cards_bottom(panes, cards));
     }
+    panes.no_cards = panes.list.is_none() && !state.compact_threads().is_empty();
     dock.render(frame, state, panes);
 }
 

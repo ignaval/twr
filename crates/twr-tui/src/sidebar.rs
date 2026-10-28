@@ -2609,7 +2609,8 @@ mod tests {
 
     /// On the shortest phone screens the arrows select only what is drawn: a card where a card
     /// is drawn, a workspace whose row is (in the cards' place, or the current one's, where
-    /// one row is all there is); Enter acts only on what it can see.
+    /// one row is all there is); Enter acts only on what it can see. A card selected before
+    /// the screen got that short is let go, and Tab selects none there.
     #[test]
     fn short_phone_screens_select_only_what_they_draw() {
         use crossterm::event::KeyCode;
@@ -2622,6 +2623,19 @@ mod tests {
             st.set_tabs(tabs);
             rows(&mut st, 40, h);
             st.handle_key(crate::app::tests::ctrl('t'));
+            // A card selected on a taller screen, then this one: it lets go of it there.
+            rows(&mut st, 40, 30);
+            st.handle_key(crate::app::tests::key(KeyCode::Down));
+            rows(&mut st, 40, 30);
+            assert!(st.focused().is_some(), "40x30");
+            let text = rows(&mut st, 40, h).join("\n");
+            if st.view.panes.no_cards {
+                assert!(st.focused().is_none(), "40x{h}: {text}");
+                st.handle_key(crate::app::tests::key(KeyCode::Tab));
+                rows(&mut st, 40, h);
+                assert!(st.focused().is_none(), "Tab, 40x{h}");
+            }
+            st.view.ws_sel = None;
             for step in 0..30 {
                 let key = if step < 20 {
                     KeyCode::Down

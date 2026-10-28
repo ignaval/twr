@@ -744,7 +744,7 @@ impl AppState {
     /// ends. With nothing selected it starts from the current workspace's card.
     fn step_screen(&mut self, delta: isize) {
         // The cards as the last frame drew them: none where it had no room for one.
-        let cards = if self.view.panes.list.is_some() {
+        let cards = if !self.view.panes.no_cards {
             self.compact_threads()
         } else {
             Vec::new()
