@@ -130,10 +130,10 @@ pub enum CompactPane {
     Chat,
     /// What waits on the user, one line per item; Enter opens one in its action popup.
     Needs,
-    /// The threads, one per line.
+    /// The threads' cards; in a TUI opened on a workspace, nested under its card among the
+    /// other workspaces', which list their threads, and the buttons under them
+    /// ([`crate::sidebar::Place::Screen`]).
     Threads,
-    /// The workspaces, a card each, and the buttons under them ([`crate::sidebar`]).
-    Workspaces,
 }
 
 /// A row of the workspace list the keys select (in its drawer and the compact layout's
@@ -3844,9 +3844,9 @@ impl AppState {
         self.view.sidebar_hidden = !on;
         self.view.shown = None;
         self.view.status = Some(if on {
-            "thread sidebar shown (Ctrl-B hides it)".into()
+            "thread cards shown (Ctrl-B hides them)".into()
         } else {
-            "thread sidebar hidden (Ctrl-B shows it)".into()
+            "thread cards hidden (Ctrl-B shows them)".into()
         });
         self.ensure_focus();
     }
@@ -3924,11 +3924,9 @@ impl AppState {
 
     /// Shows compact screen `pane`, its list's selection kept when it is in it.
     pub(crate) fn show_pane(&mut self, pane: CompactPane) {
-        if pane == CompactPane::Workspaces {
-            // Its selection starts on the current workspace.
+        if pane == CompactPane::Threads {
+            // No workspace's card selected: the arrows start from the current one.
             self.view.ws_sel = None;
-            self.view.ws_scroll = 0;
-            self.view.ws_wheeled = false;
         }
         self.view.compact_pane = pane;
         self.view.action = None;
@@ -4156,8 +4154,6 @@ impl AppState {
             match self.view.compact_pane {
                 CompactPane::Needs => return self.needs_order(),
                 CompactPane::Threads => return self.compact_threads(),
-                // Its rows are workspaces, which the keys select apart from the cards.
-                CompactPane::Workspaces => return Vec::new(),
                 CompactPane::Chat => {}
             }
         }
@@ -4650,7 +4646,7 @@ impl AppState {
         self.view.dive.is_some()
             && self.view.screen == Screen::Stack
             && !self.view.sidebar_hidden
-            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.content_width())
+            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.view.width)
     }
 
     /// Whether the main pane is selected ([`ViewState::main_focus`]): only in the stack view,
@@ -4675,7 +4671,7 @@ impl AppState {
     /// not any more; the view stays where it is.
     fn focus_cards(&mut self) {
         if self.view.sidebar_hidden {
-            self.view.status = Some("the thread sidebar is hidden (Ctrl-B shows it)".into());
+            self.view.status = Some("the thread cards are hidden (Ctrl-B shows them)".into());
             return;
         }
         if self.dive_hides_cards() {
@@ -5145,10 +5141,6 @@ impl AppState {
                     "full layout (/compact on: one screen at a time)".into()
                 });
                 self.ensure_focus();
-            }
-            Slash::Pane(crate::app::CompactPane::Workspaces) if self.workspace.is_none() => {
-                self.view.status =
-                    Some("workspaces: not here (this TUI was opened on a socket)".into());
             }
             Slash::Pane(pane) => {
                 if self.compact() {
@@ -7083,12 +7075,14 @@ impl AppState {
     }
 
     /// Columns of the input line's box (as last drawn; while it is not drawn, from the
-    /// terminal width, [`crate::ui::input_box_width`]).
+    /// columns the views get, [`AppState::content_width`]).
     pub(crate) fn input_cols(&self) -> usize {
-        usize::from(self.view.panes.get(&PaneId::Input).map_or_else(
-            || crate::ui::input_box_width(self, self.content_width()).saturating_sub(2),
-            |p| p.area.width,
-        ))
+        usize::from(
+            self.view
+                .panes
+                .get(&PaneId::Input)
+                .map_or_else(|| self.content_width().saturating_sub(2), |p| p.area.width),
+        )
     }
 
     /// Rows the input line's box may grow to at the terminal height of the last draw.
@@ -8021,6 +8015,13 @@ impl AppState {
             }
             Target::Close => return self.close_top(),
             Target::Workspace(name) => return self.ws_activate(WsRow::Workspace(name)),
+            // Brought into view: chosen as the keys would, the cards' selection let go there.
+            Target::WsMore(name) => {
+                if self.ws_screen() {
+                    self.set_focus(None);
+                }
+                self.view.ws_sel = Some(WsRow::Workspace(name));
+            }
             Target::NewWorkspace => return self.ws_activate(WsRow::New),
             Target::Settings => return self.ws_activate(WsRow::Settings),
             Target::WsSidebar => return self.toggle_workspaces(),
@@ -9145,7 +9146,7 @@ pub(crate) mod tests {
         st.view.compact_width = 60;
         let lines = rows(&mut st, 50, 24);
         assert!(st.compact());
-        let names: Vec<&str> = lines[1].split_whitespace().collect();
+        let names: Vec<&str> = lines[0].split_whitespace().collect();
         assert_eq!(
             names,
             ["Chat", "Needs", "you", "2", "Threads"],
@@ -9190,7 +9191,8 @@ pub(crate) mod tests {
         assert_eq!(st.focused(), Some("t-gamma"));
         let text = rows(&mut st, 50, 24).join("\n");
         assert!(text.contains("┏ proj · gamma "), "{text}");
-        assert!(text.contains("↑ 2 more"), "{text}");
+        // (The one-row tab bar leaves alpha room above it.)
+        assert!(text.contains("↑ 1 more"), "{text}");
         // The conversation: Enter on its empty line opens the oldest item waiting.
         type_line(&mut st, "/c");
         rows(&mut st, 50, 24);
@@ -9433,9 +9435,9 @@ pub(crate) mod tests {
         type_line(&mut st, "/compact on");
         let lines = rows(&mut st, 120, 30);
         assert!(st.compact());
-        // The tab bar's names, on its middle row.
+        // The tab bar's names, on its row.
         assert!(
-            lines[1].contains("Chat") && lines[1].contains("Needs you 2"),
+            lines[0].contains("Chat") && lines[0].contains("Needs you 2"),
             "{lines:#?}"
         );
         type_line(&mut st, "/compact off");
@@ -14552,7 +14554,7 @@ pub(crate) mod tests {
         st.settle_order(later);
         assert_eq!(st.order(), ids(&["c", "a", "b"]));
         // The pointer moves to the conversation: let go, the delay starts, then the move.
-        st.view.pointer = Some((1, 5, later));
+        st.view.pointer = Some((159, 5, later));
         st.settle_order(later);
         assert_eq!(st.order(), ids(&["c", "a", "b"]));
         assert_eq!(st.order_deadline(later), Some(later + ORDER_DELAY));
@@ -15739,15 +15741,11 @@ pub(crate) mod tests {
             .join("\n")
     }
 
-    /// [`screen_text`] of the view alone: right of the workspace sidebar where `st` docks it,
-    /// so that the view's rows read on without the sidebar's beside them.
+    /// [`screen_text`] of the view alone: right of the sidebar where `st` docks it, so that
+    /// the view's rows read on without the sidebar's beside them.
     fn view_text(st: &AppState, buf: &Buffer) -> String {
         let area = buf.area;
-        let left = if st.ws_docked() {
-            crate::sidebar::DOCK_WIDTH
-        } else {
-            0
-        };
+        let left = st.dock_width_at(area.width);
         (0..area.height)
             .map(|y| {
                 (left..area.width)
@@ -15888,10 +15886,11 @@ pub(crate) mod tests {
         st.view.help = false;
         draw(&mut st, 160, 40);
         assert_eq!(st.seen_gseq(), st.last_gseq);
-        // The `/` popup over the cards it covers.
+        // The `/` popup over the cards it covers: the row of them above a narrow conversation
+        // (the sidebar's stay beside it).
         st.view.input.clear();
         st.view.input.insert("/");
-        let screen = screen_text(&draw(&mut st, 100, 14));
+        let screen = screen_text(&draw(&mut st, 90, 14));
         let drawn = drawn_ids(&st);
         assert!(drawn.len() < 2, "{screen}");
         assert!(st.seen_gseq() < st.last_gseq, "{screen}");
@@ -17307,9 +17306,9 @@ pub(crate) mod tests {
             }
             s
         };
-        // The text of each row's leftmost box (the banner or the detail view).
-        let rows = |buf: &Buffer| -> Vec<String> {
-            screen_text(buf)
+        // The text of each row's leftmost box of the view (the banner or the detail view).
+        let rows = |st: &AppState, buf: &Buffer| -> Vec<String> {
+            view_text(st, buf)
                 .lines()
                 .filter_map(|r| {
                     r.split(['│', '┃'])
@@ -17328,7 +17327,8 @@ pub(crate) mod tests {
                 &summary(&["alpha", "gamma"]),
             )],
         );
-        let screen = rows(&draw(&mut st, 160, 40));
+        let buf = draw(&mut st, 160, 40);
+        let screen = rows(&st, &buf);
         assert!(st.view.panes.card.is_none(), "the banner: {screen:#?}");
         assert!(
             screen
@@ -17366,7 +17366,8 @@ pub(crate) mod tests {
                 &summary(&names),
             )],
         );
-        let screen = rows(&draw(&mut st, 80, 24));
+        let buf = draw(&mut st, 80, 24);
+        let screen = rows(&st, &buf);
         assert!(st.view.panes.card.is_some(), "the detail view: {screen:#?}");
         assert!(
             screen
@@ -22110,12 +22111,12 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone, the tab bar switches screens: every cell of its rows (3 on a tall
-        /// screen, 2 at 40x20, 1 on a short one) is the tab of the third of the width it is
-        /// in, the gap after a tab included, and a tap anywhere in it shows that screen.
+        /// On a phone, the tab bar switches screens: every cell of its row (a row on any
+        /// screen) is the tab of the third of the width it is in, the gap after a tab
+        /// included, and a tap anywhere in it shows that screen.
         #[test]
         fn the_compact_tab_bar_switches_screens_by_thirds() {
-            for (w, h, rows) in [(40u16, 20u16, 2u16), (40, 30, 3), (40, 12, 1), (30, 20, 2)] {
+            for (w, h, rows) in [(40u16, 20u16, 1u16), (40, 30, 1), (40, 12, 1), (30, 20, 1)] {
                 let mut st = compact();
                 frame(&mut st, w, h);
                 assert!(st.compact(), "{w}x{h}");
@@ -24032,16 +24033,18 @@ pub(crate) mod tests {
                 .lines()
                 .position(|l| l.contains("■ stop"))
                 .expect("a stop row") as u16;
+            // (In the conversation, right of the sidebar.)
+            let x = st.dock_width() + 10;
             let left = MouseButton::Left;
-            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
             let screen = draw(&mut st, 120, 30);
-            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert_eq!(out, vec![Action::JobCancel { job: "J3".into() }]);
             // Pressed on it, released once a redraw put another command's `■ stop` there
             // (output streaming in moved the rows): nothing stops.
             st.shell_jobs.clear();
             let screen = draw(&mut st, 120, 30);
-            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
             let screen = draw(&mut st, 120, 30);
             let pane = st
                 .view
@@ -24052,7 +24055,7 @@ pub(crate) mod tests {
                 .unwrap();
             let row = usize::from(y - pane.area.y);
             pane.links[row] = Some(format!("{}J9", crate::ui::SHELL_STOP));
-            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(
                 !out.iter().any(|a| matches!(a, Action::JobCancel { .. })),
                 "{out:?}"
@@ -24209,10 +24212,12 @@ pub(crate) mod tests {
                 .lines()
                 .position(|l| l.contains("■ stop"))
                 .expect("a stop row") as u16;
+            // (In the conversation, right of the sidebar.)
+            let x = st.dock_width() + 10;
             let left = MouseButton::Left;
-            st.handle_mouse(mouse(MouseEventKind::Down(left), 10, y), &screen);
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
             let screen = draw(&mut st, 120, 40);
-            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), 10, y), &screen);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert_eq!(out, vec![Action::JobCancel { job: "J5".into() }]);
         }
 
@@ -25162,7 +25167,7 @@ pub(crate) mod tests {
                 assert!(short.contains(says), "{says}");
             }
             let notice = crate::firstrun::summary_notice(&models, every);
-            for (w, h, whole) in [(40, 20, false), (160, 40, true)] {
+            for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
                 let (mut st, mut o) = conversation(true);
                 st.view.suggest_model = models.clone();
                 st.seen.summary_notice = false;
@@ -25170,7 +25175,8 @@ pub(crate) mod tests {
                 rows(&mut st, 160, 40);
                 let now = Instant::now();
                 assert!(st.take_summaries_due(now).is_empty());
-                let words = flat(&screen_text(&draw(&mut st, w, h)));
+                let buf = draw(&mut st, w, h);
+                let words = flat(&view_text(&st, &buf));
                 let (drawn, not) = if whole {
                     (&notice, &short)
                 } else {
@@ -25197,7 +25203,7 @@ pub(crate) mod tests {
             let every = Duration::from_secs(300);
             let short = crate::firstrun::summary_notice_short(&models, every);
             let notice = crate::firstrun::summary_notice(&models, every);
-            for (w, h) in [(40, 20), (30, 20), (160, 40)] {
+            for (w, h) in [(40, 20), (30, 20), (210, 40)] {
                 for (tabs, tasks) in [(true, false), (false, true), (true, true)] {
                     let case = format!("{w}x{h} tabs {tabs} tasks {tasks}");
                     let (mut st, mut o) = conversation(true);
@@ -25208,12 +25214,12 @@ pub(crate) mod tests {
                     rows(&mut st, 160, 40);
                     let now = Instant::now();
                     assert!(st.take_summaries_due(now).is_empty(), "{case}");
-                    // (At 160 columns the workspace sidebar is docked beside the view.)
+                    // (At 210 columns the sidebar is docked beside the view.)
                     let buf = draw(&mut st, w, h);
                     let words = flat(&view_text(&st, &buf));
-                    let drawn = if w == 160 { &notice } else { &short };
+                    let drawn = if w == 210 { &notice } else { &short };
                     assert!(words.contains(&flat(drawn)), "{case}: {words}");
-                    if w == 160 && tasks {
+                    if w == 210 && tasks {
                         assert!(words.contains("3 background task(s)"), "{case}: {words}");
                     }
                     st.note_drawn(now);
@@ -26298,11 +26304,12 @@ pub(crate) mod tests {
                 assert!(short.contains(says), "{says}");
             }
             let notice = crate::firstrun::suggest_notice(&models);
-            for (w, h, whole) in [(40, 20, false), (160, 40, true)] {
+            for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
                 let (mut st, _) = ended(true);
                 st.seen.suggest_notice = false;
                 assert_eq!(st.take_suggest_due(), None);
-                let words = flat(&screen_text(&draw(&mut st, w, h)));
+                let buf = draw(&mut st, w, h);
+                let words = flat(&view_text(&st, &buf));
                 let (drawn, not) = if whole {
                     (&notice, &short)
                 } else {
@@ -26327,19 +26334,19 @@ pub(crate) mod tests {
             let models = twr_core::config::SuggestModels::default();
             let short = crate::firstrun::suggest_notice_short(&models);
             let notice = crate::firstrun::suggest_notice(&models);
-            for (w, h) in [(40, 20), (30, 20), (160, 40)] {
+            for (w, h) in [(40, 20), (30, 20), (210, 40)] {
                 for (tabs, tasks) in [(true, false), (false, true), (true, true)] {
                     let case = format!("{w}x{h} tabs {tabs} tasks {tasks}");
                     let (mut st, _) = ended(true);
                     st.seen.suggest_notice = false;
                     crowd(&mut st, tabs, tasks);
                     assert_eq!(st.take_suggest_due(), None, "{case}");
-                    // (At 160 columns the workspace sidebar is docked beside the view.)
+                    // (At 210 columns the sidebar is docked beside the view.)
                     let buf = draw(&mut st, w, h);
                     let words = flat(&view_text(&st, &buf));
-                    let drawn = if w == 160 { &notice } else { &short };
+                    let drawn = if w == 210 { &notice } else { &short };
                     assert!(words.contains(&flat(drawn)), "{case}: {words}");
-                    if w == 160 && tasks {
+                    if w == 210 && tasks {
                         assert!(words.contains("3 background task(s)"), "{case}: {words}");
                     }
                     st.note_drawn(Instant::now());

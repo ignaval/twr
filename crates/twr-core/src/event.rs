@@ -1204,14 +1204,6 @@ impl ContextSize {
         let w = self.window.filter(|w| *w > 0)?;
         Some((self.tokens.saturating_mul(100) + w / 2) / w)
     }
-
-    /// Short text for cards: `ctx 34%`, or `ctx 35k` without a window.
-    pub fn short(&self) -> String {
-        match self.percent() {
-            Some(p) => format!("ctx {p}%"),
-            None => format!("ctx {}", crate::usage::tokens_text(self.tokens)),
-        }
-    }
 }
 
 /// `ext.twr` key of a `turn.started` the user asked for with `thread.compact` (`true`): the
@@ -2695,12 +2687,11 @@ mod tests {
             window: Some(100_000),
         };
         assert_eq!(size.percent(), Some(35));
-        assert_eq!(size.short(), "ctx 35%");
         let bare = ContextSize {
             tokens: 34_878,
             window: None,
         };
-        assert_eq!(bare.short(), "ctx 35k");
+        assert_eq!(bare.percent(), None);
     }
 
     #[test]

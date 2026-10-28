@@ -94,9 +94,12 @@ pub enum Target {
     /// A queued message listed above the input box, by its ref: selects it, and a tap on the
     /// selected one opens its action popup (Enter).
     Queued(i64),
-    /// A workspace's card in the workspace sidebar, its drawer or the compact layout's
-    /// Workspaces screen (every row of the card): switches to it, as its tab does.
+    /// A workspace's card in the sidebar, its drawer or the compact layout's Threads screen
+    /// (every row of the card, its threads' rows included): switches to it, as its tab does.
     Workspace(String),
+    /// `↑ more` or `↓ more` where the sidebar or the compact Threads screen cut workspaces
+    /// (the whole row): brings this one, the nearest cut, into view.
+    WsMore(String),
     /// `+ New workspace` under the workspaces (the whole row): asks for the new one's name.
     NewWorkspace,
     /// `⚙ Settings` under the workspaces (the whole row): opens the settings, as `/settings`.

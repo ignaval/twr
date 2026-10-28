@@ -51,7 +51,8 @@ pub const EMPTY_STATE: &str = "no worker threads — /new <project>, or ask the 
 
 /// Width of the side column of cards at terminal width `width`.
 pub fn side_width(width: u16) -> u16 {
-    (width * 3 / 10).clamp(34, 48)
+    let side = (u32::from(width) * 3 / 10).clamp(34, 48);
+    u16::try_from(side).unwrap_or(48)
 }
 
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
@@ -98,24 +99,36 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else {
         area
     };
-    // The workspace sidebar, docked left of every view: the strip is not drawn then. It is
-    // drawn after the overlays, which stay right of it: its cards stay on screen and
-    // tappable, as the strip's tabs do.
-    let (dock, body) = if state.ws_docked() {
-        let [dock, rest] = Layout::horizontal([
-            Constraint::Length(crate::sidebar::DOCK_WIDTH),
-            Constraint::Min(0),
-        ])
-        .areas(body);
+    // The sidebar, docked left of every view ([`crate::sidebar`]): the workspaces (the strip
+    // is not drawn then), and in the stack view the worker cards, nested under the current
+    // workspace's card. The cards are drawn first, as the views are: the main pane shows a
+    // confirm card the hub's card cut short ([`hub_detail`]), and an overlay covers them as
+    // it covers a view. The workspaces are drawn after the overlays, which stay right of
+    // them: their cards stay on screen and tappable, as the strip's tabs do.
+    let dock_width = state.dock_width_at(body.width);
+    let (mut dock, body) = if dock_width > 0 && body.width > dock_width {
+        let [dock, rest] =
+            Layout::horizontal([Constraint::Length(dock_width), Constraint::Min(0)]).areas(body);
+        let cards = state.cards_docked_at(area.width);
+        let dock =
+            crate::sidebar::Dock::new(state, dock, crate::sidebar::Place::Docked, cards, |w| {
+                column_needed(state, w)
+            });
         (Some(dock), rest)
     } else {
         (None, body)
     };
+    let docked = dock.as_mut().and_then(|d| {
+        let cards = d.cards?;
+        let noted = render_card_column(frame, cards, state, &mut panes);
+        d.fit_cards(state, cards_bottom(&mut panes, cards));
+        Some(noted)
+    });
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
         // A phone: one screen at a time.
         _ if state.compact() => render_compact(frame, body, state, &mut panes),
-        Screen::Stack => render_stack(frame, body, state, &mut panes, false),
+        Screen::Stack => render_stack(frame, body, state, &mut panes, false, docked),
         Screen::Grid => render_grid_view(frame, body, state, &mut panes),
     }
     // What an overlay hides is not on screen: no option key may answer it, no control under
@@ -139,7 +152,7 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         render_popup(frame, body, state, &mut panes);
     }
     if let Some(dock) = dock {
-        crate::sidebar::render_docked(frame, dock, state, &mut panes);
+        dock.render(frame, state, &mut panes);
     }
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
@@ -405,11 +418,16 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
         "Ctrl-G",
         "the grid of threads, or back to the stack (/grid)",
     ),
-    ("Ctrl-B", "show or hide the thread sidebar (/sidebar)"),
+    (
+        "Ctrl-B",
+        "show or hide the thread cards: in the sidebar, under the current workspace, or the \
+         row above a narrow conversation (/sidebar)",
+    ),
     (
         "Ctrl-T",
-        "show or hide the workspace sidebar (/spaces); on a narrower screen open it as a \
-         drawer (↑↓ Enter, Esc closes), in the compact layout the Workspaces screen",
+        "show or hide the workspaces in the sidebar (/spaces); on a narrower screen open them \
+         as a drawer (↑↓ Enter, Esc closes), in the compact layout the Threads screen, which \
+         lists them",
     ),
     (
         "Ctrl-F",
@@ -499,9 +517,9 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     ),
     (
         "controls",
-        "a workspace's card in the sidebar switches to it, + New workspace asks for a name, \
-         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ≡ shows \
-         it; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
+        "a workspace's card in the sidebar, or a thread under another workspace's card, \
+         switches to it, + New workspace asks for a name, ⚙ Settings opens the settings, the \
+         sidebar's ‹ hides the workspaces and the tab strip's ≡ shows them; the Chat, Needs you and Threads tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
@@ -543,8 +561,9 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread), Threads (the cards) and Workspaces, switched with /c, \
-         /n, /t and /w or a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter \
+         Needs you (a line per thread) and Threads (the workspaces, the current one's cards \
+         nested under it, the others' threads a row each), switched with /c, /n and /t (/w) or \
+         a tap on their tabs; ↑↓ on an empty line pick a row, a workspace or a card, Enter \
          opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
@@ -963,59 +982,40 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     frame.render_widget(Paragraph::new(rows).block(block), rect);
 }
 
-/// The stack view: the main pane, its input box and status bar, and the worker cards beside
-/// or above it, unless `hide_cards` (the compact layout's conversation).
+/// The stack view: the main pane, its input box and status bar, and the worker cards above it
+/// on a narrow screen, unless `hide_cards` (the compact layout's conversation) or the sidebar
+/// has them (`docked`: whether it drew the note on hidden parked threads).
 fn render_stack(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     panes: &mut Panes,
     hide_cards: bool,
+    docked: Option<bool>,
 ) {
     let [upper, status] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(status_height(state, area)),
     ])
     .areas(area);
-    // Too narrow for a column of cards, a dive takes the whole height: its header band names
-    // the thread and says Esc gets back, to the row of cards as it was.
-    let narrow_dive = upper.width < SIDE_MIN_WIDTH && state.view.dive.is_some();
-    let (left, side) = if !hide_cards && !state.view.sidebar_hidden && upper.width >= SIDE_MIN_WIDTH
-    {
-        let [left, side] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(side_width(upper.width)),
-        ])
-        .areas(upper);
-        (left, Some(side))
-    } else {
-        (upper, None)
-    };
-    // The input box is under the main pane only: the column of cards beside it keeps its
-    // height however many rows the box grows to. The main pane's thread's queued messages are
-    // listed right above it.
+    // Too narrow for the cards in the sidebar, a dive takes the whole height: its header band
+    // names the thread and says Esc gets back, to the row of cards as it was.
+    let narrow_dive = docked.is_none() && state.view.dive.is_some();
+    // The main pane's thread's queued messages are listed right above the input box.
     let [top, queued, input] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(queue_height(state)),
         Constraint::Length(input_height(
             state,
             Rect {
-                width: left.width,
+                width: upper.width,
                 ..area
             },
         )),
     ])
-    .areas(left);
-    let noted = if let Some(side) = side {
-        // The cards first: the main pane shows a confirm card the hub's card cut short
-        // ([`hub_detail`]).
-        let noted = render_card_column(frame, side, state, panes);
-        // A column apart from the cards: the main pane has no border of its own.
-        let main = Rect {
-            width: top.width.saturating_sub(1),
-            ..top
-        };
-        render_main(frame, main, state, panes);
+    .areas(upper);
+    let noted = if let Some(noted) = docked {
+        render_main(frame, top, state, panes);
         noted
     } else if hide_cards || state.view.sidebar_hidden || narrow_dive {
         render_main(frame, top, state, panes);
@@ -1037,20 +1037,17 @@ fn render_stack(
 }
 
 /// The compact layout (a phone): a tab bar naming its screens, `Chat · Needs you 2 · Threads`,
-/// the current one highlighted ([`render_tab_bar`]), over that screen: the conversation alone,
-/// what needs the user (one line per thread), or the threads' cards, each list with the input
-/// box and status bar under it.
+/// the current one highlighted ([`render_tab_bar`]), a row tall, over that screen: the
+/// conversation alone, what needs the user (one line per thread), or the threads' cards
+/// (nested under the current workspace's card among the workspaces', [`render_compact_threads`]),
+/// each list with the input box and status bar under it.
 fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
-    let [bar, rest] = Layout::vertical([
-        Constraint::Length(tab_bar_height(area.height)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    let [bar, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     render_tab_bar(frame, bar, state, panes);
     let pane = state.view.compact_pane;
     if pane == CompactPane::Chat {
-        render_stack(frame, rest, state, panes, true);
+        render_stack(frame, rest, state, panes, true, None);
         return;
     }
     let [list, input, status] = Layout::vertical([
@@ -1062,41 +1059,19 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
-    } else if pane == CompactPane::Workspaces {
-        crate::sidebar::render_screen(frame, list, state, panes);
     } else {
-        render_compact_cards(frame, list, state, panes);
+        render_compact_threads(frame, list, state, panes);
     }
     render_input(frame, input, state, panes);
     render_status(frame, status, state, panes, None);
 }
 
-/// Rows of the compact layout's tab bar on a screen `height` rows tall: 3 (its names on the
-/// middle one) from [`TAB_BAR_TALL_FROM`] rows, 2 from [`TAB_BAR_SHORT_FROM`] (a phone with its
-/// keyboard up has about 20), and 1 on a shorter one, which keeps its rows for the screen
-/// itself.
-pub fn tab_bar_height(height: u16) -> u16 {
-    if height >= TAB_BAR_TALL_FROM {
-        3
-    } else if height >= TAB_BAR_SHORT_FROM {
-        2
-    } else {
-        1
-    }
-}
-
-/// From this many rows the compact layout's tab bar is 3 rows tall ([`tab_bar_height`]).
-pub const TAB_BAR_TALL_FROM: u16 = 24;
-/// From this many rows (and up to [`TAB_BAR_TALL_FROM`]) it is 2 rows tall.
-pub const TAB_BAR_SHORT_FROM: u16 = 14;
-
-/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2`, `Threads` and, when the TUI
-/// can switch workspaces, `Workspaces` (`⚠2`: what waits on the user in the others), each a
-/// filled tab an equal share of the width wide and the bar's height tall, its name centered
-/// (`Needs 2`, `Spaces`, then cut, where it does not fit), the current one reversed and bold,
-/// `Needs you` and `Workspaces` yellow while something waits. A tap anywhere in a tab's share
-/// (the gap after it included) shows its screen, as `/c`, `/n`, `/t` and `/w` do: the whole bar
-/// is tappable.
+/// The compact layout's tab bar over `bar` (a row): `Chat`, `Needs you 2` and `Threads` (`⚠2`:
+/// what waits on the user in the other workspaces, which it lists too), each a filled tab an
+/// equal share of the width wide, its name centered (`Needs 2`, `Thr ⚠2`, then cut, where it
+/// does not fit), the current one reversed and bold, `Needs you` and `Threads` yellow while
+/// something waits. A tap anywhere in a tab's share (the gap after it included) shows its
+/// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
 fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let pane = state.view.compact_pane;
@@ -1112,26 +1087,19 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             (CompactPane::Needs, "Needs you".into(), "Needs".into())
         },
-        (CompactPane::Threads, "Threads".into(), "Threads".into()),
     ];
-    // The workspaces, with what waits on the user in the others (a TUI opened on a socket
-    // has none to show).
+    // The threads, with what waits on the user in the other workspaces it lists (a TUI opened
+    // on a socket has none).
     let elsewhere = other_waiting(state);
-    if state.workspace.is_some() {
-        names.push(if elsewhere > 0 {
-            (
-                CompactPane::Workspaces,
-                format!("Workspaces ⚠{elsewhere}"),
-                format!("Spaces ⚠{elsewhere}"),
-            )
-        } else {
-            (
-                CompactPane::Workspaces,
-                "Workspaces".into(),
-                "Spaces".into(),
-            )
-        });
-    }
+    names.push(if elsewhere > 0 {
+        (
+            CompactPane::Threads,
+            format!("Threads ⚠{elsewhere}"),
+            format!("Thr ⚠{elsewhere}"),
+        )
+    } else {
+        (CompactPane::Threads, "Threads".into(), "Threads".into())
+    });
     panes.add(PaneId::Text, bar);
     // Fixed 256-color values, like the header band's ([`target_fill`]): legible on dark and
     // light terminals alike. Without colors, unfilled: a fill is drawn reversed then
@@ -1159,7 +1127,7 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         let style = if *p == pane {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else if (*p == CompactPane::Needs && needs > 0)
-            || (*p == CompactPane::Workspaces && elsewhere > 0)
+            || (*p == CompactPane::Threads && elsewhere > 0)
         {
             off.fg(Color::Indexed(220)).add_modifier(Modifier::BOLD)
         } else {
@@ -1173,10 +1141,8 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             truncate_cells(short, room)
         };
-        let mut rows = vec![Line::default(); usize::from(tab.height.saturating_sub(1) / 2)];
-        rows.push(Line::from(label));
         frame.render_widget(
-            Paragraph::new(rows)
+            Paragraph::new(Line::from(label))
                 .alignment(Alignment::Center)
                 .style(style),
             tab,
@@ -1195,10 +1161,61 @@ fn other_waiting(state: &AppState) -> usize {
         .sum()
 }
 
-/// The compact layout's Threads screen: the threads' cards, as the stack view draws them, in a
-/// column as wide as the screen ([`render_column`]), the orchestrator's first while it asks.
-/// Scrolled like the column, by the wheel, else as little as the selection takes; a tap
-/// selects a card, and a tap on the selected one opens its action popup.
+/// The compact layout's Threads screen over `area`: in a TUI opened on a workspace, laid out as
+/// the sidebar is ([`crate::sidebar::Dock`], [`crate::sidebar::Place::Screen`]): each
+/// workspace's card, the current one's cards nested under it ([`render_compact_cards`]), the
+/// others' threads a row each, the buttons under them; on a socket, the cards alone.
+fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
+    use crate::sidebar::{Dock, Place};
+    let mut dock = Dock::new(state, area, Place::Screen, true, |w| {
+        compact_needed(state, w)
+    });
+    if let Some(cards) = dock.cards {
+        render_compact_cards(frame, cards, state, panes);
+        dock.fit_cards(state, cards_bottom(panes, cards));
+    }
+    dock.render(frame, state, panes);
+}
+
+/// The row after the last card drawn in the column over `area`, which the list of cards then
+/// takes up to ([`crate::sidebar::Dock::fit_cards`]); its bottom when anything else is drawn
+/// there (the empty pane, the note on hidden parked threads), which keeps its rows.
+fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
+    let mut bottom = area.y;
+    for p in panes.panes.iter().filter(|p| p.area.intersects(area)) {
+        match p.id {
+            // (A card's pane is its inside: its bottom border is the row under it.)
+            PaneId::Thread(_) => bottom = bottom.max(p.area.bottom() + 1),
+            _ => return area.bottom(),
+        }
+    }
+    let bottom = bottom.min(area.bottom());
+    if let Some(list) = panes.list.as_mut().filter(|l| l.area == area) {
+        list.area.height = bottom - area.y;
+    }
+    bottom
+}
+
+/// The rows the compact Threads screen's cards ([`render_compact_cards`]) take `width` columns
+/// wide when they all show, or its empty note's.
+fn compact_needed(state: &AppState, width: u16) -> u16 {
+    let order = state.compact_threads();
+    if order.is_empty() {
+        return u16::try_from(wrap(EMPTY_STATE, usize::from(width).max(1)).len()).unwrap_or(1);
+    }
+    let layout = ListLayout::Compact(crate::app::CompactPane::Threads);
+    let mut scratch = Panes::default();
+    let rows: u32 = order
+        .iter()
+        .map(|id| u32::from(card_height(state, &mut scratch, id, layout, width)))
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// The compact layout's Threads screen's cards: as the stack view draws them, in a column as
+/// wide as `area` ([`render_column`]), the orchestrator's first while it asks. Scrolled like
+/// the column, by the wheel, else as little as the selection takes; a tap selects a card, and
+/// a tap on the selected one opens its action popup.
 fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let order = state.compact_threads();
@@ -1342,20 +1359,6 @@ fn render_compact_rows(
         }
         panes.add(PaneId::Thread(id), rect);
         frame.render_widget(Paragraph::new(line), rect);
-    }
-}
-
-/// Width of the input box on a screen `width` columns wide: in the stack view with the cards
-/// in a column, the main pane's width (the column runs down beside the box), else the whole
-/// width.
-pub fn input_box_width(state: &AppState, width: u16) -> u16 {
-    if state.compact() {
-        return width;
-    }
-    if state.view.screen == Screen::Stack && !state.view.sidebar_hidden && width >= SIDE_MIN_WIDTH {
-        width.saturating_sub(side_width(width))
-    } else {
-        width
     }
 }
 
@@ -1801,6 +1804,40 @@ fn render_card_column(frame: &mut Frame, area: Rect, state: &AppState, panes: &m
     noted
 }
 
+/// The rows the column of cards [`render_card_column`] draws `width` columns wide would take
+/// to show every card at its height, its note on hidden parked threads included, or the
+/// empty pane's text whole: what the sidebar gives it when it has the room
+/// ([`crate::sidebar::Dock`]). Measured apart, so the frame's own measures are the column's.
+pub(crate) fn column_needed(state: &AppState, width: u16) -> u16 {
+    let order = state.order();
+    let note = parked_note(state);
+    if order.is_empty() {
+        let inner = usize::from(width.saturating_sub(2)).max(1);
+        let message = if state.view.focus_mode {
+            "no threads working or needing you · Ctrl-F shows all"
+        } else {
+            EMPTY_STATE
+        };
+        let rows = wrap(message, inner).len() + note.map_or(0, |n| wrap(&n, inner).len());
+        return u16::try_from(rows + 2).unwrap_or(u16::MAX);
+    }
+    let mut scratch = Panes::default();
+    let cards: u32 = order
+        .iter()
+        .map(|id| {
+            u32::from(card_height(
+                state,
+                &mut scratch,
+                id,
+                ListLayout::Column,
+                width,
+            ))
+        })
+        .sum();
+    let note = note.filter(|n| n.chars().count() < usize::from(width));
+    u16::try_from(cards + u32::from(note.is_some())).unwrap_or(u16::MAX)
+}
+
 /// Cards `order` in a column over `area` (the list's whole `column`, its note included), as
 /// many as fit at their heights ([`card_height`]), keeping card `focus` in view unless the
 /// wheel scrolled them ([`list_start`]); the edge cards say how many more there are (`↑ 2
@@ -1983,16 +2020,6 @@ fn card_block(
     (block, unsaid)
 }
 
-/// A card's or tile's right bottom label: how full its thread's context is, when its runtime
-/// said (`ctx 34%`, [`twr_core::event::ContextSize::short`]), before the `more` label `right`.
-fn with_context(t: &ThreadView, right: Option<String>) -> Option<String> {
-    let ctx = t.context.map(|c| c.short());
-    match (ctx, right) {
-        (Some(c), Some(r)) => Some(format!("{c} · {r}")),
-        (c, r) => c.or(r),
-    }
-}
-
 /// `block`, a card or tile `width` columns wide, with its bottom border's labels: the `more`
 /// labels (left, right: `↑ 2 more`, `↓ 3 more`), and after the left one the box `token` when
 /// the title had no room for the state of its box ([`card_block`]), so that state is always on
@@ -2069,7 +2096,6 @@ fn render_card(
     let (block, unsaid) = card_block(state, t, pinned, area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let more_right = with_context(t, more_right);
     let block = card_bottom(block, area.width, (more_left, more_right), token);
 
     let inner = block.inner(area);
@@ -3086,7 +3112,7 @@ pub fn model_full(t: &ThreadView) -> String {
 }
 
 /// `spans` cut to `width` characters, the last one shown being `…` when they are cut.
-fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(crate) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let total: usize = spans.iter().map(|s| crate::edit::width(&s.content)).sum();
     if total <= width {
         return spans;
@@ -3797,7 +3823,7 @@ fn render_tile(
     let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let block = card_bottom(block, area.width, (None, with_context(t, None)), token);
+    let block = card_bottom(block, area.width, (None, None), token);
     let inner = block.inner(area);
     let body = tile_body(state, t, inner.width);
     let status_row = body
@@ -3833,7 +3859,7 @@ fn tile_body(state: &AppState, t: &ThreadView, width: u16) -> CardBody {
     card_body(state, t, usize::from(width), Some((&turns, &spent)))
 }
 
-fn status_color(s: ThreadStatus) -> Color {
+pub(crate) fn status_color(s: ThreadStatus) -> Color {
     match s {
         ThreadStatus::Running | ThreadStatus::Background => Color::Green,
         ThreadStatus::Waiting => Color::Yellow,
@@ -8942,7 +8968,7 @@ fn status_note_parts(state: &AppState, parked: Option<String>) -> Vec<(String, O
             String::new()
         };
         notes.push((
-            format!("sidebar hidden{waiting} · Ctrl-B shows"),
+            format!("cards hidden{waiting} · Ctrl-B shows"),
             Some(Target::Sidebar),
         ));
     }
@@ -9202,6 +9228,34 @@ mod tests {
         lines.join("\n")
     }
 
+    /// The width of a screen whose views get `cols` columns beside the sidebar `st` docks on
+    /// it ([`AppState::dock_width_at`]).
+    fn screen_for(st: &AppState, cols: u16) -> u16 {
+        (cols..=cols.saturating_add(60))
+            .find(|w| w - st.dock_width_at(*w) == cols)
+            .unwrap_or(cols)
+    }
+
+    /// The cells of `line`, a row of a screen `w` columns wide, right of the sidebar: the
+    /// views' own.
+    fn view_part(st: &AppState, w: u16, line: &str) -> String {
+        line.chars()
+            .skip(usize::from(st.dock_width_at(w)))
+            .collect()
+    }
+
+    /// The rows `lines` of a screen `w` columns wide, right of the sidebar ([`view_part`]).
+    fn view_screen(st: &AppState, w: u16, lines: &[String]) -> String {
+        let rows: Vec<String> = lines.iter().map(|l| view_part(st, w, l)).collect();
+        rows.join("\n")
+    }
+
+    /// The last row of `st` on a screen whose views get `cols` columns, those columns alone.
+    fn view_last(st: &AppState, cols: u16) -> String {
+        let w = screen_for(st, cols);
+        view_part(st, w, &draw(st, w, 24).pop().unwrap())
+    }
+
     /// Draws `state` at `w` x `h` keeping the panes (as the IO loop does); returns the rows.
     fn draw_panes(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
         let buf = crate::app::tests::draw(state, w, h);
@@ -9387,9 +9441,9 @@ mod tests {
     }
 
     /// A taller input box lists the same cards: the box is under the main pane, and the
-    /// column of cards keeps its height beside it. (It once spanned the whole width, so a
-    /// growing box took its rows from the column too and the last card there went, e.g.
-    /// `t-eps` at 160x32.)
+    /// column of cards in the sidebar keeps its height beside it. (It once spanned the whole
+    /// width, so a growing box took its rows from the column too and the last card there went,
+    /// e.g. `t-eps` at 160x32.)
     #[test]
     fn a_taller_input_box_lists_the_same_cards() {
         let drawn = |st: &AppState| -> Vec<String> {
@@ -9412,7 +9466,7 @@ mod tests {
             assert_eq!(drawn(&st), nav, "{w}x{h}: {}", screen(&lines));
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             let column = st.view.panes.get(&card(&nav[0])).unwrap().area;
-            assert!(input.right() < column.x, "{w}x{h}: {input:?} {column:?}");
+            assert!(column.right() < input.x, "{w}x{h}: {input:?} {column:?}");
         }
         assert_eq!(
             drawn(&{
@@ -10026,8 +10080,8 @@ mod tests {
         }
     }
 
-    /// Wide: the main pane on the left, the worker cards in a column on the right, the
-    /// permission first; each card says status, runtime, model and mode.
+    /// Wide: the worker cards in a column in the sidebar on the left, the main pane right of
+    /// it, the permission first; each card says status, runtime, model and mode.
     #[test]
     fn three_threads_permission_is_first_with_card_text() {
         let mut st = three_threads();
@@ -10037,10 +10091,10 @@ mod tests {
         let (beta, alpha, gamma) = (at("t-beta"), at("t-alpha"), at("t-gamma"));
         assert!(beta.y < alpha.y && alpha.y < gamma.y, "{}", screen(&lines));
         assert_eq!(beta.y, 1, "the permission card is the first card");
-        assert_eq!(
-            beta.x,
-            120 - side_width(120) + 1,
-            "the cards are on the right"
+        assert_eq!(beta.x, 1, "the cards are on the left");
+        assert!(
+            st.view.panes.get(&PaneId::Transcript).unwrap().area.x > beta.right(),
+            "the main pane right of them"
         );
         // As tall as their text: gamma, running with nothing open and no git state, its
         // state alone; beta its state and its permission (summary, options, note).
@@ -10084,7 +10138,8 @@ mod tests {
         assert!(alpha_card.starts_with('┏'), "{alpha_card}");
         let s = screen(&lines);
         assert!(
-            lines[0].starts_with(" ORCHESTRATOR  starts with your first message "),
+            view_part(&st, 120, &lines[0])
+                .starts_with(" ORCHESTRATOR  starts with your first message "),
             "{s}"
         );
         // The empty input box is there, saying who a line goes to.
@@ -10097,8 +10152,9 @@ mod tests {
     }
 
     /// The text of the main pane's header (its band, the top row).
-    fn header(lines: &[String], w: usize) -> String {
-        lines[0].chars().take(w).collect()
+    fn header(st: &AppState, lines: &[String], w: usize) -> String {
+        let width = u16::try_from(lines[0].chars().count()).unwrap();
+        view_part(st, width, &lines[0]).chars().take(w).collect()
     }
 
     /// A working card shows a frame of the icon before its status, a waiting one none; the
@@ -10254,7 +10310,7 @@ mod tests {
         st.view.animate = true;
         st.view.frame = 4;
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(head.starts_with(" ORCHESTRATOR  claude-code"), "{head}");
         assert!(!head.contains('▄'), "idle: {head}");
 
@@ -10262,7 +10318,7 @@ mod tests {
         o.at(200);
         control(&mut st, &[o.turn_started("what needs me?")]);
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ▄ ORCHESTRATOR  claude-code"),
             "working: {head}"
@@ -10271,19 +10327,19 @@ mod tests {
 
         control(&mut st, &[o.raise("op1", AttentionReason::Question)]);
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(!head.contains('▄'), "waiting on the user: {head}");
 
         st.dive("t-gamma");
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ▄ ‹ back  talking to gamma  fake · "),
             "dive: {head}"
         );
         st.dive("t-beta");
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ‹ back  talking to beta  fake · "),
             "{head}"
@@ -11027,7 +11083,7 @@ mod tests {
         for ev in &evs {
             st.apply_event(&thread_item(ev));
         }
-        let text = screen(&draw(&st, 160, 30));
+        let text = view_screen(&st, 160, &draw(&st, 160, 30));
         assert!(
             text.starts_with(
                 " ‹ back  talking to beta  fake · default model · mode manual · Esc returns to \
@@ -11036,14 +11092,14 @@ mod tests {
             "{text}"
         );
         // Narrower, the header keeps what fits: who it talks to, then how to get back.
-        let text = screen(&draw(&st, 120, 30));
+        let text = view_screen(&st, 120, &draw(&st, 120, 30));
         assert!(
             text.starts_with(
                 " ‹ back  talking to beta  fake · default model · mode manual · Esc: back "
             ),
             "{text}"
         );
-        let text = screen(&draw(&st, 100, 30));
+        let text = view_screen(&st, 100, &draw(&st, 100, 30));
         assert!(
             text.starts_with(" ‹ back  talking to beta  mode manual · Esc: back "),
             "{text}"
@@ -11153,15 +11209,14 @@ mod tests {
     fn status_bar_shows_errors_and_hints() {
         let mut st = three_threads();
         st.view.status = Some("hub: not_found".into());
-        let lines = draw(&st, 160, 24);
-        let last = lines.last().unwrap();
+        let last = view_last(&st, 160);
         assert!(
             last.starts_with("hub: not_found"),
             "no mode badge before it: {last}"
         );
         assert!(last.contains("| Enter send · "), "{last}");
         st.view.status = None;
-        let last = draw(&st, 160, 24).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(last.starts_with("Enter send · "), "{last}");
     }
 
@@ -11224,7 +11279,7 @@ mod tests {
             (40, None),
             (30, None),
         ] {
-            let last = draw(&st, w, 24).pop().unwrap();
+            let last = view_last(&st, w);
             match usage {
                 Some(u) => {
                     assert!(last.starts_with(u), "{w}: {last}");
@@ -11287,13 +11342,13 @@ mod tests {
     fn usage_starts_the_last_row_beside_status_notes() {
         let mut st = with_usage(three_threads(), 22.0, 44.0);
         st.view.status = Some("hub: not_found".into());
-        let last = draw(&st, 280, 24).pop().unwrap();
+        let last = view_last(&st, 280);
         assert!(last.starts_with("left: Claude 5h 78%"), "{last}");
         assert!(last.contains("ago hub: not_found | Enter send"), "{last}");
 
         // Wrapped status notes still leave the usage at the start of the last row.
         st.view.status = Some("a long status message ".repeat(8));
-        let last = draw(&st, 120, 24).pop().unwrap();
+        let last = view_last(&st, 120);
         assert!(last.starts_with("C 78%/56% | G 58% "), "{last}");
         assert!(last.contains("Enter send"), "{last}");
     }
@@ -11301,7 +11356,7 @@ mod tests {
     #[test]
     fn usage_rendering_clamps_remaining_percentages() {
         let st = with_usage(three_threads(), 104.4, -3.0);
-        let last = draw(&st, 280, 24).pop().unwrap();
+        let last = view_last(&st, 280);
         assert!(last.starts_with("left: Claude 5h 0% resets "), "{last}");
         assert!(last.contains("wk 100%"), "{last}");
         let last = draw(&st, 80, 24).pop().unwrap();
@@ -11384,7 +11439,7 @@ mod tests {
         st.summary.stats.calls = 2;
         st.summary.stats.cost_usd = 0.0004;
         assert_eq!(text(&st, 200, 30).as_deref(), Some("summaries 2 · $0.0004"));
-        let last = draw(&st, 160, 24).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(last.starts_with("summaries 2 · $0.0004 "), "{last}");
     }
 
@@ -11421,9 +11476,10 @@ mod tests {
     #[test]
     fn usage_colors_windows_near_their_limit() {
         let st = with_usage(three_threads(), 90.0, 75.0);
-        let buf = draw_buf(&st, 280, 24);
+        let w = screen_for(&st, 280);
+        let buf = draw_buf(&st, w, 24);
         let y = 23;
-        let row: String = (0..280).map(|x| buf[(x, y)].symbol()).collect();
+        let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
         let at = |needle: &str| {
             let byte = row
                 .find(needle)
@@ -12715,7 +12771,7 @@ mod tests {
         draw_panes_at(&mut st, w, h, free + ORDER_DELAY * 2);
         assert_eq!(card_at(&st, "t-a").height, tall, "held by the pointer");
         // The pointer leaves: the wait starts again, and the card shrinks after it.
-        st.view.pointer = Some((1, 5, free + ORDER_DELAY * 2));
+        st.view.pointer = Some((w - 2, 5, free + ORDER_DELAY * 2));
         let left = free + ORDER_DELAY * 3;
         draw_panes_at(&mut st, w, h, left);
         assert_eq!(card_at(&st, "t-a").height, tall);
@@ -12829,43 +12885,6 @@ mod tests {
     }
 
     /// A tile says what its thread's turns spent after the turn count.
-    /// A card and a tile say how full their thread's context is on their bottom border, once
-    /// its runtime said, and what a compaction left after it.
-    #[test]
-    fn cards_say_how_full_the_context_is() {
-        let mut st = crate::app::tests::five_threads();
-        let mut z = ThreadScript::new("t-zeta");
-        z.at(40);
-        let evs = vec![z.created("zeta"), z.turn_started("go")];
-        crate::app::tests::control(&mut st, &evs);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(!screen.contains("ctx "), "nothing said yet: {screen}");
-        let mut end = z.turn_ended(twr_core::event::TurnResult::Completed);
-        if let EventBody::TurnEnded(p) = &mut end.body {
-            p.context = Some(twr_core::event::ContextSize {
-                tokens: 342_000,
-                window: Some(1_000_000),
-            });
-        }
-        crate::app::tests::control(&mut st, &[end]);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 34%"), "{screen}");
-        let compacted = z.event(EventBody::ContextCompacted(
-            twr_core::event::ContextCompacted {
-                trigger: "manual".into(),
-                pre_tokens: Some(342_000),
-                post_tokens: Some(20_000),
-                ..Default::default()
-            },
-        ));
-        crate::app::tests::control(&mut st, &[compacted]);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 2%"), "{screen}");
-        st.view.screen = Screen::Grid;
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 2%"), "a tile too: {screen}");
-    }
-
     #[test]
     fn grid_tiles_say_what_the_turns_spent() {
         let mut st = grid_state();
@@ -13282,26 +13301,18 @@ mod tests {
         }
     }
 
-    /// The compact layout's tab bar is 3 rows tall from [`TAB_BAR_TALL_FROM`] rows, 2 from
-    /// [`TAB_BAR_SHORT_FROM`] (a phone with its keyboard up, about 20) and 1 on a shorter
-    /// screen; each name is centered in its third of the width, on the middle row (the first
-    /// of two), the current one reversed. Where `Needs you 2` does not fit its third, it says
-    /// `Needs 2`; the screen under the bar keeps the rest.
+    /// The compact layout's tab bar is a row tall on any screen, so the screen under it keeps
+    /// the rest; each name is centered in its third of the width, the current one reversed.
+    /// Where `Needs you 2` does not fit its third, it says `Needs 2`.
     #[test]
     fn the_compact_tab_bar_fits_the_screen() {
-        assert_eq!(tab_bar_height(40), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM - 1), 2);
-        assert_eq!(tab_bar_height(20), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM - 1), 1);
-        assert_eq!(tab_bar_height(8), 1);
-        for (w, h, rows, names) in [
-            (40u16, 30u16, 3u16, ["Chat", "Needs you 2", "Threads"]),
-            (40, 20, 2, ["Chat", "Needs you 2", "Threads"]),
-            (40, 12, 1, ["Chat", "Needs you 2", "Threads"]),
-            (30, 20, 2, ["Chat", "Needs 2", "Threads"]),
-            (59, 20, 2, ["Chat", "Needs you 2", "Threads"]),
+        let rows = 1u16;
+        for (w, h, names) in [
+            (40u16, 30u16, ["Chat", "Needs you 2", "Threads"]),
+            (40, 20, ["Chat", "Needs you 2", "Threads"]),
+            (40, 12, ["Chat", "Needs you 2", "Threads"]),
+            (30, 20, ["Chat", "Needs 2", "Threads"]),
+            (59, 20, ["Chat", "Needs you 2", "Threads"]),
         ] {
             let mut st = crate::app::tests::three_threads();
             st.view.compact_width = 60;
@@ -13309,7 +13320,7 @@ mod tests {
             let buf = crate::app::tests::draw(&mut st, w, h);
             let lines = buffer_lines(&buf);
             let what = format!("{w}x{h}:\n{}", screen(&lines));
-            let middle = usize::from((rows - 1) / 2);
+            let middle = 0;
             let words: Vec<&str> = lines[middle].split_whitespace().collect();
             assert_eq!(words.join(" "), names.join(" "), "{what}");
             // Centered in its tab: its third of the width, but the column after it (the last
@@ -13352,7 +13363,7 @@ mod tests {
         }
     }
 
-    /// Hidden parked threads are counted: a dim row under the side column of cards, the
+    /// Hidden parked threads are counted: a dim row under the column of cards, the
     /// head of the hints when the cards are a row, the grid's header, the empty pane.
     #[test]
     fn hidden_parked_threads_are_counted_where_the_cards_are() {
@@ -13365,8 +13376,11 @@ mod tests {
             .iter()
             .position(|l| l.contains(note))
             .unwrap_or_else(|| panic!("{}", screen(&lines)));
-        assert!(row < 39, "above the status bar");
-        assert!(!lines[39].contains(note));
+        // Under the cards in the sidebar, not among the hints.
+        let dock = usize::from(st.dock_width_at(160));
+        let side: String = lines[row].chars().take(dock).collect();
+        assert!(side.contains(note), "{}", screen(&lines));
+        assert_eq!(screen(&lines).matches(note).count(), 1);
         // Cards in a row: the hints say it.
         let lines = draw(&st, 90, 30);
         assert!(lines[29].contains(note), "{}", lines[29]);
@@ -13478,7 +13492,7 @@ mod tests {
     #[test]
     fn key_help_follows_the_view_and_confirmation_takes_the_status_bar() {
         let mut st = five_threads();
-        let last = |st: &AppState| draw(st, 180, 30).pop().unwrap();
+        let last = |st: &AppState| view_last(st, 180);
         let l = last(&st);
         assert!(
             l.contains("Ctrl-G grid") && l.contains("Enter on an empty line: actions"),
@@ -13520,10 +13534,10 @@ mod tests {
     #[test]
     fn help_overlay_lists_the_commands_and_keys() {
         let mut st = three_threads();
-        let l = draw(&st, 200, 40).pop().unwrap();
+        let l = view_last(&st, 200);
         assert!(l.contains("? help"), "{l}");
         st.handle_key(key(KeyCode::Esc));
-        let l = draw(&st, 200, 40).pop().unwrap();
+        let l = view_last(&st, 200);
         assert!(l.contains("/ commands"), "{l}");
         for c in "/help".chars() {
             st.handle_key(key(KeyCode::Char(c)));
@@ -15102,7 +15116,9 @@ mod tests {
                 let what = format!("{name}{word} {width}: {row:?}");
                 assert!(has_token(&row, name, word), "{what}");
                 let col = |byte: usize| u16::try_from(row[..byte].chars().count()).unwrap();
-                let at = row.find('@').unwrap();
+                // (The header's, after its `‹ back`: the card in the sidebar names it too.)
+                let back = row.find("‹ back").unwrap();
+                let at = back + row[back..].find('@').unwrap();
                 let from = at + row[at..].find(word).unwrap();
                 let to = from + word.len();
                 // `‹ back` up to the word: the header's colors.
@@ -15532,7 +15548,7 @@ mod tests {
     #[test]
     fn decisions_key_help() {
         let mut st = decisions_state();
-        let last = draw(&st, 160, 20).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(
             last.contains("Enter open thread")
                 && last.contains("f site")
@@ -15542,7 +15558,7 @@ mod tests {
             "{last}"
         );
         st.handle_key(key(KeyCode::Esc));
-        let last = draw(&st, 180, 20).pop().unwrap();
+        let last = view_last(&st, 180);
         assert!(last.contains("Ctrl-G grid"), "{last}");
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
@@ -15560,7 +15576,8 @@ mod tests {
         let lines = draw_panes(&mut st, 160, 40);
         let s = screen(&lines);
         assert!(
-            lines[0].starts_with(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805 "),
+            view_part(&st, 160, &lines[0])
+                .starts_with(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805 "),
             "{s}"
         );
         for part in [
@@ -15965,8 +15982,10 @@ mod tests {
         let buf = crate::app::tests::draw(&mut st, 160, 40);
         let s = screen(&buffer_lines(&buf));
         assert!(titled(&s, '┏', "gamma"), "{s}");
-        // Where the line goes: the header band's fill (the pane has no border).
-        assert_eq!(buf[(0, 0)].bg, target_fill(None).bg.unwrap(), "{s}");
+        // Where the line goes: the header band's fill (the pane has no border), right of the
+        // sidebar.
+        let x0 = st.dock_width_at(160);
+        assert_eq!(buf[(x0, 0)].bg, target_fill(None).bg.unwrap(), "{s}");
         st.set_focus(None);
         let s = screen(&draw(&st, 160, 40));
         assert!(!s.contains('┏'), "nothing selected: {s}");
@@ -15988,11 +16007,11 @@ mod tests {
             .unwrap() as u16;
         assert_eq!(buf[(x, row as u16)].fg, color_of(&st, "t-beta"), "{s}");
         assert_eq!(
-            buf[(0, 0)].bg,
+            buf[(x0, 0)].bg,
             target_fill(st.dived()).bg.unwrap(),
             "the band: {s}"
         );
-        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
+        assert_eq!(buf[(x0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
         assert_eq!(s.matches('╔').count(), 1, "only the dive's card: {s}");
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
@@ -16167,28 +16186,27 @@ mod tests {
     fn the_header_band_and_the_input_box_say_where_a_line_goes() {
         use crate::app::tests::with_orch;
         let mut st = with_orch();
-        // The main pane, a column apart from the cards.
-        let main_w = 120 - side_width(120) - 1;
+        // The main pane, right of the sidebar's border.
         let check = |st: &mut AppState, fill: Style, border: Color, label: &str| {
             let buf = crate::app::tests::draw(st, 120, 40);
-            let band: String = (0..main_w).map(|x| buf[(x, 0)].symbol()).collect();
+            let x0 = st.dock_width_at(120);
+            let band: String = (x0..120).map(|x| buf[(x, 0)].symbol()).collect();
             assert!(band.starts_with(label), "{band}");
-            for x in 0..main_w {
+            for x in x0..120 {
                 assert_eq!(buf[(x, 0)].bg, fill.bg.unwrap(), "the whole row: {x}");
             }
-            assert_eq!(buf[(1, 0)].fg, fill.fg.unwrap());
-            assert!(buf[(1, 0)].modifier.contains(Modifier::BOLD));
+            assert_eq!(buf[(x0 + 1, 0)].fg, fill.fg.unwrap());
+            assert!(buf[(x0 + 1, 0)].modifier.contains(Modifier::BOLD));
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             let (lx, ly) = (input.x + 1, input.y - 1);
             assert_eq!(buf[(lx, ly)].symbol(), "→");
             assert_eq!(buf[(lx, ly)].bg, fill.bg.unwrap(), "the input's label");
             assert_eq!(buf[(input.x - 1, input.y)].fg, border, "the input's border");
-            // The main pane has none: its first column is the conversation's, and the column
-            // between it and the cards is blank.
-            assert!(!"┃│".contains(buf[(0, 1)].symbol()), "no border");
+            // The main pane has none: its first column is the conversation's, right of the
+            // sidebar's border.
+            assert!(!"┃│".contains(buf[(x0, 1)].symbol()), "no border");
             for y in 0..input.y - 1 {
-                assert_eq!(buf[(main_w, y)].symbol(), " ", "the gap: {y}");
-                assert_eq!(buf[(main_w, y)].bg, Color::Reset, "the gap: {y}");
+                assert_eq!(buf[(x0 - 1, y)].symbol(), "│", "the sidebar's border: {y}");
             }
         };
         check(&mut st, target_fill(None), Color::Cyan, " ORCHESTRATOR  ");
@@ -16201,13 +16219,14 @@ mod tests {
         // A working thread's icon leads the band, on the terminal's own background.
         st.dive("t-gamma");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
-        assert_eq!(buf[(1, 0)].symbol(), "_");
+        let x0 = st.dock_width_at(120);
+        assert_eq!(buf[(x0 + 1, 0)].symbol(), "_");
         assert_eq!(
-            (buf[(1, 0)].fg, buf[(1, 0)].bg),
+            (buf[(x0 + 1, 0)].fg, buf[(x0 + 1, 0)].bg),
             (icon::ACCENT, Color::Reset)
         );
-        assert_eq!(buf[(3, 0)].symbol(), "‹");
-        assert_eq!(buf[(3, 0)].bg, target_fill(st.dived()).bg.unwrap());
+        assert_eq!(buf[(x0 + 3, 0)].symbol(), "‹");
+        assert_eq!(buf[(x0 + 3, 0)].bg, target_fill(st.dived()).bg.unwrap());
         // With a draft and a card selected, the input's border keeps the color; its label the
         // fill.
         st.set_focus(Some("t-beta".into()));
@@ -16771,8 +16790,9 @@ mod tests {
             st.dive(id);
             let color = color_of(&st, id);
             let buf = crate::app::tests::draw(&mut st, 120, 40);
-            assert_eq!(buf[(0, 0)].bg, color, "{id}");
-            let back = (0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
+            let x0 = st.dock_width_at(120);
+            assert_eq!(buf[(x0, 0)].bg, color, "{id}");
+            let back = (x0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
             assert_eq!(buf[(back, 0)].fg, crate::color::text_on(color), "{id}");
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             assert_eq!(buf[(input.x - 1, input.y)].fg, color, "{id}: the border");
@@ -16812,7 +16832,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(buf[(0, 0)].bg, Color::Magenta, "the band");
+        let x0 = st.dock_width_at(160);
+        assert_eq!(buf[(x0, 0)].bg, Color::Magenta, "the band");
         let cards = card_corners(&st, &buf);
         let corner = |id: &str| cards.iter().find(|(i, ..)| i == id).unwrap().1;
         assert_eq!(corner("t-alpha").fg, Color::DarkGray);
@@ -16829,7 +16850,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            buf[(0, 0)].modifier.contains(Modifier::REVERSED),
+            buf[(x0, 0)].modifier.contains(Modifier::REVERSED),
             "the band"
         );
         let cards = card_corners(&st, &buf);
@@ -16841,7 +16862,7 @@ mod tests {
         // Full color draws as it always did.
         st.view.colors = crate::color::Depth::Full;
         let buf = crate::app::tests::draw(&mut st, 160, 40);
-        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"));
+        assert_eq!(buf[(x0, 0)].bg, color_of(&st, "t-beta"));
         // The compact tab bar without colors: the current tab alone is reversed.
         let mut st = three_threads();
         st.view.compact_width = 60;

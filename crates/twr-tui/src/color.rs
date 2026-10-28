@@ -44,10 +44,16 @@ pub const THREAD_COLORS: [Color; THREAD_PALETTE.len()] = {
 /// ([`ThreadView::color`]); for a view without one (an orchestrator's, or one no registry
 /// folded), one picked from its id (FNV-1a of its bytes), the same on every frame and run.
 pub fn thread_color(t: &ThreadView) -> Color {
-    let at = t.color.map_or_else(
+    color_of(t.color, &t.id)
+}
+
+/// The color of a thread whose view holds `color` (its place in [`THREAD_COLORS`]), else
+/// picked from its `id` as [`thread_color`] does: another workspace's thread as its hub said it.
+pub fn color_of(color: Option<u8>, id: &str) -> Color {
+    let at = color.map_or_else(
         || {
             let mut h: u32 = 0x811c_9dc5;
-            for b in t.id.bytes() {
+            for b in id.bytes() {
                 h ^= u32::from(b);
                 h = h.wrapping_mul(0x0100_0193);
             }
