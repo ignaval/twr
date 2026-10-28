@@ -2079,12 +2079,13 @@ async fn a_name_the_native_account_shares_is_the_named_accounts() {
     hub.shutdown().await;
 }
 
-/// `thread.set_model {runtime}` by the user.
+/// `thread.set_model {runtime}` by the user, past the thread's pin (`outside_pin`).
 async fn move_runtime(hub: &Hub, thread: &str, runtime: &str) -> Value {
     hub.set_thread_model(
         thread,
         ModelRequest {
             runtime: Some(runtime),
+            outside_pin: true,
             ..Default::default()
         },
         &user(),
@@ -2113,7 +2114,7 @@ async fn a_move_back_resumes_the_session_of_that_account_only() {
     let on_work = session(&hub, &t);
 
     // To work2: a new session there.
-    let r = move_to(&hub, &t, "work2", false, &user()).await.unwrap();
+    let r = move_to(&hub, &t, "work2", true, &user()).await.unwrap();
     assert_eq!(r["resumes"], Value::Null, "{r}");
     turn(&hub, &t, "hi").await;
     let s = env.last_start(&t);
@@ -2145,7 +2146,7 @@ async fn a_move_back_resumes_the_session_of_that_account_only() {
     );
 
     // And to work2 again: its own session there.
-    let r = move_to(&hub, &t, "work2", false, &user()).await.unwrap();
+    let r = move_to(&hub, &t, "work2", true, &user()).await.unwrap();
     assert_eq!(r["resumes"], json!(&on_work2), "{r}");
     turn(&hub, &t, "hi").await;
     assert_eq!(
@@ -2154,7 +2155,7 @@ async fn a_move_back_resumes_the_session_of_that_account_only() {
     );
 
     // The native account, where the thread never ran: a new session with the full handoff.
-    let r = move_to(&hub, &t, "default", false, &user()).await.unwrap();
+    let r = move_to(&hub, &t, "default", true, &user()).await.unwrap();
     assert_eq!(r["resumes"], Value::Null, "{r}");
     assert!(
         r["message"]
@@ -2250,7 +2251,7 @@ async fn a_move_back_after_a_directory_change_or_a_re_add_starts_a_new_session()
     )
     .await;
     turn(&hub, &w, "hi").await;
-    move_to(&hub, &w, "work2", false, &user()).await.unwrap();
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
     turn(&hub, &w, "hi").await;
     let moved = env.path("acc/work-moved");
     let hub = env.restart(hub, env.config(Some(&moved))).await;
@@ -2297,7 +2298,7 @@ async fn a_move_back_after_a_directory_change_or_a_re_add_starts_a_new_session()
     )
     .await;
     turn(&hub, &s, "hi").await;
-    move_to(&hub, &s, "work2", false, &user()).await.unwrap();
+    move_to(&hub, &s, "work2", true, &user()).await.unwrap();
     turn(&hub, &s, "hi").await;
     hub.account_remove(
         AccountRemoveParams {

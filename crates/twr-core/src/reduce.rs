@@ -3483,7 +3483,7 @@ mod tests {
             (v.session_id.as_deref(), v.handoff_pending),
             (Some("n-1"), false)
         );
-        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
         // An unstamped start says nothing.
         let unstamped = s.started("u-1");
         let v = view(&[evs[0].clone(), evs[1].clone(), evs[2].clone(), unstamped]);
