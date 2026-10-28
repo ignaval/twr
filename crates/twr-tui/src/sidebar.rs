@@ -302,7 +302,9 @@ impl Dock {
         }
         cards.height -= shift;
         marks.height -= shift;
-        for (r, _) in &mut self.rows {
+        // (The `more` rows' targets with their rows.)
+        let rects = self.rows.iter_mut().map(|(r, _)| r);
+        for r in rects.chain(self.more.iter_mut().map(|(r, _)| r)) {
             if r.y >= end {
                 r.y -= shift;
             }
@@ -539,30 +541,49 @@ fn clip(
         }
     };
     // Before the cards the rows nearest them, after them the first, unless the anchor is
-    // further: then from the row above it (the arrow's), or so that it is the last but one.
+    // further: then from the row above it (the arrow's), or so that it is the last but one
+    // (in a window of one row, the row itself).
+    let arrows = |keep: usize| usize::from(keep >= 2);
     let start_before = match in_before {
-        Some(a) => a.saturating_sub(1).min(before.len() - keep_before),
+        Some(a) => a
+            .saturating_sub(arrows(keep_before))
+            .min(before.len() - keep_before),
         None => before.len() - keep_before,
     };
     let start_after = match in_after {
-        Some(a) if a + 2 > keep_after => (a + 2 - keep_after).min(after.len() - keep_after),
-        _ => 0,
+        Some(a) => (a + 1 + arrows(keep_after))
+            .saturating_sub(keep_after)
+            .min(after.len() - keep_after),
+        None => 0,
     };
     Cut {
-        before: window(before, start_before, keep_before, width),
-        after: window(after, start_after, keep_after, width),
+        before: window(before, start_before, keep_before, width, Side::Before),
+        after: window(after, start_after, keep_after, width, Side::After),
     }
 }
 
+/// The fewest rows a [`window`] says both `↑ more` and `↓ more` in. In two rows it says only
+/// the one away from the current workspace's card (the other row is the anchor's), in one
+/// neither: its row is the workspace's own (the keys still reach the rest).
+const ARROWS_FROM: usize = 3;
+
+/// Which side of the current workspace's card a [`window`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Before,
+    After,
+}
+
 /// Keeps `keep` of `rows` from `start`: where rows were cut above the first one kept, it says
-/// `↑ more`, and where they were cut below the last one, `↓ more`. Returns those rows' places
-/// and the workspace each brings into view: the one of the row it took the place of, else the
-/// nearest one cut beyond it.
+/// `↑ more`, and where they were cut below the last one, `↓ more` (as [`ARROWS_FROM`] says for small windows
+/// kept). Returns those rows' places and the workspace each brings into view: up, the nearest
+/// one whose name row it takes or hides; down, the first whose name row is at it or past it.
 fn window(
     rows: &mut Vec<ListRow>,
     start: usize,
     keep: usize,
     width: usize,
+    side: Side,
 ) -> Vec<(usize, String)> {
     let len = rows.len();
     let end = start + keep;
@@ -570,18 +591,24 @@ fn window(
         rows.truncate(keep);
         return Vec::new();
     }
-    let name = |row: Option<&ListRow>| match row {
+    let name = |i: usize| match rows.get(i) {
         Some((_, Some(WsRow::Workspace(n)))) => Some(n.clone()),
         _ => None,
     };
-    let up = (start > 0)
-        .then(|| (0..=start).rev().find_map(|i| name(rows.get(i))))
+    // A workspace whose card starts at row `i` (its name row).
+    let starts = |i: usize| name(i).filter(|n| i == 0 || name(i - 1).as_ref() != Some(n));
+    // Up: the nearest card whose name row the arrow takes or hides; down: the first card
+    // whose name row is at the arrow's or past it, so that each tap moves on.
+    let both = keep >= ARROWS_FROM;
+    let show_up = start > 0 && (both || (keep == 2 && side == Side::Before));
+    let show_down = end < len && (both || (keep == 2 && side == Side::After));
+    let up = show_up
+        .then(|| (0..=start).rev().find_map(starts))
         .flatten();
-    let down = (end < len)
-        .then(|| (end - 1..len).find_map(|i| name(rows.get(i))))
-        .flatten();
+    let down = show_down.then(|| (end - 1..len).find_map(starts)).flatten();
     rows.truncate(end);
     rows.drain(..start);
+
     let dim = Style::default().fg(Color::DarkGray);
     let arrow = |text: &str| {
         (
@@ -590,11 +617,11 @@ fn window(
         )
     };
     let mut cut = Vec::new();
-    if start > 0 {
+    if show_up {
         rows[0] = arrow("↑ more");
         cut.extend(up.map(|n| (0, n)));
     }
-    if end < len {
+    if show_down {
         let last = rows.len() - 1;
         rows[last] = arrow("↓ more");
         cut.extend(down.map(|n| (last, n)));
@@ -2486,6 +2513,17 @@ mod tests {
                 panic!("{text}");
             };
             tap_at(&mut st, 40, 20, r.x + 1, r.y);
+            // Every `more` target is on its own row, where the rows moved to.
+            let text = rows(&mut st, 40, 20);
+            for (r, t) in &st.view.panes.targets {
+                if matches!(t, Target::WsMore(_)) {
+                    assert!(
+                        text[usize::from(r.y)].contains("more"),
+                        "{}",
+                        text.join("\n")
+                    );
+                }
+            }
         }
         let end = rows(&mut st, 40, 20).join("\n");
         assert!(end.contains("more-7") && end.contains("default"), "{end}");
@@ -2509,6 +2547,15 @@ mod tests {
         let text = rows(&mut st, 40, 20).join("\n");
         assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("more-7".into())));
         assert!(text.contains("more-7"), "{text}");
+        // On a short screen too, each workspace the arrows select is drawn, back to the first.
+        for _ in 0..30 {
+            st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
+            let text = rows(&mut st, 40, 12).join("\n");
+            if let Some(WsRow::Workspace(name)) = st.ws_keyed() {
+                assert!(text.contains(name.as_str()), "{name}: {text}");
+            }
+        }
+        assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("default".into())));
     }
 
     /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:
