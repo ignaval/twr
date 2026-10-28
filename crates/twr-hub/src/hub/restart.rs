@@ -140,7 +140,9 @@ pub(super) struct RunSettings {
     #[serde(default)]
     pub(super) session_store: Option<std::path::PathBuf>,
     /// The login generation of the account the process was started on
-    /// (`AccountsView::login_generation`; 0 on another box). Stamped as
+    /// (`AccountsView::login_generation`; 0 on another box), or, for a process that resumes a
+    /// session an earlier start named, that start's: the login the session began under
+    /// (`Core::carry_login`, as the start is recorded). Stamped as
     /// `ext.twr.account_login` (absent when 0). Not a setting: no restart; a move back resumes
     /// a session only under the generation it ran in (`hub::switch`).
     #[serde(default)]
@@ -148,7 +150,8 @@ pub(super) struct RunSettings {
     /// The login note of the directory the process's login lived in when it started (the
     /// named account's, or the native account's [`RunSettings::session_store`]:
     /// `twr_core::account::login_note`; on the hub's own box only), `None` when there was
-    /// none. Stamped as `ext.twr.login_note` (absent: none). Not a setting: no restart; a
+    /// none; carried from the session's earlier start like [`RunSettings::account_login`]. The
+    /// native account's directory is not carried: each start's is its own. Stamped as `ext.twr.login_note` (absent: none). Not a setting: no restart; a
     /// move back resumes a session only while the note is the same (`hub::switch`).
     #[serde(default)]
     pub(super) login_note: Option<String>,

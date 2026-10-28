@@ -99,8 +99,10 @@
 //! session's start recorded the runtime's own directory it is now (`ext.twr.session_store`,
 //! as the environment the thread's runtime starts with selects it: its selector variable from
 //! `threads.env`, the project's `env` or the hub's, else under `HOME`; a start from before
-//! the stamp is taken to be in it), and the account was not logged in again since that start:
-//! neither as this hub saw it (`ext.twr.account_login`, the account's login generation then:
+//! the stamp is taken to be in it), and the account was not logged in again since the session
+//! began (a start that resumes a session carries the login stamps of the session's earlier
+//! start forward, [`Core::carry_login`], so a settings restart or a hub restart after a login
+//! does not make an older session look newer): neither as this hub saw it (`ext.twr.account_login`, the account's login generation then:
 //! a login `twr account login` or `add` recorded, whatever the check after it found, or a
 //! check that found it logged in after logged out or missing), nor as any workspace's `twr
 //! account login` or `add` noted it (`ext.twr.login_note`, the login note of the account's
@@ -358,7 +360,8 @@ impl Core {
     /// a login this hub recorded since may be another organization's), or under another login
     /// note of its directory than the one there now (`ext.twr.login_note`, absent: none,
     /// against [`Core::login_note`]: `twr account login` or `add` in any workspace wrote one
-    /// since; one that cannot be read is another).
+    /// since; one that cannot be read is another). Those two are the session's first start's,
+    /// which every start that resumed it carried ([`Core::carry_login`]).
     pub(super) fn departure_check(
         &self,
         hub: &Inner,
@@ -518,26 +521,8 @@ impl Core {
     /// no start, as `hub::retry` reads them), as its stamps say. A start the log does not have
     /// counts as one in no directory, unstamped, from the log's beginning.
     fn session_start(&self, thread: &str, seq: u64, session: &str) -> anyhow::Result<SessionStart> {
-        let conn = self.store.conn();
-        let mut start: Option<Event> = None;
-        for kind in ["thread.started", "thread.resumed"] {
-            let found = store::latest_of_kind(conn, thread, kind, STARTS_MAX)?
-                .into_iter()
-                .filter(|e| e.seq < seq && matches!(e.source, Source::Adapter(_)))
-                .map(|e| self.full(e))
-                .find(|e| match &e.body {
-                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
-                        p.session_id.as_deref().is_none_or(|s| s == session)
-                    }
-                    _ => false,
-                });
-            if let Some(e) = found {
-                if start.as_ref().is_none_or(|s| s.seq < e.seq) {
-                    start = Some(e);
-                }
-            }
-        }
-        let Some(e) = &start else {
+        let found = self.newest_start(thread, seq, |s| s.is_none_or(|s| s == session))?;
+        let Some(e) = &found else {
             return Ok(SessionStart::default());
         };
         let twr = match &e.body {
@@ -550,21 +535,80 @@ impl Core {
                 .filter(|d| !d.is_empty())
                 .map(PathBuf::from)
         };
+        let (login, note) = login_stamps(twr);
         Ok(SessionStart {
             began_in: path(ACCOUNT_DIR_KEY),
             store: path(SESSION_STORE_KEY),
-            login: twr
-                .and_then(|t| t.get(ACCOUNT_LOGIN_KEY))
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-            note: twr
-                .and_then(|t| t.get(LOGIN_NOTE_KEY))
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            since: store::event_position(conn, &e.id)?
+            login,
+            note,
+            since: store::event_position(self.store.conn(), &e.id)?
                 .and_then(|(_, g)| g)
                 .unwrap_or(0),
         })
+    }
+
+    /// Of thread `thread`'s latest [`STARTS_MAX`] `thread.started` and `thread.resumed` each
+    /// that a runtime reported (`Source::Adapter`) before `seq`, the newest whose session
+    /// `names` takes.
+    fn newest_start(
+        &self,
+        thread: &str,
+        seq: u64,
+        names: impl Fn(Option<&str>) -> bool,
+    ) -> anyhow::Result<Option<Event>> {
+        let conn = self.store.conn();
+        let mut start: Option<Event> = None;
+        for kind in ["thread.started", "thread.resumed"] {
+            let found = store::latest_of_kind(conn, thread, kind, STARTS_MAX)?
+                .into_iter()
+                .filter(|e| e.seq < seq && matches!(e.source, Source::Adapter(_)))
+                .map(|e| self.full(e))
+                .find(|e| match &e.body {
+                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
+                        names(p.session_id.as_deref())
+                    }
+                    _ => false,
+                });
+            if let Some(e) = found {
+                if start.as_ref().is_none_or(|s| s.seq < e.seq) {
+                    start = Some(e);
+                }
+            }
+        }
+        Ok(start)
+    }
+
+    /// The login a start of thread `thread`'s session `session` (on the hub's own box) that
+    /// is about to be recorded ran under, into `settings` (`RunSettings::account_login`,
+    /// `RunSettings::login_note`): the session's own, as the newest earlier start that named
+    /// it was stamped, so a process that resumes a session (a settings restart, the end of
+    /// an attach, a hub restart, a retry) carries the login the session began under forward,
+    /// never the account's newer one, which a move back compares (`Core::departure_check`).
+    /// A session no earlier start named is a new one: the account's login now, as stamped
+    /// when it started, stays. A log that cannot be read stamps a note no login has
+    /// ([`UNREADABLE_NOTE`]): a move back never resumes that session. The native account's
+    /// directory (`RunSettings::session_store`) is not carried: it is where this process
+    /// looks for the session, and a move back compares that with the directory now.
+    pub(super) fn carry_login(
+        &self,
+        thread: &str,
+        session: &str,
+        settings: &mut super::restart::RunSettings,
+    ) {
+        match self.newest_start(thread, u64::MAX, |s| s == Some(session)) {
+            Ok(None) => {}
+            Ok(Some(e)) => {
+                let twr = match &e.body {
+                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => twr_ext(&p.ext),
+                    _ => None,
+                };
+                (settings.account_login, settings.login_note) = login_stamps(twr);
+            }
+            Err(e) => {
+                tracing::warn!(thread, error = %format!("{e:#}"), "cannot read the session's start: its login is stamped unreadable");
+                settings.login_note = Some(UNREADABLE_NOTE.to_string());
+            }
+        }
     }
 
     /// Whether the session that `start` ran ([`Core::session_start`]), which a move left on
@@ -1034,6 +1078,20 @@ impl Core {
             })
         })
     }
+}
+
+/// The login a start's `ext.twr` stamps: its account's login generation
+/// (`ext.twr.account_login`, absent: 0) and the login note of its directory then
+/// (`ext.twr.login_note`, absent: none).
+fn login_stamps(twr: Option<&JsonMap>) -> (u64, Option<String>) {
+    (
+        twr.and_then(|t| t.get(ACCOUNT_LOGIN_KEY))
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        twr.and_then(|t| t.get(LOGIN_NOTE_KEY))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    )
 }
 
 /// The account a move left (`None`: the native one): its `previous_account` when it changed

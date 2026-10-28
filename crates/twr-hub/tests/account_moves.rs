@@ -3174,3 +3174,167 @@ async fn a_native_session_resumes_only_in_the_store_its_environment_selects() {
     );
     hub.shutdown().await;
 }
+
+/// A process that resumes a session carries the login that session began under: after a login
+/// of its account (`twr account login`: a login recorded and its note written), a settings
+/// restart of the idle thread (an effort change, no prompt) resumes the session as before, but
+/// its start keeps the session's first login (`ext.twr.account_login`, `ext.twr.login_note`),
+/// so a move away and back starts a new session rather than resuming one from before the
+/// login. A new session's start takes the login now.
+#[tokio::test]
+async fn a_resumed_session_keeps_the_login_it_began_under() {
+    let env = Env::new();
+    env.probe.store(true, Ordering::SeqCst);
+    let root = Paths::with_home(env.home.path()).accounts_dir();
+    let hub = env.open(env.config(None)).await;
+    let w = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "w")
+        },
+    )
+    .await;
+    turn(&hub, &w, "hi").await;
+    let first = session(&hub, &w);
+    let starts = env.starts(&w).len();
+
+    // A login of work, then an idle settings restart: the session resumes, its login kept.
+    let note = twr_core::account::note_login(&root, &env.path("acc/work")).unwrap();
+    check_work(&hub, true).await;
+    hub.set_thread_model(
+        &w,
+        ModelRequest {
+            effort: Some("high"),
+            ..Default::default()
+        },
+        &user(),
+    )
+    .await
+    .unwrap();
+    stopped_for(&hub, &w, 1).await;
+    until(&hub, &w, |evs| start_stamps(evs).len() >= 2).await;
+    assert_eq!(env.starts(&w).len(), starts + 1);
+    let s = env.last_start(&w);
+    assert_eq!(s.cfg.resume_session.as_deref(), Some(first.as_str()));
+    assert_eq!(s.cfg.effort.as_deref(), Some("high"));
+    let stamp = start_stamps(&events(&hub, &w)).pop().unwrap();
+    assert!(stamp.get(ACCOUNT_LOGIN_KEY).is_none(), "{stamp}");
+    assert!(stamp.get(LOGIN_NOTE_KEY).is_none(), "{stamp}");
+
+    // Away and back: a session from before the login is not resumed.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    let s = env.last_start(&w);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "a session from before the login"
+    );
+    let second = session(&hub, &w);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &w)).pop().unwrap();
+    assert_eq!(stamp[ACCOUNT_LOGIN_KEY], json!(1), "{stamp}");
+    assert_eq!(stamp[LOGIN_NOTE_KEY], json!(note), "{stamp}");
+
+    // The new session, restarted idle and moved away and back: it resumes.
+    hub.set_thread_model(
+        &w,
+        ModelRequest {
+            effort: Some("low"),
+            ..Default::default()
+        },
+        &user(),
+    )
+    .await
+    .unwrap();
+    let n = start_stamps(&events(&hub, &w)).len();
+    until(&hub, &w, |evs| start_stamps(evs).len() > n).await;
+    let stamp = start_stamps(&events(&hub, &w)).pop().unwrap();
+    assert_eq!(stamp[ACCOUNT_LOGIN_KEY], json!(1), "{stamp}");
+    assert_eq!(stamp[LOGIN_NOTE_KEY], json!(note), "{stamp}");
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    hub.shutdown().await;
+}
+
+/// A relative selector in a project's `env` (`CODEX_HOME = "home-link"`) names a directory
+/// under the thread's working directory, where its runtime starts: the native session's store
+/// is that one, links followed (`ext.twr.session_store`). With the link retargeted while the
+/// session is saved, a move back starts a new session, at the move and at the turn that would
+/// resume one.
+#[tokio::test]
+async fn a_relative_selector_is_the_runtimes_working_directorys() {
+    let env = Env::new();
+    let (ca, cb) = (env.path("codex-a"), env.path("codex-b"));
+    for d in [&ca, &cb] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let link = env.path("api/home-link");
+    let point = |to: &Path| {
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(to, &link).unwrap();
+    };
+    point(&ca);
+    let mut config = env.config(None);
+    config
+        .projects
+        .get_mut("api")
+        .unwrap()
+        .env
+        .insert("CODEX_HOME".into(), "home-link".into());
+    let real = |d: &Path| json!(std::fs::canonicalize(d).unwrap());
+    let hub = env.open(config.clone()).await;
+    let c = create(
+        &hub,
+        NewThread {
+            runtime: Some("codex".into()),
+            ..new_thread("api", "c")
+        },
+    )
+    .await;
+    turn(&hub, &c, "hi").await;
+    let first = session(&hub, &c);
+    let stamp = start_stamps(&events(&hub, &c)).remove(0);
+    assert_eq!(stamp[SESSION_STORE_KEY], real(&ca), "{stamp}");
+    assert_eq!(
+        get(&env.last_start(&c).cfg.env, "CODEX_HOME"),
+        vec!["home-link"]
+    );
+
+    // Retargeted while the session is saved: the move back starts a new session.
+    move_to(&hub, &c, "team", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    point(&cb);
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &c, "hi").await;
+    assert!(env.last_start(&c).cfg.resume_session.is_none());
+    let second = session(&hub, &c);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &c)).pop().unwrap();
+    assert_eq!(stamp[SESSION_STORE_KEY], real(&cb), "{stamp}");
+
+    // Retargeted between the move back and its turn: the turn drops the resume.
+    move_to(&hub, &c, "team", false, &user()).await.unwrap();
+    turn(&hub, &c, "hi").await;
+    let r = move_to(&hub, &c, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&second), "{r}");
+    point(&ca);
+    turn(&hub, &c, "go on").await;
+    let s = env.last_start(&c);
+    assert!(s.cfg.resume_session.is_none());
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier codex session of this thread (c): \
+             the runtime's own directory is not the one that session ran in"
+        ),
+        "{prompt}"
+    );
+    hub.shutdown().await;
+}

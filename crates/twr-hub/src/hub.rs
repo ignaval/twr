@@ -2599,7 +2599,7 @@ impl Core {
         // The native account's session store as the environment it starts with selects it
         // (`Core::native_store`), on the hub's own box: stamped on its start below.
         let store = (view.account.is_none() && view.box_name == LOCAL_BOX)
-            .then(|| self.native_store(&view.runtime, &cfg.env, &cfg.env_remove))
+            .then(|| self.native_store(&view.runtime, &cfg.env, &cfg.env_remove, &cfg.cwd))
             .flatten();
         // Its working directory is held from before it starts until it is gone; refused while
         // the directory's worktree is being removed (a park whose caller went away, whose git
@@ -2684,7 +2684,8 @@ impl Core {
         // (`hub::switch`): the native account's directory as its environment selected it, the
         // account's login generation, and the login note of the directory its login lives in
         // (an account on the hub's own box only; a note that cannot be read is stamped as
-        // such, which no note now matches).
+        // such, which no note now matches). A start that resumes a session takes the session's
+        // login instead when it is recorded (`Core::carry_login`).
         let local = view.box_name == LOCAL_BOX;
         let account_dir = self.account_dir(&view);
         let login_dir = match view.account {

@@ -1006,7 +1006,7 @@ impl Core {
             return None;
         }
         let cfg = super::spawn_config(hub, view, None);
-        self.native_store(runtime, &cfg.env, &cfg.env_remove)
+        self.native_store(runtime, &cfg.env, &cfg.env_remove, &cfg.cwd)
     }
 
     /// The directory runtime `runtime` on the native account keeps its sessions in when it
@@ -1015,12 +1015,16 @@ impl Core {
     /// `GROK_HOME`) as that environment has it, else its default under that environment's
     /// `HOME` (`twr_adapters::account::native_dir`), links followed where it exists. When
     /// `env` and `remove` touch neither the variable nor `HOME`, the hub's own selection
-    /// (`HubOptions::native_dir`). The process's environment is not changed.
+    /// (`HubOptions::native_dir`). A relative directory (a relative selector or `HOME`) is
+    /// the runtime's process's: under `cwd`, the directory it starts in
+    /// (`SpawnConfig::cwd`), before links are followed. The process's environment is not
+    /// changed.
     pub(super) fn native_store(
         &self,
         runtime: &str,
         env: &[(String, String)],
         remove: &[String],
+        cwd: &Path,
     ) -> Option<PathBuf> {
         let selector = twr_adapters::account::support(runtime)?.var;
         let touched = |k: &str| env.iter().any(|(n, _)| n == k) || remove.iter().any(|r| r == k);
@@ -1040,6 +1044,10 @@ impl Core {
             twr_adapters::account::native_dir(runtime, var, home.as_deref())?
         } else {
             (self.account_native_dir)(runtime)?
+        };
+        let dir = match dir.is_relative() && !cwd.as_os_str().is_empty() {
+            true => cwd.join(dir),
+            false => dir,
         };
         Some(std::fs::canonicalize(&dir).unwrap_or(dir))
     }
