@@ -46,6 +46,8 @@
 //!
 //! [`ThreadView`]: twr_core::reduce::ThreadView
 
+use std::sync::Arc;
+
 use serde_json::{json, Value};
 use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
@@ -178,6 +180,19 @@ impl Hub {
         self.inner.core().orchestrator_acts(method, received)
     }
 
+    /// [`Core::orchestrator_admitted`]: the checks of [`Hub::orchestrator_acts`] without
+    /// marking the turn acted.
+    pub fn orchestrator_admitted(
+        &self,
+        method: &str,
+        received: Option<&OrchCall>,
+    ) -> Result<(), RpcError> {
+        self.inner
+            .core()
+            .orchestrator_admitted(method, received)
+            .map(drop)
+    }
+
     /// The orchestrator as a call it makes now is bound to; `None` without one.
     pub fn orchestrator_call(&self) -> Option<OrchCall> {
         self.inner.core().orchestrator_call()
@@ -254,7 +269,7 @@ impl Core {
 
     fn withdraw_locked(
         &mut self,
-        hub: &Inner,
+        hub: &Arc<Inner>,
         id: &str,
         msg_ref: i64,
         caller: &Caller,
@@ -289,6 +304,8 @@ impl Core {
                 }),
             );
             self.append_batch(hub, batch).map_err(append_err)?;
+            // A card that held it closes when it no longer applies (`hub::idle_compact`).
+            self.recheck_idle_offer(hub, id);
             return Ok(with(
                 base,
                 json!({"withdrawn": true, "state": "queued", "prompt": p.prompt}),

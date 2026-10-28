@@ -426,7 +426,7 @@ fn snippet(os: &str, systemctl: bool, spec: &ServiceSpec) -> Service {
 
 /// Whether `body` can go into a heredoc ended by `end`: no line of it is `end` (a backstop:
 /// the values in it hold no newline, [`plain_values`]).
-fn heredoc(body: &str, end: &str) -> bool {
+pub(crate) fn heredoc(body: &str, end: &str) -> bool {
     !body.lines().any(|l| l.trim() == end)
 }
 
@@ -440,7 +440,7 @@ pub fn unit_name(name: &str) -> String {
 /// Where the systemd user manager reads units the user writes, as a shell word:
 /// `$XDG_CONFIG_HOME/systemd/user` (`config_home`, when absolute: quoted), else
 /// `~/.config/systemd/user`.
-fn unit_dir(config_home: Option<&str>) -> String {
+pub(crate) fn unit_dir(config_home: Option<&str>) -> String {
     match config_home.filter(|c| c.starts_with('/')) {
         Some(c) => sh_word(&format!("{}/systemd/user", c.trim_end_matches('/'))),
         None => "~/.config/systemd/user".to_string(),

@@ -1,34 +1,46 @@
 //! Core types for twr, a control tower for parallel coding agents.
 //!
 //! - [`event`]: the event envelope and every event kind
+//! - [`account`]: a runtime's accounts (logins), pins, and when labels show them
 //! - [`activity`]: what a thread is doing, in a few words (its activity line's phrases)
 //! - [`blob`]: content-addressed blob store trait and the 4 KB payload cap
 //! - [`reduce`]: pure reducers (thread views, registry, attention stack, stack order)
 //! - [`adapter`]: the runtime adapter trait and its channel-based handle
+//! - [`fsread`]: bounded, non-blocking reads of other programs' settings files
 //! - [`git`]: the box git trait (worktrees, snapshots) and the porcelain v2 parser
 //! - [`gitremote`]: git remote URLs: which twr clones, how they are shown and compared
 //! - [`project_lookup`]: a git repository by its folder name under the project roots
 //! - [`load`]: how loaded the machine is (pressure stall information, the load average)
 //! - [`paths`], [`config`]: filesystem layout and `config.toml`
 //! - [`notify`]: which control events deserve a user notification
+//! - [`palette`]: the threads' 30 colors and which one a new thread gets
+//! - [`compact`]: the compacted control backlog (`control.subscribe` with `compact`)
 //! - [`proto`], [`client`]: the hub socket protocol and an async client
+//! - [`client_state`]: what a client keeps of the control stream, folded (the hub's snapshot)
 //! - [`runner`]: the hub <-> runner WebSocket protocol
 //! - [`sealed`]: the hub's box key and the sealed channel to an SSH box's daemon
+//! - [`sorted`]: hash sets serialized in a fixed order
+//! - [`speech`]: reading messages aloud: which turns speak, Markdown to sentences, `speech.*` types
 //! - [`testkit`]: event-sequence builders for tests
 //! - [`trace`]: `TWR_TRACE_STARTUP`, the steps of starting twr timed
 //! - [`usage`]: subscription usage windows, their fold and how clients show them
 
+pub mod account;
 pub mod activity;
 pub mod adapter;
 pub mod b64;
 pub mod blob;
 pub mod client;
+pub mod client_state;
+pub mod compact;
 pub mod config;
 pub mod event;
+pub mod fsread;
 pub mod git;
 pub mod gitremote;
 pub mod load;
 pub mod notify;
+pub mod palette;
 pub mod paths;
 pub mod project_lookup;
 pub mod proto;
@@ -36,6 +48,8 @@ pub mod reduce;
 pub mod runner;
 pub mod sealed;
 pub mod shell;
+pub mod sorted;
+pub mod speech;
 pub mod testkit;
 pub mod trace;
 pub mod usage;

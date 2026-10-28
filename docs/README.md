@@ -7,9 +7,11 @@ The [README](../README.md) has the short version: what twr is, install, the main
 | [install.md](install.md) | the install script and its options, release builds and platforms, building from source, static builds, where twr keeps its files |
 | [usage.md](usage.md) | a session from start to end: threads, `say` and `send`, answering cards, reports, attach, park, standing context, the event log |
 | [tui.md](tui.md) | the stack, grid and decision views, keys, slash commands, notifications |
+| [read-aloud.md](read-aloud.md) | reading the orchestrator's messages aloud: `/read`, speakers, `twr speak` and `twr remote` over SSH and mosh, engines |
 | [notifications.md](notifications.md) | the hub's notification command: what it's told and when, ntfy, desktop and Slack recipes |
 | [configuration.md](configuration.md) | every key in `config.toml` with its default, and the environment variables |
 | [runtimes.md](runtimes.md) | Claude Code, Codex, Grok Build, ACP agents and presets, PTY, permission modes, what's been checked against the real CLIs |
+| [accounts.md](accounts.md) | several logins per runtime (two Claude subscriptions, a Codex account per client): adding them, pins, moves, labels, the providers' terms |
 | [orchestrator.md](orchestrator.md) | what the orchestrator may do, the relay rule, reports, switching runtimes and the handoff |
 | [worktrees.md](worktrees.md) | per-thread worktrees, working in your checkout, what parking removes and keeps |
 | [workspaces.md](workspaces.md) | separate twrs on one machine (`twr ws`, `-w`): each with its own hub, orchestrator and threads, as tabs in the TUI |

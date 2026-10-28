@@ -341,12 +341,23 @@ pub fn build_args(cfg: &SpawnConfig) -> Vec<String> {
     a
 }
 
-/// Environment added to the grok process: `cfg.env` and `GROK_DISABLE_AUTOUPDATER=1`.
+/// Environment added to the grok process: `cfg.env` and `GROK_DISABLE_AUTOUPDATER=1`, and
+/// with [`SpawnConfig::native_memory_off`] [`MEMORY_ENV`]`=0`.
 pub fn build_env(cfg: &SpawnConfig) -> Vec<(String, String)> {
     let mut env = cfg.env.clone();
     env.push(("GROK_DISABLE_AUTOUPDATER".into(), "1".into()));
+    if cfg.native_memory_off {
+        env.retain(|(k, _)| k != MEMORY_ENV);
+        env.push((MEMORY_ENV.into(), "0".into()));
+    }
     env
 }
+
+/// Grok's memory switch: `0` turns its cross-session memory off for the whole process, whatever
+/// its config says (grok 1.0.62's docs: "Force-Disable"; only `requirements.toml` ranks above
+/// it). Its memory captures every turn in the background and is read with file tools, which
+/// the orchestrator does not have.
+pub const MEMORY_ENV: &str = "GROK_MEMORY";
 
 impl Adapter for GrokBuildAdapter {
     fn info(&self) -> AdapterInfo {
@@ -361,6 +372,11 @@ impl Adapter for GrokBuildAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// The prompt `/compact` (checked with grok 1.0.62, see `acp`).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let mode = permission_mode(&cfg)?;
@@ -372,6 +388,7 @@ impl Adapter for GrokBuildAdapter {
             &bin,
             &build_args(&cfg),
             &build_env(&cfg),
+            &cfg.env_remove,
             &cwd,
             &fix,
         )?;
@@ -439,8 +456,8 @@ impl Adapter for GrokBuildAdapter {
         if let Some(e) = cfg.effort.as_deref().filter(|e| !e.trim().is_empty()) {
             cmd.args(["--reasoning-effort", e]);
         }
-        cmd.args(["--resume", session_id]).envs(build_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(["--resume", session_id]);
+        process::apply_env_std(&mut cmd, build_env(cfg), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }

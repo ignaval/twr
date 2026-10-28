@@ -2,9 +2,10 @@
 //! its own timeout, and its records are no activity) that is not waiting on the user (no open
 //! permission / question) and has had no event for `stall_after` gets one hub-raised
 //! `attention.raised{reason: stalled, summary: "No activity for N min"}` for that turn. Not
-//! while one of its jobs runs (its own, not a `!` command of the user's, renewed within
-//! [`JOB_ALIVE`]): its turn or its runtime's watcher waits on the job, legitimately silent;
-//! once the job ends, the silence counts again.
+//! while one of its jobs runs or waits for its slots (its own, not a `!` command of the
+//! user's; one this hub runs, [`Core::runs_jobs_of`]: jobs never outlive their hub): its turn
+//! or its runtime's watcher waits on the job, legitimately silent; once the job ends, the
+//! silence counts again.
 //!
 //! A hung turn: a turn open and silent for `hung_after` (`min(stall_after, 5 min)`), counted
 //! from its last event or from when the oldest prompt queued for the thread arrived, whichever
@@ -28,6 +29,11 @@
 //! `ext.twr.went_on` ([`WENT_ON_KEY`]): only such a stall resolved by itself (a client folds
 //! it away, and a summary's basis reads past it, [`Core::stall_went_on`]). Startup resolves
 //! any stalled item whose turn is no longer active (logs written before that), without it.
+//! While its runtime compacts its context (a `context.compacting` without its
+//! `context.compacted`, [`ThreadView::compacting`]), which can be minutes of silence, a thread
+//! gets neither a stalled item nor a hung-turn card, for at most
+//! [`COMPACTING_HOLD_SECS`] from the compaction's start ([`compaction_holds`]); past that its
+//! silence counts as any other.
 //! Inventory heartbeats renew task liveness without resetting stalls or repeatedly resolving
 //! and raising them. A thread has at most one open stalled item. The check runs on a hub tick
 //! every `min(30 s, stall_after / 4)`; `stall_after_secs = 0` turns it off.
@@ -51,17 +57,20 @@ use super::{
 /// The longest a turn may be silent while a prompt waits before it is hung.
 pub const HUNG_AFTER_MAX: Duration = Duration::from_secs(5 * 60);
 
-/// How recently a job must have renewed its task to count as running (it renews every
-/// [`super::jobs::PROGRESS_EVERY`]).
-pub const JOB_ALIVE: chrono::Duration = chrono::Duration::minutes(3);
-
 /// How long a turn may be silent while a prompt waits, for stall threshold `after`.
 pub fn hung_after(after: Duration) -> Duration {
     after.min(HUNG_AFTER_MAX)
 }
 
+/// Whether `v`'s runtime is compacting its context at `now`, begun less than
+/// [`COMPACTING_HOLD_SECS`] ago: its silence is no stall (see the module docs).
+pub(super) fn compaction_holds(v: &ThreadView, now: DateTime<Utc>) -> bool {
+    let hold = chrono::Duration::seconds(i64::try_from(COMPACTING_HOLD_SECS).unwrap_or(i64::MAX));
+    v.compacting.is_some_and(|since| now - since < hold)
+}
+
 /// The hung-turn cards (see the module docs), folded from the log.
-#[derive(Debug, Default)]
+#[derive(PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct HungState {
     /// Open cards: attn_id -> (thread, turn).
     cards: HashMap<String, (String, u64)>,
@@ -75,7 +84,7 @@ const WENT_ON_KEPT: usize = 64;
 
 /// The plain stalls each thread went on from ([`WENT_ON_KEY`]; not a hung-turn card), folded
 /// from the log: thread -> attn_ids, oldest first, at most [`WENT_ON_KEPT`].
-#[derive(Debug, Default)]
+#[derive(PartialEq, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct WentOn(HashMap<String, VecDeque<String>>);
 
 /// Longest tick period.
@@ -116,7 +125,11 @@ impl Core {
         let mut hung: Vec<(String, u64, String, Option<String>)> = Vec::new();
         let mut due: Vec<(String, Option<u64>, String)> = Vec::new();
         for v in self.registry.list() {
-            if v.attached.is_some() || v.is_blocked() || v.last_activity.is_none() {
+            if v.attached.is_some()
+                || v.is_blocked()
+                || v.last_activity.is_none()
+                || compaction_holds(v, now)
+            {
                 continue;
             }
             if let Some((turn, waiting)) = self.hung_turn(v, now, hung_chrono)? {
@@ -143,7 +156,7 @@ impl Core {
                 // A job has its own timeout: only the runtime's own work stalls.
                 || !v.runtime_work()
                 // Its turn or its runtime's watcher waits on a job of its own.
-                || job_running(v, now)
+                || self.runs_jobs_of(&v.id)
             {
                 continue;
             }
@@ -524,14 +537,6 @@ impl Core {
     }
 }
 
-/// Whether a job of `v`'s own (not a `!` command of the user's) runs at `now`: renewed within
-/// [`JOB_ALIVE`].
-fn job_running(v: &ThreadView, now: DateTime<Utc>) -> bool {
-    v.background_tasks
-        .values()
-        .any(|t| t.job && !t.shell && now - t.updated_at <= JOB_ALIVE)
-}
-
 /// Whether `events` (a batch) have `thread`'s own work going on ([`goes_on`]) and nothing that
 /// ends it ([`ends_work`]); `stopping`: its open turn was being interrupted or taken back.
 fn went_on_in(events: &[BatchEvent], thread: &str, stopping: bool) -> bool {
@@ -552,6 +557,8 @@ fn goes_on(e: &BatchEvent, stopping: bool) -> bool {
         | EventBody::AgentToolCall(_)
         | EventBody::AgentToolResult(_)
         | EventBody::AgentThinking(_)
+        | EventBody::ContextCompacting(_)
+        | EventBody::ContextCompacted(_)
         | EventBody::TurnStarted(_) => true,
         EventBody::TaskUpdated(p) => !p.heartbeat,
         EventBody::TurnEnded(p) => p.result == TurnResult::Completed && !stopping,
@@ -635,5 +642,47 @@ mod tests {
             Duration::from_millis(100)
         );
         assert_eq!(tick_period(Duration::from_millis(1)), TICK_MIN);
+    }
+
+    /// A compaction holds the checks from its start for at most `COMPACTING_HOLD_SECS`; its
+    /// end, or the end of its turn, lets them go at once.
+    #[test]
+    fn a_compaction_holds_the_checks_for_a_while() {
+        let t0 = Utc::now();
+        let mut v = ThreadView::new("t");
+        let at = |n: i64| t0 + chrono::Duration::seconds(n);
+        let ev = |seq: u64, ts: DateTime<Utc>, body: EventBody| {
+            let mut e = Event::new("t", seq, Some(1), Source::Adapter("fake".into()), body);
+            e.ts = ts;
+            e
+        };
+        v.apply(&ev(
+            1,
+            at(0),
+            EventBody::TurnStarted(TurnStarted::default()),
+        ));
+        assert!(!compaction_holds(&v, at(1)));
+        v.apply(&ev(
+            2,
+            at(10),
+            EventBody::ContextCompacting(ContextCompacting::default()),
+        ));
+        let hold = i64::try_from(COMPACTING_HOLD_SECS).unwrap();
+        assert!(compaction_holds(&v, at(10 + 600)));
+        assert!(compaction_holds(&v, at(10 + hold - 1)));
+        assert!(!compaction_holds(&v, at(10 + hold)));
+        v.apply(&ev(
+            3,
+            at(20),
+            EventBody::ContextCompacted(ContextCompacted::default()),
+        ));
+        assert!(!compaction_holds(&v, at(21)));
+        v.apply(&ev(
+            4,
+            at(30),
+            EventBody::ContextCompacting(ContextCompacting::default()),
+        ));
+        v.apply(&ev(5, at(31), EventBody::TurnEnded(TurnEnded::default())));
+        assert!(!compaction_holds(&v, at(32)));
     }
 }

@@ -223,7 +223,7 @@ impl Dir {
     /// Moves its entry `name` (whatever it is) to `to`'s entry `new` only when there is none:
     /// `AlreadyExists` otherwise, and an error where that cannot be told atomically
     /// ([`rename_new`]).
-    pub(super) fn rename_new(&self, name: &OsStr, to: &Dir, new: &OsStr) -> io::Result<()> {
+    pub fn rename_new(&self, name: &OsStr, to: &Dir, new: &OsStr) -> io::Result<()> {
         let (a, b) = (entry(name)?, entry(new)?);
         rename_new(self.file.as_raw_fd(), &a, to.file.as_raw_fd(), &b)
     }
@@ -355,7 +355,7 @@ impl Dir {
     /// system: `fdopendir` of a duplicate of it, rewound first (a duplicate shares its read
     /// position). Never by a path: the directory held, wherever it is now and whatever is at the
     /// path it was reached by.
-    pub(crate) fn listed(&self) -> io::Result<Vec<OsString>> {
+    pub fn listed(&self) -> io::Result<Vec<OsString>> {
         sys()?;
         /// Closes the stream (and with it the duplicate) when dropped.
         struct Stream(*mut libc::DIR);

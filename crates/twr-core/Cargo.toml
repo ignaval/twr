@@ -14,6 +14,8 @@ chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
 libc.workspace = true
+# `speech::utterances`: a message's Markdown read as sentences (the parser only).
+pulldown-cmark.workspace = true
 # The runner handshake's HMAC-SHA256 proofs and nonces (`runner::auth_proof`): the ring
 # that rustls already builds.
 ring.workspace = true

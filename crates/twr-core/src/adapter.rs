@@ -71,6 +71,9 @@ pub struct SpawnConfig {
     /// `TWR_AGENT=<thread id>:<generation>` so its socket tells the process (and whatever it
     /// starts) from the user.
     pub env: Vec<(String, String)>,
+    /// Environment variables the runtime process must not inherit (stray credentials when it
+    /// runs on a named account), removed after `env` is applied: a name in both is removed.
+    pub env_remove: Vec<String>,
     /// Session to resume instead of starting a new one.
     pub resume_session: Option<String>,
     /// Turn number of the initial `prompt` passed to [`Adapter::spawn`] (default 1).
@@ -91,6 +94,11 @@ pub struct SpawnConfig {
     /// What a Codex thread in `auto` does with a command its sandbox does not allow (`[codex]
     /// auto`, `[projects.<name>] codex_auto`). Other runtimes and modes ignore it.
     pub codex_auto: CodexAuto,
+    /// Turn the runtime's own cross-session memory off (the orchestrator's: it keeps twr's
+    /// memory instead, `twr-hub`'s `hub::memory`): Codex's `memories` feature and Grok
+    /// Build's memory (`GROK_MEMORY=0`). Claude Code ignores it (its orchestrator keeps its
+    /// own memory directory). Never sent to a runner.
+    pub native_memory_off: bool,
 }
 
 /// What a Codex thread in `auto` mode does with a command its sandbox does not allow, when
@@ -175,6 +183,14 @@ pub enum AdapterCmd {
     },
     /// Cancel only the current turn, keeping the runtime session alive.
     Interrupt,
+    /// Start turn `turn` as a compaction of the session's context (the user's `/compact`):
+    /// Claude Code and Grok Build get `/compact` as the turn's message, Codex
+    /// `thread/compact/start`. Like a prompt, the hub sends it only between turns. Only an
+    /// adapter that [`Adapter::compacts`] is sent one; any other ends the turn `error`.
+    Compact {
+        /// Turn number assigned by the hub; echoed on the turn's events.
+        turn: u64,
+    },
     /// Stop the runtime (interrupting any running turn).
     Stop,
 }
@@ -296,6 +312,11 @@ impl AdapterHandle {
             text: text.into(),
             turn,
         })
+    }
+
+    /// Starts turn `turn` as a compaction of the session's context ([`AdapterCmd::Compact`]).
+    pub fn compact(&self, turn: u64) -> Result<(), AdapterGone> {
+        self.command(AdapterCmd::Compact { turn })
     }
 
     /// Answers attention item `attn_id`.
@@ -461,6 +482,13 @@ pub trait Adapter: Send + Sync + 'static {
     /// one cannot, and an adapter that ignores the command overrides this with `false`.
     fn interrupts_turns(&self) -> bool {
         self.info().tier == Tier::Headless
+    }
+
+    /// Whether [`AdapterCmd::Compact`] compacts the session's context here (the user's
+    /// `/compact`, `thread.compact`). Default: no; the hub refuses the request naming the
+    /// runtime.
+    fn compacts(&self) -> bool {
+        false
     }
 
     /// The program this adapter starts (its argv[0], as the spawn would resolve it now: an

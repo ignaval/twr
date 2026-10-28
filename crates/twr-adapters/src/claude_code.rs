@@ -371,6 +371,11 @@ impl Adapter for ClaudeCodeAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// `/compact` as the turn's message ([`Translator::compact_message`]).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let mode = permission_mode(&cfg)?;
@@ -472,8 +477,8 @@ impl ClaudeCodeAdapter {
         if let Some(e) = effort {
             cmd.args([cli::EFFORT, e]);
         }
-        cmd.args(tool_args(cfg)).envs(process::attach_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(tool_args(cfg));
+        process::apply_env_std(&mut cmd, process::attach_env(cfg), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }
@@ -573,13 +578,12 @@ impl Start {
         let plan = cli::plan(bin, help.support(), self.mode, &full).map_err(anyhow::Error::msg)?;
         let mut cmd = process::wrapped(&cfg.wrap, bin);
         cmd.args(build_args_with(cfg, &session_id, plan))
-            .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         process::new_session(&mut cmd);
-        process::scrub(&mut cmd);
+        process::apply_env(&mut cmd, cfg.env.iter().cloned(), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }
@@ -874,6 +878,11 @@ fn on_cmd(
             if let Some(line) = tr.interrupt() {
                 queue_line(stdin, line);
             }
+            false
+        }
+        Some(AdapterCmd::Compact { turn }) => {
+            let line = tr.compact_message(turn);
+            queue_line(stdin, line);
             false
         }
         Some(AdapterCmd::Stop) | None => true,

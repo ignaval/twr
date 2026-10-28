@@ -214,6 +214,67 @@ async fn jobs_wait_for_slots_in_turn_and_count_as_background_work() {
     hub.request_shutdown();
 }
 
+/// What the hub shows of a job it runs (`thread.get`, the activity line) is what the job does
+/// now, not its last renewal (every 5 min): a queued job moves up when one before it goes.
+#[tokio::test]
+async fn a_jobs_shown_state_is_what_it_does_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(opts(dir.path(), 1)).await.unwrap();
+    let t = thread(&hub, &dir.path().join("proj"), "api").await;
+    let job = |name: &str| {
+        start(
+            &hub,
+            &t,
+            &["sleep", "30"],
+            json!({"wake": false, "name": name}),
+        )["job"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let a = job("a");
+    until(&hub, &t, |evs| {
+        evs.iter().any(|e| {
+            matches!(&e.body, EventBody::TaskUpdated(p)
+            if p.task_id == format!("job:{a}") && p.description == "job a: running")
+        })
+    })
+    .await;
+    let (b, c) = (job("b"), job("c"));
+    let shown = |job: &str| {
+        hub.get_thread(&t).unwrap()["background_tasks"][format!("job:{job}")]["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(shown(&a), "job a: running");
+    assert_eq!(shown(&c), "job c: queued (1 ahead)");
+    hub.cancel_job(&b, None).unwrap();
+    until(&hub, &t, |evs| job_end(evs, &b).is_some()).await;
+    assert_eq!(shown(&c), "job c: queued (0 ahead)");
+    let activity = hub.thread_activity()[&t]["activity"].clone();
+    assert!(
+        activity
+            .as_str()
+            .unwrap()
+            .contains("job c: queued (0 ahead)"),
+        "{activity}"
+    );
+    // The log still says what its start said: nothing was recorded for the move.
+    let recorded = hub.thread_view(&t).unwrap().background_tasks[&format!("job:{c}")]
+        .description
+        .clone();
+    assert_eq!(recorded, "job c: queued (1 ahead)");
+    for j in [&a, &c] {
+        hub.cancel_job(j, None).unwrap();
+    }
+    until(&hub, &t, |evs| {
+        job_end(evs, &a).is_some() && job_end(evs, &c).is_some()
+    })
+    .await;
+    hub.request_shutdown();
+}
+
 #[tokio::test]
 async fn a_cancel_or_a_timeout_ends_its_process_group() {
     let dir = tempfile::tempdir().unwrap();

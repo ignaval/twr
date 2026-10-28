@@ -603,6 +603,7 @@ impl Adapter for AcpAdapter {
             &program,
             &argv[1..],
             &program_env(&cfg),
+            &cfg.env_remove,
             &cwd,
             MISSING_FIX,
         )?;
@@ -655,8 +656,8 @@ impl Adapter for AcpAdapter {
         let template = parse_argv(env_of(cfg, ATTACH_ENV)?, ATTACH_ENV).ok()?;
         let argv = attach_argv(&template, session_id, cfg)?;
         let mut cmd = std::process::Command::new(&argv[0]);
-        cmd.args(&argv[1..]).envs(process::attach_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(&argv[1..]);
+        process::apply_env_std(&mut cmd, process::attach_env(cfg), &cfg.env_remove);
         if !cfg.cwd.as_os_str().is_empty() {
             cmd.current_dir(&cfg.cwd);
         }

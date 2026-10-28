@@ -324,6 +324,8 @@ pub struct BlockContext {
     pub transient: bool,
     /// Some `ext.<runtime>.auth_failed` flag is true: the agent is not signed in.
     pub auth_failed: bool,
+    /// The turn hit a usage or spending limit ([`limited_flag`]).
+    pub limited: bool,
 }
 
 /// Whether any runtime section of an event's `ext` carries `transient: true`
@@ -341,6 +343,16 @@ pub fn auth_failed_flag(ext: Option<&JsonMap>) -> bool {
     ext.is_some_and(|m| {
         m.values()
             .any(|v| v.get("auth_failed").and_then(|t| t.as_bool()) == Some(true))
+    })
+}
+
+/// Whether any section of an event's `ext` carries a `limit` object (`ext.twr.limit`, which
+/// the adapters set on a turn that hit a usage or spending limit, or a runtime's own
+/// `ext.<runtime>.limit`).
+pub fn limited_flag(ext: Option<&JsonMap>) -> bool {
+    ext.is_some_and(|m| {
+        m.values()
+            .any(|v| v.get("limit").is_some_and(|l| l.is_object()))
     })
 }
 
@@ -490,5 +502,24 @@ mod tests {
         ));
         assert!(!transient_flag(m(json!({"transient": true})).as_ref()));
         assert!(!transient_flag(None));
+    }
+
+    #[test]
+    fn limited_flag_reads_twr_and_runtime_sections() {
+        let m = |v: serde_json::Value| v.as_object().cloned();
+        assert!(limited_flag(
+            m(json!({"twr": {"error": "x", "limit": {"kind": "usage", "message": "x"}}})).as_ref()
+        ));
+        assert!(limited_flag(
+            m(json!({"codex": {"limit": {"kind": "spend"}}})).as_ref()
+        ));
+        assert!(!limited_flag(
+            m(json!({"twr": {"limit": "usage"}})).as_ref()
+        ));
+        assert!(!limited_flag(m(json!({"twr": {"limit": null}})).as_ref()));
+        assert!(!limited_flag(
+            m(json!({"claude": {"transient": true}})).as_ref()
+        ));
+        assert!(!limited_flag(None));
     }
 }

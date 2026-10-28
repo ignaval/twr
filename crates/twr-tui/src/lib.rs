@@ -13,10 +13,13 @@
 //! The TUI is only a view: reports, routing and attention all live in the hub, so nothing here is
 //! required for the report path to work without a screen.
 
+pub mod accounts;
 pub mod app;
 #[cfg(test)]
 mod bench;
 pub mod color;
+#[cfg(test)]
+mod compact_tests;
 pub mod config_edit;
 pub mod edit;
 pub mod firstrun;
@@ -31,6 +34,11 @@ pub mod settings;
 pub mod shell;
 pub mod sidebar;
 pub mod slash;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
+pub mod speaker;
+pub mod speech;
 pub mod suggest;
 pub mod summary;
 pub mod terminal_setup;
@@ -52,6 +60,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
 use twr_core::client::{Client, HubClosed};
+use twr_core::client_state::ClientFold;
 use twr_core::event::EventBody;
 use twr_core::proto::StreamItem;
 
@@ -172,17 +181,42 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
             let value = |k: &str| result[k].as_str().unwrap_or("default").to_string();
             let now = format!("model {}, effort {}", value("model"), value("effort"));
             if result["changed"].as_bool() == Some(false) {
+                // Asked for an account it is on: the hub's message names it
+                // (`api already runs on claude-code:work with ...`). Asked for the runtime
+                // alone, or the model: what it has, as without accounts.
+                let on_account = match (result["runtime"].as_str(), result["account"].as_str()) {
+                    (Some(rt), Some(a)) => format!("{name} already runs on {rt}:{a} "),
+                    _ => String::new(),
+                };
+                if let Some(m) = result["message"]
+                    .as_str()
+                    .filter(|m| !on_account.is_empty() && m.starts_with(&on_account))
+                {
+                    return Some(m.to_string());
+                }
                 return Some(format!("{name} already has {now}"));
             }
-            // A move to another runtime: the hub's message says when its session starts.
-            if result["runtime_changed"].as_bool() == Some(true) {
+            // A move to another runtime or account: the hub's message says when its session
+            // starts.
+            if result["runtime_changed"].as_bool() == Some(true)
+                || result["account_changed"].as_bool() == Some(true)
+            {
                 let runtime = result["runtime"].as_str().unwrap_or("?");
+                let same_runtime = result["runtime_changed"].as_bool() != Some(true);
+                let to = match result["account"].as_str() {
+                    Some(a) if same_runtime => format!("{runtime}:{a}"),
+                    _ => runtime.to_string(),
+                };
                 let mut msg = result["message"]
                     .as_str()
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("{name} moves to {runtime} with {now}"));
+                    .unwrap_or_else(|| format!("{name} moves to {to} with {now}"));
                 if result["applies"].as_str() == Some("after_turn") {
-                    msg.push_str("; the current turn finishes on the previous runtime first");
+                    msg.push_str(if same_runtime {
+                        "; the current turn finishes on the previous account first"
+                    } else {
+                        "; the current turn finishes on the previous runtime first"
+                    });
                 }
                 if result["stops_background_tasks"].as_bool() == Some(true) {
                     msg.push_str("; its background tasks end with it");
@@ -247,6 +281,13 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
             return Some(msg);
         }
         "thread.resume" => return Some("resumed".into()),
+        "thread.compact" => {
+            let name = result["thread_name"].as_str().unwrap_or("the thread");
+            return Some(match result["state"].as_str() {
+                Some("started") => format!("{name} compacts its context now"),
+                _ => format!("{name} compacts its context after its running turn"),
+            });
+        }
         "thread.trim" => {
             let name = result["thread_name"].as_str().unwrap_or("?");
             let deleted = result["deleted"].as_array().map_or(0, Vec::len);
@@ -340,10 +381,13 @@ fn method_status(method: &str, result: &Value) -> Option<String> {
                     h["summary_note"].as_str().unwrap_or("skipped")
                 )
             };
-            let mut msg = format!(
-                "the orchestrator is now {} (a new session{handoff})",
-                result["runtime"].as_str().unwrap_or("?")
-            );
+            // With its account while its runtime shows account labels: `claude-code:work`.
+            let rt = result["runtime"].as_str().unwrap_or("?");
+            let runtime = match result["account"].as_str() {
+                Some(a) if result["account_shown"].as_bool() == Some(true) => format!("{rt}:{a}"),
+                _ => rt.to_string(),
+            };
+            let mut msg = format!("the orchestrator is now {runtime} (a new session{handoff})");
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -419,6 +463,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         | Action::SettingsFile
         | Action::TerminalSetup { .. } => None,
         Action::ConfigShow => Some(("config.show", Value::Null)),
+        Action::Speech { method, params } => Some((*method, params.clone())),
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -491,6 +536,18 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             Some(("thread.set_model", p))
         }
+        // `outside_pin` only when set: a hub before accounts takes no such field.
+        Action::SetAccount {
+            thread,
+            account,
+            outside_pin,
+        } => {
+            let mut p = json!({ "thread": thread, "account": account });
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
+            }
+            Some(("thread.set_model", p))
+        }
         Action::Dismiss { attn_id, revision } => {
             let mut p = json!({ "attn_id": attn_id });
             if *revision > 0 {
@@ -519,6 +576,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Park { thread } => Some(("thread.park", json!({"thread": thread}))),
         Action::Resume { thread } => Some(("thread.resume", json!({"thread": thread}))),
         Action::Trim { thread } => Some(("thread.trim", json!({"thread": thread}))),
+        Action::CompactContext { thread } => Some(("thread.compact", json!({"thread": thread}))),
         Action::ResetOrchestrator => Some(("orchestrator.reset", json!({}))),
         Action::UseOrchestrator {
             runtime,
@@ -538,6 +596,8 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             project,
             runtime,
             name,
+            account,
+            outside_pin,
         } => {
             let mut p = json!({ "project": project_param(project) });
             if let Some(r) = runtime {
@@ -545,6 +605,12 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if let Some(n) = name {
                 p["name"] = json!(n);
+            }
+            if let Some(a) = account {
+                p["account"] = json!(a);
+            }
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
             }
             Some(("thread.new", p))
         }
@@ -707,6 +773,10 @@ fn save_setting(change: &settings::Change) -> Result<String, String> {
 
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
 const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
+
+/// How often the current workspace's hub is asked what its speakers read (`speech.status`,
+/// [`speech`]): the status bar's note and the conversation's `▶` follow it.
+pub const SPEECH_EVERY: Duration = Duration::from_secs(2);
 
 /// How long quitting waits for the input history's last lines to be written.
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
@@ -1493,16 +1563,21 @@ pub const INFO_EVERY: Duration = Duration::from_secs(10);
 /// How long the tab strip waits for one hub's answer.
 const TAB_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info` and
-/// `orchestrator.show`, the connection for calls, and the control stream with the head its
-/// replay runs up to.
+/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info`,
+/// `orchestrator.show` and `account.list`, the connection for calls, and the control stream
+/// with the head its replay runs up to (and, compacted, how many items the replay has), or the
+/// state at that head (a snapshot) when the hub gave it: the stream then brings what comes
+/// after it.
 struct Session {
     socket: PathBuf,
     calls: Client,
     info: Value,
     show: Value,
+    accounts: Value,
     control: ItemStream,
     head: u64,
+    backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
 }
 
 impl Session {
@@ -1529,21 +1604,38 @@ impl Session {
         })
         .await
         .unwrap_or(Value::Null);
-        let control = within(
+        let ControlStart {
+            sub: control,
+            backlog,
+            snapshot,
+        } = within(
             CONNECT_TIMEOUT,
             "subscribing to the control stream",
-            async {
-                connect(socket)
-                    .await?
-                    .subscribe("control.subscribe", json!({"since": 0}))
-                    .await
-                    .context("subscribing to the control stream")
-            },
+            subscribe_control(socket),
         )
         .await?;
-        // The replay up to the ack's head is the initial state; focus waits for it.
+        // The replay up to the ack's head (or the snapshot at it) is the initial state; focus
+        // waits for it.
         let head = control.ack()["head"].as_u64().unwrap_or(0);
-        twr_core::trace::mark_with(|| format!("tui: control subscribed (head {head})"));
+        twr_core::trace::mark_with(|| match (&snapshot, backlog) {
+            (Some(fold), _) => format!(
+                "tui: control subscribed (head {head}, a snapshot of {} threads)",
+                fold.registry.list().len() + fold.registry.deleted_views().count()
+            ),
+            (None, Some(n)) => {
+                format!("tui: control subscribed (head {head}, {n} items compacted)")
+            }
+            (None, None) => format!("tui: control subscribed (head {head})"),
+        });
+        // The accounts, asked for once subscribed: the answer is as new as the replay's end
+        // (or the snapshot's head) at least, and each `account.*` event after it asks again. A
+        // hub older than accounts has none (null): no labels. Another failure (no answer in
+        // time) is `{failed: true}`: asked for again soon (`AppState::accounts_answered`).
+        let accounts = within(CONNECT_TIMEOUT, "asking for the accounts", async {
+            calls.call("account.list", json!({})).await
+        })
+        .await
+        .unwrap_or_else(|e| accounts_failure(&e));
         let blobs = connect(socket).await?;
         let control = read_ahead(hydrating(
             Box::pin(control.into_stream()),
@@ -1556,9 +1648,137 @@ impl Session {
             calls,
             info,
             show,
+            accounts,
             control,
             head,
+            backlog,
+            snapshot,
         })
+    }
+}
+
+/// How the control stream starts ([`subscribe_control`]): the subscription, and either the
+/// state at its head (`snapshot`: the subscription brings what comes after it), or the
+/// backlog to replay, compacted (`backlog`: how many items it has) or not.
+struct ControlStart {
+    sub: twr_core::client::Subscription,
+    backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
+}
+
+/// Subscribes to the control stream from its start, on a connection of its own, asking for
+/// the state at its head ([`ClientFold`], `snapshot`) instead of the items up to it. A hub
+/// may answer with its stored backlog instead, compacted ([`twr_core::compact`]: what the TUI
+/// folds of it, without the updates that change nothing of that; the ack's `backlog` says
+/// how many items it has). A hub from before snapshots refuses `snapshot` (`bad_request`): it
+/// is asked again for a compacted backlog; one from before compaction refuses `compact` too,
+/// and is asked again for the whole log.
+///
+/// A snapshot this TUI cannot read (malformed, or of another version: a hub of another
+/// build) is dropped with its subscription, and the stream is asked for again as from a hub
+/// without snapshots: the TUI then replays the log as before, rather than not starting.
+async fn subscribe_control(socket: &Path) -> anyhow::Result<ControlStart> {
+    let refused = |e: &anyhow::Error| {
+        e.downcast_ref::<twr_core::proto::RpcError>()
+            .is_some_and(|r| r.code == twr_core::proto::codes::BAD_REQUEST)
+    };
+    let asked = connect(socket)
+        .await?
+        .subscribe(
+            "control.subscribe",
+            json!({"since": 0, "compact": true, "snapshot": true}),
+        )
+        .await;
+    match asked {
+        Ok(sub) => match read_snapshot(sub.ack()) {
+            Ok(Some(fold)) => {
+                return Ok(ControlStart {
+                    sub,
+                    backlog: None,
+                    snapshot: Some(fold),
+                })
+            }
+            Ok(None) => {
+                let backlog = compacted_backlog(sub.ack());
+                return Ok(ControlStart {
+                    sub,
+                    backlog,
+                    snapshot: None,
+                });
+            }
+            Err(e) => {
+                twr_core::trace::mark_with(|| format!("tui: control snapshot unread: {e:#}"));
+            }
+        },
+        Err(e) if refused(&e) => {}
+        Err(e) => return Err(e).context("subscribing to the control stream"),
+    }
+    let compacted = connect(socket)
+        .await?
+        .subscribe("control.subscribe", json!({"since": 0, "compact": true}))
+        .await;
+    match compacted {
+        Ok(sub) => {
+            let backlog = compacted_backlog(sub.ack());
+            Ok(ControlStart {
+                sub,
+                backlog,
+                snapshot: None,
+            })
+        }
+        Err(e) if refused(&e) => {
+            let sub = connect(socket)
+                .await?
+                .subscribe("control.subscribe", json!({"since": 0}))
+                .await
+                .context("subscribing to the control stream")?;
+            Ok(ControlStart {
+                sub,
+                backlog: None,
+                snapshot: None,
+            })
+        }
+        Err(e) => Err(e).context("subscribing to the control stream"),
+    }
+}
+
+/// How many items the compacted backlog a `control.subscribe` `ack` announces has (`None`:
+/// it is not compacted).
+fn compacted_backlog(ack: &Value) -> Option<u64> {
+    (ack["compacted"] == true)
+        .then(|| ack["backlog"].as_u64())
+        .flatten()
+}
+
+/// The snapshot a `control.subscribe` `ack` carries (`None`: it has none, its backlog
+/// follows), or why it can't be read.
+fn read_snapshot(ack: &Value) -> anyhow::Result<Option<ClientFold>> {
+    let Some(snapshot) = ack.get("snapshot").filter(|s| !s.is_null()) else {
+        return Ok(None);
+    };
+    // Folded by this TUI's own code only ([`twr_core::client_state::FOLD`]): a hub of another
+    // build may fold the same items otherwise, and one that does not say its fold is unknown.
+    let fold = ack["snapshot_fold"].as_str();
+    anyhow::ensure!(
+        fold == Some(twr_core::client_state::FOLD),
+        "snapshot folded by {}, not this build's {}",
+        fold.unwrap_or("an unnamed fold"),
+        twr_core::client_state::FOLD
+    );
+    let fold = serde_json::from_value(snapshot.clone()).context("reading the snapshot")?;
+    Ok(Some(fold))
+}
+
+/// What a failed `account.list` call (`e`) tells the view (`AppState::accounts_answered`):
+/// `null` from a hub older than accounts (its unknown method: no accounts, never asked
+/// again), else `{failed: true}` (asked for again after a wait).
+fn accounts_failure(e: &anyhow::Error) -> Value {
+    match e
+        .downcast_ref::<twr_core::proto::RpcError>()
+        .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND)
+    {
+        true => Value::Null,
+        false => json!({"failed": true}),
     }
 }
 
@@ -2017,6 +2237,9 @@ async fn serve_calls(
         };
         let named = params["ref"].clone();
         let named_job = params["job"].clone();
+        // What a `speech.*` call asked goes with its answer: the words for what it did need
+        // it ([`speech::SpeechView::answered`]).
+        let asked = method.starts_with("speech.").then(|| params.clone());
         let answer = calls.call(method, params).await;
         if let (Some(n), Ok(r)) = (launch, &answer) {
             if !r["job"].is_null() {
@@ -2025,6 +2248,17 @@ async fn serve_calls(
                     launched.pop_front();
                 }
             }
+        }
+        if let Some(asked) = asked {
+            let said = results.view.send((method, speech::answer(asked, &answer)));
+            // The view that asked is gone (a switch): a failure is said where the TUI is now,
+            // naming the workspace, as other calls' are; a poll's says nothing.
+            if let (Err(_), Err(e)) = (said, &answer) {
+                if method != "speech.status" {
+                    status.send((error_status(method, &format!("{e:#}")), false));
+                }
+            }
+            continue;
         }
         match answer {
             // What a message did ("sent to the orchestrator") is news only for a moment.
@@ -2040,6 +2274,8 @@ async fn serve_calls(
                     || method == "message.send_now"
                     || method == "job.log"
                     || method == "hub.info"
+                    || method == "account.list"
+                    || method == "orchestrator.show"
                     || method == "trash.list"
                     || (method == "trash.empty" && is_dry_run(&r))
                 {
@@ -2050,7 +2286,8 @@ async fn serve_calls(
             Err(_)
                 if method == "thread.activity"
                     || method == "hub.info"
-                    || method == "thread.queue" =>
+                    || method == "thread.queue"
+                    || method == "orchestrator.show" =>
             {
                 let _ = results.view.send((method, Value::Null));
             }
@@ -2064,6 +2301,11 @@ async fn serve_calls(
                 let _ = results
                     .view
                     .send((method, json!({"failed": true, "job": named_job})));
+            }
+            // Nor a failed `account.list`, which is asked for again after a wait (none from a
+            // hub older than accounts).
+            Err(e) if method == "account.list" => {
+                let _ = results.view.send((method, accounts_failure(&e)));
             }
             Err(e) => {
                 status.send((error_status(method, &format!("{e:#}")), false));
@@ -2139,6 +2381,9 @@ struct Shared {
     asking: Asks,
     /// The summary asks on their way, of every workspace shown ([`Asks`]).
     summarizing: Asks,
+    /// The TUI's own speaker, once per process whichever workspace shows
+    /// ([`speaker::OwnSpeaker`]).
+    speaker: speaker::OwnSpeaker,
 }
 
 /// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
@@ -2176,7 +2421,7 @@ impl Drop for Asks {
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
-    run_with(socket, None, None, None).await
+    run_with(socket, None, None, None, None).await
 }
 
 /// The `[tui]` settings: `given` (what the CLI read from the config of the workspace it
@@ -2193,12 +2438,14 @@ pub fn tui_config(given: Option<twr_core::config::TuiConfig>) -> twr_core::confi
 /// Runs the TUI against the hub listening on `socket` until the user quits; with `switching`,
 /// on the workspace it names, with a tab per workspace to switch to ([`workspace`]). `tui`:
 /// the `[tui]` settings ([`tui_config`]). `agent`: the thread's agent this TUI runs for, if
-/// it does (it then offers to change nothing of the user's terminal).
+/// it does (it then offers to change nothing of the user's terminal). `speech`: what the
+/// TUI's own speaker needs ([`speaker`]; `None`: it has none).
 pub async fn run_with(
     socket: PathBuf,
     switching: Option<Switching>,
     tui: Option<twr_core::config::TuiConfig>,
     agent: Option<String>,
+    speech: Option<speaker::LocalSpeech>,
 ) -> anyhow::Result<()> {
     let tui = tui_config(tui);
     // Connect before touching the terminal so connection errors print normally.
@@ -2224,6 +2471,10 @@ pub async fn run_with(
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)
         .context("enabling bracketed paste")?;
     let mut keys = enhance_keyboard();
+    // (`keys.mosh` is not looked for where the terminal speaks the keyboard protocol, which
+    // mosh does not pass on.)
+    let remote = terminal_setup::place(keys.mosh).remote.is_some();
+    let agent_tui = is_agent_tui(agent.as_deref());
     // What was told in earlier runs, and the Shift-Enter offer (only where it can be
     // remembered: it must not come back every start).
     let seen_file = firstrun::state_file();
@@ -2239,10 +2490,7 @@ pub async fn run_with(
             })
         } else {
             let place = terminal_setup::place(keys.mosh);
-            let agent = agent.is_some()
-                // (A thread's processes carry `TWR_AGENT`, `twr_runner::reap::AGENT_ENV`.)
-                || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty());
-            firstrun::terminal_offer(&keys, &place, agent, &seen, terminal_setup::prepare)
+            firstrun::terminal_offer(&keys, &place, agent_tui, &seen, terminal_setup::prepare)
         };
         // Remembered, the startup notices are told once (the mosh one among the offers).
         keys.notice = None;
@@ -2266,6 +2514,12 @@ pub async fn run_with(
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
     let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
     let (saves, settings_writer) = spawn_settings_writer(saved_tx);
+    let own = speaker::Place {
+        remote,
+        agent: agent_tui,
+        socket_only: switching.is_none(),
+    };
+    let speaker = speaker::OwnSpeaker::start(speech, own, late_tx.clone());
     let mut ctx = Shared {
         callers: std::collections::HashMap::new(),
         all_callers: Vec::new(),
@@ -2291,6 +2545,7 @@ pub async fn run_with(
         offer,
         asking: Asks::default(),
         summarizing: Asks::default(),
+        speaker,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -2349,10 +2604,12 @@ pub async fn run_with(
             Err(e) => break (Err(e), writer),
         }
     };
-    // Nothing is sent once the user quit, from any workspace: no suggestion asked either.
+    // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
+    // and nothing more read aloud.
     abort_all(&mut ctx.all_callers);
     ctx.asking.settle(false);
     ctx.summarizing.settle(false);
+    ctx.speaker.stop();
 
     // Nothing reads the terminal once it is the user's again.
     drop(input);
@@ -2365,6 +2622,12 @@ pub async fn run_with(
     drop(ctx.saves.take());
     flush_history(settings_writer);
     result
+}
+
+/// Whether this is a thread's agent's TUI: `agent` given, or the process carries `TWR_AGENT`
+/// (a thread's processes do, `twr_runner::reap::AGENT_ENV`).
+fn is_agent_tui(agent: Option<&str>) -> bool {
+    agent.is_some() || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty())
 }
 
 /// Waits for the history writer (or the settings writer) to finish, at most
@@ -2404,8 +2667,11 @@ async fn drive(
         calls,
         info,
         show,
+        accounts,
         control,
         head,
+        backlog,
+        snapshot,
     } = session;
     let epoch = ctx.epoch;
     let instance = info["instance"].as_str().map(str::to_string);
@@ -2474,6 +2740,9 @@ async fn drive(
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
     state.view.orch_default = orch_default;
+    state.view.orch_default_account = show["account"].as_str().map(str::to_string);
+    state.view.default_runtime = crate::app::default_runtime(&show);
+    state.accounts_answered(&accounts, std::time::Instant::now());
     state.view.mouse = carried.mouse;
     state.view.animate = ctx.tui.animate;
     state.view.color_mode = ctx.tui.colors;
@@ -2488,7 +2757,7 @@ async fn drive(
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
     state.summary.every = ctx.tui.summary_every();
-    state.view.picker = Picker::from_show(&show);
+    state.view.picker = Picker::from_show(&show, &state.accounts);
     state.workspace = current;
     state.set_tabs(carried.tabs);
     if let Some(view) = carried.view {
@@ -2506,7 +2775,20 @@ async fn drive(
     state.apply_suggest_info(&info);
     // Another workspace's frame may be on screen: the first one starts from a clear screen.
     state.view.repaint = true;
-    state.begin_catch_up(head);
+    match (snapshot, backlog) {
+        // The state at the head, at once: no replay, no loading frame. The notifier takes what
+        // a replay would have left it with.
+        (Some(fold), _) => {
+            notifier.adopt(&fold.policy);
+            let threads = fold.registry.list().len() + fold.registry.deleted_views().count();
+            state.install_snapshot(fold, head);
+            twr_core::trace::mark_with(|| {
+                format!("tui: control snapshot installed (head {head}, {threads} threads)")
+            });
+        }
+        (None, Some(items)) => state.begin_compacted_catch_up(head, items),
+        (None, None) => state.begin_catch_up(head),
+    }
     // The history file is written on a thread of its own, in order: a save waits for the
     // file's lock (another TUI may hold it), and the input loop never does.
     // (One JSON string per line, oldest first: [`load_history`].)
@@ -2519,6 +2801,9 @@ async fn drive(
     });
     let mut activity_poll = tokio::time::interval(ACTIVITY_EVERY);
     activity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What this hub's speakers read: asked now, then every [`SPEECH_EVERY`].
+    let mut speech_poll = tokio::time::interval(SPEECH_EVERY);
+    speech_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The other workspaces' tabs: asked now, then every [`TABS_EVERY`].
     let mut tab_poll = tokio::time::interval(TABS_EVERY);
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2580,6 +2865,9 @@ async fn drive(
     let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
     // Summary calls' answers, by thread and ask, each call on a connection of its own too.
     let (sum_tx, mut sum_rx) = mpsc::unbounded_channel::<(String, u64, summary::Answer)>();
+    // The decisions older than a snapshot's (`decisions.list`), read once on a connection of
+    // its own.
+    let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Value>();
 
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
@@ -2688,6 +2976,30 @@ async fn drive(
                     typed_ahead.start(std::time::Instant::now());
                 }
             }
+            // The decisions older than the snapshot's, once its first frame is drawn: they
+            // never hold that frame up. A hub without `decisions.list` (or a failed read)
+            // leaves the snapshot's rows, and nothing is said.
+            if let Some((before, limit)) = shown.is_some().then(|| state.older_decisions.take()).flatten() {
+                let (socket, tx) = (socket.clone(), dec_tx.clone());
+                tokio::spawn(async move {
+                    let params = json!({"before": before, "limit": limit});
+                    let r = async { connect(&socket).await?.call("decisions.list", params).await }.await;
+                    if let Ok(r) = r {
+                        let _ = tx.send(r);
+                    }
+                });
+            }
+            // An `account.*` event came, or a failed `account.list` is due again: the accounts
+            // again, one call at a time, and the orchestrator the hub would start while there
+            // is none.
+            state.accounts_retry_due(std::time::Instant::now());
+            for method in state.account_calls() {
+                let params = match method {
+                    "account.list" => json!({}),
+                    _ => Value::Null,
+                };
+                let _ = call_tx.send((method, params));
+            }
             for (attn, revision, raise) in state.hydration_due(std::time::Instant::now()) {
                 let (socket, tx) = (socket.clone(), hyd_tx.clone());
                 tokio::spawn(async move {
@@ -2744,6 +3056,9 @@ async fn drive(
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
             let retry = state
                 .next_hydration()
+                .into_iter()
+                .chain(state.accounts_retry)
+                .min()
                 .map(tokio::time::Instant::from_std)
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
@@ -2978,6 +3293,7 @@ async fn drive(
                     state.expire_unsend(std::time::Instant::now());
                 }
                 Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
+                Some(r) = dec_rx.recv() => state.older_decisions_came(&r),
                 Some((thread, ask, answer)) = sum_rx.recv() => {
                     state.summary_result(&thread, ask, answer, std::time::Instant::now());
                 }
@@ -3000,7 +3316,7 @@ async fn drive(
                         }
                     }
                 }
-                // A failed fetch is due again: loop to start it.
+                // A failed fetch (a capped text, the accounts) is due again: loop to start it.
                 _ = tokio::time::sleep_until(retry) => {}
                 // The user's attention to this lapsed, or it is time to say it lasts.
                 _ = sleep_opt(attendance.next_check(notifier)) => {
@@ -3015,6 +3331,14 @@ async fn drive(
                     if !state.activity_pending {
                         state.activity_pending = true;
                         let _ = call_tx.send(("thread.activity", Value::Null));
+                    }
+                }
+                // Not asked of a hub from before reading aloud, until a `/read` it answers;
+                // never by a thread's agent's TUI, which the hub refuses `speech.*`.
+                _ = speech_poll.tick(), if !state.speech.unsupported && state.agent.is_none() => {
+                    if !state.speech.pending {
+                        state.speech.pending = true;
+                        let _ = call_tx.send(("speech.status", json!({})));
                     }
                 }
                 // Read off the loop: a few small files, but a `sysctl` on macOS.
@@ -3220,9 +3544,10 @@ mod asks_tests {
 
 #[cfg(test)]
 mod tests {
-    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` whose
-    /// params say `fail`), answers `slow` once its oneshot fires, and a `message.withdraw`
-    /// with its params.
+    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` or an
+    /// `account.list` whose params say `fail`; an `account.list` whose params say `old` as a
+    /// hub older than accounts does), answers `slow` once its oneshot fires, and a
+    /// `message.withdraw` with its params.
     struct Recording(
         std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
@@ -3249,6 +3574,22 @@ mod tests {
                     "shell.cd" if params["dir"] == "/missing" => {
                         Err(anyhow::anyhow!("/missing: No such file or directory"))
                     }
+                    "account.list" if params["fail"] == true => {
+                        Err(anyhow::anyhow!("connection lost"))
+                    }
+                    "account.list" if params["old"] == true => {
+                        Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                            twr_core::proto::codes::METHOD_NOT_FOUND,
+                            "unknown method \"account.list\"",
+                        )))
+                    }
+                    "account.list" => Ok(serde_json::json!({"runtimes": {}})),
+                    // A hub from before reading aloud.
+                    "speech.status" => Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                        twr_core::proto::codes::METHOD_NOT_FOUND,
+                        "unknown method speech.status",
+                    ))),
+                    "speech.request" => Ok(serde_json::json!({"count": 2, "speakers": 1})),
                     _ => Ok(serde_json::Value::Null),
                 }
             })
@@ -3331,6 +3672,52 @@ mod tests {
             ),
             "{shown}"
         );
+    }
+
+    /// A `speech.*` answer goes to the view with what was asked, for the words that say what
+    /// it did ([`speech::SpeechView::answered`]); a hub without the method is told apart, and
+    /// nothing of either goes to the status bar from here.
+    #[tokio::test]
+    async fn speech_answers_go_to_the_view_with_what_was_asked() {
+        use serde_json::json;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        tx.send(("speech.request", json!({"last": 2}))).unwrap();
+        tx.send(("speech.status", json!({}))).unwrap();
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        super::serve_calls(
+            Recording(seen.clone(), None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["speech.request", "speech.status"]);
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            (
+                "speech.request",
+                json!({"asked": {"last": 2}, "result": {"count": 2, "speakers": 1}})
+            )
+        );
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            ("speech.status", json!({"asked": {}, "unsupported": true}))
+        );
+        assert!(status_rx.try_recv().is_err());
     }
 
     /// Calls asked for before a switch are still sent once the view that asked is gone, and
@@ -3649,6 +4036,69 @@ mod tests {
         st.apply_result(method, &r);
         assert!(!st.shell_cd_asked);
         assert!(st.shell_cds.is_empty());
+    }
+
+    /// A failed `account.list` reaches the view as `{failed: true}` (asked for again after a
+    /// wait, `AppState::accounts_answered`), an older hub's unknown method as null (never
+    /// asked again), with nothing in the status bar; an answer as it is.
+    #[tokio::test]
+    async fn a_failed_account_list_is_told_apart_from_an_older_hub() {
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        for params in [
+            serde_json::json!({"fail": true}),
+            serde_json::json!({"old": true}),
+            serde_json::json!({}),
+        ] {
+            tx.send(("account.list", params)).unwrap();
+        }
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        let mut answers = Vec::new();
+        while let Ok((method, r)) = view_rx.try_recv() {
+            assert_eq!(method, "account.list");
+            answers.push(r);
+        }
+        assert_eq!(
+            answers,
+            [
+                serde_json::json!({"failed": true}),
+                serde_json::Value::Null,
+                serde_json::json!({"runtimes": {}}),
+            ]
+        );
+        assert!(status_rx.try_recv().is_err(), "nothing in the status bar");
+        // The one on connecting, as `Session::connect` maps it (no answer in time too).
+        let timed_out = super::within(
+            std::time::Duration::from_millis(1),
+            "asking for the accounts",
+            std::future::pending::<anyhow::Result<serde_json::Value>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            super::accounts_failure(&timed_out),
+            serde_json::json!({"failed": true})
+        );
     }
 
     /// A view left by a switch keeps sending its calls (it is not stopped), and the next view
@@ -4118,6 +4568,74 @@ mod tests {
         let polled = poll_tabs(&ws, vec!["new".into()]).await;
         assert_eq!(polled.len(), 1);
         assert_eq!(new_asked.lock().unwrap().len(), 4);
+    }
+
+    /// Polling preserves aggregate worker activity with an idle orchestrator, for both
+    /// glance-capable and older hubs. Fresh idle answers clear it; unavailable hubs keep
+    /// the useful reply without showing stale work. Fakes::open refuses hub startup.
+    #[tokio::test]
+    async fn polled_worker_activity_reaches_cards_and_clears() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new();
+        for (i, worker) in ["running", "background", "idle"].into_iter().enumerate() {
+            let active = worker != "idle";
+            let glance = json!({
+                "threads": 1, "running": usize::from(active), "active": active,
+                "orchestrator": {"id": "o", "status": "idle", "preview": "Latest reply."},
+            });
+            for (kind, fake) in [
+                ("new", Fake::Glance(glance)),
+                (
+                    "old",
+                    Fake::Old(
+                        json!([
+                            {"id": "o", "role": "orchestrator", "status": "idle"},
+                            {"id": "w", "status": worker},
+                        ]),
+                        json!([]),
+                    ),
+                ),
+            ] {
+                let name = format!("{kind}-{i}");
+                let (socket, _) = fake_hub(dir.path(), &name, fake);
+                let ws = Fakes([(name.clone(), socket)].into_iter().collect());
+                let polled = poll_tabs(&ws, vec![name.clone()]).await;
+                // Merge successive answers into the same card to exercise stale activity.
+                state.merge_poll(
+                    Some(vec!["work".into()]),
+                    polled
+                        .into_iter()
+                        .map(|p| Polled {
+                            name: "work".into(),
+                            ..p
+                        })
+                        .collect(),
+                );
+                let tab = &state.tabs[0];
+                assert_eq!(sidebar::tab_active(&state, "work"), active);
+                assert_eq!(
+                    sidebar::status_text(state.tab_hub(tab), state.tab_glance(tab).as_ref()).0,
+                    if active { "working" } else { "idle" }
+                );
+                if kind == "new" {
+                    assert!(sidebar::card_lines(&state, tab, 25, false)
+                        .iter()
+                        .any(|l| l.to_string().contains("Latest reply.")));
+                }
+                for unavailable in [TabHub::Busy, TabHub::Stopped] {
+                    state.merge_poll(
+                        None,
+                        vec![Polled {
+                            name: "work".into(),
+                            hub: unavailable,
+                            glance: None,
+                        }],
+                    );
+                    assert!(!sidebar::tab_active(&state, "work"));
+                }
+            }
+        }
     }
 
     /// Every connection to a workspace's socket checks the hub serves that workspace.
@@ -5058,10 +5576,26 @@ mod tests {
             .as_deref(),
             Some("the orchestrator is now codex (a new session; handed over without a summary (the previous orchestrator was not running))")
         );
+        let on = |shown: bool| {
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "claude-code", "account": "work", "account_shown": shown}),
+            )
+        };
+        assert_eq!(
+            on(true).as_deref(),
+            Some("the orchestrator is now claude-code:work (a new session)")
+        );
+        assert_eq!(
+            on(false).as_deref(),
+            Some("the orchestrator is now claude-code (a new session)")
+        );
         let (m, p) = action_request(&Action::NewThread {
             project: "api".into(),
             runtime: Some("codex".into()),
             name: Some("api2".into()),
+            account: None,
+            outside_pin: false,
         })
         .unwrap();
         assert_eq!(
@@ -5146,6 +5680,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!((m, p), ("thread.trim", json!({"thread": "t1"})));
+        let (m, p) = action_request(&Action::CompactContext {
+            thread: "t1".into(),
+        })
+        .unwrap();
+        assert_eq!((m, p), ("thread.compact", json!({"thread": "t1"})));
+        assert_eq!(
+            result_status(
+                "thread.compact",
+                &json!({"thread_name": "api", "state": "queued"})
+            )
+            .as_deref(),
+            Some("api compacts its context after its running turn")
+        );
         assert_eq!(
             result_status(
                 "thread.trim",
@@ -5734,6 +6281,116 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let second = out.next().await.unwrap().unwrap();
         assert_eq!(second.event.body, finals[1].0);
+    }
+
+    /// The TUI asks for the control stream's snapshot; a hub may answer with its compacted
+    /// backlog instead (a snapshot too big), whose items it counts. A hub from before
+    /// snapshots refuses the key (`bad_request`, as `deny_unknown_fields` does) and is asked
+    /// for the compacted backlog; one from before compaction refuses that too and is asked for
+    /// the whole log. A snapshot the TUI can't read (malformed, another build's fold or one
+    /// that does not say its fold) is dropped: it asks as from a hub without snapshots.
+    #[tokio::test]
+    async fn the_control_stream_starts_from_a_snapshot_unless_the_hub_is_older() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let snapshot = serde_json::to_value(ClientFold::default()).unwrap();
+        let fold = twr_core::client_state::FOLD;
+        let both = json!({"since": 0, "compact": true, "snapshot": true});
+        let compact = json!({"since": 0, "compact": true});
+        let full = json!({"since": 0});
+        let dir = tempfile::tempdir().unwrap();
+        // The hub: how it answers a snapshot asked for; whether it knows `snapshot` and
+        // `compact`.
+        let hubs = [
+            (
+                "new",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": fold}),
+            ),
+            (
+                "unnamed",
+                json!({"since": 9, "head": 9, "snapshot": snapshot}),
+            ),
+            (
+                "too big",
+                json!({"since": 0, "head": 9, "backlog": 4, "compacted": true}),
+            ),
+            (
+                "malformed",
+                json!({"since": 9, "head": 9, "snapshot": {"registry": 5}, "snapshot_fold": fold}),
+            ),
+            (
+                "another build",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": "0123"}),
+            ),
+            ("compact only", Value::Null),
+            ("old", Value::Null),
+        ];
+        for (i, (hub, answer)) in hubs.into_iter().enumerate() {
+            let sock = dir.path().join(format!("hub-{i}.sock"));
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&asked);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (log, answer) = (Arc::clone(&log), answer.clone());
+                    tokio::spawn(async move {
+                        let (r, mut w) = stream.into_split();
+                        let mut lines = BufReader::new(r).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let params = req["params"].clone();
+                            let unknown = |key: &str| {
+                                json!({"id": req["id"], "error": {"code": "bad_request",
+                                    "message": format!("unknown field `{key}`")}})
+                            };
+                            let frame = match req["method"].as_str() {
+                                Some("control.subscribe") => {
+                                    log.lock().unwrap().push(params.clone());
+                                    let (snap, compact) = (
+                                        params.get("snapshot").is_some(),
+                                        params.get("compact").is_some(),
+                                    );
+                                    match hub {
+                                        "old" if compact => unknown("compact"),
+                                        "old" | "compact only" if snap => unknown("snapshot"),
+                                        _ if snap => json!({"id": req["id"], "result": answer}),
+                                        _ if compact => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9,
+                                            "backlog": 4, "compacted": true}})
+                                        }
+                                        _ => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9}})
+                                        }
+                                    }
+                                }
+                                _ => json!({"id": req["id"], "result": {}}),
+                            };
+                            let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                        }
+                    });
+                }
+            });
+            let start = subscribe_control(&sock).await.unwrap();
+            assert_eq!(start.sub.ack()["head"], 9, "{hub}");
+            let asked = asked.lock().unwrap().clone();
+            let (snap, backlog, chain) = match hub {
+                "new" => (true, None, vec![both.clone()]),
+                "too big" => (false, Some(4), vec![both.clone()]),
+                "unnamed" | "malformed" | "another build" | "compact only" => {
+                    (false, Some(4), vec![both.clone(), compact.clone()])
+                }
+                _ => (
+                    false,
+                    None,
+                    vec![both.clone(), compact.clone(), full.clone()],
+                ),
+            };
+            assert_eq!(start.snapshot.is_some(), snap, "{hub}");
+            assert_eq!(start.backlog, backlog, "{hub}");
+            assert_eq!(asked, chain, "{hub}");
+        }
     }
 
     /// Every connection the TUI opens starts with `hello {client: "tui"}`.

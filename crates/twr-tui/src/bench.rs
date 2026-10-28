@@ -31,6 +31,11 @@ fn lines(items: &[StreamItem]) -> Vec<String> {
 
 /// A long-used hub's control stream and its orchestrator's latest events, made up.
 fn made_up() -> (Vec<String>, Vec<String>) {
+    (lines(&made_up_control()), lines(&made_up_transcript()))
+}
+
+/// A long-used hub's control stream, made up.
+pub(crate) fn made_up_control() -> Vec<StreamItem> {
     let mut control = Vec::new();
     let mut gseq = 0;
     let mut push = |control: &mut Vec<StreamItem>, event: Event| {
@@ -68,6 +73,13 @@ fn made_up() -> (Vec<String>, Vec<String>) {
             push(&mut control, s.git("main", turn % 3));
         }
     }
+    control
+}
+
+/// The orchestrator's latest events, made up.
+fn made_up_transcript() -> Vec<StreamItem> {
+    let mut o = ThreadScript::new("t-orch");
+    let _ = orch_events(&mut o, "t-orch");
     let mut transcript = Vec::new();
     let turns = crate::TRANSCRIPT_TAIL / 5;
     for turn in 0..turns {
@@ -91,15 +103,14 @@ fn made_up() -> (Vec<String>, Vec<String>) {
         })));
         transcript.push(o.turn_ended(TurnResult::Completed));
     }
-    let transcript: Vec<StreamItem> = transcript
+    transcript
         .into_iter()
         .map(|event| StreamItem {
             stream: StreamKind::Thread,
             gseq: None,
             event,
         })
-        .collect();
-    (lines(&control), lines(&transcript))
+        .collect()
 }
 
 /// The lines of `var`'s file, if it names one.
@@ -110,7 +121,7 @@ fn from_file(var: &str) -> Option<Vec<String>> {
 }
 
 /// Each line decoded as the client decodes what the hub pushes.
-fn decode(lines: &[String]) -> Vec<StreamItem> {
+pub(crate) fn decode(lines: &[String]) -> Vec<StreamItem> {
     lines
         .iter()
         .map(|l| match ServerMessage::from_line(l.as_bytes()).unwrap() {
@@ -128,19 +139,20 @@ fn ms(d: Duration) -> String {
 #[ignore = "a benchmark: run in release mode with --ignored --nocapture"]
 fn replay_bench() {
     let made = made_up();
-    let control = from_file("TWR_BENCH_CONTROL").unwrap_or(made.0);
+    let control_lines = from_file("TWR_BENCH_CONTROL").unwrap_or(made.0);
+    let control = &control_lines;
     let transcript = from_file("TWR_BENCH_TRANSCRIPT").unwrap_or(made.1);
     let bytes = |l: &[String]| l.iter().map(String::len).sum::<usize>() as f64 / 1e6;
     eprintln!(
         "control: {} items, {:.1} MB; transcript: {} events, {:.1} MB",
         control.len(),
-        bytes(&control),
+        bytes(control),
         transcript.len(),
         bytes(&transcript)
     );
 
     let t = Instant::now();
-    let control = decode(&control);
+    let control = decode(control);
     eprintln!("{}  decode the control replay", ms(t.elapsed()));
     let t = Instant::now();
     let capped = control
@@ -159,6 +171,38 @@ fn replay_bench() {
     }
     eprintln!("{}  apply the control replay", ms(t.elapsed()));
     assert_eq!(st.catch_up, None, "the replay is applied");
+
+    // The same, compacted as a hub compacts it (`control.subscribe` with `compact`): the
+    // selection runs on the hub, timed here over decoded events (the hub reads rows instead).
+    let t = Instant::now();
+    let kept =
+        twr_core::compact::select_events(control.iter().map(|i| (i.gseq.unwrap(), &i.event)), 0);
+    eprintln!(
+        "{}  select the compacted backlog: {} of {} items",
+        ms(t.elapsed()),
+        kept.len(),
+        control.len()
+    );
+    let kept_lines: Vec<String> = control_lines
+        .iter()
+        .zip(&control)
+        .filter(|(_, i)| i.gseq.is_some_and(|g| kept.binary_search(&g).is_ok()))
+        .map(|(l, _)| l.clone())
+        .collect();
+    let t = Instant::now();
+    let compacted = decode(&kept_lines);
+    eprintln!("{}  decode the compacted replay", ms(t.elapsed()));
+    let mut compact_st = AppState::new();
+    compact_st.begin_compacted_catch_up(
+        control.last().and_then(|i| i.gseq).unwrap_or(0),
+        compacted.len() as u64,
+    );
+    let t = Instant::now();
+    for item in &compacted {
+        compact_st.apply_event(item);
+    }
+    eprintln!("{}  apply the compacted replay", ms(t.elapsed()));
+    assert_eq!(compact_st.catch_up, None, "the compacted replay is applied");
 
     let orch = st.main_thread().expect("an orchestrator");
     let t = Instant::now();

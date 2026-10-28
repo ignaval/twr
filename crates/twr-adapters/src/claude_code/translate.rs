@@ -16,7 +16,9 @@
 //! - Assistant messages arrive one per content block; `stream_event` wraps the raw API
 //!   stream (`message_start` identifies an autonomous turn; `text_delta` streams text).
 //! - `result` ends a turn. `total_cost_usd` is cumulative per process (per-turn cost is the
-//!   delta); `usage`, `duration_ms` and `num_turns` are per turn. An interrupted turn's cost
+//!   delta); `usage`, `duration_ms` and `num_turns` are per turn (`usage` sums every model
+//!   call of the turn, `num_turns` of them: what it spent, not how full the context is). An
+//!   interrupted turn's cost
 //!   is not included (the total stays put, or reads 0), so it is reported as unknown. A
 //!   `result` with `origin.kind: task-notification` and `num_turns: 0` (Claude 2.1.291: a
 //!   resumed session consuming a notice of a task its previous process left, before the
@@ -75,6 +77,61 @@
 //!   `errors` (`error_max_turns`, `error_max_budget_usd`, `error_during_execution`), else
 //!   `api_error_status` with the turn's API error message (an `assistant` message carrying
 //!   `error`), else `terminal_reason` / the subtype.
+//! - A failed turn that hit a usage or spending limit carries `ext.twr.limit`
+//!   ([`crate::usage::Limit`], [`limit_of`]) and is not transient: the latest
+//!   `rate_limit_event` since the last `result` was `rejected` for a window type (usage, with
+//!   its `resetsAt`) or for `overage` (spend), or said `errorCode: credits_required` (spend);
+//!   else an `assistant` `error: rate_limit` message whose text names a limit it hit ("You've
+//!   hit your weekly limit · resets 5am (UTC)": usage, no time). A plain 429 or overload
+//!   stays transient.
+//!
+//! Context compaction (Claude Code 2.1.304, see the recorded fixtures): `system/status`
+//! `status: "compacting"` starts one (`context.compacting`; Claude says nothing else until it
+//! ends, minutes on a large context); a later `status` with `compact_result: "failed"` (and
+//! `compact_error`) ends it unchanged (`context.compacted` with `error`); `system/compact_boundary`
+//! `compact_metadata {trigger, pre_tokens, post_tokens, duration_ms}` is the compaction done
+//! (`context.compacted`). The synthetic user message that follows (`isSynthetic`, the summary)
+//! and the replayed `<local-command-stdout>` are neither a prompt nor the agent's text: nothing.
+//! A manual compaction is the user message `/compact` ([`Translator::compact_message`]): its
+//! `compacting` comes before the `init` (it opens the queued turn), and its `result` ran no
+//! agent call (`num_turns: 0`, `local_command: compact`, usage all zero; the summary itself is
+//! a model call, billed: the total cost goes up) and ends that turn as any other.
+//!
+//! How full the context is (`turn.ended` `context`, [`twr_core::event::ContextSize`]): the
+//! input of the main agent's latest model call in the turn, its `message.usage`
+//! `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` (what Claude's
+//! own `get_context_usage` counts as the context's `totalTokens`; the call's output is not in
+//! it), from its `stream_event` `message_start` or its `assistant` message (one per content
+//! block, the same input and message id in each). A subagent's calls (`parent_tool_use_id`
+//! set) are in their own context, and a `<synthetic>` message is no call. Not the `result`'s
+//! `usage`: that sums every call of the turn (a turn of 62 calls of about 110k tokens each
+//! reads 6.9M), except for a turn of one call (`num_turns: 1`), when the two are the same.
+//! After a compaction in the turn with no call since, the boundary's `post_tokens`. A turn
+//! whose latest call reported no size, whose compaction said none, or that called the model
+//! (`usage` input above 0) with none of these, has no `context` and says the size is unknown
+//! ([`CONTEXT_UNKNOWN`]); a turn that called none says nothing (the context is as it was). A
+//! turn ended for its missing `result` keeps what it saw of the context.
+//!
+//! The window is the `modelUsage[].contextWindow` of the model of that call (else of the
+//! session's latest call): the entries whose key or `canonicalModel` is that model, any `[1m]`
+//! suffix ignored, when they all say the same; with no model known, the one window every entry
+//! says. When the entries say nothing of it, the last window known of that model; when they
+//! disagree, unknown. A subagent's model may have another window, and so does a window smaller
+//! than the call (a call never exceeds its model's window): unknown too.
+//! `ext.claude.context_from` says where the tokens came from; a `turn.ended` written before twr
+//! read the last call has no such key, and its `context` is the `result`'s `usage`
+//! ([`twr_core::reduce::recorded_context`] tells which of those to trust).
+//!
+//! The prompt cache (`turn.ended` `prompt_cache`, [`twr_core::event::PromptCache`]): a turn
+//! whose context is its latest call's (`context_from: last_call`) also says when that call was
+//! made (the translator's clock when its first frame came) and how long the prompt cache lives:
+//! 3600 s when the call's `message.usage.cache_creation` wrote `ephemeral_1h_input_tokens`
+//! (a subscription), 300 s for `ephemeral_5m_input_tokens`, else what the latest main call of
+//! this process that wrote any said (a call that read its whole prompt from the cache writes
+//! none), else unknown (`ttl_s` absent). Subagent calls and `<synthetic>` messages are no
+//! calls here either. A turn without a call of its own (a manual `/compact`'s, one that asked
+//! the model nothing) has none: the thread keeps the expiry it knew
+//! ([`twr_core::reduce::ThreadView::cache_expires_at`]), and a compaction forgets it.
 //!
 //! Turn stamping: every user message written for turn `n` queues `n`; the first in-turn line
 //! after a `result` (normally the next `system/init`) opens the oldest queued turn, and the
@@ -117,14 +174,28 @@ use twr_core::usage::{UsageWindow, FIVE_HOUR, SEVEN_DAY};
 
 use crate::acp::translate::{mode_acceptable, mode_level, ModeLevel};
 use crate::attn::IssuedIds;
+use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
-    AttentionReason, AttentionResolved, EventBody, JsonMap, ResolvedBy, SessionPayload, TurnEnded,
-    TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY, RUNTIME_TURN_KEY, STEP_KEY,
+    AttentionReason, AttentionResolved, EventBody, JsonMap, PromptCache, ResolvedBy,
+    SessionPayload, TurnEnded, TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY,
+    RUNTIME_TURN_KEY, STEP_KEY,
 };
 
 /// Key of this runtime's extras (`data.ext.claude`).
 pub const EXT: &str = "claude";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is the input of the main agent's
+/// latest model call in the turn.
+pub const CONTEXT_FROM_CALL: &str = "last_call";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is what a compaction left (no
+/// model call since it).
+pub const CONTEXT_FROM_COMPACTION: &str = "compaction";
+
+/// `ext.claude.context_from` of a `turn.ended` that called the model but reported no call's
+/// size: it has no `context`, and how full the context is is unknown from then.
+pub const CONTEXT_UNKNOWN: &str = "unknown";
 
 /// Tools whose calls always count as risky.
 pub const RISKY_TOOLS: &[&str] = &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
@@ -352,6 +423,11 @@ pub struct Translator {
     /// The running turn carried Claude's `[Request interrupted by user]` user text.
     interrupted_marker: bool,
     transient_hint: Option<String>,
+    /// The `rate_limit_info` of the latest `rate_limit_event` since the last `result`.
+    rate_limit_info: Option<Value>,
+    /// The running turn's `assistant` `error: rate_limit` text that names a limit it hit
+    /// ([`is_limit_text`]).
+    limit_text: Option<String>,
     /// The running turn reported an authentication failure (an `assistant` or `api_retry`
     /// message with `error: authentication_failed`).
     auth_failed: bool,
@@ -384,7 +460,30 @@ pub struct Translator {
     notice_quiet: bool,
     /// The last turn ended `error`.
     last_failed: bool,
-    /// The clock usage reads are timed by.
+    /// Turns written as `/compact` ([`Translator::compact_message`]) not ended yet: a
+    /// compaction in them is `manual`.
+    compact_turns: std::collections::HashSet<u64>,
+    /// The trigger of the compaction under way (`system/status` `compacting` seen, no end yet).
+    compacting: Option<String>,
+    /// A compaction since the last `result` and the main agent's last model call, with the
+    /// context it left when it said: what a turn that ran no agent call (a manual
+    /// `/compact`'s) ends with.
+    compacted_to: Option<Option<u64>>,
+    /// The main agent's latest model call since the last `result` or compaction.
+    last_call: Option<Call>,
+    /// The main agent's model, as its latest model call said (none: it did not say).
+    main_model: Option<String>,
+    /// The prompt cache's lifetime in seconds, as the main agent's latest call that wrote the
+    /// cache in this process said ([`cache_ttl`]).
+    cache_ttl: Option<u64>,
+    /// The main agent's model and its context window, as the last `result` that said it did.
+    context_window: Option<(String, u64)>,
+    /// A compaction began in the runtime's turn opened for a notification while its run was
+    /// awaited ([`Watch::NoticeRun`]): the wait is held until the compaction ends (at most
+    /// [`twr_core::event::COMPACTING_HOLD_SECS`]), then starts again (a compaction can take
+    /// longer than the wait).
+    notice_held: bool,
+    /// The clock usage reads, waits and model calls are timed by.
     clock: fn() -> DateTime<Utc>,
 }
 
@@ -415,6 +514,8 @@ impl Translator {
             interrupts_sent: 0,
             interrupted_marker: false,
             transient_hint: None,
+            rate_limit_info: None,
+            limit_text: None,
             auth_failed: false,
             api_error: None,
             allowed_mode: match opts.mode.trim() {
@@ -431,13 +532,22 @@ impl Translator {
             absorb_result: false,
             notice_quiet: false,
             last_failed: false,
+            compact_turns: Default::default(),
+            compacting: None,
+            compacted_to: None,
+            last_call: None,
+            main_model: None,
+            cache_ttl: None,
+            context_window: None,
+            notice_held: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
         }
     }
 
-    /// Times usage reads by `clock` instead of the system clock (tests).
+    /// Times usage reads, waits and model calls by `clock` instead of the system clock
+    /// (tests).
     pub fn set_clock(&mut self, clock: fn() -> DateTime<Utc>) {
         self.clock = clock;
     }
@@ -532,6 +642,13 @@ impl Translator {
             "session_id": "",
         })
         .to_string()
+    }
+
+    /// The stdin line starting turn `turn` as a compaction of the context: the user message
+    /// `/compact`, as given (Claude runs it as its own command, not a prompt).
+    pub fn compact_message(&mut self, turn: u64) -> String {
+        self.compact_turns.insert(turn);
+        self.user_message("/compact", turn)
     }
 
     /// The stdin line interrupting the running turn, if one is running or queued.
@@ -721,13 +838,17 @@ impl Translator {
         // A line of the main agent's run: the notification's run started. Not a subagent's
         // line, a task's, a rate limit's, the answer to a request of twr's, a request for the
         // user (a subagent's carries no mark of it; while one is open the wait is held, and it
-        // starts again when the last closes), nor anything unknown (a `result` is
-        // [`Translator::on_result`]'s to judge).
+        // starts again when the last closes), nor a compaction's bookkeeping (its summary,
+        // `isSynthetic`, and a replayed command output, `isReplay`: a compaction's end starts
+        // the wait again), nor anything unknown (a `result` is [`Translator::on_result`]'s to
+        // judge).
         let kind = str_at(&v, "type");
         let main = v.get("parent_tool_use_id").is_none_or(Value::is_null);
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
         let run_line = match kind {
             "system" => matches!(str_at(&v, "subtype"), "init" | "api_retry"),
-            "stream_event" | "assistant" | "user" => main,
+            "user" => main && !flag("isSynthetic") && !flag("isReplay"),
+            "stream_event" | "assistant" => main,
             _ => false,
         };
         if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
@@ -753,6 +874,7 @@ impl Translator {
                     self.read_usage(&mut out);
                 }
                 self.on_task(&v, line, &mut out);
+                self.on_compaction(&v, line, &mut out);
                 // Claude retries a request refused for authentication before giving up.
                 if str_at(&v, "subtype") == "api_retry" && str_at(&v, "error") == AUTH_FAILED {
                     self.in_turn();
@@ -774,6 +896,7 @@ impl Translator {
                 if status == "rejected" {
                     self.transient_hint = Some("rate_limit_event status rejected".into());
                 }
+                self.rate_limit_info = Some(v["rate_limit_info"].clone());
                 let windows = rate_limit_windows(&v["rate_limit_info"]);
                 if !windows.is_empty() {
                     self.usage.heard((self.clock)(), &windows);
@@ -932,6 +1055,7 @@ impl Translator {
             self.active = true;
             self.turn = self.queued.pop_front();
             self.transient_hint = None;
+            self.limit_text = None;
             self.auth_failed = false;
             self.api_error = None;
             self.interrupted_marker = false;
@@ -1108,6 +1232,87 @@ impl Translator {
         }
     }
 
+    /// A compaction's start, failure or end (see the module docs).
+    fn on_compaction(&mut self, v: &Value, line: &str, out: &mut Translated) {
+        match str_at(v, "subtype") {
+            "status" if str_at(v, "status") == "compacting" => {
+                // A manual one comes before the `init` of the turn written for it: the oldest
+                // queued turn is the one it runs in.
+                let turn = if self.active {
+                    self.turn
+                } else {
+                    self.queued.front().copied()
+                };
+                let manual = turn.is_some_and(|t| self.compact_turns.contains(&t));
+                let trigger = if manual { "manual" } else { "auto" };
+                self.compacting = Some(trigger.to_string());
+                // The notification's run is compacting: its wait holds until that ends, for
+                // as long as the hub holds its stall checks for one at most.
+                if matches!(self.watch, Some((Watch::NoticeRun, _))) {
+                    let hold =
+                        std::time::Duration::from_secs(twr_core::event::COMPACTING_HOLD_SECS);
+                    self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(hold)));
+                    self.notice_held = true;
+                }
+                let body = EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                    trigger: Some(trigger.into()),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "status" if str_at(v, "compact_result") == "failed" => {
+                self.resume_notice_wait();
+                let trigger = self.compacting.take().unwrap_or_else(|| "auto".into());
+                let error = match str_at(v, "compact_error") {
+                    "" => "failed".to_string(),
+                    e => e.to_string(),
+                };
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    error: Some(error),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "compact_boundary" => {
+                self.resume_notice_wait();
+                let m = &v["compact_metadata"];
+                let n = |k: &str| m.get(k).and_then(Value::as_u64);
+                let trigger = match str_at(m, "trigger") {
+                    "" => self.compacting.clone().unwrap_or_else(|| "auto".into()),
+                    t => t.to_string(),
+                };
+                self.compacting = None;
+                self.compacted_to = Some(n("post_tokens"));
+                // The call before it is not the context any more.
+                self.last_call = None;
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    pre_tokens: n("pre_tokens"),
+                    post_tokens: n("post_tokens"),
+                    duration_ms: n("duration_ms"),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            _ => {}
+        }
+    }
+
+    /// A compaction that held a notification's wait ended: the wait starts again from now
+    /// (its run's output ends it as usual; none within it ends the turn `no_run`).
+    fn resume_notice_wait(&mut self) {
+        if std::mem::take(&mut self.notice_held)
+            && self.notice_quiet
+            && self.active
+            && self.turn.is_none()
+            && self.runtime_turn.is_some()
+        {
+            let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
+            self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
+        }
+    }
+
     /// A background task of the main agent's ended: Claude starts a run of its own for its
     /// notification. With no turn running or queued, the runtime's turn opens now, not at the
     /// run's first output (see the module docs).
@@ -1180,8 +1385,8 @@ impl Translator {
         out
     }
 
-    /// Ends the running turn without a `result` of Claude's: `completed`, no usage, and
-    /// `ext.twr.<why> = true`.
+    /// Ends the running turn without a `result` of Claude's: `completed`, no usage (its
+    /// context as its latest call said), and `ext.twr.<why> = true`.
     fn end_without_result(&mut self, why: &str, out: &mut Translated) {
         self.notice_quiet = false;
         let model_ran = self.model_ran;
@@ -1192,10 +1397,13 @@ impl Translator {
         for mut e in ended.events {
             e.raw = None;
             if let EventBody::TurnEnded(t) = &mut e.body {
+                // What it spent is unknown; what it saw of the context (its latest call) holds.
                 t.usage = None;
                 if let Some(claude) = t.ext.as_mut().and_then(|x| x.get_mut(EXT)) {
                     if let Some(c) = claude.as_object_mut() {
-                        c.retain(|k, _| k == "mode_changed" || k == "mode_note");
+                        c.retain(|k, _| {
+                            matches!(k.as_str(), "mode_changed" | "mode_note" | "context_from")
+                        });
                     }
                 }
                 set_twr_ext(&mut t.ext, why, json!(true));
@@ -1249,6 +1457,9 @@ impl Translator {
         }
         let ev = &v["event"];
         if str_at(ev, "type") == "message_start" {
+            // A model call: what a compaction left is no longer the context.
+            self.compacted_to = None;
+            self.note_call(&ev["message"]);
             self.model_ran = true;
             self.absorb_result = false;
             self.notice_quiet = false;
@@ -1287,6 +1498,9 @@ impl Translator {
 
     fn on_assistant(&mut self, v: &Value, line: &str, out: &mut Translated) {
         let parent = opt_str(v, "parent_tool_use_id");
+        if parent.is_none() {
+            self.note_call(&v["message"]);
+        }
         if let Some(e) = v.get("error").and_then(Value::as_str) {
             if matches!(e, "rate_limit" | "server_error" | "overloaded") {
                 self.transient_hint = Some(format!("assistant error {e}"));
@@ -1307,6 +1521,9 @@ impl Translator {
             // A subagent's own API error is not the turn's cause.
             if !text.is_empty() && parent.is_none() {
                 self.in_turn();
+                if e == "rate_limit" && is_limit_text(&text) {
+                    self.limit_text = Some(text.clone());
+                }
                 self.api_error = Some(text);
             }
         }
@@ -1376,6 +1593,44 @@ impl Translator {
                 _ => {}
             }
         }
+    }
+
+    /// Records the main agent's model call `message` (an API message: `id`, `model`, `usage`)
+    /// as the latest. Frames of one call (its `message_start`, one `assistant` line per content
+    /// block) share its id; a new call without `usage` makes the size unknown, not the one
+    /// before. A new call is timed when its first frame comes. A `<synthetic>` message is no
+    /// call.
+    fn note_call(&mut self, message: &Value) {
+        let model = str_at(message, "model");
+        if !message.is_object() || model == "<synthetic>" {
+            return;
+        }
+        let id = str_at(message, "id");
+        let tokens = call_input(message);
+        let ttl = cache_ttl(message);
+        let model = Some(model.to_string()).filter(|m| !m.is_empty());
+        match &mut self.last_call {
+            Some(call) if !id.is_empty() && call.id == id => {
+                call.tokens = tokens.or(call.tokens);
+                call.model = model.clone().or(call.model.take());
+                call.ttl = ttl.or(call.ttl);
+            }
+            _ => {
+                self.last_call = Some(Call {
+                    id: id.to_string(),
+                    tokens,
+                    model: model.clone(),
+                    called_at: (self.clock)(),
+                    ttl,
+                })
+            }
+        }
+        if ttl.is_some() {
+            self.cache_ttl = ttl;
+        }
+        self.compacted_to = None;
+        // The session's model is the latest call's, unknown when it did not say.
+        self.main_model = self.last_call.as_ref().and_then(|c| c.model.clone());
     }
 
     fn on_user(&mut self, v: &Value, line: &str, out: &mut Translated) {
@@ -1753,6 +2008,10 @@ impl Translator {
         if !self.pending.is_empty() {
             return;
         }
+        // (A compaction holds a notification run's wait, whatever closed meanwhile.)
+        if matches!(self.watch, Some((Watch::NoticeRun, _))) && self.notice_held {
+            return;
+        }
         if let Some((watch, _)) = self.watch {
             let after = match watch {
                 Watch::Result => self
@@ -1823,6 +2082,8 @@ impl Translator {
         let interrupted = std::mem::take(&mut self.interrupt_requested);
         let marker = std::mem::take(&mut self.interrupted_marker);
         let hint = self.transient_hint.take();
+        let rate_limit_info = self.rate_limit_info.take();
+        let limit_text = self.limit_text.take();
         let auth_failed = std::mem::take(&mut self.auth_failed);
         let api_error = self.api_error.take();
 
@@ -1864,6 +2125,77 @@ impl Translator {
             output: tok("output_tokens"),
             cost,
         };
+        // How full the context is (see the module docs): the main agent's latest call's input,
+        // else (no call since a compaction, a manual `/compact`'s turn) what the compaction
+        // left, else the `result`'s usage when it is one call's. Never the usage of a turn of
+        // several calls: their sum is what the turn spent, not what the context holds.
+        let one_call = v.get("num_turns").and_then(Value::as_u64) == Some(1) && usage.input > 0;
+        let call = self.last_call.take();
+        let (from, tokens) = match (&call, self.compacted_to.take()) {
+            (
+                Some(Call {
+                    tokens: Some(t), ..
+                }),
+                _,
+            ) => (CONTEXT_FROM_CALL, Some(*t)),
+            (Some(_), _) | (None, None) if one_call => (CONTEXT_FROM_CALL, Some(usage.input)),
+            (Some(_), _) => (CONTEXT_UNKNOWN, None),
+            (None, Some(Some(t))) => (CONTEXT_FROM_COMPACTION, Some(t)),
+            (None, Some(None)) => (CONTEXT_UNKNOWN, None),
+            (None, None) if usage.input > 0 => (CONTEXT_UNKNOWN, None),
+            (None, None) => ("", None),
+        };
+        // The prompt cache of that call, when the context is its: when it was made, and how
+        // long the cache lives (as it said, else as an earlier call of this process did).
+        let prompt_cache = call
+            .as_ref()
+            .filter(|_| from == CONTEXT_FROM_CALL)
+            .map(|c| PromptCache {
+                called_at: c.called_at,
+                ttl_s: c.ttl.or(self.cache_ttl),
+            });
+        // The model of the call (a call that did not say has none), else the session's.
+        let model = match call {
+            Some(c) => c.model,
+            None => self.main_model.clone(),
+        }
+        .or_else(|| {
+            // One model in the turn's `modelUsage`: the main agent's.
+            let models = v["modelUsage"].as_object()?;
+            (models.len() == 1).then(|| models.keys().next().cloned())?
+        });
+        let said = context_window(&v["modelUsage"], model.as_deref());
+        let window = match (said, &model) {
+            (Window::Said(w), _) => Some(w),
+            // A turn whose `modelUsage` lacks the window: the last one known of that model.
+            (Window::Unsaid, Some(m)) => self
+                .context_window
+                .as_ref()
+                .filter(|(known, _)| known == m)
+                .map(|(_, w)| *w),
+            (Window::Unsaid, None) | (Window::Conflicting, _) => None,
+        };
+        // A call fits its model's window: a smaller one is another model's, never kept.
+        let window = window.filter(|w| tokens.is_none_or(|t| t <= *w));
+        // Entries that disagree, or a window the call did not fit (said now, or the one known
+        // of its model): that model's window is not known any more.
+        let forget = match said {
+            Window::Said(_) => window.is_none(),
+            Window::Conflicting => true,
+            Window::Unsaid => model.is_some() && tokens.is_some() && window.is_none(),
+        };
+        let ours = |(known, _): &(String, u64)| model.as_ref().is_none_or(|m| m == known);
+        if forget && self.context_window.as_ref().is_some_and(ours) {
+            self.context_window = None;
+        }
+        if let (Window::Said(_), Some(w), Some(m)) = (said, window, &model) {
+            self.context_window = Some((m.clone(), w));
+        }
+        let context = tokens.map(|tokens| twr_core::event::ContextSize { tokens, window });
+        if let Some(t) = turn {
+            self.compact_turns.remove(&t);
+        }
+        self.compacting = None;
 
         let mut claude = Map::new();
         claude.insert("subtype".into(), json!(subtype));
@@ -1883,6 +2215,9 @@ impl Translator {
         for key in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
             claude.insert(key.into(), json!(tok(key)));
         }
+        if !from.is_empty() {
+            claude.insert("context_from".into(), json!(from));
+        }
         if let Some(change) = self.mode_changed.take() {
             claude.insert("mode_changed".into(), change);
             claude.insert("mode_note".into(), json!(PLAN_EXIT_NOTE));
@@ -1891,6 +2226,7 @@ impl Translator {
         // the login expired): said with what to do, and never transient (retrying cannot help
         // until the user signs in).
         let mut twr_error = None;
+        let mut limit = None;
         if result == TurnResult::Error && (auth_failed || auth_failure(v)) {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code could not authenticate".into());
@@ -1901,16 +2237,25 @@ impl Translator {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code reported an error without details".into());
             twr_error = Some(error_line(&text));
-            let reason = transient_reason(v).or(hint);
-            claude.insert("transient".into(), json!(reason.is_some()));
-            if let Some(r) = reason {
-                claude.insert("transient_reason".into(), json!(r));
+            limit = limit_of(rate_limit_info.as_ref(), limit_text.as_deref(), &text);
+            if limit.is_some() {
+                // Retrying before the reset cannot help.
+                claude.insert("transient".into(), json!(false));
+            } else {
+                let reason = transient_reason(v).or(hint);
+                claude.insert("transient".into(), json!(reason.is_some()));
+                if let Some(r) = reason {
+                    claude.insert("transient_reason".into(), json!(r));
+                }
             }
         }
         let mut ext = ext_of(claude);
         if let Some(e) = twr_error {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": e }));
+        }
+        if let Some(l) = limit {
+            set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
         }
         if let Some(id) = runtime_turn {
             set_twr_ext(&mut ext, RUNTIME_TURN_KEY, json!(id.to_string()));
@@ -1922,6 +2267,8 @@ impl Translator {
                 session_id,
                 usage: Some(usage),
                 duration_ms: v.get("duration_ms").and_then(Value::as_u64),
+                context,
+                prompt_cache,
                 ext,
                 ..Default::default()
             }),
@@ -2045,6 +2392,103 @@ impl Steps {
 /// Whether a control request subtype asks the user for input (MCP elicitations).
 fn is_elicitation(subtype: &str) -> bool {
     subtype.to_ascii_lowercase().contains("elicit")
+}
+
+/// The tokens of model call `message`'s input (`usage`: `input_tokens`,
+/// `cache_creation_input_tokens`, `cache_read_input_tokens`), how full the context was when it
+/// was made; none when it reports no input (no `usage`, a `<synthetic>` message's zeros).
+fn call_input(message: &Value) -> Option<u64> {
+    let u = message.get("usage")?;
+    let tokens = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+    .fold(0u64, u64::saturating_add);
+    (tokens > 0).then_some(tokens)
+}
+
+/// The prompt cache lifetime model call `message` reports, in seconds: its `usage`
+/// `cache_creation` wrote 1-hour entries (`ephemeral_1h_input_tokens` above 0: 3600), else
+/// 5-minute ones (`ephemeral_5m_input_tokens`: 300). `None` when it wrote none (all of its
+/// prompt was read from the cache, or the call did not say).
+fn cache_ttl(message: &Value) -> Option<u64> {
+    let written = |k: &str| {
+        message
+            .pointer("/usage/cache_creation")
+            .and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+    };
+    if written("ephemeral_1h_input_tokens") {
+        Some(3600)
+    } else if written("ephemeral_5m_input_tokens") {
+        Some(300)
+    } else {
+        None
+    }
+}
+
+/// The main agent's model call the translator saw last.
+#[derive(Debug, Clone)]
+struct Call {
+    /// Its API message id: frames of one call share it.
+    id: String,
+    /// The tokens of its input ([`call_input`]), how full the context was when it was made,
+    /// when it said.
+    tokens: Option<u64>,
+    /// Its model, when it said.
+    model: Option<String>,
+    /// When it was made: the translator's clock when its first frame came.
+    called_at: DateTime<Utc>,
+    /// The prompt cache lifetime it reported ([`cache_ttl`]), when it wrote the cache.
+    ttl: Option<u64>,
+}
+
+/// What a `result`'s `modelUsage` says of a model's context window ([`context_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// This window.
+    Said(u64),
+    /// Nothing: no entry of the model, or none with a window.
+    Unsaid,
+    /// Entries of the model disagree (`m` and `m[1m]`), or only some say one.
+    Conflicting,
+}
+
+/// The context window of `model` in a `result`'s `modelUsage`: the `contextWindow` of the
+/// entries whose key or `canonicalModel` is that model (a `[1m]`-like suffix ignored), when
+/// they all say the same (`m` and `m[1m]` may differ). With no model known, the window every
+/// entry says: another model's (a subagent's) is not the main agent's.
+fn context_window(model_usage: &Value, model: Option<&str>) -> Window {
+    let base = |m: &str| m.split('[').next().unwrap_or(m).trim().to_string();
+    let window = |m: &Value| {
+        m.get("contextWindow")
+            .and_then(Value::as_u64)
+            .filter(|w| *w > 0)
+    };
+    let is = |model: &str, k: &str, m: &Value| {
+        base(k) == model
+            || m.get("canonicalModel")
+                .and_then(Value::as_str)
+                .is_some_and(|c| base(c) == model)
+    };
+    let model = model.map(base);
+    let windows: Vec<Option<u64>> = model_usage
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, m)| model.as_deref().is_none_or(|model| is(model, k, m)))
+        .map(|(_, m)| window(m))
+        .collect();
+    match windows.first() {
+        None => Window::Unsaid,
+        _ if windows.iter().all(Option::is_none) => Window::Unsaid,
+        Some(Some(first)) if windows.iter().all(|w| *w == Some(*first)) => Window::Said(*first),
+        Some(_) => Window::Conflicting,
+    }
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -2558,6 +3002,58 @@ pub fn transient_reason(v: &Value) -> Option<String> {
             .iter()
             .find(|p| t.contains(*p))
             .map(|p| format!("error text matches {p:?}"))
+    })
+}
+
+/// `rateLimitType`s of a `rejected` `rate_limit_event` that mean a usage window is used up.
+const USAGE_LIMIT_TYPES: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_overage_included",
+];
+
+/// Whether an `assistant` `error: rate_limit` message's text says a limit was hit rather than
+/// the API throttling: it names a limit and says when it resets or that "you hit your" limit
+/// ("You've hit your weekly limit · resets 5am (UTC)").
+pub fn is_limit_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("limit") && (t.contains("resets") || t.contains("hit your"))
+}
+
+/// The limit a failed turn hit, from the latest `rate_limit_event`'s `rate_limit_info` of
+/// the turn (`info`) and its limit-naming `rate_limit` error text (`text`, [`is_limit_text`]),
+/// in the runtime's words `message`: `rejected` with a [`USAGE_LIMIT_TYPES`] type is usage
+/// (that window, its `resetsAt`); `rejected` `overage` or `errorCode: credits_required` is
+/// spend; else such a text is usage with no window or time. None otherwise (a plain 429 or
+/// overload).
+pub fn limit_of(info: Option<&Value>, text: Option<&str>, message: &str) -> Option<Limit> {
+    if let Some(info) = info {
+        let rejected = str_at(info, "status") == "rejected";
+        let kind = str_at(info, "rateLimitType");
+        if str_at(info, "errorCode") == "credits_required" || (rejected && kind == "overage") {
+            return Some(Limit {
+                kind: LimitKind::Spend,
+                window: None,
+                resets_at: None,
+                message: message.to_string(),
+            });
+        }
+        if rejected && USAGE_LIMIT_TYPES.contains(&kind) {
+            return Some(Limit {
+                kind: LimitKind::Usage,
+                window: Some(kind.to_string()),
+                resets_at: crate::usage::epoch(&info["resetsAt"]),
+                message: message.to_string(),
+            });
+        }
+    }
+    text.map(|t| Limit {
+        kind: LimitKind::Usage,
+        window: None,
+        resets_at: None,
+        message: t.to_string(),
     })
 }
 
@@ -3440,6 +3936,75 @@ mod tests {
         assert!(!t.busy());
     }
 
+    /// A notification's run that begins by compacting the context (minutes of silence, the
+    /// compaction's own lines aside) is no run that never came: the wait holds while it
+    /// compacts (for `COMPACTING_HOLD_SECS` at most) and starts again once it ended.
+    #[test]
+    fn a_compaction_holds_a_notification_runs_wait() {
+        let status = |s: &str| {
+            json!({"type": "system", "subtype": "status", "status": s, "session_id": "s"})
+                .to_string()
+        };
+        let boundary = json!({"type": "system", "subtype": "compact_boundary",
+            "session_id": "s", "compact_metadata": {"trigger": "auto", "pre_tokens": 900_000,
+            "post_tokens": 40_000}})
+        .to_string();
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        let wait = t.deadline().unwrap();
+        let events = feed(&mut t, &[&status("compacting")]);
+        assert!(matches!(events[0].body, EventBody::ContextCompacting(_)));
+        let held = t.deadline().unwrap();
+        assert!(
+            held - wait > chrono::Duration::minutes(20),
+            "held for the compaction"
+        );
+        assert!(t
+            .expire(wait + chrono::Duration::minutes(5))
+            .events
+            .is_empty());
+        assert!(t.busy(), "the turn still runs");
+        // Done compacting: the wait starts again, and ends the turn if still nothing runs;
+        // the summary Claude writes into the session (`isSynthetic`) and a replayed command
+        // output (`isReplay`) are no run.
+        let summary = json!({"type": "user", "isSynthetic": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text",
+            "text": "This session is being continued from a previous conversation."}]}})
+        .to_string();
+        let replayed = json!({"type": "user", "isReplay": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user",
+            "content": "<local-command-stdout>Compacted </local-command-stdout>"}})
+        .to_string();
+        feed(&mut t, &[&boundary, &summary, &replayed]);
+        let again = t.deadline().unwrap();
+        assert!(again < held);
+        let events = t.expire(again).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        // A request of the user's closed meanwhile (a subagent's permission answered or
+        // withdrawn) leaves the hold as it is.
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let held = t.deadline().unwrap();
+        t.translate(r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","message":"Name?"}}"#);
+        t.translate(r#"{"type":"control_cancel_request","request_id":"e1"}"#);
+        assert_eq!(t.deadline(), Some(held));
+        // Held no longer than the hub holds its stall checks.
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
     /// Claude 2.1.295+ folds a prompt written into a run it started itself into that run, and
     /// writes no `result` for it: once the main agent's message stopped (`end_turn`) and
     /// nothing came for the wait, the turn ends `completed`, marked `missing_result`. A late
@@ -3488,6 +4053,47 @@ mod tests {
             &[INIT, &reply("Next done."), &result(1, Some(2.5), false)],
         );
         assert_eq!(turn_marks(&events), ["end Some(3) None Some(0.5)"]);
+    }
+
+    /// A turn ended for its missing `result` has no usage, but keeps what its latest call said
+    /// of the context, and where that came from.
+    #[test]
+    fn a_missing_result_keeps_the_context_its_call_said() {
+        let mut t = Translator::new(TranslatorOptions {
+            missing_result_after: Some(std::time::Duration::from_secs(90)),
+            ..Default::default()
+        });
+        t.user_message("hi", 1);
+        let call = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+            "id": "m1", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "Done."}],
+            "usage": {"input_tokens": 3, "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 50_000, "output_tokens": 9}}});
+        let stop = stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}));
+        feed(&mut t, &[INIT, MESSAGE_START, &call.to_string(), &stop]);
+        let at = t.deadline().unwrap();
+        let ended = t
+            .expire(at)
+            .events
+            .into_iter()
+            .find_map(|e| match e.body {
+                EventBody::TurnEnded(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            ended.ext.as_ref().unwrap()["twr"][MISSING_RESULT_KEY],
+            json!(true)
+        );
+        assert_eq!(ended.usage, None);
+        assert_eq!(
+            ended.context,
+            Some(twr_core::event::ContextSize {
+                tokens: 50_103,
+                window: None
+            })
+        );
+        let claude = &ended.ext.as_ref().unwrap()[EXT];
+        assert_eq!(claude["context_from"], json!(CONTEXT_FROM_CALL));
     }
 
     /// A subagent's line is no run of the main agent's: it neither ends the wait for the

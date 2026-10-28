@@ -26,8 +26,8 @@ use twr_core::config::CardOrder;
 use twr_core::event::{
     is_delete_card, message_ref, AttentionRaised, AttentionReason, AttentionResolved, ChangedBy,
     DecisionProvider, DecisionSite, EventBody, JsonMap, ResolvedBy, ThreadModelChanged, TurnFrom,
-    TurnResult, DELETE_KEY, HUB_THREAD, MODEL_RESTART_REASON, MODE_RESTART_REASON,
-    RUNTIME_RESTART_REASON,
+    TurnResult, ACCOUNT_RESTART_REASON, DELETE_KEY, HUB_THREAD, MODEL_RESTART_REASON,
+    MODE_RESTART_REASON, RUNTIME_RESTART_REASON,
 };
 use twr_core::proto::{StreamItem, StreamKind};
 use twr_core::reduce::{
@@ -35,6 +35,7 @@ use twr_core::reduce::{
 };
 use twr_core::Event;
 
+use crate::accounts::Accounts;
 use crate::edit::LineInput;
 use crate::select::{Anchor, PaneId, Panes, Selection, Target};
 use crate::slash::{self, Slash, TrashCmd};
@@ -261,6 +262,12 @@ pub struct ViewState {
     /// The orchestrator the hub would start (`orchestrator.show` `runtime`, `model`), for the
     /// main pane's header before an orchestrator thread exists.
     pub orch_default: Option<(String, Option<String>)>,
+    /// The account of that orchestrator (`orchestrator.show` `account`: a name, the native
+    /// account's under its current one), labelled in that header as a thread's is.
+    pub orch_default_account: Option<String>,
+    /// The hub's `default_runtime`, when `orchestrator.show` says it: its `configured.runtime`
+    /// while no `[orchestrator] runtime` is set (`/new --account` suggestions).
+    pub default_runtime: Option<String>,
     /// Whether each orchestrator runtime is installed, as `orchestrator.show` said (`/orch`
     /// suggestions).
     pub orch_installed: Vec<(String, bool)>,
@@ -506,13 +513,17 @@ impl CardView {
 /// <runtime>` does ([`AppState::confirm_switch`]); Esc leaves the orchestrator as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
-    /// Runtimes that can host the orchestrator, and whether each is installed (`None`: the
-    /// hub did not say).
+    /// Its rows ([`orch_rows`]): the runtimes that can host the orchestrator, one row per
+    /// usable account (`claude-code:work`) of a runtime that shows account labels, and
+    /// whether each is installed (`None`: the hub did not say). A row is the runtime spec
+    /// choosing it sends; it is shown as [`orch_label`] says (the runtime alone while the
+    /// runtime hides account labels, though the spec names an account).
     pub runtimes: Vec<(String, Option<bool>)>,
     /// The highlighted row.
     pub selected: usize,
-    /// The configured default (`[orchestrator] runtime`, else `default_runtime`); for a
-    /// switch, the current orchestrator's runtime.
+    /// The configured default (`[orchestrator] runtime`, else `default_runtime`, with
+    /// `[orchestrator] account`: `claude-code:work`); for a switch, the current
+    /// orchestrator's runtime and account. A row ([`orch_rows`]).
     pub default: String,
     /// The configured model, sent when the default runtime is chosen (never for a switch,
     /// which starts the runtime's default model, as `/orch <runtime>` does).
@@ -523,8 +534,11 @@ pub struct Picker {
 
 impl Picker {
     /// The picker an `orchestrator.show` result asks for, or `None` when an orchestrator was
-    /// chosen already (or the hub is too old to say whether the config chose one).
-    pub fn from_show(show: &Value) -> Option<Picker> {
+    /// chosen already (or the hub is too old to say whether the config chose one). Its
+    /// default row is the configured runtime with the configured account
+    /// (`configured.account`, `[orchestrator] account`): choosing it sends both, so the
+    /// account the configuration names is the one the hub checks ([`orch_rows`]).
+    pub fn from_show(show: &Value, accounts: &Accounts) -> Option<Picker> {
         let configured = &show["configured"];
         let first = configured["explicit"].as_bool() == Some(false)
             && show["thread"].is_null()
@@ -541,21 +555,128 @@ impl Picker {
         if runtimes.is_empty() {
             return None;
         }
-        let default = configured["runtime"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let selected = runtimes
-            .iter()
-            .position(|(r, _)| *r == default)
-            .unwrap_or(0);
+        let (rows, default) = orch_rows(
+            &runtimes,
+            accounts,
+            Some(OrchCurrent {
+                spec: configured["runtime"].as_str().unwrap_or_default(),
+                account: configured["account"].as_str(),
+                resolved: show["account"].as_str(),
+            }),
+        );
+        let selected = rows.iter().position(|(r, _)| *r == default).unwrap_or(0);
         Some(Picker {
-            runtimes,
+            runtimes: rows,
             selected,
             default,
             model: configured["model"].as_str().map(str::to_string),
             switch: false,
         })
+    }
+}
+
+/// The hub's `default_runtime` as `orchestrator.show` result `show` says it: the configured
+/// runtime while `[orchestrator] runtime` is not set (`configured.explicit` false), when the
+/// orchestrator runtime is `default_runtime`; else unknown.
+pub fn default_runtime(show: &Value) -> Option<String> {
+    let configured = &show["configured"];
+    (configured["explicit"].as_bool() == Some(false))
+        .then(|| configured["runtime"].as_str())
+        .flatten()
+        .map(|r| twr_core::account::split_runtime(r).0.to_string())
+}
+
+/// The orchestrator a picker marks ([`orch_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OrchCurrent<'a> {
+    /// Its runtime spec (`claude-code`, `claude-code:work`).
+    pub spec: &'a str,
+    /// The account it names, as configured or recorded (`None`: the account part of `spec`,
+    /// else none: the hub's default one).
+    pub account: Option<&'a str>,
+    /// The account it gets when it names none, as the hub resolved it (its native account
+    /// under its current name, or the policy's default).
+    pub resolved: Option<&'a str>,
+}
+
+/// The rows of an orchestrator picker and of `/orch` completion, each the runtime spec that
+/// chooses it, and the row of `current` (empty without one). Each of `runtimes` (with
+/// whether it is installed) is a row of its own, as `runtime`, unless it shows account
+/// labels ([`crate::accounts::RuntimeAccounts::shown`]): then each of its usable accounts is
+/// one (`claude-code:work`, `claude-code:personal`), `current`'s among them (added when it
+/// is not usable: choosing it is refused by the hub, never another account in its place).
+/// `current`'s runtime without labels is `runtime:account` when it names an account, so that
+/// choosing it keeps that account; else `runtime`, the hub's default account. A `current` the
+/// rows do not have is its spec as given.
+pub fn orch_rows(
+    runtimes: &[(String, Option<bool>)],
+    accounts: &Accounts,
+    current: Option<OrchCurrent<'_>>,
+) -> (Vec<(String, Option<bool>)>, String) {
+    let (base, account, resolved) = match current {
+        Some(c) => {
+            let (base, part) = twr_core::account::split_runtime(c.spec);
+            (Some(base), c.account.or(part), c.resolved)
+        }
+        None => (None, None, None),
+    };
+    let mut rows = Vec::new();
+    let mut default = current.map(|c| match account {
+        Some(a) if twr_core::account::split_runtime(c.spec).1.is_none() => {
+            format!("{}:{a}", c.spec)
+        }
+        _ => c.spec.to_string(),
+    });
+    for (runtime, installed) in runtimes {
+        let is_current = base == Some(runtime.as_str());
+        match accounts.runtime(runtime).filter(|r| r.shown) {
+            Some(entry) => {
+                // (Not the native account a named one's name shadows: its row is the named
+                // one's.)
+                let mut names: Vec<&str> = entry
+                    .accounts
+                    .iter()
+                    .filter(|a| a.usable() && !a.shadowed)
+                    .map(|a| a.name.as_str())
+                    .collect();
+                if is_current {
+                    let name = account.or(resolved).unwrap_or(&entry.native);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    default = Some(format!("{runtime}:{name}"));
+                }
+                rows.extend(
+                    names
+                        .into_iter()
+                        .map(|n| (format!("{runtime}:{n}"), *installed)),
+                );
+            }
+            None => {
+                let row = match account.filter(|_| is_current) {
+                    Some(a) => format!("{runtime}:{a}"),
+                    None => runtime.clone(),
+                };
+                if is_current {
+                    default = Some(row.clone());
+                }
+                rows.push((row, *installed));
+            }
+        }
+    }
+    (rows, default.unwrap_or_default())
+}
+
+/// How the UI shows orchestrator runtime spec `spec` (a picker row, [`orch_rows`]): as
+/// written while its runtime shows account labels ([`crate::accounts::RuntimeAccounts::
+/// shown`]), else the runtime alone, as a thread's label hides its account then. Only the
+/// display: the row still sends `spec`, account and all.
+pub fn orch_label(spec: &str, accounts: &Accounts) -> String {
+    match twr_core::account::split_runtime(spec) {
+        (runtime, Some(_)) if !accounts.runtime(runtime).is_some_and(|r| r.shown) => {
+            runtime.to_string()
+        }
+        _ => spec.to_string(),
     }
 }
 
@@ -585,6 +706,14 @@ pub const HYDRATION_PARALLEL: usize = 4;
 
 /// The longest wait before fetching a capped attention text again.
 pub const HYDRATION_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// How long a failed `account.list` waits before it is asked again, by failures in a row
+/// ([`AppState::accounts_answered`]): the last wait over and over.
+pub const ACCOUNTS_RETRY: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// An attention card on screen: the item and revision an option key answers.
 #[derive(Debug, Clone, PartialEq)]
@@ -926,6 +1055,16 @@ pub enum Action {
         /// The runtime, as typed; `None` keeps it (the hub checks it).
         runtime: Option<String>,
     },
+    /// Move a thread to another account of its runtime (`thread.set_model {account}`,
+    /// `/account`): a new session with a handoff.
+    SetAccount {
+        /// Thread id.
+        thread: String,
+        /// The account, as typed (the hub checks it).
+        account: String,
+        /// Leave the thread's or its project's pin (`outside_pin`).
+        outside_pin: bool,
+    },
     /// Rename a worker thread (`thread.rename`, `/rename`).
     Rename {
         /// Thread id.
@@ -990,6 +1129,11 @@ pub enum Action {
         /// Thread id.
         thread: String,
     },
+    /// Compact a thread's context (`thread.compact`).
+    CompactContext {
+        /// Thread id.
+        thread: String,
+    },
     /// Switch the orchestrator to `runtime` (`orchestrator.use`): a new orchestrator session
     /// that starts with a handoff.
     UseOrchestrator {
@@ -1008,6 +1152,10 @@ pub enum Action {
         runtime: Option<String>,
         /// Name; `None` = derived by the hub.
         name: Option<String>,
+        /// Account; `None` = the project's pin, else the runtime's default.
+        account: Option<String>,
+        /// Open it on `account` although the project's pin leaves it out.
+        outside_pin: bool,
     },
     /// Put selected text on the clipboard (OSC 52, and a local clipboard command when there
     /// is one).
@@ -1030,6 +1178,14 @@ pub enum Action {
     Setting(crate::settings::Change),
     /// Ask the hub for its settings (`config.show`), for the settings overlay.
     ConfigShow,
+    /// A `speech.request` or `speech.control` call (`/read`, Ctrl-R; [`crate::speech`]): its
+    /// answer says what was done.
+    Speech {
+        /// The method.
+        method: &'static str,
+        /// Its params, as [`twr_core::speech`] types them.
+        params: Value,
+    },
     /// Read what the config file says of the TUI's settings, for the settings overlay: the
     /// IO loop has the settings writer read it, off the loop.
     SettingsFile,
@@ -1095,6 +1251,9 @@ pub enum Entry {
         text: String,
         /// Still receiving deltas.
         open: bool,
+        /// The seq of its final `agent.text`, once it came: what names the message to the
+        /// hub's `speech.*` (`/read this`, the `▶` of the message being read).
+        final_seq: Option<u64>,
     },
     /// A tool call, shown as one line; `ok` is filled by the matching tool result.
     Tool {
@@ -1210,6 +1369,13 @@ pub struct Transcript {
     /// (the seq says whether the hub's is newer). A text a stop or crash cut short is never
     /// one.
     pub last_reply: Option<(u64, String)>,
+    /// The account the thread's last account move (in the events applied so far) went to,
+    /// with its runtime ([`moved_label`]: `claude-code:work`): what the line of the stop
+    /// that move restarts the runtime with names. `None` before one.
+    pub moved_to: Option<String>,
+    /// That move resumes the session the thread left on that account
+    /// (`ext.twr.resume_session`): the stop's line says so instead of a new session.
+    pub moved_resumes: bool,
 }
 
 impl Transcript {
@@ -1225,6 +1391,13 @@ impl Transcript {
 
     /// Applies one event of this thread. Events of other threads and already-seen seqs are ignored.
     pub fn apply(&mut self, ev: &Event) {
+        self.apply_named(ev, &|_| None);
+    }
+
+    /// [`Transcript::apply`], with `native`: the current name of a runtime's native account
+    /// (`None`: not known, or the thread's box's own login), which the lines of account moves
+    /// name it by ([`model_changed_notice`]).
+    pub fn apply_named(&mut self, ev: &Event, native: &dyn Fn(&str) -> Option<String>) {
         if ev.thread != self.thread || (ev.seq != 0 && ev.seq <= self.last_seq) {
             return;
         }
@@ -1241,22 +1414,28 @@ impl Transcript {
                 // The first turn of a thread's new runtime carries a handoff of the previous
                 // session (`ext.twr.runtime_handoff`): marked, never shown (the prompt is the
                 // message as given).
-                let handoff = p
-                    .ext
-                    .as_ref()
-                    .and_then(|m| m.get("twr"))
+                let twr = p.ext.as_ref().and_then(|m| m.get("twr"));
+                let handoff = twr
                     .and_then(|t| t.get(RUNTIME_HANDOFF_KEY))
                     .is_some_and(|h| !h.is_null());
-                if handoff {
+                // A move back resumes the session the thread left that runtime with, told what
+                // the thread did since (`ext.twr.resumes`), with or without a handoff.
+                let resumes = twr
+                    .and_then(|t| t.get("resumes"))
+                    .and_then(|r| r.as_str())
+                    .is_some();
+                if handoff || resumes {
                     let rt = self
                         .runtime
                         .as_deref()
                         .map(|r| format!("{r} "))
                         .unwrap_or_default();
-                    self.notice(
-                        NoticeLevel::Info,
-                        format!("new {rt}session, with a handoff of the previous one"),
-                    );
+                    let what = if resumes {
+                        format!("earlier {rt}session resumed, told what the thread did since")
+                    } else {
+                        format!("new {rt}session, with a handoff of the previous one")
+                    };
+                    self.notice(NoticeLevel::Info, what);
                 }
                 let notice = p.from == TurnFrom::Runtime
                     || p.from == TurnFrom::Orchestrator
@@ -1295,25 +1474,30 @@ impl Transcript {
                     .is_some_and(|fields| fields.iter().any(|f| f.as_str() == Some("text")));
                 let open = self.entries.iter_mut().rev().find_map(|e| match e {
                     Entry::Text {
-                        text, open: true, ..
-                    } => Some(text),
+                        text,
+                        open: true,
+                        final_seq,
+                        ..
+                    } => Some((text, final_seq)),
                     _ => None,
                 });
                 match (open, p.is_final) {
                     // The final text carries the whole message: it replaces the deltas.
-                    (Some(text), true) => {
+                    (Some((text, final_seq)), true) => {
                         // A failed blob fetch must never replace complete streamed text
                         // with the final event's 512-byte preview.
                         if !capped || text.len() < p.text.len() {
                             *text = p.text.clone();
                         }
+                        *final_seq = Some(ev.seq);
                         self.close_text();
                     }
-                    (Some(text), false) => text.push_str(&p.text),
+                    (Some((text, _)), false) => text.push_str(&p.text),
                     (None, is_final) => self.push(Entry::Text {
                         seq: ev.seq,
                         text: p.text.clone(),
                         open: !is_final,
+                        final_seq: is_final.then_some(ev.seq),
                     }),
                 }
                 if p.is_final && !p.text.trim().is_empty() {
@@ -1378,9 +1562,31 @@ impl Transcript {
             EventBody::TaskUpdated(p) if ev.source == twr_core::event::Source::Hub => {
                 self.apply_shell(ev.seq, p)
             }
+            // The runtime compacted its context (or failed to): a line of its own, in a dive
+            // and in the orchestrator's conversation alike. While it runs, the activity line
+            // says so.
+            EventBody::ContextCompacted(p) => {
+                self.close_text();
+                let level = match p.error {
+                    Some(_) => NoticeLevel::Error,
+                    None => NoticeLevel::Info,
+                };
+                self.notice(level, p.line());
+            }
             // What the orchestrator read of a project: shown like a hub update, so it stays on
             // screen when tool calls are folded.
             EventBody::ProjectRead(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
+            }),
+            // A note of the orchestrator's memory saved or forgotten: shown the same way.
+            EventBody::MemoryChanged(p) => self.push(Entry::HubUpdate {
                 text: p.line(),
                 user_message: None,
                 attn_id: None,
@@ -1459,11 +1665,28 @@ impl Transcript {
                     .and_then(|m| m.get("twr"))
                     .and_then(|t| t.get("reason"))
                     .and_then(Value::as_str);
+                let on_account;
                 let text = match reason {
                     Some(MODE_RESTART_REASON) => "restarting the runtime in its new mode",
                     Some(MODEL_RESTART_REASON) => "restarting the runtime with its new settings",
                     Some(RUNTIME_RESTART_REASON) => {
                         "the previous runtime stopped; the next turn starts a session of the new one"
+                    }
+                    // A move between accounts of one runtime: a new session, as for a runtime,
+                    // or the session the thread left on that account, resumed.
+                    Some(ACCOUNT_RESTART_REASON) => {
+                        let to = self.moved_to.as_deref().unwrap_or("its new account");
+                        on_account = match self.moved_resumes {
+                            true => format!(
+                                "the previous session stopped; the next turn resumes the \
+                                 thread's earlier session on {to}"
+                            ),
+                            false => format!(
+                                "the previous session stopped; the next turn starts a new \
+                                 session on {to}"
+                            ),
+                        };
+                        on_account.as_str()
                     }
                     Some(twr_core::event::TRIM_RESTART_REASON) => {
                         "the runtime stopped for a trim of its build output; the next prompt \
@@ -1489,7 +1712,17 @@ impl Transcript {
                 if let Some(r) = &p.runtime {
                     self.runtime = Some(r.clone());
                 }
-                self.notice(NoticeLevel::Info, model_changed_notice(p))
+                if p.account_changed {
+                    let rt = p.runtime.as_deref().or(p.previous_runtime.as_deref());
+                    self.moved_to = Some(moved_label(rt.unwrap_or("?"), &p.account, native));
+                    self.moved_resumes = p
+                        .ext
+                        .as_ref()
+                        .and_then(|e| e.get("twr"))
+                        .and_then(|t| t.get(twr_core::event::RESUME_SESSION_KEY))
+                        .is_some();
+                }
+                self.notice(NoticeLevel::Info, model_changed_notice(p, native))
             }
             EventBody::ThreadRenamed(p) => {
                 let by = match p.by {
@@ -1808,32 +2041,65 @@ fn setting(v: &Option<String>) -> &str {
 /// the effort did. One that changes neither (the hub records none) reads `model kept at
 /// sonnet, effort at high`. A move to another runtime names the runtimes and the model and
 /// effort the thread has on the new one: `runtime claude-code → codex, model gpt-6.1-sol,
-/// effort xhigh (by you)`.
-pub fn model_changed_notice(p: &ThreadModelChanged) -> String {
+/// effort xhigh (by you)`. A move between accounts (`account_changed`) names both accounts
+/// (the native one by its current name, `native`, else `own login`): `account work →
+/// personal (by you)`, with the model or effort when they changed too (`account work →
+/// personal, model from opus to sonnet`), and with their runtimes when the runtime changed
+/// too: `runtime codex:team → claude-code:work, model default, effort default (by you)`.
+pub fn model_changed_notice(
+    p: &ThreadModelChanged,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let by = match p.by {
         ChangedBy::User => " (by you)",
         ChangedBy::Orchestrator => " (by the orchestrator)",
     };
+    let changed = |i: usize, what: &str, before: &Option<String>, now: &Option<String>| {
+        let verb = if i == 0 { " changed" } else { "" };
+        format!("{what}{verb} from {} to {}", setting(before), setting(now))
+    };
+    let settings = [
+        ("model", &p.previous_model, &p.model),
+        ("effort", &p.previous_effort, &p.effort),
+    ];
+    let previous_runtime = p.previous_runtime.as_deref();
+    if p.account_changed
+        && p.runtime
+            .as_deref()
+            .is_none_or(|r| Some(r) == previous_runtime)
+    {
+        let rt = p.runtime.as_deref().or(previous_runtime).unwrap_or("?");
+        let mut s = format!(
+            "account {} → {}",
+            moved_account(rt, &p.previous_account, native),
+            moved_account(rt, &p.account, native)
+        );
+        for (what, before, now) in settings.into_iter().filter(|(_, b, n)| b != n) {
+            // (No verb: `account work → personal, model from opus to sonnet`.)
+            s.push_str(&format!(", {}", changed(1, what, before, now)));
+        }
+        return format!("{s}{by}");
+    }
     if let Some(r) = &p.runtime {
+        let (from, to) = match p.account_changed {
+            true => (
+                moved_label(previous_runtime.unwrap_or("?"), &p.previous_account, native),
+                moved_label(r, &p.account, native),
+            ),
+            false => (previous_runtime.unwrap_or("?").to_string(), r.clone()),
+        };
         return format!(
-            "runtime {} → {r}, model {}, effort {}{by}",
-            p.previous_runtime.as_deref().unwrap_or("?"),
+            "runtime {from} → {to}, model {}, effort {}{by}",
             setting(&p.model),
             setting(&p.effort)
         );
     }
-    let changes: Vec<String> = [
-        ("model", &p.previous_model, &p.model),
-        ("effort", &p.previous_effort, &p.effort),
-    ]
-    .into_iter()
-    .filter(|(_, before, now)| before != now)
-    .enumerate()
-    .map(|(i, (what, before, now))| {
-        let verb = if i == 0 { " changed" } else { "" };
-        format!("{what}{verb} from {} to {}", setting(before), setting(now))
-    })
-    .collect();
+    let changes: Vec<String> = settings
+        .into_iter()
+        .filter(|(_, before, now)| before != now)
+        .enumerate()
+        .map(|(i, (what, before, now))| changed(i, what, before, now))
+        .collect();
     if changes.is_empty() {
         return format!(
             "model kept at {}, effort at {}{by}",
@@ -1844,14 +2110,45 @@ pub fn model_changed_notice(p: &ThreadModelChanged) -> String {
     format!("{}{by}", changes.join(", "))
 }
 
+/// Account `account` of `runtime` (`None`: the native one) as an account move's line names
+/// it: its name, the native account's current name when `native` knows it, else `own login`.
+fn moved_account(
+    runtime: &str,
+    account: &Option<String>,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    account
+        .clone()
+        .or_else(|| native(runtime))
+        .unwrap_or_else(|| "own login".into())
+}
+
+/// [`moved_account`] with its runtime: `codex:team`, `claude-code:personal`, or `claude-code
+/// (own login)` when the native account's name is not known.
+fn moved_label(
+    runtime: &str,
+    account: &Option<String>,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    match account.clone().or_else(|| native(runtime)) {
+        Some(a) => format!("{runtime}:{a}"),
+        None => format!("{runtime} (own login)"),
+    }
+}
+
 /// What `/model <thread>` says of a thread: its model and reasoning effort, and the model its
 /// runtime reports when that is another (an alias it resolved, or the one it still runs until
 /// it restarts): `api: model fable, effort high (runs claude-fable-5-1)`. A thread that moved
 /// to another runtime and has no session of it yet says so: `api: model default, effort
-/// default; its first codex session starts with its next turn`.
-pub fn model_show(t: &ThreadView) -> String {
+/// default; its first codex session starts with its next turn` (or, moving back, that its
+/// earlier session resumes). With `account`, the account it runs on as the UI labels it
+/// ([`AppState::account_label`]), first: `api: account work, model ...`.
+pub fn model_show(t: &ThreadView, account: Option<&str>) -> String {
+    let account = account
+        .map(|a| format!("account {a}, "))
+        .unwrap_or_default();
     let mut out = format!(
-        "{}: model {}, effort {}",
+        "{}: {account}model {}, effort {}",
         t.name,
         setting(&t.model),
         setting(&t.effort)
@@ -1864,10 +2161,16 @@ pub fn model_show(t: &ThreadView) -> String {
         out.push_str(&format!(" (runs {a})"));
     }
     if t.handoff_pending {
-        out.push_str(&format!(
-            "; its first {} session starts with its next turn",
-            t.runtime
-        ));
+        match &t.resume_session {
+            Some(_) => out.push_str(&format!(
+                "; its earlier {} session resumes with its next turn",
+                t.runtime
+            )),
+            None => out.push_str(&format!(
+                "; its first {} session starts with its next turn",
+                t.runtime
+            )),
+        }
     }
     out
 }
@@ -2086,6 +2389,30 @@ impl DecisionLog {
         }
     }
 
+    /// The rows of a snapshot of the control stream (oldest first; at most [`DECISIONS_CAP`]
+    /// are kept), of `seen` decisions in all: the log as folding them would leave it.
+    pub fn install(&mut self, rows: impl IntoIterator<Item = DecisionRow>, seen: u64) {
+        self.rows = rows.into_iter().collect();
+        while self.rows.len() > DECISIONS_CAP {
+            self.rows.pop_front();
+        }
+        self.seen = seen;
+    }
+
+    /// Puts `older` (rows older than every kept one, newest first, as `decisions.list` gives
+    /// them) before the kept rows, as many as fit under [`DECISIONS_CAP`]: a kept row is never
+    /// dropped for them. They were counted in [`DecisionLog::seen`] already. Returns how many
+    /// were put.
+    pub fn prepend_older(&mut self, older: impl IntoIterator<Item = DecisionRow>) -> usize {
+        let room = DECISIONS_CAP.saturating_sub(self.rows.len());
+        let mut put = 0;
+        for row in older.into_iter().take(room) {
+            self.rows.push_front(row);
+            put += 1;
+        }
+        put
+    }
+
     /// Rows kept.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -2281,8 +2608,20 @@ pub struct AppState {
     /// is still running. The view kept for this workspace waits for it, and keys do (the IO
     /// loop drops them), so nothing answers a state the screen has not shown yet.
     pub catch_up: Option<u64>,
+    /// The initial replay is a compacted backlog ([`AppState::begin_compacted_catch_up`]):
+    /// how many of its items came, of how many. It ends after the last of them, whatever its
+    /// gseq.
+    pub catch_up_items: Option<(u64, u64)>,
     /// Recent `decision.made` events for the audit view.
     pub decisions: DecisionLog,
+    /// The decisions older than a snapshot's to read (`decisions.list`): before which control
+    /// position, and how many at most ([`AppState::install_snapshot`]). Taken when the read
+    /// is sent.
+    pub older_decisions: Option<(u64, usize)>,
+    /// A view kept across a switch had this decision selected, at this place of the table,
+    /// and the snapshot's rows do not have it: it is selected again once the older rows have
+    /// it, unless the selection moved meanwhile ([`AppState::older_decisions_came`]).
+    pub pending_decision: Option<(String, usize)>,
     /// The latest usage of each runtime's account, from `account.usage` (the status bar's
     /// usage segment).
     pub usage: twr_core::usage::UsageView,
@@ -2299,6 +2638,20 @@ pub struct AppState {
     pub boxes_known: bool,
     /// A `hub.info` poll is on its way: the next one waits for it.
     pub info_pending: bool,
+    /// The hub's accounts (`account.list`, [`crate::accounts`]): which runtimes show account
+    /// labels ([`AppState::account_label`]). Empty for a hub older than accounts.
+    pub accounts: crate::accounts::Accounts,
+    /// An `account.list` call is on its way: another waits for its answer.
+    pub accounts_pending: bool,
+    /// An `account.*` control event came since the accounts were last asked for: they are to
+    /// be asked for again ([`AppState::send_accounts`]).
+    pub accounts_due: bool,
+    /// When the accounts are asked for again after a failed `account.list` (the one on
+    /// connecting too; [`AppState::accounts_answered`]), if one failed last.
+    pub accounts_retry: Option<Instant>,
+    /// How many `account.list` calls failed in a row: how long the next retry waits
+    /// ([`ACCOUNTS_RETRY`]).
+    pub accounts_failures: u32,
     /// How many live `runner.connected` / `runner.disconnected` events were applied: the
     /// order of those against the `hub.info` polls ([`AppState::send_info`]).
     pub live_seq: u64,
@@ -2321,6 +2674,8 @@ pub struct AppState {
     pub activity: HashMap<String, ThreadActivity>,
     /// A `thread.activity` call is on its way: the next poll waits for it.
     pub activity_pending: bool,
+    /// What the hub's speakers read, polled ([`crate::speech`]).
+    pub speech: crate::speech::SpeechView,
     /// The workspace shown (`twr ws`), when the TUI can switch workspaces; `None` for a TUI
     /// opened on a socket.
     pub workspace: Option<String>,
@@ -2446,6 +2801,7 @@ impl AppState {
     /// kept to what the replayed stack lists. Nothing is selected until the user selects a
     /// card (the TUI opens with none, unless a kept view had one).
     pub fn begin_catch_up(&mut self, head: u64) {
+        self.catch_up_items = None;
         if head > self.last_gseq {
             self.catch_up = Some(head);
         } else {
@@ -2456,12 +2812,27 @@ impl AppState {
         }
     }
 
+    /// [`AppState::begin_catch_up`] for a compacted replay (`control.subscribe` with
+    /// `compact`): `items` items of those up to `head`, not every one ([`twr_core::compact`]).
+    /// It ends after the last of them, and the TUI then stands at `head`, as after a full
+    /// replay (what it has seen, [`AppState::seen_gseq`], counts from there).
+    pub fn begin_compacted_catch_up(&mut self, head: u64, items: u64) {
+        if items == 0 {
+            self.last_gseq = self.last_gseq.max(head);
+        }
+        self.begin_catch_up(head);
+        if self.catch_up.is_some() {
+            self.catch_up_items = Some((0, items));
+        }
+    }
+
     /// The control stream ended (lost, or the hub closed it): no replay is coming any more,
     /// so a view kept for this workspace is restored with what was applied, and the answers to
     /// its messages that waited for that are applied ([`AppState::finish_restore`]).
     pub fn control_ended(&mut self) {
         self.control_lost = true;
         self.catch_up = None;
+        self.catch_up_items = None;
         self.finish_restore();
     }
 
@@ -2470,31 +2841,53 @@ impl AppState {
     pub fn apply_event(&mut self, item: &StreamItem) {
         match item.stream {
             StreamKind::Control => {
-                if let Some(g) = item.gseq {
-                    if g <= self.last_gseq {
-                        return;
-                    }
-                    self.last_gseq = g;
+                if let Some((came, _)) = &mut self.catch_up_items {
+                    *came += 1;
                 }
-                self.apply_control_at(&item.event, item.gseq);
-                self.note_capped(item);
-                if self.catch_up.is_some_and(|head| self.last_gseq >= head) {
-                    self.catch_up = None;
+                let new = item.gseq.is_none_or(|g| g > self.last_gseq);
+                if new {
+                    if let Some(g) = item.gseq {
+                        self.last_gseq = g;
+                    }
+                    self.apply_control_at(&item.event, item.gseq);
+                    self.note_capped(item);
+                }
+                // A compacted replay ends with its last item, which may come before the head.
+                let compacted = self
+                    .catch_up_items
+                    .is_some_and(|(came, items)| came >= items);
+                let ended = self.catch_up.is_some_and(|head| self.last_gseq >= head) || compacted;
+                if ended {
+                    if let Some(head) = self.catch_up.take() {
+                        self.last_gseq = self.last_gseq.max(head);
+                    }
+                    self.catch_up_items = None;
                     self.finish_restore();
                     self.ensure_focus();
                 }
-                self.sync_action();
+                if new || ended {
+                    self.sync_action();
+                }
             }
             StreamKind::Thread => {
                 self.clear_transient_on(&item.event);
                 self.track_sent(&item.event);
+                // The native account's current name, for account moves' lines (a thread on
+                // another box: its own login, not named here).
+                let (accounts, registry) = (&self.accounts, &self.registry);
                 if let Some(t) = &mut self.transcript {
-                    t.apply(&item.event);
+                    let remote = registry.get(&t.thread).is_some_and(on_remote_box);
+                    let native = |rt: &str| {
+                        accounts
+                            .runtime(rt)
+                            .map(|r| r.native.clone())
+                            .filter(|n| !remote && !n.is_empty())
+                    };
+                    t.apply_named(&item.event, &native);
                     // The orchestrator's newest reply outlives its transcript, which the
                     // cache of conversations may drop.
                     if let Some((seq, text)) = &t.last_reply {
-                        let orch = self
-                            .registry
+                        let orch = registry
                             .get(&t.thread)
                             .is_some_and(|v| v.is_current_orchestrator());
                         let newer = self
@@ -2672,6 +3065,11 @@ impl AppState {
             // A new row lands on top: keep a selection below the top on the same row.
             if self.view.decision_sel > 0 && self.view.decision_filter.matches(&row) {
                 self.view.decision_sel = self.view.decision_sel.saturating_add(1);
+                // A selection a kept view waits to find again moves with it: this is no move
+                // of the user's ([`AppState::pending_decision`]).
+                if let Some((_, at)) = self.pending_decision.as_mut() {
+                    *at = at.saturating_add(1);
+                }
             }
             self.decisions.push(row);
         }
@@ -2680,6 +3078,14 @@ impl AppState {
         self.note_stall_resolved(ev);
         self.attention.apply_at(ev, gseq);
         self.usage.apply(ev);
+        // An account added, removed or checked: the label rule may say otherwise now (the
+        // replay's are in the answer asked for on connecting). Usage changes no account.
+        if self.catch_up.is_none()
+            && ev.kind().starts_with("account.")
+            && !matches!(ev.body, EventBody::AccountUsage(_))
+        {
+            self.accounts_due = true;
+        }
         self.clear_transient_on(ev);
         self.track_sent(ev);
         match &ev.body {
@@ -2792,6 +3198,76 @@ impl AppState {
             Some(b) => b.word(),
             None => self.boxes_known.then_some(BoxWord::NotConfigured),
         }
+    }
+
+    /// The account `t` runs on as the UI names it ([`crate::accounts::Accounts::label_on`]):
+    /// its name while its runtime shows account labels, `<name> (removed)` for a removed
+    /// account whatever the rule (not the native account of a thread on another box: that is
+    /// the box's own login), else `None` (a single-account user sees none anywhere).
+    pub fn account_label(&self, t: &ThreadView) -> Option<String> {
+        self.accounts
+            .label_on(&t.runtime, t.account.as_deref(), on_remote_box(t))
+    }
+
+    /// An `account.list` call is to be sent: an `account.*` control event came since the last
+    /// one ([`AppState::accounts_due`]) and none is on its way (`false` then: one at a time,
+    /// and an event meanwhile asks again once its answer is in).
+    pub fn send_accounts(&mut self) -> bool {
+        if !self.accounts_due || self.accounts_pending {
+            return false;
+        }
+        self.accounts_due = false;
+        self.accounts_pending = true;
+        // (This call is the retry, if one waited.)
+        self.accounts_retry = None;
+        true
+    }
+
+    /// What an `account.list` call answered (`result`, at `now`): the accounts; `null`, a hub
+    /// older than accounts (its unknown method), none, as they were (empty from the start);
+    /// `{failed: true}`, a call that failed otherwise (an error, no answer in time), the
+    /// accounts as they were, asked for again after [`ACCOUNTS_RETRY`]'s wait
+    /// ([`AppState::accounts_retry_due`]), so the labels do not stay stale for want of an
+    /// `account.*` event.
+    pub fn accounts_answered(&mut self, result: &Value, now: Instant) {
+        self.accounts_pending = false;
+        if result["failed"].as_bool() == Some(true) {
+            let wait =
+                ACCOUNTS_RETRY[(self.accounts_failures as usize).min(ACCOUNTS_RETRY.len() - 1)];
+            self.accounts_failures = self.accounts_failures.saturating_add(1);
+            self.accounts_retry = Some(now + wait);
+            return;
+        }
+        self.accounts_failures = 0;
+        self.accounts_retry = None;
+        if !result.is_null() {
+            self.accounts = crate::accounts::Accounts::from_list(result);
+        }
+    }
+
+    /// The retry of a failed `account.list` is due at `now`: the accounts are to be asked for
+    /// again ([`AppState::accounts_due`]).
+    pub fn accounts_retry_due(&mut self, now: Instant) {
+        if self.accounts_retry.is_some_and(|at| at <= now) {
+            self.accounts_retry = None;
+            self.accounts_due = true;
+        }
+    }
+
+    /// The calls an `account.*` control event asks for ([`AppState::send_accounts`]; none
+    /// while one is on its way): `account.list`, and, before an orchestrator thread exists,
+    /// `orchestrator.show` too, whose `account` the main pane's header shows
+    /// ([`ViewState::orch_default_account`]): the native account renamed, or a pool whose
+    /// choice changed, starts the orchestrator on another account.
+    pub fn account_calls(&mut self) -> Vec<&'static str> {
+        if !self.send_accounts() {
+            return Vec::new();
+        }
+        let mut calls = vec!["account.list"];
+        if self.orchestrator().is_none() {
+            calls.push("orchestrator.show");
+        }
+        calls
     }
 
     /// A `hub.info` poll is to be sent, unless one is on its way (`false` then): records when
@@ -2993,6 +3469,11 @@ impl AppState {
             "job.log" => self.shell_log(result, Instant::now()),
             "job.cancel" => self.shell_cancel_result(result),
             "suggest.next" => self.suggest_result(result),
+            "speech.status" | "speech.request" | "speech.control" => {
+                if let Some(msg) = self.speech.answered(method, result) {
+                    self.view.status = Some(msg);
+                }
+            }
             "config.show" => self.settings_hub(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
@@ -3011,6 +3492,20 @@ impl AppState {
                 self.view.trash = Some(result);
                 self.view.trash_scroll = 0;
                 self.view.status = None;
+            }
+            // An older hub's answer arrives as null, another failure as `{failed: true}`: the
+            // accounts stay as they were, asked for again after a failure.
+            "account.list" => self.accounts_answered(result, Instant::now()),
+            // The orchestrator the hub would start, asked for again after an account change
+            // ([`AppState::account_calls`]). A failed call arrives as null: what was known
+            // stays.
+            "orchestrator.show" => {
+                if let Some(rt) = result["runtime"].as_str() {
+                    let model = result["model"].as_str().map(str::to_string);
+                    self.view.orch_default = Some((rt.to_string(), model));
+                    self.view.orch_default_account = result["account"].as_str().map(str::to_string);
+                    self.view.default_runtime = default_runtime(result);
+                }
             }
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
@@ -4309,9 +4804,10 @@ impl AppState {
         });
     }
 
-    /// Asks for `y` before switching the orchestrator (`/orch`, or the picker `/orch` opens);
-    /// `s` switches without the current orchestrator's summary.
-    fn confirm_switch(&mut self, runtime: String, model: Option<String>) {
+    /// Asks for `y` before switching the orchestrator (`/orch`, or the picker `/orch` opens) to
+    /// runtime spec `runtime`, which the prompt calls `shown` (a picker row's display,
+    /// [`orch_label`]); `s` switches without the current orchestrator's summary.
+    fn confirm_switch(&mut self, runtime: String, shown: &str, model: Option<String>) {
         let with = model
             .as_deref()
             .map(|m| format!(" ({m})"))
@@ -4319,12 +4815,12 @@ impl AppState {
         self.view.status = None;
         self.view.confirm = Some(Confirm {
             prompt: format!(
-                "switch the orchestrator to {runtime}{with}? A new session that starts with a \
+                "switch the orchestrator to {shown}{with}? A new session that starts with a \
                  handoff. y: with the current one's summary (waits up to 60s if it is busy) · \
                  s: without it · any other key cancels"
             ),
             pending: format!(
-                "switching the orchestrator to {runtime}: asking the current one for a handoff \
+                "switching the orchestrator to {shown}: asking the current one for a handoff \
                  summary (up to 60s if it is busy)"
             ),
             alt: Some((
@@ -4334,9 +4830,7 @@ impl AppState {
                     model: model.clone(),
                     summary: false,
                 },
-                format!(
-                    "switching the orchestrator to {runtime} (no summary): waiting for the hub"
-                ),
+                format!("switching the orchestrator to {shown} (no summary): waiting for the hub"),
             )),
             offer: false,
             action: Action::UseOrchestrator {
@@ -4439,7 +4933,7 @@ impl AppState {
                 let view = self.registry.get(&thread);
                 if model.is_none() && effort.is_none() && runtime.is_none() {
                     self.view.status = Some(match view {
-                        Some(t) => model_show(t),
+                        Some(t) => model_show(t, self.account_label(t).as_deref()),
                         None => format!("no thread {thread}"),
                     });
                     return (Vec::new(), true);
@@ -4497,7 +4991,10 @@ impl AppState {
                     offer: false,
                 });
             }
-            Slash::Orch { runtime, model } => self.confirm_switch(runtime, model),
+            Slash::Orch { runtime, model } => {
+                let shown = runtime.clone();
+                self.confirm_switch(runtime, &shown, model)
+            }
             Slash::OrchPick => self.open_orch_picker(),
             Slash::Grid => self.toggle_grid(),
             Slash::Decisions => self.toggle_decisions(),
@@ -4512,6 +5009,8 @@ impl AppState {
                 project,
                 runtime,
                 name,
+                account,
+                outside_pin,
             } => {
                 self.view.status = Some(format!("creating a thread in {project}..."));
                 return (
@@ -4519,9 +5018,31 @@ impl AppState {
                         project,
                         runtime,
                         name,
+                        account,
+                        outside_pin,
                     }],
                     true,
                 );
+            }
+            Slash::Account {
+                thread,
+                account,
+                outside_pin,
+            } => return self.slash_account(thread, account, outside_pin),
+            Slash::AccountAdd { runtime, name } => {
+                // Its login needs a terminal, which the TUI cannot hand over.
+                self.view.status = Some(format!(
+                    "to add the account, run in another terminal: twr{} account add {runtime} \
+                     {name}",
+                    self.attach_via
+                ));
+            }
+            Slash::Accounts => {
+                self.view.status = Some(if self.accounts.runtimes.is_empty() {
+                    "no accounts known: the hub is older than accounts".into()
+                } else {
+                    format!("accounts: {}", self.accounts.summary())
+                });
             }
             Slash::Park(q) => {
                 self.confirm_lifecycle_of(true, q.as_deref());
@@ -4556,6 +5077,18 @@ impl AppState {
                 let (thread, name) = (t.id.clone(), t.name.clone());
                 self.view.status = Some(format!("trim {name}: deleting its build output"));
                 return (vec![Action::Trim { thread }], true);
+            }
+            Slash::CompactContext(q) => {
+                let t = match self.thread_arg(q.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.view.status = Some(e);
+                        return (Vec::new(), false);
+                    }
+                };
+                let (thread, name) = (t.id.clone(), t.name.clone());
+                self.view.status = Some(format!("compact {name}'s context: waiting for the hub"));
+                return (vec![Action::CompactContext { thread }], true);
             }
             Slash::Stop(q) => {
                 let Some((thread, name)) = thread(self, &q) else {
@@ -4664,8 +5197,205 @@ impl AppState {
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
             Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Settings => return (self.open_settings(), true),
+            Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
         }
         (Vec::new(), true)
+    }
+
+    /// `/account [thread] [name] [--outside-pin]`: shows the account the thread runs on (in
+    /// the status bar: `api: claude-code account work (logged in)`, or `api: claude-code (one
+    /// account)`), or asks the hub to move it to account `name`. In a dive, one word is the
+    /// account to move the dived thread to, unless it names a thread and no account of the
+    /// dived thread's runtime.
+    fn slash_account(
+        &mut self,
+        thread: Option<String>,
+        account: Option<String>,
+        outside_pin: bool,
+    ) -> (Vec<Action>, bool) {
+        let usage = "usage: /account [thread] [name] [--outside-pin] (in a dive: /account [name])";
+        let (thread, account) = match (thread, account, self.dived()) {
+            (Some(one), None, Some(d)) => {
+                let an_account = self.accounts.account(&d.runtime, Some(&one)).is_some();
+                if an_account || self.thread_arg(Some(&one)).is_err() || outside_pin {
+                    (None, Some(one))
+                } else {
+                    (Some(one), None)
+                }
+            }
+            other => (other.0, other.1),
+        };
+        if outside_pin && account.is_none() {
+            self.view.status = Some(usage.into());
+            return (Vec::new(), false);
+        }
+        let t = match self.thread_arg(thread.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                let e = if thread.is_none() {
+                    format!("{e}; {usage}")
+                } else {
+                    e
+                };
+                self.view.status = Some(e);
+                return (Vec::new(), false);
+            }
+        };
+        let Some(account) = account else {
+            self.view.status = Some(self.account_show(t));
+            return (Vec::new(), true);
+        };
+        let (id, name) = (t.id.clone(), t.name.clone());
+        self.view.status = Some(format!("{name} → account {account}: waiting for the hub"));
+        (
+            vec![Action::SetAccount {
+                thread: id,
+                account,
+                outside_pin,
+            }],
+            true,
+        )
+    }
+
+    /// What `/account <thread>` says of a thread: the account it runs on with its login, when
+    /// its runtime has more than one account (`api: claude-code account work (logged in)`;
+    /// `(removed)` for a removed one), else `api: claude-code (one account)`. The accounts
+    /// are the hub's machine's: a thread on another box on the native account runs on that
+    /// box's own login (`api: claude-code (the box's own login)`), whatever they say.
+    pub fn account_show(&self, t: &ThreadView) -> String {
+        let rt = if t.runtime.is_empty() {
+            "?"
+        } else {
+            t.runtime.as_str()
+        };
+        if on_remote_box(t) && t.account.is_none() {
+            return format!("{}: {rt} (the box's own login)", t.name);
+        }
+        let entry = self.accounts.runtime(&t.runtime);
+        let listed = self.accounts.account(&t.runtime, t.account.as_deref());
+        let several = entry.is_some_and(|r| r.accounts.iter().filter(|a| !a.removed).count() > 1);
+        // (A named account the list no longer has is removed too, as the hub says.)
+        let gone = t.account.is_some()
+            && listed.is_none()
+            && entry.is_some_and(|r| !r.accounts.is_empty());
+        let removed = gone || listed.is_some_and(|a| a.removed);
+        if !several && !removed && t.account.is_none() {
+            return format!("{}: {rt} (one account)", t.name);
+        }
+        let name = t
+            .account
+            .clone()
+            .unwrap_or_else(|| entry.map_or_else(|| "default".into(), |r| r.native.clone()));
+        let state = match listed {
+            _ if gone => "removed".to_string(),
+            Some(a) => a.state_text(),
+            None => String::new(),
+        };
+        match state {
+            s if s.is_empty() => format!("{}: {rt} account {name}", t.name),
+            s => format!("{}: {rt} account {name} ({s})", t.name),
+        }
+    }
+
+    /// `/read ...` ([`slash::ReadCmd`]) on `on` (a speaker; `None`: every one), as a
+    /// `speech.*` call ([`crate::speech`]); `/read status` says what the last poll said. Never
+    /// a message. A command that can't go stays on the line, its error in the status bar.
+    fn read_aloud(&mut self, cmd: slash::ReadCmd, on: Option<String>) -> (Vec<Action>, bool) {
+        use crate::speech::{control, request};
+        use slash::ReadCmd;
+        use twr_core::speech::CtlOp;
+        let action = match cmd {
+            ReadCmd::Status => {
+                self.view.status = Some(self.speech.listing());
+                return (Vec::new(), true);
+            }
+            // In a dive, the thread's messages; else, or with --orch, the orchestrator's.
+            ReadCmd::Last { n, orch } => {
+                let thread = self.view.dive.clone().filter(|_| !orch);
+                Ok(request(thread, Some(n), None, on))
+            }
+            ReadCmd::This => self
+                .selected_message()
+                .map(|(thread, seq)| request(Some(thread), None, Some(seq), on)),
+            ReadCmd::On | ReadCmd::Off => {
+                control(CtlOp::Live, Some(Value::Bool(cmd == ReadCmd::On)), on)
+            }
+            ReadCmd::Stop => control(CtlOp::Stop, None, on),
+            ReadCmd::Pause => control(CtlOp::Pause, None, on),
+            ReadCmd::Resume => control(CtlOp::Resume, None, on),
+            ReadCmd::Skip => control(CtlOp::Skip, None, on),
+            ReadCmd::Voice(v) => control(CtlOp::Voice, Some(Value::String(v)), on),
+            ReadCmd::Rate(r) => control(CtlOp::Rate, Some(r.into()), on),
+        };
+        match action {
+            Ok(a) => {
+                self.view.status = None;
+                (vec![a], true)
+            }
+            Err(e) => {
+                self.view.status = Some(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// The message selected in the conversation (a long block, Shift-↑/↓): its thread and the
+    /// seq of its final text, for `/read this`. The error, for the status bar, says why there
+    /// is none.
+    fn selected_message(&self) -> Result<(String, u64), String> {
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        let (Some(key), Some(t)) = (self.view.block.as_deref(), self.transcript.as_ref()) else {
+            return Err(pick.into());
+        };
+        // `block:<thread>:text:<seq or #index>[:<section>]` ([`crate::ui`]'s block keys).
+        let Some(id) = key
+            .strip_prefix("block:")
+            .and_then(|k| k.strip_prefix(t.thread.as_str()))
+            .and_then(|k| k.strip_prefix(":text:"))
+            .and_then(|k| k.split(':').next())
+        else {
+            return Err(pick.into());
+        };
+        let (entries, _) = t.visible();
+        let found = entries.iter().enumerate().find_map(|(i, e)| match e {
+            Entry::Text {
+                seq,
+                open,
+                final_seq,
+                ..
+            } if (*seq == 0 && id == format!("#{i}")) || (*seq != 0 && id == seq.to_string()) => {
+                Some((*open, *final_seq))
+            }
+            _ => None,
+        });
+        match found {
+            None => Err(pick.into()),
+            Some((true, _)) => Err("that message is still being written".into()),
+            Some((false, None)) => {
+                Err("that message has no final text to read; /read N reads the last ones".into())
+            }
+            Some((false, Some(seq))) => Ok((t.thread.clone(), seq)),
+        }
+    }
+
+    /// Ctrl-R: stops what the speakers read (as `/read stop`); with nothing read, says how to
+    /// start.
+    fn stop_reading(&mut self) -> Vec<Action> {
+        if self.speech.unsupported {
+            self.view.status = Some(crate::speech::PREDATES.into());
+            return Vec::new();
+        }
+        if !self.speech.busy() {
+            self.view.status = Some(crate::speech::NOTHING_READ.into());
+            return Vec::new();
+        }
+        match crate::speech::control(twr_core::speech::CtlOp::Stop, None, None) {
+            Ok(a) => vec![a],
+            Err(e) => {
+                self.view.status = Some(e);
+                Vec::new()
+            }
+        }
     }
 
     /// Runtimes that can host the orchestrator (for `/orch` completion and its picker).
@@ -4677,16 +5407,9 @@ impl AppState {
         }
     }
 
-    /// `/orch` without arguments: the picker of the orchestrator's runtime
-    /// ([`Picker::switch`]), the current one highlighted (before an orchestrator thread
-    /// exists, the one the hub would start); choosing asks to confirm the switch.
-    fn open_orch_picker(&mut self) {
-        let current = self
-            .orchestrator()
-            .map(|o| o.runtime.clone())
-            .or_else(|| self.view.orch_default.as_ref().map(|(r, _)| r.clone()));
-        let runtimes: Vec<(String, Option<bool>)> = self
-            .runtimes()
+    /// The orchestrator runtimes ([`AppState::runtimes`]) with whether each is installed.
+    fn orch_runtimes_installed(&self) -> Vec<(String, Option<bool>)> {
+        self.runtimes()
             .into_iter()
             .map(|r| {
                 let installed = self
@@ -4697,8 +5420,41 @@ impl AppState {
                     .map(|(_, i)| *i);
                 (r, installed)
             })
-            .collect();
-        let default = current.unwrap_or_default();
+            .collect()
+    }
+
+    /// What `/orch` completes to: the rows of its picker without a current one
+    /// ([`orch_rows`]: `claude-code:work` while Claude Code shows account labels).
+    fn orch_specs(&self) -> Vec<(String, Option<bool>)> {
+        orch_rows(&self.orch_runtimes_installed(), &self.accounts, None).0
+    }
+
+    /// `/orch` without arguments: the picker of the orchestrator's runtime and account
+    /// ([`Picker::switch`], [`orch_rows`]), the current one highlighted (before an
+    /// orchestrator thread exists, the one the hub would start, its account named unless it
+    /// is the native one); choosing asks to confirm the switch.
+    fn open_orch_picker(&mut self) {
+        let current: Option<(String, Option<String>, Option<String>)> = match self.orchestrator() {
+            Some(o) => Some((o.runtime.clone(), o.account.clone(), None)),
+            None => self.view.orch_default.as_ref().map(|(r, _)| {
+                let base = twr_core::account::split_runtime(r).0;
+                let native = self.accounts.runtime(base).map(|e| e.native.as_str());
+                let resolved = self.view.orch_default_account.clone();
+                let named = resolved.clone().filter(|a| Some(a.as_str()) != native);
+                (r.clone(), named, resolved)
+            }),
+        };
+        let (runtimes, default) = orch_rows(
+            &self.orch_runtimes_installed(),
+            &self.accounts,
+            current
+                .as_ref()
+                .map(|(spec, account, resolved)| OrchCurrent {
+                    spec,
+                    account: account.as_deref(),
+                    resolved: resolved.as_deref(),
+                }),
+        );
         let selected = runtimes
             .iter()
             .position(|(r, _)| *r == default)
@@ -4763,8 +5519,9 @@ impl AppState {
             .map(|t| t.name.clone())
             .collect();
         let workspaces: Vec<String> = self.tabs.iter().map(|t| t.name.clone()).collect();
+        let runtimes: Vec<String> = self.orch_specs().into_iter().map(|(r, _)| r).collect();
         let (line, candidates) =
-            slash::complete(&self.view.input, &self.runtimes(), &threads, &workspaces);
+            slash::complete(&self.view.input, &runtimes, &threads, &workspaces);
         if let Some(l) = line {
             self.view.input.set(&l);
             self.view
@@ -4812,6 +5569,12 @@ impl AppState {
         if ctrl && key.code == KeyCode::Char('l') {
             self.view.repaint = true;
             return Vec::new();
+        }
+        // Ctrl-R stops what a speaker reads aloud, whatever else is open (a picker, the
+        // settings, the help, a confirmation): speech that starts at a bad moment stops at once.
+        if ctrl && key.code == KeyCode::Char('r') && !self.speech.unsupported && self.speech.busy()
+        {
+            return self.stop_reading();
         }
         // Workspaces: Alt-1..9 the tab at that place, Ctrl-PgUp/PgDn the previous and next one
         // (only while the strip shows), whatever is open: the first-run picker of a new
@@ -5100,6 +5863,7 @@ impl AppState {
             KeyCode::Char('g') if ctrl && self.view.screen != Screen::Decisions => {
                 self.toggle_grid();
             }
+            KeyCode::Char('r') if ctrl => return Some(self.stop_reading()),
             // A detail view in the main pane scrolls instead of the transcript under it.
             KeyCode::PageUp | KeyCode::PageDown if self.view.panes.card.is_some() => {
                 self.scroll_card(key.code == KeyCode::PageDown, usize::MAX);
@@ -6078,7 +6842,12 @@ impl AppState {
             } else {
                 &t.runtime
             };
-            format!("{} · {rt} · mode {}", t.status().as_str(), t.mode)
+            // `claude-code:work` while its runtime shows account labels.
+            let account = self
+                .account_label(t)
+                .map(|a| format!(":{a}"))
+                .unwrap_or_default();
+            format!("{} · {rt}{account} · mode {}", t.status().as_str(), t.mode)
         };
         let workers: Vec<&ThreadView> = self
             .registry
@@ -6105,21 +6874,25 @@ impl AppState {
             })
             .collect();
         let runtimes = self
-            .runtimes()
+            .orch_specs()
             .into_iter()
-            .map(|r| {
-                let installed = self
-                    .view
-                    .orch_installed
-                    .iter()
-                    .find(|(n, _)| *n == r)
-                    .map(|(_, i)| *i);
-                let detail = match installed {
-                    Some(true) => "installed",
-                    Some(false) => "not installed",
-                    None => "",
+            .map(|(r, installed)| {
+                let installed = match installed {
+                    Some(true) => Some("installed"),
+                    Some(false) => Some("not installed"),
+                    None => None,
                 };
-                (r, detail.to_string())
+                // Of `claude-code:work`, the account's state too.
+                let state = match twr_core::account::split_runtime(&r) {
+                    (base, Some(a)) => self
+                        .accounts
+                        .account(base, Some(a))
+                        .map(|a| a.state_text())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                let detail: Vec<&str> = installed.into_iter().chain(state.as_deref()).collect();
+                (r, detail.join(" · "))
             })
             .collect();
         let workspaces = self
@@ -6133,12 +6906,45 @@ impl AppState {
                 )
             })
             .collect();
+        // Accounts a thread can move to: not removed, each with its state (`logged in`).
+        let accounts = self
+            .accounts
+            .runtimes
+            .iter()
+            .map(|(rt, entry)| {
+                // (Not the native account a named one's name shadows: the name moves to that
+                // one.)
+                let names = entry
+                    .accounts
+                    .iter()
+                    .filter(|a| !a.removed && !a.shadowed)
+                    .map(|a| (a.name.clone(), a.state_text()))
+                    .collect();
+                (rt.clone(), names)
+            })
+            .collect();
+        let thread_runtimes = workers
+            .iter()
+            .map(|t| (t.name.clone(), t.runtime.clone()))
+            .collect();
+        // The latest thread made for a configured project says its runtime (in creation
+        // order: a later one replaces an earlier one).
+        let project_runtimes = workers
+            .iter()
+            .filter(|t| t.configured_project && !t.runtime.is_empty())
+            .filter_map(|t| Some((t.project.clone()?, t.runtime.clone())))
+            .collect();
         slash::Pools {
             runtimes,
             threads,
             dive: self.view.dive.is_some(),
             mentions,
             workspaces,
+            accounts,
+            thread_runtimes,
+            account_runtime: self.thread_arg(None).ok().map(|t| t.runtime.clone()),
+            project_runtimes,
+            default_runtime: self.view.default_runtime.clone(),
         }
     }
 
@@ -6230,7 +7036,8 @@ impl AppState {
             KeyCode::Enter if p.switch => {
                 let runtime = p.runtimes[p.selected].0.clone();
                 self.view.picker = None;
-                self.confirm_switch(runtime, None);
+                let shown = orch_label(&runtime, &self.accounts);
+                self.confirm_switch(runtime, &shown, None);
             }
             KeyCode::Esc if p.switch => {
                 self.view.picker = None;
@@ -6241,7 +7048,8 @@ impl AppState {
                 let model = p.model.clone().filter(|_| runtime == p.default);
                 self.view.picker = None;
                 self.view.status = Some(format!(
-                    "choosing {runtime} for the orchestrator: waiting for the hub"
+                    "choosing {} for the orchestrator: waiting for the hub",
+                    orch_label(&runtime, &self.accounts)
                 ));
                 return vec![Action::UseOrchestrator {
                     runtime,
@@ -6250,7 +7058,7 @@ impl AppState {
                 }];
             }
             KeyCode::Esc => {
-                let default = p.default.clone();
+                let default = orch_label(&p.default, &self.accounts);
                 self.view.picker = None;
                 self.view.status = Some(format!(
                     "no choice made: the orchestrator will be {default} (asked again next \
@@ -6488,7 +7296,7 @@ impl AppState {
     fn decisions_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('b' | 'f' | 'o' | 't') if ctrl => return None,
+            KeyCode::Char('b' | 'f' | 'o' | 'r' | 't') if ctrl => return None,
             _ if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Esc => self.toggle_decisions(),
             KeyCode::Down | KeyCode::Char('j') => self.move_decision(1),
@@ -8198,6 +9006,30 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn memory_changes_show_as_hub_lines() {
+        let mut t = Transcript::new("t-orch");
+        let mut o = ThreadScript::new("t-orch");
+        t.apply(
+            &o.event(EventBody::MemoryChanged(twr_core::event::MemoryChanged {
+                op: "updated".into(),
+                name: "short-replies".into(),
+                by: "orchestrator".into(),
+                origin: Some("user".into()),
+                ..Default::default()
+            })),
+        );
+        let texts: Vec<&str> = t
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::HubUpdate { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["updated memory short-replies"]);
+    }
+
     /// A request's end goes onto the hub update that raised it: one entry, its outcome
     /// filled in. An end whose raise is not in the transcript stays an update of its own.
     #[test]
@@ -9535,7 +10367,8 @@ pub(crate) mod tests {
             [Entry::Text {
                 seq: later.seq,
                 text: "and more".into(),
-                open: false
+                open: false,
+                final_seq: Some(later.seq),
             }]
         );
 
@@ -10102,6 +10935,229 @@ pub(crate) mod tests {
         assert!(st.view.confirm.is_some());
     }
 
+    /// A `speech.*` call (`/read`, Ctrl-R).
+    fn speech_call(method: &'static str, params: Value) -> Vec<Action> {
+        vec![Action::Speech { method, params }]
+    }
+
+    /// The poll's answer: `laptop` reading message `seq` of `thread` (or idle).
+    fn speech_polled(st: &mut AppState, reading: Option<(&str, u64)>) {
+        use crate::speech::tests::{playing, polled, speaker};
+        let state = twr_core::speech::SpeechStateParams {
+            playing: reading.and_then(|(t, seq)| playing(t, seq)),
+            ..Default::default()
+        };
+        st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
+    }
+
+    /// `/read` runs as the hub's `speech.*` calls, never as a message: the last messages of
+    /// the orchestrator, or in a dive of the thread (`--orch`: the orchestrator's still), on
+    /// every speaker or `--on` one; live mode and the controls. One that can't go stays on the
+    /// line with its error; `/read status` says what the last poll said.
+    #[test]
+    fn read_runs_as_speech_calls_never_as_messages() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let request = |p: Value| speech_call("speech.request", p);
+        let control = |p: Value| speech_call("speech.control", p);
+        assert_eq!(type_line(&mut st, "/read"), request(json!({"last": 1})));
+        assert!(st.view.input.is_empty());
+        assert_eq!(
+            type_line(&mut st, "/read 5 --on laptop"),
+            request(json!({"last": 5, "speaker": "laptop"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 2 --orch"),
+            request(json!({"last": 2})),
+            "outside a dive, the orchestrator's anyway"
+        );
+        assert_eq!(
+            type_line(&mut st, "/read on"),
+            control(json!({"op": "live", "value": true}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read off --on mini"),
+            control(json!({"op": "live", "value": false, "speaker": "mini"}))
+        );
+        for op in ["stop", "pause", "resume", "skip"] {
+            assert_eq!(
+                type_line(&mut st, &format!("/read {op}")),
+                control(json!({ "op": op })),
+                "{op}"
+            );
+        }
+        assert_eq!(
+            type_line(&mut st, "/read voice Samantha"),
+            control(json!({"op": "voice", "value": "Samantha"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read rate 220"),
+            control(json!({"op": "rate", "value": 220}))
+        );
+        // In a dive: the thread's messages, unless --orch.
+        st.dive("t-gamma");
+        assert_eq!(
+            type_line(&mut st, "/read 3"),
+            request(json!({"thread": "t-gamma", "last": 3}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 3 --orch"),
+            request(json!({"last": 3}))
+        );
+        // Refused: on the line still, the error said; nothing sent.
+        assert!(type_line(&mut st, "/read 99").is_empty());
+        assert_eq!(st.view.input, "/read 99");
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("/read N reads the last 1 to 50 messages")
+        );
+        // `/read status`: the last poll, here none yet, then a speaker.
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert!(st.view.input.is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("no word from the hub yet"));
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("1 speaker: laptop (spd) · live off · reading")
+        );
+    }
+
+    /// `/read this` reads the long message selected in the conversation, by the seq of its
+    /// final text; with none selected, or one still streaming, it says so.
+    #[test]
+    fn read_this_reads_the_selected_message() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(pick));
+        let t = st.transcript.as_mut().unwrap();
+        t.entries.push(Entry::Text {
+            seq: 5,
+            text: "long reply\n".repeat(30),
+            open: false,
+            final_seq: Some(9),
+        });
+        t.entries.push(Entry::Text {
+            seq: 12,
+            text: "still coming\n".repeat(30),
+            open: true,
+            final_seq: None,
+        });
+        st.view.block = Some("block:t-orch:text:5:0".into());
+        assert_eq!(
+            type_line(&mut st, "/read this --on mini"),
+            speech_call(
+                "speech.request",
+                json!({"thread": "t-orch", "seq": 9, "speaker": "mini"})
+            )
+        );
+        st.view.block = Some("block:t-orch:text:12:0".into());
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("that message is still being written")
+        );
+        // A block that is no message, or of another thread.
+        for key in [
+            "block:t-orch:prompt:3",
+            "block:t-gamma:text:5:0",
+            "block:t-orch:text:7:0",
+        ] {
+            st.view.block = Some(key.into());
+            assert!(type_line(&mut st, "/read this").is_empty());
+            assert_eq!(st.view.status.as_deref(), Some(pick), "{key}");
+        }
+    }
+
+    /// What the hub answers is said in the status bar: no speaker (and how to connect one), how
+    /// many messages are read; a hub from before reading aloud is said on `/read`, and its
+    /// poll stops, silently.
+    #[test]
+    fn read_answers_are_said() {
+        use crate::speech::answer;
+        use serde_json::json;
+        let mut st = with_orch();
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 1}),
+                &Ok(json!({"count": 0, "speakers": 0, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status, Some(crate::speech::no_speaker()));
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains(&format!("twr speak --ssh {}", crate::speech::host())));
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 4}),
+                &Ok(json!({"count": 4, "speakers": 1, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status.as_deref(), Some("reading 4 messages"));
+        let old = || {
+            anyhow::Error::new(twr_core::proto::RpcError::new(
+                twr_core::proto::codes::METHOD_NOT_FOUND,
+                "unknown method",
+            ))
+        };
+        st.view.status = None;
+        st.speech.pending = true;
+        st.apply_result("speech.status", &answer(json!({}), &Err(old())));
+        assert_eq!(st.view.status, None, "the poll says nothing");
+        assert!(st.speech.unsupported && !st.speech.pending);
+        st.apply_result(
+            "speech.control",
+            &answer(json!({"op": "stop"}), &Err(old())),
+        );
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
+    }
+
+    /// Ctrl-R stops what a speaker reads, whatever is typed and in the decisions overlay too;
+    /// with nothing read it says how to start.
+    #[test]
+    fn ctrl_r_stops_reading_or_says_how_to_start() {
+        use serde_json::json;
+        let mut st = with_orch();
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::NOTHING_READ));
+        speech_polled(&mut st, None);
+        assert!(st.handle_key(ctrl('r')).is_empty(), "idle");
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        let stop = speech_call("speech.control", json!({"op": "stop"}));
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        // With text typed, and the / popup open: it stays.
+        st.view.input.set("/re");
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.input, "/re");
+        st.view.input.clear();
+        st.toggle_decisions();
+        assert_eq!(st.view.screen, Screen::Decisions);
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.screen, Screen::Decisions);
+        // With the help open: stopped too, and the help stays.
+        st.toggle_decisions();
+        st.view.help = true;
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert!(st.view.help);
+        st.view.help = false;
+        // An older hub: said.
+        st.speech.unsupported = true;
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
+    }
+
     #[test]
     fn slash_commands_run_locally_and_never_as_messages() {
         let mut st = five_threads();
@@ -10133,6 +11189,8 @@ pub(crate) mod tests {
                 project: "~/src/api".into(),
                 runtime: Some("codex".into()),
                 name: Some("api2".into()),
+                account: None,
+                outside_pin: false,
             }]
         );
         // /park and /stop ask first; the default is the focused thread.
@@ -10842,10 +11900,12 @@ pub(crate) mod tests {
                     notice: false,
                     withdrawn: false,
                 },
+                // The final after the deltas names the message: its seq.
                 Entry::Text {
                     seq: evs[2].seq,
                     text: "hello world".into(),
-                    open: false
+                    open: false,
+                    final_seq: Some(evs[6].seq),
                 },
                 Entry::Tool {
                     call_id: "c1".into(),
@@ -12081,6 +13141,7 @@ pub(crate) mod tests {
                     seq: 0,
                     text: "On it".into(),
                     open,
+                    final_seq: None,
                 },
             ];
             st.view.selection = None;
@@ -12442,6 +13503,44 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A compaction of the runtime's context reads as a line of the transcript (a dive's and
+    /// the orchestrator's conversation alike): its sizes, or why it failed.
+    #[test]
+    fn a_compaction_reads_as_a_line_of_the_transcript() {
+        let mut s = ThreadScript::new("t1");
+        let mut tr = Transcript::new("t1");
+        tr.apply(&s.event(EventBody::ContextCompacting(Default::default())));
+        assert!(tr.entries.is_empty(), "the activity line says it runs");
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                pre_tokens: Some(34_878),
+                post_tokens: Some(12_726),
+                ..Default::default()
+            },
+        )));
+        assert_eq!(
+            tr.entries.last(),
+            Some(&Entry::Notice {
+                seq: tr.last_seq,
+                level: NoticeLevel::Info,
+                text: "context compacted (auto) · 34.9k tokens → 12.7k".into()
+            })
+        );
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                error: Some("too_few_groups".into()),
+                ..Default::default()
+            },
+        )));
+        assert!(matches!(
+            tr.entries.last(),
+            Some(Entry::Notice { level: NoticeLevel::Error, text, .. })
+                if text == "context compaction failed (auto): too_few_groups"
+        ));
+    }
+
     /// `thread.model_changed` reads as a line of the transcript naming what changed, from what,
     /// and by whom; the runtime the hub restarts for it did not stop, and any other reason (or
     /// none) is a stop.
@@ -12543,6 +13642,150 @@ pub(crate) mod tests {
                 tr.entries.last()
             );
         }
+    }
+
+    /// An account move's `thread.model_changed` names both accounts (the native one by its
+    /// current name when the TUI knows it, else `own login`), the model or effort when they
+    /// changed too, and both runtimes on a move between runtimes; the stop that restarts the
+    /// runtime for it says the next turn starts a new session on the new account, not that the
+    /// thread stopped.
+    #[test]
+    fn an_account_move_is_a_transcript_line() {
+        use twr_core::event::{ChangedBy, SessionPayload};
+        let mut s = ThreadScript::new("t1");
+        let mut tr = Transcript::new("t1");
+        let opt = |v: Option<&str>| v.map(str::to_string);
+        let named = |rt: &str| (rt == "claude-code").then(|| "personal".to_string());
+        let unnamed = |_: &str| None;
+        let last = |tr: &Transcript| match tr.entries.last() {
+            Some(Entry::Notice { text, .. }) => text.clone(),
+            e => panic!("not a notice: {e:?}"),
+        };
+        let stop = |s: &mut ThreadScript| {
+            s.event(EventBody::ThreadStopped(SessionPayload {
+                ext: serde_json::json!({"twr": {"reason": ACCOUNT_RESTART_REASON}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }))
+        };
+        // Before any move the transcript saw (an older one, out of its replay).
+        tr.apply(&stop(&mut s));
+        assert_eq!(
+            last(&tr),
+            "the previous session stopped; the next turn starts a new session on its new account"
+        );
+        // (Runtime and account before, after; a new model; who; then the lines.)
+        let mut check = |(from_rt, from, to_rt, to): (&str, Option<&str>, &str, Option<&str>),
+                         model: Option<&str>,
+                         by: ChangedBy,
+                         native: &dyn Fn(&str) -> Option<String>,
+                         want: &str,
+                         on: &str| {
+            let mv = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+                runtime: opt(Some(to_rt)),
+                previous_runtime: opt(Some(from_rt)),
+                account_changed: true,
+                account: opt(to),
+                previous_account: opt(from),
+                model: opt(model.or(Some("opus"))),
+                previous_model: opt(Some("opus")),
+                by,
+                ..Default::default()
+            }));
+            tr.apply_named(&mv, native);
+            assert_eq!(last(&tr), want);
+            assert_eq!(tr.runtime.as_deref(), Some(to_rt));
+            tr.apply(&stop(&mut s));
+            assert_eq!(
+                last(&tr),
+                format!("the previous session stopped; the next turn starts a new session on {on}")
+            );
+        };
+        let cc = "claude-code";
+        check(
+            (cc, Some("work"), cc, None),
+            None,
+            ChangedBy::User,
+            &named,
+            "account work → personal (by you)",
+            "claude-code:personal",
+        );
+        check(
+            (cc, None, cc, Some("work")),
+            None,
+            ChangedBy::Orchestrator,
+            &unnamed,
+            "account own login → work (by the orchestrator)",
+            "claude-code:work",
+        );
+        check(
+            (cc, Some("work"), cc, Some("work2")),
+            Some("sonnet"),
+            ChangedBy::User,
+            &named,
+            "account work → work2, model from opus to sonnet (by you)",
+            "claude-code:work2",
+        );
+        check(
+            ("codex", Some("team"), cc, Some("work")),
+            None,
+            ChangedBy::User,
+            &named,
+            "runtime codex:team → claude-code:work, model opus, effort default (by you)",
+            "claude-code:work",
+        );
+        check(
+            (cc, None, "codex", Some("team")),
+            None,
+            ChangedBy::User,
+            &unnamed,
+            "runtime claude-code (own login) → codex:team, model opus, effort default (by you)",
+            "codex:team",
+        );
+        // A move back to an account the thread left resumes its session there: the stop says
+        // so.
+        let mut back = ThreadModelChanged {
+            runtime: opt(Some(cc)),
+            previous_runtime: opt(Some(cc)),
+            account_changed: true,
+            account: opt(Some("work")),
+            previous_account: opt(Some("work2")),
+            ..Default::default()
+        };
+        twr_core::event::set_twr_ext(
+            &mut back.ext,
+            twr_core::event::RESUME_SESSION_KEY,
+            serde_json::json!("s-work"),
+        );
+        tr.apply_named(&s.event(EventBody::ThreadModelChanged(back)), &named);
+        tr.apply(&stop(&mut s));
+        assert_eq!(
+            last(&tr),
+            "the previous session stopped; the next turn resumes the thread's earlier session on \
+             claude-code:work"
+        );
+
+        // The main pane's transcript names the native account as the hub lists it now.
+        let mut st = AppState::new();
+        st.accounts = crate::accounts::Accounts::from_list(&serde_json::json!({
+            "runtimes": {"claude-code": {"shown": true, "native": "personal", "accounts": []}}
+        }));
+        st.view.dive = Some("t1".into());
+        st.sync_main();
+        let mut s = ThreadScript::new("t1");
+        let mv = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+            runtime: opt(Some(cc)),
+            previous_runtime: opt(Some(cc)),
+            account_changed: true,
+            account: opt(Some("work")),
+            ..Default::default()
+        }));
+        st.apply_event(&thread_item(&mv));
+        assert_eq!(
+            last(st.transcript.as_ref().unwrap()),
+            "account personal → work (by you)"
+        );
     }
 
     /// `/model <thread>` shows the thread's model and effort; with a model, `--effort` or both
@@ -12653,14 +13896,279 @@ pub(crate) mod tests {
             effort: Some("high".into()),
             ..Default::default()
         };
-        assert_eq!(model_show(&t), "api: model fable, effort high");
+        assert_eq!(model_show(&t, None), "api: model fable, effort high");
         t.actual_model = Some("claude-fable-5-1".into());
         assert_eq!(
-            model_show(&t),
+            model_show(&t, None),
             "api: model fable, effort high (runs claude-fable-5-1)"
         );
         t.model = Some("claude-fable-5-1".into());
-        assert_eq!(model_show(&t), "api: model claude-fable-5-1, effort high");
+        assert_eq!(
+            model_show(&t, None),
+            "api: model claude-fable-5-1, effort high"
+        );
+        t.runtime = "codex".into();
+        t.actual_model = None;
+        t.handoff_pending = true;
+        assert!(
+            model_show(&t, None).ends_with("; its first codex session starts with its next turn")
+        );
+        t.resume_session = Some("th-1".into());
+        assert!(model_show(&t, None)
+            .ends_with("; its earlier codex session resumes with its next turn"));
+    }
+
+    /// An `account.list` answer for the test runtime `fake`: `personal` (native) and `work`,
+    /// both logged in when `shown` (the runtime then shows account labels), else `work` logged
+    /// out.
+    pub(crate) fn fake_accounts(shown: bool) -> Value {
+        let mut l = crate::accounts::tests::list(shown);
+        let fake = l["runtimes"]["claude-code"].take();
+        l["runtimes"] = serde_json::json!({ "fake": fake });
+        l
+    }
+
+    /// [`three_threads`] (on the `fake` runtime's native account) plus `job`, on its account
+    /// `work`.
+    pub(crate) fn with_job_on_work() -> AppState {
+        let mut st = three_threads();
+        let mut j = ThreadScript::new("t-job");
+        j.at(30);
+        let mut created = j.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.ext = serde_json::json!({"twr": {"account": "work"}})
+                .as_object()
+                .cloned();
+        }
+        control(&mut st, &[created]);
+        st
+    }
+
+    /// `/account <thread>` says the account a thread runs on and its login (or that its
+    /// runtime has one account); `/account <thread> <name>` moves it (`thread.set_model
+    /// {account}`, `outside_pin` only with `--outside-pin`); in a dive one word is the
+    /// account, unless it names a thread and no account; `/model` names the account while
+    /// labels show; `/accounts` lists them; `/account add` says the command to run.
+    #[test]
+    fn slash_account_shows_moves_and_lists() {
+        let mut st = with_job_on_work();
+        let status = |st: &AppState| st.view.status.clone().unwrap_or_default();
+        // A hub older than accounts: nothing known, nothing labelled.
+        assert!(type_line(&mut st, "/accounts").is_empty());
+        assert_eq!(
+            status(&st),
+            "no accounts known: the hub is older than accounts"
+        );
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(status(&st), "alpha: fake (one account)");
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work");
+        st.apply_result("account.list", &fake_accounts(true));
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (logged in)");
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(
+            status(&st),
+            "alpha: fake account personal (native, logged in)"
+        );
+        assert!(type_line(&mut st, "/model job").is_empty());
+        assert_eq!(
+            status(&st),
+            "job: account work, model default, effort default"
+        );
+        assert!(type_line(&mut st, "/accounts").is_empty());
+        assert_eq!(
+            status(&st),
+            "accounts: fake: personal (native, logged in), work (logged in)"
+        );
+        // A move.
+        let set = |thread: &str, account: &str, outside_pin| Action::SetAccount {
+            thread: thread.into(),
+            account: account.into(),
+            outside_pin,
+        };
+        assert_eq!(
+            type_line(&mut st, "/account alpha work"),
+            [set("t-alpha", "work", false)]
+        );
+        assert_eq!(status(&st), "alpha → account work: waiting for the hub");
+        assert_eq!(
+            lib_request(&set("t-alpha", "work", false)),
+            (
+                "thread.set_model",
+                serde_json::json!({"thread": "t-alpha", "account": "work"})
+            )
+        );
+        assert_eq!(
+            type_line(&mut st, "/account alpha work --outside-pin"),
+            [set("t-alpha", "work", true)]
+        );
+        assert_eq!(
+            lib_request(&set("t-alpha", "work", true)),
+            (
+                "thread.set_model",
+                serde_json::json!({"thread": "t-alpha", "account": "work", "outside_pin": true})
+            )
+        );
+        assert!(type_line(&mut st, "/account nope work").is_empty());
+        assert_eq!(status(&st), "no thread nope");
+        // In a dive.
+        st.dive("t-alpha");
+        assert_eq!(
+            type_line(&mut st, "/account work"),
+            [set("t-alpha", "work", false)]
+        );
+        // Not an account, not a thread: the hub says what it has.
+        assert_eq!(
+            type_line(&mut st, "/account gpu"),
+            [set("t-alpha", "gpu", false)]
+        );
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (logged in)");
+        assert!(type_line(&mut st, "/account").is_empty());
+        assert_eq!(
+            status(&st),
+            "alpha: fake account personal (native, logged in)"
+        );
+        assert_eq!(
+            type_line(&mut st, "/account job --outside-pin"),
+            [set("t-alpha", "job", true)]
+        );
+        st.back();
+        st.set_focus(None);
+        assert!(type_line(&mut st, "/account").is_empty());
+        assert!(status(&st).starts_with("no thread selected; usage: /account"));
+        // Adding one needs a terminal.
+        assert!(type_line(&mut st, "/account add claude max-2").is_empty());
+        assert_eq!(
+            status(&st),
+            "to add the account, run in another terminal: twr account add claude max-2"
+        );
+        // The hub's answer to a move says what happens.
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "runtime": "fake",
+                    "account": "work", "previous_account": "personal", "account_changed": true,
+                    "runtime_changed": false, "changed": true, "applies": "after_turn",
+                    "message": "alpha moves to fake:work; its next turn starts a new session \
+                                there with a handoff"})
+            )
+            .as_deref(),
+            Some(
+                "alpha moves to fake:work; its next turn starts a new session there with a \
+                 handoff; the current turn finishes on the previous account first"
+            )
+        );
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "changed": false,
+                    "runtime": "fake", "account": "work",
+                    "message": "alpha already runs on fake:work with model default"})
+            )
+            .as_deref(),
+            Some("alpha already runs on fake:work with model default")
+        );
+        // The runtime alone asked for: what it has, as without accounts (no account named).
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "changed": false,
+                    "runtime": "fake", "account": "work",
+                    "message": "alpha already runs on fake with model default"})
+            )
+            .as_deref(),
+            Some("alpha already has model default, effort default")
+        );
+        // `/new --account`.
+        let new = type_line(&mut st, "/new api --account work --outside-pin");
+        assert_eq!(
+            lib_request(&new[0]),
+            (
+                "thread.new",
+                serde_json::json!({"project": "api", "account": "work", "outside_pin": true})
+            )
+        );
+        // An account the list no longer has (config.toml dropped it) is removed, as the hub's
+        // `account_removed` says: the label and `/account` name it so.
+        let mut l = fake_accounts(false);
+        l["runtimes"]["fake"]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["name"] != "work");
+        st.apply_result("account.list", &l);
+        let job = st.registry.get("t-job").unwrap().clone();
+        assert_eq!(st.account_label(&job).as_deref(), Some("work (removed)"));
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (removed)");
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(status(&st), "alpha: fake (one account)");
+    }
+
+    /// `/account` of a thread on another box on the native account says it runs on that
+    /// box's own login, never the state of this machine's native login.
+    #[test]
+    fn slash_account_of_a_remote_native_thread_shows_no_local_state() {
+        let mut st = with_job_on_work();
+        let mut gpu = ThreadScript::new("t-gpu");
+        gpu.at(40);
+        let mut created = gpu.created("far");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.box_name = "gpu".into();
+        }
+        control(&mut st, &[created]);
+        st.apply_result("account.list", &fake_accounts(true));
+        assert!(type_line(&mut st, "/account far").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("far: fake (the box's own login)")
+        );
+        // A local one on it still shows the local login.
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha: fake account personal (native, logged in)")
+        );
+    }
+
+    /// Completion names a thread's account while its runtime shows labels, and `/account`
+    /// completes the accounts of the thread named, or dived into, with their state.
+    #[test]
+    fn completion_names_accounts() {
+        let mut st = with_job_on_work();
+        let detail = |st: &AppState, name: &str| {
+            st.pools()
+                .threads
+                .into_iter()
+                .find(|t| t.0 == name)
+                .unwrap()
+                .1
+        };
+        st.apply_result("account.list", &fake_accounts(false));
+        assert_eq!(detail(&st, "job"), "idle · fake · mode manual");
+        st.apply_result("account.list", &fake_accounts(true));
+        assert_eq!(detail(&st, "job"), "idle · fake:work · mode manual");
+        assert_eq!(
+            detail(&st, "alpha").split(" · ").nth(1),
+            Some("fake:personal")
+        );
+        let values = |st: &AppState, line: &str| -> Vec<(String, String)> {
+            slash::suggest(line, &st.pools())
+                .items
+                .into_iter()
+                .map(|i| (i.value, i.detail))
+                .collect()
+        };
+        assert_eq!(
+            values(&st, "/account job "),
+            [
+                ("personal".to_string(), "native, logged in".to_string()),
+                ("work".to_string(), "logged in".to_string())
+            ]
+        );
+        st.dive("t-job");
+        assert_eq!(values(&st, "/account w")[0].0, "work");
     }
 
     /// The popup above the input line: arrows pick, Tab completes, Enter on a partial command
@@ -12737,7 +14245,7 @@ pub(crate) mod tests {
         type_chars(&mut st, "hello /x");
         assert!(st.popup().is_none());
         st.view.input.set("/");
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.popup().is_none());
     }
 
@@ -13563,7 +15071,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_picker_is_offered_only_when_nothing_was_ever_chosen() {
-        let p = Picker::from_show(&first_show()).unwrap();
+        let p = Picker::from_show(&first_show(), &Accounts::default()).unwrap();
         assert_eq!(
             p.runtimes,
             [
@@ -13585,14 +15093,14 @@ pub(crate) mod tests {
         ] {
             let mut v = first_show();
             edit(&mut v);
-            assert!(Picker::from_show(&v).is_none(), "{v}");
+            assert!(Picker::from_show(&v, &Accounts::default()).is_none(), "{v}");
         }
-        assert!(Picker::from_show(&Value::Null).is_none());
+        assert!(Picker::from_show(&Value::Null, &Accounts::default()).is_none());
         // An unknown default: the first row; no `installed`: unknown.
         let mut v = first_show();
         v["configured"]["runtime"] = "fake".into();
         v.as_object_mut().unwrap().remove("installed");
-        let p = Picker::from_show(&v).unwrap();
+        let p = Picker::from_show(&v, &Accounts::default()).unwrap();
         assert_eq!(p.selected, 0);
         assert_eq!(p.runtimes[0].1, None);
     }
@@ -13600,11 +15108,11 @@ pub(crate) mod tests {
     #[test]
     fn the_picker_chooses_with_enter_and_waits_with_esc() {
         let mut st = AppState::new();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         st.begin_catch_up(5);
         assert!(!st.picker_open(), "not before the replay is applied");
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.picker_open());
         // Modal: other keys (and the mouse, and pastes) do nothing but say how it works.
         assert!(st.handle_key(key(KeyCode::Char('q'))).is_empty());
@@ -13647,7 +15155,7 @@ pub(crate) mod tests {
             )
         );
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -13658,7 +15166,7 @@ pub(crate) mod tests {
         );
         // Esc closes it without choosing; keys work as usual afterwards.
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(st.view.picker.is_none());
         assert!(st
@@ -13671,14 +15179,14 @@ pub(crate) mod tests {
         assert_eq!(st.view.input, "q");
         // Ctrl-C quits from the picker.
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
     }
 
     #[test]
     fn the_picker_closes_once_an_orchestrator_exists() {
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         let mut o = ThreadScript::new("t-orch");
         o.at(60);
         let mut created = o.created("orchestrator");
@@ -13689,6 +15197,327 @@ pub(crate) mod tests {
         }
         control(&mut st, &[created]);
         assert!(st.view.picker.is_none());
+    }
+
+    /// The first-run picker keeps the configured account: its default row is
+    /// `claude-code:work` with `[orchestrator] account = "work"`, and choosing it sends that
+    /// account, labels shown or not. While a runtime shows account labels it has a row per
+    /// usable account, the configured one among them even when it cannot be used (the hub
+    /// refuses it, never another login in its place); without labels and no account
+    /// configured, the rows are the runtimes alone.
+    #[test]
+    fn the_first_run_picker_keeps_the_configured_account() {
+        let show = |account: Option<&str>| {
+            let mut v = first_show();
+            v["runtime"] = "claude-code".into();
+            v["account"] = account.unwrap_or("personal").into();
+            v["configured"]["runtime"] = "claude-code".into();
+            v["configured"]["model"] = "opus".into();
+            v["configured"]["account"] = account.into();
+            v
+        };
+        let rows = |p: &Picker| p.runtimes.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+        // Labels hidden (one account logged in), an account configured: its row carries it.
+        let hidden = Accounts::from_list(&crate::accounts::tests::list(false));
+        let p = Picker::from_show(&show(Some("work")), &hidden).unwrap();
+        assert_eq!(rows(&p), ["claude-code:work", "codex", "grok-build"]);
+        assert_eq!((p.selected, p.default.as_str()), (0, "claude-code:work"));
+        assert_eq!(p.runtimes[0].1, Some(true), "installed, as its runtime");
+        let mut st = three_threads();
+        // It shows the runtime alone, as labels are hidden.
+        st.accounts = hidden.clone();
+        st.view.picker = Some(p.clone());
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!lines.iter().any(|l| l.contains("work")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code ") && l.contains("(default)")),
+            "{lines:?}"
+        );
+        st.handle_key(key(KeyCode::Esc));
+        let said = st.view.status.clone().unwrap();
+        assert!(
+            said.contains("the orchestrator will be claude-code (") && !said.contains("work"),
+            "{said}"
+        );
+        st.view.picker = Some(p);
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: Some("opus".into()),
+                summary: false,
+            }]
+        );
+        assert_eq!(
+            crate::action_request(&Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: None,
+                summary: false,
+            })
+            .unwrap()
+            .1["runtime"],
+            "claude-code:work"
+        );
+        // Labels hidden, nothing configured: as before accounts.
+        let p = Picker::from_show(&show(None), &hidden).unwrap();
+        assert_eq!(rows(&p), ["claude-code", "codex", "grok-build"]);
+        assert_eq!(p.default, "claude-code");
+        // An older hub (no `configured.account`): likewise.
+        let mut old = show(None);
+        old["configured"].as_object_mut().unwrap().remove("account");
+        assert_eq!(
+            Picker::from_show(&old, &hidden).unwrap().default,
+            "claude-code"
+        );
+        // Labels shown: one row per account, the configured one the default.
+        let shown = Accounts::from_list(&crate::accounts::tests::list(true));
+        let p = Picker::from_show(&show(Some("work")), &shown).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!((p.selected, p.default.as_str()), (1, "claude-code:work"));
+        let mut st = three_threads();
+        st.accounts = shown.clone();
+        st.view.picker = Some(p);
+        let lines = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("claude-code:work") && l.contains("(default)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("claude-code:personal") && !l.contains("(default)")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: Some("opus".into()),
+                summary: false,
+            }]
+        );
+        // Nothing configured: the account the hub would pick is the default.
+        let p = Picker::from_show(&show(None), &shown).unwrap();
+        assert_eq!(p.default, "claude-code:personal");
+        // A configured account that cannot be used is still the default row; a logged-out
+        // one that is not configured is not offered.
+        let mut l = crate::accounts::tests::list(true);
+        l["runtimes"]["claude-code"]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "old", "native": false, "login": "logged_out"}));
+        let three = Accounts::from_list(&l);
+        let p = Picker::from_show(&show(Some("work")), &three).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        let p = Picker::from_show(&show(Some("old")), &three).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "claude-code:old",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!(p.default, "claude-code:old");
+        assert_eq!(default_runtime(&show(None)).as_deref(), Some("claude-code"));
+        let mut explicit = show(None);
+        explicit["configured"]["explicit"] = true.into();
+        assert_eq!(default_runtime(&explicit), None);
+    }
+
+    /// `/orch`'s picker and completion name accounts as the first-run picker does: the
+    /// current orchestrator's account is its highlighted row (`claude-code:work`), labels
+    /// shown or not, and `/orch` completes `claude-code:work` while labels show.
+    #[test]
+    fn orch_picks_and_completes_accounts() {
+        let on_work = |accounts: Value| {
+            let mut st = three_threads();
+            st.accounts = Accounts::from_list(&accounts);
+            st.view.orch_installed = vec![("claude-code".into(), true)];
+            let mut o = ThreadScript::new("t-orch");
+            o.at(40);
+            let mut evs = orch_events(&mut o, "t-orch");
+            if let EventBody::ThreadCreated(p) = &mut evs[0].body {
+                p.ext = serde_json::json!({"twr": {"role": "orchestrator", "account": "work"}})
+                    .as_object()
+                    .cloned();
+            }
+            control(&mut st, &evs);
+            st
+        };
+        let mut st = on_work(crate::accounts::tests::list(true));
+        type_line(&mut st, "/orch");
+        let p = st.view.picker.clone().unwrap();
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            rows,
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!((p.default.as_str(), p.selected), ("claude-code:work", 1));
+        st.handle_key(key(KeyCode::Up));
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('s'))),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:personal".into(),
+                model: None,
+                summary: false,
+            }]
+        );
+        let pools = st.pools();
+        assert!(
+            pools.runtimes.contains(&(
+                "claude-code:work".to_string(),
+                "installed · logged in".to_string()
+            )),
+            "{:?}",
+            pools.runtimes
+        );
+        assert!(!pools.runtimes.iter().any(|r| r.0 == "claude-code"));
+        st.view.input.set("/orch claude-code:w");
+        st.complete_slash();
+        assert_eq!(st.view.input.as_str(), "/orch claude-code:work ");
+        // Labels hidden: the runtimes alone, but the current one keeps its account.
+        let mut st = on_work(crate::accounts::tests::list(false));
+        type_line(&mut st, "/orch");
+        let p = st.view.picker.clone().unwrap();
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(rows, ["claude-code:work", "codex", "grok-build"]);
+        assert_eq!((p.default.as_str(), p.selected), ("claude-code:work", 0));
+        let pools = st.pools();
+        let names: Vec<&str> = pools.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(names, ["claude-code", "codex", "grok-build"]);
+        // Shown as the runtime alone, the account still sent.
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!lines.iter().any(|l| l.contains("work")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code ") && l.contains("(current)")),
+            "{lines:?}"
+        );
+        st.handle_key(key(KeyCode::Enter));
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.starts_with("switch the orchestrator to claude-code? "),
+            "{prompt}"
+        );
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('s'))),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: None,
+                summary: false,
+            }]
+        );
+        assert!(
+            !st.view.status.clone().unwrap_or_default().contains("work"),
+            "{:?}",
+            st.view.status
+        );
+        // A native account a named one's name shadows has no row of its own: the name's row
+        // is the named account's.
+        let shadowed = serde_json::json!({"runtimes": {"claude-code": {
+            "shown": true, "native": "default", "accounts": [
+                {"name": "default", "native": true, "shadowed": true, "login": "logged_in"},
+                {"name": "default", "native": false, "login": "logged_in"},
+                {"name": "work", "native": false, "login": "logged_in"},
+        ]}}});
+        let st = on_work(shadowed);
+        let rows: Vec<String> = st.orch_specs().into_iter().map(|r| r.0).collect();
+        assert_eq!(
+            rows,
+            [
+                "claude-code:default",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        let accounts = st.pools().accounts;
+        let names: Vec<&str> = accounts["claude-code"]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["default", "work"]);
+    }
+
+    /// `/new <project> --account ` completes the accounts of the runtime the project's latest
+    /// thread made for it runs (a thread made for a path says nothing of the project's).
+    #[test]
+    fn new_account_completion_knows_a_projects_runtime() {
+        let mut st = three_threads();
+        st.accounts = Accounts::from_list(&crate::accounts::tests::list(true));
+        let make = |id: &str, at, runtime: &str, configured: bool| {
+            let mut s = ThreadScript::new(id);
+            s.at(at);
+            let mut created = s.created(id.trim_start_matches("t-"));
+            if let EventBody::ThreadCreated(p) = &mut created.body {
+                p.project = Some("api".into());
+                p.runtime = runtime.into();
+                p.ext = serde_json::json!({"twr": {"configured_project": configured}})
+                    .as_object()
+                    .cloned();
+            }
+            created
+        };
+        control(
+            &mut st,
+            &[
+                make("t-api1", 30, "codex", true),
+                make("t-api2", 31, "claude-code", true),
+                make("t-api3", 32, "codex", false),
+            ],
+        );
+        assert_eq!(
+            st.pools().project_runtimes.get("api").map(String::as_str),
+            Some("claude-code")
+        );
+        st.view.input.set("/new api --account ");
+        let rows: Vec<String> = st
+            .popup()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.value)
+            .collect();
+        assert_eq!(rows, ["personal", "work"]);
     }
 
     #[test]
@@ -13949,6 +15778,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         let api = st.attention.get("pa").unwrap().revision;
@@ -14018,6 +15848,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         let api = st.attention.get("pa").unwrap().first_revision;
         let web = st.attention.get("pw").unwrap().first_revision;
@@ -14303,6 +16134,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         // Long options: the tenth does not fit on the card, so the item is not drawn in full.
         expand_long_test_messages(&mut st);
@@ -16422,6 +18254,7 @@ pub(crate) mod tests {
                 seq: 0,
                 text: "Earlier reply".into(),
                 open: false,
+                final_seq: None,
             },
             Entry::HubUpdate {
                 text: "api needs permission".into(),
@@ -16437,6 +18270,7 @@ pub(crate) mod tests {
                 seq: 0,
                 text: "Latest reply stays at the bottom".into(),
                 open: false,
+                final_seq: None,
             },
         ];
         let buf = draw(&mut st, 160, 40);
@@ -16479,6 +18313,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "Long explanation after the selected request\n".repeat(60),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         settled(&mut st);
@@ -20812,7 +22647,7 @@ pub(crate) mod tests {
         #[test]
         fn the_picker_works_with_taps() {
             let mut st = three_threads();
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             frame(&mut st, 100, 30);
             tap(&mut st, 100, 30, Target::Runtime(0));
             assert_eq!(st.view.picker.as_ref().unwrap().selected, 0);
@@ -20828,7 +22663,7 @@ pub(crate) mod tests {
                     summary: false,
                 }]
             );
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             tap(&mut st, 100, 30, Target::Close);
             assert!(st.view.picker.is_none());
         }
@@ -20936,7 +22771,7 @@ pub(crate) mod tests {
                     .unwrap_or_else(|| panic!("no runtime {i}"))
             };
             let mut st = three_threads();
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             let buf = frame(&mut st, 40, 20);
             for i in 0..3 {
                 let y = first_row(&st, i);
@@ -24168,8 +26003,8 @@ pub(crate) mod tests {
                 Value::Null,
             );
             let (alpha, gamma) = (
-                crate::ui::thread_color("t-alpha"),
-                crate::ui::thread_color("t-gamma"),
+                crate::ui::thread_color(st.thread_named("t-alpha").unwrap()),
+                crate::ui::thread_color(st.thread_named("t-gamma").unwrap()),
             );
             let colored = |buf: &ratatui::buffer::Buffer, needle: &str, name: &str, color| {
                 let (x, y) = cell_of(buf, needle).unwrap_or_else(|| panic!("{needle}"));
@@ -24285,7 +26120,9 @@ pub(crate) mod tests {
                 let text = rows(st, 160, 40).join("\n");
                 assert!(!text.contains("t-gamma"), "{when}: {text}");
                 assert!(text.contains("╭─ gamma ──"), "{when}: {text}");
-                let gamma = Some(crate::color::thread_color("t-gamma"));
+                let gamma = Some(crate::color::thread_color(
+                    st.thread_named("t-gamma").unwrap(),
+                ));
                 for lead in ["╭─ gamma", "◦ gamma · ", "· gamma has a note"] {
                     assert_eq!(color_of(st, &buf, lead, "gamma"), gamma, "{when}: {lead}");
                 }

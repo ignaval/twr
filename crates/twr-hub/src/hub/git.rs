@@ -75,7 +75,7 @@ use crate::host::ThreadHost;
 pub const GIT_TICK: Duration = Duration::from_secs(30);
 
 /// Where a thread works, from its `thread.created` `ext.twr`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(super) enum Workspace {
     /// Nothing recorded (threads created before workspaces were recorded, the orchestrator):
     /// the recorded directory, not managed by the hub.

@@ -10,6 +10,12 @@
 //!   (and `attach` template, `ext.twr.acp_attach`), resolved when the thread is created (so a
 //!   later config change does not change an existing thread) and recorded with
 //!   `ext.twr.acp_preset = <name>`.
+//! - `<runtime>:<account>` of a runtime that takes accounts
+//!   ([`twr_core::account::takes_accounts`]: `claude-code:work`): that runtime, with the
+//!   account (a name, a glob or a comma-separated list: [`twr_core::account::Pin`]) as
+//!   [`RuntimeSpec::account`] ([`split_account`], before anything else: the runtime is
+//!   checked, never the whole spec). An account part on another runtime (a preset, `fake`)
+//!   or an empty one is refused.
 //! - anything else: a runtime name, as is.
 //!
 //! Permission modes (`thread.new` `mode`, `threads.default_mode`) are canonicalized here
@@ -34,6 +40,7 @@
 
 use serde_json::{json, Map, Value};
 use twr_adapters::{acp, pty};
+use twr_core::account::{takes_accounts, Pin};
 use twr_core::config::Config;
 use twr_core::proto::{codes, RpcError};
 
@@ -51,6 +58,9 @@ pub(super) struct RuntimeSpec {
     pub(super) pty_command: Option<Vec<String>>,
     /// An `acp` thread's agent.
     pub(super) acp: Option<AcpSpec>,
+    /// The account part of a `<runtime>:<account>` spec, as written (a name, a glob or a
+    /// comma-separated list, checked: [`split_account`]).
+    pub(super) account: Option<String>,
 }
 
 /// The agent of an `acp` thread.
@@ -95,13 +105,50 @@ fn split(kind: &str, line: &str, max: usize) -> Result<Vec<String>, RpcError> {
         .map_err(|e| rpc(codes::BAD_REQUEST, format!("{kind} command {line:?}: {e}")))
 }
 
+/// Splits the account part off `spec` (`claude-code:work` is `claude-code` and `work`; an
+/// `acp:` or `pty:` spec has none, [`twr_core::account::split_runtime`]): the runtime part
+/// and the account part, checked as a pin ([`Pin::validate`]). Refused (`bad_request`): an
+/// account part on a runtime that takes no accounts, or an empty one.
+pub(super) fn split_account(spec: &str) -> Result<(&str, Option<String>), RpcError> {
+    let (runtime, Some(account)) = twr_core::account::split_runtime(spec) else {
+        return Ok((spec, None));
+    };
+    if !takes_accounts(runtime) {
+        return Err(rpc(
+            codes::BAD_REQUEST,
+            format!("runtime {runtime} takes no accounts"),
+        ));
+    }
+    let pin = Pin::parse(account);
+    if pin.0.is_empty() {
+        return Err(rpc(
+            codes::BAD_REQUEST,
+            format!(
+                "{spec:?} names no account: give one ({runtime}:<account>), or none ({runtime})"
+            ),
+        ));
+    }
+    pin.validate()
+        .map_err(|e| rpc(codes::BAD_REQUEST, format!("runtime {spec:?}: {e}")))?;
+    Ok((runtime, Some(pin.to_string())))
+}
+
 /// Resolves `spec` (see the module docs).
 pub(super) fn resolve(spec: &str, config: &Config) -> Result<RuntimeSpec, RpcError> {
+    let (spec, account) = split_account(spec)?;
+    Ok(RuntimeSpec {
+        account,
+        ..resolve_runtime(spec, config)?
+    })
+}
+
+/// [`resolve`] of a spec without an account part.
+fn resolve_runtime(spec: &str, config: &Config) -> Result<RuntimeSpec, RpcError> {
     if let Some(line) = spec.strip_prefix(pty::RUNTIME_PREFIX) {
         return Ok(RuntimeSpec {
             runtime: pty::NAME.to_string(),
             pty_command: Some(split("pty", line, PTY_COMMAND_MAX)?),
-            acp: None,
+            ..Default::default()
         });
     }
     if spec == pty::NAME {
@@ -121,8 +168,8 @@ pub(super) fn resolve(spec: &str, config: &Config) -> Result<RuntimeSpec, RpcErr
 pub(super) fn resolve_acp(spec: &str, config: &Config) -> Result<Option<RuntimeSpec>, RpcError> {
     let acp_spec = |a: AcpSpec| RuntimeSpec {
         runtime: acp::NAME.to_string(),
-        pty_command: None,
         acp: Some(a),
+        ..Default::default()
     };
     if let Some(line) = spec.strip_prefix(acp::RUNTIME_PREFIX) {
         return Ok(Some(acp_spec(AcpSpec {
@@ -472,6 +519,44 @@ mod tests {
             assert!(resolve(bad, &c).is_err(), "{bad}");
         }
         assert!(resolve(&format!("acp:{}", "x".repeat(5000)), &c).is_err());
+    }
+
+    /// `<runtime>:<account>`: split before anything else, for a runtime that takes accounts
+    /// only; the account part is a pin (normalized), never empty.
+    #[test]
+    fn account_specs_split() {
+        let c = config();
+        let s = resolve("claude-code:work", &c).unwrap();
+        assert_eq!(
+            (s.runtime.as_str(), s.account.as_deref()),
+            ("claude-code", Some("work"))
+        );
+        assert_eq!(
+            resolve("codex: a , b-* ", &c).unwrap().account.as_deref(),
+            Some("a,b-*")
+        );
+        assert_eq!(resolve("codex", &c).unwrap().account, None);
+        assert_eq!(resolve("acp:x y:z", &c).unwrap().account, None);
+        assert_eq!(resolve("pty:a:b", &c).unwrap().account, None);
+        for (bad, why) in [
+            ("gemini:work", "runtime gemini takes no accounts"),
+            ("fake:work", "runtime fake takes no accounts"),
+            (
+                "claude-code:",
+                "\"claude-code:\" names no account: give one (claude-code:<account>), or none \
+                 (claude-code)",
+            ),
+            ("claude-code:,", "names no account"),
+            ("claude-code:../x", "is not an account name or glob"),
+        ] {
+            let e = resolve(bad, &c).unwrap_err();
+            assert_eq!(e.code, codes::BAD_REQUEST, "{bad}");
+            assert!(e.message.contains(why), "{bad}: {}", e.message);
+        }
+        assert_eq!(
+            resolve("gemini:work", &c).unwrap_err().message,
+            "runtime gemini takes no accounts"
+        );
     }
 
     #[test]

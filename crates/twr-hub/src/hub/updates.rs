@@ -275,10 +275,12 @@ impl Core {
             crate::store::latest_of_kind(self.store.conn(), thread, "conversation.update", 33)?;
         // Notice and handoff turns do not receive this context. Only the preceding
         // user turn is a delivery watermark; the current user turn is already committed. A
-        // turn whose message the user took back is none: what it was told goes again.
+        // turn whose message the user took back is none: what it was told goes again. Nor is
+        // a compaction (`hub::compact`): it was told nothing.
         let since: i64 = self.store.conn().query_row(
             "SELECT COALESCE((SELECT seq FROM events WHERE thread=?1 AND kind='turn.started'
              AND json_extract(data, '$.from')='user'
+             AND json_extract(data, '$.ext.twr.compact') IS NOT 1
              AND turn NOT IN (SELECT turn FROM events WHERE thread=?1 AND kind='turn.withdrawn'
                               AND turn IS NOT NULL)
              ORDER BY seq DESC LIMIT 1 OFFSET 1),0)",

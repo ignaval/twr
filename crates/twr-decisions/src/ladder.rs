@@ -526,6 +526,14 @@ mod tests {
         let r = ladder(None).run(&plain, &opts);
         assert_eq!(r.block_kind(), BlockKind::UserBlocked);
         assert!(r.records.is_empty());
+        let limited = DecisionContext::BlockKind(BlockContext {
+            result: Some(TurnResult::Error),
+            transient: true,
+            limited: true,
+            ..Default::default()
+        });
+        let r = ladder(None).run(&limited, &opts);
+        assert_eq!(r.block_kind(), BlockKind::Limited);
     }
 
     #[test]

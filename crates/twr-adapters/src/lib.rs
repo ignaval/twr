@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use twr_core::adapter::Adapter;
 
+pub mod account;
 pub mod acp;
 pub mod agents;
 pub mod attn;

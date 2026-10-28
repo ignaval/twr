@@ -1,13 +1,14 @@
 //! What the adapters share for usage tracking ([`twr_core::usage`]): when to read a runtime's
-//! usage again ([`Reads`]), its timestamps, and the `runtime.limits` event.
+//! usage again ([`Reads`]), its timestamps, the `runtime.limits` event, and the limit a failed
+//! turn ended on ([`Limit`], `ext.twr.limit`).
 //!
 //! A read never starts a model turn: Claude Code's `get_usage` control request, Codex's
 //! `account/rateLimits/read` and Grok Build's `_x.ai/billing` ask the provider's usage
 //! endpoint. An adapter reads when its session is up and again when a turn ends, once what it
 //! last read or heard is [`REFRESH_AFTER`] old.
 
-use chrono::{DateTime, Utc};
-use serde_json::Value;
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde_json::{json, Value};
 use twr_core::event::{EventBody, RuntimeLimits};
 use twr_core::usage::{UsageWindow, REFRESH_AFTER};
 
@@ -117,6 +118,57 @@ pub fn limits(windows: Vec<UsageWindow>, source: &str, plan: Option<String>) -> 
     })
 }
 
+/// Key of [`Limit`] in a failed `turn.ended`'s `ext.twr`.
+pub const LIMIT_KEY: &str = "limit";
+
+/// What kind of limit a turn ended on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitKind {
+    /// A usage window is used up: the account can work again when it resets.
+    Usage,
+    /// Credits or a spending cap ran out: it needs the user.
+    Spend,
+}
+
+impl LimitKind {
+    /// Wire name (`usage` / `spend`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LimitKind::Usage => "usage",
+            LimitKind::Spend => "spend",
+        }
+    }
+}
+
+/// The usage or spending limit a failed turn ended on (`ext.twr.limit`). A turn that carries
+/// one is not transient: retrying before the reset cannot help.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Limit {
+    /// Usage or spend.
+    pub kind: LimitKind,
+    /// The window used up ([`twr_core::usage::FIVE_HOUR`], Claude's `seven_day_opus`, ...),
+    /// when the runtime says.
+    pub window: Option<String>,
+    /// When the window resets, when the runtime says.
+    pub resets_at: Option<DateTime<Utc>>,
+    /// The runtime's own words.
+    pub message: String,
+}
+
+impl Limit {
+    /// `{"kind", "window"?, "resets_at"? (RFC 3339), "message"}`.
+    pub fn to_value(&self) -> Value {
+        let mut v = json!({ "kind": self.kind.as_str(), "message": self.message });
+        if let Some(w) = &self.window {
+            v["window"] = json!(w);
+        }
+        if let Some(t) = self.resets_at {
+            v["resets_at"] = json!(t.to_rfc3339_opts(SecondsFormat::Secs, true));
+        }
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +220,28 @@ mod tests {
         assert!(r.due(t0 + TimeDelta::minutes(25)));
         r.stop();
         assert!(!r.due(t0 + TimeDelta::days(1)));
+    }
+
+    #[test]
+    fn limit_shape() {
+        let l = Limit {
+            kind: LimitKind::Usage,
+            window: Some("five_hour".into()),
+            resets_at: DateTime::from_timestamp(1791559200, 0),
+            message: "hit".into(),
+        };
+        assert_eq!(
+            l.to_value(),
+            json!({"kind": "usage", "window": "five_hour",
+                   "resets_at": "2026-10-09T15:20:00Z", "message": "hit"})
+        );
+        let s = Limit {
+            kind: LimitKind::Spend,
+            window: None,
+            resets_at: None,
+            message: "cap".into(),
+        };
+        assert_eq!(s.to_value(), json!({"kind": "spend", "message": "cap"}));
     }
 
     #[test]

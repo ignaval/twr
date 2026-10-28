@@ -28,7 +28,8 @@
 //!   and `claude-haiku-5-5`: about 780 input tokens with twr's prompt (cached after the first
 //!   call), 20 output, $0.0002 at list price uncached and $0.00002 cached.
 //! - **Codex:** `codex exec` with the user's own login (no `OPENAI_*` or `CODEX_*` from the
-//!   hub's environment, but `CODEX_HOME`: the home twr checked, [`codex_home`]): no session saved (`--ephemeral`), none of the user's
+//!   hub's environment, but `CODEX_HOME`: the home twr checked, the native Codex account's,
+//!   [`codex_home`]): no session saved (`--ephemeral`), none of the user's
 //!   config, rules, project `AGENTS.md` or skills (`--ignore-user-config`, `--ignore-rules`,
 //!   `project_doc_max_bytes=0`, `skills.include_instructions=false`), twr's prompt as the
 //!   model's instructions (`model_instructions_file`), a read-only sandbox that asks nothing,
@@ -43,7 +44,9 @@
 //! - **Both:** in a private empty folder, without twr's tokens, with a `TWR_AGENT` marker, in
 //!   a session and process group of its own, killed with all it started when it answered or
 //!   after [`SUGGEST_TIMEOUT`]. On a subscription a call counts toward the plan's usage like
-//!   any other use.
+//!   any other use. Always on the runtime's native login (the hub's own environment, the one
+//!   its agent probe checks), whatever account the thread runs on (`hub::accounts`): no
+//!   account's variables are set, and a named account's limit or login is never involved.
 //! - **A suggestion is a message:** one that starts with `!`, `/` or `\` (a command in the
 //!   TUI) is dropped, and the TUI escapes whatever it takes in anyway.
 //! - **What it reads:** the turn's prompt (its first [`PROMPT_MAX`] bytes) and the end of the
@@ -242,64 +245,26 @@ pub(super) fn codex_global_instructions(dir: &Path) -> Option<PathBuf> {
         .find(|f| std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.len() > 0))
 }
 
-/// The Codex home the hub's Codex uses ([`codex_home_from`] with this process's environment
-/// and account); a suggestion call passes it to Codex as `CODEX_HOME`, so that the home twr
-/// checked is the one Codex reads.
-pub(super) fn codex_home(given: Option<&Path>) -> Option<PathBuf> {
-    codex_home_from(
-        given,
-        std::env::var_os("CODEX_HOME"),
-        std::env::var_os("HOME"),
-        account_home,
-    )
-}
-
-/// The Codex home, absolute, as Codex 0.162.1 finds it: `given`
-/// ([`super::HubOptions::suggest_codex_home`]), else `codex_home` (`$CODEX_HOME`) when set,
-/// else `.codex` in `home` (`$HOME`) when set, else in the account's home directory
-/// (`account`, as Codex's `dirs::home_dir` falls back to the password database). `None` when
-/// none is found, or when it isn't UTF-8 (Codex reads `CODEX_HOME` as UTF-8 and falls back to
-/// another home when it isn't, one twr didn't check): Codex isn't asked then.
-fn codex_home_from(
+/// The Codex home a suggestion call passes to Codex as `CODEX_HOME`, so that the home twr
+/// checked is the one Codex reads, absolute: `given` ([`super::HubOptions::suggest_codex_home`]),
+/// else the native Codex account's directory (`native`: the hub's,
+/// `hub::accounts::own_native_dir`, which finds it as Codex 0.162.1 does: `$CODEX_HOME` when
+/// set, else `.codex` in `$HOME` when set, else in the account's home directory, as Codex's
+/// `dirs::home_dir` falls back to the password database). A suggestion runs on the native
+/// login whatever account the thread runs on. `None` when none is found, or when it isn't
+/// UTF-8 (Codex reads `CODEX_HOME` as UTF-8 and falls back to another home when it isn't, one
+/// twr didn't check): Codex isn't asked then.
+pub(super) fn codex_home(
     given: Option<&Path>,
-    codex_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-    account: impl FnOnce() -> Option<PathBuf>,
+    native: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let set = |v: Option<std::ffi::OsString>| v.filter(|v| !v.is_empty()).map(PathBuf::from);
     let dir = match given {
         Some(dir) => dir.to_path_buf(),
-        None => set(codex_home)
-            .or_else(|| set(home).map(|h| h.join(".codex")))
-            .or_else(|| account().map(|h| h.join(".codex")))?,
+        None => native()?,
     };
     std::path::absolute(dir)
         .ok()
         .filter(|d| d.to_str().is_some())
-}
-
-/// This account's home directory in the password database (`getpwuid_r`).
-fn account_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut buf = vec![0u8; 16 * 1024];
-    // SAFETY: getpwuid_r writes the entry into `pwd` and its strings into `buf`, both ours and
-    // as large as we say; `found` points at `pwd` or is null. Nothing is kept past `buf`.
-    unsafe {
-        let mut pwd: libc::passwd = std::mem::zeroed();
-        let mut found: *mut libc::passwd = std::ptr::null_mut();
-        let rc = libc::getpwuid_r(
-            libc::geteuid(),
-            &mut pwd,
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-            &mut found,
-        );
-        if rc != 0 || found.is_null() || pwd.pw_dir.is_null() {
-            return None;
-        }
-        let dir = std::ffi::CStr::from_ptr(pwd.pw_dir).to_bytes();
-        (!dir.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(dir)))
-    }
 }
 
 /// Why `runtime` can't run suggestions at all now: its CLI missing or signed out (the
@@ -923,6 +888,10 @@ impl Hub {
             if super::orch::is_notice(&p) {
                 return Ok(none(&id, "notice"));
             }
+            // A compaction (`hub::compact`) is no exchange with the user either.
+            if is_compact_turn(&p) {
+                return Ok(none(&id, "compaction"));
+            }
             // Only after a turn the user's own message started: another's prompt (the
             // orchestrator's, a job's end, a shared command's output) is not the user's voice.
             if p.from != TurnFrom::User {
@@ -968,7 +937,9 @@ impl Hub {
         let probe = Probe {
             agents: &agents,
             at: hub.local_agents.probed_at(),
-            codex_home: codex_home(hub.suggest_codex_home.as_deref()),
+            codex_home: codex_home(hub.suggest_codex_home.as_deref(), || {
+                hub.accounts.native_dir(twr_adapters::codex::NAME)
+            }),
         };
         // Answered already, or being asked: that answer. An ask that waited on a call whose
         // asker hung up (or turned suggestions off) before its answer takes the call over: its
@@ -1134,7 +1105,9 @@ impl Hub {
         let probe = Probe {
             agents: &agents,
             at: self.inner.local_agents.probed_at(),
-            codex_home: codex_home(self.inner.suggest_codex_home.as_deref()),
+            codex_home: codex_home(self.inner.suggest_codex_home.as_deref(), || {
+                self.inner.accounts.native_dir(twr_adapters::codex::NAME)
+            }),
         };
         let s = self
             .inner
@@ -1329,14 +1302,25 @@ mod tests {
 
     /// Codex's home as Codex finds it: `$CODEX_HOME`, else `$HOME/.codex`, else the account's
     /// home's `.codex` (an unset or empty variable is no value), always absolute; none found,
-    /// none.
+    /// none. The native Codex account's directory (`twr_adapters::account::own_native_dir`).
     #[test]
     fn the_codex_home_is_found_as_codex_finds_it() {
+        use twr_adapters::account::{native_dir, user_home};
         let os = |s: &str| Some(std::ffi::OsString::from(s));
         let account = || Some(PathBuf::from("/home/acct"));
         let none = || None;
-        let got = |given, ch, home, acct: &dyn Fn() -> Option<PathBuf>| {
-            codex_home_from(given, ch, home, acct)
+        let got = |given,
+                   ch: Option<std::ffi::OsString>,
+                   home: Option<std::ffi::OsString>,
+                   acct: &dyn Fn() -> Option<PathBuf>| {
+            let var = |k: &str| match k {
+                "CODEX_HOME" => ch.clone(),
+                "HOME" => home.clone(),
+                _ => None,
+            };
+            codex_home(given, || {
+                native_dir("codex", var, user_home(var, acct).as_deref())
+            })
         };
         assert_eq!(
             got(Some(Path::new("/t/ch")), os("/x"), os("/h"), &account),
@@ -1367,8 +1351,6 @@ mod tests {
         assert_eq!(got(None, None, bad_home, &account), None);
         let rel = got(None, os("rel/codex"), None, &none).unwrap();
         assert!(rel.is_absolute() && rel.ends_with("rel/codex"), "{rel:?}");
-        // This account has a home in the password database.
-        assert!(account_home().is_some_and(|h| h.is_absolute()));
     }
 
     /// Codex's global instructions: `AGENTS.override.md`, else `AGENTS.md`, when not empty.

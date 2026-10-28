@@ -1,9 +1,9 @@
 //! Workspaces (`twr ws`): separate hubs on this machine, which the TUI switches between, one
 //! connected at a time. The workspace sidebar ([`crate::ui`]) lists them all, each with its
-//! orchestrator's status and last reply ([`Glance`]); where it is not drawn, the tab strip lists
-//! them once there is more than `default`. Alt-1..9, Ctrl-PgUp/PgDn, a click on a sidebar card or
-//! a tab and `/ws <name>` switch. A switch keeps the view of the workspace left ([`SavedView`])
-//! and restores it on coming back.
+//! activity and its orchestrator's last reply ([`Glance`]); where it is not drawn, the tab
+//! strip lists them once there is more than `default`. Alt-1..9, Ctrl-PgUp/PgDn, a click on a
+//! sidebar card or a tab and `/ws <name>` switch. A switch keeps the view of the workspace
+//! left ([`SavedView`]) and restores it on coming back.
 //!
 //! The other workspaces' hubs are asked how they are on a clock of their own ([`PollClock`]):
 //! one `hub.glance` each, a running hub every [`POLL_RUNNING`], one stopped or not answering
@@ -1024,7 +1024,7 @@ impl AppState {
         }
         let threads = self.registry.list();
         let active = threads.iter().any(|t| {
-            !t.parked
+            (t.is_current_orchestrator() || !t.parked)
                 && !(t.is_orchestrator() && t.retired)
                 && ((t.current_turn.is_some() && !t.is_blocked()) || t.own_background())
         });
@@ -1291,10 +1291,15 @@ impl AppState {
                 request: v.request.clone(),
                 card_view: v.card_view.clone(),
                 detail: v.detail.clone(),
-                decision_id: self
-                    .decision_rows()
-                    .get(self.decision_selected())
-                    .map(|r| r.id.clone()),
+                // A selection still waiting for the older rows that have it (a view kept across
+                // an earlier switch, the user not having moved since): that one.
+                decision_id: match &self.pending_decision {
+                    Some((id, at)) if *at == v.decision_sel => Some(id.clone()),
+                    _ => self
+                        .decision_rows()
+                        .get(self.decision_selected())
+                        .map(|r| r.id.clone()),
+                },
                 dive: v.dive.clone(),
                 focus_before_dive: v.focus_before_dive.clone(),
                 scroll: v.scroll,
@@ -1416,8 +1421,13 @@ impl AppState {
         }
         self.view.decision_sel = r.decision_sel;
         if let Some(id) = r.decision_id {
-            if let Some(i) = self.decision_rows().iter().position(|row| row.id == id) {
-                self.view.decision_sel = i;
+            match self.decision_rows().iter().position(|row| row.id == id) {
+                Some(i) => self.view.decision_sel = i,
+                // Older than a snapshot's rows: found once they are read.
+                None if self.older_decisions.is_some() => {
+                    self.pending_decision = Some((id, r.decision_sel));
+                }
+                None => {}
             }
         }
         // The conversation shows from its bottom when the thread dived into is gone.

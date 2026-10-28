@@ -1605,6 +1605,9 @@ mod tests {
             BoxProjectConfig {
                 repo: "/h/web".into(),
                 runtime: None,
+                account: None,
+                accounts: Default::default(),
+                exclude_accounts: None,
             },
         );
         save(&start);
@@ -1701,6 +1704,9 @@ mod tests {
             BoxProjectConfig {
                 repo: "/h/api".into(),
                 runtime: None,
+                account: None,
+                accounts: Default::default(),
+                exclude_accounts: None,
             },
         );
         save(&more);

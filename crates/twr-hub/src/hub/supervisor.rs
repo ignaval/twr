@@ -14,6 +14,7 @@ use twr_core::blob::strip_body_capping_metadata;
 use twr_core::event::*;
 
 use super::append::rejection;
+use super::coalesce::Due;
 use super::{
     git, AfterReap, Batch, BatchEvent, Core, EndedTurn, HubState, Inner, PendingExit, LOCAL_BOX,
 };
@@ -113,6 +114,23 @@ impl Core {
                 return Ok(None);
             }
         }
+        // A runtime's task updates come often: only those due are recorded (`hub::coalesce`).
+        let task_update = match &body {
+            EventBody::TaskUpdated(p) => {
+                let now = Utc::now();
+                let at = at.map_or(now, |a| {
+                    Self::event_time(a, self.last_ts.get(thread).copied(), now)
+                });
+                let due = self.task_update_due(hub, thread, p, at);
+                if due == Due::Skip {
+                    self.commit_ack(hub, ack)?;
+                    self.coalesced_events += 1;
+                    return Ok(None);
+                }
+                Some((p.task_id.clone(), p.running, at, due))
+            }
+            _ => None,
+        };
         namespace_attention(thread, self.runtime_gen(thread), &mut body);
         if let EventBody::AttentionResolved(p) = &body {
             if !self.is_adapter_withdrawal(thread, p) {
@@ -276,12 +294,24 @@ impl Core {
         // settings restart replaces.
         if let EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) = &mut body {
             use super::restart::{stamp, stamped, RunSettings};
-            let settings = self
+            let mut settings = self
                 .rt
                 .get(thread)
                 .and_then(|r| r.runtime_settings.clone())
                 .or_else(|| stamped(p, source))
                 .unwrap_or_else(RunSettings::unknown);
+            // On the hub's own box, a start of a session an earlier start named carries the
+            // login that session began under (`Core::carry_login`). A start that names no
+            // session resumed the thread's (a spawn is only for a thread with none).
+            let view = self.registry.get(thread);
+            let session = p
+                .session_id
+                .clone()
+                .or_else(|| view.and_then(|v| v.session_id.clone()));
+            if let (Some(session), true) = (session, view.is_some_and(|v| v.box_name == LOCAL_BOX))
+            {
+                self.carry_login(thread, &session, &mut settings);
+            }
             stamp(p, &settings);
         }
         let fallback = match &body {
@@ -326,6 +356,9 @@ impl Core {
             }
         }
         // Recorded: what follows is no reason to record the event again.
+        if let Some((task, running, at, due)) = &task_update {
+            self.task_update_recorded(thread, (task, *running), *at, *due);
+        }
         if let (Some(sign), Some(t)) = (running, turn) {
             self.withdrawn_turn_runs(hub, thread, t, sign);
         }
@@ -411,6 +444,8 @@ pub fn adapter_may_emit(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::TurnEnded(_)
             | EventBody::TaskUpdated(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     ) || matches!(body, EventBody::TurnStarted(p) if p.from == TurnFrom::Runtime)
         || matches!(
             body,
@@ -442,6 +477,8 @@ fn in_turn_kind(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::AttentionResolved(_)
             | EventBody::TurnEnded(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     )
 }
 
@@ -475,6 +512,10 @@ pub(super) async fn supervise(
                         (hub.core().registry.get(&thread)).and_then(|v| hub.host(&v.box_name));
                     crate::host::stamp_start_time(host, &thread, &mut body).await;
                 }
+                let session = matches!(
+                    body,
+                    EventBody::ThreadStarted(_) | EventBody::ThreadResumed(_)
+                );
                 let ev = (body, raw, turn);
                 let recorded = persist(&hub, &thread, "recording an adapter event", |core| {
                     core.record_adapter_event(
@@ -495,6 +536,11 @@ pub(super) async fn supervise(
                         continue;
                     }
                 };
+                // A runtime started with no turn (a settings restart) may be on another
+                // session than the one an open offer to compact was about (`hub::idle_compact`).
+                if session {
+                    hub.core().recheck_idle_offer(&hub, &thread);
+                }
                 if let Some(t) = ended {
                     let reacted = persist(&hub, &thread, "reacting to the end of a turn", |core| {
                         core.react_to_adapter_turn_end(&hub, &thread, &t)
@@ -633,6 +679,17 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
         .await;
         if let Err(e) = r {
             tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the crash");
+        }
+    }
+    if exit.stopped {
+        // Stopped: a transient failure whose retry the stop forestalls gets its item
+        // (`hub::retry`).
+        let r = persist(hub, thread, "reacting to a stop", |core| {
+            core.react_to_stop(hub, thread)
+        })
+        .await;
+        if let Err(e) = r {
+            tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the stop");
         }
     }
     if dispatch {

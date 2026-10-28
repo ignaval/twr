@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use twr_core::blob::{cap_body, has_capped, hydrate_with, BlobStore, CapError};
 use twr_core::event::*;
 
@@ -106,24 +106,56 @@ fn check_identifiers(body: &EventBody) -> anyhow::Result<()> {
 /// The event with its payload hydrated from `conn`'s blobs, when it has capped fields (`None`
 /// otherwise, or when hydration fails, which is logged).
 pub(super) fn hydrated_from_store(conn: &Connection, ev: &Event) -> Option<Event> {
-    // Most events have nothing moved: told without building their `data` (a hub start asks
-    // this of every control event of the log).
-    if !ev.body.maybe_capped() {
-        return None;
-    }
-    let mut data = ev.body.data().ok()?;
-    if !has_capped(&data) {
-        return None;
-    }
-    let restored = hydrate_with(&mut data, &mut |r: &str| store::get_blob(conn, r), false)
-        .and_then(|_| Ok(EventBody::from_kind_data(ev.kind(), data)?));
-    match restored {
-        Ok(body) => Some(Event { body, ..ev.clone() }),
+    match try_hydrated(conn, ev) {
+        Ok(full) => full.map(|(ev, _)| ev),
         Err(e) => {
-            tracing::warn!(event = %ev.id, error = %e, "cannot hydrate a capped event");
+            tracing::warn!(event = %ev.id, error = %format!("{e:#}"), "cannot hydrate a capped event");
             None
         }
     }
+}
+
+/// [`hydrated_from_store`], failing when the event has capped fields that cannot be hydrated
+/// (a blob missing or unreadable), with whether every field came back (one whose blob no longer
+/// matches its preview stays capped).
+fn try_hydrated(conn: &Connection, ev: &Event) -> anyhow::Result<Option<(Event, bool)>> {
+    // Most events have nothing moved: told without building their `data` (a hub start asks
+    // this of every control event of the log).
+    if !ev.body.maybe_capped() {
+        return Ok(None);
+    }
+    let mut data = ev.body.data()?;
+    if !has_capped(&data) {
+        return Ok(None);
+    }
+    hydrate_with(&mut data, &mut |r: &str| store::get_blob(conn, r), false)?;
+    let whole = !has_capped(&data);
+    let body = EventBody::from_kind_data(ev.kind(), data)?;
+    Ok(Some((Event { body, ..ev.clone() }, whole)))
+}
+
+/// The event with its payload hydrated whole from `conn`'s blobs, when it has capped fields
+/// (`None` otherwise); failing when any field cannot be restored (a blob missing, unreadable,
+/// or no longer matching its preview): what a checkpoint's fold needs (`hub::checkpoint`).
+pub(super) fn hydrated_whole(conn: &Connection, ev: &Event) -> anyhow::Result<Option<Event>> {
+    match try_hydrated(conn, ev)? {
+        Some((ev, true)) => Ok(Some(ev)),
+        Some((_, false)) => anyhow::bail!("some of its fields stay capped"),
+        None => Ok(None),
+    }
+}
+
+/// A named account's directory as `ext.twr` `twr` records it ([`ACCOUNT_DIR_KEY`]).
+fn recorded_account_dir(twr: Option<&Map<String, Value>>) -> Option<std::path::PathBuf> {
+    recorded_path(twr, ACCOUNT_DIR_KEY)
+}
+
+/// A path `ext.twr` `twr` records under `key`.
+fn recorded_path(twr: Option<&Map<String, Value>>, key: &str) -> Option<std::path::PathBuf> {
+    twr?.get(key)?
+        .as_str()
+        .filter(|d| !d.is_empty())
+        .map(std::path::PathBuf::from)
 }
 
 impl Core {
@@ -136,21 +168,40 @@ impl Core {
                     .filter(|c| c.is_array())
                     .map(Value::to_string);
                 let acp_env = runtime_spec::acp_env(twr_ext(&p.ext));
+                let account_dir = recorded_account_dir(twr_ext(&p.ext));
+                let account_env_dir = recorded_path(twr_ext(&p.ext), ACCOUNT_ENV_DIR_KEY);
                 let rt = self.rt(&ev.thread);
                 rt.workspace = git::Workspace::from_created(p);
                 rt.pty_command = pty_command;
                 rt.acp_env = acp_env;
+                rt.account_dir = account_dir;
+                rt.account_env_dir = account_env_dir;
             }
-            // Moved to another runtime (`hub::switch`): what that one needs, recorded like
-            // `thread.created`'s (a `pty` thread's command goes; a move is never to `pty`). A
-            // live runtime is the previous one, whatever its name (`hub::restart`).
+            // Moved to another runtime or account (`hub::switch`): what that one needs,
+            // recorded like `thread.created`'s (a `pty` thread's command goes; a move is never
+            // to `pty`). A live runtime is the previous one, whatever its name
+            // (`hub::restart`). A move between accounts of one runtime keeps its agent unless
+            // the event names one (as the reducer keeps `acp_command`).
             EventBody::ThreadModelChanged(p) if p.runtime.is_some() => {
+                let same_runtime = p.previous_runtime == p.runtime;
+                let account_only = p.account_changed && same_runtime;
+                let names_agent = twr_ext(&p.ext).is_some_and(|t| t.contains_key(ACP_COMMAND_KEY));
                 let acp_env = runtime_spec::acp_env(twr_ext(&p.ext));
+                let account_dir = recorded_account_dir(twr_ext(&p.ext));
+                let account_env_dir = recorded_path(twr_ext(&p.ext), ACCOUNT_ENV_DIR_KEY);
                 let rt = self.rt(&ev.thread);
                 rt.pty_command = None;
-                rt.acp_env = acp_env;
+                if !account_only || names_agent {
+                    rt.acp_env = acp_env;
+                }
+                // An account move records the new account's directory (none for the native).
+                if p.account_changed {
+                    rt.account_dir = account_dir;
+                    rt.account_env_dir = account_env_dir;
+                }
                 if let Some(s) = rt.runtime_settings.as_mut() {
                     s.moved = true;
+                    s.account_moved |= account_only;
                 }
                 // The previous session's settings are no session's of the thread now: the new
                 // runtime's first start records its own (an attach meanwhile is refused, the
@@ -160,10 +211,13 @@ impl Core {
             // Gone (`hub::delete`): its runtime was stopped and its items resolved with it.
             // What a restore needs again is set aside (`hub::trash`), with its trash item.
             EventBody::ThreadDeleted(d) => {
-                if let Some(rt) = self.rt.remove(&ev.thread) {
-                    self.deleted_rt
-                        .insert(ev.thread.clone(), trash::DeletedRt::of(rt));
-                }
+                let mut saved = self
+                    .rt
+                    .remove(&ev.thread)
+                    .map(trash::DeletedRt::of)
+                    .unwrap_or_default();
+                saved.item = d.trash.clone();
+                self.deleted_rt.insert(ev.thread.clone(), saved);
                 if let Some(item) = &d.trash {
                     self.items_deleted.insert(item.clone());
                 }
@@ -257,6 +311,43 @@ impl Core {
                 }
             }
             EventBody::TurnStarted(_) => self.rt(&ev.thread).final_text = None,
+            // The turn that carried the resume of a session the thread moved back to failed
+            // (`ThreadView::resume_failed_turn`, `hub::switch`): the runtime that tried has no
+            // session of the thread, whose next turn starts a new one. A live one is replaced
+            // like a runtime the thread moved away from (`hub::restart`), never sent that turn.
+            EventBody::TurnEnded(_) => {
+                let failed = self
+                    .registry
+                    .get(&ev.thread)
+                    .is_some_and(|v| v.resume_failed_turn.is_some_and(|t| ev.turn == Some(t)));
+                if failed {
+                    if let Some(s) = self.rt(&ev.thread).runtime_settings.as_mut() {
+                        s.moved = true;
+                    }
+                }
+            }
+            // A trash item gone from its box (`hub::trash`): no longer listed, and when it is
+            // the deleted thread's own, the thread is not restorable any more; what its agent
+            // did is archived (`hub::prune`), so nothing folded from that is kept.
+            EventBody::TrashPurged(p) if ev.thread == HUB_THREAD && ev.source == Source::Hub => {
+                if self
+                    .trash
+                    .get(&p.item)
+                    .is_some_and(|s| s.thread == p.thread)
+                {
+                    self.trash.remove(&p.item);
+                }
+                if self.registry.is_deleted(&p.thread) {
+                    if let Some(d) = self
+                        .deleted_rt
+                        .get_mut(&p.thread)
+                        .filter(|d| d.item.as_deref() == Some(p.item.as_str()))
+                    {
+                        d.purged = true;
+                        self.activity.remove(&p.thread);
+                    }
+                }
+            }
             EventBody::AttentionRaised(p) => {
                 self.known_attn.insert(p.attn_id.clone());
                 if matches!(ev.source, Source::Adapter(_)) {
@@ -299,6 +390,7 @@ impl Core {
         self.track_context(ev);
         self.track_stall(ev);
         self.track_after(ev);
+        self.track_idle_offer(ev);
         self.track_activity(ev);
     }
 
@@ -322,6 +414,17 @@ impl Core {
         self.attention
             .apply_at(ev, ev.is_control().then_some(self.gseq));
         self.usage.apply(ev);
+        self.accounts.apply(ev);
+        if ev.thread == twr_core::event::HUB_THREAD
+            && matches!(
+                ev.body,
+                EventBody::AccountAdded(_)
+                    | EventBody::AccountRemoved(_)
+                    | EventBody::AccountStatus(_)
+            )
+        {
+            self.account_events.push((self.gseq, ev.clone()));
+        }
         self.track(ev);
     }
 
@@ -413,6 +516,10 @@ impl Core {
         // (`hub::stall`), so no crash can leave it open behind the activity.
         let resolutions = self.stall_resolutions(&events);
         events.extend(resolutions);
+        // An account whose directory the batch changes has its known usage cleared with it
+        // (`hub::usage`).
+        let clears = self.usage_clears(&events);
+        events.extend(clears);
         // Per-thread seqs (and timestamps) as they will be once the earlier events of the batch
         // are in.
         let mut seqs: HashMap<String, u64> = HashMap::new();
@@ -420,6 +527,8 @@ impl Core {
         let mut prepared: Vec<(Event, EventBody, Option<String>)> =
             Vec::with_capacity(events.len());
         for mut e in events {
+            // The orchestrator's memory calls are recorded without their text (`hub::memory`).
+            self.redact_memory_call(&e.thread, &mut e.body, &mut e.raw, &e.source);
             if self.is_orch(&e.thread) {
                 if let EventBody::TurnStarted(p) = &mut e.body {
                     let ext = p.ext.get_or_insert_with(JsonMap::new);
@@ -525,6 +634,12 @@ impl Core {
             stop_requests: &stop_requests,
             drop_queues: &drop_queues,
         })?;
+        // A compaction asked for goes with the queue (`hub::compact`).
+        for t in &drop_queues {
+            if let Some(r) = self.rt.get_mut(t) {
+                r.compact = None;
+            }
+        }
         let mut out = Vec::with_capacity(prepared.len());
         for ((ev, full_body, final_text), gseq) in prepared.into_iter().zip(commit.gseqs) {
             // Reducers see the event's own gseq as the head (the relay guard orders by it).
@@ -540,11 +655,14 @@ impl Core {
                 self.feed_hook(&full, g);
             }
             self.feed_after(&full);
+            self.task_progress_after(&full);
             if let Some(text) = final_text {
                 self.rt(&ev.thread).final_text = Some(text);
             }
             let shared = Arc::new(ev.clone());
             if let Some(g) = gseq {
+                // Folded for the snapshots (`hub::subscribe`) before any subscriber has it.
+                self.client.apply(&full, Some(g));
                 let _ = hub.control_tx.send((g, Arc::clone(&shared)));
             }
             let _ = hub.events_tx.send(shared);
@@ -563,7 +681,7 @@ impl Core {
     /// The `ts` of an event that happened `at` (a runner's capture time) and is recorded
     /// `now`: `at`, but never before the thread's previous event (`floor`: the log stays in
     /// time order per thread) nor after `now` (a runner clock ahead of the hub's).
-    fn event_time(
+    pub(super) fn event_time(
         at: DateTime<Utc>,
         floor: Option<DateTime<Utc>>,
         now: DateTime<Utc>,

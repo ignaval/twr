@@ -79,6 +79,8 @@ wake_after_secs = 30              # wake a worker idle this long after its backg
 autostart = false                 # start it with the hub instead of on your first message
 project_reads = true              # it may read your projects' committed files (false: never)
 # read_deny = ["*.sqlite", "config/prod/**"]  # more files it may never read, over the built-in secret names
+memory = true                     # it keeps notes across sessions and runtimes (false: no memory tools, nothing loaded)
+# account = "personal"           # the first orchestrator's account; unset = the policy default, else the native one
 
 [threads]
 default_mode = "auto"             # permission mode for new threads; checked when the hub starts
@@ -95,9 +97,14 @@ disk_warn_gb = 10                 # under this many GB free on a box, a disk car
 job_slots = 0                     # the machine's job slots for `twr job run`; 0 = its CPUs
 # cpu_weight = 20                 # the workers' CPU weight against the rest (systemd: 100); unset = no limit
 # memory_high = "8G"              # each worker's memory before it's slowed (systemd MemoryHigh); unset = none
+idle_compaction = "ask"           # a large context's prompt cache expired: ask before sending; "before_expiry" also compacts idle ones; "off"
 
 [trash]
 keep_days = 7                     # deleted threads stay in the trash this long; 0 = purge at the next check
+
+[log]
+retention_days = 30               # agent events of turns older than this leave twr.db (7 at least)
+archive = true                    # into archive.db beside it; false = they are deleted
 
 [projects.api]                    # example
 repo = "/home/me/code/api"        # the repository
@@ -109,9 +116,22 @@ repo = "/home/me/code/api"        # the repository
 # trim_idle_after = "24h"         # trim the build output of its threads idle this long (90m, 24h, 2d)
 # idle_trim_disposable = ["target/"]  # replaces [threads] idle_trim_disposable for this project
 # codex_auto = "ask"              # overrides [codex] auto for this project's threads
+# account = "work"               # its threads' account on every runtime: a name, a glob, a list (accounts.md)
+# accounts = { codex = "team" }   # per runtime; replaces `account` there
+# exclude_accounts = ["personal"] # never these accounts
 
 [codex]
 auto = "auto_review"              # a Codex thread in `auto` whose sandbox says no: Codex's "auto_review" agent decides (the default), "ask" you, or "never" run it
+
+[accounts.claude-code.work]       # example: an account (accounts.md); `twr account add` can record one instead
+# dir = "~/.claude-work"          # unset = ~/.local/share/twr/accounts/claude-code/work
+# share = "config"                # what `twr account add` links into it from the native directory: config | none
+
+[accounts.claude-code.personal]   # example
+native = true                     # names the native account (the runtime's own directory)
+
+[account_policy.claude-code]      # example
+# default = "personal"            # the account of threads nothing pins; unset = the native one
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
@@ -135,6 +155,19 @@ terminal = "off"                  # bell | osc9 | osc777: alert the terminal whe
 when = "unfocused"                # always: also while the terminal has focus
 events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 
+[speech]                          # reading aloud, on the machine you listen on; see read-aloud.md
+engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux) | command; auto: say, else spd if installed
+voice = ""                        # the engine's voice; empty = the system's default
+rate = 0                          # words per minute, 80-500; 0 = the engine's default
+volume = 1.0                      # 0.0-1.0 (avspeech, spd)
+read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it
+turn_from = "all"                 # mine: only the turns you started
+code = "announce"                 # read | skip: what a code block reads as
+paths = "short"                   # full: paths as written
+catchup_secs = 120                # after a disconnect, messages older than this are counted, not read
+local = "auto"                    # on | off: the TUI speaks by itself (auto: not under SSH or mosh)
+command = []                      # engine = "command": a program and its arguments (no shell), text on stdin
+
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"
 attach = "gemini --resume {session}"  # optional: what `twr attach` runs; also takes {mode}
@@ -154,6 +187,7 @@ ssh = "me@gpu-box"                # where; also used by `twr attach` for threads
 [boxes.gpu.projects.api]
 repo = "/srv/code/api"            # where that project lives on the box (`twr box project gpu api` finds and writes it)
 # runtime = "codex"               # runtime for this project's threads on that box
+# account = "work"               # also accounts, exclude_accounts: replace the project's on that box
 
 [boxes.sandbox]                   # example: a container the hub reaches through docker exec
 transport = "command"
@@ -167,7 +201,11 @@ ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 
 ## Notes on some keys
 
+`[accounts.<runtime>.<name>]`, `[account_policy.<runtime>]`, `[orchestrator] account` and a project's `account`, `accounts` and `exclude_accounts` are about several logins per runtime; see [accounts.md](accounts.md). Accounts work for `claude-code`, `codex` and `grok-build`. A pin that names an account the runtime doesn't have refuses the thread. `default_runtime` and a project's `runtime` take a runtime alone: write an account as `accounts.<runtime>` or `[account_policy.<runtime>] default` (only `[orchestrator] runtime` takes `claude-code:work`).
+
 `[orchestrator] project_reads` (default `true`) lets the orchestrator read your projects' committed files, and `read_deny` lists more file names it may never read, as globs: `*` within a path part, `**` across parts, `?` one character. A pattern without `/` matches a file name, `*.sqlite`, and one with `/` a path from the repository's top, `config/prod/**`. They add to the built-in secret names and never remove one. See [Reading your projects](orchestrator.md#reading-your-projects).
+
+`[orchestrator] memory` (default `true`) lets the orchestrator keep notes across its sessions, on any runtime, in the workspace's data directory. `false` refuses its memory tools and loads nothing into its sessions; the notes stay, and `twr memory` still shows and changes them. See [orchestrator.md](orchestrator.md#memory).
 
 `default_runtime`, `[projects.<name>] runtime` and `[orchestrator] runtime` take the same values as `twr thread new --runtime`. A thread's runtime is the one given on the command line, else its project's, else `default_runtime`. See [runtimes.md](runtimes.md).
 
@@ -211,9 +249,13 @@ The TUI folds a thread's routine updates in the orchestrator conversation (inter
 
 `cpu_weight` and `memory_high` limit the workers on the hub's machine. Both are off by default. See [usage.md](usage.md#resource-limits).
 
+`idle_compaction` is what the hub does when a worker's prompt cache has expired and its context is large (200 000 tokens or more; only Claude Code reports a cache). With `"ask"`, the default, the hub holds your message or the orchestrator's to such a worker and asks you on a card whether to compact its context first: `Compact first`, `Send as is` or `Don't ask for <thread>`. `"before_expiry"` does the same, and also has the hub compact an idle worker's context itself within the 5 minutes before a cache of an hour or more expires, so the compaction reads it from the cache: the one case where the hub compacts a context without being asked each time. `"off"` does neither. `twr compact <thread> --offers on|off` turns the offers on or off for one thread. Any other value is a config error. See [runtimes.md](runtimes.md#the-prompt-cache).
+
 `disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts, and `twr box doctor` warns under it. 0 turns them off. See [worktrees.md](worktrees.md#disk-use).
 
 `[trash] keep_days` is how long a deleted thread's worktree, record and branch stay in the trash of its box before the hub purges them. The hub checks when it starts and every hour, on every box that is online; a box that is offline is purged at the first check after it reconnects. `twr trash empty` purges sooner, and `twr trash restore` brings a thread back until then. See [usage.md](usage.md#trash).
+
+`[log]` is what the hub keeps of its log in `twr.db`. What threads, turns, items, reports and decisions are (the control events) always stays. What the agents said, thought and did (the agent events) moves out of `twr.db` into `archive.db` beside it once nothing reads it any more: a deleted thread's once its trash item is purged, and of any other thread, each turn's that ended more than `retention_days` ago and whose report (or, for the orchestrator, its outcome) is recorded. Each turn's final reply, every thread's last turn, and blobs a row that stays still points to stay. `retention_days` is 30 by default and at least 7: a remote box's recorded commands are resent for 6 days, and a resend reads its turn's events; twr refuses a config with less. With `archive = false` those events are deleted instead. The hub looks every hour and moves them once 2 000 or more can go; `twr log compact` does it now, and `twr log stats` says how big the log is and what would move. `twr events` reads archived events too; transcripts and the TUI's dive show an old turn's final reply but not its tool calls. An older twr (0.2.0 and before) refuses a config with a `[log]` table. See [architecture.md](architecture.md#archive-and-prune).
 
 A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can't be a built-in runtime name: `claude-code`, `codex`, `grok-build`, `acp`, `pty` or `fake`. `acp` is required. `attach` must contain `{session}`, which becomes the session id. `{mode}` becomes the thread's permission mode. twr refuses to attach a thread in a restricted mode, such as `plan`, through a template without `{mode}`, since the agent's CLI would then start in its own wider default mode. twr resolves the preset when the thread is created, so a later config change doesn't change an existing thread.
 

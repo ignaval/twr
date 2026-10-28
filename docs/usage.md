@@ -19,6 +19,8 @@ The project is a name from `[projects]` in the [config](configuration.md), a dir
 twr thread new orbit-webapp
 ```
 
+With several logins for one runtime, `--account work` (or `--runtime claude-code:work`) picks the account; a project can pin one. See [accounts.md](accounts.md).
+
 twr looks in `~/code`, `~/src`, `~/projects`, `~/dev`, `~/Developer`, `~/repos`, `~/git` and `~/workspace`, and one level below each. `project_roots` in the [config](configuration.md#notes-on-some-keys) changes the list. The repository found is used as if you had typed its path, and the hub's answer names it. If two repositories have that name, twr lists both and creates nothing; give the path of the one you mean. If none does, the error says where it looked. The TUI's `/new orbit-webapp` and the orchestrator ("open a new session on my orbit-webapp project") work the same way. On the command line, a directory of that name in the current directory is taken first.
 
 Without `--name`, twr makes one up. Other options:
@@ -62,7 +64,7 @@ twr model api gpt-6.1-sol --effort xhigh --runtime codex   # move api to Codex
 
 The model is the runtime's own id or alias (Claude Code takes `fable`, `opus`, `sonnet` or a full id). The effort must be one the runtime takes: Claude Code `low`, `medium`, `high`, `xhigh`, `max`; Codex `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`; Grok Build `low`, `medium`, `high`, `xhigh`; an ACP agent its own values. `default` returns either one to the runtime's default, and `twr thread new --effort E` sets the effort from the start. Once a thread has a session, `default` works only where its runtime falls back to the default on resume: the effort on Claude Code. Codex, Grok Build and ACP agents keep a session's model and effort, and Claude Code keeps its model, so twr refuses `default` there and you need to pick a value ([runtimes.md](runtimes.md#models-and-reasoning-effort)). The change goes into the log (`thread.model_changed`) and applies like a mode change: an idle thread restarts its runtime right away on the same session, a running one finishes its turn first, and a parked or stopped one starts with it next time. Setting what the thread already has records nothing. Not for the orchestrator (`twr orchestrator use`) or `pty` threads, whose command line is their own. Ask the orchestrator and it does the same ([orchestrator.md](orchestrator.md#changing-a-threads-model-and-effort)).
 
-`--runtime R` moves the thread to another runtime: `claude-code`, `codex`, `grok-build`, `acp:<command>` or a `[runtimes]` preset, but not `pty:`. A session can't move between agents, so the thread keeps its name, worktree, branch, queued prompts and permission mode, and starts a new session of the new runtime. Its current runtime stops: an idle one right away, a running one once its turn ends. The new session starts with the thread's next turn, whose prompt carries a handoff of what the previous session did: the thread's first prompt, its worktree and branch, its latest reports and its recent turns. A model or effort you leave out is the new runtime's default, since the old runtime's names mean nothing to it, and `default` is always fine with a move, since the new session is a new one. The thread's permission mode must be one the new runtime takes, and an attached thread can't move. Until the new runtime's session has started, `twr attach` refuses: the thread has no session to open yet, so send it a prompt first. `twr model api` then says `its next turn starts a new codex session` until that session has started. The orchestrator can move a thread too, but only to `claude-code`, `codex`, `grok-build` or a `[runtimes]` preset, and, unless the thread is in `plan`, `read-only` or `dontAsk`, only with your confirmation on a card ([orchestrator.md](orchestrator.md#changing-a-threads-model-and-effort)).
+`--runtime R` moves the thread to another runtime: `claude-code`, `codex`, `grok-build`, `acp:<command>` or a `[runtimes]` preset, but not `pty:`. A session can't move between agents, so the thread keeps its name, worktree, branch, queued prompts and permission mode, and starts a new session of the new runtime. Its current runtime stops: an idle one right away, a running one once its turn ends. The new session starts with the thread's next turn, whose prompt carries a handoff of what the previous session did: the thread's first prompt, its worktree and branch, its latest reports and its recent turns. A model or effort you leave out is the new runtime's default, since the old runtime's names mean nothing to it, and `default` is always fine with a move, since the new session is a new one. Moving back to a runtime the thread left a session of earlier, as in `twr model api --runtime claude-code` after the move above, resumes that session instead: its next turn gets a handoff of only what the thread did since it left (none when it did no work), a model or effort you leave out is the one it had then, and a `default` the runtime would not take on resume starts a new session instead. If the session can't be resumed, twr retries that turn once on a new session with the full handoff, then the turn's message ([runtimes.md](runtimes.md#moving-a-thread-back)). The thread's permission mode must be one the new runtime takes, and an attached thread can't move. Until the new runtime's session has started, `twr attach` refuses (also for a session the move resumes, which hasn't been told what happened since yet), so send it a prompt first. `twr model api` then says `its next turn starts a new codex session` until that session has started (`its next turn resumes its earlier claude-code session <id>` on a move back). The orchestrator can move a thread too, but only to `claude-code`, `codex`, `grok-build` or a `[runtimes]` preset, and, unless the thread is in `plan`, `read-only` or `dontAsk`, only with your confirmation on a card ([orchestrator.md](orchestrator.md#changing-a-threads-model-and-effort)).
 
 ### Rename a thread
 
@@ -140,7 +142,7 @@ A job runs in a session of its own, without a controlling terminal, also when th
 
 Every job waits for job slots, one by default (`--slots N` for more): the machine has `[threads] job_slots` of them (its CPUs by default), shared by every twr hub of this home, and each hub's jobs take them in the order they came. So when several threads build and test at once, their jobs queue instead of loading the machine all at once.
 
-While a job is queued or runs it's one of its thread's background tasks: the card says `background`, the activity line says `job cargo test: running 6m` (or `queued (2 ahead)`), and the turn that started it ends with an interim report. A job outlives its runtime: a settings restart or a crash doesn't end it, and neither a settings restart nor an automatic retry waits for it. `twr stop`, a forced park and a deletion cancel the thread's jobs, and its runtime can't start one while it's stopping or stopped; an attach doesn't wait for them, and the attached CLI can start jobs while the attach lasts. A job an agent started (its runtime or the attached CLI) doesn't wake a stopped thread when it ends. After a crash that failed the thread's turn, a job's wake waits in the queue with the rest until you send to the thread or resume it. A hub that stops cancels every job and records how each ended. Before a job's command runs, the hub records its process group. A job a hub didn't see end (it died) is recorded as lost when the next hub starts, after what is left of its process group is killed (also a process that cleared twr's variables from its environment; if the hub can't verify that nothing of it still runs, the job isn't recorded and its thread starts nothing until a later hub start verifies it), and its thread is told, unless the job was started with `--no-wake` or the thread is stopped or parked. Jobs run only on the hub's own box for now, and a thread may have at most 8 queued or running.
+While a job is queued or runs it's one of its thread's background tasks: the card says `background`, the activity line says `job cargo test: running 6m 0s` (or `queued (2 ahead)`), as the job does now, and the turn that started it ends with an interim report. A job outlives its runtime: a settings restart or a crash doesn't end it, and neither a settings restart nor an automatic retry waits for it. `twr stop`, a forced park and a deletion cancel the thread's jobs, and its runtime can't start one while it's stopping or stopped; an attach doesn't wait for them, and the attached CLI can start jobs while the attach lasts. A job an agent started (its runtime or the attached CLI) doesn't wake a stopped thread when it ends. After a crash that failed the thread's turn, a job's wake waits in the queue with the rest until you send to the thread or resume it. A hub that stops cancels every job and records how each ended. Before a job's command runs, the hub records its process group. A job a hub didn't see end (it died) is recorded as lost when the next hub starts, after what is left of its process group is killed (also a process that cleared twr's variables from its environment; if the hub can't verify that nothing of it still runs, the job isn't recorded and its thread starts nothing until a later hub start verifies it), and its thread is told, unless the job was started with `--no-wake` or the thread is stopped or parked. Jobs run only on the hub's own box for now, and a thread may have at most 8 queued or running.
 
 A job's processes count as the thread's agent, as its runtime's do ([Security](#security)): they can read the hub but change nothing in it, and they can't start jobs. A thread's agent cancels its own thread's jobs, and starts them only while the thread's mode lets it run commands: `manual` or wider. Both only from a process that still runs under its thread's runtime or attached CLI: the hub checks again at each request, so a process that left them (its parent exited) or outlived them still reads but starts and cancels no job. In `plan`, `dontAsk` or `read-only`, or in an ACP agent's own mode that twr doesn't know, its `twr job run` is refused; give the thread a mode twr knows, such as `manual`, if it should run jobs. The mode is checked when the job is queued and again when it starts: a job still waiting for its slots when the mode narrows ends as `failed_to_start`, saying why. A job that already runs keeps running when the thread's mode changes. Like transcripts, every thread's jobs are open to read: any agent can list them and read their output. Your own jobs work in any mode. The orchestrator runs none. A job runs outside the runtime's own sandbox, as the hub's child, so it can do whatever you can, like a command an agent hands to `systemd-run --user`. Only an agent that can reach the hub's socket can start one: Codex's sandbox blocks local sockets in every mode but `auto` and the bypass modes (`bypassPermissions`, `danger-full-access`, `yolo`, which run without a sandbox; [runtimes.md](runtimes.md#permission-modes)), and `auto` already lets an agent reach outside it. Claude Code has no OS sandbox unless you configure one. If a runtime's sandbox is your boundary, keep its threads from the socket.
 
@@ -225,8 +227,14 @@ twr park api          # stop it, remove its worktree if clean (the branch stays)
 twr trim api          # delete its build output (target/, ...); it keeps working
 twr park api --keep   # stop it, keep the worktree
 twr resume api        # recreate the worktree at the same path, same session
+twr compact api       # compact its context, as its agent's own /compact does
+twr compact api --offers off   # no more offers to compact it once its prompt cache expired
 twr stop api          # stop the runtime and drop its queued prompts
 ```
+
+`twr compact` runs a compaction of the thread's context as a turn of its own, after the turn that runs and the messages queued before it (`/compact-context` in the TUI). Claude Code, Codex and Grok Build threads on this machine can; [runtimes.md](runtimes.md#context-compaction) says what each does on its own, how to tune it, and what twr shows of it.
+
+When a Claude Code worker's prompt cache has expired and its context is large, the hub holds the next message to it, yours or the orchestrator's, and asks you on a card whether to compact first (`[threads] idle_compaction`, [runtimes.md](runtimes.md#the-prompt-cache)). `twr compact <thread> --offers off` turns those offers off for that thread without compacting anything, as the card's `Don't ask for <thread>` does (with `before_expiry`, the hub's own compaction of it too), and `--offers on` turns them back on: `api: offers to compact its context once its prompt cache expired are off`. Only you can turn them on or off, and only you answer the card.
 
 `park` refuses while a turn or background work runs, unless you pass `--force`. Prompts sent to a parked thread wait for `resume`. [worktrees.md](worktrees.md) has the rules for what parking removes.
 
@@ -283,6 +291,23 @@ If a step fails, the restore removes only what it made (the new worktree, its re
 
 Without the hub, you can recover an item by hand: `git branch <name> refs/twr-trash/<item>/branch` in the repository brings the branch back, and the files are in `<data dir>/trash/<item>/worktree`. Its `.git` file still names the record's old path; copy the pack files of `<item>/index-objects/` (if any) into `<repo>/.git/objects/pack/`, move `<item>/record` back to `<repo>/.git/worktrees/<name>` and run `git worktree repair <path>`, or just copy the files out.
 
+## The log
+
+The hub records everything in `twr.db` in its data directory. What agents said, thought and did in old turns leaves it for `archive.db` beside it once nothing reads it any more: a deleted thread's once its trash item is purged (every purge is recorded, and such a thread can't be restored), and of the other threads each turn's that ended more than `[log] retention_days` (30) ago and has its report, except its final reply and the thread's last turn ([configuration.md](configuration.md)). The hub does that every hour by itself.
+
+```sh
+twr log stats                     # sizes, rows per kind, checkpoints, what would move; --json
+twr log compact                   # move it now
+twr log compact --vacuum          # then rewrite twr.db to give the space back; the hub waits
+                                  # (3 to 18 s for a 475 MB twr.db)
+twr log checkpoint                # this build's checkpoint of the hub's state; --all, --json
+twr events <thread>               # reads archived events too; a deleted thread's by its id
+```
+
+A hub starts from a checkpoint of its state, written by its own build, and folds only the events after it. `twr log checkpoint` writes one for the `twr` you run, with or without a hub running (it never starts one), so that a new build's first start does not fold the whole log: the development installer and `twr update` run it for every workspace after installing, and `twr hub stop` does before stopping a hub that runs another build (it prints a line saying what it wrote, and its `--timeout` counts from after it).
+
+Transcripts and the TUI's dive show an old turn's final reply but not its tool calls any more; `twr events` has them.
+
 ## Standing context
 
 Standing context for a project lives in `<repo>/.twr/context.md`. The hub prepends it to every prompt it sends to that project's worker threads, never to the orchestrator.
@@ -293,6 +318,18 @@ twr context edit api    # opens a copy in $VISUAL, else $EDITOR, else vi
 ```
 
 If the context changed while you were editing, or the save fails, nothing is overwritten and your edit is kept in a temporary file whose path is printed. The hub refuses a symlinked `.twr/` or `context.md`, and writes the file inside the `.twr/` directory it checked (held open), so one swapped for a symlink meanwhile is never written through; reads at most 1 MiB of the file and injects at most 64 KiB. Threads on a remote box get the project's context from the hub's log, the last version set or captured, because the hub never reads files on another machine.
+
+## The orchestrator's memory
+
+The orchestrator keeps notes across its sessions and runtimes, one memory per workspace ([orchestrator.md](orchestrator.md#memory)). You can read, change and remove them:
+
+```sh
+twr memory list
+twr memory show short-replies
+twr memory edit short-replies   # or a new name for a new note
+twr memory rm short-replies
+twr memory path
+```
 
 ## Subscription usage
 

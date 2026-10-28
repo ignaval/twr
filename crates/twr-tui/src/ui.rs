@@ -61,8 +61,10 @@ pub fn side_width(width: u16) -> u16 {
 /// the view: how far the replay is. No key acts on it (the view is not drawn yet).
 pub fn render_loading(frame: &mut Frame, state: &AppState) {
     let area = frame.area();
-    let text = match state.catch_up {
-        Some(head) if head > 0 && head < u64::MAX => {
+    let text = match (state.catch_up, state.catch_up_items) {
+        // A compacted replay: its items, not the gseqs up to the head.
+        (Some(_), Some((came, items))) => format!("Loading… {} of {items} events", came.min(items)),
+        (Some(head), None) if head > 0 && head < u64::MAX => {
             format!("Loading… {} of {head} events", state.last_gseq.min(head))
         }
         _ => "Loading…".to_string(),
@@ -417,6 +419,10 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
         "Ctrl-O",
         "show or hide tool calls (the orchestrator's, or in a dive the thread's) and the hub's \
          updates",
+    ),
+    (
+        "Ctrl-R",
+        "while a speaker reads aloud, stop it (/read stop); otherwise say how to start (/read)",
     ),
     ("Ctrl-L", "repaint the whole screen"),
     (
@@ -823,13 +829,20 @@ fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes
 }
 
 /// The orchestrator picker's lines: what it is for, one row per runtime (installed or not,
-/// the configured default marked, or for a switch the current one), the keys.
+/// the configured default marked, or for a switch the current one), the keys. A row shows
+/// its spec as [`crate::app::orch_label`] says (the runtime alone while it hides account
+/// labels), whatever account choosing it sends.
 pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
     let Some(p) = &state.view.picker else {
         return Vec::new();
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let name_width = p.runtimes.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+    let shown: Vec<String> = p
+        .runtimes
+        .iter()
+        .map(|(r, _)| crate::app::orch_label(r, &state.accounts))
+        .collect();
+    let name_width = shown.iter().map(|r| r.chars().count()).max().unwrap_or(0);
     let (title, note) = if p.switch {
         (
             "Switch the orchestrator to",
@@ -849,7 +862,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
         Line::from(Span::styled(note, dim)),
         Line::from(""),
     ];
-    for (i, (runtime, installed)) in p.runtimes.iter().enumerate() {
+    for (i, ((runtime, installed), label)) in p.runtimes.iter().zip(&shown).enumerate() {
         let chosen = i == p.selected;
         let mut spans = vec![
             Span::raw(if chosen { "› " } else { "  " }),
@@ -860,7 +873,7 @@ pub fn picker_lines(state: &AppState) -> Vec<Line<'static>> {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{runtime:<name_width$}  "),
+                format!("{label:<name_width$}  "),
                 if chosen {
                     Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
                 } else {
@@ -1893,7 +1906,8 @@ fn card_border(block: Block<'static>, look: Look, color: Color) -> Block<'static
 /// `claude-code · sonnet-4-5`, with the box token of a remote box) and its permission mode,
 /// apart (`─ auto`). Where they do not all fit, the project gives way first: cut with `…` to
 /// the room the rest leaves ([`title_project`]), then left out; then who runs it shortens
-/// (the runtime goes, the model is cut, then left out, then the box's name is cut); then the
+/// (the runtime goes, the model is cut, then left out, then the account, then the box's name
+/// is cut); then the
 /// mode goes, before the state of a box not simply online would. The name is never cut (only the border can clip it). Also
 /// returns whether a box not simply online has its state left out for want of room (the
 /// bottom border then says it, [`card_bottom`]).
@@ -1967,6 +1981,16 @@ fn card_block(
         block = block.title(Line::from(Span::styled(mode, dim)).right_aligned());
     }
     (block, unsaid)
+}
+
+/// A card's or tile's right bottom label: how full its thread's context is, when its runtime
+/// said (`ctx 34%`, [`twr_core::event::ContextSize::short`]), before the `more` label `right`.
+fn with_context(t: &ThreadView, right: Option<String>) -> Option<String> {
+    let ctx = t.context.map(|c| c.short());
+    match (ctx, right) {
+        (Some(c), Some(r)) => Some(format!("{c} · {r}")),
+        (c, r) => c.or(r),
+    }
 }
 
 /// `block`, a card or tile `width` columns wide, with its bottom border's labels: the `more`
@@ -2045,6 +2069,7 @@ fn render_card(
     let (block, unsaid) = card_block(state, t, pinned, area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
+    let more_right = with_context(t, more_right);
     let block = card_bottom(block, area.width, (more_left, more_right), token);
 
     let inner = block.inner(area);
@@ -2191,8 +2216,9 @@ fn at_work(t: &ThreadView) -> bool {
 /// the state says already ([`after_state`]): while the thread is at work ([`at_work`]) or failed,
 /// what it does now or why it failed (the hub's activity line, `thread.activity`; until the hub
 /// said, what its status says, [`twr_core::activity::fallback`]); else its last report (dim), or
-/// the activity line when it has none (`idle · not started`). A selected card waiting on
-/// background work shows the report its turn yielded under that: an interim one. With an item
+/// the activity line when it has none (`idle · not started`). A card waiting on background
+/// work shows the report its turn yielded under that: an interim one, selected or not (a card
+/// has the same rows either way). With an item
 /// open (`item`), a thread at work but not waiting on the user (running, on background tasks,
 /// attached: a stalled notice, a review) still says what it does; one waiting on the user, or
 /// not at work, shows the state alone: the item says the rest. Also returns the section on
@@ -2277,8 +2303,7 @@ fn section_lines(
     }
     let line = one(&spans);
     let mut lines = wrapped(spans);
-    let selected = highlighted(state) == Some(t.id.as_str());
-    if selected && status == ThreadStatus::Background && t.reported {
+    if status == ThreadStatus::Background && t.reported {
         if let Some(r) = &t.last_report {
             lines.extend(wrapped(vec![report(r)]));
         }
@@ -2897,16 +2922,21 @@ fn box_token(state: &AppState, t: &ThreadView) -> Option<BoxToken> {
 }
 
 /// Who runs `t`, as its card's or tile's title says it at its right ([`card_block`]), in the
-/// first of these that fits `room` cells: `runtime@box[ state] · model`; the runtime left out
-/// (`@box[ state] · model`, a local thread's model alone); the model cut with `…` (to 3 of its
-/// cells at least); then left out (`@box state`; nothing for a local thread); then the box's
-/// name cut (`@g… offline`, [`BoxToken::fit`]). The box's state is never cut. Dim, but for the
+/// first of these that fits `room` cells: `runtime[:account]@box[ state] · model`; the runtime
+/// left out, its account kept (`[account]@box[ state] · model`, a local thread's `[account ·
+/// ]model`); the model cut with `…` (to 3 of its cells at least); then left out
+/// (`[account]@box state`, a local thread's account alone); then the account left out (`@box
+/// state`; nothing for a local thread); then the box's name cut (`@g… offline`,
+/// [`BoxToken::fit`]). The account is there only when its runtime shows account labels, or it
+/// was removed ([`AppState::account_label`]). The box's state is never cut. Dim, but for the
 /// state's own color ([`box_word_style`]). None when not even that fits.
 fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'static>>> {
     let cells = crate::edit::width;
     let dim = Style::default().fg(Color::DarkGray);
     let token = box_token(state, t);
     let model = model_label(t);
+    let label = state.account_label(t);
+    let account = label.is_some();
     let whole: Vec<Span<'static>> = token
         .as_ref()
         .map(|k| k.fit(usize::MAX))
@@ -2920,10 +2950,14 @@ fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'st
             }
         })
         .collect();
-    let form = |runtime: bool, model: Option<String>| {
+    let form = |runtime: bool, account: bool, model: Option<String>| {
         let mut spans = Vec::new();
         if runtime {
             spans.push(Span::styled(runtime_name(t).to_string(), dim));
+        }
+        if let Some(a) = label.as_ref().filter(|_| account) {
+            let a = if runtime { format!(":{a}") } else { a.clone() };
+            spans.push(Span::styled(a, dim));
         }
         spans.extend(whole.iter().cloned());
         if let Some(m) = model {
@@ -2936,16 +2970,24 @@ fn who_fit(state: &AppState, t: &ThreadView, room: usize) -> Option<Vec<Span<'st
     };
     let width = |spans: &[Span<'static>]| Line::from(spans.to_vec()).width();
     let mut forms = vec![
-        form(true, Some(model.clone())),
-        form(false, Some(model.clone())),
+        form(true, account, Some(model.clone())),
+        form(false, account, Some(model.clone())),
     ];
-    // The model cut to the room the token leaves it.
-    let used = width(&form(false, None)) + if whole.is_empty() { 0 } else { 3 };
+    // The model cut to the room the account and the token leave it.
+    let before = form(false, account, None);
+    let used = width(&before) + if before.is_empty() { 0 } else { 3 };
     if room >= used + 4 && cells(&model) > room - used {
-        forms.push(form(false, Some(truncate_cells(&model, room - used))));
+        forms.push(form(
+            false,
+            account,
+            Some(truncate_cells(&model, room - used)),
+        ));
+    }
+    if account {
+        forms.push(before);
     }
     if let Some(token) = &token {
-        forms.push(form(false, None));
+        forms.push(form(false, false, None));
         if room >= token.min_width() {
             forms.push(
                 token
@@ -3755,7 +3797,7 @@ fn render_tile(
     let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let block = card_bottom(block, area.width, (None, None), token);
+    let block = card_bottom(block, area.width, (None, with_context(t, None)), token);
     let inner = block.inner(area);
     let body = tile_body(state, t, inner.width);
     let status_row = body
@@ -3953,7 +3995,7 @@ fn card_color(t: &ThreadView) -> Color {
     if t.is_orchestrator() {
         target_color(None)
     } else {
-        thread_color(&t.id)
+        thread_color(t)
     }
 }
 
@@ -4234,7 +4276,7 @@ fn thread_box(
     threads: &Threads,
 ) -> Vec<TranscriptRow> {
     let thread = threads.get(name);
-    let frame = Style::default().fg(thread.map_or(Color::DarkGray, |t| thread_color(&t.id)));
+    let frame = Style::default().fg(thread.map_or(Color::DarkGray, thread_color));
     let label = thread.map_or(name, |t| t.name.as_str());
     let mut out = Vec::new();
     if width < BOX_MIN_WIDTH {
@@ -5155,6 +5197,7 @@ fn tool_phrase(tool: &str) -> (&'static str, &'static str) {
             "delete_thread" => ("asked to delete", "thread"),
             "list_trash" => ("listed the trash", ""),
             "get_usage" => ("checked the usage", ""),
+            "list_accounts" => ("listed the accounts", ""),
             "stop" => ("stopped", "thread"),
             "read_transcript" => ("read", "transcript"),
             "subscribe_control" => ("watched the hub", ""),
@@ -5285,7 +5328,7 @@ fn about_spans(about: Option<&str>, threads: &Threads) -> Vec<Span<'static>> {
     };
     let thread = threads.get(name);
     let label = thread.map_or(name, |t| t.name.as_str()).to_string();
-    let color = thread.map_or(Color::DarkGray, |t| thread_color(&t.id));
+    let color = thread.map_or(Color::DarkGray, thread_color);
     vec![
         Span::styled(label, Style::default().fg(color)),
         Span::styled(" · ", Style::default().fg(Color::DarkGray)),
@@ -5437,10 +5480,8 @@ fn hub_update_rows(v: &mut View, e: &Entry, threads: &Threads) {
     }
     let dim = Style::default().fg(Color::DarkGray);
     let color = |name: &str| {
-        let id = about
-            .as_deref()
-            .or_else(|| threads.get(name).map(|t| t.id.as_str()));
-        Style::default().fg(id.map_or(Color::Reset, thread_color))
+        let thread = threads.get(about.as_deref().unwrap_or(name));
+        Style::default().fg(thread.map_or(Color::Reset, thread_color))
     };
     match (UpdateShape::of(text), outcome) {
         (
@@ -5558,7 +5599,7 @@ fn named_spans(
     match about {
         Some(id) => {
             if let Some(t) = threads.get(id).filter(|t| t.id == id) {
-                let color = thread_color(&t.id);
+                let color = thread_color(t);
                 for (at, w) in name_words(text) {
                     if w == t.name || t.aliases.iter().chain(&t.former_names).any(|n| n == w) {
                         named.push((at..at + w.len(), color));
@@ -5570,14 +5611,14 @@ fn named_spans(
             let word = text.split([' ', '\n']).next().unwrap_or_default();
             let name = word.strip_suffix("'s").unwrap_or(word);
             if let Some(t) = threads.get(name).filter(|_| !name.is_empty()) {
-                named.push((0..name.len(), thread_color(&t.id)));
+                named.push((0..name.len(), thread_color(t)));
             }
         }
     }
     for at in hub_lists(text) {
         let w = &text[at.clone()];
         if let Some(t) = threads.get(w).filter(|_| !w.is_empty()) {
-            named.push((at, thread_color(&t.id)));
+            named.push((at, thread_color(t)));
         }
     }
     named.sort_by_key(|(r, _)| r.start);
@@ -5829,7 +5870,7 @@ pub fn target_color(dive: Option<&ThreadView>) -> Color {
     match dive {
         None => Color::Cyan,
         Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Magenta,
-        Some(t) => thread_color(&t.id),
+        Some(t) => thread_color(t),
     }
 }
 
@@ -5844,7 +5885,7 @@ pub fn target_fill(dive: Option<&ThreadView>) -> Style {
     let bg = match dive {
         None => Color::Indexed(80),
         Some(t) if t.id == HUB_THREAD || t.is_orchestrator() => Color::Indexed(176),
-        Some(t) => thread_color(&t.id),
+        Some(t) => thread_color(t),
     };
     Style::default().fg(crate::color::text_on(bg)).bg(bg)
 }
@@ -5853,8 +5894,8 @@ pub fn target_fill(dive: Option<&ThreadView>) -> Style {
 /// `talking to <name>`, and the details that fit after it (two columns apart): in a dive the
 /// runtime with the box token ([`box_token`]), model, mode and what Esc does ([`esc_words`]:
 /// how to get back, when the next Esc leaves the dive), shortened as needed ([`dive_title`]);
-/// in the orchestrator conversation the runtime and the full model id the runtime reports,
-/// cut to fit. Before an orchestrator thread exists, the one the hub would start, which starts
+/// in the orchestrator conversation the runtime (with its account while it shows account
+/// labels: `claude-code:personal`) and the full model id the runtime reports, cut to fit. Before an orchestrator thread exists, the one the hub would start, which starts
 /// with the first message. A label wider than `width` is cut, with no details.
 pub fn main_title(state: &AppState, width: usize) -> (String, String) {
     if let Some(t) = state.dived() {
@@ -5866,20 +5907,29 @@ pub fn main_title(state: &AppState, width: usize) -> (String, String) {
         return (truncate_cells(&label, width), String::new());
     }
     let room = width.saturating_sub(used + 2);
+    // The runtime with its account while it shows account labels: `claude-code:personal`.
+    let labelled = |rt: &str, account: Option<String>| match account {
+        Some(a) => format!("{rt}:{a}"),
+        None => rt.to_string(),
+    };
     let full = match (state.orchestrator(), &state.view.orch_default) {
         (Some(o), _) => format!(
             "{} · {}",
-            if o.runtime.is_empty() {
-                "?"
-            } else {
-                &o.runtime
-            },
+            labelled(runtime_name(o), state.account_label(o)),
             model_full(o)
         ),
-        (None, Some((rt, model))) => format!(
-            "{rt} · {} · starts with your first message",
-            model.as_deref().unwrap_or("default model")
-        ),
+        (None, Some((rt, model))) => {
+            // A configured `claude-code:work` is the runtime and its account, labelled only
+            // while the runtime shows account labels.
+            let (base, named) = twr_core::account::split_runtime(rt);
+            let account = state.view.orch_default_account.as_deref().or(named);
+            let label = state.accounts.label(base, account);
+            format!(
+                "{} · {} · starts with your first message",
+                labelled(base, label),
+                model.as_deref().unwrap_or("default model")
+            )
+        }
         (None, None) => "starts with your first message".to_string(),
     };
     let detail = if room >= 6 {
@@ -5950,9 +6000,11 @@ enum TokenShown {
 }
 
 /// [`main_title`] in a dive into `t`, `width` cells wide (measured in display cells):
-/// `talking to <name>` and the first of these that fits: runtime with the box token, model,
-/// mode and what Esc does (long, then short); for a box not simply online, the token with the
-/// mode, then the token alone, each with `Esc: back`; then the mode, then `Esc: back` alone. A
+/// `talking to <name>` and the first of these that fits: runtime (with its account when it
+/// shows account labels, [`AppState::account_label`]: `claude-code:work`) with the box token,
+/// model, mode and what Esc does (long, then short); for a box not simply online, the account
+/// and the token with the mode, then the account and the token alone, each with `Esc: back`;
+/// then the mode, then `Esc: back` alone. A
 /// box's state (R9) comes before the label: when no detail with the token fits after `talking
 /// to <name>`, the label becomes the name, cut as needed, with the token and `Esc: back`, then
 /// the token alone, then the token with its box's name cut (`@gp… offline`, the two names
@@ -5962,7 +6014,13 @@ fn dive_header(state: &AppState, t: &ThreadView, width: usize) -> DiveHeader {
     let cells = crate::edit::width;
     let label = format!("talking to {}", t.name);
     let (esc_long, back) = esc_words(state);
-    let rt = runtime_name(t);
+    // The account when its runtime shows labels (or it was removed): `claude-code:work`, and
+    // `work` where the runtime gives way.
+    let account = state.account_label(t).unwrap_or_default();
+    let rt = match account.as_str() {
+        "" => runtime_name(t).to_string(),
+        a => format!("{}:{a}", runtime_name(t)),
+    };
     let token = box_token(state, t);
     let whole = token
         .as_ref()
@@ -5997,8 +6055,8 @@ fn dive_header(state: &AppState, t: &ThreadView, width: usize) -> DiveHeader {
     let with_token: Vec<String> = [
         Some(format!("{rt}{whole} · {model}{mode} · {esc_long}")),
         Some(format!("{rt}{whole} · {model}{mode} · {back}")),
-        not_online.then(|| format!("{whole}{mode} · {back}")),
-        not_online.then(|| format!("{whole} · {back}")),
+        not_online.then(|| format!("{account}{whole}{mode} · {back}")),
+        not_online.then(|| format!("{account}{whole} · {back}")),
     ]
     .into_iter()
     .flatten()
@@ -6542,10 +6600,8 @@ fn request_detail_rows(state: &AppState, item: &AttentionItem, width: usize) -> 
 }
 
 fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<TranscriptRow> {
-    let name = state
-        .registry
-        .get(&item.thread)
-        .map_or(item.thread.as_str(), |t| t.name.as_str());
+    let thread = state.registry.get(&item.thread);
+    let name = thread.map_or(item.thread.as_str(), |t| t.name.as_str());
     let reason = if item.reason == AttentionReason::Permission {
         "permission"
     } else {
@@ -6562,7 +6618,7 @@ fn request_rows(state: &AppState, item: &AttentionItem, width: u16) -> Vec<Trans
     let color = if selected {
         Color::Yellow
     } else {
-        thread_color(&item.thread)
+        thread.map_or(Color::DarkGray, thread_color)
     };
     let frame = Style::default().fg(color);
     let mut rows = thread_box(
@@ -6887,6 +6943,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         state: Some(state),
     };
     let (mut rows, spans) = transcript_view_spans(entries, inner.width, &collapse, &threads);
+    mark_read_aloud(&mut rows, &spans, entries, state);
     if entries.is_empty() && state.selected_request().is_none() {
         rows.extend(
             main_hint(state)
@@ -7069,6 +7126,73 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         let row = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         render_below(frame, row, rows.len() - end, state);
         panes.target(row, Target::Follow);
+    }
+}
+
+/// The marker of the message a speaker reads aloud ([`mark_read_aloud`]), and its form with
+/// `[tui] colors = "none"`.
+pub const READING_MARK: &str = "▶ ";
+/// [`READING_MARK`] without colors.
+pub const READING_MARK_PLAIN: &str = "> ";
+
+/// Puts [`READING_MARK`] before each message of the shown conversation a speaker reads now
+/// ([`crate::speech::SpeechView::playing_in`], by the seq of its final text): in place of the
+/// `● ` of its first row (or the indentation of its first indented row, should it start with
+/// a thread box), in the selected block's yellow. Those cells are the row's gutter
+/// ([`Edge::Gutter`]), so nothing moves or wraps anew when the marker comes and goes, and a
+/// copy leaves it out. A message too narrow for an indentation gets none.
+fn mark_read_aloud(rows: &mut [TranscriptRow], spans: &Spans, entries: &[Entry], state: &AppState) {
+    let Some(t) = state.transcript.as_ref() else {
+        return;
+    };
+    let seqs = state.speech.playing_in(&t.thread);
+    if seqs.is_empty() {
+        return;
+    }
+    let mark = if state.view.colors == crate::color::Depth::None {
+        READING_MARK_PLAIN
+    } else {
+        READING_MARK
+    };
+    let style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    for (i, e) in entries.iter().enumerate() {
+        let Entry::Text {
+            final_seq: Some(seq),
+            ..
+        } = e
+        else {
+            continue;
+        };
+        let Some(range) = spans.entries.get(i).filter(|_| seqs.contains(seq)) else {
+            continue;
+        };
+        let leads = |row: &TranscriptRow, lead: &str| {
+            matches!(row.3, Edge::Gutter(n) if n >= 2)
+                && row
+                    .0
+                    .spans
+                    .first()
+                    .is_some_and(|s| s.content.starts_with(lead))
+        };
+        // The bullet's row, else the first indented one.
+        let Some((at, lead)) = ["● ", "  "].into_iter().find_map(|lead| {
+            rows.get(range.clone())?
+                .iter()
+                .position(|row| leads(row, lead))
+                .map(|at| (range.start + at, lead))
+        }) else {
+            continue;
+        };
+        let row = &mut rows[at].0;
+        let first = row.spans.remove(0);
+        let after = first.content[lead.len()..].to_string();
+        let mut marked = vec![Span::styled(mark, style)];
+        if !after.is_empty() {
+            marked.push(Span::styled(after, first.style));
+        }
+        row.spans.splice(0..0, marked);
     }
 }
 
@@ -8705,7 +8829,9 @@ where
     Tz::Offset: std::fmt::Display,
 {
     use twr_core::usage::{segment, Form, Level, Part};
-    let shown = state.usage.shown(now);
+    // Accounts named as threads' labels name them (the hub's rule; an older hub's: by the
+    // entries).
+    let shown = state.accounts.usage_shown(&state.usage, now);
     let calls = state.summary.stats.calls;
     let summaries = if calls > 0 {
         vec![
@@ -8786,6 +8912,9 @@ where
 /// cards have no room for it); each with what a tap on it does ([`Target`]).
 fn status_note_parts(state: &AppState, parked: Option<String>) -> Vec<(String, Option<Target>)> {
     let mut notes = Vec::new();
+    // What the hub's speakers read ([`crate::speech`]).
+    let plain = state.view.colors == crate::color::Depth::None;
+    notes.extend(state.speech.note(plain).map(|n| (n, None)));
     let background: usize = state
         .registry
         .list()
@@ -10337,6 +10466,142 @@ mod tests {
         transcript_rows(st, &lines)
     }
 
+    /// The poll's answer: `laptop` in `state`.
+    fn speech_polled(st: &mut AppState, state: twr_core::speech::SpeechStateParams) {
+        use crate::speech::tests::{polled, speaker};
+        st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
+    }
+
+    /// While a speaker reads a message of the conversation shown, `▶` takes the place of its
+    /// `●` (`>` without colors), in its gutter: nothing else moves, and a copy leaves it out.
+    /// Another message gets none, nor does a message of another thread that has its seq.
+    #[test]
+    fn the_message_read_aloud_is_marked() {
+        use crate::speech::tests::playing;
+        let text = |seq: u64, final_seq: u64, t: &str| Entry::Text {
+            seq,
+            text: t.into(),
+            open: false,
+            final_seq: Some(final_seq),
+        };
+        let mut st = orch_working(vec![
+            prompt("hi"),
+            text(3, 4, "first reply"),
+            prompt("more"),
+            text(6, 7, "second reply\nwith a second line"),
+        ]);
+        let before = drawn_rows(&mut st);
+        let row = |rows: &[String], word: &str| {
+            rows.iter()
+                .position(|r| r.contains(word))
+                .unwrap_or_else(|| panic!("{word}: {rows:#?}"))
+        };
+        assert!(before[row(&before, "second reply")].starts_with("● second reply"));
+        let reading = |thread: &str, seq: u64| twr_core::speech::SpeechStateParams {
+            playing: playing(thread, seq),
+            ..Default::default()
+        };
+        speech_polled(&mut st, reading("t-orch", 7));
+        let rows = drawn_rows(&mut st);
+        let at = row(&rows, "second reply");
+        assert_eq!(rows[at], "▶ second reply", "{rows:#?}");
+        assert_eq!(rows[at + 1], "  with a second line");
+        assert!(rows[row(&rows, "first reply")].starts_with("● first reply"));
+        // The same rows otherwise.
+        let mut unmarked = rows.clone();
+        unmarked[at] = before[at].clone();
+        assert_eq!(unmarked, before);
+        // Its cells are the gutter's: left out of a copy.
+        let pane = st.view.panes.get(&PaneId::Transcript).unwrap();
+        let y = pane.area.y + u16::try_from(at).unwrap();
+        let cell = Rect::new(pane.area.x, y, 1, 1);
+        assert!(
+            pane.skip.iter().any(|r| r.intersection(cell) == cell),
+            "{:?}",
+            pane.skip
+        );
+        // Without colors: `>`.
+        st.view.colors = crate::color::Depth::None;
+        let rows = drawn_rows(&mut st);
+        assert_eq!(rows[at], "> second reply");
+        st.view.colors = crate::color::Depth::Full;
+        // A message of another thread with that seq: no marker; nothing read: none.
+        speech_polled(&mut st, reading("t-gamma", 7));
+        assert_eq!(drawn_rows(&mut st), before);
+        speech_polled(&mut st, Default::default());
+        assert_eq!(drawn_rows(&mut st), before);
+    }
+
+    /// The status bar's note of reading aloud: what reads (its place in a `/read N`), paused,
+    /// live mode on while idle; `[read]` for `🔊` without colors; nothing with no speaker.
+    #[test]
+    fn the_status_bar_says_what_is_read_aloud() {
+        use crate::speech::tests::playing;
+        use twr_core::speech::SpeechStateParams;
+        let mut st = orch_working(vec![prompt("hi")]);
+        // (A wide character's second cell draws as a space.)
+        let bar = |st: &mut AppState| draw_panes(st, 120, 30).pop().unwrap().replace("🔊 ", "🔊");
+        assert!(!bar(&mut st).contains("read"), "{}", bar(&mut st));
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                queued: 2,
+                batch: Some((2, 5)),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 reading 2/5 · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        st.view.colors = crate::color::Depth::None;
+        assert!(
+            bar(&mut st).contains("[read] reading 2/5 · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        st.view.colors = crate::color::Depth::Full;
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 reading · Ctrl-R stop"),
+            "{}",
+            bar(&mut st)
+        );
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                playing: playing("t-orch", 4),
+                paused: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("🔊 paused · /read resume"),
+            "{}",
+            bar(&mut st)
+        );
+        speech_polled(
+            &mut st,
+            SpeechStateParams {
+                live: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            bar(&mut st).contains("read aloud on (laptop)"),
+            "{}",
+            bar(&mut st)
+        );
+    }
+
     /// While the orchestrator works, the accent cursor alone waits below the last line of the
     /// conversation: on the clock's frame, out of copied text, keeping the clock ticking.
     #[test]
@@ -10378,6 +10643,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open: true,
+            final_seq: None,
         };
         let mut st = orch_working(vec![prompt("hi"), text("hello")]);
         st.view.animate = false;
@@ -10431,6 +10697,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open,
+            final_seq: None,
         };
         let epoch = std::time::Instant::now();
         for entries in [
@@ -10539,6 +10806,7 @@ mod tests {
             seq: 0,
             text: t.into(),
             open,
+            final_seq: None,
         };
         let mut st = orch_working(vec![prompt("hi"), text("Checking the threads", true)]);
         let lines = draw_panes(&mut st, 120, 30);
@@ -11120,6 +11388,33 @@ mod tests {
         assert!(last.starts_with("summaries 2 · $0.0004 "), "{last}");
     }
 
+    /// The usage line names accounts by the hub's label rule (`account.list`'s `shown` and
+    /// `native`), not by which accounts reported: the native account's one report is named
+    /// while a second account is usable, under its current name, and nothing is named once
+    /// the second one is logged out or removed. With no accounts listed (an older hub): the
+    /// old rule, nothing named for one report.
+    #[test]
+    fn usage_labels_follow_the_accounts() {
+        let mut st = with_usage(three_threads(), 22.0, 44.0);
+        let text = |st: &AppState| -> String {
+            usage_spans(st, 94, 200, chrono::Utc::now(), &chrono::Utc)
+                .unwrap()
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect()
+        };
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
+        st.accounts = crate::accounts::Accounts::from_list(&crate::accounts::tests::list(true));
+        assert_eq!(text(&st), "C:personal 78%/56% | G 58%");
+        st.accounts = crate::accounts::Accounts::from_list(&crate::accounts::tests::list(false));
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
+        let mut l = crate::accounts::tests::list(true);
+        l["runtimes"]["claude-code"]["shown"] = serde_json::json!(false);
+        l["runtimes"]["claude-code"]["accounts"][1]["removed"] = serde_json::json!(true);
+        st.accounts = crate::accounts::Accounts::from_list(&l);
+        assert_eq!(text(&st), "C 78%/56% | G 58%");
+    }
+
     /// A window with 25% left or less is yellow and one with 10% or less red and bold, with
     /// its reset time in the full form; data ten minutes old is grey; a question waiting for
     /// `y` hides the usage like the hints.
@@ -11462,8 +11757,9 @@ mod tests {
     /// One section on its status: a card says its state (with its report's grade once it is
     /// done), then what is going on, nothing twice: an open item, else what it does while at
     /// work or why it failed (an activity line that starts with the state's word goes on from
-    /// it), else its last report, cut to the rows the card has. Never the activity and the
-    /// report both, never a report of an earlier turn while it works, never a `report:` label
+    /// it; waiting on background work, the report its turn yielded under it), else its last
+    /// report, cut to the rows the card has. Never the activity next to a report of an
+    /// earlier turn, never a report of an earlier turn while it works, never a `report:` label
     /// or a `›`. Who runs it is in the title. In the column
     /// (34, 40 and 48 columns), the row above a narrow conversation, the grid, and the compact
     /// layout's Threads screen (40 columns).
@@ -11477,8 +11773,11 @@ mod tests {
             ),
             (
                 "bg",
-                &["background (1 bg) · cargo test --workspace"],
-                &["Tests run", "earlier", "waiting on"],
+                &[
+                    "background (1 bg) · cargo test --workspace",
+                    "Tests run in the background.",
+                ],
+                &["earlier", "waiting on"],
             ),
             (
                 "perm",
@@ -11549,11 +11848,6 @@ mod tests {
                 st.set_focus(Some(format!("t-{name}")));
                 let lines = draw_panes(&mut st, w, 40);
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-                if *name == "bg" {
-                    // Selected, it shows the report its turn yielded with: an interim one.
-                    assert!(text.contains("Tests run in the"), "row {w}:\n{text}");
-                    continue;
-                }
                 check(&format!("row {w}"), &text, name);
             }
         }
@@ -11573,11 +11867,114 @@ mod tests {
             let lines = draw_panes(&mut st, 40, 20);
             assert!(st.compact());
             let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-            if *name == "bg" {
-                assert!(text.contains("Tests run in the"), "compact:\n{text}");
-                continue;
-            }
             check("compact", &text, name);
+        }
+    }
+
+    /// A card shows the same rows selected or not. Three cards, the first waiting on background
+    /// work after a long interim report: with nothing selected, with another card selected and
+    /// selected itself, it shows its state, what it waits on and the report under them, up to
+    /// the rows the list gives it, the last one cut with `…`. In the column (120, 160 and 200
+    /// columns), the row above a narrow conversation, the grid and the compact Threads screen.
+    #[test]
+    fn an_unselected_card_shows_its_whole_section() {
+        use crate::app::tests::control;
+        use twr_core::event::{Grade, TaskUpdated};
+        let interim = "The gates job is running: cargo deny passed, fmt passed and clippy is \
+                       in progress. The PR body is drafted in pr-body.md, with the changelog \
+                       entries and the screenshots it links. The hub will wake me when the job \
+                       ends; I will open the PR then, say how the gates went and list what is \
+                       left for the release, which is the docs pass and the tag.";
+        let three = || {
+            let mut st = AppState::new();
+            st.view.animate = false;
+            for (i, name) in ["first", "second", "third"].iter().enumerate() {
+                let mut s = ThreadScript::new(format!("t-{name}"));
+                let mut evs = vec![
+                    s.at(i as i64).created(name),
+                    s.turn_started("go"),
+                    s.git(&format!("twr/{name}"), 1),
+                ];
+                match *name {
+                    "first" => {
+                        let mut report = s.report(Some(1), Grade::Success);
+                        if let EventBody::ReportReady(p) = &mut report.body {
+                            p.summary = interim.into();
+                        }
+                        evs.extend([
+                            s.event(EventBody::TaskUpdated(TaskUpdated {
+                                task_id: "job".into(),
+                                running: true,
+                                ..Default::default()
+                            })),
+                            s.turn_ended(TurnResult::Completed),
+                            report,
+                        ]);
+                    }
+                    "third" => evs.extend([
+                        s.turn_ended(TurnResult::Completed),
+                        s.report(Some(1), Grade::Success),
+                    ]),
+                    _ => {}
+                }
+                control(&mut st, &evs);
+            }
+            st.apply_result(
+                "thread.activity",
+                &serde_json::json!({
+                    "t-first": {"activity": "waiting on background: job sync gates: running"},
+                    "t-second": {"activity": "running the invoice tests"},
+                }),
+            );
+            st
+        };
+        // The list: what the case is called, the screen's size, how the view is set up and
+        // the most rows a card gets there.
+        type Case = (&'static str, u16, u16, fn(&mut AppState), u16);
+        let compact: fn(&mut AppState) = |st| {
+            st.view.compact_width = 60;
+            st.view.compact_pane = crate::app::CompactPane::Threads;
+        };
+        let grid: fn(&mut AppState) = |st| st.view.screen = Screen::Grid;
+        let plain: fn(&mut AppState) = |_| {};
+        let cases: [Case; 6] = [
+            ("column 120", 120, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 160", 160, 45, plain, COMPACT_CARD_HEIGHT),
+            ("column 200", 200, 45, plain, COMPACT_CARD_HEIGHT),
+            ("row 90", 90, 40, plain, CARD_HEIGHT),
+            ("grid 160", 160, 40, grid, TILE_HEIGHT),
+            ("compact 40", 40, 30, compact, COMPACT_CARD_HEIGHT),
+        ];
+        for (what, w, h, setup, cap) in cases {
+            // Each from a fresh state: a card drawn taller once keeps its height a while.
+            let inside = |focus: Option<&str>| {
+                let mut st = three();
+                setup(&mut st);
+                st.set_focus(focus.map(String::from));
+                let lines = draw_panes(&mut st, w, h);
+                card_lines(&st, &lines, "t-first")
+            };
+            let none = inside(None);
+            let other = inside(Some("t-second"));
+            let own = inside(Some("t-first"));
+            let text = none.join("\n");
+            let words = none.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+            assert!(words.contains("background (1 bg)"), "{what}:\n{text}");
+            assert!(
+                words.contains("The gates job is running"),
+                "{what}:\n{text}"
+            );
+            assert_eq!(
+                none.len(),
+                usize::from(cap - 2),
+                "{what}: all its rows\n{text}"
+            );
+            assert!(
+                none.iter().any(|l| l.trim_end().ends_with('…')),
+                "{what}: cut at its last row\n{text}"
+            );
+            assert_eq!(none, other, "{what}: another card selected");
+            assert_eq!(none, own, "{what}: selected itself");
         }
     }
 
@@ -11889,7 +12286,7 @@ mod tests {
         };
         assert_eq!(name(HUB_THREAD).content, "twr");
         assert_eq!(name(HUB_THREAD).style.fg, Some(Color::Yellow));
-        assert_eq!(name("t-w").style.fg, Some(thread_color("t-w")));
+        assert_eq!(name("t-w").style.fg, Some(color_of(&st, "t-w")));
     }
 
     /// [`five_saying_things`], its texts in paragraphs: eps's report and a question of
@@ -12432,6 +12829,43 @@ mod tests {
     }
 
     /// A tile says what its thread's turns spent after the turn count.
+    /// A card and a tile say how full their thread's context is on their bottom border, once
+    /// its runtime said, and what a compaction left after it.
+    #[test]
+    fn cards_say_how_full_the_context_is() {
+        let mut st = crate::app::tests::five_threads();
+        let mut z = ThreadScript::new("t-zeta");
+        z.at(40);
+        let evs = vec![z.created("zeta"), z.turn_started("go")];
+        crate::app::tests::control(&mut st, &evs);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(!screen.contains("ctx "), "nothing said yet: {screen}");
+        let mut end = z.turn_ended(twr_core::event::TurnResult::Completed);
+        if let EventBody::TurnEnded(p) = &mut end.body {
+            p.context = Some(twr_core::event::ContextSize {
+                tokens: 342_000,
+                window: Some(1_000_000),
+            });
+        }
+        crate::app::tests::control(&mut st, &[end]);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 34%"), "{screen}");
+        let compacted = z.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "manual".into(),
+                pre_tokens: Some(342_000),
+                post_tokens: Some(20_000),
+                ..Default::default()
+            },
+        ));
+        crate::app::tests::control(&mut st, &[compacted]);
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 2%"), "{screen}");
+        st.view.screen = Screen::Grid;
+        let screen = draw(&st, 180, 40).join("\n");
+        assert!(screen.contains("ctx 2%"), "a tile too: {screen}");
+    }
+
     #[test]
     fn grid_tiles_say_what_the_turns_spent() {
         let mut st = grid_state();
@@ -13948,6 +14382,411 @@ mod tests {
         assert_eq!(text(who_fit(&st, loc, 3)), None);
     }
 
+    /// [`model_threads`] plus `job`, a claude-code worker on account `work` like `ops`, with
+    /// the accounts as `account.list` answered `list` (none: a hub older than accounts).
+    fn account_threads(list: Option<Value>) -> AppState {
+        let mut st = model_threads();
+        let mut j = ThreadScript::new("t-job");
+        j.at(60);
+        let mut created = j.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "claude-code".into();
+            p.ext = serde_json::json!({"twr": {"model": "opus", "account": "work"}})
+                .as_object()
+                .cloned();
+        }
+        let mut started = j.started("s");
+        if let EventBody::ThreadStarted(p) = &mut started.body {
+            p.ext = serde_json::json!({"claude": {"model": "claude-opus-4-1-20250805"}})
+                .as_object()
+                .cloned();
+        }
+        crate::app::tests::control(&mut st, &[created, started]);
+        if let Some(list) = list {
+            st.apply_result("account.list", &list);
+        }
+        st.set_focus(Some("t-ops".into()));
+        st
+    }
+
+    /// The title row of card `id` as last drawn.
+    fn card_title(st: &AppState, lines: &[String], id: &str) -> String {
+        pane_text(st, lines, &card(id))
+            .lines()
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// While a runtime has one account logged in, nothing names an account: cards, tiles,
+    /// the dive header and the orchestrator's header are as they were before accounts.
+    #[test]
+    fn one_logged_in_account_shows_no_labels() {
+        use crate::accounts::tests::list;
+        let mut before = account_threads(None);
+        let mut hidden = account_threads(Some(list(false)));
+        assert!(!hidden.accounts.runtimes.is_empty());
+        for (w, h) in [(160u16, 40u16), (30, 24), (60, 30)] {
+            assert_eq!(
+                draw_panes(&mut hidden, w, h),
+                draw_panes(&mut before, w, h),
+                "{w}x{h}"
+            );
+        }
+        for st in [&mut before, &mut hidden] {
+            st.view.screen = Screen::Grid;
+        }
+        for w in [180u16, 28] {
+            assert_eq!(draw(&hidden, w, 30), draw(&before, w, 30), "grid {w}");
+        }
+        for st in [&mut before, &mut hidden] {
+            st.view.screen = Screen::Stack;
+            st.dive("t-job");
+        }
+        for w in [160u16, 50, 30] {
+            assert_eq!(draw(&hidden, w, 30), draw(&before, w, 30), "dive {w}");
+        }
+        let lines = draw(&hidden, 160, 30);
+        assert!(
+            screen(&lines).contains("talking to job  claude-code · opus-4-1 · mode manual"),
+            "{}",
+            screen(&lines)
+        );
+    }
+
+    /// With two claude-code accounts logged in, claude-code threads name theirs (the native
+    /// one under its name) on cards and tiles, in the dive header and the orchestrator's;
+    /// codex, with one, names none. Narrow, the runtime goes and the account stays, then the
+    /// model goes, then the account.
+    #[test]
+    fn two_logged_in_accounts_label_cards_tiles_and_headers() {
+        use crate::accounts::tests::list;
+        let mut st = account_threads(Some(list(true)));
+        let lines = draw_panes(&mut st, 160, 40);
+        // (`ops`'s title has no room for its runtime beside its account and model.)
+        for (id, want) in [
+            ("t-ops", "personal · opus-4-1"),
+            ("t-job", "claude-code:work · opus-4-1"),
+            ("t-api", "codex · gpt-5-codex"),
+            ("t-web", "claude-code:personal · sonnet"),
+            ("t-sh", "pty · default model"),
+        ] {
+            let title = card_title(&st, &lines, id);
+            assert!(title.contains(&format!(" {want} ")), "{title}");
+            if id == "t-ops" {
+                assert!(!title.contains("claude-code"), "{title}");
+            }
+        }
+        let s = screen(&lines);
+        assert!(
+            s.contains("ORCHESTRATOR  claude-code:personal · claude-opus-4-1-20250805"),
+            "{s}"
+        );
+        // Narrow cards: the account without the runtime, then without the model.
+        st.set_focus(Some("t-job".into()));
+        let lines = draw(&st, 40, 24);
+        assert_eq!(
+            lines[0],
+            "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
+            "{}",
+            screen(&lines)
+        );
+        st.set_focus(Some("t-ops".into()));
+        let lines = draw(&st, 30, 24);
+        assert_eq!(
+            lines[0],
+            "┏ ops ━━━━ personal ━ manual ┓",
+            "{}",
+            screen(&lines)
+        );
+        // Tiles (too narrow for the runtime beside the account).
+        st.view.screen = Screen::Grid;
+        let s = screen(&draw(&st, 180, 30));
+        assert!(s.contains(" work · opus-4-1 "), "{s}");
+        assert!(s.contains(" personal · opus-4-1 "), "{s}");
+        assert!(s.contains(" personal · sonnet "), "{s}");
+        assert!(s.contains(" codex · gpt-5-codex "), "{s}");
+        // The dive header.
+        st.view.screen = Screen::Stack;
+        st.dive("t-job");
+        assert_eq!(
+            main_title(&st, 160),
+            (
+                "talking to job".into(),
+                "claude-code:work · opus-4-1 · mode manual · Esc returns to the orchestrator"
+                    .into()
+            )
+        );
+        st.back();
+        // Before an orchestrator exists: the one the hub would start, on its account.
+        let mut fresh = AppState::new();
+        fresh.apply_result("account.list", &list(true));
+        fresh.view.orch_default = Some(("claude-code".into(), Some("opus".into())));
+        fresh.view.orch_default_account = Some("work".into());
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code:work · opus · starts with your first message"
+        );
+        fresh.view.orch_default = Some(("claude-code:work".into(), None));
+        fresh.view.orch_default_account = None;
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code:work · default model · starts with your first message"
+        );
+        fresh.apply_result("account.list", &list(false));
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code · default model · starts with your first message",
+            "a configured account is labelled only while the runtime shows labels"
+        );
+        fresh.view.orch_default = Some(("claude-code".into(), None));
+        fresh.view.orch_default_account = Some("personal".into());
+        assert_eq!(
+            main_title(&fresh, 120).1,
+            "claude-code · default model · starts with your first message"
+        );
+    }
+
+    /// Labels follow the accounts: a second account's login (`account.status`) asks for the
+    /// accounts again (one call at a time; an event meanwhile asks once more after it), and
+    /// its answer labels the cards; a logout takes them away; a thread on a removed account
+    /// says so whatever the rule. The replay's events ask nothing (the answer asked for on
+    /// connecting has them), nor does usage.
+    #[test]
+    fn labels_follow_logins_logouts_and_removals() {
+        use crate::accounts::tests::list;
+        use twr_core::event::{AccountStatus, AccountUsage};
+        let mut st = account_threads(Some(list(false)));
+        let title = |st: &mut AppState, id: &str| {
+            let lines = draw_panes(st, 160, 40);
+            card_title(st, &lines, id)
+        };
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let status = |hub: &mut ThreadScript, login| {
+            hub.event(EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                login,
+                ..Default::default()
+            }))
+        };
+        let usage = hub.event(EventBody::AccountUsage(AccountUsage::default()));
+        crate::app::tests::control(&mut st, &[usage]);
+        assert!(!st.send_accounts(), "usage changes no account");
+        let login = status(&mut hub, twr_core::account::Login::LoggedIn);
+        crate::app::tests::control(&mut st, std::slice::from_ref(&login));
+        assert!(st.send_accounts());
+        assert!(!st.send_accounts(), "one at a time");
+        crate::app::tests::control(&mut st, &[login]);
+        assert!(!st.send_accounts(), "one at a time");
+        st.apply_result("account.list", &list(true));
+        assert!(st.send_accounts(), "the event meanwhile asks again");
+        st.apply_result("account.list", &list(true));
+        assert!(!st.send_accounts());
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert!(title(&mut st, "t-ops").contains(" personal · opus-4-1 "));
+        // An older hub's answer (null) keeps what was known; a failure keeps it too, and is
+        // asked for again (`a_failed_account_list_is_asked_for_again_with_a_backoff`).
+        let logout = status(&mut hub, twr_core::account::Login::LoggedOut);
+        crate::app::tests::control(&mut st, &[logout]);
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &Value::Null);
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &list(false));
+        assert!(title(&mut st, "t-job").contains(" claude-code · opus-4-1 "));
+        // Removed: `job` names its account, `ops` nothing.
+        let mut removed = list(false);
+        removed["runtimes"]["claude-code"]["accounts"][1]["removed"] = true.into();
+        st.apply_result("account.list", &removed);
+        let job = title(&mut st, "t-job");
+        assert!(job.contains(" work (removed) · opus-4-1 "), "{job}");
+        assert!(title(&mut st, "t-ops").contains(" claude-code · opus-4-1 "));
+        // The replay asks nothing.
+        let mut st = account_threads(None);
+        st.begin_catch_up(st.last_gseq + 5);
+        let again = status(&mut hub, twr_core::account::Login::LoggedIn);
+        crate::app::tests::control(&mut st, &[again]);
+        assert!(!st.send_accounts());
+    }
+
+    /// A failed `account.list` (not an older hub's unknown method) is asked for again after
+    /// 5s, 30s, then every 60s, keeping what was known meanwhile, until one answers: the
+    /// labels recover without an `account.*` event. The one on connecting too. An older hub's
+    /// answer (null) asks nothing again: no labels, as before.
+    #[test]
+    fn a_failed_account_list_is_asked_for_again_with_a_backoff() {
+        use crate::accounts::tests::list;
+        let failed = serde_json::json!({"failed": true});
+        let title = |st: &mut AppState, id: &str| {
+            let lines = draw_panes(st, 160, 40);
+            card_title(st, &lines, id)
+        };
+        let t0 = std::time::Instant::now();
+        let secs = |s: u64| t0 + std::time::Duration::from_secs(s);
+        // On connecting: nothing known yet, asked again 5s later.
+        let mut st = account_threads(None);
+        st.accounts_answered(&failed, t0);
+        assert_eq!(st.accounts_retry, Some(secs(5)));
+        st.accounts_retry_due(secs(4));
+        assert!(!st.send_accounts(), "not yet");
+        st.accounts_retry_due(secs(5));
+        assert!(st.send_accounts());
+        assert_eq!(st.accounts_retry, None);
+        // It fails again: 30s, then 60s, then 60s.
+        st.accounts_answered(&failed, secs(5));
+        assert_eq!(st.accounts_retry, Some(secs(35)));
+        st.accounts_retry_due(secs(35));
+        assert!(st.send_accounts());
+        st.accounts_answered(&failed, secs(35));
+        assert_eq!(st.accounts_retry, Some(secs(95)));
+        st.accounts_retry_due(secs(95));
+        assert!(st.send_accounts());
+        st.accounts_answered(&failed, secs(95));
+        assert_eq!(st.accounts_retry, Some(secs(155)));
+        // An `account.*` event's call meanwhile is the retry.
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        assert_eq!(st.accounts_retry, None);
+        // Answered: the labels are back, and nothing waits.
+        st.accounts_answered(&list(true), secs(100));
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert_eq!((st.accounts_retry, st.accounts_failures), (None, 0));
+        // A later failure keeps the labels and starts the backoff over (through
+        // `apply_result`, as the calls' answers arrive).
+        st.accounts_due = true;
+        assert!(st.send_accounts());
+        st.apply_result("account.list", &failed);
+        assert!(title(&mut st, "t-job").contains(" claude-code:work · opus-4-1 "));
+        assert_eq!(st.accounts_failures, 1);
+        let at = st.accounts_retry.expect("a retry");
+        assert!(at <= std::time::Instant::now() + std::time::Duration::from_secs(5));
+        st.accounts_retry_due(at);
+        assert!(st.send_accounts());
+        // An older hub (its unknown method, null): nothing is asked again.
+        let mut old = account_threads(None);
+        old.accounts_answered(&Value::Null, t0);
+        assert_eq!(old.accounts_retry, None);
+        old.accounts_retry_due(secs(3600));
+        assert!(!old.send_accounts());
+        assert!(title(&mut old, "t-job").contains(" claude-code · opus-4-1 "));
+    }
+
+    /// Before an orchestrator exists, an `account.*` event asks for the orchestrator the hub
+    /// would start again (`orchestrator.show`) with the accounts, and the header follows its
+    /// answer: the native account renamed from `default` to `personal` no longer shows as
+    /// `default (removed)`. A failed answer keeps what was known; once an orchestrator
+    /// exists, only the accounts are asked for.
+    #[test]
+    fn the_pending_orchestrators_account_follows_account_changes() {
+        use crate::accounts::tests::list;
+        use twr_core::event::AccountStatus;
+        let mut before = list(true);
+        before["runtimes"]["claude-code"]["native"] = "default".into();
+        before["runtimes"]["claude-code"]["accounts"][0]["name"] = "default".into();
+        let mut st = AppState::new();
+        st.apply_result("account.list", &before);
+        st.view.orch_default = Some(("claude-code".into(), None));
+        st.view.orch_default_account = Some("default".into());
+        let pending = |account: &str| {
+            format!("claude-code:{account} · default model · starts with your first message")
+        };
+        assert_eq!(main_title(&st, 120).1, pending("default"));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let event = hub.event(EventBody::AccountStatus(AccountStatus {
+            runtime: "claude-code".into(),
+            account: "personal".into(),
+            ..Default::default()
+        }));
+        crate::app::tests::control(&mut st, std::slice::from_ref(&event));
+        assert_eq!(st.account_calls(), ["account.list", "orchestrator.show"]);
+        assert!(st.account_calls().is_empty(), "one at a time");
+        st.apply_result("account.list", &list(true));
+        assert_eq!(main_title(&st, 120).1, pending("default (removed)"));
+        st.apply_result(
+            "orchestrator.show",
+            &serde_json::json!({"runtime": "claude-code", "model": null, "account": "personal"}),
+        );
+        assert_eq!(main_title(&st, 120).1, pending("personal"));
+        // A failed call keeps what was known.
+        st.apply_result("orchestrator.show", &Value::Null);
+        assert_eq!(main_title(&st, 120).1, pending("personal"));
+        // A pool's choice changed: its answer names the other account.
+        crate::app::tests::control(&mut st, std::slice::from_ref(&event));
+        assert_eq!(st.account_calls(), ["account.list", "orchestrator.show"]);
+        st.apply_result("account.list", &list(true));
+        st.apply_result(
+            "orchestrator.show",
+            &serde_json::json!({"runtime": "claude-code", "model": "opus", "account": "work"}),
+        );
+        assert_eq!(
+            main_title(&st, 120).1,
+            "claude-code:work · opus · starts with your first message"
+        );
+        // With an orchestrator thread, the accounts only.
+        let mut st = account_threads(Some(list(true)));
+        assert!(st.orchestrator().is_some());
+        crate::app::tests::control(&mut st, &[event]);
+        assert_eq!(st.account_calls(), ["account.list"]);
+    }
+
+    /// On a remote box the account joins the runtime before the box token
+    /// (`codex:team@gpu`); narrow, the runtime goes first, the model next, then the account,
+    /// then the box's name is cut, never its state. The dive header keeps the account with
+    /// the token, and still colors the token's state.
+    #[test]
+    fn the_account_gives_way_after_the_model() {
+        use crate::app::tests::info_box;
+        let text = |w: Option<Vec<Span<'static>>>| w.map(|w| Line::from(w).to_string());
+        let two = serde_json::json!({"runtimes": {"codex": {"shown": true, "native": "default",
+            "accounts": [{"name": "default", "native": true, "login": "logged_in"},
+                         {"name": "team", "native": false, "login": "logged_in"}]}}});
+        let mut st = on_box("job", "gpu", info_box("gpu", "online"), |_| Vec::new());
+        st.apply_result("account.list", &two);
+        let job = st.registry.get("t-job").unwrap().clone();
+        let fit = |st: &AppState, room| text(who_fit(st, &job, room)).unwrap_or_default();
+        assert_eq!(fit(&st, 60), "codex:default@gpu · gpt-5-codex");
+        assert_eq!(fit(&st, 26), "default@gpu · gpt-5-codex");
+        assert_eq!(fit(&st, 20), "default@gpu · gpt-5…");
+        assert_eq!(fit(&st, 14), "default@gpu");
+        assert_eq!(fit(&st, 8), "@gpu");
+        assert_eq!(fit(&st, 3), "@g…");
+        let mut st = on_box("job", "gpu", info_box("gpu", "offline"), |_| Vec::new());
+        st.apply_result("account.list", &two);
+        assert_eq!(fit(&st, 40), "codex:default@gpu offline · gpt-5-codex");
+        assert_eq!(fit(&st, 22), "default@gpu offline");
+        assert_eq!(fit(&st, 16), "@gpu offline");
+        st.dive("t-job");
+        let (_, detail) = main_title(&st, 64);
+        assert_eq!(detail, "default@gpu offline · mode manual · Esc: back");
+        let band = target_fill(st.dived());
+        let (_, spans) = main_title_spans(&st, 64, band);
+        let word = spans.iter().find(|s| s.content == " offline").unwrap();
+        assert_eq!(word.style.fg, Some(Color::Red));
+        assert_eq!(spans[0].content, "default");
+        assert_eq!(spans[1].content, "@gpu");
+        // A local thread: its account and model, then the account alone.
+        let mut st = box_threads(info_box("gpu", "online"));
+        st.apply_result("account.list", &crate::accounts::tests::list(true));
+        let loc = st.registry.get("t-loc").unwrap();
+        assert_eq!(
+            text(who_fit(&st, loc, 40)).as_deref(),
+            Some("claude-code:personal · sonnet")
+        );
+        assert_eq!(
+            text(who_fit(&st, loc, 20)).as_deref(),
+            Some("personal · sonnet")
+        );
+        assert_eq!(
+            text(who_fit(&st, loc, 15)).as_deref(),
+            Some("personal · son…")
+        );
+        assert_eq!(text(who_fit(&st, loc, 10)).as_deref(), Some("personal"));
+        assert_eq!(text(who_fit(&st, loc, 7)), None);
+    }
+
     /// The same, drawn: a card at its narrowest (30 columns), in the side column (34), a
     /// 30-column tile and a tile at its narrowest (40) show the box's state whole whatever the
     /// box's name, and the card keeps its height.
@@ -14385,12 +15224,15 @@ mod tests {
     #[test]
     fn the_first_run_picker_is_drawn_over_the_view() {
         let mut st = three_threads();
-        st.view.picker = crate::app::Picker::from_show(&serde_json::json!({
-            "thread": null, "retired": 0,
-            "configured": {"runtime": "codex", "explicit": false},
-            "runtimes": ["claude-code", "codex", "gemini"],
-            "installed": {"claude-code": true, "codex": false},
-        }));
+        st.view.picker = crate::app::Picker::from_show(
+            &serde_json::json!({
+                "thread": null, "retired": 0,
+                "configured": {"runtime": "codex", "explicit": false},
+                "runtimes": ["claude-code", "codex", "gemini"],
+                "installed": {"claude-code": true, "codex": false},
+            }),
+            &Default::default(),
+        );
         let lines = draw(&st, 120, 30);
         let s = screen(&lines);
         for part in [
@@ -15144,13 +15986,13 @@ mod tests {
         let x = col(&lines[row], "╔ beta ")
             .or_else(|| col(&lines[row], "╔ proj · beta "))
             .unwrap() as u16;
-        assert_eq!(buf[(x, row as u16)].fg, thread_color("t-beta"), "{s}");
+        assert_eq!(buf[(x, row as u16)].fg, color_of(&st, "t-beta"), "{s}");
         assert_eq!(
             buf[(0, 0)].bg,
             target_fill(st.dived()).bg.unwrap(),
             "the band: {s}"
         );
-        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"), "the band: {s}");
+        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
         assert_eq!(s.matches('╔').count(), 1, "only the dive's card: {s}");
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
@@ -15352,14 +16194,10 @@ mod tests {
         check(&mut st, target_fill(None), Color::Cyan, " ORCHESTRATOR  ");
         st.dive("t-beta");
         let fill = target_fill(st.dived());
-        check(
-            &mut st,
-            fill,
-            thread_color("t-beta"),
-            " ‹ back  talking to beta  ",
-        );
+        let beta = color_of(&st, "t-beta");
+        check(&mut st, fill, beta, " ‹ back  talking to beta  ");
         assert_ne!(target_fill(None), fill);
-        assert_eq!(fill.bg, Some(thread_color("t-beta")));
+        assert_eq!(fill.bg, Some(color_of(&st, "t-beta")));
         // A working thread's icon leads the band, on the terminal's own background.
         st.dive("t-gamma");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
@@ -15376,7 +16214,7 @@ mod tests {
         st.view.input.set("draft");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
         let input = st.view.panes.get(&PaneId::Input).unwrap().area;
-        assert_eq!(buf[(input.x - 1, input.y)].fg, thread_color("t-gamma"));
+        assert_eq!(buf[(input.x - 1, input.y)].fg, color_of(&st, "t-gamma"));
         assert_eq!(
             buf[(input.x + 1, input.y - 1)].bg,
             target_fill(st.dived()).bg.unwrap()
@@ -15530,6 +16368,7 @@ mod tests {
                 seq: 0,
                 text: text.into(),
                 open,
+                final_seq: None,
             },
         ]);
         st
@@ -15575,7 +16414,7 @@ mod tests {
             "{rows:#?}"
         );
         let (y3, y6) = (a.y + 3, a.y + 6);
-        let color = thread_color("t-alpha");
+        let color = color_of(&st, "t-alpha");
         assert!(THREAD_COLORS.contains(&color));
         assert_eq!(buf[(a.x, y3)].fg, color);
         assert_eq!(buf[(a.x + 3, y3)].fg, color, "the name");
@@ -15607,18 +16446,59 @@ mod tests {
         let rows = transcript_rows(&st, &lines);
         assert!(rows[3].starts_with("╭─ alpha-v2 · running ─"), "{rows:#?}");
         let a = st.view.panes.get(&PaneId::Transcript).unwrap().area;
-        assert_eq!(buf[(a.x, a.y + 3)].fg, thread_color("t-alpha"));
+        assert_eq!(buf[(a.x, a.y + 3)].fg, color_of(&st, "t-alpha"));
     }
 
-    /// Every thread has a color of its own palette, the same every time; the palette has
-    /// none of the orchestrator's cyan, a dive's magenta or the working cursor's orange.
+    /// Thread `id`'s color in `st` ([`thread_color`] of its view, a deleted one's too).
+    fn color_of(st: &AppState, id: &str) -> Color {
+        thread_color(st.thread_named(id).unwrap_or_else(|| panic!("{id}")))
+    }
+
+    /// Threads take the palette's colors in the order they were made, each its own; a deleted
+    /// thread's color goes to the next new thread, and no other card changes color. The
+    /// palette has none of the orchestrator's cyan, a dive's magenta or the working cursor's
+    /// orange.
     #[test]
-    fn thread_colors_are_stable_and_apart_from_the_other_accents() {
-        assert_eq!(thread_color("t-alpha"), thread_color("t-alpha"));
-        let used: HashSet<String> = (0..64)
-            .map(|i| format!("{:?}", thread_color(&format!("t-{i}"))))
-            .collect();
-        assert!(used.len() > 3, "{used:?}");
+    fn threads_have_colors_of_their_own_that_stay() {
+        let mut st = three_threads();
+        let ids = ["t-alpha", "t-beta", "t-gamma"];
+        assert_eq!(
+            ids.map(|id| color_of(&st, id)),
+            [0, 1, 2].map(|i| THREAD_COLORS[i])
+        );
+        let corner = |st: &mut AppState, id: &str| {
+            let buf = crate::app::tests::draw(st, 160, 40);
+            card_corners(st, &buf)
+                .into_iter()
+                .find(|(i, ..)| i == id)
+                .map(|(_, corner, _)| corner.fg)
+        };
+        st.set_focus(None);
+        let before = ids.map(|id| corner(&mut st, id));
+        assert_eq!(before, [0, 1, 2].map(|i| Some(THREAD_COLORS[i])));
+        let mut b = ThreadScript::new("t-beta");
+        let mut d = ThreadScript::new("t-delta");
+        crate::app::tests::control(
+            &mut st,
+            &[
+                b.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: "beta".into(),
+                    ..Default::default()
+                })),
+                d.created("delta"),
+            ],
+        );
+        let delta = color_of(&st, "t-delta");
+        assert_eq!(
+            delta,
+            THREAD_COLORS[usize::from(twr_core::palette::allocate([0, 2]))]
+        );
+        assert!(delta != THREAD_COLORS[0] && delta != THREAD_COLORS[2]);
+        assert_eq!(corner(&mut st, "t-alpha"), before[0]);
+        assert_eq!(corner(&mut st, "t-gamma"), before[2]);
+        assert_eq!(corner(&mut st, "t-delta"), Some(delta));
+        // The deleted thread keeps its color where it is still named.
+        assert_eq!(color_of(&st, "t-beta"), THREAD_COLORS[1]);
         for c in [
             Color::Indexed(80),
             Color::Indexed(176),
@@ -15664,7 +16544,7 @@ mod tests {
             let cards = card_corners(st, &buf);
             assert!(!cards.is_empty(), "{what}: {s}");
             for (id, corner, name) in cards {
-                let color = thread_color(&id);
+                let color = color_of(st, &id);
                 let (shape, fg) = match look(st, &id) {
                     Look::Selected => ("┏", Color::Yellow),
                     Look::Target => ("╔", color),
@@ -15698,7 +16578,7 @@ mod tests {
         // The three threads have colors apart: told apart by them.
         let colors: HashSet<String> = ["t-alpha", "t-beta", "t-gamma"]
             .iter()
-            .map(|id| format!("{:?}", thread_color(id)))
+            .map(|id| format!("{:?}", color_of(&st, id)))
             .collect();
         assert_eq!(colors.len(), 3);
     }
@@ -15717,7 +16597,7 @@ mod tests {
         let buf = crate::app::tests::draw(&mut st, 160, 40);
         let cards = card_corners(&st, &buf);
         let (_, corner, name) = cards.iter().find(|(id, ..)| id == "t-alpha").unwrap();
-        assert_eq!(corner.fg, thread_color("t-alpha"));
+        assert_eq!(corner.fg, color_of(&st, "t-alpha"));
         assert!(corner.modifier.contains(Modifier::DIM));
         assert!(name.modifier.contains(Modifier::DIM | Modifier::BOLD));
         let (_, corner, _) = cards.iter().find(|(id, ..)| id == "t-beta").unwrap();
@@ -15733,7 +16613,7 @@ mod tests {
         for (id, line) in rows {
             let name = &line.spans[0];
             assert_eq!(name.content, st.registry.get(&id).unwrap().name);
-            assert_eq!(name.style.fg, Some(thread_color(&id)), "{id}");
+            assert_eq!(name.style.fg, Some(color_of(&st, &id)), "{id}");
         }
     }
 
@@ -15761,7 +16641,7 @@ mod tests {
             .flat_map(|r| r.0.spans.iter())
             .find(|s| s.content == "alpha")
             .unwrap();
-        assert_eq!(span.style.fg, Some(thread_color("t-alpha")));
+        assert_eq!(span.style.fg, Some(color_of(&st, "t-alpha")));
         assert!(span.style.add_modifier.contains(Modifier::BOLD));
     }
 
@@ -15804,9 +16684,9 @@ mod tests {
                 .collect()
         };
         let (a, b, g) = (
-            ("alpha".to_string(), thread_color("t-alpha")),
-            ("beta".to_string(), thread_color("t-beta")),
-            ("gamma".to_string(), thread_color("t-gamma")),
+            ("alpha".to_string(), color_of(&st, "t-alpha")),
+            ("beta".to_string(), color_of(&st, "t-beta")),
+            ("gamma".to_string(), color_of(&st, "t-gamma")),
         );
         for (text, about, want) in [
             (
@@ -15889,7 +16769,7 @@ mod tests {
         let mut st = three_threads();
         for id in ["t-alpha", "t-beta", "t-gamma"] {
             st.dive(id);
-            let color = thread_color(id);
+            let color = color_of(&st, id);
             let buf = crate::app::tests::draw(&mut st, 120, 40);
             assert_eq!(buf[(0, 0)].bg, color, "{id}");
             let back = (0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
@@ -15961,7 +16841,7 @@ mod tests {
         // Full color draws as it always did.
         st.view.colors = crate::color::Depth::Full;
         let buf = crate::app::tests::draw(&mut st, 160, 40);
-        assert_eq!(buf[(0, 0)].bg, thread_color("t-beta"));
+        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"));
         // The compact tab bar without colors: the current tab alone is reversed.
         let mut st = three_threads();
         st.view.compact_width = 60;
@@ -16280,6 +17160,7 @@ mod tests {
                 seq: 0,
                 text: "## Plan\n- **one** step".into(),
                 open: false,
+                final_seq: None,
             },
             tool("c1", "Bash", "ls"),
             tool("c2", "Bash", "cat x"),
@@ -16288,6 +17169,7 @@ mod tests {
                 seq: 0,
                 text: "done".into(),
                 open: false,
+                final_seq: None,
             },
             Entry::TurnEnd {
                 result: TurnResult::Completed,
@@ -16448,6 +17330,7 @@ mod tests {
                     seq: 0,
                     text: "between".into(),
                     open: false,
+                    final_seq: None,
                 });
             }
             let mut e = update("api needs permission: x", id, Some("answered: allow"));
@@ -16524,6 +17407,7 @@ mod tests {
                 seq: 0,
                 text: quote.clone(),
                 open: false,
+                final_seq: None,
             }],
             36,
             &Collapse::default(),
@@ -16702,6 +17586,7 @@ mod tests {
                 seq: 0,
                 text: format!("<thread name=\"日本語の長い名前alpha\">\n{body}\n</thread>"),
                 open: false,
+                final_seq: None,
             }];
             for w in 8..=40u16 {
                 let rows = transcript_view(&entries, w, &Collapse::default(), &threads);
@@ -16749,6 +17634,7 @@ mod tests {
                 seq: 0,
                 text: "<thread name=\"alpha\">\nalpha is still at it".into(),
                 open: true,
+                final_seq: None,
             },
         ]);
         let rows = drawn_rows(&mut st);
@@ -16764,6 +17650,7 @@ mod tests {
             seq: 0,
             text: "<thread name=\"alpha\">\n".into(),
             open: true,
+            final_seq: None,
         };
         let rows = drawn_rows(&mut st);
         assert!(rows[2].starts_with("╭─ alpha"), "{rows:#?}");
@@ -16776,6 +17663,7 @@ mod tests {
             seq: 0,
             text: "<thread name=\"alpha\">\nalpha is done".into(),
             open: false,
+            final_seq: None,
         };
         let rows = drawn_rows(&mut st);
         assert!(rows[4].starts_with('╰'), "{rows:#?}");
@@ -16867,6 +17755,7 @@ mod tests {
                 seq: 21,
                 text: long_body(100),
                 open: false,
+                final_seq: None,
             },
             Entry::TurnStart {
                 seq: 22,
@@ -16935,6 +17824,7 @@ mod tests {
                     seq: 301,
                     text: format!("<thread name=\"alpha\">\n{body}"),
                     open: true,
+                    final_seq: None,
                 },
             ]);
             st.view.sidebar_hidden = true;
@@ -17189,6 +18079,7 @@ mod tests {
                 seq: 0,
                 text: "one".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c3", "send", "{}", Some("t-alpha")),
             twr_call("c4", "set_mode", "{}", Some("beta")),
@@ -17196,6 +18087,7 @@ mod tests {
                 seq: 0,
                 text: "two".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c5", "list_threads", "{}", None),
             twr_call("c6", "send", "{}", Some("alpha")),
@@ -17203,6 +18095,7 @@ mod tests {
                 seq: 0,
                 text: "three".into(),
                 open: false,
+                final_seq: None,
             },
             twr_call("c7", "respond_attention", r#"{"answer":"allow","attn_id":"pm9"}"#, None),
             notice(2, &["- thread=gamma report turn=1 grade=success summary=\"y\"", "- thread=alpha report turn=2 grade=success summary=\"z\""]),
@@ -17240,8 +18133,8 @@ mod tests {
         );
         let y = |start: &str| all.iter().find(|(_, r)| r.starts_with(start)).unwrap().0;
         let alpha = y("  alpha");
-        assert_eq!(buf[(a.x + 2, alpha)].fg, thread_color("t-alpha"));
-        assert_eq!(buf[(a.x + 2, y("  beta"))].fg, thread_color("t-beta"));
+        assert_eq!(buf[(a.x + 2, alpha)].fg, color_of(&st, "t-alpha"));
+        assert_eq!(buf[(a.x + 2, y("  beta"))].fg, color_of(&st, "t-beta"));
         assert_eq!(buf[(a.x + 8, alpha)].fg, Color::DarkGray, "the rest is dim");
         assert_eq!(
             buf[(a.x + 2, y("  nobody"))].fg,
@@ -17319,6 +18212,7 @@ mod tests {
                     "Here:\n\n```\n{code}\n```\n\n- a list item {words}\n\n> a quote {words}"
                 ),
                 open: false,
+                final_seq: None,
             },
             Entry::Tool {
                 call_id: "c1".into(),
@@ -17331,6 +18225,7 @@ mod tests {
                 seq: 0,
                 text: format!("<thread name=\"web\">\n{words}\n</thread>\nafter"),
                 open: false,
+                final_seq: None,
             },
         ];
         let ids: Vec<u64> = (10..10 + entries.len() as u64).collect();

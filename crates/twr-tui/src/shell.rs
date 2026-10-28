@@ -392,9 +392,15 @@ impl AppState {
     /// A command's job ended (`task.updated`, not running): it is no longer this TUI's to stop.
     pub(crate) fn shell_ended(&mut self, thread: &str, job: &str) {
         self.shell_done.push_back(job.to_string());
-        if self.shell_done.len() > 32 {
+        if self.shell_done.len() > twr_core::client_state::SHELL_DONE {
             self.shell_done.pop_front();
         }
+        self.shell_gone(thread, job);
+    }
+
+    /// [`AppState::shell_ended`] but for remembering the end ([`AppState::shell_done`]): for a
+    /// command whose end a snapshot of the control stream holds already.
+    pub(crate) fn shell_gone(&mut self, thread: &str, job: &str) {
         let Some(i) = self
             .shell_jobs
             .iter()

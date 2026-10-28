@@ -22,8 +22,9 @@ impl Hub {
     /// `threads` counts the worker threads (every thread whose role is not `orchestrator`,
     /// as `thread.list` lists them), `running` those of them running or in the background,
     /// `permissions` and `questions` the open items of those reasons (every one, as
-    /// `attention.list {all: true}`). `active`: the current orchestrator or a thread that is
-    /// not parked is at work ([`working`]). `orchestrator` is null without one, else `{id,
+    /// `attention.list {all: true}`). `active`: the current orchestrator or a worker that is
+    /// not parked is at work ([`working`]); retired orchestrators count as no work.
+    /// `orchestrator` is null without one, else `{id,
     /// name, status, preview, preview_seq}`: `preview` is its latest final `agent.text` of any
     /// turn as stored (a capped one's preview, no blob read), cut to
     /// [`GLANCE_PREVIEW_CHARS`] characters with nothing added, and `preview_seq` that event's
@@ -46,7 +47,7 @@ impl Hub {
         let of = |reason: AttentionReason| items.iter().filter(|i| i.reason == reason).count();
         let active = views
             .iter()
-            .any(|v| (orch == Some(v.id.as_str()) || !v.parked) && working(v));
+            .any(|v| !v.retired && (orch == Some(v.id.as_str()) || !v.parked) && working(v));
         let orchestrator = match orch.and_then(|id| core.registry.get(id)) {
             None => Value::Null,
             Some(v) => {
@@ -342,6 +343,33 @@ mod tests {
             (g["active"].clone(), g["running"].clone()),
             (json!(false), json!(0))
         );
+        // An orchestrator's hub job survives parking, just as it does in the live TUI.
+        append(&hub, "o1", None, Source::Hub, task("job:o1", true, None));
+        append(
+            &hub,
+            "o1",
+            None,
+            Source::Hub,
+            EventBody::ThreadParked(SessionPayload::default()),
+        );
+        assert_eq!(active(&hub), true);
+        append(
+            &hub,
+            "o1",
+            None,
+            Source::Hub,
+            EventBody::ThreadResumed(SessionPayload::default()),
+        );
+        // Replacing it retires its activity, even if its old job still exists.
+        created(&hub, "o2", "orchestrator", json!({"role": "orchestrator"}));
+        assert!(hub
+            .inner
+            .core()
+            .registry
+            .get("o1")
+            .unwrap()
+            .own_background());
+        assert_eq!(active(&hub), false);
         hub.shutdown().await;
     }
 

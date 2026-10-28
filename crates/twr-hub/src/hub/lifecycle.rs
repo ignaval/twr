@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::Context;
 use chrono::Utc;
 use rusqlite::Connection;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -16,11 +17,11 @@ use twr_core::proto::RpcError;
 use twr_core::reduce::{AttentionStack, Registry};
 use twr_decisions::Ladder;
 
-use super::append::hydrated_from_store;
+use super::append::{hydrated_from_store, hydrated_whole};
 use super::closing::release_live;
 use super::{
-    after, boxes, context, git, hook, orch, runtime_spec, stall, trash, Core, Exit, Hub,
-    HubOptions, HubState, Inner, GIT_TICK, LOCAL_BOX, LOCK_FILE,
+    after, boxes, checkpoint, coalesce, context, git, hook, orch, runtime_spec, stall, trash, Core,
+    Exit, Hub, HubOptions, HubState, Inner, GIT_TICK, LOCAL_BOX, LOCK_FILE,
 };
 use crate::host::{LocalHost, StaleProcess, ThreadHost};
 use crate::store::{self, Store};
@@ -46,6 +47,8 @@ impl Hub {
         checked_config(&mut opts.config)?;
         // MCP config files of orchestrators that outlived a previous hub (dead tokens).
         orch::remove_stale_mcp_files(&data_dir_of(&opts.db_path));
+        // A change to the orchestrator's memory the previous hub did not finish (`hub::memory`).
+        super::memory::recover(&super::memory::dir_of(&opts.db_path));
         // The hook's policy recalls the replay (a report it already knew of, rewritten later,
         // only revises it), and is fed from the commit path from here on: the past is no news.
         let (feed, hook_rx) = hook::HookFeed::new(&opts.config.notify).unzip();
@@ -61,7 +64,29 @@ impl Hub {
                 super::limits::Limits::prepare(&threads, &run, &ctl)
             })
         };
-        let (mut core, reader) = Core::replay_with(&opts.db_path, feed)?;
+        // Accounts: the config's, then the log's records folded over them, then checked
+        // (`hub::accounts`): a config account in a runtime's own directory, or two config
+        // accounts in one, stop the hub like a config error; a recorded account that collides
+        // is a warning, and refused at use until `twr account remove` (or the environment)
+        // fixes it.
+        let accounts_root = opts
+            .accounts_root
+            .clone()
+            .unwrap_or_else(|| data_dir_of(&opts.db_path).join("accounts"));
+        let native_dir = opts
+            .native_dir
+            .clone()
+            .unwrap_or_else(super::accounts::own_native_dir);
+        let view =
+            twr_core::account::AccountsView::new(&opts.config).with_default_root(&accounts_root);
+        let (mut core, reader) = Core::replay_accounts(&opts.db_path, feed, view)?;
+        let account_warnings =
+            super::accounts::check_at_start(&core.accounts, &opts.config, &native_dir)?;
+        core.account_native_dir = Arc::clone(&native_dir);
+        core.account_native_var = opts
+            .native_var
+            .clone()
+            .unwrap_or_else(super::accounts::own_native_var);
         core.wake.after = chrono::Duration::from_std(
             opts.wake_after
                 .unwrap_or(Duration::from_secs(opts.config.wake_after_secs)),
@@ -76,7 +101,8 @@ impl Hub {
         let stall_secs = opts.config.stall_after_secs;
         let limits = limits.await.unwrap_or_default();
         twr_core::trace::mark("hub: limits prepared");
-        let warnings = opts.config.warnings(opts.config_file.as_deref());
+        let mut warnings = opts.config.warnings(opts.config_file.as_deref());
+        warnings.extend(account_warnings);
         for w in &warnings {
             tracing::warn!("{w}");
         }
@@ -85,11 +111,14 @@ impl Hub {
             .job_slots_dir
             .clone()
             .unwrap_or_else(|| data_dir_of(&opts.db_path).join("job-slots"));
+        let compact_rows = Arc::new(Mutex::new(std::mem::take(&mut core.compact_rows)));
         let inner = Arc::new(Inner {
             core: Mutex::new(core),
             reader: Mutex::new(reader),
+            compact_rows,
             control_tx,
             events_tx,
+            snapshot_max: opts.snapshot_max,
             live_count: watch::Sender::new(0),
             state: watch::Sender::new(HubState::Running),
             boxes: std::sync::RwLock::new(boxes::Boxes::with_local(local)),
@@ -99,10 +128,16 @@ impl Hub {
             box_switch: opts.box_switch,
             box_files_lock: tokio::sync::Mutex::new(()),
             box_files_read_hook: opts.box_files_read_hook,
+            pins_lookup_hook: opts.pins_lookup_hook,
             socket_removed_hook: opts.socket_removed_hook,
             box_dialer: opts.box_dialer,
             local_agents: Arc::new(super::box_agents::LocalAgents::new(opts.agent_probe)),
             agents_poll: opts.agents_poll,
+            accounts: super::accounts::AccountsRt::new(
+                opts.account_probe,
+                accounts_root,
+                native_dir,
+            ),
             worktree_namespace: opts.worktree_namespace,
             listening: Default::default(),
             box_key: Default::default(),
@@ -141,12 +176,29 @@ impl Hub {
             }),
             suggestions: Mutex::default(),
             summaries: Mutex::default(),
+            speech: Mutex::default(),
             claude_policy: opts.claude_policy,
             notify_tx,
             stall_after: opts.stall_after.unwrap_or(Duration::from_secs(stall_secs)),
             git_tick: opts.git_tick.unwrap_or(GIT_TICK),
             trash_tick: opts.trash_tick.unwrap_or(trash::TRASH_TICK),
             disk_tick: opts.disk_tick.unwrap_or(super::disk::DISK_TICK),
+            checkpoint_tick: opts.checkpoint_tick.unwrap_or(checkpoint::CHECKPOINT_TICK),
+            checkpoint_events: opts
+                .checkpoint_events
+                .unwrap_or(checkpoint::CHECKPOINT_EVERY),
+            prune_tick: opts.prune_tick.unwrap_or(super::prune::PRUNE_TICK),
+            idle_compaction_tick: opts
+                .idle_compaction_tick
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_TICK),
+            idle_compaction_lead: opts
+                .idle_compaction_lead
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_LEAD),
+            idle_compaction_margin: opts
+                .idle_compaction_margin
+                .unwrap_or(super::idle_compact::IDLE_COMPACTION_MARGIN),
+            maintenance: Mutex::new(()),
+            archive_reader: Mutex::new(None),
             job_slots_dir,
             test_user_token: opts
                 .test_user_token
@@ -190,6 +242,9 @@ impl Hub {
         }
         twr_core::trace::mark("hub: lost jobs reaped");
         spawn_tasks(&inner, notify_rx);
+        // (A hub started from a checkpoint does not read the compacted backlog's rows now: a
+        // client gets the state at the head (`control.subscribe` with `snapshot`), and only an
+        // older one, which asks for the compacted backlog, has them read, then.)
         if let Some(rx) = hook_rx {
             let task = tokio::spawn(hook::hook_task(
                 Arc::downgrade(&inner),
@@ -226,6 +281,21 @@ impl Hub {
         for (rbox, ssh) in registered {
             boxes::start_box(&hub.inner, rbox, ssh);
         }
+        // Compactions before a prompt cache expires, only when the user configured them: once
+        // the previous hub's runtimes are killed and their threads closed (a compaction resumes
+        // a session; one started earlier would run beside its old process and be closed by
+        // the recovery).
+        if !hub.inner.idle_compaction_tick.is_zero()
+            && hub.inner.config.threads.idle_compaction
+                == twr_core::config::IdleCompaction::BeforeExpiry
+        {
+            tokio::spawn(super::idle_compact::idle_compaction_ticker(
+                Arc::downgrade(&hub.inner),
+                hub.inner.idle_compaction_tick,
+            ));
+        }
+        // The accounts' login checks, in the background from now on (`hub::accounts`).
+        super::accounts::start_probes(&hub.inner);
         twr_core::trace::mark("hub: open");
         Ok(hub)
     }
@@ -477,17 +547,117 @@ impl Core {
     /// reducers, and the `thread.stop`s still waiting for their runtime's exit. Returns it with
     /// a reader connection. With the notification hook's feed ([`hook::HookFeed`]), its
     /// policy recalls each replayed control event as it is folded, and gives nothing for them.
+    /// The log's account events fold over no declaration ([`Core::replay_accounts`] gives
+    /// the config's).
+    ///
+    /// It starts from the newest checkpoint this build can use (`hub::checkpoint`) and folds
+    /// only the events after it; without one, from nothing. Either way the state is the one a
+    /// fold of the whole log builds.
+    #[cfg(test)]
     pub(super) fn replay_with(
         db_path: &Path,
         hook: Option<hook::HookFeed>,
     ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, true, Default::default())
+    }
+
+    /// [`Core::replay_with`] whose account events fold over `accounts` (the config's
+    /// declarations, `hub::accounts`): what a hub's start replays.
+    pub(super) fn replay_accounts(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        accounts: twr_core::account::AccountsView,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, true, accounts)
+    }
+
+    /// [`Core::replay_with`] that folds the whole log, whatever checkpoints it has.
+    #[cfg(test)]
+    pub(super) fn replay_full(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, false, Default::default())
+    }
+
+    /// [`Core::replay_full`] whose account events fold over `accounts`.
+    #[cfg(test)]
+    pub(super) fn replay_full_accounts(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        accounts: twr_core::account::AccountsView,
+    ) -> anyhow::Result<(Core, Connection)> {
+        Self::replay_from(db_path, hook, false, accounts)
+    }
+
+    fn replay_from(
+        db_path: &Path,
+        hook: Option<hook::HookFeed>,
+        checkpoints: bool,
+        accounts: twr_core::account::AccountsView,
+    ) -> anyhow::Result<(Core, Connection)> {
         let store = Store::open(db_path)?;
         twr_core::trace::mark("hub: store opened");
         let reader = store::connect(db_path)?;
-        let events = store.load_all_with_gseq()?;
+        let mut refused = Vec::new();
+        let (mut core, after) = match checkpoints {
+            true => checkpoint::start(store, hook, &mut refused)?,
+            false => (Core::empty(store, hook)?, None),
+        };
+        // The accounts: the config's declarations, with the account events a checkpoint
+        // folded (none without one) folded over them again, as a whole replay folds them
+        // (`hub::checkpoint`: a checkpoint keeps the events, never what config made of them).
+        core.accounts = accounts;
+        for (_, ev) in &core.account_events {
+            core.accounts.apply(ev);
+        }
+        let events = store::load_with_gseq(core.store.conn(), after.as_ref().map(|c| c.row))?;
         twr_core::trace::mark_with(|| format!("hub: {} events loaded", events.len()));
+        let gseq = core.store.control_head()?;
+        // The compacted backlog's rows, when every event is here (`hub::subscribe`); after a
+        // checkpoint the first compacted subscription reads them.
+        if after.is_none() {
+            let rows = events
+                .iter()
+                .filter_map(|(ev, g)| g.map(|g| twr_core::compact::Row::of(g, ev)))
+                .collect();
+            core.compact_rows = super::subscribe::CompactRows::new(rows, gseq);
+        }
+        let (hydrating, folding) = core.fold_events(&events);
+        twr_core::trace::mark_with(|| {
+            format!(
+                "hub: log folded (hydration {}ms, reducers {}ms)",
+                hydrating.as_millis(),
+                folding.as_millis()
+            )
+        });
+        core.replayed = checkpoint::Replayed {
+            checkpoint: after.map(|c| c.id),
+            events: events.len(),
+            refused,
+        };
+        core.gseq = gseq;
+        drop(events);
+        // Account data recorded before the store raised the schema version with it (the
+        // checkpoint's events count too): raise it now, so a twr before accounts refuses this
+        // database (`crate::store`).
+        if core.account_data {
+            core.store.fence_accounts()?;
+        }
+        // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).
+        // (Only for threads the log has: a deleted one has none, `hub::delete`.)
+        for thread in core.store.stop_requests()? {
+            if let Some(rt) = core.rt.get_mut(&thread) {
+                rt.stop_requested = true;
+            }
+        }
+        Ok((core, reader))
+    }
+
+    /// The state of an empty log on `store`, with the notification hook's feed `hook`.
+    pub(super) fn empty(store: Store, hook: Option<hook::HookFeed>) -> anyhow::Result<Core> {
         let gseq = store.control_head()?;
-        let mut core = Core {
+        Ok(Core {
             store,
             registry: Registry::new(),
             attention: AttentionStack::new(),
@@ -502,6 +672,9 @@ impl Core {
             shutting_down: false,
             dropped_events: 0,
             sanitized_events: 0,
+            coalesced_events: 0,
+            compact_rows: Default::default(),
+            task_progress: coalesce::TaskProgress::default(),
             persist_retries: 0,
             orch: orch::OrchState::default(),
             hub_questions: HashMap::new(),
@@ -511,9 +684,16 @@ impl Core {
             jobs: Default::default(),
             hook,
             after: Default::default(),
+            idle_offers: HashMap::new(),
             card_outcomes: HashMap::new(),
             context_hashes: HashMap::new(),
             usage: Default::default(),
+            client: Default::default(),
+            accounts: Default::default(),
+            account_events: Vec::new(),
+            account_data: false,
+            account_native_dir: Arc::new(|_: &str| None),
+            account_native_var: Arc::new(|_: &str| None),
             project_contexts: HashMap::new(),
             context_files: context::FileCache::default(),
             context_roots: HashMap::new(),
@@ -533,52 +713,73 @@ impl Core {
             switching_boxes: HashSet::new(),
             draining_boxes: HashMap::new(),
             defer_ack_sync: false,
-        };
+            replayed: Default::default(),
+            memory_seen: None,
+            memory_calls: HashSet::new(),
+        })
+    }
+
+    /// Folds stored `events` (each with its control gseq) as a replay does, in order: each one
+    /// hydrated where the reducers need its whole payload, folded, and a control event
+    /// recalled by the notification hook's policy. Returns how long hydration and the reducers
+    /// took, when `TWR_TRACE_STARTUP` records steps (zero otherwise).
+    pub(super) fn fold_events(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+    ) -> (std::time::Duration, std::time::Duration) {
+        // (It fails nothing: a payload it cannot hydrate is folded as stored, and logged.)
+        let lenient = |conn: &Connection, ev: &Event| Ok(hydrated_from_store(conn, ev));
+        self.fold_events_with(events, lenient).unwrap_or_default()
+    }
+
+    /// [`Core::fold_events`] that stops at the first payload it cannot hydrate (the checkpoint
+    /// writer, `hub::checkpoint`): what is folded then is not the log's state.
+    pub(super) fn fold_events_strict(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+    ) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
+        self.fold_events_with(events, |conn, ev| {
+            hydrated_whole(conn, ev).with_context(|| format!("hydrating event {}", ev.id))
+        })
+    }
+
+    fn fold_events_with(
+        &mut self,
+        events: &[(Event, Option<u64>)],
+        hydrate: impl Fn(&Connection, &Event) -> anyhow::Result<Option<Event>>,
+    ) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
         // Reducers fold hydrated payloads: control kinds, agent text whose end the thread's
         // activity keeps (`hub::activity`; a capped one has a `text_ref`), and tool calls,
         // whose input and extras its activity line reads (a capped one keeps a preview).
         // `TWR_TRACE_STARTUP`: the time hydration and the reducers took.
         let timed = twr_core::trace::enabled();
         let (mut hydrating, mut folding) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
-        for (ev, g) in &events {
+        for (ev, g) in events {
             if let Some(g) = g {
-                core.gseq = *g;
+                self.gseq = *g;
             }
             let t0 = timed.then(std::time::Instant::now);
             let folded_whole = ev.is_control()
                 || matches!(&ev.body, EventBody::AgentText(t) if !t.extra.is_empty())
                 || matches!(&ev.body, EventBody::AgentToolCall(_));
-            let full = folded_whole
-                .then(|| hydrated_from_store(core.store.conn(), ev))
-                .flatten();
+            let full = match folded_whole {
+                true => hydrate(self.store.conn(), ev)?,
+                false => None,
+            };
             let t1 = timed.then(std::time::Instant::now);
             let ev = full.as_ref().unwrap_or(ev);
-            core.apply(ev);
+            self.account_data |= store::account_dependent(ev);
+            self.apply(ev);
             if let Some(g) = g {
-                core.recall_hook(ev, *g);
+                self.client.apply(ev, Some(*g));
+                self.recall_hook(ev, *g);
             }
             if let (Some(t0), Some(t1)) = (t0, t1) {
                 hydrating += t1 - t0;
                 folding += t1.elapsed();
             }
         }
-        twr_core::trace::mark_with(|| {
-            format!(
-                "hub: log folded (hydration {}ms, reducers {}ms)",
-                hydrating.as_millis(),
-                folding.as_millis()
-            )
-        });
-        core.gseq = gseq;
-        drop(events);
-        // `thread.stop`s whose runtime's exit is not recorded yet (`crate::store`).
-        // (Only for threads the log has: a deleted one has none, `hub::delete`.)
-        for thread in core.store.stop_requests()? {
-            if let Some(rt) = core.rt.get_mut(&thread) {
-                rt.stop_requested = true;
-            }
-        }
-        Ok((core, reader))
+        Ok((hydrating, folding))
     }
 }
 
@@ -620,6 +821,19 @@ fn spawn_tasks(inner: &Arc<Inner>, notify_rx: mpsc::UnboundedReceiver<()>) {
         tokio::spawn(super::disk::disk_ticker(
             Arc::downgrade(inner),
             inner.disk_tick,
+        ));
+    }
+    if !inner.checkpoint_tick.is_zero() {
+        tokio::spawn(checkpoint::checkpoint_ticker(
+            Arc::downgrade(inner),
+            inner.checkpoint_tick,
+            inner.checkpoint_events,
+        ));
+    }
+    if !inner.prune_tick.is_zero() {
+        tokio::spawn(super::prune::prune_ticker(
+            Arc::downgrade(inner),
+            inner.prune_tick,
         ));
     }
     // The hub's own agent CLIs, in the background (`hub::box_agents`).
@@ -750,22 +964,32 @@ impl Core {
         stale: Vec<Stale>,
         running_attaches: HashMap<String, store::AttachProcess>,
     ) -> anyhow::Result<()> {
+        // `TWR_TRACE_STARTUP`: each step, as start-up recovery reads the log.
+        let mark = |step: &str| twr_core::trace::mark_with(|| format!("hub: recovery: {step}"));
         for (thread, _) in intents {
             self.store.clear_spawn_intent(thread)?;
         }
         self.resolve_idle_turn_attention(inner)?;
+        mark("idle turns' attention resolved");
         // Stalled items left open behind activity by a log from before their resolution
         // was part of the activity's batch.
         self.repair_stalls(inner)?;
+        mark("stalls repaired");
+        // Usage read in a directory an account no longer has (config names another one now).
+        self.clear_moved_usage(inner)?;
         // Turns that ended before the crash but lost their report (and grade, review).
         self.recover_turn_reactions(inner)?;
+        mark("turn reactions recovered");
         self.release_crash_holds()?;
         self.close_stale_runtimes(inner, stale)?;
+        mark("stale runtimes closed");
         self.settle_attaches(inner, running_attaches)?;
         self.react_to_failures_at_open(inner)?;
+        mark("failures reacted to");
         for thread in self.store.threads_with_pending()? {
             self.try_dispatch(inner, &thread)?;
         }
+        mark("queues dispatched");
         self.autostart_orchestrator(inner);
         // Notices rebuilt from the log wait for the orchestrator like new ones.
         if std::mem::take(&mut self.orch.wake) || !self.orch.notices.is_empty() {
@@ -1051,6 +1275,82 @@ mod tests {
         let db = data.join("twr.db");
         let lock = try_lock_data_dir(&db).unwrap().unwrap();
         assert!(locks_path(&lock, &path));
+    }
+
+    /// A log with account data recorded before the store's fence (schema 9) is raised to
+    /// [`store::ACCOUNTS_SCHEMA_VERSION`] when the hub replays it; one without stays at 9. So
+    /// is one whose account data only a checkpoint the start uses folded (the events after it
+    /// have none).
+    #[test]
+    fn replay_fences_account_data_recorded_before_the_fence() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, body: EventBody| {
+            let db = dir.path().join(name);
+            let mut s = Store::open(&db).unwrap();
+            let ev = Event::new(HUB_THREAD, 1, None, Source::Hub, body);
+            s.append(&ev, true, Default::default()).unwrap();
+            // As a build before the fence left it.
+            s.conn()
+                .pragma_update(None, "user_version", store::SCHEMA_VERSION)
+                .unwrap();
+            db
+        };
+        let version = |db: &Path| -> i32 {
+            store::connect(db)
+                .unwrap()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap()
+        };
+        let accounts = write(
+            "accounts.db",
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                dir: Some("/acc/work".into()),
+                ..Default::default()
+            }),
+        );
+        let native = write(
+            "native.db",
+            EventBody::ThreadStarted(SessionPayload::default()),
+        );
+        assert_eq!(version(&accounts), store::SCHEMA_VERSION);
+        drop(Core::replay(&accounts).unwrap());
+        assert_eq!(version(&accounts), store::ACCOUNTS_SCHEMA_VERSION);
+        drop(Core::replay(&native).unwrap());
+        assert_eq!(version(&native), store::SCHEMA_VERSION);
+
+        let from_checkpoint = write(
+            "checkpoint.db",
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "codex".into(),
+                account: "team".into(),
+                ..Default::default()
+            }),
+        );
+        let notify = twr_core::config::NotifyConfig::default();
+        let w = super::super::checkpoint::write(&from_checkpoint, &notify, 1)
+            .unwrap()
+            .expect("a checkpoint");
+        {
+            let mut s = Store::open(&from_checkpoint).unwrap();
+            let ev = Event::new(
+                "t1",
+                1,
+                None,
+                Source::Hub,
+                EventBody::ThreadStarted(SessionPayload::default()),
+            );
+            s.append(&ev, true, Default::default()).unwrap();
+            s.conn()
+                .pragma_update(None, "user_version", store::SCHEMA_VERSION)
+                .unwrap();
+        }
+        let (core, _) = Core::replay(&from_checkpoint).unwrap();
+        assert_eq!(core.replayed.checkpoint, Some(w.id));
+        assert_eq!(core.replayed.events, 1);
+        drop(core);
+        assert_eq!(version(&from_checkpoint), store::ACCOUNTS_SCHEMA_VERSION);
     }
 
     #[test]

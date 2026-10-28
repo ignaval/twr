@@ -5,11 +5,11 @@
 //! adapter that hands every session to the test ([`OrchRt`]), so each test drives its turns.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use twr_adapters::fake::FakeAdapter;
 use twr_core::adapter::{
@@ -3678,6 +3678,220 @@ async fn the_orchestrators_runtime_move_goes_on_the_card() {
         _ => None,
     });
     assert_eq!(by, Some(ChangedBy::User));
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// A hook on the moves' project lookups (`HubOptions::pins_lookup_hook`): once armed, it holds
+/// the next lookup until released.
+#[derive(Clone, Default)]
+struct LookupHold {
+    #[allow(clippy::type_complexity)]
+    armed: Arc<Mutex<Option<(oneshot::Sender<String>, oneshot::Receiver<()>)>>>,
+}
+
+impl LookupHold {
+    fn hook(&self) -> twr_hub::hub::BoxFilesReadHook {
+        let hold = self.clone();
+        Arc::new(move |id: &str| {
+            let armed = hold.armed.lock().unwrap().take();
+            let id = id.to_string();
+            Box::pin(async move {
+                if let Some((held, release)) = armed {
+                    let _ = held.send(id);
+                    let _ = release.await;
+                }
+            })
+        })
+    }
+
+    /// Holds the next lookup: the receiver gets its thread once it is held, the sender
+    /// releases it.
+    fn arm(&self) -> (oneshot::Receiver<String>, oneshot::Sender<()>) {
+        let (held, on_hold) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *self.armed.lock().unwrap() = Some((held, released));
+        (on_hold, release)
+    }
+}
+
+/// The orchestrator's `thread.set_model` moves of `thread`.
+fn model_changes(hub: &Hub, thread: &str) -> usize {
+    hub.thread_events(thread, 0, 10_000)
+        .unwrap()
+        .1
+        .iter()
+        .filter(|e| matches!(e.body, EventBody::ThreadModelChanged(_)))
+        .count()
+}
+
+/// A move looks the thread's project up before the core is locked, and the orchestrator that
+/// asked may be replaced meanwhile: once the lookup is done, its call is checked again as the
+/// server admitted it, and refused (`unauthorized`) when the user reset the orchestrator
+/// during the lookup. Nothing is recorded. A move between accounts of one runtime (applied
+/// directly, no card) shows it: held and let go with the same orchestrator, it is made.
+#[tokio::test]
+async fn an_orchestrators_move_is_refused_once_it_was_replaced_during_the_lookup() {
+    let mut env = Env::new();
+    let hold = LookupHold::default();
+    let side = env.path().join("acc").join("side");
+    std::fs::create_dir_all(&side).unwrap();
+    let mut opts = env.opts(|c| {
+        c.accounts.entry("claude-code".into()).or_default().insert(
+            "side".into(),
+            twr_core::config::AccountConfig {
+                dir: Some(side.clone()),
+                ..Default::default()
+            },
+        );
+    });
+    opts.pins_lookup_hook = Some(hold.hook());
+    let hub = Hub::open(opts).await.unwrap();
+    let worker = async |name: &str| {
+        let v = hub
+            .new_thread(
+                NewThread {
+                    project: env.path().to_string_lossy().into_owned(),
+                    runtime: Some("claude-code".into()),
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+    let api = worker("api").await;
+    let web = worker("web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    // Its turn stays open: an account move needs none.
+    rt.next_turn().await;
+    let to_side = async |thread: &str| {
+        let req = twr_hub::hub::ModelRequest {
+            account: Some("side"),
+            ..Default::default()
+        };
+        hub.set_thread_model(thread, req, &Caller::Orchestrator)
+            .await
+    };
+
+    // The same orchestrator throughout: the move is made.
+    let (on_hold, release) = hold.arm();
+    let let_go = async {
+        assert_eq!(on_hold.await.unwrap(), web);
+        release.send(()).unwrap();
+    };
+    let (r, ()) = tokio::join!(to_side(&web), let_go);
+    let r = r.unwrap();
+    assert_eq!(r["account_changed"], json!(true), "{r}");
+    assert_eq!(
+        hub.thread_view(&web).unwrap().account.as_deref(),
+        Some("side")
+    );
+
+    // Reset while the move looks api's project up: refused, nothing recorded.
+    let before = hub.thread_view(&api).unwrap().account;
+    let (on_hold, release) = hold.arm();
+    let replace = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        let stopper = async {
+            let _ = timeout(WAIT, async {
+                while let Some(cmd) = rt.end.cmds.recv().await {
+                    if matches!(cmd, AdapterCmd::Stop) {
+                        rt.end.exited(Some(0), "");
+                        return;
+                    }
+                }
+            })
+            .await;
+        };
+        let user = tui();
+        let (reset, ()) = tokio::join!(hub.reset_orchestrator(&user), stopper);
+        reset.unwrap();
+        release.send(()).unwrap();
+    };
+    let (moved, ()) = tokio::join!(to_side(&api), replace);
+    let e = moved.unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{e:?}");
+    assert_eq!(
+        e.message,
+        "thread.set_model came from an orchestrator that was replaced or restarted since: it \
+         changes nothing"
+    );
+    assert_eq!(hub.thread_view(&api).unwrap().account, before);
+    assert_eq!(model_changes(&hub, &api), 0);
+    hub.shutdown().await;
+}
+
+/// The `set_mode` gate of the orchestrator's move to another runtime is the turn's the call
+/// came in: when that turn ends during the move's project lookup and the user's next message
+/// starts another, the move is refused (`relay_forbidden`), not proposed on the new turn's
+/// authority; a move the new turn asks for itself, held the same way, goes on the card.
+#[tokio::test]
+async fn an_orchestrators_move_keeps_the_gate_of_the_turn_it_came_in() {
+    let mut env = Env::new();
+    let hold = LookupHold::default();
+    let mut opts = env.opts(|_| {});
+    opts.pins_lookup_hook = Some(hold.hook());
+    let hub = Hub::open(opts).await.unwrap();
+    let api = env.worker(&hub, "api").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let r = hub
+        .say_to_orchestrator("move api to claude code", Some(seen), &tui())
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    let (_, t2) = rt.next_turn().await;
+    let to_claude = || {
+        let req = twr_hub::hub::ModelRequest {
+            runtime: Some("claude-code"),
+            ..Default::default()
+        };
+        hub.set_thread_model(&api, req, &Caller::Orchestrator)
+    };
+
+    // Turn 2 ends while the move looks api's project up, and the user's next message starts
+    // turn 3.
+    let (on_hold, release) = hold.arm();
+    let next = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        rt.end_turn(t2, "Done.");
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator("move api to claude code", Some(seen), &tui())
+            .unwrap();
+        assert_eq!(r["action"], "delegate", "{r}");
+        let (_, t3) = rt.next_turn().await;
+        release.send(()).unwrap();
+        t3
+    };
+    let (moved, t3) = tokio::join!(to_claude(), next);
+    assert!(t3 > t2);
+    let e = moved.unwrap_err();
+    assert_eq!(e.code, codes::RELAY_FORBIDDEN, "{e:?}");
+    assert_eq!(
+        e.message,
+        "the turn this call came in has ended: it cannot move api to another runtime; ask the \
+         user"
+    );
+    assert_eq!(hub.thread_view(&api).unwrap().runtime, "fake");
+    assert_eq!(model_changes(&hub, &api), 0);
+
+    // Turn 3's own move, held the same way: on the card.
+    let (on_hold, release) = hold.arm();
+    let let_go = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        release.send(()).unwrap();
+    };
+    let (r, ()) = tokio::join!(to_claude(), let_go);
+    let r = r.unwrap();
+    assert_eq!(r["status"], "needs_confirmation", "{r}");
+    assert_eq!(hub.thread_view(&api).unwrap().runtime, "fake");
     drop(rt);
     hub.shutdown().await;
 }

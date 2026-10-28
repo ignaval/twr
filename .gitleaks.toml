@@ -45,3 +45,11 @@ condition = "AND"
 paths = ['''^crates/twr-hub/tests/summary\.rs$''']
 regexTarget = "match"
 regexes = ['''^curl -H 'Authorization: SHELL-SECRET'$''']
+
+# Anthropic API message ids (msg_...) in the recorded Claude Code compaction fixtures: ids, not keys.
+[[allowlists]]
+description = "Claude fixture API message ids"
+condition = "AND"
+paths = ['''^crates/twr-adapters/tests/fixtures/claude/compact_[a-z_]+\.both\.jsonl$''']
+regexTarget = "match"
+regexes = ['''^api_message_id":"msg_[0-9A-Za-z]+"$''']

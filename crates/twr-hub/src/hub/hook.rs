@@ -46,7 +46,8 @@ const STDERR_MAX: usize = 4096;
 
 /// What feeds the hook from the commit path: the policy and the dispatcher's channel.
 pub(super) struct HookFeed {
-    policy: Policy,
+    /// Folded on replay as the reducers are: in the hub's checkpoints (`hub::checkpoint`).
+    pub(super) policy: Policy,
     tx: mpsc::UnboundedSender<Candidate>,
 }
 

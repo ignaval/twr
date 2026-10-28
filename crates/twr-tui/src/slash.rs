@@ -1,6 +1,7 @@
-//! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`, `/rename`,
-//! `/orch`, `/new`, `/park`, `/resume`, `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
-//! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/ws`,
+//! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`,
+//! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/park`, `/resume`, `/compact-context`,
+//! `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
+//! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/read`, `/ws`,
 //! `/settings`, `/help`, `/quit`. Pure parsing, the
 //! suggestions of the popup above the input line ([`suggest`]) and Tab completion;
 //! [`crate::app`] turns a parsed command into actions, confirmations or a status line. The same
@@ -46,6 +47,29 @@ pub enum Slash {
         /// The runtime to move the thread to, as typed (the hub checks it); `None` keeps it.
         runtime: Option<String>,
     },
+    /// `/account [thread] [name] [--outside-pin]`: show the account a thread runs on, or move
+    /// it to account `name` (`thread.set_model {account}`: a new session with a handoff, even
+    /// on the same runtime; `--outside-pin` leaves the thread's or its project's pin). One
+    /// word is a thread, but in a dive the account to move to unless it names a thread and no
+    /// account of the dived thread's runtime ([`crate::app`] decides).
+    Account {
+        /// The thread; `None` = the one dived into, else the selected one.
+        thread: Option<String>,
+        /// The account to move to; `None` shows the thread's.
+        account: Option<String>,
+        /// Leave the thread's or its project's pin (`outside_pin`).
+        outside_pin: bool,
+    },
+    /// `/account add <runtime> <name>`: the `twr account add` command to run in another
+    /// terminal (its login needs the terminal).
+    AccountAdd {
+        /// The runtime, as typed.
+        runtime: String,
+        /// The account's name, as typed.
+        name: String,
+    },
+    /// `/accounts`: every runtime's accounts and their logins.
+    Accounts,
     /// `/rename [thread] <name>`: give a worker thread a new name (in a dive the thread may
     /// be left out).
     Rename {
@@ -63,7 +87,8 @@ pub enum Slash {
     },
     /// `/orch` without arguments: pick the runtime to switch the orchestrator to.
     OrchPick,
-    /// `/new <project> [--runtime r] [--name n]`: a new thread.
+    /// `/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]`: a new
+    /// thread.
     New {
         /// A configured project name or a path.
         project: String,
@@ -71,6 +96,11 @@ pub enum Slash {
         runtime: Option<String>,
         /// Thread name (default: derived from the project).
         name: Option<String>,
+        /// The account (a name, a glob or a comma-separated list; default: the project's pin,
+        /// else the runtime's default account).
+        account: Option<String>,
+        /// Open it on `account` although the project's pin leaves it out (`outside_pin`).
+        outside_pin: bool,
     },
     /// `/park [thread]`.
     Park(Option<String>),
@@ -78,6 +108,9 @@ pub enum Slash {
     Resume(Option<String>),
     /// `/trim [thread]`: delete the build output of a thread's worktree (`thread.trim`).
     Trim(Option<String>),
+    /// `/compact-context [thread]`: compact a thread's context (`thread.compact`, what the
+    /// agent's own `/compact` does; `/compact` is the TUI's phone layout).
+    CompactContext(Option<String>),
     /// `/stop [thread]`.
     Stop(Option<String>),
     /// `/pin [thread]`: pin or unpin a thread's card (default: the selected one).
@@ -112,6 +145,14 @@ pub enum Slash {
     /// `/summaries [on|off]`: summaries of the threads' routine updates for this TUI
     /// ([`crate::summary`]).
     Summaries(Option<bool>),
+    /// `/read ...`: read the conversation aloud on the speakers connected to the hub
+    /// (`docs/read-aloud.md`, [`crate::speech`]), or control them.
+    Read {
+        /// What to do.
+        cmd: ReadCmd,
+        /// `--on <speaker>`: only that speaker (its name or device); `None`: every one.
+        on: Option<String>,
+    },
     /// `/ws [name]` (alias `/workspace`): list the workspaces, or switch to one (a new name
     /// asks to create it).
     Ws(Option<String>),
@@ -151,6 +192,130 @@ pub enum TrashCmd {
     },
 }
 
+/// What `/read` does ([`Slash::Read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadCmd {
+    /// `/read on`: live mode, every new message of the orchestrator read as it comes.
+    On,
+    /// `/read off`: live mode off.
+    Off,
+    /// `/read [N] [--orch]`: the last `n` messages (1 to [`READ_MAX`]; alone, 1), oldest
+    /// first, of the thread dived into, or with `orch` (or outside a dive) the orchestrator's.
+    Last {
+        /// How many.
+        n: u32,
+        /// The orchestrator's, even in a dive.
+        orch: bool,
+    },
+    /// `/read stop`: stop now and empty the queue.
+    Stop,
+    /// `/read pause`.
+    Pause,
+    /// `/read resume`.
+    Resume,
+    /// `/read skip`: end the message being read.
+    Skip,
+    /// `/read status`: the speakers connected, as last polled.
+    Status,
+    /// `/read voice <name>`: the speakers' voice.
+    Voice(String),
+    /// `/read rate <wpm>`: their speed, [`RATE_MIN`] to [`RATE_MAX`] words per minute.
+    Rate(u32),
+    /// `/read this`: the long message selected in the conversation.
+    This,
+}
+
+/// The most messages `/read N` reads (the hub's `speech.request` limit).
+pub const READ_MAX: u32 = twr_core::speech::REQUEST_MAX;
+/// The slowest `/read rate`, in words per minute.
+pub const RATE_MIN: u32 = 80;
+/// The fastest `/read rate`.
+pub const RATE_MAX: u32 = 500;
+
+/// `/read`'s first words, with what each does: its popup rows and Tab completion.
+pub const READ_WORDS: &[(&str, &str)] = &[
+    (
+        "on",
+        "read each new message of the orchestrator aloud as it comes",
+    ),
+    ("off", "stop reading new messages as they come"),
+    ("stop", "stop now and empty the queue (Ctrl-R)"),
+    ("pause", "pause reading"),
+    ("resume", "go on reading"),
+    ("skip", "end the message being read; go to the next"),
+    (
+        "status",
+        "the speakers connected, live mode on each, what is read",
+    ),
+    ("this", "the long message selected in the conversation"),
+    ("voice", "the speakers' voice: /read voice <name>"),
+    (
+        "rate",
+        "the speakers' speed: /read rate <80-500 words per minute>",
+    ),
+];
+
+/// Parses `/read`'s arguments (`usage` for the errors).
+fn parse_read(args: &[String], usage: &str) -> Result<Slash, String> {
+    let bad = || {
+        format!("usage: {usage} [--orch] [--on <speaker>], /read voice <name>, /read rate <wpm>")
+    };
+    let (mut words, mut orch, mut on) = (Vec::new(), false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let speaker = match a.split_once('=') {
+            Some(("--on", v)) => Some(v.to_string()),
+            _ if a == "--on" => it.next().cloned().or(Some(String::new())),
+            _ => None,
+        };
+        match speaker {
+            Some(_) if on.is_some() => return Err(bad()),
+            Some(s) => on = Some(s),
+            None if a == "--orch" => orch = true,
+            None if a.starts_with("--") => return Err(format!("unknown option {a}; {}", bad())),
+            None => words.push(a.as_str()),
+        }
+    }
+    if on.as_deref().is_some_and(|s| s.trim().is_empty()) {
+        return Err("--on takes a speaker: its name or device".into());
+    }
+    let last = |n: &str| match n.parse::<u32>() {
+        Ok(n) if (1..=READ_MAX).contains(&n) => Ok(ReadCmd::Last { n, orch }),
+        _ => Err(format!("/read N reads the last 1 to {READ_MAX} messages")),
+    };
+    let cmd = match words.as_slice() {
+        [] => ReadCmd::Last { n: 1, orch },
+        [n] if n.starts_with(|c: char| c.is_ascii_digit()) => last(n)?,
+        _ if orch => return Err("--orch goes with /read N: /read N --orch".into()),
+        ["on"] => ReadCmd::On,
+        ["off"] => ReadCmd::Off,
+        ["stop"] => ReadCmd::Stop,
+        ["pause"] => ReadCmd::Pause,
+        ["resume"] => ReadCmd::Resume,
+        ["skip"] => ReadCmd::Skip,
+        ["status"] if on.is_none() => ReadCmd::Status,
+        ["status"] => return Err("/read status lists every speaker; --on is for the others".into()),
+        ["this"] => ReadCmd::This,
+        ["voice"] => return Err("usage: /read voice <name> (quote a name with spaces)".into()),
+        ["voice", name @ ..] => ReadCmd::Voice(name.join(" ")),
+        ["rate", wpm] => match wpm.parse::<u32>() {
+            Ok(r) if (RATE_MIN..=RATE_MAX).contains(&r) => ReadCmd::Rate(r),
+            _ => {
+                return Err(format!(
+                    "/read rate takes {RATE_MIN} to {RATE_MAX} words per minute"
+                ))
+            }
+        },
+        ["rate", ..] => {
+            return Err(format!(
+                "usage: /read rate <wpm> ({RATE_MIN} to {RATE_MAX} words per minute)"
+            ))
+        }
+        _ => return Err(bad()),
+    };
+    Ok(Slash::Read { cmd, on })
+}
+
 /// What an argument of a command completes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgKind {
@@ -168,6 +333,12 @@ pub enum ArgKind {
     OnOff,
     /// A workspace name.
     Workspace,
+    /// An account of the thread named before it (else of the thread dived into or selected).
+    Account,
+    /// `/account`'s first argument: a thread name, and in a dive an account too.
+    AccountOrThread,
+    /// `/read`'s first word ([`READ_WORDS`]).
+    Read,
     /// Nothing to complete.
     Free,
 }
@@ -206,6 +377,19 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         &[ArgKind::Thread],
     ),
     (
+        "/account",
+        "/account [thread] [name] [--outside-pin] | add <runtime> <name>",
+        "show the account a thread runs on, or move it to another (a new session with a \
+         handoff; in a dive: /account [name]); add: the command that adds one",
+        &[ArgKind::AccountOrThread, ArgKind::Account],
+    ),
+    (
+        "/accounts",
+        "/accounts",
+        "every runtime's accounts and their logins",
+        &[],
+    ),
+    (
         "/rename",
         "/rename [thread] <name>",
         "rename a worker thread; its worktree and branch keep theirs (in a dive: /rename <name>)",
@@ -226,7 +410,7 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     ),
     (
         "/new",
-        "/new <project> [--runtime r] [--name n]",
+        "/new <project> [--runtime r] [--name n] [--account a [--outside-pin]]",
         "start a thread in a project (a configured name or a path)",
         &[],
     ),
@@ -246,6 +430,12 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/trim",
         "/trim [thread]",
         "delete an idle thread's build output (target/, node_modules/, ...)",
+        &[ArgKind::Thread],
+    ),
+    (
+        "/compact-context",
+        "/compact-context [thread]",
+        "compact a thread's context, as its agent's own /compact does (in a dive: that thread)",
         &[ArgKind::Thread],
     ),
     (
@@ -347,6 +537,15 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/summaries [on|off]",
         "a line on where a thread stands in its folded routine updates (a small model)",
         &[ArgKind::OnOff],
+    ),
+    (
+        "/read",
+        // (A space inside: on a phone's help, no word is wider than its rows.)
+        "/read [on|off|N|this|status | stop|pause|resume|skip]",
+        "read aloud on the speakers of this hub: on/off as messages come, N the last N (1-50; \
+         in a dive the thread's, --orch the orchestrator's; --on <speaker> one speaker), this \
+         the long message selected, the controls (Ctrl-R stops), voice <name>, rate <wpm>",
+        &[ArgKind::Read],
     ),
     (
         "/ws",
@@ -536,14 +735,63 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             }),
             _ => bad(),
         },
+        "/account" => {
+            if let [add, runtime, name] = args {
+                if add == "add" {
+                    return Ok(Slash::AccountAdd {
+                        runtime: runtime.clone(),
+                        name: name.clone(),
+                    });
+                }
+            }
+            let mut outside_pin = false;
+            let mut words = Vec::new();
+            for a in args {
+                match a.as_str() {
+                    "--outside-pin" => outside_pin = true,
+                    f if f.starts_with("--") => {
+                        return Err(format!("unknown option {f}; usage: {usage}"))
+                    }
+                    _ => words.push(a.clone()),
+                }
+            }
+            let (thread, account) = match words.as_slice() {
+                [] => (None, None),
+                [one] => (Some(one.clone()), None),
+                [thread, account] => (Some(thread.clone()), Some(account.clone())),
+                _ => return bad(),
+            };
+            // Leaving a pin is for a move; in a dive one word is the account.
+            if outside_pin && account.is_none() && thread.is_none() {
+                return bad();
+            }
+            Ok(Slash::Account {
+                thread,
+                account,
+                outside_pin,
+            })
+        }
+        "/accounts" if args.is_empty() => Ok(Slash::Accounts),
         "/new" => {
             let mut project = None;
-            let (mut runtime, mut name) = (None, None);
+            let (mut runtime, mut name, mut account) = (None, None, None);
+            let mut outside_pin = false;
             let mut it = args.iter();
             while let Some(a) = it.next() {
-                let slot = match a.as_str() {
+                // `--account=work` as `--account work`.
+                let (flag, inline) = match a.split_once('=') {
+                    Some((f, v)) if f.starts_with("--") => (f, Some(v)),
+                    _ => (a.as_str(), None),
+                };
+                let slot = match flag {
                     "--runtime" => &mut runtime,
                     "--name" => &mut name,
+                    "--account" => &mut account,
+                    "--outside-pin" if inline.is_none() => {
+                        outside_pin = true;
+                        continue;
+                    }
+                    "--outside-pin" => return bad(),
                     flag if flag.starts_with("--") => {
                         return Err(format!("unknown option {flag}; usage: {usage}"))
                     }
@@ -553,16 +801,29 @@ pub fn parse(line: &str) -> Result<Slash, String> {
                     }
                     _ => return bad(),
                 };
-                match it.next() {
-                    Some(v) if slot.is_none() => *slot = Some(v.clone()),
+                match inline.map(str::to_string).or_else(|| it.next().cloned()) {
+                    Some(v) if slot.is_none() => *slot = Some(v),
                     _ => return bad(),
                 }
             }
             match project {
+                // Leaving the pin is for an account given (`--account`, or the account part
+                // of `--runtime <runtime>:<account>`).
+                Some(_)
+                    if outside_pin
+                        && account.is_none()
+                        && !runtime
+                            .as_deref()
+                            .is_some_and(|r| twr_core::account::split_runtime(r).1.is_some()) =>
+                {
+                    bad()
+                }
                 Some(project) => Ok(Slash::New {
                     project,
                     runtime,
                     name,
+                    account,
+                    outside_pin,
                 }),
                 None => bad(),
             }
@@ -570,6 +831,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
         "/park" => one(args).map(Slash::Park),
         "/resume" => one(args).map(Slash::Resume),
         "/trim" => one(args).map(Slash::Trim),
+        "/compact-context" => one(args).map(Slash::CompactContext),
         "/stop" => one(args).map(Slash::Stop),
         "/pin" => one(args).map(Slash::Pin),
         "/delete" => match args {
@@ -602,6 +864,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             }
         }
         "/attach" => one(args).map(Slash::Attach),
+        "/read" => parse_read(args, usage),
         "/ws" => match args {
             [new] if new == "new" => Ok(Slash::WsNew(None)),
             [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
@@ -675,13 +938,18 @@ pub fn complete(
         };
         let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
         let on_off = ["on".to_string(), "off".into()];
+        let read: Vec<String> = READ_WORDS.iter().map(|w| w.0.to_string()).collect();
         let pool = match kind {
             ArgKind::Runtime => runtimes,
-            ArgKind::Thread | ArgKind::Threads | ArgKind::ModeOrThread => threads,
+            ArgKind::Thread
+            | ArgKind::Threads
+            | ArgKind::ModeOrThread
+            | ArgKind::AccountOrThread => threads,
             ArgKind::Mode => &modes[..],
             ArgKind::OnOff => &on_off[..],
             ArgKind::Workspace => workspaces,
-            ArgKind::Free => &[][..],
+            ArgKind::Read => &read[..],
+            ArgKind::Account | ArgKind::Free => &[][..],
         };
         pool.iter()
             .filter(|c| c.starts_with(last))
@@ -749,6 +1017,21 @@ pub struct Pools {
     pub dive: bool,
     /// Workspace names (`/ws`).
     pub workspaces: Vec<(String, String)>,
+    /// Each runtime's accounts that are not removed, with their state (`/account`:
+    /// `work`, `logged in`).
+    pub accounts: std::collections::BTreeMap<String, Vec<(String, String)>>,
+    /// Each thread's runtime, by name: whose accounts `/account <thread>` completes.
+    pub thread_runtimes: std::collections::BTreeMap<String, String>,
+    /// The runtime of the thread dived into, else of the selected one: whose accounts
+    /// `/account` completes when no thread is named.
+    pub account_runtime: Option<String>,
+    /// Each configured project's runtime as far as the TUI knows it, by project name: the
+    /// runtime of the latest thread made for it (`/new <project> --account` completes its
+    /// accounts).
+    pub project_runtimes: std::collections::BTreeMap<String, String>,
+    /// The hub's `default_runtime`, when the TUI knows it (`/new --account` without a
+    /// runtime or a project it knows).
+    pub default_runtime: Option<String>,
     /// The threads an `@` mention can name: workers only, never an orchestrator (current or
     /// retired) or the hub, which are no relay targets.
     pub mentions: Vec<Mentionable>,
@@ -827,6 +1110,36 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
     let Some(cmd) = words.first().and_then(|w| canonical(w)) else {
         return Suggestions::default();
     };
+    // `/new <project> --account <name>` (or `--account=<name>`): the accounts of the runtime
+    // the line names.
+    if cmd == "/new" {
+        let inline = word.strip_prefix("--account=");
+        if inline.is_some() || (words.last() == Some(&"--account") && !word.starts_with("--")) {
+            let (start, word) = match inline {
+                Some(rest) => (line.len() - rest.len(), rest),
+                None => (start, word),
+            };
+            let rows = new_accounts(&words[1..], pools)
+                .into_iter()
+                .map(|(value, detail)| {
+                    let row = Suggestion {
+                        label: value.clone(),
+                        value: value.clone(),
+                        detail,
+                        more: true,
+                    };
+                    (vec![value], row)
+                })
+                .collect();
+            return Suggestions {
+                start,
+                end: line.len(),
+                command: false,
+                mention: false,
+                items: ranked(word, rows),
+            };
+        }
+    }
     let kinds = COMMANDS
         .iter()
         .find(|c| c.0 == cmd)
@@ -875,6 +1188,40 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
             ("off".into(), "the terminal selects".into()),
         ],
         Some(ArgKind::Workspace) => pools.workspaces.clone(),
+        // `/account add <runtime> <name>`: the runtimes that take accounts, then a new name.
+        Some(ArgKind::Account) if words.get(1) == Some(&"add") => pools
+            .accounts
+            .keys()
+            .map(|r| (r.clone(), "runtime".to_string()))
+            .collect(),
+        Some(ArgKind::Account) => {
+            let runtime = words
+                .get(1)
+                .and_then(|w| pools.thread_runtimes.get(*w))
+                .or(pools.account_runtime.as_ref());
+            runtime
+                .and_then(|r| pools.accounts.get(r))
+                .cloned()
+                .unwrap_or_default()
+        }
+        Some(ArgKind::AccountOrThread) => {
+            let mut all: Vec<(String, String)> = if pools.dive {
+                pools
+                    .account_runtime
+                    .as_ref()
+                    .and_then(|r| pools.accounts.get(r))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            all.extend(pools.threads.iter().cloned());
+            all
+        }
+        Some(ArgKind::Read) => READ_WORDS
+            .iter()
+            .map(|(w, what)| (w.to_string(), what.to_string()))
+            .collect(),
         Some(ArgKind::Free) | None => Vec::new(),
     };
     let rows = pool
@@ -895,6 +1242,53 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
         command: false,
         mention: false,
         items: ranked(word, rows),
+    }
+}
+
+/// The accounts `/new --account` offers, with their state, for the arguments `args` typed
+/// so far: those of the runtime `--runtime` names (its runtime part: `claude-code` of
+/// `claude-code:work`), else of the project's runtime as far as the TUI knows it
+/// ([`Pools::project_runtimes`]), else of the default runtime ([`Pools::default_runtime`]);
+/// with none known, every runtime's, each row's detail naming its runtime.
+fn new_accounts(args: &[&str], pools: &Pools) -> Vec<(String, String)> {
+    let (mut project, mut runtime): (Option<&str>, Option<&str>) = (None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.split_once('=') {
+            Some(("--runtime", v)) => runtime = Some(v),
+            Some((f, _)) if f.starts_with("--") => {}
+            _ if *a == "--runtime" => runtime = it.next().copied(),
+            _ if *a == "--name" || *a == "--account" => {
+                it.next();
+            }
+            _ if a.starts_with("--") => {}
+            _ if project.is_none() => project = Some(*a),
+            _ => {}
+        }
+    }
+    let runtime = runtime
+        .map(|r| twr_core::account::split_runtime(r).0)
+        .or_else(|| {
+            project
+                .and_then(|p| pools.project_runtimes.get(p))
+                .map(String::as_str)
+        })
+        .or(pools.default_runtime.as_deref());
+    match runtime {
+        Some(r) => pools.accounts.get(r).cloned().unwrap_or_default(),
+        None => pools
+            .accounts
+            .iter()
+            .flat_map(|(rt, names)| {
+                names.iter().map(move |(name, state)| {
+                    let detail = match state.as_str() {
+                        "" => rt.clone(),
+                        s => format!("{rt} · {s}"),
+                    };
+                    (name.clone(), detail)
+                })
+            })
+            .collect(),
     }
 }
 
@@ -999,7 +1393,9 @@ mod tests {
             Ok(Slash::New {
                 project: "~/src/api".into(),
                 runtime: Some("codex".into()),
-                name: Some("api2".into())
+                name: Some("api2".into()),
+                account: None,
+                outside_pin: false,
             })
         );
         assert_eq!(
@@ -1007,7 +1403,9 @@ mod tests {
             Ok(Slash::New {
                 project: "my project".into(),
                 runtime: None,
-                name: None
+                name: None,
+                account: None,
+                outside_pin: false,
             })
         );
         assert_eq!(parse("/park"), Ok(Slash::Park(None)));
@@ -1154,6 +1552,14 @@ mod tests {
         assert_eq!(parse("/resume web"), Ok(Slash::Resume(Some("web".into()))));
         assert_eq!(parse("/trim web"), Ok(Slash::Trim(Some("web".into()))));
         assert_eq!(parse("/trim"), Ok(Slash::Trim(None)));
+        // The context's compaction is no layout: `/compact` stays the phone layout's.
+        assert_eq!(
+            parse("/compact-context web"),
+            Ok(Slash::CompactContext(Some("web".into())))
+        );
+        assert_eq!(parse("/compact-context"), Ok(Slash::CompactContext(None)));
+        assert_eq!(parse("/compact"), Ok(Slash::Compact(None)));
+        assert!(parse("/compact-context a b").is_err());
         assert_eq!(parse("/attach"), Ok(Slash::Attach(None)));
         assert_eq!(parse("/help"), Ok(Slash::Help));
         assert_eq!(parse("/parked"), Ok(Slash::Parked(None)));
@@ -1323,6 +1729,7 @@ mod tests {
                 ("default".into(), "current".into()),
                 ("work".into(), "".into()),
             ],
+            ..Default::default()
         };
         let names = |line: &str, pools: &Pools| -> Vec<String> {
             suggest(line, pools)
@@ -1345,6 +1752,9 @@ mod tests {
                 "/orch",
                 "/mode",
                 "/model",
+                "/account",
+                "/accounts",
+                "/compact-context",
                 "/stop",
                 "/compact",
                 "/focus",
@@ -1357,7 +1767,18 @@ mod tests {
         assert_eq!(names("/se", &pools), ["/settings", "/unsend", "/mouse"]);
         assert_eq!(
             names("/P", &pools),
-            ["/park", "/pin", "/parked", "/open", "/stop", "/spaces", "/compact", "/ws", "/help"]
+            [
+                "/park",
+                "/pin",
+                "/parked",
+                "/open",
+                "/compact-context",
+                "/stop",
+                "/spaces",
+                "/compact",
+                "/ws",
+                "/help"
+            ]
         );
         // Taking arguments or not.
         let help = &suggest("/he", &pools).items[0];
@@ -1523,9 +1944,370 @@ mod tests {
         assert!(mention("@é", 2, &pools).items.is_empty());
     }
 
+    /// Every form of `/read`, and its errors, which say the forms.
+    #[test]
+    fn read_parses_every_form() {
+        let read = |cmd: ReadCmd, on: Option<&str>| {
+            Ok(Slash::Read {
+                cmd,
+                on: on.map(str::to_string),
+            })
+        };
+        let last = |n: u32, orch: bool| ReadCmd::Last { n, orch };
+        assert_eq!(parse("/read"), read(last(1, false), None));
+        assert_eq!(parse("/read 3"), read(last(3, false), None));
+        assert_eq!(parse("/read 50 --orch"), read(last(50, true), None));
+        assert_eq!(parse("/read --orch"), read(last(1, true), None));
+        assert_eq!(
+            parse("/read 2 --on laptop --orch"),
+            read(last(2, true), Some("laptop"))
+        );
+        assert_eq!(
+            parse("/read --on='my phone' 4"),
+            read(last(4, false), Some("my phone"))
+        );
+        assert_eq!(parse("/read on"), read(ReadCmd::On, None));
+        assert_eq!(
+            parse("/read off --on mini"),
+            read(ReadCmd::Off, Some("mini"))
+        );
+        assert_eq!(parse("/read stop"), read(ReadCmd::Stop, None));
+        assert_eq!(parse("/read pause"), read(ReadCmd::Pause, None));
+        assert_eq!(parse("/read resume"), read(ReadCmd::Resume, None));
+        assert_eq!(
+            parse("/read skip --on laptop"),
+            read(ReadCmd::Skip, Some("laptop"))
+        );
+        assert_eq!(parse("/read status"), read(ReadCmd::Status, None));
+        assert_eq!(parse("/read this"), read(ReadCmd::This, None));
+        assert_eq!(
+            parse("/read voice 'Daniel (Enhanced)'"),
+            read(ReadCmd::Voice("Daniel (Enhanced)".into()), None)
+        );
+        assert_eq!(
+            parse("/read voice en GB"),
+            read(ReadCmd::Voice("en GB".into()), None)
+        );
+        assert_eq!(parse("/read rate 220"), read(ReadCmd::Rate(220), None));
+        assert_eq!(parse("/read rate 80"), read(ReadCmd::Rate(80), None));
+        // Errors.
+        let err = |line: &str| parse(line).unwrap_err();
+        for line in ["/read 0", "/read 51", "/read 3x"] {
+            assert_eq!(
+                err(line),
+                "/read N reads the last 1 to 50 messages",
+                "{line}"
+            );
+        }
+        for line in ["/read rate 79", "/read rate 501", "/read rate fast"] {
+            assert_eq!(
+                err(line),
+                "/read rate takes 80 to 500 words per minute",
+                "{line}"
+            );
+        }
+        assert!(err("/read rate").starts_with("usage: /read rate <wpm>"));
+        assert!(err("/read voice").starts_with("usage: /read voice <name>"));
+        assert!(err("/read on --orch").contains("/read N --orch"));
+        assert!(err("/read status --on laptop").contains("every speaker"));
+        let usage = err("/read loud");
+        assert!(
+            usage.starts_with("usage: /read [on|off|N|this|status | stop|pause|resume|skip]"),
+            "{usage}"
+        );
+        assert!(usage.contains("--on <speaker>") && usage.contains("rate <wpm>"));
+        assert!(err("/read 2 3").starts_with("usage: /read"));
+        assert_eq!(
+            err("/read --on"),
+            "--on takes a speaker: its name or device"
+        );
+        assert_eq!(
+            err("/read 2 --on ''"),
+            "--on takes a speaker: its name or device"
+        );
+        assert!(err("/read --on a --on b").starts_with("usage: /read"));
+        assert!(err("/read --loud").starts_with("unknown option --loud"));
+    }
+
+    /// `/read`'s first word completes and has popup rows, each saying what it does.
+    #[test]
+    fn read_words_complete_and_suggest() {
+        assert_eq!(
+            complete("/read st", &[], &[], &[]),
+            (None, vec!["stop".to_string(), "status".into()])
+        );
+        assert_eq!(
+            complete("/read pa", &[], &[], &[]),
+            (Some("/read pause ".into()), Vec::new())
+        );
+        assert_eq!(complete("/read 3 ", &[], &[], &[]), (None, Vec::new()));
+        let s = suggest("/read ", &Pools::default());
+        let words: Vec<&str> = s.items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(words, READ_WORDS.iter().map(|w| w.0).collect::<Vec<_>>());
+        let s = suggest("/read th", &Pools::default());
+        assert_eq!(s.items[0].value, "this");
+        assert!(s.items[0].detail.contains("selected"));
+        assert!(takes_args("/read"));
+    }
+
     #[test]
     fn words_split_on_whitespace_and_quotes() {
         assert_eq!(words(r#"a "b c" 'd' e"#).unwrap(), ["a", "b c", "d", "e"]);
         assert_eq!(words("x ''").unwrap(), ["x", ""]);
+    }
+
+    /// `/account [thread] [name] [--outside-pin]`, `/account add <runtime> <name>`,
+    /// `/accounts`, and `/new --account`.
+    #[test]
+    fn account_commands_parse() {
+        let account = |thread: Option<&str>, account: Option<&str>, outside_pin| {
+            Ok(Slash::Account {
+                thread: thread.map(str::to_string),
+                account: account.map(str::to_string),
+                outside_pin,
+            })
+        };
+        assert_eq!(parse("/account"), account(None, None, false));
+        assert_eq!(parse("/account api"), account(Some("api"), None, false));
+        assert_eq!(
+            parse("/account api work"),
+            account(Some("api"), Some("work"), false)
+        );
+        assert_eq!(
+            parse("/account --outside-pin api work"),
+            account(Some("api"), Some("work"), true)
+        );
+        // In a dive one word may be the account: the app decides.
+        assert_eq!(
+            parse("/account work --outside-pin"),
+            account(Some("work"), None, true)
+        );
+        assert!(parse("/account --outside-pin").is_err());
+        assert!(parse("/account a b c").is_err());
+        assert_eq!(
+            parse("/account --force api"),
+            Err(
+                "unknown option --force; usage: /account [thread] [name] [--outside-pin] | add \
+                 <runtime> <name>"
+                    .into()
+            )
+        );
+        assert_eq!(
+            parse("/account add claude work"),
+            Ok(Slash::AccountAdd {
+                runtime: "claude".into(),
+                name: "work".into()
+            })
+        );
+        // `add` alone or with one word is a thread's name.
+        assert_eq!(parse("/account add"), account(Some("add"), None, false));
+        assert_eq!(
+            parse("/account add work"),
+            account(Some("add"), Some("work"), false)
+        );
+        assert_eq!(parse("/accounts"), Ok(Slash::Accounts));
+        assert!(parse("/accounts claude").is_err());
+        assert_eq!(
+            parse("/new api --account work --outside-pin"),
+            Ok(Slash::New {
+                project: "api".into(),
+                runtime: None,
+                name: None,
+                account: Some("work".into()),
+                outside_pin: true,
+            })
+        );
+        assert_eq!(
+            parse("/new api --runtime claude-code:work"),
+            Ok(Slash::New {
+                project: "api".into(),
+                runtime: Some("claude-code:work".into()),
+                name: None,
+                account: None,
+                outside_pin: false,
+            })
+        );
+        assert_eq!(
+            parse("/new api --runtime claude-code:work --outside-pin"),
+            Ok(Slash::New {
+                project: "api".into(),
+                runtime: Some("claude-code:work".into()),
+                name: None,
+                account: None,
+                outside_pin: true,
+            })
+        );
+        assert!(parse("/new api --outside-pin").is_err());
+        assert!(parse("/new api --runtime claude-code --outside-pin").is_err());
+        assert!(parse("/new api --account").is_err());
+        // `--option=value` as `--option value`.
+        assert_eq!(
+            parse("/new api --account=work --runtime=claude-code --name=api2 --outside-pin"),
+            Ok(Slash::New {
+                project: "api".into(),
+                runtime: Some("claude-code".into()),
+                name: Some("api2".into()),
+                account: Some("work".into()),
+                outside_pin: true,
+            })
+        );
+        assert!(parse("/new api --account=work --account x").is_err());
+        assert!(parse("/new api --outside-pin=yes --account work").is_err());
+        assert!(parse("/new api --box=b").is_err());
+    }
+
+    /// `/new <project> --account ` (and `--account=`) completes the accounts of the runtime
+    /// the line names (`--runtime`, its runtime part), else of the project's runtime as the
+    /// TUI knows it, else of the default runtime; with none known, every runtime's.
+    #[test]
+    fn new_completes_the_account_of_its_runtime() {
+        let accounts = [
+            (
+                "claude-code".to_string(),
+                vec![
+                    ("personal".to_string(), "native, logged in".to_string()),
+                    ("work".to_string(), "logged in".to_string()),
+                ],
+            ),
+            (
+                "codex".to_string(),
+                vec![("default".to_string(), "native".to_string())],
+            ),
+        ];
+        let mut pools = Pools {
+            accounts: accounts.into_iter().collect(),
+            project_runtimes: [("gen".to_string(), "codex".to_string())]
+                .into_iter()
+                .collect(),
+            default_runtime: Some("claude-code".into()),
+            ..Default::default()
+        };
+        let rows = |line: &str, pools: &Pools| -> Vec<(String, String)> {
+            suggest(line, pools)
+                .items
+                .into_iter()
+                .map(|i| (i.value, i.detail))
+                .collect()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        let claude = [
+            pair("personal", "native, logged in"),
+            pair("work", "logged in"),
+        ];
+        // The default runtime.
+        assert_eq!(rows("/new api --account ", &pools), claude);
+        assert_eq!(
+            rows("/new api --account w", &pools),
+            [pair("work", "logged in")]
+        );
+        // The project's runtime.
+        assert_eq!(
+            rows("/new gen --account ", &pools),
+            [pair("default", "native")]
+        );
+        // `--runtime`, before or after, with or without `=`, its account part aside.
+        assert_eq!(
+            rows("/new api --runtime codex --account ", &pools),
+            [pair("default", "native")]
+        );
+        assert_eq!(
+            rows(
+                "/new gen --runtime=claude-code:work --name x --account ",
+                &pools
+            ),
+            claude
+        );
+        // `--account=`: the rows replace what follows `=`.
+        let s = suggest("/new gen --runtime claude-code --account=wo", &pools);
+        assert_eq!(
+            (s.start, s.items.len(), s.items[0].value.as_str()),
+            ("/new gen --runtime claude-code --account=".len(), 1, "work")
+        );
+        let s = suggest("/new api --account=", &pools);
+        assert_eq!(s.items.len(), 2);
+        // Nothing else completes there.
+        assert!(rows("/new api ", &pools).is_empty());
+        assert!(rows("/new api --name ", &pools).is_empty());
+        // A runtime with no accounts listed: none.
+        assert!(rows("/new api --runtime gemini --account ", &pools).is_empty());
+        // No runtime known: every runtime's, named.
+        pools.default_runtime = None;
+        assert_eq!(
+            rows("/new api --account ", &pools),
+            [
+                pair("personal", "claude-code · native, logged in"),
+                pair("work", "claude-code · logged in"),
+                pair("default", "codex · native"),
+            ]
+        );
+    }
+
+    /// `/account` completes threads, then the accounts of the thread named (else of the
+    /// thread dived into or selected), with their state; in a dive its first word is an
+    /// account too. `/account add` completes the runtimes.
+    #[test]
+    fn account_arguments_complete_to_accounts() {
+        let accounts = [
+            (
+                "claude-code".to_string(),
+                vec![
+                    ("personal".to_string(), "native, logged in".to_string()),
+                    ("work".to_string(), "logged in".to_string()),
+                ],
+            ),
+            (
+                "codex".to_string(),
+                vec![("default".to_string(), "native".to_string())],
+            ),
+        ];
+        let mut pools = Pools {
+            threads: vec![
+                ("api".into(), "idle · claude-code:work · mode auto".into()),
+                ("gen".into(), "idle · codex · mode auto".into()),
+            ],
+            accounts: accounts.into_iter().collect(),
+            thread_runtimes: [
+                ("api".to_string(), "claude-code".to_string()),
+                ("gen".to_string(), "codex".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            account_runtime: Some("codex".into()),
+            ..Default::default()
+        };
+        let rows = |line: &str, pools: &Pools| -> Vec<(String, String)> {
+            suggest(line, pools)
+                .items
+                .into_iter()
+                .map(|i| (i.value, i.detail))
+                .collect()
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            rows("/account ", &pools),
+            [
+                pair("api", "idle · claude-code:work · mode auto"),
+                pair("gen", "idle · codex · mode auto")
+            ]
+        );
+        assert_eq!(
+            rows("/account api ", &pools),
+            [
+                pair("personal", "native, logged in"),
+                pair("work", "logged in")
+            ]
+        );
+        assert_eq!(rows("/account api w", &pools), [pair("work", "logged in")]);
+        // No thread named: the selected one's runtime.
+        assert_eq!(rows("/account nope ", &pools), [pair("default", "native")]);
+        pools.dive = true;
+        pools.account_runtime = Some("claude-code".into());
+        let first: Vec<String> = rows("/account ", &pools).into_iter().map(|r| r.0).collect();
+        assert_eq!(first, ["personal", "work", "api", "gen"]);
+        assert_eq!(
+            rows("/account add ", &pools),
+            [pair("claude-code", "runtime"), pair("codex", "runtime")]
+        );
+        assert!(rows("/account add codex ", &pools).is_empty());
     }
 }

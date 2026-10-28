@@ -148,6 +148,7 @@ use crate::claude_code::translate::{
     error_line, is_destructive, mark_visible, one_line, render_command, FULL_INPUT_KEY,
 };
 use crate::codex::translate::question_answer;
+use crate::usage::{Limit, LimitKind};
 
 /// ACP protocol version twr speaks.
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -318,11 +319,55 @@ pub trait Dialect: std::fmt::Debug + Send + 'static {
         " (sign in with the agent's own CLI first)"
     }
 
+    /// The kind of limit a prompt error's text (`error_text`) says the account hit, if it says
+    /// one: the turn then carries `ext.twr.limit` and is not transient. None (the default):
+    /// the standard dialect knows no agent's wording.
+    fn limit_kind(&self, _text: &str) -> Option<LimitKind> {
+        None
+    }
+
     /// The text of the first prompt of a new session, when the dialect changes it (the
     /// standard dialect prepends the system prompt: ACP has no field for one).
     fn first_prompt(&self, _text: &str) -> Option<String> {
         None
     }
+
+    /// The prompt that compacts the session's context (`/compact`), when the agent has one
+    /// twr knows ([`Translator::compact`]); None: twr cannot compact it.
+    fn compact_prompt(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// What a vendor notification says of a compaction of the session's context, if it is one
+    /// ([`Compaction`]).
+    fn compaction(&self, _method: &str, _params: &Value) -> Option<Compaction> {
+        None
+    }
+
+    /// The context window of `model` (the session's current one, when known), if the agent
+    /// said.
+    fn context_window(&self, _model: Option<&str>) -> Option<u64> {
+        None
+    }
+}
+
+/// A compaction of the session's context, as a vendor notification reports it
+/// ([`Dialect::compaction`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Compaction {
+    /// It began, with the context this full (and the window), when said.
+    Started {
+        tokens: Option<u64>,
+        window: Option<u64>,
+    },
+    /// It ended, from `before` to `after` tokens, taking `elapsed_ms`, when said.
+    Completed {
+        before: Option<u64>,
+        after: Option<u64>,
+        elapsed_ms: Option<u64>,
+    },
+    /// It failed, or was cancelled: the context is as it was.
+    Failed(String),
 }
 
 /// The standard model request: `session/set_config_option` for a `configOptions` entry of
@@ -634,6 +679,15 @@ pub struct Translator<D: Dialect> {
     next_usage_id: u64,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
+    /// Turns sent as the dialect's compaction prompt ([`Translator::compact`]) not ended yet.
+    compact_turns: std::collections::HashSet<u64>,
+    /// The compaction under way, as [`Dialect::compaction`] reported its start: its trigger and
+    /// the context before.
+    compacting: Option<(&'static str, Option<u64>)>,
+    /// How full the context is (the prompt result's `_meta.totalTokens`, Grok Build's), and
+    /// the window a compaction's start reported.
+    context: Option<u64>,
+    reported_window: Option<u64>,
 }
 
 /// `ext.<dialect>.mode_note` of the turn in which the session left plan mode with consent.
@@ -683,6 +737,10 @@ impl<D: Dialect> Translator<D> {
             usage: crate::usage::Reads::default(),
             next_usage_id: 1 << 50,
             clock: Utc::now,
+            compact_turns: Default::default(),
+            compacting: None,
+            context: None,
+            reported_window: None,
         }
     }
 
@@ -818,6 +876,78 @@ impl<D: Dialect> Translator<D> {
         out
     }
 
+    /// Starts turn `turn` as a compaction of the session's context: the dialect's compaction
+    /// prompt ([`Dialect::compact_prompt`], sent as any prompt), or, for an agent twr cannot
+    /// compact, the turn ends `error` saying so.
+    pub fn compact(&mut self, turn: u64) -> Translated {
+        let Some(prompt) = self.dialect.compact_prompt() else {
+            let mut out = Translated::default();
+            let msg = format!(
+                "{} cannot compact its context from twr",
+                self.dialect.title()
+            );
+            self.end_failed_turn(turn, &msg, None, &mut out);
+            return out;
+        };
+        self.compact_turns.insert(turn);
+        self.send(prompt, turn)
+    }
+
+    /// A compaction a vendor notification reports ([`Dialect::compaction`]), in the running
+    /// prompt's turn (`manual` when that prompt is twr's compaction).
+    fn on_compaction(&mut self, c: Compaction, line: &str, out: &mut Translated) {
+        let turn = self.turn();
+        let manual = turn.is_some_and(|t| self.compact_turns.contains(&t));
+        let trigger = if manual { "manual" } else { "auto" };
+        let body = match c {
+            Compaction::Started { tokens, window } => {
+                if window.is_some() {
+                    self.reported_window = window;
+                }
+                // Said already (the user's, when its prompt went out): what it began with.
+                if let Some((_, pre)) = self.compacting.as_mut() {
+                    *pre = tokens.or(*pre);
+                    return;
+                }
+                self.compacting = Some((trigger, tokens.or(self.context)));
+                EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                    trigger: Some(trigger.into()),
+                    ..Default::default()
+                })
+            }
+            Compaction::Completed {
+                before,
+                after,
+                elapsed_ms,
+            } => {
+                let (trigger, pre) = self.compacting.take().unwrap_or((trigger, None));
+                // It replaced the context: what it left, unknown when it did not say (the
+                // size before is no longer the context).
+                self.context = after;
+                EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger: trigger.into(),
+                    pre_tokens: before.or(pre),
+                    post_tokens: after,
+                    duration_ms: elapsed_ms,
+                    ..Default::default()
+                })
+            }
+            Compaction::Failed(why) => {
+                let (trigger, _) = self.compacting.take().unwrap_or((trigger, None));
+                EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger: trigger.into(),
+                    error: Some(why),
+                    ..Default::default()
+                })
+            }
+        };
+        out.events.push(Emitted {
+            body,
+            turn,
+            raw: Some(line.to_string()),
+        });
+    }
+
     fn pump(&mut self, out: &mut Translated) {
         if self.phase != Phase::Ready
             || self.in_flight.is_some()
@@ -856,6 +986,21 @@ impl<D: Dialect> Translator<D> {
         );
         self.in_flight = Some((id, turn));
         out.writes.push(line);
+        // The user's compaction starts now: Grok Build reports only its end (1.0.62), so its
+        // start is said here, which holds the hub's stall checks while it runs.
+        if self.compact_turns.contains(&turn) {
+            self.on_compaction(
+                Compaction::Started {
+                    tokens: None,
+                    window: None,
+                },
+                "",
+                out,
+            );
+            if let Some(e) = out.events.last_mut() {
+                e.raw = None;
+            }
+        }
     }
 
     /// Answers item `attn_id`. None if it is not pending.
@@ -1785,14 +1930,27 @@ impl<D: Dialect> Translator<D> {
         let stop = r.get("stopReason").and_then(Value::as_str).unwrap_or("");
         // Every failed turn says why (`ext.twr.error`, what the hub quotes).
         let mut why = None;
+        let mut limit = None;
         let result = match error {
             Some(e) => {
-                why = Some(self.with_auth_hint(&error_text(e)));
+                let text = error_text(e);
+                why = Some(self.with_auth_hint(&text));
                 ours.insert("error".into(), e.clone());
-                let reason = transient_reason(e);
-                ours.insert("transient".into(), json!(reason.is_some()));
-                if let Some(r) = reason {
-                    ours.insert("transient_reason".into(), json!(r));
+                if let Some(kind) = self.dialect.limit_kind(&text) {
+                    // Retrying before the reset cannot help.
+                    ours.insert("transient".into(), json!(false));
+                    limit = Some(Limit {
+                        kind,
+                        window: None,
+                        resets_at: None,
+                        message: text,
+                    });
+                } else {
+                    let reason = transient_reason(e);
+                    ours.insert("transient".into(), json!(reason.is_some()));
+                    if let Some(r) = reason {
+                        ours.insert("transient_reason".into(), json!(r));
+                    }
                 }
                 TurnResult::Error
             }
@@ -1852,11 +2010,33 @@ impl<D: Dialect> Translator<D> {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": error_line(&why) }));
         }
+        if let Some(l) = limit {
+            twr_core::event::set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
+        }
+        self.compact_turns.remove(&turn);
+        self.compacting = None;
+        // How full the context is, when the agent says (Grok Build's `_meta.totalTokens`: the
+        // last call's input and output; 0 for a turn that called no model, `/compact`'s).
+        if let Some(n) = r
+            .pointer("/_meta/totalTokens")
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+        {
+            self.context = Some(n);
+        }
+        let window = self
+            .dialect
+            .context_window(self.model.as_deref())
+            .or(self.reported_window);
+        let context = self
+            .context
+            .map(|tokens| twr_core::event::ContextSize { tokens, window });
         out.events.push(Emitted {
             body: EventBody::TurnEnded(TurnEnded {
                 result,
                 session_id: self.session_id.clone(),
                 usage,
+                context,
                 ext,
                 ..Default::default()
             }),
@@ -1933,6 +2113,14 @@ impl<D: Dialect> Translator<D> {
             }
             // Vendor extensions and anything newer: the dialect's.
             _ => {
+                // A compaction of this session (another session's says nothing of this one).
+                let ours = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| self.session_id.as_deref().is_some_and(|own| own == s));
+                if let Some(c) = self.dialect.compaction(method, params).filter(|_| ours) {
+                    self.on_compaction(c, line, out);
+                }
                 let requested = self.requested_mode().to_string();
                 let sid = self.known_session().map(str::to_string);
                 let ctx = SessionCtx {

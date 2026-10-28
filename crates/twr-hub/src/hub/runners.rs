@@ -1281,6 +1281,11 @@ async fn handle(hub: &Arc<Inner>, conn: &mut Conn, msg: RunnerMsg) -> Result<(),
                 }
                 Ok(Ingested::Recorded { generation, ended }) => {
                     conn.ack(&thread, rseq);
+                    // As for a local runtime (`hub::supervisor`): a session reported may make
+                    // an open offer to compact stale (`hub::idle_compact`).
+                    if kind == "thread.started" || kind == "thread.resumed" {
+                        hub.core().recheck_idle_offer(hub, &thread);
+                    }
                     if let Some(t) = ended {
                         // The turn's end is acked before its reactions, which may take a
                         // while (retried, or given up on). The reactions run even when the
