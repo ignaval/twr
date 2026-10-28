@@ -4991,7 +4991,8 @@ fn account_add_rechecks_collisions_once_the_directory_exists() {
 fn open_pty() -> (std::fs::File, std::fs::File) {
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    // SAFETY: plain calls on the descriptor posix_openpt returned; `name` outlives ptsname_r.
+    // SAFETY: plain calls on the descriptor posix_openpt returned; `name` (128 bytes, what
+    // TIOCPTYGNAME writes) outlives ptsname_r / the ioctl.
     unsafe {
         let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
         assert!(
@@ -5004,6 +5005,15 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
         assert_eq!(libc::grantpt(fd), 0, "grantpt");
         assert_eq!(libc::unlockpt(fd), 0, "unlockpt");
         let mut name = [0 as libc::c_char; 128];
+        // macOS has no ptsname_r in libc (and ptsname's buffer is shared between threads);
+        // TIOCPTYGNAME is what its ptsname asks.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            libc::ioctl(fd, libc::TIOCPTYGNAME as _, name.as_mut_ptr()),
+            0,
+            "TIOCPTYGNAME"
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             libc::ptsname_r(fd, name.as_mut_ptr(), name.len()),
             0,
