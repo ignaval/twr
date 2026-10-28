@@ -55,6 +55,57 @@ pub struct Glance {
     pub active: bool,
     /// Its orchestrator; `None` when it has none.
     pub orch: Option<OrchGlance>,
+    /// Its worker threads, oldest first, for the rows under its card in the sidebar
+    /// ([`WorkerGlance`]); `None` when its hub did not say.
+    pub workers: Option<Vec<WorkerGlance>>,
+}
+
+/// One of a workspace's worker threads, as its hub said it ([`Glance::workers`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerGlance {
+    /// Its thread id.
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Its status.
+    pub status: ThreadStatus,
+    /// Its color, as its hub's registry holds it ([`twr_core::reduce::ThreadView::color`]).
+    pub color: Option<u8>,
+    /// It is parked.
+    pub parked: bool,
+}
+
+impl WorkerGlance {
+    /// The workers of a `hub.glance`'s `workers` or a `thread.list` (its orchestrators left
+    /// out); `None` when `list` is not a list.
+    fn list(list: &serde_json::Value) -> Option<Vec<WorkerGlance>> {
+        let list = list.as_array()?;
+        Some(
+            list.iter()
+                .filter(|t| t["role"] != "orchestrator")
+                .filter_map(|t| {
+                    Some(WorkerGlance {
+                        id: t["id"].as_str()?.to_string(),
+                        name: t["name"].as_str()?.to_string(),
+                        status: status_of(&t["status"]),
+                        color: t["color"].as_u64().and_then(|c| u8::try_from(c).ok()),
+                        parked: t["parked"] == true,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// A thread of the current workspace's registry as its hub would say it.
+    pub fn of(t: &twr_core::reduce::ThreadView) -> WorkerGlance {
+        WorkerGlance {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            status: t.status(),
+            color: t.color,
+            parked: t.parked,
+        }
+    }
 }
 
 /// A workspace's orchestrator, as its hub said it ([`Glance`]).
@@ -91,11 +142,12 @@ impl Glance {
         Glance {
             active: v["active"] == true,
             orch,
+            workers: WorkerGlance::list(&v["workers"]),
         }
     }
 
     /// What an older hub's `thread.list` says (no `hub.glance`): the current orchestrator's
-    /// status, without its reply, and whether a thread works.
+    /// status, without its reply, whether a thread works, and its workers.
     pub fn from_threads(threads: &serde_json::Value) -> Glance {
         let list = threads.as_array().map(Vec::as_slice).unwrap_or_default();
         let orch = list
@@ -111,7 +163,11 @@ impl Glance {
             !(t["role"] == "orchestrator" && t["retired"] == true)
                 && matches!(t["status"].as_str(), Some("running" | "background"))
         });
-        Glance { active, orch }
+        Glance {
+            active,
+            orch,
+            workers: WorkerGlance::list(threads),
+        }
     }
 }
 
@@ -392,9 +448,10 @@ impl AppState {
         self.switchable() && !self.ws_docked() && !self.compact()
     }
 
-    /// Whether the workspace sidebar is docked left of the views ([`crate::sidebar`]): the
-    /// TUI opened on a workspace, the sidebar is not hidden, the layout is the full one and
-    /// the screen is [`crate::sidebar::DOCK_MIN_WIDTH`] columns wide or more.
+    /// Whether the workspaces are docked in the sidebar left of the views
+    /// ([`crate::sidebar`]): the TUI opened on a workspace, their part is not hidden (Ctrl-T),
+    /// the layout is the full one and the screen is [`crate::sidebar::DOCK_MIN_WIDTH`]
+    /// columns wide or more.
     pub fn ws_docked(&self) -> bool {
         self.workspace.is_some()
             && !self.view.ws_sidebar_hidden
@@ -402,13 +459,36 @@ impl AppState {
             && self.view.width >= crate::sidebar::DOCK_MIN_WIDTH
     }
 
-    /// The columns the views get: the terminal's, less the docked workspace sidebar's.
+    /// Whether the worker cards are in the sidebar, under the current workspace's card when
+    /// the workspaces are docked too ([`AppState::ws_docked`]): the stack view of the full
+    /// layout, the cards not hidden (Ctrl-B), from [`crate::ui::SIDE_MIN_WIDTH`] columns.
+    /// Narrower, they are a row above the conversation.
+    pub fn cards_docked(&self) -> bool {
+        self.cards_docked_at(self.view.width)
+    }
+
+    /// [`AppState::cards_docked`] on a screen `width` columns wide.
+    pub fn cards_docked_at(&self, width: u16) -> bool {
+        !self.compact()
+            && self.view.screen == Screen::Stack
+            && !self.view.sidebar_hidden
+            && width >= crate::ui::SIDE_MIN_WIDTH
+    }
+
+    /// The columns of the sidebar, its border included ([`crate::sidebar::dock_width`]); 0
+    /// when nothing is docked.
+    pub fn dock_width(&self) -> u16 {
+        self.dock_width_at(self.view.width)
+    }
+
+    /// [`AppState::dock_width`] on a screen `width` columns wide.
+    pub fn dock_width_at(&self, width: u16) -> u16 {
+        crate::sidebar::dock_width(width, self.cards_docked_at(width), self.ws_docked())
+    }
+
+    /// The columns the views get: the terminal's, less the sidebar's.
     pub fn content_width(&self) -> u16 {
-        if self.ws_docked() {
-            self.view.width.saturating_sub(crate::sidebar::DOCK_WIDTH)
-        } else {
-            self.view.width
-        }
+        self.view.width.saturating_sub(self.dock_width())
     }
 
     /// Whether the workspace list is open as a drawer: opened, and not docked or in the
@@ -542,9 +622,9 @@ impl AppState {
         // A drawer opened on a narrower screen is not to come back with it.
         self.view.ws_drawer = false;
         self.view.status = Some(if on {
-            "workspace sidebar shown (Ctrl-T hides it)".into()
+            "workspaces shown in the sidebar (Ctrl-T hides them)".into()
         } else {
-            "workspace sidebar hidden (Ctrl-T shows it)".into()
+            "workspaces hidden from the sidebar (Ctrl-T shows them)".into()
         });
         vec![Action::WsSidebar(on)]
     }
@@ -1038,7 +1118,16 @@ impl AppState {
                 preview,
             }
         });
-        Some(Glance { active, orch })
+        let workers = threads
+            .iter()
+            .filter(|t| !t.is_orchestrator())
+            .map(|t| WorkerGlance::of(t))
+            .collect();
+        Some(Glance {
+            active,
+            orch,
+            workers: Some(workers),
+        })
     }
 
     /// Keeps what the current workspace's card shows ([`AppState::tab_glance`]) as its tab's
@@ -1498,6 +1587,7 @@ mod tests {
                 preview: Some("done".into()),
                 ..Default::default()
             }),
+            workers: None,
         };
         let running = TabHub::Running {
             threads: 1,
@@ -1560,6 +1650,7 @@ mod tests {
                     preview: Some("polled".into()),
                     ..Default::default()
                 }),
+                workers: None,
             }),
         }]);
         let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
@@ -1803,7 +1894,7 @@ mod tests {
         use crate::select::PaneId;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut st = in_workspaces("default", &["default", "a"]);
-        let screen = crate::app::tests::draw(&mut st, 100, 30);
+        let screen = crate::app::tests::draw(&mut st, 90, 30);
         let tab = st
             .view
             .panes
@@ -2176,7 +2267,7 @@ mod tests {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut st = in_workspaces("default", &["default", "a"]);
         st.view.help = true;
-        let screen = crate::app::tests::draw(&mut st, 100, 30);
+        let screen = crate::app::tests::draw(&mut st, 90, 30);
         let tab = st.view.panes.get(&PaneId::Tab("a".into())).unwrap().area;
         let at = |kind| MouseEvent {
             kind,

@@ -477,14 +477,14 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     (
         "/sidebar",
         "/sidebar [on|off]",
-        "show or hide the thread sidebar (Ctrl-B); returns to the conversation",
+        "show or hide the thread cards (Ctrl-B); returns to the conversation",
         &[ArgKind::OnOff],
     ),
     (
         "/spaces",
         "/spaces [on|off]",
-        "show or hide the workspace sidebar (Ctrl-T): each workspace's orchestrator, new \
-         workspace, settings",
+        "show or hide the workspaces in the sidebar (Ctrl-T): each workspace's orchestrator \
+         and threads, new workspace, settings",
         &[ArgKind::OnOff],
     ),
     (
@@ -1169,7 +1169,7 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
             ("off".into(), "parked threads are hidden".into()),
         ],
         Some(ArgKind::OnOff) if cmd == "/sidebar" => vec![
-            ("on".into(), "thread sidebar is shown".into()),
+            ("on".into(), "thread cards are shown".into()),
             ("off".into(), "conversation uses the full area".into()),
         ],
         Some(ArgKind::OnOff) if cmd == "/compact" => vec![

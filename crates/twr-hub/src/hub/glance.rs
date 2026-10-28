@@ -17,7 +17,7 @@ pub const GLANCE_PREVIEW_CHARS: usize = 300;
 
 impl Hub {
     /// `hub.glance`: `{workspace, threads, running, permissions, questions, active,
-    /// orchestrator}`.
+    /// orchestrator, workers}`.
     ///
     /// `threads` counts the worker threads (every thread whose role is not `orchestrator`,
     /// as `thread.list` lists them), `running` those of them running or in the background,
@@ -28,7 +28,9 @@ impl Hub {
     /// name, status, preview, preview_seq}`: `preview` is its latest final `agent.text` of any
     /// turn as stored (a capped one's preview, no blob read), cut to
     /// [`GLANCE_PREVIEW_CHARS`] characters with nothing added, and `preview_seq` that event's
-    /// seq; both null until it replied.
+    /// seq; both null until it replied. `workers` lists the worker threads `threads` counts,
+    /// oldest first, each `{id, name, status, color, parked}`, for the rows under the
+    /// workspace's card.
     pub fn glance(&self) -> Result<Value, RpcError> {
         let workspace = self.workspace().to_string();
         let core = self.inner.core();
@@ -74,6 +76,16 @@ impl Hub {
             "questions": of(AttentionReason::Question),
             "active": active,
             "orchestrator": orchestrator,
+            "workers": workers
+                .iter()
+                .map(|v| json!({
+                    "id": v.id,
+                    "name": v.name,
+                    "status": v.status().as_str(),
+                    "color": v.color,
+                    "parked": v.parked,
+                }))
+                .collect::<Vec<_>>(),
         }))
     }
 }
@@ -179,6 +191,7 @@ mod tests {
                 "threads": 0, "running": 0, "permissions": 0, "questions": 0,
                 "active": false,
                 "orchestrator": null,
+                "workers": [],
             })
         );
         for (id, name) in [("t1", "api"), ("t2", "web"), ("t3", "docs")] {
@@ -188,6 +201,20 @@ mod tests {
         assert_eq!(
             (g["threads"].clone(), g["orchestrator"].clone()),
             (json!(3), Value::Null)
+        );
+        let names: Vec<_> = g["workers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| (w["name"].clone(), w["status"].clone(), w["parked"].clone()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                (json!("api"), json!("idle"), json!(false)),
+                (json!("web"), json!("idle"), json!(false)),
+                (json!("docs"), json!("idle"), json!(false)),
+            ]
         );
         append(
             &hub,

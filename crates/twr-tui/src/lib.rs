@@ -1843,9 +1843,10 @@ async fn poll_tabs(ws: &dyn Workspaces, due: Vec<String>) -> Vec<workspace::Poll
 /// How the hub of workspace `name` on `socket` is, for its tab and its sidebar card: stopped
 /// when nothing listens (it is never started to be asked), busy when it does not answer within
 /// [`TAB_TIMEOUT`] (or is another workspace's), else its counts and what it says of its
-/// orchestrator, in one `hub.glance`. A hub older than that method answers `thread.list` and
-/// `attention.list` instead, as tabs asked before: the same counts, its orchestrator's status
-/// without its latest reply.
+/// orchestrator and its workers, in one `hub.glance` (and its `thread.list` from a hub whose
+/// glance does not list its workers yet). A hub older than that method answers `thread.list`
+/// and `attention.list` instead, as tabs asked before: the same counts, its orchestrator's
+/// status without its latest reply.
 async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<workspace::Glance>) {
     use workspace::{Glance, TabHub};
     let Ok(Ok(mut c)) = tokio::time::timeout(TAB_TIMEOUT, Client::connect(socket)).await else {
@@ -1855,6 +1856,14 @@ async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<wor
         let hello = c.hello(json!({ "client": CLIENT_NAME })).await?;
         check_hub_workspace(&hello, name, socket)?;
         match c.call("hub.glance", Value::Null).await {
+            // A hub that predates its `workers` names them in `thread.list`, read-only too.
+            // (Its counts stand without them.)
+            Ok(mut g) if g.is_object() && g["workers"].is_null() => {
+                if let Ok(threads) = c.call("thread.list", Value::Null).await {
+                    g["workers"] = threads;
+                }
+                anyhow::Ok(Ok(g))
+            }
             Ok(g) => anyhow::Ok(Ok(g)),
             Err(e)
                 if e.downcast_ref::<twr_core::proto::RpcError>()
@@ -3420,7 +3429,7 @@ async fn drive(
                     Saved::WsSidebar(on, Err(e)) => {
                         let how = if on { "shown" } else { "hidden" };
                         state.view.status = Some(format!(
-                            "workspace sidebar {how}, but not remembered for the next runs: {e}"
+                            "workspaces {how} in the sidebar, but not remembered for the next runs: {e}"
                         ));
                     }
                     Saved::WsSidebar(_, Ok(())) => {}
@@ -4395,6 +4404,8 @@ mod tests {
     enum Fake {
         /// `hub.glance` with this.
         Glance(Value),
+        /// `hub.glance` without its `workers`, and `thread.list` with these.
+        Mid(Value, Value),
         /// An older hub: no `hub.glance`, `thread.list` and `attention.list` with these.
         Old(Value, Value),
         /// Takes the connection and never answers.
@@ -4434,7 +4445,10 @@ mod tests {
                         }
                         let answer = match (method.as_str(), &fake) {
                             ("hello", _) => json!({"result": {"workspace": name}}),
-                            ("hub.glance", Fake::Glance(g)) => json!({"result": g}),
+                            ("hub.glance", Fake::Glance(g) | Fake::Mid(g, _)) => {
+                                json!({"result": g})
+                            }
+                            ("thread.list", Fake::Mid(_, t)) => json!({"result": t}),
                             ("thread.list", Fake::Old(t, _)) => json!({"result": t}),
                             ("attention.list", Fake::Old(_, a)) => json!({"result": a}),
                             _ => json!({"error": {"code": "method_not_found", "message": method}}),
@@ -4488,8 +4502,17 @@ mod tests {
             "active": true,
             "orchestrator": {"id": "o", "name": "orch", "status": "waiting",
                              "preview": "Approve the deploy?", "preview_seq": 9},
+            "workers": [{"id": "w1", "name": "api", "status": "running", "color": 3,
+                         "parked": false}],
         });
-        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance));
+        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance.clone()));
+        let mut bare = glance;
+        bare.as_object_mut().unwrap().remove("workers");
+        let listed = json!([
+            {"id": "o", "role": "orchestrator", "name": "orch", "status": "waiting"},
+            {"id": "w2", "name": "web", "status": "waiting", "parked": true},
+        ]);
+        let (mid_sock, mid_asked) = fake_hub(dir.path(), "mid", Fake::Mid(bare, listed));
         let threads = json!([
             {"role": "orchestrator", "status": "running"},
             {"role": "orchestrator", "status": "idle", "retired": true},
@@ -4501,6 +4524,7 @@ mod tests {
         let ws = Fakes(
             [
                 ("new", new_sock),
+                ("mid", mid_sock),
                 ("old", old_sock),
                 ("silent", silent_sock),
                 ("stopped", dir.path().join("stopped.sock")),
@@ -4530,7 +4554,32 @@ mod tests {
         let o = g.orch.unwrap();
         assert_eq!(o.status, twr_core::reduce::ThreadStatus::Waiting);
         assert_eq!(o.preview.as_deref(), Some("Approve the deploy?"));
+        assert_eq!(
+            g.workers.unwrap(),
+            [workspace::WorkerGlance {
+                id: "w1".into(),
+                name: "api".into(),
+                status: twr_core::reduce::ThreadStatus::Running,
+                color: Some(3),
+                parked: false,
+            }]
+        );
         assert_eq!(*new_asked.lock().unwrap(), ["hello", "hub.glance"]);
+        // A hub whose glance predates its workers names them in its thread list.
+        let mid = by("mid");
+        assert!(matches!(mid.hub, TabHub::Running { threads: 3, .. }));
+        let workers = mid.glance.unwrap().workers.unwrap();
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| (w.name.as_str(), w.status, w.parked))
+                .collect::<Vec<_>>(),
+            [("web", twr_core::reduce::ThreadStatus::Waiting, true)]
+        );
+        assert_eq!(
+            *mid_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list"]
+        );
         let old = by("old");
         assert_eq!(
             old.hub,
