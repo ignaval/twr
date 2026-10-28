@@ -6,11 +6,13 @@
 //! session ran on, pins are kept, and `account.remove {move_to}` moves every thread on the
 //! account, or none.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::FutureExt;
 use serde_json::{json, Value};
 use tokio::sync::Notify;
 use tokio::time::timeout;
@@ -19,8 +21,12 @@ use twr_core::config::{AccountConfig, BoxConfig, Config, ProjectConfig};
 use twr_core::event::*;
 use twr_core::paths::Paths;
 use twr_core::proto::{codes, RpcError};
+use twr_core::runner::{AgentInfo, AgentLogin};
 use twr_core::usage::UsageWindow;
-use twr_hub::hub::{AccountAddParams, AccountRemoveParams, ModelRequest, NativeDirFn};
+use twr_hub::hub::{
+    AccountAddParams, AccountProbe, AccountRemoveParams, AccountStatusParams, ModelRequest,
+    NativeDirFn,
+};
 use twr_hub::{Caller, Hub, HubOptions, JobStart, NewThread};
 
 const WAIT: Duration = Duration::from_secs(20);
@@ -146,10 +152,16 @@ impl Adapter for MoveAdapter {
 }
 
 /// A scratch home: projects `api` (no pin) and `acme-api` (pinned to `work`), the accounts'
-/// directories, and every start the runtimes saw.
+/// directories, and every start the runtimes saw. The runtimes' own directories are
+/// `<home>/<native>/<runtime>` (`native`, `native` by default: what the hub's selector
+/// variable says at its next start). With `probe`, the hub checks logins: each account's
+/// answer by its directory's name (`native` for the native account's; default logged in).
 struct Env {
     home: tempfile::TempDir,
     shared: Arc<Shared>,
+    native: Mutex<String>,
+    probe: AtomicBool,
+    logins: Arc<Mutex<HashMap<String, AgentLogin>>>,
 }
 
 impl Env {
@@ -168,7 +180,41 @@ impl Env {
         Env {
             home,
             shared: Arc::default(),
+            native: Mutex::new("native".into()),
+            probe: AtomicBool::new(false),
+            logins: Arc::default(),
         }
+    }
+
+    /// The login check's answer for the account in directory `name` from now on.
+    fn set_login(&self, name: &str, login: AgentLogin) {
+        self.logins.lock().unwrap().insert(name.into(), login);
+    }
+
+    /// The login check ([`Env::probe`]).
+    fn account_probe(&self) -> AccountProbe {
+        let logins = Arc::clone(&self.logins);
+        Arc::new(move |rt: String, dir: Option<PathBuf>| {
+            let name = dir
+                .as_deref()
+                .and_then(Path::file_name)
+                .map_or("native".to_string(), |n| n.to_string_lossy().into_owned());
+            let login = logins
+                .lock()
+                .unwrap()
+                .get(&name)
+                .copied()
+                .unwrap_or(AgentLogin::LoggedIn);
+            async move {
+                AgentInfo {
+                    runtime: rt,
+                    found: true,
+                    login,
+                    ..Default::default()
+                }
+            }
+            .boxed()
+        })
     }
 
     fn path(&self, p: &str) -> PathBuf {
@@ -230,9 +276,12 @@ impl Env {
         let paths = Paths::with_home(self.home.path());
         let mut o = HubOptions::new(paths.db_file(), config);
         o.accounts_root = Some(paths.accounts_dir());
-        let native = self.path("native");
+        let native = self.path(&self.native.lock().unwrap());
         let native: NativeDirFn = Arc::new(move |rt: &str| Some(native.join(rt)));
         o.native_dir = Some(native);
+        if self.probe.load(Ordering::SeqCst) {
+            o.account_probe = Some(self.account_probe());
+        }
         o.git_tick = Some(Duration::ZERO);
         o.disk_tick = Some(Duration::ZERO);
         o.trash_tick = Some(Duration::ZERO);
@@ -265,6 +314,11 @@ impl Env {
     async fn restart(&self, hub: Hub, config: Config) -> Hub {
         hub.shutdown().await;
         drop(hub);
+        self.reopen(config).await
+    }
+
+    /// Opens the home again with `config`, its hub shut down.
+    async fn reopen(&self, config: Config) -> Hub {
         timeout(WAIT, async {
             loop {
                 match Hub::open(self.opts(config.clone())).await {
@@ -2630,5 +2684,233 @@ async fn an_account_move_back_keeps_the_threads_model_and_effort() {
     let s = env.last_start(&c);
     assert!(s.cfg.resume_session.is_none(), "a new session");
     assert_eq!(s.cfg.model, None);
+    hub.shutdown().await;
+}
+
+/// A native session lives in the runtime's own directory the hub's selector variable gave it
+/// (`ext.twr.session_store` on its start; the runtime's environment is not changed): a move
+/// back to the native account resumes it while that directory is the same after a hub
+/// restart, and starts a new session with the full handoff once the variable selects another
+/// one, checked again when the turn that carries the resume starts. A start from before the
+/// stamp is taken to be in the runtime's own directory: it still resumes.
+#[tokio::test]
+async fn a_native_session_resumes_only_in_the_runtimes_own_directory() {
+    let env = Env::new();
+    let hub = env.open(env.config(None)).await;
+    let a = create(&hub, new_thread("api", "a")).await;
+    turn(&hub, &a, "hi").await;
+    let first = session(&hub, &a);
+    let stamp = start_stamps(&events(&hub, &a)).remove(0);
+    assert_eq!(
+        stamp["session_store"],
+        json!(env.dir("native/claude-code")),
+        "{stamp}"
+    );
+    assert!(get(&env.last_start(&a).cfg.env, "CLAUDE_CONFIG_DIR").is_empty());
+
+    // The same directory after a restart: the session resumes.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let hub = env.restart(hub, env.config(None)).await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&first), "{r}");
+    turn(&hub, &a, "hi").await;
+    assert_eq!(
+        env.last_start(&a).cfg.resume_session.as_deref(),
+        Some(first.as_str())
+    );
+
+    // Back again, then the hub restarts with its variable selecting another directory before
+    // the turn: the turn drops the resume and starts a new session there.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&first), "{r}");
+    *env.native.lock().unwrap() = "native2".into();
+    let hub = env.restart(hub, env.config(None)).await;
+    turn(&hub, &a, "go on").await;
+    let s = env.last_start(&a);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "another directory's session"
+    );
+    assert!(get(&s.cfg.env, "CLAUDE_CONFIG_DIR").is_empty());
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier claude-code session of this thread \
+             (a): the runtime's own directory is not the one that session ran in"
+        ),
+        "{prompt}"
+    );
+    let twr = last_turn_twr(&hub, &a);
+    assert_eq!(twr["resume_dropped"], json!(&first), "{twr}");
+    let second = session(&hub, &a);
+    assert_ne!(second, first);
+    let stamp = start_stamps(&events(&hub, &a)).pop().unwrap();
+    assert_eq!(
+        stamp["session_store"],
+        json!(env.dir("native2/claude-code"))
+    );
+
+    // And at the move: away, the directory changed again, back: a new session.
+    move_to(&hub, &a, "work", false, &user()).await.unwrap();
+    turn(&hub, &a, "hi").await;
+    *env.native.lock().unwrap() = "native3".into();
+    let hub = env.restart(hub, env.config(None)).await;
+    let r = move_to(&hub, &a, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &a, "hi").await;
+    let s = env.last_start(&a);
+    assert!(s.cfg.resume_session.is_none());
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (a) moved to another account:"));
+    assert_ne!(session(&hub, &a), second);
+
+    // A start from before the stamp (none on it, as this build's runtimes' starts are
+    // stamped when the hub takes them in): taken to be in the runtime's own directory.
+    let b = create(&hub, new_thread("api", "b")).await;
+    let adapter = Source::Adapter("claude-code".into());
+    hub.append(
+        &b,
+        None,
+        adapter.clone(),
+        EventBody::ThreadStarted(SessionPayload {
+            session_id: Some("legacy-1".into()),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    hub.append(
+        &b,
+        None,
+        adapter,
+        EventBody::ThreadStopped(SessionPayload {
+            session_id: Some("legacy-1".into()),
+            ext: json!({"twr": {"reason": MODEL_RESTART_REASON}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    assert!(start_stamps(&events(&hub, &b)).iter().all(|t| t.is_null()));
+    move_to(&hub, &b, "work", false, &user()).await.unwrap();
+    turn(&hub, &b, "hi").await;
+    let r = move_to(&hub, &b, "default", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!("legacy-1"), "{r}");
+    turn(&hub, &b, "hi").await;
+    assert_eq!(
+        env.last_start(&b).cfg.resume_session.as_deref(),
+        Some("legacy-1")
+    );
+    hub.shutdown().await;
+}
+
+/// `account.status {refresh}` of claude-code's `work`, `after_login` as `twr account login`
+/// asks after a login that ended well.
+async fn check_work(hub: &Hub, after_login: bool) {
+    hub.account_status(
+        AccountStatusParams {
+            runtime: Some("claude-code".into()),
+            account: Some("work".into()),
+            refresh: true,
+            after_login,
+        },
+        &user(),
+    )
+    .await
+    .unwrap();
+}
+
+/// A session ran under its account's login then: once a login of the account is recorded
+/// since (`twr account login`, an `account.status` with `after_login`), or a check found it
+/// logged in after logged out, a move back starts a new session with the full handoff (the
+/// login may be another organization's), also when the login comes between the move back and
+/// its turn. Checks that keep finding it logged in change nothing: the session resumes.
+#[tokio::test]
+async fn a_move_back_after_a_login_starts_a_new_session() {
+    let env = Env::new();
+    env.probe.store(true, Ordering::SeqCst);
+    let hub = env.open(env.config(None)).await;
+    let w = create(
+        &hub,
+        NewThread {
+            account: Some("work".into()),
+            ..new_thread("api", "w")
+        },
+    )
+    .await;
+    turn(&hub, &w, "hi").await;
+    let first = session(&hub, &w);
+
+    // Checked again, still logged in: the session resumes.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    check_work(&hub, false).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&first), "{r}");
+    turn(&hub, &w, "hi").await;
+    assert_eq!(
+        env.last_start(&w).cfg.resume_session.as_deref(),
+        Some(first.as_str())
+    );
+
+    // A login recorded (`twr account login`): a new session.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    check_work(&hub, true).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    let s = env.last_start(&w);
+    assert!(
+        s.cfg.resume_session.is_none(),
+        "a session from before the login"
+    );
+    assert!(s
+        .prompt
+        .unwrap()
+        .starts_with("[twr handoff] This thread (w) moved to another account:"));
+    let second = session(&hub, &w);
+    let stamp = start_stamps(&events(&hub, &w)).pop().unwrap();
+    assert_eq!(stamp["account_login"], json!(1), "{stamp}");
+
+    // Logged out, then in again, as the checks saw it: a new session.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    env.set_login("work", AgentLogin::LoggedOut);
+    check_work(&hub, false).await;
+    env.set_login("work", AgentLogin::LoggedIn);
+    check_work(&hub, false).await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    turn(&hub, &w, "hi").await;
+    assert!(env.last_start(&w).cfg.resume_session.is_none());
+    let third = session(&hub, &w);
+    assert_ne!(third, second);
+
+    // A login between the move back and its turn: the turn drops the resume.
+    move_to(&hub, &w, "work2", true, &user()).await.unwrap();
+    turn(&hub, &w, "hi").await;
+    let r = move_to(&hub, &w, "work", false, &user()).await.unwrap();
+    assert_eq!(r["resumes"], json!(&third), "{r}");
+    check_work(&hub, true).await;
+    turn(&hub, &w, "go on").await;
+    let s = env.last_start(&w);
+    assert!(s.cfg.resume_session.is_none());
+    let prompt = s.prompt.unwrap();
+    assert!(
+        prompt.starts_with(
+            "[twr handoff] twr did not resume the earlier claude-code session of this thread \
+             (w): its account was logged in again since that session ran"
+        ),
+        "{prompt}"
+    );
+    assert_eq!(last_turn_twr(&hub, &w)["resume_dropped"], json!(&third));
     hub.shutdown().await;
 }

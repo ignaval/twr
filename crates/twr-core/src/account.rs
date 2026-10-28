@@ -22,7 +22,8 @@
 //! named `default`, or a removed native account next to a live named one of its name. The name
 //! stands for the named account then ([`AccountsView::resolve`]); the native entry says so
 //! ([`AccountInfo::shadowed`]), and lookups by name skip it ([`AccountInfo::answers_to`]).
-//! `account.status` events keep each account's last known login state. [`AccountsView`] folds
+//! `account.status` events keep each account's last known login state, and count its logins
+//! ([`AccountsView::login_generation`]). [`AccountsView`] folds
 //! the config and those events; the hub and every client build it the same way, so they agree
 //! on when a runtime shows account labels ([`AccountsView::shows_labels`]).
 //!
@@ -353,6 +354,33 @@ struct Status {
     checked_at: DateTime<Utc>,
 }
 
+/// An account's logins as its `account.status` events tell them
+/// ([`AccountsView::login_generation`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct Logins {
+    /// How many logins were seen: a status recorded after a login twr ran (`after_login`), or
+    /// one logged in after one logged out or missing.
+    generation: u64,
+    /// The last state known (not [`Login::Unknown`]) was logged out or missing.
+    out: bool,
+}
+
+impl Logins {
+    /// Folds status `login` (`after_login`: recorded after a login twr ran).
+    fn apply(&mut self, login: Login, after_login: bool) {
+        match login {
+            Login::LoggedIn => {
+                if after_login || self.out {
+                    self.generation += 1;
+                }
+                self.out = false;
+            }
+            Login::LoggedOut | Login::Missing => self.out = true,
+            Login::Unknown => {}
+        }
+    }
+}
+
 /// Every account per runtime: the config's declarations and twr's records, folded from the
 /// control stream (`account.added`, `account.removed`, `account.status` on the hub thread).
 /// The hub keeps one (replayed at start, then live), and so does every client.
@@ -372,6 +400,10 @@ pub struct AccountsView {
     native_status: BTreeMap<String, Status>,
     /// Named accounts' last status, by (runtime, name).
     status: BTreeMap<(String, String), Status>,
+    /// The native account's logins, per runtime (whatever its name was then).
+    native_logins: BTreeMap<String, Logins>,
+    /// Named accounts' logins, by (runtime, name).
+    logins: BTreeMap<(String, String), Logins>,
     /// Where named accounts declared without a directory live: `<root>/<runtime>/<name>`.
     default_root: Option<PathBuf>,
 }
@@ -475,9 +507,17 @@ impl AccountsView {
                 };
                 if p.native || self.native_owns(&p.runtime, &p.account) {
                     self.native_status.insert(p.runtime.clone(), status);
+                    self.native_logins
+                        .entry(p.runtime.clone())
+                        .or_default()
+                        .apply(p.login, p.after_login);
                 } else {
-                    self.status
-                        .insert((p.runtime.clone(), p.account.clone()), status);
+                    let key = (p.runtime.clone(), p.account.clone());
+                    self.logins
+                        .entry(key.clone())
+                        .or_default()
+                        .apply(p.login, p.after_login);
+                    self.status.insert(key, status);
                 }
             }
             _ => {}
@@ -628,6 +668,24 @@ impl AccountsView {
             Some(name) if self.native_owns(runtime, name) => Some(self.native_info(runtime)),
             Some(name) => self.named_info(runtime, name),
         }
+    }
+
+    /// The login generation of account `account` of `runtime` (`None`: the native one, as
+    /// [`AccountsView::info`] reads a name): how many logins its `account.status` events
+    /// show, a status recorded after a login twr ran (`twr account login`, `twr account add`:
+    /// `after_login`) or one logged in after the last known state was logged out or missing.
+    /// 0 before any. A session that ran under an earlier generation may be another login's
+    /// (another organization's): a move back does not resume it (`hub::switch`). A login made
+    /// outside twr over a login that was never seen logged out is not seen. Kept by name: a
+    /// removal does not reset it.
+    pub fn login_generation(&self, runtime: &str, account: Option<&str>) -> u64 {
+        let logins = match account {
+            Some(name) if !self.native_owns(runtime, name) => {
+                self.logins.get(&(runtime.to_string(), name.to_string()))
+            }
+            _ => self.native_logins.get(runtime),
+        };
+        logins.map_or(0, |l| l.generation)
     }
 
     /// Whether `runtime` shows account labels: it has two or more accounts (the native one
@@ -1545,6 +1603,63 @@ mod tests {
             v.info("claude-code", Some("later")).unwrap().login,
             Some(Login::LoggedIn)
         );
+    }
+
+    /// A login generation is raised by a status recorded after a login twr ran that found it
+    /// logged in, and by logged in after logged out or missing (an unknown check between them
+    /// changes nothing); never by checks that keep finding it logged in. The native account's
+    /// is the runtime's, whatever its name.
+    #[test]
+    fn logins_raise_the_login_generation() {
+        let mut v = AccountsView::new(&Config::default());
+        let after = |rt: &str, name: &str, native: bool, login: Login| {
+            hub(EventBody::AccountStatus(AccountStatus {
+                runtime: rt.into(),
+                account: name.into(),
+                native,
+                login,
+                after_login: true,
+                ..Default::default()
+            }))
+        };
+        v.apply(&added("codex", "work", Some("/w"), false));
+        assert_eq!(v.login_generation("codex", Some("work")), 0);
+        v.apply(&status("codex", "work", Login::LoggedIn));
+        v.apply(&status("codex", "work", Login::LoggedIn));
+        assert_eq!(v.login_generation("codex", Some("work")), 0);
+        v.apply(&after("codex", "work", false, Login::LoggedIn));
+        assert_eq!(v.login_generation("codex", Some("work")), 1);
+        // A login that did not end logged in raises nothing.
+        v.apply(&after("codex", "work", false, Login::LoggedOut));
+        v.apply(&status("codex", "work", Login::Unknown));
+        assert_eq!(v.login_generation("codex", Some("work")), 1);
+        // Logged in again after logged out (and an unknown check): another login.
+        v.apply(&status("codex", "work", Login::LoggedIn));
+        assert_eq!(v.login_generation("codex", Some("work")), 2);
+        v.apply(&status("codex", "work", Login::Missing));
+        v.apply(&after("codex", "work", false, Login::LoggedIn));
+        assert_eq!(
+            v.login_generation("codex", Some("work")),
+            3,
+            "one login, once"
+        );
+        // The native account's, by any name it has.
+        assert_eq!(v.login_generation("codex", None), 0);
+        v.apply(&after("codex", "default", true, Login::LoggedIn));
+        v.apply(&added("codex", "personal", None, true));
+        assert_eq!(v.login_generation("codex", None), 1);
+        assert_eq!(v.login_generation("codex", Some("personal")), 1);
+        assert_eq!(v.login_generation("claude-code", None), 0);
+        // Old events (no `after_login`) read false.
+        let old: AccountStatus = serde_json::from_value(
+            json!({"runtime": "codex", "account": "work", "login": "logged_in"}),
+        )
+        .unwrap();
+        assert!(!old.after_login);
+        assert!(serde_json::to_value(&old)
+            .unwrap()
+            .get("after_login")
+            .is_none());
     }
 
     #[test]

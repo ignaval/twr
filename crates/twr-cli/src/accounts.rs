@@ -1360,12 +1360,15 @@ async fn after_login(
     ended: Option<DateTime<Utc>>,
     own: &Native,
 ) -> anyhow::Result<()> {
+    // A login that ran (`ended`) is recorded as one (`after_login`): a session from before
+    // it may be another login's, and a move back does not resume it.
+    let mut params = json!({ "runtime": runtime, "account": name, "refresh": true });
+    if ended.is_some() {
+        params["after_login"] = json!(true);
+    }
     let r = connect(socket)
         .await?
-        .call(
-            "account.status",
-            json!({ "runtime": runtime, "account": name, "refresh": true }),
-        )
+        .call("account.status", params)
         .await?;
     let entry = &r["runtimes"][runtime];
     let found = find(entry, name);

@@ -1017,6 +1017,54 @@ async fn the_orchestrator_lists_accounts_only() {
 /// changes, a runtime shows its labels while two of its accounts count (a named one logging
 /// in and out flips them), a missing CLI or directory is `missing`, `account.add` checks the
 /// new account, and a restart keeps the states.
+/// A check after a login twr ran (`account.status {refresh, after_login}`, what `twr account
+/// login` and `add` ask) is recorded when it finds the account logged in, unchanged too, with
+/// `after_login`; one that finds it logged out is recorded only as a change. It needs the
+/// account and `refresh`.
+#[tokio::test]
+async fn a_check_after_a_login_is_recorded_as_one() {
+    let home = tempfile::tempdir().unwrap();
+    let work_dir = home.path().join("cfg").join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let mut config = Config::default();
+    account(&mut config, "claude-code", "work", Some(&work_dir), false);
+    let logins = Logins::default();
+    let th = start(home.path(), config, Some(logins.probe())).await;
+    let mut c = th.client().await;
+    refresh(&mut c).await;
+    let before = control_of(&mut c, "account.status").await.len();
+    let after_login = json!({
+        "runtime": "claude-code", "account": "work", "refresh": true, "after_login": true,
+    });
+    let s = c.call("account.status", after_login.clone()).await.unwrap();
+    assert_eq!(entry(&s, "claude-code", "work")["login"], "logged_in");
+    let st = control_of(&mut c, "account.status").await;
+    assert_eq!(st.len(), before + 1, "{st:?}");
+    let last = &st.last().unwrap()["data"];
+    assert_eq!(
+        (&last["account"], &last["after_login"]),
+        (&json!("work"), &json!(true)),
+        "{last}"
+    );
+    // A plain check that finds the same records nothing, and its status has no `after_login`.
+    refresh(&mut c).await;
+    assert_eq!(control_of(&mut c, "account.status").await.len(), before + 1);
+    // A login that did not end logged in: recorded as the change it is, not as a login.
+    logins.set("claude-code:work", true, AgentLogin::LoggedOut);
+    c.call("account.status", after_login).await.unwrap();
+    let st = control_of(&mut c, "account.status").await;
+    assert_eq!(st.len(), before + 2);
+    assert!(st.last().unwrap()["data"].get("after_login").is_none());
+    for bad in [
+        json!({"runtime": "claude-code", "refresh": true, "after_login": true}),
+        json!({"runtime": "claude-code", "account": "work", "after_login": true}),
+    ] {
+        let e = c.call("account.status", bad).await.unwrap_err();
+        assert_eq!(code(&e), codes::BAD_REQUEST);
+    }
+    th.stop().await;
+}
+
 #[tokio::test]
 async fn login_checks_record_changes_and_flip_labels() {
     let home = tempfile::tempdir().unwrap();

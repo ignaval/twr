@@ -95,7 +95,13 @@
 //! account was not removed since that start, and a named account's runtime was given its
 //! directory by the path the move gives it now (`ext.twr.account_env_dir` of the account's
 //! binding then: a runtime may key its login on the path, Claude Code's macOS Keychain
-//! entry, so two links to one directory are two logins). So a move back to the account a
+//! entry, so two links to one directory are two logins). On the hub's own box, a native
+//! session's start recorded the runtime's own directory it is now (`ext.twr.session_store`,
+//! the hub's selector variable's: a start from before the stamp is taken to be in it), and
+//! the account was not logged in again since that start (`ext.twr.account_login`, the
+//! account's login generation then: a login `twr account login` or `add` recorded, or a
+//! check that found it logged in after logged out or missing, may be another organization's;
+//! one made outside twr over a login never seen logged out is not seen). So a move back to the account a
 //! thread left resumes its session there, and a move to another account of the runtime, to
 //! its account in another directory or by another path, or to an account removed and added
 //! again starts a new session with the full handoff; the turn that would resume checks all
@@ -151,6 +157,25 @@ const REMOVED: &str =
     "its account was removed since that session ran (it may be another login now)";
 const OTHER_PATH: &str =
     "its account is reached by another path than the one that session ran through";
+
+const OTHER_STORE: &str = "the runtime's own directory is not the one that session ran in";
+const OTHER_LOGIN: &str =
+    "its account was logged in again since that session ran (it may be another login now)";
+
+/// The runtime start that ran a session a move left, as its stamps say
+/// ([`Core::session_start`]).
+#[derive(Default)]
+struct SessionStart {
+    /// The named account's directory it ran in (`ext.twr.account_dir`).
+    began_in: Option<PathBuf>,
+    /// The native account's directory it ran in (`ext.twr.session_store`; `None`: a start
+    /// from before the stamp, or on another box).
+    store: Option<PathBuf>,
+    /// Its account's login generation (`ext.twr.account_login`; absent: 0).
+    login: u64,
+    /// Its control position (0: not known).
+    since: u64,
+}
 
 /// The tags around the handoff.
 const OPEN_TAG: &str = "<twr-handoff>";
@@ -312,7 +337,13 @@ impl Core {
     /// the session lives in the directory it began in, and another login there is not the
     /// one it ran on), or, on a named account, when its runtime was given that directory by
     /// another path than `env` ([`Core::launch_path`]: a runtime may key its login on the
-    /// path, Claude Code's macOS Keychain entry).
+    /// path, Claude Code's macOS Keychain entry). On the hub's own box, also when the native
+    /// account's session ran in another directory than the runtime's own now
+    /// (`ext.twr.session_store` against [`Core::session_store`]: the hub's selector variable
+    /// changed; a start without the stamp, from before it, is taken to be in it), or under
+    /// another login generation of the account than its now (`ext.twr.account_login`, absent:
+    /// 0, against `AccountsView::login_generation`: a login recorded since may be another
+    /// organization's).
     pub(super) fn departure_check(
         &self,
         thread: &str,
@@ -337,8 +368,24 @@ impl Core {
         let Some((i, seq, session, m)) = found else {
             return Ok(Err(NO_SESSION));
         };
-        if let Err(why) = self.session_in(thread, seq, &session, runtime, left_account(m), dir)? {
+        let start = self.session_start(thread, seq, &session)?;
+        if let Err(why) = self.session_in(&start, runtime, left_account(m), dir) {
             return Ok(Err(why));
+        }
+        // On the hub's own box: the native account's directory now, and the account's logins
+        // (a remote box's are its own).
+        let view = self.registry.get(thread);
+        let local = view.is_some_and(|v| v.box_name == super::LOCAL_BOX);
+        if local && target.is_none() {
+            if let Some(was) = &start.store {
+                let now = view.and_then(|v| self.session_store(v, runtime));
+                if !now.is_some_and(|n| n == *was || super::accounts::same_dir(&n, was)) {
+                    return Ok(Err(OTHER_STORE));
+                }
+            }
+        }
+        if local && start.login != self.accounts.login_generation(runtime, target.as_deref()) {
+            return Ok(Err(OTHER_LOGIN));
         }
         if target.is_some() && self.launch_path(thread, &moves, i)?.as_deref() != env {
             return Ok(Err(OTHER_PATH));
@@ -425,25 +472,12 @@ impl Core {
         }
     }
 
-    /// Whether session `session` of thread `thread`, which the move at `seq` left on account
-    /// `account` of `runtime` (`None`: the native one), ran in directory `dir` (the account's
-    /// now; `None` for the native account), and the account was not removed since (else
-    /// why not): the runtime start that ran it (the newest `thread.started` / `thread.resumed`
-    /// a runtime reported before the move that names that session or none; a park's or a
-    /// user's resume the hub recorded is no start, as `hub::retry` reads them) recorded that
-    /// directory (`ext.twr.account_dir`, stamped by the hub; absent for the native account),
-    /// and no `account.removed` of the account (but a `record_only` one: the account stayed)
-    /// came after that start. A start the log does not have counts as one in no directory,
-    /// from the log's beginning.
-    fn session_in(
-        &self,
-        thread: &str,
-        seq: u64,
-        session: &str,
-        runtime: &str,
-        account: Option<&str>,
-        dir: Option<&Path>,
-    ) -> anyhow::Result<Result<(), &'static str>> {
+    /// The runtime start that ran session `session` of thread `thread`, which the move at
+    /// `seq` left: the newest `thread.started` / `thread.resumed` a runtime reported before the
+    /// move that names that session or none (a park's or a user's resume the hub recorded is
+    /// no start, as `hub::retry` reads them), as its stamps say. A start the log does not have
+    /// counts as one in no directory, unstamped, from the log's beginning.
+    fn session_start(&self, thread: &str, seq: u64, session: &str) -> anyhow::Result<SessionStart> {
         let conn = self.store.conn();
         let mut start: Option<Event> = None;
         for kind in ["thread.started", "thread.resumed"] {
@@ -463,36 +497,57 @@ impl Core {
                 }
             }
         }
-        let (began_in, since) = match &start {
-            Some(e) => {
-                let twr = match &e.body {
-                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => twr_ext(&p.ext),
-                    _ => None,
-                };
-                let began_in = twr
-                    .and_then(|t| t.get(ACCOUNT_DIR_KEY))
-                    .and_then(Value::as_str)
-                    .filter(|d| !d.is_empty())
-                    .map(PathBuf::from);
-                let since = store::event_position(conn, &e.id)?
-                    .and_then(|(_, g)| g)
-                    .unwrap_or(0);
-                (began_in, since)
-            }
-            None => (None, 0),
+        let Some(e) = &start else {
+            return Ok(SessionStart::default());
         };
-        let same = match (began_in.as_deref(), dir) {
+        let twr = match &e.body {
+            EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => twr_ext(&p.ext),
+            _ => None,
+        };
+        let path = |key: &str| {
+            twr.and_then(|t| t.get(key))
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+        };
+        Ok(SessionStart {
+            began_in: path(ACCOUNT_DIR_KEY),
+            store: path(SESSION_STORE_KEY),
+            login: twr
+                .and_then(|t| t.get(ACCOUNT_LOGIN_KEY))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            since: store::event_position(conn, &e.id)?
+                .and_then(|(_, g)| g)
+                .unwrap_or(0),
+        })
+    }
+
+    /// Whether the session that `start` ran ([`Core::session_start`]), which a move left on
+    /// account `account` of `runtime` (`None`: the native one), ran in directory `dir` (the
+    /// account's now; `None` for the native account), and the account was not removed since
+    /// (else why not): the start recorded that directory (`ext.twr.account_dir`, stamped by
+    /// the hub; absent for the native account), and no `account.removed` of the account (but a
+    /// `record_only` one: the account stayed) came after it.
+    fn session_in(
+        &self,
+        start: &SessionStart,
+        runtime: &str,
+        account: Option<&str>,
+        dir: Option<&Path>,
+    ) -> Result<(), &'static str> {
+        let same = match (start.began_in.as_deref(), dir) {
             (None, None) => true,
             (Some(a), Some(b)) => a == b || super::accounts::same_dir(a, b),
             _ => false,
         };
         if !same {
-            return Ok(Err(OTHER_DIR));
+            return Err(OTHER_DIR);
         }
-        if self.account_removed_since(runtime, account, since) {
-            return Ok(Err(REMOVED));
+        if self.account_removed_since(runtime, account, start.since) {
+            return Err(REMOVED);
         }
-        Ok(Ok(()))
+        Ok(())
     }
 
     /// Whether account `account` of `runtime` (`None`: the native one) was removed after

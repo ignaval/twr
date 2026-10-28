@@ -2897,7 +2897,8 @@ struct NotSerialized {
     /// (`twr account name-native`), login checks of both, usage read in the named account's
     /// directory and of the native account, a thread on the named account that moves to the
     /// native one, the named account removed and the usage that removal clears, the account
-    /// added again in another directory, and another runtime's account logged out.
+    /// added again in another directory, another runtime's account logged out and in again,
+    /// and a login of the re-added account recorded.
     fn account_log(db: &Path) {
         let mut l = Log::default();
         let hub = Source::Hub;
@@ -3019,11 +3020,29 @@ struct NotSerialized {
             hub.clone(),
             status("codex", "team", false, Login::LoggedOut),
         );
+        // Logins: `team` logged in after logged out, `work` (added again) by `twr account
+        // login` (`after_login`), each a login generation raised.
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            status("codex", "team", false, Login::LoggedIn),
+        );
+        l.ev(
+            HUB_THREAD,
+            hub.clone(),
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                login: Login::LoggedIn,
+                after_login: true,
+                ..Default::default()
+            }),
+        );
         l.write(db);
     }
 
     /// From a checkpoint at any control event of a log with accounts (records, a native
-    /// rename, statuses, a removal, the usage it clears, an account added again), a hub start
+    /// rename, statuses, a removal, the usage it clears, an account added again, logins), a hub start
     /// folds what a fold of the whole log does, the accounts included; the log's account data
     /// raised the database to schema 10, which this build checkpoints and starts from.
     #[test]
@@ -3052,6 +3071,13 @@ struct NotSerialized {
         assert_eq!(work.dir.as_deref(), Some(Path::new("/acc/work2")));
         assert!(!work.removed);
         assert_eq!(core.accounts.native_name("claude-code"), "personal");
+        // The login generations, as a whole replay has them (`check_log` compares the views).
+        assert_eq!(
+            core.accounts.login_generation("claude-code", Some("work")),
+            1
+        );
+        assert_eq!(core.accounts.login_generation("codex", Some("team")), 1);
+        assert_eq!(core.accounts.login_generation("claude-code", None), 0);
     }
 
     /// The config a start has wins over the records as on a whole replay, whatever config the

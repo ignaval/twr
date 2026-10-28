@@ -384,7 +384,8 @@ pub fn summary(ev: &Event) -> String {
                 .note
                 .as_deref()
                 .map_or(String::new(), |n| format!(" ({})", short(n)));
-            format!("account {}:{} {login}{note}", p.runtime, p.account)
+            let after = if p.after_login { " after a login" } else { "" };
+            format!("account {}:{} {login}{note}{after}", p.runtime, p.account)
         }
         EventBody::ContextCompacted(p) => p.line(),
         EventBody::ProjectRead(p) => p.line(),
@@ -794,8 +795,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            summary(&ev(EventBody::AccountStatus(status))),
+            summary(&ev(EventBody::AccountStatus(status.clone()))),
             "account claude-code:work logged in (claude.ai)"
+        );
+        let after = AccountStatus {
+            after_login: true,
+            ..status
+        };
+        assert_eq!(
+            summary(&ev(EventBody::AccountStatus(after))),
+            "account claude-code:work logged in (claude.ai) after a login"
         );
     }
 

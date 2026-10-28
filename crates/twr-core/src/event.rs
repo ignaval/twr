@@ -845,6 +845,19 @@ pub const ACCOUNT_DIR_KEY: &str = "account_dir";
 /// keeps elsewhere on that path (Claude Code's macOS Keychain entry hashes it), so the thread
 /// keeps using it while it still leads to that directory.
 pub const ACCOUNT_ENV_DIR_KEY: &str = "account_env_dir";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps for the native
+/// account (a string): the runtime's own directory that process ran in, as the hub's selector
+/// variable has it (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ...; unset: the runtime's default in
+/// `$HOME`), links followed where it exists. Only stamped: the process's environment is not
+/// changed. A move back resumes a native session only in that directory; a start without it
+/// (from before the key, or on another box) is taken to be in it.
+pub const SESSION_STORE_KEY: &str = "session_store";
+/// `ext.twr` key on a `thread.started` / `thread.resumed` the hub stamps (a number): the login
+/// generation of the account that process ran on
+/// ([`crate::account::AccountsView::login_generation`]), absent when 0. A move back resumes a
+/// session only under the generation it ran in: a login recorded since may be another
+/// organization's.
+pub const ACCOUNT_LOGIN_KEY: &str = "account_login";
 
 /// `ext.twr` key of a thread's own account pin on `thread.created` (a string, the pin's
 /// items comma-separated, [`crate::account::Pin`]): what the thread was asked to run on.
@@ -1955,8 +1968,8 @@ pub struct AccountRemoved {
 }
 
 /// `account.status` (hub thread): a status check of an account (the native one under its
-/// name then) found `login`, recorded when it differs from the last one. No email,
-/// organization or plan is kept.
+/// name then) found `login`, recorded when it differs from the last one, or when it follows a
+/// login twr ran (`after_login`). No email, organization or plan is kept.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AccountStatus {
@@ -1977,6 +1990,12 @@ pub struct AccountStatus {
     /// Why, when the state is not plain (a check that failed, say).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The check ran after a login twr ran ended successfully (`twr account login`, `twr
+    /// account add`) and found it logged in: recorded even when the state is unchanged, it
+    /// raises the account's login generation
+    /// ([`crate::account::AccountsView::login_generation`]). Written only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub after_login: bool,
     /// Runtime-specific extras.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ext: Option<JsonMap>,

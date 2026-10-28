@@ -48,7 +48,9 @@
 //! cadence), after `account.add` (that account), and on `account.status {refresh}` (waited
 //! for, at most [`REFRESH_WAIT`]). One check runs at a time; what it found is recorded as
 //! `account.status` only when it differs from the account's last state (login, method,
-//! note). A check that finds no CLI, or no directory, says `missing`.
+//! note), or when it follows a login twr ran and found it logged in (`account.status
+//! {refresh, after_login}`, `twr account login` / `add`: `after_login`, which raises the
+//! account's login generation). A check that finds no CLI, or no directory, says `missing`.
 //!
 //! [`HubOptions::accounts_root`]: crate::HubOptions::accounts_root
 //! [`HubOptions::native_dir`]: crate::HubOptions::native_dir
@@ -498,6 +500,12 @@ pub struct AccountStatusParams {
     pub account: Option<String>,
     /// Check the logins again now (waited for, at most [`REFRESH_WAIT`]).
     pub refresh: bool,
+    /// A login twr ran of `runtime`'s `account` just ended successfully (`twr account login`,
+    /// `twr account add`; with `refresh`): a check that finds it logged in is recorded even
+    /// when the state is unchanged, `after_login`, which raises the account's login generation
+    /// (`AccountsView::login_generation`: a session from before it is not resumed by a move
+    /// back, `hub::switch`).
+    pub after_login: bool,
 }
 
 /// One account to check: runtime, its name when the check began, whether it is the native
@@ -860,7 +868,9 @@ impl Core {
     }
 
     /// Records what the checks found (`results`), each only when it differs from its
-    /// account's last state. A result is of the directory it checked: one whose account is
+    /// account's last state, or, `after_login` (the checks follow a login twr ran), when it
+    /// found the account logged in (`AccountStatus::after_login`). A result is of the
+    /// directory it checked: one whose account is
     /// gone meanwhile (removed, renamed), or is no longer that directory (removed and added
     /// again elsewhere, its name now the native account's), is dropped. An error says whose
     /// checks could not be recorded, and why (their accounts keep their last state).
@@ -868,6 +878,7 @@ impl Core {
         &mut self,
         hub: &Inner,
         results: Vec<(Target, AgentInfo)>,
+        after_login: bool,
     ) -> Result<(), String> {
         let mut batch = Batch::default();
         let mut labels = Vec::new();
@@ -887,7 +898,9 @@ impl Core {
                 continue;
             }
             let login = login_of(&info);
-            if current.login == Some(login)
+            let after_login = after_login && login == Login::LoggedIn;
+            if !after_login
+                && current.login == Some(login)
                 && current.method == info.method
                 && current.note == info.note
             {
@@ -906,6 +919,7 @@ impl Core {
                     login,
                     method: info.method,
                     note: info.note,
+                    after_login,
                     ..Default::default()
                 }),
             );
@@ -959,9 +973,9 @@ fn runtime_json(view: &AccountsView, runtime: &str, with_dirs: bool) -> Value {
 }
 
 /// Checks `targets` (one check at a time across the hub, see the module docs) and records
-/// what changed. Nothing without a probe. An error when what changed could not be recorded
-/// ([`Core::record_statuses`]).
-async fn probe(inner: &Arc<Inner>, targets: Vec<Target>) -> Result<(), String> {
+/// what changed (`after_login`: they follow a login twr ran). Nothing without a probe. An
+/// error when what changed could not be recorded ([`Core::record_statuses`]).
+async fn probe(inner: &Arc<Inner>, targets: Vec<Target>, after_login: bool) -> Result<(), String> {
     let Some(probe) = inner.accounts.probe.clone() else {
         return Ok(());
     };
@@ -975,13 +989,13 @@ async fn probe(inner: &Arc<Inner>, targets: Vec<Target>) -> Result<(), String> {
     });
     let results = futures::future::join_all(checks).await;
     tracing::debug!(checked = results.len(), "checked the accounts' logins");
-    inner.core().record_statuses(inner, results)
+    inner.core().record_statuses(inner, results, after_login)
 }
 
 /// [`probe`] in the background: what could not be recorded is logged (the next check tries
 /// again).
 async fn probe_logged(inner: &Arc<Inner>, targets: Vec<Target>) {
-    if let Err(why) = probe(inner, targets).await {
+    if let Err(why) = probe(inner, targets, false).await {
         tracing::warn!(%why, "recording the accounts' login checks failed");
     }
 }
@@ -1075,10 +1089,12 @@ impl Hub {
         Ok(core.accounts_json(runtime, with_dirs))
     }
 
-    /// `account.status {runtime?, account?, refresh?}` (users only): `account.list`'s answer,
-    /// after checking the logins again with `refresh` (`runtime`'s `account`, else `runtime`'s
-    /// accounts, else every runtime's that has a named one; waited for at most
-    /// [`REFRESH_WAIT`]). `internal` when what the checks found could not be recorded.
+    /// `account.status {runtime?, account?, refresh?, after_login?}` (users only):
+    /// `account.list`'s answer, after checking the logins again with `refresh` (`runtime`'s
+    /// `account`, else `runtime`'s accounts, else every runtime's that has a named one; waited
+    /// for at most [`REFRESH_WAIT`]); `after_login`: the check follows a login twr ran of that
+    /// account, recorded when it finds it logged in ([`AccountStatusParams::after_login`]).
+    /// `internal` when what the checks found could not be recorded.
     pub async fn account_status(
         &self,
         p: AccountStatusParams,
@@ -1089,6 +1105,12 @@ impl Hub {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 "account needs its runtime: give runtime too",
+            ));
+        }
+        if p.after_login && !(p.refresh && p.account.is_some()) {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "after_login needs refresh, a runtime and its account",
             ));
         }
         if let Some(rt) = &p.runtime {
@@ -1108,7 +1130,9 @@ impl Hub {
                 }
                 core.probe_targets(p.runtime.as_deref(), p.account.as_deref())
             };
-            match tokio::time::timeout(REFRESH_WAIT, probe(&self.inner, targets)).await {
+            match tokio::time::timeout(REFRESH_WAIT, probe(&self.inner, targets, p.after_login))
+                .await
+            {
                 Ok(recorded) => recorded.map_err(|why| rpc(codes::INTERNAL, why))?,
                 Err(_) => {
                     tracing::info!("the accounts' login checks took longer than {REFRESH_WAIT:?}");

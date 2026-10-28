@@ -989,6 +989,20 @@ impl Core {
             })
     }
 
+    /// The directory a runtime `runtime` of thread `view` on the native account keeps its
+    /// sessions in: the runtime's own as the hub's selector variable has it
+    /// (`HubOptions::native_dir`: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, ... when set, else the
+    /// runtime's default in `$HOME`), links followed where it exists. Stamped on the native
+    /// account's starts (`RunSettings::session_store`), the process's environment unchanged.
+    /// `None` on another box (its own environment decides), or when not known.
+    pub(super) fn session_store(&self, view: &ThreadView, runtime: &str) -> Option<PathBuf> {
+        if view.box_name != LOCAL_BOX {
+            return None;
+        }
+        let dir = (self.account_native_dir)(runtime)?;
+        Some(std::fs::canonicalize(&dir).unwrap_or(dir))
+    }
+
     /// The directory thread `view`'s runtimes get as their named account's
     /// (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`): the path recorded with the account
     /// ([`ACCOUNT_ENV_DIR_KEY`]) while it still leads (links followed) to the recorded

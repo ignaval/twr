@@ -119,11 +119,6 @@ pub(super) fn capped(d: &str) -> String {
     }
 }
 
-/// The failure's detail as one capped line (`hub::compact`'s failed-compaction summary).
-pub(super) fn failure_detail(ended: &TurnEnded) -> Option<String> {
-    full_detail(ended).map(|d| capped(&d))
-}
-
 /// The reason a failed `turn.ended` gives: `ext.twr.error`, else any runtime section's
 /// `message` / `error`, its whitespace collapsed (a card cuts it, [`capped`]).
 fn full_detail(ended: &TurnEnded) -> Option<String> {
@@ -718,6 +713,8 @@ mod tests {
 
     #[test]
     fn failure_details_come_from_ext() {
+        // As one capped line.
+        let failure_detail = |e: &TurnEnded| full_detail(e).map(|d| capped(&d));
         let ended = |ext: Value| TurnEnded {
             ext: ext.as_object().cloned(),
             ..Default::default()

@@ -625,6 +625,143 @@ async fn a_compaction_that_says_it_failed_raises_its_error_card() {
     hub.shutdown().await;
 }
 
+/// A runtime played under `claude-code` whose compactions fail signing in, as Claude Code's
+/// adapter reports it (`auth_failed`, its sign-in hint in the error).
+struct SignedOutCompaction;
+
+impl Adapter for SignedOutCompaction {
+    fn info(&self) -> AdapterInfo {
+        AdapterInfo {
+            name: "claude-code",
+            tier: Tier::Headless,
+            description: "compactions that are not signed in",
+        }
+    }
+
+    fn compacts(&self) -> bool {
+        true
+    }
+
+    fn spawn(&self, _cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
+        let (h, mut end) = AdapterHandle::pair();
+        tokio::spawn(async move {
+            end.emit(
+                EventBody::ThreadStarted(SessionPayload {
+                    session_id: Some("s-out".into()),
+                    ..Default::default()
+                }),
+                None,
+            );
+            let done = || EventBody::TurnEnded(TurnEnded::default());
+            if prompt.is_some() {
+                end.emit(done(), Some(1));
+            }
+            while let Some(cmd) = end.cmds.recv().await {
+                match cmd {
+                    AdapterCmd::Send { turn, .. } => {
+                        end.emit(done(), Some(turn));
+                    }
+                    AdapterCmd::Compact { turn } => {
+                        let hint = twr_adapters::claude_code::translate::AUTH_HINT;
+                        let ext = serde_json::json!({
+                            "claude": {"auth_failed": true},
+                            "twr": {"error": format!("Not logged in · Please run /login{hint}")},
+                        });
+                        end.emit(
+                            EventBody::TurnEnded(TurnEnded {
+                                result: TurnResult::Error,
+                                ext: ext.as_object().cloned(),
+                                ..Default::default()
+                            }),
+                            Some(turn),
+                        );
+                    }
+                    AdapterCmd::Stop => break,
+                    _ => {}
+                }
+            }
+            end.exited(Some(0), "");
+        });
+        Ok(h)
+    }
+}
+
+/// A compaction on a named account that fails signing in says so as a failed turn's card
+/// does: how to sign that account in (`twr account login <runtime> <account>`, in place of
+/// the runtime's own hint), not retried.
+#[tokio::test]
+async fn a_compaction_failing_sign_in_on_a_named_account_names_its_login() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("acc").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut config = Config::default();
+    config
+        .accounts
+        .entry("claude-code".into())
+        .or_default()
+        .insert(
+            "work".into(),
+            twr_core::config::AccountConfig {
+                dir: Some(work),
+                ..Default::default()
+            },
+        );
+    let mut o = opts(dir.path());
+    o.config = config;
+    let native = dir.path().join("native");
+    o.native_dir = Some(Arc::new(move |rt: &str| Some(native.join(rt))));
+    o.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
+        (name == "claude-code").then(|| Arc::new(SignedOutCompaction) as Arc<dyn Adapter>)
+    });
+    let hub = Hub::open(o).await.unwrap();
+    let t = hub
+        .new_thread(
+            NewThread {
+                project: dir.path().to_string_lossy().into_owned(),
+                runtime: Some("claude-code".into()),
+                account: Some("work".into()),
+                name: Some("api".into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "hi");
+    until(&mut sub, ended_turn(1)).await;
+    hub.compact_thread(&t, &Caller::user("test")).unwrap();
+    let evs = until(
+        &mut sub,
+        |e| matches!(&e.body, EventBody::AttentionRaised(a) if a.reason == AttentionReason::Error),
+    )
+    .await;
+    let raised = evs.last().unwrap();
+    let EventBody::AttentionRaised(a) = &raised.body else {
+        unreachable!()
+    };
+    assert_eq!(
+        a.summary,
+        "api: compacting its context failed: Not logged in · Please run /login \
+         (sign in again: twr account login claude-code work)"
+    );
+    assert_eq!(raised.turn, Some(2));
+    // Not retried.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let starts = hub
+        .thread_events(&t, 0, 10_000)
+        .unwrap()
+        .1
+        .iter()
+        .filter(|e| e.kind() == "turn.started")
+        .count();
+    assert_eq!(starts, 2);
+    hub.shutdown().await;
+}
+
 /// A compaction asked for behind a queued message, of a thread then moved to another runtime
 /// that compacts too: the message starts the new runtime's session (with the handoff), and
 /// the compaction, asked of the old session, is dropped.

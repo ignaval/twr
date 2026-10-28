@@ -131,6 +131,19 @@ pub(super) struct RunSettings {
     /// added again elsewhere) is not the account's now (`hub::usage`, `hub::retry`). `None`
     /// also when not known (a start from before the stamp). Not a setting: no restart.
     pub(super) account_dir: Option<std::path::PathBuf>,
+    /// The native account's directory the process was started in: the runtime's own as the
+    /// hub's selector variable has it (`Core::session_store`; the process's environment is
+    /// not changed). Stamped as `ext.twr.session_store` (absent for a named account, and when
+    /// not known: a start from before the stamp, or on another box). Not a setting: no
+    /// restart; a move back resumes a native session only in it (`hub::switch`).
+    #[serde(default)]
+    pub(super) session_store: Option<std::path::PathBuf>,
+    /// The login generation of the account the process was started on
+    /// (`AccountsView::login_generation`; 0 on another box). Stamped as
+    /// `ext.twr.account_login` (absent when 0). Not a setting: no restart; a move back resumes
+    /// a session only under the generation it ran in (`hub::switch`).
+    #[serde(default)]
+    pub(super) account_login: u64,
 }
 
 impl RunSettings {
@@ -146,6 +159,8 @@ impl RunSettings {
             account: view.account.clone(),
             account_moved: false,
             account_dir: None,
+            session_store: None,
+            account_login: 0,
         }
     }
 
@@ -161,6 +176,8 @@ impl RunSettings {
             account: None,
             account_moved: false,
             account_dir: None,
+            session_store: None,
+            account_login: 0,
         }
     }
 
@@ -235,7 +252,8 @@ impl RunSettings {
 /// runtime is the one of `source`, the event's; `runtime_moved` is [`RunSettings::moved`];
 /// `acp_command` is [`RunSettings::agent`], missing when not known; `account` is
 /// [`RunSettings::account`], missing for the native account; `account_dir` is
-/// [`RunSettings::account_dir`]).
+/// [`RunSettings::account_dir`], `session_store` [`RunSettings::session_store`] and
+/// `account_login` [`RunSettings::account_login`], missing: 0).
 pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings> {
     let twr = p.ext.as_ref()?.get("twr")?;
     let mode = twr.get("mode")?.as_str()?.to_string();
@@ -265,6 +283,15 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
             .and_then(Value::as_str)
             .filter(|d| !d.is_empty())
             .map(std::path::PathBuf::from),
+        session_store: twr
+            .get(SESSION_STORE_KEY)
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(std::path::PathBuf::from),
+        account_login: twr
+            .get(ACCOUNT_LOGIN_KEY)
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
     })
 }
 
@@ -274,7 +301,10 @@ pub(super) fn stamped(p: &SessionPayload, source: &Source) -> Option<RunSettings
 /// runtime. `ext.twr.runtime_moved` (true) when the thread moved away from it meanwhile;
 /// `ext.twr.acp_command`, an `acp` runtime's agent, when known (else a runner's stays);
 /// `ext.twr.account`, the named account it runs on (absent: the native account), and
-/// `ext.twr.account_dir`, its directory ([`RunSettings::account_dir`], when known).
+/// `ext.twr.account_dir`, its directory ([`RunSettings::account_dir`], when known);
+/// `ext.twr.session_store`, the native account's directory ([`RunSettings::session_store`],
+/// when known), and `ext.twr.account_login`, the account's login generation
+/// ([`RunSettings::account_login`], when not 0).
 pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
     let ext = p.ext.get_or_insert_with(JsonMap::new);
     let twr = ext
@@ -300,6 +330,14 @@ pub(super) fn stamp(p: &mut SessionPayload, s: &RunSettings) {
         match s.account_dir.as_ref().filter(|_| s.account.is_some()) {
             Some(d) => twr.insert(ACCOUNT_DIR_KEY.into(), json!(d.to_string_lossy())),
             None => twr.remove(ACCOUNT_DIR_KEY),
+        };
+        match s.session_store.as_ref().filter(|_| s.account.is_none()) {
+            Some(d) => twr.insert(SESSION_STORE_KEY.into(), json!(d.to_string_lossy())),
+            None => twr.remove(SESSION_STORE_KEY),
+        };
+        match s.account_login {
+            0 => twr.remove(ACCOUNT_LOGIN_KEY),
+            n => twr.insert(ACCOUNT_LOGIN_KEY.into(), json!(n)),
         };
     }
 }
@@ -554,6 +592,8 @@ mod tests {
                 account: None,
                 account_moved: false,
                 account_dir: None,
+                session_store: None,
+                account_login: 0,
             };
             stamp(&mut p, &s);
             EventBody::ThreadStarted(p)
@@ -757,6 +797,9 @@ mod tests {
                 account: account.map(str::to_string),
                 account_moved: false,
                 account_dir: None,
+                // The native account's directory, and a login generation (round trip).
+                session_store: account.is_none().then(|| "/native/claude".into()),
+                account_login: if account.is_some() { 2 } else { 0 },
             };
             stamp(&mut p, &s);
             assert_eq!(stamped(&p, &Source::Hub), Some(s));
@@ -876,6 +919,8 @@ mod tests {
             account: None,
             account_moved: false,
             account_dir: None,
+            session_store: None,
+            account_login: 0,
         };
         stamp(&mut p, &started);
         hub.append(
@@ -942,6 +987,8 @@ mod tests {
             account: None,
             account_moved: false,
             account_dir: None,
+            session_store: None,
+            account_login: 0,
         };
         assert!(s("claude-code", "auto").narrows_to(&s("claude-code", "plan")));
         assert!(!s("claude-code", "plan").narrows_to(&s("claude-code", "auto")));
@@ -971,6 +1018,8 @@ mod tests {
             account: None,
             account_moved: false,
             account_dir: None,
+            session_store: None,
+            account_login: 0,
         };
         let a = || Some(json!(["agent-a"]));
         assert!(s(a()).runs_in(&s(a())));

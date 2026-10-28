@@ -2673,9 +2673,23 @@ impl Core {
         self.rt(thread).crash_hold = None;
         // The settings it runs in (recorded on its `thread.started`, `hub::restart`).
         // Its account's directory too: what it reports is that directory's (`hub::usage`,
-        // `hub::retry`).
+        // `hub::retry`). And what a move back checks a session it resumes against
+        // (`hub::switch`): the native account's directory as the hub's variable has it, and
+        // the account's login generation (an account on the hub's own box only).
+        let local = view.box_name == LOCAL_BOX;
         let settings = restart::RunSettings {
             account_dir: self.account_dir(&view),
+            session_store: view
+                .account
+                .is_none()
+                .then(|| self.session_store(&view, &view.runtime))
+                .flatten(),
+            account_login: if local {
+                self.accounts
+                    .login_generation(&view.runtime, view.account.as_deref())
+            } else {
+                0
+            },
             ..restart::RunSettings::of(&view)
         };
         self.rt(thread).runtime_settings = Some(settings);

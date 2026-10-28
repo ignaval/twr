@@ -754,11 +754,12 @@ fn main_text(ev: &Value) -> (&'static str, String) {
 }
 
 /// Takes the account directories out of event data `d` of kind `kind` (an account move's or a
-/// new thread's `ext.twr.account_dir`, an `account.added`'s `dir`): they go to neither the
-/// orchestrator nor thread agents.
+/// new thread's `ext.twr.account_dir`, a native start's `ext.twr.session_store`, an
+/// `account.added`'s `dir`): they go to neither the orchestrator nor thread agents.
 fn hide_account_dirs(kind: &str, d: &mut Value) {
     if let Some(twr) = d.pointer_mut("/ext/twr").and_then(Value::as_object_mut) {
         twr.remove(ACCOUNT_DIR_KEY);
+        twr.remove(twr_core::event::SESSION_STORE_KEY);
     }
     if kind.starts_with("account.") {
         if let Some(o) = d.as_object_mut() {
