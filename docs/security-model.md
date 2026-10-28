@@ -166,6 +166,17 @@ The same small models write thread summaries, on by default too: `[tui] summarie
 - **Who asks.** User clients only (`summary.thread`): the orchestrator and agents get `unauthorized`, and the orchestrator's own conversation has no summary.
 - **What a summary can do.** Nothing. It is a line of text in your TUI, first line only, control characters stripped, at most 160 characters. It is never recorded in the event log and never sent to the orchestrator or a worker. The hub keeps the last one of each thread in memory. The TUI never puts one in place of an item: a permission, question, error or hung-turn card always shows as itself.
 
+## Reading aloud
+
+A speaker reads the orchestrator's messages aloud on the machine you listen on ([read-aloud.md](read-aloud.md)): the TUI's own, `twr speak`, or `twr speech feed --text`.
+
+- **Who can make it speak.** User clients only. The `speech.*` methods are refused to the orchestrator and to every agent (`unauthorized`), like any method outside their lists, so nothing a model writes can start, stop, pause or aim speech, or change a speaker's voice. A speaker attaches as a user client on the hub's socket; over SSH, `twr speech feed` runs on the hub's machine as you, from your ssh login, and connects to the socket as any CLI does.
+- **What it can say.** Only what the log holds. No method takes a text to say: `speech.request` names messages by thread and position, and the hub reads them from the log, as `speech.attach` reads the orchestrator's new ones. Only final texts of conversation turns are sent, never maintenance turns (handoffs, compactions), and a turn whose metadata the hub can't read whole is silent.
+- **Text is data.** The speaker never runs a shell. `say` and `spd-say` get each sentence on their stdin and fixed arguments, and a `command` engine is an argument list run without a shell, the text on its stdin, as `[notify] command` is. Control, bidirectional and zero-width characters are removed before an engine sees the text, and what an engine would read as a command of its own is defused: a line `spd-say -e` would take as a speech-dispatcher command (`!-!CANCEL ALL`, which silences every program's speech) gets a space in front, and macOS's embedded speech commands (`[[volm 0]]`) lose their double bracket. The proxy `twr speak --ssh` runs is fixed words and shell-quoted workspace names, with agent and X11 forwarding off, and it passes on `speech.attach` and `speech.state` only.
+- **What crosses the network.** Over SSH, the messages' text and the speakers' status, inside your SSH connection; nothing goes anywhere else, unless your `command` engine sends it (a hosted voice gets every word).
+- **The feed is trusted as far as the server is.** A server you don't trust could make your laptop speak any text: the speaker checks every item's shape, bounds its sizes (64 KB per message, 300 characters per utterance) and only plays it. The speaker never listens on a socket or port.
+- **What is kept.** Nothing in the event log. The hub keeps the attached speakers and their status in memory. The speaker keeps its device id, its live switch per workspace, its voice and rate, and the last message it read of each thread in `speech-state.json` in twr's data directory, readable only by you.
+
 ## Terminal setup from the TUI
 
 The TUI's offer to make `Shift-Enter` start a new line ([tui.md](tui.md#shift-enter-over-mosh-and-ssh)) changes a file of yours, your terminal's settings, so it is held to the rules of `twr terminal-setup`, and more:

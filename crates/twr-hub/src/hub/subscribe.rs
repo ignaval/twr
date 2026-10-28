@@ -679,6 +679,13 @@ impl ThreadSubscription {
         self.head
     }
 
+    /// Goes on after `seq` instead of the `since_seq` it was made with: what it took from its
+    /// head ([`ThreadSubscription::head`]) before anything is read. Only before the first read.
+    pub(super) fn start_after(&mut self, seq: u64) {
+        debug_assert!(self.backlog.is_empty() && self.lines.is_empty());
+        self.last = seq;
+    }
+
     /// Appends the line of the next event logged up to the head known to `buf`, read from
     /// the store as a line ([`store::read_thread_lines`]); `Ok(false)` when the next one is
     /// still to come live. Never waits. What [`ThreadSubscription::next`] read already goes

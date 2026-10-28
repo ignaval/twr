@@ -6,6 +6,7 @@ mod accounts;
 mod boxes;
 mod dial_in;
 mod pretty;
+mod speech;
 #[cfg(test)]
 mod test_support;
 
@@ -406,6 +407,59 @@ enum Cmd {
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
+    },
+    /// Reading aloud, the hub machine's end (docs/read-aloud.md).
+    Speech {
+        #[command(subcommand)]
+        cmd: SpeechCmd,
+    },
+    /// A speaker on this machine: reads aloud the orchestrator's messages that this machine's
+    /// hubs send (the current workspace's, `-w`'s, or with `--all-workspaces` every one's), or
+    /// with `--ssh HOST` those of HOST's hubs, over `ssh HOST twr speech feed` (every
+    /// workspace there unless `-w`). Keys in its terminal: `s` stop, `p` pause or resume, `n`
+    /// skip, `q` quit. What it reads is turned on with `/read on` in the TUI
+    /// (docs/read-aloud.md).
+    Speak {
+        /// Read aloud what HOST's hubs send, over ssh (your ssh config and keys).
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
+        /// Every workspace (of this machine, or of HOST), not only one.
+        #[arg(long)]
+        all_workspaces: bool,
+        /// The speaker's name in `/read status` and for `/read N --on` (default: this
+        /// machine's name).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The engine, over `[speech] engine`: say, avspeech, spd or command.
+        #[arg(long, value_name = "ENGINE", value_parser = ["say", "avspeech", "spd", "command"])]
+        engine: Option<String>,
+        /// The engine's voice, over the one kept by `/read voice` and `[speech] voice`.
+        #[arg(long, value_name = "VOICE")]
+        voice: Option<String>,
+        /// Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech]
+        /// rate`.
+        #[arg(long, value_name = "WPM", value_parser = clap::value_parser!(u32).range(80..=500))]
+        rate: Option<u32>,
+        /// Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`,
+        /// and the commands to install it; installs nothing.
+        #[arg(long)]
+        print_service: bool,
+    },
+    /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
+    /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
+    /// data directory), stopped when the session ends.
+    Remote {
+        /// The host, as mosh and ssh take it (`me@box`, a `Host` of your ssh config).
+        host: String,
+        /// Run the session over `ssh -t` rather than mosh.
+        #[arg(long)]
+        ssh: bool,
+        /// The speaker's name (`twr speak --name`).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The arguments of the remote `twr`, after `--`.
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
     /// Print a thread's events as NDJSON.
     Events {
@@ -905,6 +959,24 @@ enum JobCmd {
     },
 }
 
+/// `twr speech`.
+#[derive(Subcommand, Debug)]
+enum SpeechCmd {
+    /// Stream the orchestrator's new messages: with `--text`, their sentences one per line
+    /// (for a reader of your own); without it, the line protocol `twr speak --ssh` reads.
+    Feed {
+        /// Print each message's sentences, one per line, and nothing else.
+        #[arg(long)]
+        text: bool,
+        /// The line protocol (the default); for `twr speak --ssh`.
+        #[arg(long, conflicts_with = "text")]
+        proto: bool,
+        /// Every workspace of this machine, not only the current one (`-w`).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+}
+
 #[derive(Subcommand, Debug)]
 enum LogCmd {
     /// Move the agent events `[log]` lets go (of turns older than `retention_days` whose
@@ -1179,7 +1251,10 @@ fn main() -> ExitCode {
     );
     // The relay's read of stdin is a blocking task, which a runtime's graceful shutdown would
     // wait on after the daemon's side ended: it leaves without it. So does `--find-repo`, past
-    // its deadline, without a walk of the box's folders that hangs (a dead network mount).
+    // its deadline, without a walk of the box's folders that hangs (a dead network mount). And
+    // so does `twr speech feed`, whose proxy reads stdin the same way: once its output is gone
+    // (or its speaker went quiet) it ends with stdin still open. Every line it wrote was
+    // flushed as it was written.
     let relaying = matches!(
         cli.cmd,
         Some(
@@ -1187,6 +1262,9 @@ fn main() -> ExitCode {
                 | Cmd::Runner {
                     find_repo: true,
                     ..
+                }
+                | Cmd::Speech {
+                    cmd: SpeechCmd::Feed { .. }
                 }
         )
     );
@@ -1653,6 +1731,59 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ws(cmd, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
+        // A speaker is the root's (its state and `[speech]`), and with `--ssh` (or `twr
+        // remote`) `-w` names a workspace of the other machine, which this one need not have.
+        Some(Cmd::Speak {
+            ssh,
+            all_workspaces,
+            name,
+            engine,
+            voice,
+            rate,
+            print_service,
+        }) => {
+            refuse_agent_action("start a speaker")?;
+            if cli.socket.is_some() {
+                bail!("--socket does not apply to `twr speak`: it reads the workspaces' own hubs");
+            }
+            speech::speak(
+                speech::Speak {
+                    ssh,
+                    workspace: cli.workspace.clone(),
+                    all_workspaces,
+                    name,
+                    engine,
+                    voice,
+                    rate,
+                    print_service,
+                },
+                &paths,
+            )
+            .await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Remote {
+            host,
+            ssh,
+            name,
+            args,
+        }) => {
+            refuse_agent_action("start a remote session with a speaker")?;
+            if cli.socket.is_some() {
+                bail!("--socket does not apply to `twr remote`");
+            }
+            return speech::remote(
+                speech::Remote {
+                    host,
+                    ssh,
+                    name,
+                    workspace: cli.workspace.clone(),
+                    args,
+                },
+                &paths,
+            )
+            .await;
+        }
         // Before the config is loaded: it repairs config files that do not load (a box in
         // both, or one whose settings twr refuses, comes out of boxes.toml). The hub's socket
         // as config.toml alone says, else the default.
@@ -1703,7 +1834,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 config: Config::load_from(&paths.root()).unwrap_or_else(|_| config.clone()),
             }),
         });
-        open_tui(&socket, &paths, switching, config.tui.clone()).await?;
+        open_tui(
+            &socket,
+            &paths,
+            switching,
+            config.tui.clone(),
+            config.speech.clone(),
+        )
+        .await?;
         return Ok(ExitCode::SUCCESS);
     };
     match cmd {
@@ -1722,6 +1860,21 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
             .await
             .map(|()| ExitCode::SUCCESS),
+        Cmd::Speech {
+            cmd:
+                SpeechCmd::Feed {
+                    text,
+                    proto: _,
+                    all_workspaces,
+                },
+        } => {
+            if text {
+                speech::text(speech::workspace_sockets(&paths, &[], all_workspaces)?).await?;
+            } else {
+                speech::proxy(&paths, all_workspaces, speech::proxy_idle()).await?;
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         cmd => run_simple(cmd, &config, paths, socket)
             .await
             .map(|()| ExitCode::SUCCESS),
@@ -1742,6 +1895,9 @@ async fn run_simple(
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
         | Cmd::Boxes { .. }
+        | Cmd::Speech { .. }
+        | Cmd::Speak { .. }
+        | Cmd::Remote { .. }
         | Cmd::TerminalSetup { .. }
         | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
@@ -7631,9 +7787,23 @@ async fn open_tui(
     paths: &Paths,
     switching: Option<twr_tui::Switching>,
     tui: twr_core::config::TuiConfig,
+    speech: twr_core::config::SpeechConfig,
 ) -> anyhow::Result<()> {
     wait_for_hub(socket, paths).await?;
-    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui), calling_agent()).await
+    // The TUI's own speaker reads this root aloud (`[speech] local`).
+    let speech = twr_tui::speaker::LocalSpeech {
+        paths: paths.clone(),
+        config: speech,
+    };
+    let agent = calling_agent();
+    twr_tui::run_with(
+        socket.to_path_buf(),
+        switching,
+        Some(tui),
+        agent,
+        Some(speech),
+    )
+    .await
 }
 
 /// The workspaces of a root, as the TUI switches between them: their hubs are started like

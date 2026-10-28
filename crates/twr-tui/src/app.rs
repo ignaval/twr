@@ -1178,6 +1178,14 @@ pub enum Action {
     Setting(crate::settings::Change),
     /// Ask the hub for its settings (`config.show`), for the settings overlay.
     ConfigShow,
+    /// A `speech.request` or `speech.control` call (`/read`, Ctrl-R; [`crate::speech`]): its
+    /// answer says what was done.
+    Speech {
+        /// The method.
+        method: &'static str,
+        /// Its params, as [`twr_core::speech`] types them.
+        params: Value,
+    },
     /// Read what the config file says of the TUI's settings, for the settings overlay: the
     /// IO loop has the settings writer read it, off the loop.
     SettingsFile,
@@ -1243,6 +1251,9 @@ pub enum Entry {
         text: String,
         /// Still receiving deltas.
         open: bool,
+        /// The seq of its final `agent.text`, once it came: what names the message to the
+        /// hub's `speech.*` (`/read this`, the `▶` of the message being read).
+        final_seq: Option<u64>,
     },
     /// A tool call, shown as one line; `ok` is filled by the matching tool result.
     Tool {
@@ -1463,25 +1474,30 @@ impl Transcript {
                     .is_some_and(|fields| fields.iter().any(|f| f.as_str() == Some("text")));
                 let open = self.entries.iter_mut().rev().find_map(|e| match e {
                     Entry::Text {
-                        text, open: true, ..
-                    } => Some(text),
+                        text,
+                        open: true,
+                        final_seq,
+                        ..
+                    } => Some((text, final_seq)),
                     _ => None,
                 });
                 match (open, p.is_final) {
                     // The final text carries the whole message: it replaces the deltas.
-                    (Some(text), true) => {
+                    (Some((text, final_seq)), true) => {
                         // A failed blob fetch must never replace complete streamed text
                         // with the final event's 512-byte preview.
                         if !capped || text.len() < p.text.len() {
                             *text = p.text.clone();
                         }
+                        *final_seq = Some(ev.seq);
                         self.close_text();
                     }
-                    (Some(text), false) => text.push_str(&p.text),
+                    (Some((text, _)), false) => text.push_str(&p.text),
                     (None, is_final) => self.push(Entry::Text {
                         seq: ev.seq,
                         text: p.text.clone(),
                         open: !is_final,
+                        final_seq: is_final.then_some(ev.seq),
                     }),
                 }
                 if p.is_final && !p.text.trim().is_empty() {
@@ -2658,6 +2674,8 @@ pub struct AppState {
     pub activity: HashMap<String, ThreadActivity>,
     /// A `thread.activity` call is on its way: the next poll waits for it.
     pub activity_pending: bool,
+    /// What the hub's speakers read, polled ([`crate::speech`]).
+    pub speech: crate::speech::SpeechView,
     /// The workspace shown (`twr ws`), when the TUI can switch workspaces; `None` for a TUI
     /// opened on a socket.
     pub workspace: Option<String>,
@@ -3451,6 +3469,11 @@ impl AppState {
             "job.log" => self.shell_log(result, Instant::now()),
             "job.cancel" => self.shell_cancel_result(result),
             "suggest.next" => self.suggest_result(result),
+            "speech.status" | "speech.request" | "speech.control" => {
+                if let Some(msg) = self.speech.answered(method, result) {
+                    self.view.status = Some(msg);
+                }
+            }
             "config.show" => self.settings_hub(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
@@ -5174,6 +5197,7 @@ impl AppState {
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
             Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Settings => return (self.open_settings(), true),
+            Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
         }
         (Vec::new(), true)
     }
@@ -5270,6 +5294,107 @@ impl AppState {
         match state {
             s if s.is_empty() => format!("{}: {rt} account {name}", t.name),
             s => format!("{}: {rt} account {name} ({s})", t.name),
+        }
+    }
+
+    /// `/read ...` ([`slash::ReadCmd`]) on `on` (a speaker; `None`: every one), as a
+    /// `speech.*` call ([`crate::speech`]); `/read status` says what the last poll said. Never
+    /// a message. A command that can't go stays on the line, its error in the status bar.
+    fn read_aloud(&mut self, cmd: slash::ReadCmd, on: Option<String>) -> (Vec<Action>, bool) {
+        use crate::speech::{control, request};
+        use slash::ReadCmd;
+        use twr_core::speech::CtlOp;
+        let action = match cmd {
+            ReadCmd::Status => {
+                self.view.status = Some(self.speech.listing());
+                return (Vec::new(), true);
+            }
+            // In a dive, the thread's messages; else, or with --orch, the orchestrator's.
+            ReadCmd::Last { n, orch } => {
+                let thread = self.view.dive.clone().filter(|_| !orch);
+                Ok(request(thread, Some(n), None, on))
+            }
+            ReadCmd::This => self
+                .selected_message()
+                .map(|(thread, seq)| request(Some(thread), None, Some(seq), on)),
+            ReadCmd::On | ReadCmd::Off => {
+                control(CtlOp::Live, Some(Value::Bool(cmd == ReadCmd::On)), on)
+            }
+            ReadCmd::Stop => control(CtlOp::Stop, None, on),
+            ReadCmd::Pause => control(CtlOp::Pause, None, on),
+            ReadCmd::Resume => control(CtlOp::Resume, None, on),
+            ReadCmd::Skip => control(CtlOp::Skip, None, on),
+            ReadCmd::Voice(v) => control(CtlOp::Voice, Some(Value::String(v)), on),
+            ReadCmd::Rate(r) => control(CtlOp::Rate, Some(r.into()), on),
+        };
+        match action {
+            Ok(a) => {
+                self.view.status = None;
+                (vec![a], true)
+            }
+            Err(e) => {
+                self.view.status = Some(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// The message selected in the conversation (a long block, Shift-↑/↓): its thread and the
+    /// seq of its final text, for `/read this`. The error, for the status bar, says why there
+    /// is none.
+    fn selected_message(&self) -> Result<(String, u64), String> {
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        let (Some(key), Some(t)) = (self.view.block.as_deref(), self.transcript.as_ref()) else {
+            return Err(pick.into());
+        };
+        // `block:<thread>:text:<seq or #index>[:<section>]` ([`crate::ui`]'s block keys).
+        let Some(id) = key
+            .strip_prefix("block:")
+            .and_then(|k| k.strip_prefix(t.thread.as_str()))
+            .and_then(|k| k.strip_prefix(":text:"))
+            .and_then(|k| k.split(':').next())
+        else {
+            return Err(pick.into());
+        };
+        let (entries, _) = t.visible();
+        let found = entries.iter().enumerate().find_map(|(i, e)| match e {
+            Entry::Text {
+                seq,
+                open,
+                final_seq,
+                ..
+            } if (*seq == 0 && id == format!("#{i}")) || (*seq != 0 && id == seq.to_string()) => {
+                Some((*open, *final_seq))
+            }
+            _ => None,
+        });
+        match found {
+            None => Err(pick.into()),
+            Some((true, _)) => Err("that message is still being written".into()),
+            Some((false, None)) => {
+                Err("that message has no final text to read; /read N reads the last ones".into())
+            }
+            Some((false, Some(seq))) => Ok((t.thread.clone(), seq)),
+        }
+    }
+
+    /// Ctrl-R: stops what the speakers read (as `/read stop`); with nothing read, says how to
+    /// start.
+    fn stop_reading(&mut self) -> Vec<Action> {
+        if self.speech.unsupported {
+            self.view.status = Some(crate::speech::PREDATES.into());
+            return Vec::new();
+        }
+        if !self.speech.busy() {
+            self.view.status = Some(crate::speech::NOTHING_READ.into());
+            return Vec::new();
+        }
+        match crate::speech::control(twr_core::speech::CtlOp::Stop, None, None) {
+            Ok(a) => vec![a],
+            Err(e) => {
+                self.view.status = Some(e);
+                Vec::new()
+            }
         }
     }
 
@@ -5444,6 +5569,12 @@ impl AppState {
         if ctrl && key.code == KeyCode::Char('l') {
             self.view.repaint = true;
             return Vec::new();
+        }
+        // Ctrl-R stops what a speaker reads aloud, whatever else is open (a picker, the
+        // settings, the help, a confirmation): speech that starts at a bad moment stops at once.
+        if ctrl && key.code == KeyCode::Char('r') && !self.speech.unsupported && self.speech.busy()
+        {
+            return self.stop_reading();
         }
         // Workspaces: Alt-1..9 the tab at that place, Ctrl-PgUp/PgDn the previous and next one
         // (only while the strip shows), whatever is open: the first-run picker of a new
@@ -5732,6 +5863,7 @@ impl AppState {
             KeyCode::Char('g') if ctrl && self.view.screen != Screen::Decisions => {
                 self.toggle_grid();
             }
+            KeyCode::Char('r') if ctrl => return Some(self.stop_reading()),
             // A detail view in the main pane scrolls instead of the transcript under it.
             KeyCode::PageUp | KeyCode::PageDown if self.view.panes.card.is_some() => {
                 self.scroll_card(key.code == KeyCode::PageDown, usize::MAX);
@@ -7164,7 +7296,7 @@ impl AppState {
     fn decisions_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('b' | 'f' | 'o' | 't') if ctrl => return None,
+            KeyCode::Char('b' | 'f' | 'o' | 'r' | 't') if ctrl => return None,
             _ if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Esc => self.toggle_decisions(),
             KeyCode::Down | KeyCode::Char('j') => self.move_decision(1),
@@ -10235,7 +10367,8 @@ pub(crate) mod tests {
             [Entry::Text {
                 seq: later.seq,
                 text: "and more".into(),
-                open: false
+                open: false,
+                final_seq: Some(later.seq),
             }]
         );
 
@@ -10800,6 +10933,229 @@ pub(crate) mod tests {
         }
         st.apply_control(&ev);
         assert!(st.view.confirm.is_some());
+    }
+
+    /// A `speech.*` call (`/read`, Ctrl-R).
+    fn speech_call(method: &'static str, params: Value) -> Vec<Action> {
+        vec![Action::Speech { method, params }]
+    }
+
+    /// The poll's answer: `laptop` reading message `seq` of `thread` (or idle).
+    fn speech_polled(st: &mut AppState, reading: Option<(&str, u64)>) {
+        use crate::speech::tests::{playing, polled, speaker};
+        let state = twr_core::speech::SpeechStateParams {
+            playing: reading.and_then(|(t, seq)| playing(t, seq)),
+            ..Default::default()
+        };
+        st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
+    }
+
+    /// `/read` runs as the hub's `speech.*` calls, never as a message: the last messages of
+    /// the orchestrator, or in a dive of the thread (`--orch`: the orchestrator's still), on
+    /// every speaker or `--on` one; live mode and the controls. One that can't go stays on the
+    /// line with its error; `/read status` says what the last poll said.
+    #[test]
+    fn read_runs_as_speech_calls_never_as_messages() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let request = |p: Value| speech_call("speech.request", p);
+        let control = |p: Value| speech_call("speech.control", p);
+        assert_eq!(type_line(&mut st, "/read"), request(json!({"last": 1})));
+        assert!(st.view.input.is_empty());
+        assert_eq!(
+            type_line(&mut st, "/read 5 --on laptop"),
+            request(json!({"last": 5, "speaker": "laptop"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 2 --orch"),
+            request(json!({"last": 2})),
+            "outside a dive, the orchestrator's anyway"
+        );
+        assert_eq!(
+            type_line(&mut st, "/read on"),
+            control(json!({"op": "live", "value": true}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read off --on mini"),
+            control(json!({"op": "live", "value": false, "speaker": "mini"}))
+        );
+        for op in ["stop", "pause", "resume", "skip"] {
+            assert_eq!(
+                type_line(&mut st, &format!("/read {op}")),
+                control(json!({ "op": op })),
+                "{op}"
+            );
+        }
+        assert_eq!(
+            type_line(&mut st, "/read voice Samantha"),
+            control(json!({"op": "voice", "value": "Samantha"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read rate 220"),
+            control(json!({"op": "rate", "value": 220}))
+        );
+        // In a dive: the thread's messages, unless --orch.
+        st.dive("t-gamma");
+        assert_eq!(
+            type_line(&mut st, "/read 3"),
+            request(json!({"thread": "t-gamma", "last": 3}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 3 --orch"),
+            request(json!({"last": 3}))
+        );
+        // Refused: on the line still, the error said; nothing sent.
+        assert!(type_line(&mut st, "/read 99").is_empty());
+        assert_eq!(st.view.input, "/read 99");
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("/read N reads the last 1 to 50 messages")
+        );
+        // `/read status`: the last poll, here none yet, then a speaker.
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert!(st.view.input.is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("no word from the hub yet"));
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("1 speaker: laptop (spd) · live off · reading")
+        );
+    }
+
+    /// `/read this` reads the long message selected in the conversation, by the seq of its
+    /// final text; with none selected, or one still streaming, it says so.
+    #[test]
+    fn read_this_reads_the_selected_message() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(pick));
+        let t = st.transcript.as_mut().unwrap();
+        t.entries.push(Entry::Text {
+            seq: 5,
+            text: "long reply\n".repeat(30),
+            open: false,
+            final_seq: Some(9),
+        });
+        t.entries.push(Entry::Text {
+            seq: 12,
+            text: "still coming\n".repeat(30),
+            open: true,
+            final_seq: None,
+        });
+        st.view.block = Some("block:t-orch:text:5:0".into());
+        assert_eq!(
+            type_line(&mut st, "/read this --on mini"),
+            speech_call(
+                "speech.request",
+                json!({"thread": "t-orch", "seq": 9, "speaker": "mini"})
+            )
+        );
+        st.view.block = Some("block:t-orch:text:12:0".into());
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("that message is still being written")
+        );
+        // A block that is no message, or of another thread.
+        for key in [
+            "block:t-orch:prompt:3",
+            "block:t-gamma:text:5:0",
+            "block:t-orch:text:7:0",
+        ] {
+            st.view.block = Some(key.into());
+            assert!(type_line(&mut st, "/read this").is_empty());
+            assert_eq!(st.view.status.as_deref(), Some(pick), "{key}");
+        }
+    }
+
+    /// What the hub answers is said in the status bar: no speaker (and how to connect one), how
+    /// many messages are read; a hub from before reading aloud is said on `/read`, and its
+    /// poll stops, silently.
+    #[test]
+    fn read_answers_are_said() {
+        use crate::speech::answer;
+        use serde_json::json;
+        let mut st = with_orch();
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 1}),
+                &Ok(json!({"count": 0, "speakers": 0, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status, Some(crate::speech::no_speaker()));
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains(&format!("twr speak --ssh {}", crate::speech::host())));
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 4}),
+                &Ok(json!({"count": 4, "speakers": 1, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status.as_deref(), Some("reading 4 messages"));
+        let old = || {
+            anyhow::Error::new(twr_core::proto::RpcError::new(
+                twr_core::proto::codes::METHOD_NOT_FOUND,
+                "unknown method",
+            ))
+        };
+        st.view.status = None;
+        st.speech.pending = true;
+        st.apply_result("speech.status", &answer(json!({}), &Err(old())));
+        assert_eq!(st.view.status, None, "the poll says nothing");
+        assert!(st.speech.unsupported && !st.speech.pending);
+        st.apply_result(
+            "speech.control",
+            &answer(json!({"op": "stop"}), &Err(old())),
+        );
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
+    }
+
+    /// Ctrl-R stops what a speaker reads, whatever is typed and in the decisions overlay too;
+    /// with nothing read it says how to start.
+    #[test]
+    fn ctrl_r_stops_reading_or_says_how_to_start() {
+        use serde_json::json;
+        let mut st = with_orch();
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::NOTHING_READ));
+        speech_polled(&mut st, None);
+        assert!(st.handle_key(ctrl('r')).is_empty(), "idle");
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        let stop = speech_call("speech.control", json!({"op": "stop"}));
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        // With text typed, and the / popup open: it stays.
+        st.view.input.set("/re");
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.input, "/re");
+        st.view.input.clear();
+        st.toggle_decisions();
+        assert_eq!(st.view.screen, Screen::Decisions);
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.screen, Screen::Decisions);
+        // With the help open: stopped too, and the help stays.
+        st.toggle_decisions();
+        st.view.help = true;
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert!(st.view.help);
+        st.view.help = false;
+        // An older hub: said.
+        st.speech.unsupported = true;
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
     }
 
     #[test]
@@ -11544,10 +11900,12 @@ pub(crate) mod tests {
                     notice: false,
                     withdrawn: false,
                 },
+                // The final after the deltas names the message: its seq.
                 Entry::Text {
                     seq: evs[2].seq,
                     text: "hello world".into(),
-                    open: false
+                    open: false,
+                    final_seq: Some(evs[6].seq),
                 },
                 Entry::Tool {
                     call_id: "c1".into(),
@@ -12783,6 +13141,7 @@ pub(crate) mod tests {
                     seq: 0,
                     text: "On it".into(),
                     open,
+                    final_seq: None,
                 },
             ];
             st.view.selection = None;
@@ -15419,6 +15778,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         let api = st.attention.get("pa").unwrap().revision;
@@ -15488,6 +15848,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         let api = st.attention.get("pa").unwrap().first_revision;
         let web = st.attention.get("pw").unwrap().first_revision;
@@ -15773,6 +16134,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         // Long options: the tenth does not fit on the card, so the item is not drawn in full.
         expand_long_test_messages(&mut st);
@@ -17892,6 +18254,7 @@ pub(crate) mod tests {
                 seq: 0,
                 text: "Earlier reply".into(),
                 open: false,
+                final_seq: None,
             },
             Entry::HubUpdate {
                 text: "api needs permission".into(),
@@ -17907,6 +18270,7 @@ pub(crate) mod tests {
                 seq: 0,
                 text: "Latest reply stays at the bottom".into(),
                 open: false,
+                final_seq: None,
             },
         ];
         let buf = draw(&mut st, 160, 40);
@@ -17949,6 +18313,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "Long explanation after the selected request\n".repeat(60),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         settled(&mut st);

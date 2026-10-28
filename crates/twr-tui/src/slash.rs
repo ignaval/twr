@@ -1,7 +1,7 @@
 //! Slash commands of the input line: `/open`, `/back`, `/unsend`, `/mode`, `/model`,
 //! `/account`, `/accounts`, `/rename`, `/orch`, `/new`, `/park`, `/resume`, `/compact-context`,
 //! `/stop`, `/pin`, `/delete`, `/trash`, `/attach`,
-//! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/ws`,
+//! `/parked`, `/sidebar`, `/spaces`, `/focus`, `/grid`, `/decisions`, `/mouse`, `/read`, `/ws`,
 //! `/settings`, `/help`, `/quit`. Pure parsing, the
 //! suggestions of the popup above the input line ([`suggest`]) and Tab completion;
 //! [`crate::app`] turns a parsed command into actions, confirmations or a status line. The same
@@ -145,6 +145,14 @@ pub enum Slash {
     /// `/summaries [on|off]`: summaries of the threads' routine updates for this TUI
     /// ([`crate::summary`]).
     Summaries(Option<bool>),
+    /// `/read ...`: read the conversation aloud on the speakers connected to the hub
+    /// (`docs/read-aloud.md`, [`crate::speech`]), or control them.
+    Read {
+        /// What to do.
+        cmd: ReadCmd,
+        /// `--on <speaker>`: only that speaker (its name or device); `None`: every one.
+        on: Option<String>,
+    },
     /// `/ws [name]` (alias `/workspace`): list the workspaces, or switch to one (a new name
     /// asks to create it).
     Ws(Option<String>),
@@ -184,6 +192,130 @@ pub enum TrashCmd {
     },
 }
 
+/// What `/read` does ([`Slash::Read`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadCmd {
+    /// `/read on`: live mode, every new message of the orchestrator read as it comes.
+    On,
+    /// `/read off`: live mode off.
+    Off,
+    /// `/read [N] [--orch]`: the last `n` messages (1 to [`READ_MAX`]; alone, 1), oldest
+    /// first, of the thread dived into, or with `orch` (or outside a dive) the orchestrator's.
+    Last {
+        /// How many.
+        n: u32,
+        /// The orchestrator's, even in a dive.
+        orch: bool,
+    },
+    /// `/read stop`: stop now and empty the queue.
+    Stop,
+    /// `/read pause`.
+    Pause,
+    /// `/read resume`.
+    Resume,
+    /// `/read skip`: end the message being read.
+    Skip,
+    /// `/read status`: the speakers connected, as last polled.
+    Status,
+    /// `/read voice <name>`: the speakers' voice.
+    Voice(String),
+    /// `/read rate <wpm>`: their speed, [`RATE_MIN`] to [`RATE_MAX`] words per minute.
+    Rate(u32),
+    /// `/read this`: the long message selected in the conversation.
+    This,
+}
+
+/// The most messages `/read N` reads (the hub's `speech.request` limit).
+pub const READ_MAX: u32 = twr_core::speech::REQUEST_MAX;
+/// The slowest `/read rate`, in words per minute.
+pub const RATE_MIN: u32 = 80;
+/// The fastest `/read rate`.
+pub const RATE_MAX: u32 = 500;
+
+/// `/read`'s first words, with what each does: its popup rows and Tab completion.
+pub const READ_WORDS: &[(&str, &str)] = &[
+    (
+        "on",
+        "read each new message of the orchestrator aloud as it comes",
+    ),
+    ("off", "stop reading new messages as they come"),
+    ("stop", "stop now and empty the queue (Ctrl-R)"),
+    ("pause", "pause reading"),
+    ("resume", "go on reading"),
+    ("skip", "end the message being read; go to the next"),
+    (
+        "status",
+        "the speakers connected, live mode on each, what is read",
+    ),
+    ("this", "the long message selected in the conversation"),
+    ("voice", "the speakers' voice: /read voice <name>"),
+    (
+        "rate",
+        "the speakers' speed: /read rate <80-500 words per minute>",
+    ),
+];
+
+/// Parses `/read`'s arguments (`usage` for the errors).
+fn parse_read(args: &[String], usage: &str) -> Result<Slash, String> {
+    let bad = || {
+        format!("usage: {usage} [--orch] [--on <speaker>], /read voice <name>, /read rate <wpm>")
+    };
+    let (mut words, mut orch, mut on) = (Vec::new(), false, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let speaker = match a.split_once('=') {
+            Some(("--on", v)) => Some(v.to_string()),
+            _ if a == "--on" => it.next().cloned().or(Some(String::new())),
+            _ => None,
+        };
+        match speaker {
+            Some(_) if on.is_some() => return Err(bad()),
+            Some(s) => on = Some(s),
+            None if a == "--orch" => orch = true,
+            None if a.starts_with("--") => return Err(format!("unknown option {a}; {}", bad())),
+            None => words.push(a.as_str()),
+        }
+    }
+    if on.as_deref().is_some_and(|s| s.trim().is_empty()) {
+        return Err("--on takes a speaker: its name or device".into());
+    }
+    let last = |n: &str| match n.parse::<u32>() {
+        Ok(n) if (1..=READ_MAX).contains(&n) => Ok(ReadCmd::Last { n, orch }),
+        _ => Err(format!("/read N reads the last 1 to {READ_MAX} messages")),
+    };
+    let cmd = match words.as_slice() {
+        [] => ReadCmd::Last { n: 1, orch },
+        [n] if n.starts_with(|c: char| c.is_ascii_digit()) => last(n)?,
+        _ if orch => return Err("--orch goes with /read N: /read N --orch".into()),
+        ["on"] => ReadCmd::On,
+        ["off"] => ReadCmd::Off,
+        ["stop"] => ReadCmd::Stop,
+        ["pause"] => ReadCmd::Pause,
+        ["resume"] => ReadCmd::Resume,
+        ["skip"] => ReadCmd::Skip,
+        ["status"] if on.is_none() => ReadCmd::Status,
+        ["status"] => return Err("/read status lists every speaker; --on is for the others".into()),
+        ["this"] => ReadCmd::This,
+        ["voice"] => return Err("usage: /read voice <name> (quote a name with spaces)".into()),
+        ["voice", name @ ..] => ReadCmd::Voice(name.join(" ")),
+        ["rate", wpm] => match wpm.parse::<u32>() {
+            Ok(r) if (RATE_MIN..=RATE_MAX).contains(&r) => ReadCmd::Rate(r),
+            _ => {
+                return Err(format!(
+                    "/read rate takes {RATE_MIN} to {RATE_MAX} words per minute"
+                ))
+            }
+        },
+        ["rate", ..] => {
+            return Err(format!(
+                "usage: /read rate <wpm> ({RATE_MIN} to {RATE_MAX} words per minute)"
+            ))
+        }
+        _ => return Err(bad()),
+    };
+    Ok(Slash::Read { cmd, on })
+}
+
 /// What an argument of a command completes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArgKind {
@@ -205,6 +337,8 @@ pub enum ArgKind {
     Account,
     /// `/account`'s first argument: a thread name, and in a dive an account too.
     AccountOrThread,
+    /// `/read`'s first word ([`READ_WORDS`]).
+    Read,
     /// Nothing to complete.
     Free,
 }
@@ -403,6 +537,15 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
         "/summaries [on|off]",
         "a line on where a thread stands in its folded routine updates (a small model)",
         &[ArgKind::OnOff],
+    ),
+    (
+        "/read",
+        // (A space inside: on a phone's help, no word is wider than its rows.)
+        "/read [on|off|N|this|status | stop|pause|resume|skip]",
+        "read aloud on the speakers of this hub: on/off as messages come, N the last N (1-50; \
+         in a dive the thread's, --orch the orchestrator's; --on <speaker> one speaker), this \
+         the long message selected, the controls (Ctrl-R stops), voice <name>, rate <wpm>",
+        &[ArgKind::Read],
     ),
     (
         "/ws",
@@ -721,6 +864,7 @@ pub fn parse(line: &str) -> Result<Slash, String> {
             }
         }
         "/attach" => one(args).map(Slash::Attach),
+        "/read" => parse_read(args, usage),
         "/ws" => match args {
             [new] if new == "new" => Ok(Slash::WsNew(None)),
             [new, name] if new == "new" => Ok(Slash::WsNew(Some(name.clone()))),
@@ -794,6 +938,7 @@ pub fn complete(
         };
         let modes: Vec<String> = MODES.iter().map(|m| m.to_string()).collect();
         let on_off = ["on".to_string(), "off".into()];
+        let read: Vec<String> = READ_WORDS.iter().map(|w| w.0.to_string()).collect();
         let pool = match kind {
             ArgKind::Runtime => runtimes,
             ArgKind::Thread
@@ -803,6 +948,7 @@ pub fn complete(
             ArgKind::Mode => &modes[..],
             ArgKind::OnOff => &on_off[..],
             ArgKind::Workspace => workspaces,
+            ArgKind::Read => &read[..],
             ArgKind::Account | ArgKind::Free => &[][..],
         };
         pool.iter()
@@ -1072,6 +1218,10 @@ pub fn suggest(line: &str, pools: &Pools) -> Suggestions {
             all.extend(pools.threads.iter().cloned());
             all
         }
+        Some(ArgKind::Read) => READ_WORDS
+            .iter()
+            .map(|(w, what)| (w.to_string(), what.to_string()))
+            .collect(),
         Some(ArgKind::Free) | None => Vec::new(),
     };
     let rows = pool
@@ -1792,6 +1942,112 @@ mod tests {
         assert!(mention(line, line.len(), &pools).items.is_empty());
         assert!(mention(line, at("and"), &pools).items.is_empty());
         assert!(mention("@é", 2, &pools).items.is_empty());
+    }
+
+    /// Every form of `/read`, and its errors, which say the forms.
+    #[test]
+    fn read_parses_every_form() {
+        let read = |cmd: ReadCmd, on: Option<&str>| {
+            Ok(Slash::Read {
+                cmd,
+                on: on.map(str::to_string),
+            })
+        };
+        let last = |n: u32, orch: bool| ReadCmd::Last { n, orch };
+        assert_eq!(parse("/read"), read(last(1, false), None));
+        assert_eq!(parse("/read 3"), read(last(3, false), None));
+        assert_eq!(parse("/read 50 --orch"), read(last(50, true), None));
+        assert_eq!(parse("/read --orch"), read(last(1, true), None));
+        assert_eq!(
+            parse("/read 2 --on laptop --orch"),
+            read(last(2, true), Some("laptop"))
+        );
+        assert_eq!(
+            parse("/read --on='my phone' 4"),
+            read(last(4, false), Some("my phone"))
+        );
+        assert_eq!(parse("/read on"), read(ReadCmd::On, None));
+        assert_eq!(
+            parse("/read off --on mini"),
+            read(ReadCmd::Off, Some("mini"))
+        );
+        assert_eq!(parse("/read stop"), read(ReadCmd::Stop, None));
+        assert_eq!(parse("/read pause"), read(ReadCmd::Pause, None));
+        assert_eq!(parse("/read resume"), read(ReadCmd::Resume, None));
+        assert_eq!(
+            parse("/read skip --on laptop"),
+            read(ReadCmd::Skip, Some("laptop"))
+        );
+        assert_eq!(parse("/read status"), read(ReadCmd::Status, None));
+        assert_eq!(parse("/read this"), read(ReadCmd::This, None));
+        assert_eq!(
+            parse("/read voice 'Daniel (Enhanced)'"),
+            read(ReadCmd::Voice("Daniel (Enhanced)".into()), None)
+        );
+        assert_eq!(
+            parse("/read voice en GB"),
+            read(ReadCmd::Voice("en GB".into()), None)
+        );
+        assert_eq!(parse("/read rate 220"), read(ReadCmd::Rate(220), None));
+        assert_eq!(parse("/read rate 80"), read(ReadCmd::Rate(80), None));
+        // Errors.
+        let err = |line: &str| parse(line).unwrap_err();
+        for line in ["/read 0", "/read 51", "/read 3x"] {
+            assert_eq!(
+                err(line),
+                "/read N reads the last 1 to 50 messages",
+                "{line}"
+            );
+        }
+        for line in ["/read rate 79", "/read rate 501", "/read rate fast"] {
+            assert_eq!(
+                err(line),
+                "/read rate takes 80 to 500 words per minute",
+                "{line}"
+            );
+        }
+        assert!(err("/read rate").starts_with("usage: /read rate <wpm>"));
+        assert!(err("/read voice").starts_with("usage: /read voice <name>"));
+        assert!(err("/read on --orch").contains("/read N --orch"));
+        assert!(err("/read status --on laptop").contains("every speaker"));
+        let usage = err("/read loud");
+        assert!(
+            usage.starts_with("usage: /read [on|off|N|this|status | stop|pause|resume|skip]"),
+            "{usage}"
+        );
+        assert!(usage.contains("--on <speaker>") && usage.contains("rate <wpm>"));
+        assert!(err("/read 2 3").starts_with("usage: /read"));
+        assert_eq!(
+            err("/read --on"),
+            "--on takes a speaker: its name or device"
+        );
+        assert_eq!(
+            err("/read 2 --on ''"),
+            "--on takes a speaker: its name or device"
+        );
+        assert!(err("/read --on a --on b").starts_with("usage: /read"));
+        assert!(err("/read --loud").starts_with("unknown option --loud"));
+    }
+
+    /// `/read`'s first word completes and has popup rows, each saying what it does.
+    #[test]
+    fn read_words_complete_and_suggest() {
+        assert_eq!(
+            complete("/read st", &[], &[], &[]),
+            (None, vec!["stop".to_string(), "status".into()])
+        );
+        assert_eq!(
+            complete("/read pa", &[], &[], &[]),
+            (Some("/read pause ".into()), Vec::new())
+        );
+        assert_eq!(complete("/read 3 ", &[], &[], &[]), (None, Vec::new()));
+        let s = suggest("/read ", &Pools::default());
+        let words: Vec<&str> = s.items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(words, READ_WORDS.iter().map(|w| w.0).collect::<Vec<_>>());
+        let s = suggest("/read th", &Pools::default());
+        assert_eq!(s.items[0].value, "this");
+        assert!(s.items[0].detail.contains("selected"));
+        assert!(takes_args("/read"));
     }
 
     #[test]

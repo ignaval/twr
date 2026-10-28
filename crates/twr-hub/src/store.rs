@@ -2181,6 +2181,26 @@ const LATEST_FINAL_TEXT: &str = concat!(
      AND json_extract(data, '$.final') = 1 ORDER BY turn DESC, seq DESC LIMIT 1"
 );
 
+/// [`speakable_finals`]: the thread's events walked backwards by `seq` from `?2` (the
+/// primary key; `+kind` keeps SQLite off `events_kind_turn`, which would read and sort every
+/// text of the thread), its final texts only. By `seq`, not by turn: a late text of an older
+/// turn (a runtime's notice in a turn it reopened) comes where it was said, and the page's
+/// cursor is a `seq`.
+const FINALS_BEFORE: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE thread = ?1 AND seq < ?2 AND +kind = 'agent.text' AND turn IS NOT NULL
+     AND json_extract(data, '$.final') = 1 ORDER BY seq DESC LIMIT ?3"
+);
+
+/// [`next_final_text`].
+const NEXT_FINAL_TEXT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'agent.text' AND thread = ?1 AND turn = ?2 AND seq >= ?3
+     AND json_extract(data, '$.final') = 1 ORDER BY +seq LIMIT 1"
+);
+
 /// [`updates_about`]: through the kind index (`+seq`: not the primary key's order, which would
 /// read every event of the conversation), the thread's updates only, filtered before the limit.
 const UPDATES_ABOUT: &str = concat!(
@@ -2293,6 +2313,44 @@ pub fn last_final_text(
 pub fn latest_final_text(conn: &Connection, thread: &str) -> anyhow::Result<Option<Event>> {
     let mut st = conn.prepare_cached(LATEST_FINAL_TEXT)?;
     let row = st.query_row(params![thread], row_to_raw).optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// The final `agent.text`s of `thread` in a turn, newest first, those with `seq < before_seq`
+/// (all with `None`), at most `limit`, as stored (possibly capped): what `speech.request` reads
+/// aloud (`hub::speech`), a page at a time.
+pub fn speakable_finals(
+    conn: &Connection,
+    thread: &str,
+    before_seq: Option<u64>,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let before = match before_seq {
+        Some(s) => to_i64(s)?,
+        None => i64::MAX,
+    };
+    let mut st = conn.prepare_cached(FINALS_BEFORE)?;
+    let rows = st.query_map(params![thread, before, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The `turn.started` of turn `turn` of `thread`, as stored (possibly capped).
+pub fn turn_start(conn: &Connection, thread: &str, turn: u64) -> anyhow::Result<Option<Event>> {
+    last_of_kind(conn, thread, Some(turn), "turn.started")
+}
+
+/// The first final `agent.text` of turn `turn` of `thread` at or after `seq`, as stored
+/// (possibly capped): the message a streamed text from `seq` (a delta of it) became.
+pub fn next_final_text(
+    conn: &Connection,
+    thread: &str,
+    turn: u64,
+    seq: u64,
+) -> anyhow::Result<Option<Event>> {
+    let mut st = conn.prepare_cached(NEXT_FINAL_TEXT)?;
+    let row = st
+        .query_row(params![thread, to_i64(turn)?, to_i64(seq)?], row_to_raw)
+        .optional()?;
     row.map(|r| r.into_event()).transpose()
 }
 

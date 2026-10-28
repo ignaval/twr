@@ -50,6 +50,9 @@ pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>)
         project_roots,
         accounts,
         account_policy,
+        // The speaker's (`twr speak`, the TUI's), not the hub's: not shown (its `command` can
+        // carry a hosted voice's key in its arguments).
+        speech: _,
     } = config;
     let CodexConfig { auto: codex_auto } = codex;
     // The command often holds a secret (an ntfy topic, a webhook's URL): whether it is set.

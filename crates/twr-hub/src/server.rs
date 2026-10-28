@@ -68,6 +68,11 @@
 //! | `memory.read`       | `{name}`                                            | a note of `memory.list` with its `body` |
 //! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
 //! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
+//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
+//! | `speech.state`      | `{playing?, queued, batch?, paused, live, voice?, rate, error?}` (on the connection that attached a speaker) | `{ok: true}`: what that speaker plays, for `speech.status` |
+//! | `speech.request`    | `{thread?, last? \| seq?, speaker?}` (users only)   | `{count, speakers, thread}`: reads the last `last` messages, or the one at `seq`, on the speakers now, as one batch (`hub::speech`) |
+//! | `speech.control`    | `{op, value?, speaker?}` (users only)               | `{speakers}`: stop, pause, resume, skip, live, voice or rate, sent to the speakers |
+//! | `speech.status`     | - (users only)                                      | `{speakers: [{device, name, engine, since, playing?, queued, batch?, paused, live, voice?, rate, error?}]}` |
 //! | `usage.get`         | -                                                   | `{now, runtimes: [{runtime, account, label, plan, windows: [{window, label, used_pct, resets_at, minutes}], observed_at, age_secs, stale, source}]}` |
 //! | `account.list`      | `{runtime?}` (not agents)                           | `{runtimes: {<runtime>: {shown, native, native_dir?, native_var?, accounts: [{runtime, name, native, dir, share, source, login, method, note, checked_at, removed, threads, conflict?, shared_credentials?, retained_paths?}]}}, now}`: every runtime that takes accounts (or `runtime`), the native account first (`hub::accounts`); `native_dir` (the runtime's own directory as the hub has it, `null` when none) and `native_var` (`{name, set, value?}`: its selector variable in the hub's environment) for each runtime that takes accounts; the orchestrator gets no `dir`, `native_dir`, `native_var`, `shared_credentials` nor `retained_paths` (`[{thread, path}]`: its threads given its directory by a path it is no longer configured with) |
 //! | `account.add`       | `{runtime, account, dir?, share?, native?, dry_run?, after_native_name?}` (users only) | `{runtime, account, native, dir, share, source, config, existing, recorded}`: records `account.added` unless config.toml declares it or a live record says the same; `dry_run` records nothing; `after_native_name` (a named account's dry run only) answers as if the native account were named that first, that rename checked too |
@@ -702,6 +707,11 @@ pub const METHODS: &[&str] = &[
     "shell.cd",
     "suggest.next",
     "summary.thread",
+    "speech.attach",
+    "speech.state",
+    "speech.request",
+    "speech.control",
+    "speech.status",
     "trash.list",
     "trash.empty",
     "trash.restore",
@@ -955,6 +965,8 @@ async fn connection(
     let mut subs = JoinSet::new();
     let mut state = hub.state();
     let mut leases: Leases = Vec::new();
+    // The speaker this connection attached (`speech.attach`), which its `speech.state` names.
+    let mut speaker: Option<u64> = None;
     loop {
         let frame = tokio::select! {
             f = read_frame::<_, Request>(&mut reader) => f,
@@ -1083,6 +1095,46 @@ async fn connection(
                     }
                 }
             }
+            // A speaker (`hub::speech`): its items go out on this connection, and it reports
+            // its state on it.
+            "speech.attach" => {
+                let attached = if speaker.is_some() {
+                    Err(RpcError::new(
+                        codes::CONFLICT,
+                        "this connection has a speaker attached already",
+                    ))
+                } else {
+                    sub_slot(&sub_count, subs.len(), agent).and_then(|slot| {
+                        let p = required_params(req.params)?;
+                        Ok((slot, hub.speech_attach(p, &caller)?))
+                    })
+                };
+                match attached {
+                    Ok((slot, att)) => {
+                        speaker = Some(att.key());
+                        subs.spawn(pump_speech(writer.clone(), id, att, slot));
+                    }
+                    Err(e) => {
+                        let _ = send(&writer, &Response::err(id, e)).await;
+                    }
+                }
+            }
+            "speech.state" => {
+                let result = match speaker {
+                    Some(key) => params(req.params).and_then(|p| hub.speech_state(key, p)),
+                    None => Err(RpcError::new(
+                        codes::BAD_REQUEST,
+                        "no speaker is attached on this connection (speech.attach first)",
+                    )),
+                };
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
             "attach.begin" => {
                 let result = attach_begin(&hub, &client, req.params, &mut leases).await;
                 let resp = match result {
@@ -1136,7 +1188,7 @@ async fn connection(
             | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
             | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
             | "box.projects" | "box.token" | "account.status" | "account.remove"
-            | "thread.set_model" => {
+            | "thread.set_model" | "speech.request" | "speech.control" => {
                 let result =
                     call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
@@ -1389,6 +1441,39 @@ async fn pump_thread(
     pump(w, id, ack, sub).await;
 }
 
+/// Serves speaker `att` (request `id`) until its feed ends (the hub stopped) or the
+/// connection goes (which detaches it: dropping `att` does), counted in the hub's
+/// subscriptions meanwhile: its ack, then each item as `{"stream":"speech","item":{...}}`.
+async fn pump_speech(w: Writer, id: u64, mut att: crate::hub::SpeechAttachment, _slot: SubSlot) {
+    /// A line of the stream.
+    #[derive(Serialize)]
+    struct Line<'a> {
+        stream: &'static str,
+        item: &'a twr_core::speech::SpeechItem,
+    }
+    let ack = match serde_json::to_value(att.ack()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send(&w, &Response::err(id, internal(e))).await;
+            return;
+        }
+    };
+    if send(&w, &Response::ok(id, ack)).await.is_err() {
+        return;
+    }
+    while let Some(item) = att.next().await {
+        let line = Line {
+            stream: "speech",
+            item: &item,
+        };
+        if send(&w, &line).await.is_err() {
+            return;
+        }
+    }
+    // End of stream: close our side so the speaker sees EOF (and attaches again).
+    let _ = w.lock().await.shutdown().await;
+}
+
 /// Most bytes of items [`pump`] writes at once.
 const WRITE_BATCH: usize = 64 * 1024;
 
@@ -1493,6 +1578,12 @@ fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, RpcError> {
     if v.is_null() {
         return Ok(T::default());
     }
+    serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+}
+
+/// [`params`] of a method whose params have fields without a default: none given is a
+/// `bad_request` too.
+fn required_params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
     serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
 }
 
@@ -2079,6 +2170,17 @@ async fn call_async(
             let p: twr_core::proto::SummaryThreadParams = params(p)?;
             hub.summary_thread(&p, caller).await
         }
+        // Sent to the speakers attached, each in its turn (`hub::speech`).
+        "speech.request" => {
+            let p: twr_core::speech::SpeechRequestParams = params(p)?;
+            let out = hub.speech_request(&p, caller).await?;
+            serde_json::to_value(out).map_err(internal)
+        }
+        "speech.control" => {
+            let p: twr_core::speech::SpeechControlParams = required_params(p)?;
+            let out = hub.speech_control(&p, caller).await?;
+            serde_json::to_value(out).map_err(internal)
+        }
         "usage.threads" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -2637,6 +2739,10 @@ fn call(
                 threads.iter_mut().for_each(hide_removed_login_dir);
             }
             Ok(Value::Array(threads))
+        }
+        "speech.status" => {
+            let _: EmptyParams = params(p)?;
+            serde_json::to_value(hub.speech_status(caller)?).map_err(internal)
         }
         "thread.activity" => Ok(hub.thread_activity()),
         "hub.glance" => hub.glance(),

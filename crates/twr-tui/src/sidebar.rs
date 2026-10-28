@@ -1571,6 +1571,7 @@ mod tests {
             seq: 1,
             text: "old reply".into(),
             open: false,
+            final_seq: None,
         });
         st.transcripts.push(t);
         st.tabs[0].glance = Some(Glance {

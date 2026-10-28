@@ -18,6 +18,8 @@ twr-core.workspace = true
 twr-hub.workspace = true
 twr-mcp.workspace = true
 twr-runner.workspace = true
+# `twr speak` and `twr remote`: the speaker (docs/read-aloud.md).
+twr-speech.workspace = true
 twr-tui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
