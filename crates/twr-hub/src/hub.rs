@@ -2385,13 +2385,24 @@ impl Core {
         // thread left that runtime with, given what the thread did since, if anything
         // (`hub::switch`). The turn says which session it resumes: its failure before the
         // runtime started it drops the resume (`ThreadView::resume_failed_turn`).
+        // The session it resumes is checked again now, under the lock the turn starts in, as
+        // the move checked it: its account may have been removed (and added again) since. One
+        // that no longer holds is dropped by this turn (`ext.twr.resume_dropped`, with why),
+        // which starts a new session with the full handoff instead.
         let moving = view.handoff_pending && !self.orch.is_thread(thread);
-        let resumes = view.resume_session.clone().filter(|_| moving);
+        let pending = view.resume_session.clone().filter(|_| moving);
+        let dropped = pending.as_ref().and_then(|_| self.resume_dropped(view));
+        let resumes = pending.clone().filter(|_| dropped.is_none());
         let handoff = if moving {
-            self.thread_handoff_or_note(thread)
+            self.thread_handoff_or_note(thread, dropped.as_deref())
         } else {
             None
         };
+        if let (Some(s), Some(why)) = (&pending, &dropped) {
+            tracing::info!(thread, session = %s, why = %why, "a pending resume no longer holds: a new session");
+            twr.insert(RESUME_DROPPED_KEY.into(), json!(s));
+            twr.insert(RESUME_DROPPED_WHY_KEY.into(), json!(why));
+        }
         let injected = self.context_for_turn(hub, thread, &mut batch)?;
         if let Some(i) = &injected {
             context::turn_ext(i, &mut twr);

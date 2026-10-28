@@ -1562,7 +1562,7 @@ mod tests {
         let handoff = hub
             .inner
             .core()
-            .thread_handoff("t1")
+            .thread_handoff("t1", None)
             .unwrap()
             .expect("a handoff");
         assert!(

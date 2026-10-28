@@ -24,7 +24,8 @@
 //!    session). The move records it as `ext.twr.`[`RESUME_SESSION_KEY`], and the thread's
 //!    session is that one meanwhile (`ThreadView::resume_session`, still pending). A model or
 //!    effort left out is then the one the thread had when it left the session (the
-//!    session's); one given replaces it, but a `default` the runtime would not take on resume
+//!    session's; on a move between accounts of one runtime, the thread's own, kept); one
+//!    given replaces it, but a default the runtime would not take on resume
 //!    ([`runtime_spec::clear_refusal`]) makes the move start a new session instead.
 //! 2. The old runtime: a live one is stopped through the settings restart (`hub::restart`,
 //!    `thread.stopped` with reason `runtime_change`; the thread does not count as stopped):
@@ -55,6 +56,13 @@
 //!    reports its session (`thread.started`), every turn carries it again: a start that failed
 //!    delivered nothing.
 //!
+//!    The turn that would carry a resume checks the session again first, under the lock it
+//!    starts in, as the move did ([`Core::resume_dropped`]): the account may have been removed
+//!    (and added again, maybe as another login) or reached by another path since. One that no
+//!    longer holds is dropped by that turn (`ext.twr.`[`RESUME_DROPPED_KEY`] and why, the
+//!    fold clearing the resume, the move still pending): it starts a new session given the
+//!    full handoff, whose first sentence says why the earlier session was not resumed.
+//!
 //!    When the turn that carried a resume (any turn the hub starts: the user's, the
 //!    orchestrator's, a job's wake) fails before the runtime reported the session (it ends
 //!    `error` or `interrupted`, or the runtime crashes in it: Claude Code's `No conversation
@@ -83,11 +91,16 @@
 //! A move back resumes a session only on the account it ran on ([`Core::departure`]): the
 //! move that left it was away from the same runtime and the same account (the native account
 //! whatever it is called now; a named one by name, not removed), the runtime start that ran it
-//! recorded the directory the account has now (`ext.twr.account_dir`, links followed), and
-//! the account was not removed since that start. So a move back to the account a thread left
-//! resumes its session there, and a move to another account of the runtime, to its account in
-//! another directory, or to an account removed and added again starts a new session with the
-//! full handoff. No session moves between accounts (nor between organizations of one).
+//! recorded the directory the account has now (`ext.twr.account_dir`, links followed), the
+//! account was not removed since that start, and a named account's runtime was given its
+//! directory by the path the move gives it now (`ext.twr.account_env_dir` of the account's
+//! binding then: a runtime may key its login on the path, Claude Code's macOS Keychain
+//! entry, so two links to one directory are two logins). So a move back to the account a
+//! thread left resumes its session there, and a move to another account of the runtime, to
+//! its account in another directory or by another path, or to an account removed and added
+//! again starts a new session with the full handoff; the turn that would resume checks all
+//! that again (above). No session moves between accounts (nor between organizations of
+//! one).
 //!
 //! The previous runtime is not asked for a summary (unlike an orchestrator switch,
 //! `hub::handoff`): a worker's reports already summarize its turns, and the log has the rest.
@@ -128,6 +141,16 @@ const REPORT_MAX: usize = 600;
 
 /// `turn.started` `ext.twr` key of the handoff a turn delivered to a thread's new runtime.
 pub const HANDOFF_KEY: &str = "runtime_handoff";
+
+/// Why a saved session is not resumed ([`Core::departure_check`]), as the handoff of the new
+/// session that a dropped resume starts says it.
+const GONE: &str = "its account was removed";
+const NO_SESSION: &str = "twr no longer finds the move that left that session";
+const OTHER_DIR: &str = "its account's directory is not the one that session ran in";
+const REMOVED: &str =
+    "its account was removed since that session ran (it may be another login now)";
+const OTHER_PATH: &str =
+    "its account is reached by another path than the one that session ran through";
 
 /// The tags around the handoff.
 const OPEN_TAG: &str = "<twr-handoff>";
@@ -261,46 +284,130 @@ impl Core {
     }
 
     /// The move that left thread `thread`'s latest session of `runtime` on account `account`
-    /// (`None`: the native one) that a move back there resumes (see the module docs): of its
-    /// latest [`MOVES_MAX`] moves, the newest away from `runtime` and that same account
-    /// ([`Core::account_identity`]: the native account whatever its name is now, a named one
-    /// that is not removed) that recorded the session it left (`ext.twr.previous_session`:
-    /// only a session the runtime had confirmed, never one a pending move only asked for).
-    /// `None` too when that session began in another directory than `dir` (the account's
-    /// now, links followed; `None` for the native account) or the account was removed since
-    /// it began ([`Core::session_in`]): the session lives in the directory it began in, and
-    /// another login there is not the one it ran on. Another account's session is never
-    /// resumed.
+    /// (`None`: the native one) that a move back there resumes, `None` when there is none or
+    /// it no longer holds ([`Core::departure_check`]). `dir`: the account's directory now
+    /// (links followed; `None` for the native account); `env`: the path the resumed runtime
+    /// would be given as that directory (`ACCOUNT_ENV_DIR_KEY`). Another account's session is
+    /// never resumed.
     pub(super) fn departure(
         &self,
         thread: &str,
         runtime: &str,
         account: Option<&str>,
         dir: Option<&Path>,
+        env: Option<&Path>,
     ) -> anyhow::Result<Option<Departure>> {
+        Ok(self
+            .departure_check(thread, runtime, account, dir, env)?
+            .ok())
+    }
+
+    /// [`Core::departure`], or why there is no session to resume (see the module docs): of
+    /// the thread's latest [`MOVES_MAX`] moves, the newest away from `runtime` and that same
+    /// account ([`Core::account_identity`]: the native account whatever its name is now, a
+    /// named one that is not removed) that recorded the session it left
+    /// (`ext.twr.previous_session`: only a session the runtime had confirmed, never one a
+    /// pending move only asked for). It no longer holds when that session began in another
+    /// directory than `dir` or the account was removed since it began ([`Core::session_in`]:
+    /// the session lives in the directory it began in, and another login there is not the
+    /// one it ran on), or, on a named account, when its runtime was given that directory by
+    /// another path than `env` ([`Core::launch_path`]: a runtime may key its login on the
+    /// path, Claude Code's macOS Keychain entry).
+    pub(super) fn departure_check(
+        &self,
+        thread: &str,
+        runtime: &str,
+        account: Option<&str>,
+        dir: Option<&Path>,
+        env: Option<&Path>,
+    ) -> anyhow::Result<Result<Departure, &'static str>> {
         let Some(target) = self.account_identity(runtime, account) else {
-            return Ok(None);
+            return Ok(Err(GONE));
         };
-        let found = self.moves(thread)?.into_iter().find_map(|(seq, m)| {
+        let moves = self.moves(thread)?;
+        let found = moves.iter().enumerate().find_map(|(i, (seq, m))| {
             if m.previous_runtime.as_deref() != Some(runtime)
-                || self.account_identity(runtime, left_account(&m)).as_ref() != Some(&target)
+                || self.account_identity(runtime, left_account(m)).as_ref() != Some(&target)
             {
                 return None;
             }
-            let session = left_session(&m)?.to_string();
-            Some((seq, session, m))
+            let session = left_session(m)?.to_string();
+            Some((i, *seq, session, m))
         });
-        let Some((seq, session, m)) = found else {
-            return Ok(None);
+        let Some((i, seq, session, m)) = found else {
+            return Ok(Err(NO_SESSION));
         };
-        if !self.session_in(thread, seq, &session, runtime, left_account(&m), dir)? {
+        if let Err(why) = self.session_in(thread, seq, &session, runtime, left_account(m), dir)? {
+            return Ok(Err(why));
+        }
+        if target.is_some() && self.launch_path(thread, &moves, i)?.as_deref() != env {
+            return Ok(Err(OTHER_PATH));
+        }
+        Ok(Ok(Departure {
+            session,
+            model: m.previous_model.clone(),
+            effort: m.previous_effort.clone(),
+        }))
+    }
+
+    /// The path the runtime of the session that move `moves[i]` (of thread `thread`'s, newest
+    /// first) left was given as its named account's directory: `ext.twr.account_env_dir` of
+    /// the account's binding then, the newest move before it that changed the account (as
+    /// `hub::append` tracks it), else the thread's `thread.created`. `None` when that records
+    /// none (the native account, or a binding from before the key) or the moves read back do
+    /// not reach it.
+    fn launch_path(
+        &self,
+        thread: &str,
+        moves: &[(u64, ThreadModelChanged)],
+        i: usize,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        let path = |ext: &Option<JsonMap>| {
+            twr_ext(ext)
+                .and_then(|t| t.get(ACCOUNT_ENV_DIR_KEY))
+                .and_then(Value::as_str)
+                .filter(|d| !d.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some((_, m)) = moves[i + 1..].iter().find(|(_, m)| m.account_changed) {
+            return Ok(path(&m.ext));
+        }
+        if moves.len() >= MOVES_MAX {
             return Ok(None);
         }
-        Ok(Some(Departure {
-            session,
-            model: m.previous_model,
-            effort: m.previous_effort,
-        }))
+        let created = store::first_of_kind(self.store.conn(), thread, "thread.created")?
+            .map(|e| self.full(e));
+        Ok(match created.map(|e| e.body) {
+            Some(EventBody::ThreadCreated(p)) => path(&p.ext),
+            _ => None,
+        })
+    }
+
+    /// Why the session thread `view`'s pending move back resumes (`ThreadView::resume_session`)
+    /// no longer holds as its turn starts, checked again as the move checked it
+    /// ([`Core::departure_check`], with the account's directory and path the move recorded):
+    /// the account may have been removed (and added again) since, under the lock the turn's
+    /// start holds. `None` when it holds, or no resume is pending. A log that cannot be read
+    /// drops the resume too (said so).
+    pub(super) fn resume_dropped(&self, view: &ThreadView) -> Option<String> {
+        let session = view.resume_session.as_deref()?;
+        let dir = self.account_dir(view);
+        let env = self.account_env_dir(view);
+        match self.departure_check(
+            &view.id,
+            &view.runtime,
+            view.account.as_deref(),
+            dir.as_deref(),
+            env.as_deref(),
+        ) {
+            Ok(Ok(d)) if d.session == session => None,
+            Ok(Ok(_)) => Some(NO_SESSION.to_string()),
+            Ok(Err(why)) => Some(why.to_string()),
+            Err(e) => {
+                tracing::warn!(thread = %view.id, error = %format!("{e:#}"), "cannot check a pending resume");
+                Some(format!("twr could not check it ({e:#})"))
+            }
+        }
     }
 
     /// Which account `account` of `runtime` is now (`None`: the native one): `Some(None)` the
@@ -320,12 +427,14 @@ impl Core {
 
     /// Whether session `session` of thread `thread`, which the move at `seq` left on account
     /// `account` of `runtime` (`None`: the native one), ran in directory `dir` (the account's
-    /// now; `None` for the native account), and the account was not removed since: the
-    /// runtime start that ran it (the newest `thread.started` / `thread.resumed` before the
-    /// move that names that session or none) recorded that directory (`ext.twr.account_dir`,
-    /// stamped by the hub; absent for the native account), and no `account.removed` of the
-    /// account (but a `record_only` one: the account stayed) came after that start. A start
-    /// the log does not have counts as one in no directory, from the log's beginning.
+    /// now; `None` for the native account), and the account was not removed since (else
+    /// why not): the runtime start that ran it (the newest `thread.started` / `thread.resumed`
+    /// a runtime reported before the move that names that session or none; a park's or a
+    /// user's resume the hub recorded is no start, as `hub::retry` reads them) recorded that
+    /// directory (`ext.twr.account_dir`, stamped by the hub; absent for the native account),
+    /// and no `account.removed` of the account (but a `record_only` one: the account stayed)
+    /// came after that start. A start the log does not have counts as one in no directory,
+    /// from the log's beginning.
     fn session_in(
         &self,
         thread: &str,
@@ -334,21 +443,19 @@ impl Core {
         runtime: &str,
         account: Option<&str>,
         dir: Option<&Path>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Result<(), &'static str>> {
         let conn = self.store.conn();
         let mut start: Option<Event> = None;
         for kind in ["thread.started", "thread.resumed"] {
             let found = store::latest_of_kind(conn, thread, kind, STARTS_MAX)?
                 .into_iter()
+                .filter(|e| e.seq < seq && matches!(e.source, Source::Adapter(_)))
                 .map(|e| self.full(e))
-                .find(|e| {
-                    e.seq < seq
-                        && match &e.body {
-                            EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
-                                p.session_id.as_deref().is_none_or(|s| s == session)
-                            }
-                            _ => false,
-                        }
+                .find(|e| match &e.body {
+                    EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) => {
+                        p.session_id.as_deref().is_none_or(|s| s == session)
+                    }
+                    _ => false,
                 });
             if let Some(e) = found {
                 if start.as_ref().is_none_or(|s| s.seq < e.seq) {
@@ -379,7 +486,13 @@ impl Core {
             (Some(a), Some(b)) => a == b || super::accounts::same_dir(a, b),
             _ => false,
         };
-        Ok(same && !self.account_removed_since(runtime, account, since))
+        if !same {
+            return Ok(Err(OTHER_DIR));
+        }
+        if self.account_removed_since(runtime, account, since) {
+            return Ok(Err(REMOVED));
+        }
+        Ok(Ok(()))
     }
 
     /// Whether account `account` of `runtime` (`None`: the native one) was removed after
@@ -422,16 +535,23 @@ impl Core {
     /// runtime is pending (see the module docs), built from the log now: when the move resumes
     /// a session the thread left earlier, what the thread did since it left it (`None` when it
     /// did nothing since: no handoff); otherwise what the previous session did.
-    pub(super) fn thread_handoff(&self, thread: &str) -> anyhow::Result<Option<String>> {
+    /// With `dropped`, the turn drops the pending resume for that reason
+    /// ([`Core::resume_dropped`]): a new session's full handoff, saying so.
+    pub(super) fn thread_handoff(
+        &self,
+        thread: &str,
+        dropped: Option<&str>,
+    ) -> anyhow::Result<Option<String>> {
         let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
-        match view.resume_session.clone() {
+        match view.resume_session.clone().filter(|_| dropped.is_none()) {
             Some(session) => self.resume_handoff(&view, &session),
-            None => self.full_handoff(&view).map(Some),
+            None => self.full_handoff(&view, dropped).map(Some),
         }
     }
 
-    /// The handoff of a new session of the thread's new runtime (step 3 of the module docs).
-    fn full_handoff(&self, view: &ThreadView) -> anyhow::Result<String> {
+    /// The handoff of a new session of the thread's new runtime (step 3 of the module docs);
+    /// `dropped`: why the turn drops the resume it would have carried.
+    fn full_handoff(&self, view: &ThreadView, dropped: Option<&str>) -> anyhow::Result<String> {
         let thread = view.id.as_str();
         let conn = self.store.conn();
         // The move away from the session that did the work: of the latest moves (newest
@@ -516,13 +636,18 @@ impl Core {
 
         // After a resume that failed (`ThreadView::resume_failed_turn`), the session is a new
         // one all the same.
-        let opening = match view.resume_failed_turn {
-            Some(_) => format!(
+        let opening = match (dropped, view.resume_failed_turn) {
+            (Some(why), _) => format!(
+                "twr did not resume the earlier {} session of this thread ({}): {why}. So you \
+                 are a new {} session taking over its work",
+                view.runtime, view.name, view.runtime
+            ),
+            (None, Some(_)) => format!(
                 "twr could not resume the earlier {} session of this thread ({}), so you are a \
                  new {} session taking over its work",
                 view.runtime, view.name, view.runtime
             ),
-            None => format!(
+            (None, None) => format!(
                 "This thread ({}) moved to another {}: you are a new {} session taking over its \
                  work",
                 view.name,
@@ -778,15 +903,21 @@ impl Core {
         Ok(out)
     }
 
-    /// The handoff for the turn now starting on `thread` (see [`Core::thread_handoff`]); when
-    /// the log cannot be read, a short one saying so (the move must not stop the turn).
-    pub(super) fn thread_handoff_or_note(&self, thread: &str) -> Option<String> {
-        self.thread_handoff(thread).unwrap_or_else(|e| {
+    /// The handoff for the turn now starting on `thread` (see [`Core::thread_handoff`];
+    /// `dropped`: the turn drops the pending resume, [`Core::resume_dropped`]); when the log
+    /// cannot be read, a short one saying so (the move must not stop the turn).
+    pub(super) fn thread_handoff_or_note(
+        &self,
+        thread: &str,
+        dropped: Option<&str>,
+    ) -> Option<String> {
+        self.thread_handoff(thread, dropped).unwrap_or_else(|e| {
             tracing::warn!(thread, error = %format!("{e:#}"), "cannot build a runtime handoff");
-            let resumes = self
-                .registry
-                .get(thread)
-                .is_some_and(|v| v.resume_session.is_some());
+            let resumes = dropped.is_none()
+                && self
+                    .registry
+                    .get(thread)
+                    .is_some_and(|v| v.resume_session.is_some());
             Some(if resumes {
                 format!(
                     "[twr handoff] This thread comes back to you: you are its earlier session, \

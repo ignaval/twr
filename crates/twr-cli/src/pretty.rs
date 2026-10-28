@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 use twr_core::blob::truncate_utf8;
-use twr_core::event::{Event, EventBody};
+use twr_core::event::{Event, EventBody, RESUME_DROPPED_KEY, RESUME_DROPPED_WHY_KEY};
 use twr_core::reduce::reported_model;
 // `ext.twr.reason` of the `thread.stopped` a hub shutdown records.
 use twr_hub::hub::HUB_SHUTDOWN as SHUTDOWN;
@@ -237,8 +237,20 @@ pub fn summary(ev: &Event) -> String {
                 Some(_) => "(with handoff) ".to_string(),
                 None => String::new(),
             };
+            // A move back whose earlier session no longer held when this turn started: a new
+            // session instead, and why.
+            let dropped = match twr.and_then(|t| t.get(RESUME_DROPPED_KEY)) {
+                Some(Value::String(s)) => {
+                    let why = twr
+                        .and_then(|t| t.get(RESUME_DROPPED_WHY_KEY))
+                        .and_then(Value::as_str)
+                        .unwrap_or("it no longer holds");
+                    format!("(new session, not resuming {s}: {why}) ")
+                }
+                _ => String::new(),
+            };
             format!(
-                "from={} {handoff}{}",
+                "from={} {dropped}{handoff}{}",
                 from.as_str().unwrap_or("?"),
                 short(&p.prompt)
             )

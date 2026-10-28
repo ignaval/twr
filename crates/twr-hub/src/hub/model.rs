@@ -34,15 +34,22 @@
 //! A move back to a runtime the thread left a session of earlier resumes that session instead
 //! (not for `acp`): a model or effort left out is then the one the thread had when it left it,
 //! and a `default` that runtime keeps a session's value of makes the move start a new session
-//! (with the full handoff) rather than being refused. Until the resumed session starts, a clear
-//! of a setting the runtime keeps is refused as for any session the thread has.
+//! (with the full handoff) rather than being refused. (The session is resumed with the
+//! thread's settings, as any resume is: a value other than the session's applies.) Until the
+//! resumed session starts, a clear of a setting the runtime keeps is refused as for any
+//! session the thread has.
 //!
 //! With an `account` (`twr model --account`, or `--runtime <runtime>:<account>`), the thread
 //! moves to that account (`hub::switch`, `hub::thread_account`), on its runtime or with a new
 //! one: a new session there, with the handoff, like a runtime move. A move between accounts of
-//! one runtime keeps the thread's model and effort unless given. A move back resumes only a
-//! session the thread left on that runtime and that same account, in the directory the
-//! account has now ([`Core::departure`]): never another account's session.
+//! one runtime keeps the thread's model and effort unless given, also when it moves back to
+//! an account the thread left a session of: that session resumes with the thread's settings
+//! now, not the ones it had when the thread left it, unless the thread's default for a
+//! setting the runtime keeps on resume would leave the session on its own value (as for a
+//! `default` given above): then the move starts a new session there. A move back resumes
+//! only a session the thread left on that runtime and that same account, in the directory
+//! the account has now and through the path its runtime was given then
+//! ([`Core::departure`]): never another account's session.
 //!
 //! Unlike a mode change, the orchestrator's change of a model or effort is applied directly,
 //! recorded with `by: orchestrator`: choosing a model is no permission answer (like
@@ -397,13 +404,14 @@ impl Core {
         }
         // A move back to a runtime and account the thread left a session of resumes that
         // session (`hub::switch`): found before the settings are checked, which then start from
-        // the session's. Only that account's own session, in the directory the account has
-        // now ([`Core::departure`]). Unless the call asks the runtime's default for a setting
-        // the runtime keeps on resume: the session would go on with its own, so the move
+        // the session's on a move to another runtime (or agent). Only that account's own
+        // session, in the directory the account has now and given it by the path its runtime
+        // had then ([`Core::departure`]). Unless the move's settings would clear one the
+        // runtime keeps on resume (below): the session would go on with its own, so the move
         // starts a new one.
-        let target_dir = match account_move {
-            Some(a) => a.dir.clone(),
-            None => self.account_dir(&view),
+        let (target_dir, target_env) = match account_move {
+            Some(a) => (a.dir.clone(), a.env_dir.clone()),
+            None => (self.account_dir(&view), self.account_env_dir(&view)),
         };
         let mut departure = match &switch {
             Some(s) if s.spec.acp.is_none() && s.spec.runtime != twr_adapters::pty::NAME => self
@@ -412,20 +420,11 @@ impl Core {
                     &s.spec.runtime,
                     target_account.as_deref(),
                     target_dir.as_deref(),
+                    target_env.as_deref(),
                 )
                 .map_err(internal)?,
             _ => None,
         };
-        if let Some(d) = &departure {
-            let cleared = [("model", model, &d.model), ("effort", effort, &d.effort)];
-            if cleared.into_iter().any(|(what, given, from)| {
-                given.is_some_and(runtime_spec::is_default)
-                    && runtime_spec::clear_refusal(&target, &view.name, true, what, from, &None)
-                        .is_some()
-            }) {
-                departure = None;
-            }
-        }
         // Its own runtime (or account) named alone: nothing changes (reported below).
         let named = runtime.is_some() || account.is_some();
         if model.is_none() && effort.is_none() && switch.is_none() && !named {
@@ -435,28 +434,52 @@ impl Core {
                  or effort to the runtime's own)",
             ));
         }
-        // On another runtime, one left out is the new runtime's default, or the session's
-        // when the move resumes one.
-        let new_model = match model {
-            None if departure.is_some() => departure.as_ref().and_then(|d| d.model.clone()),
-            None if runtime_changed => None,
-            None => view.model.clone(),
-            Some(m) if runtime_spec::is_default(m) => None,
-            Some(m) => {
-                let m = m.trim();
-                if let Some(e) = runtime_spec::model_error(m) {
-                    return Err(rpc(codes::BAD_REQUEST, e));
+        // On another runtime (or agent), one left out is the new runtime's default, or the
+        // session's when the move resumes one. A move between accounts of one runtime keeps
+        // the thread's, also when it resumes the session the thread left there: that session
+        // runs on with them (a resume is given the thread's settings).
+        let settings = |restores: Option<&super::switch::Departure>| {
+            let restores = restores.filter(|_| runtime_changed);
+            let new_model = match model {
+                None if restores.is_some() => restores.and_then(|d| d.model.clone()),
+                None if runtime_changed => None,
+                None => view.model.clone(),
+                Some(m) if runtime_spec::is_default(m) => None,
+                Some(m) => {
+                    let m = m.trim();
+                    if let Some(e) = runtime_spec::model_error(m) {
+                        return Err(rpc(codes::BAD_REQUEST, e));
+                    }
+                    Some(m.to_string())
                 }
-                Some(m.to_string())
+            };
+            let new_effort = match effort {
+                None if restores.is_some() => restores.and_then(|d| d.effort.clone()),
+                None if runtime_changed => None,
+                None => view.effort.clone(),
+                Some(e) => runtime_spec::canonical_effort(e, &target)
+                    .map_err(|e| rpc(codes::BAD_REQUEST, e))?,
+            };
+            Ok((new_model, new_effort))
+        };
+        let (mut new_model, mut new_effort) = settings(departure.as_ref())?;
+        // A resumed session given the runtime's default for a setting the runtime keeps on
+        // resume would go on with its own (`runtime_spec::clear_refusal`): a `default` asked
+        // for, or, between accounts of one runtime, the thread's default kept while the
+        // session had a value. The move starts a new session there instead, with the full
+        // handoff (and, on another runtime, that runtime's defaults for what was left out).
+        if let Some(d) = &departure {
+            let cleared = [
+                ("model", &d.model, &new_model),
+                ("effort", &d.effort, &new_effort),
+            ];
+            if cleared.into_iter().any(|(what, from, to)| {
+                runtime_spec::clear_refusal(&target, &view.name, true, what, from, to).is_some()
+            }) {
+                departure = None;
+                (new_model, new_effort) = settings(None)?;
             }
-        };
-        let new_effort = match effort {
-            None if departure.is_some() => departure.as_ref().and_then(|d| d.effort.clone()),
-            None if runtime_changed => None,
-            None => view.effort.clone(),
-            Some(e) => runtime_spec::canonical_effort(e, &target)
-                .map_err(|e| rpc(codes::BAD_REQUEST, e))?,
-        };
+        }
         // A runtime that keeps a session's model or effort on resume cannot be cleared back to
         // its default once the thread's next start resumes a session: the session would go on
         // with the old value while the thread said the default. A session the thread has, or

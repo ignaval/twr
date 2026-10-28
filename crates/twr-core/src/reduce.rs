@@ -292,7 +292,8 @@ pub struct ThreadView {
     /// [`ThreadView::session_id`] is that session meanwhile (still
     /// [`ThreadView::handoff_pending`]). Every move clears it before it sets its own; the new
     /// runtime's start ends it, and so does the failure of the turn that carried it
-    /// ([`ThreadView::resume_failed_turn`]).
+    /// ([`ThreadView::resume_failed_turn`]), or a turn that drops it because the session no
+    /// longer holds when the turn starts ([`RESUME_DROPPED_KEY`]: no session, still pending).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session: Option<String>,
     /// The turn that carries [`ThreadView::resume_session`]: the work turn whose
@@ -714,6 +715,18 @@ impl ThreadView {
                 self.current_turn_interrupted = false;
                 if let Some(r) = self.current_turn_retry_of {
                     self.turn_retry_of.insert(n, r);
+                }
+                // A turn the hub recorded that drops the pending resume (its session no longer
+                // holds, [`RESUME_DROPPED_KEY`]): it starts a new session, the move still
+                // pending.
+                if self.handoff_pending
+                    && !matches!(ev.source, Source::Adapter(_))
+                    && self.resume_session.is_some()
+                    && twr_str(p.ext.as_ref(), RESUME_DROPPED_KEY) == self.resume_session.as_deref()
+                {
+                    self.session_id = None;
+                    self.resume_session = None;
+                    self.resume_turn = None;
                 }
                 // The turn that carries the pending resume: one the hub recorded, whoever it is
                 // from (a job's wake is `from: runtime`), never one a runtime reported.
@@ -2403,6 +2416,43 @@ mod tests {
         assert_eq!(resume_state(&v), (None, None, None, None, true));
         v.apply(&from(s.started("g1"), "grok-build"));
         assert_eq!(resume_state(&v), (Some("g1"), None, None, None, false));
+    }
+
+    /// A hub turn that drops the pending resume (`ext.twr.resume_dropped`, the session no
+    /// longer holding when the turn starts) leaves no session and no resume, the move still
+    /// pending; one that names another session, or a runtime's own turn, drops nothing. The
+    /// new runtime's start then ends the move.
+    #[test]
+    fn a_turn_that_drops_the_resume_starts_a_new_session() {
+        let dropping = |s: &mut ThreadScript, session: &str| {
+            let mut ev = s.turn_started("go");
+            ev.source = Source::Hub;
+            if let EventBody::TurnStarted(p) = &mut ev.body {
+                set_twr_ext(&mut p.ext, RESUME_DROPPED_KEY, serde_json::json!(session));
+            }
+            ev
+        };
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("a1"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        v.apply(&from(s.started("b1"), "codex"));
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&dropping(&mut s, "zz"));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&s.turn_ended(TurnResult::Error));
+        v.apply(&from(runtime_turn(dropping(&mut s, "a1")), "fake"));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&dropping(&mut s, "a1"));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        // Its failure is no failed resume.
+        v.apply(&s.turn_ended(TurnResult::Error));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        v.apply(&s.started("a2"));
+        assert_eq!(resume_state(&v), (Some("a2"), None, None, None, false));
     }
 
     /// The turn that carried a resume fails (ends `error` or `interrupted`, or a crash takes

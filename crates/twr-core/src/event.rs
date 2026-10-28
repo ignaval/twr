@@ -810,6 +810,18 @@ pub const RESUME_SESSION_KEY: &str = "resume_session";
 /// ([`crate::reduce::ThreadView::resume_failed_turn`]).
 pub const RESUMES_KEY: &str = "resumes";
 
+/// `ext.twr` key of the `turn.started` that would have carried a pending resume
+/// ([`RESUME_SESSION_KEY`]) but drops it: the session no longer holds when the turn starts
+/// (its account was removed since, or is in another directory or reached by another path:
+/// `hub::switch`), so the turn starts a new session with the full handoff instead. The
+/// session it drops (a string); the fold clears the resume and keeps the move pending
+/// ([`crate::reduce::ThreadView::resume_session`]).
+pub const RESUME_DROPPED_KEY: &str = "resume_dropped";
+
+/// `ext.twr` key next to [`RESUME_DROPPED_KEY`]: why the resume was dropped (a string, for
+/// the transcript).
+pub const RESUME_DROPPED_WHY_KEY: &str = "resume_dropped_why";
+
 /// `ext.twr` key of a `conversation.update` on a worker thread that turns the hub's offers to
 /// compact its context once its prompt cache expired off (`"off"`) or back on (`"on"`)
 /// ([`crate::reduce::ThreadView::idle_compaction_off`]).

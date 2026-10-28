@@ -11,7 +11,7 @@
 use serde_json::Value;
 use twr_core::event::{
     ACCOUNT_DIR_KEY, ACCOUNT_KEY, ACCOUNT_RESTART_REASON, BOX_UPGRADE_REASON, MODEL_RESTART_REASON,
-    MODE_RESTART_REASON, RUNTIME_RESTART_REASON,
+    MODE_RESTART_REASON, RESUME_DROPPED_KEY, RESUME_DROPPED_WHY_KEY, RUNTIME_RESTART_REASON,
 };
 
 /// Output cap for one tool result, in bytes.
@@ -122,15 +122,30 @@ fn or_default(v: Option<&Value>) -> String {
 }
 
 /// ` (with the handoff from its previous runtime)` for the turn that started a thread's new
-/// runtime (`turn.started` `ext.twr.runtime_handoff`), else empty.
-fn handoff_note(d: &Value) -> &'static str {
-    if d.pointer("/ext/twr/runtime_handoff")
+/// runtime (`turn.started` `ext.twr.runtime_handoff`), else empty; with why the turn did not
+/// resume the earlier session its move back named, when it dropped that resume
+/// (`ext.twr.resume_dropped`).
+fn handoff_note(d: &Value) -> String {
+    let dropped = d
+        .pointer(&format!("/ext/twr/{RESUME_DROPPED_KEY}"))
+        .and_then(Value::as_str)
+        .map(|s| {
+            let why = d
+                .pointer(&format!("/ext/twr/{RESUME_DROPPED_WHY_KEY}"))
+                .and_then(Value::as_str)
+                .unwrap_or("it no longer holds");
+            format!(" (a new session: earlier session {s} not resumed, {why})")
+        })
+        .unwrap_or_default();
+    let handoff = if d
+        .pointer("/ext/twr/runtime_handoff")
         .is_some_and(|h| !h.is_null())
     {
         " (with the handoff from its previous runtime)"
     } else {
         ""
-    }
+    };
+    format!("{dropped}{handoff}")
 }
 
 /// An account of a `thread.model_changed` (`account` or `previous_account`): its name, or
@@ -2095,6 +2110,15 @@ mod tests {
         assert_eq!(
             transcript_line(&started).unwrap(),
             "turn 4 started (from user) (with the handoff from its previous runtime): go on"
+        );
+        let dropped = json!({"thread": "T1", "turn": 5, "kind": "turn.started", "data": {
+            "prompt": "go on", "from": "user",
+            "ext": {"twr": {"runtime_handoff": "<twr-handoff>...</twr-handoff>",
+                "resume_dropped": "s1", "resume_dropped_why": "its account was removed"}}}});
+        assert_eq!(
+            transcript_line(&dropped).unwrap(),
+            "turn 5 started (from user) (a new session: earlier session s1 not resumed, its \
+             account was removed) (with the handoff from its previous runtime): go on"
         );
     }
 }
