@@ -414,16 +414,15 @@ enum Cmd {
         cmd: SpeechCmd,
     },
     /// A speaker on this machine: reads aloud the orchestrator's messages that this machine's
-    /// hubs send (the current workspace's, `-w`'s, or with `--all-workspaces` every one's), or
-    /// with `--ssh HOST` those of HOST's hubs, over `ssh HOST twr speech feed` (every
-    /// workspace there unless `-w`). Keys in its terminal: `s` stop, `p` pause or resume, `n`
-    /// skip, `q` quit. What it reads is turned on with `/read on` in the TUI
+    /// hubs send, or with `--ssh HOST` those of HOST's hubs, over `ssh HOST twr speech feed`:
+    /// every workspace unless `-w` names one. Keys in its terminal: `s` stop, `p` pause or
+    /// resume, `n` skip, `q` quit. What it reads is turned on with `/read on` in the TUI
     /// (docs/read-aloud.md).
     Speak {
         /// Read aloud what HOST's hubs send, over ssh (your ssh config and keys).
         #[arg(long, value_name = "HOST")]
         ssh: Option<String>,
-        /// Every workspace (of this machine, or of HOST), not only one.
+        /// Every workspace (of this machine, or of HOST): the default; refused with `-w`.
         #[arg(long)]
         all_workspaces: bool,
         /// The speaker's name in `/read status` and for `/read N --on` (default: this
