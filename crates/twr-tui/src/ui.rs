@@ -1179,7 +1179,8 @@ fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes
 
 /// The row after the last card drawn in the column over `area`, which the list of cards then
 /// takes up to ([`crate::sidebar::Dock::fit_cards`]); its bottom when anything else is drawn
-/// there (the empty pane, the note on hidden parked threads), which keeps its rows.
+/// there (the empty pane, the note on hidden parked threads), which keeps its rows. Where it
+/// drew no card (too few rows), it lists none: no key selects a card it did not draw.
 fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
     let mut bottom = area.y;
     for p in panes.panes.iter().filter(|p| p.area.intersects(area)) {
@@ -1190,8 +1191,12 @@ fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
         }
     }
     let bottom = bottom.min(area.bottom());
-    if let Some(list) = panes.list.as_mut().filter(|l| l.area == area) {
-        list.area.height = bottom - area.y;
+    if panes.list.is_some_and(|l| l.area == area) {
+        if bottom == area.y {
+            panes.list = None;
+        } else if let Some(list) = panes.list.as_mut() {
+            list.area.height = bottom - area.y;
+        }
     }
     bottom
 }

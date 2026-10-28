@@ -259,6 +259,8 @@ impl Dock {
                 if region < CARD_ROWS {
                     region = 0;
                 }
+                // (Its row before the current workspace's own, where only one is left.)
+                current.truncate(avail.saturating_sub(1));
             }
             let cut = clip(
                 &mut before,
@@ -2603,6 +2605,47 @@ mod tests {
         rows(&mut st, 40, 20);
         st.handle_key(crate::app::tests::ctrl('t'));
         assert_eq!(st.view.compact_pane, crate::app::CompactPane::Threads);
+    }
+
+    /// On the shortest phone screens the arrows select only what is drawn: a card where a card
+    /// is drawn, a workspace whose row is (in the cards' place, or the current one's, where
+    /// one row is all there is); Enter acts only on what it can see.
+    #[test]
+    fn short_phone_screens_select_only_what_they_draw() {
+        use crossterm::event::KeyCode;
+        for h in [8u16, 9, 10, 11, 12] {
+            let mut st = with_workers(in_workspaces("default"));
+            let mut tabs = st.tabs.clone();
+            for i in 0..8 {
+                tabs.push(Tab::new(format!("more-{i}")));
+            }
+            st.set_tabs(tabs);
+            rows(&mut st, 40, h);
+            st.handle_key(crate::app::tests::ctrl('t'));
+            for step in 0..30 {
+                let key = if step < 20 {
+                    KeyCode::Down
+                } else {
+                    KeyCode::Up
+                };
+                st.handle_key(crate::app::tests::key(key));
+                let text = rows(&mut st, 40, h).join("\n");
+                if let Some(WsRow::Workspace(name)) = st.ws_keyed() {
+                    assert!(text.contains(name.as_str()), "40x{h} {name}: {text}");
+                }
+                if let Some(card) = st.focused() {
+                    assert!(
+                        st.view.panes.list.is_some()
+                            && st
+                                .view
+                                .panes
+                                .get(&PaneId::Thread(card.to_string()))
+                                .is_some(),
+                        "40x{h} {card}: {text}"
+                    );
+                }
+            }
+        }
     }
 
     /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:

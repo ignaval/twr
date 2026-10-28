@@ -20,7 +20,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::{Action, AppState, Confirm, DecisionFilter, Screen, Transcript, WsRow};
 use crate::edit::LineInput;
 use crate::notify::{Notifier, WorkspaceAlert};
-use crate::select::Anchor;
+use crate::select::{Anchor, Target};
 
 /// A workspace in the tab strip and the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -719,6 +719,19 @@ impl AppState {
             KeyCode::Down if plain => self.step_screen(1),
             KeyCode::Enter if key.modifiers.is_empty() => {
                 let row = self.ws_keyed()?;
+                // Only what the last frame drew: a screen too short for it shows it not.
+                let target = match &row {
+                    WsRow::Workspace(name) => Target::Workspace(name.clone()),
+                    WsRow::New => Target::NewWorkspace,
+                    WsRow::Settings => Target::Settings,
+                };
+                if !self.view.panes.targets.iter().any(|(_, t)| *t == target) {
+                    self.view.status = Some(
+                        "not on screen: a taller screen shows it (Alt-1..9 and /ws switch too)"
+                            .into(),
+                    );
+                    return Some(Vec::new());
+                }
                 return Some(self.ws_activate(row));
             }
             _ => return None,
