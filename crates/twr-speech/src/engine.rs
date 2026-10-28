@@ -784,18 +784,15 @@ impl Engine for FakeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// A program at `dir/name` that records its arguments (one per line) in `name.args` and its
     /// stdin in `name.stdin`, then exits 0.
     fn recorder(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
-        std::fs::write(
+        crate::test_support::install(
             &p,
             "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.args\"\nprintf -- '--\\n' >> \"$0.args\"\ncat >> \"$0.stdin\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         p
     }
 
@@ -879,12 +876,10 @@ mod tests {
     async fn a_failing_or_missing_program_is_an_error_with_its_words() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("say");
-        std::fs::write(
+        crate::test_support::install(
             &p,
             "#!/bin/sh\necho 'Voice `Nobody` not found.' >&2\nexit 1\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let e = SayEngine::with_program(&p)
             .speak("hi", &Prefs::default())
             .await
@@ -903,15 +898,13 @@ mod tests {
         let p = dir.path().join("slow");
         let pids = dir.path().join("pids");
         // The program starts a child of its own (same group), records both ids, and waits.
-        std::fs::write(
+        crate::test_support::install(
             &p,
             format!(
                 "#!/bin/sh\nsleep 30 &\necho $$ $! > {}\nwait\n",
                 pids.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let mut e = CommandEngine::new(vec![p.display().to_string()]).unwrap();
         let fut = e.speak("hi", &Prefs::default());
         let task = tokio::spawn(fut);

@@ -54,6 +54,12 @@ pub fn speaks_by_itself(local: SpeechLocal, place: Place, engine: impl FnOnce() 
     wanted && !place.agent && !place.socket_only && engine()
 }
 
+/// The speaker's name: this machine's, cut to the 64 characters a speaker's name may have (as
+/// `twr speak` cuts its default); a longer one would keep the speaker from starting.
+fn speaker_name(host: &str) -> String {
+    host.chars().take(64).collect()
+}
+
 /// What the status bar is told: a message, and whether it is transient.
 type Notices = mpsc::UnboundedSender<(String, bool)>;
 
@@ -115,7 +121,7 @@ impl OwnSpeaker {
             let root = paths.root();
             let opts = SpeakerOpts {
                 tty_keys_once_attached: false,
-                name: crate::speech::host(),
+                name: speaker_name(&crate::speech::host()),
                 config,
                 voice: None,
                 rate: None,
@@ -224,6 +230,17 @@ mod tests {
         assert!(asked);
     }
 
+    /// A machine name longer than a speaker's may be (some CI runners' are) is cut to 64
+    /// characters, which the speaker takes.
+    #[test]
+    fn a_long_machine_name_is_cut_to_a_speakers() {
+        let long = format!("Mac-{}", "7".repeat(80));
+        let name = speaker_name(&long);
+        assert_eq!(name, long[..64]);
+        assert_eq!(twr_core::speech::name_error("name", &name, 64), None);
+        assert_eq!(speaker_name("box"), "box");
+    }
+
     fn fake(_: &SpeechConfig) -> anyhow::Result<Box<dyn Engine>> {
         Ok(Box::new(FakeEngine::manual().0))
     }
@@ -267,7 +284,10 @@ mod tests {
             w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
             let attach = next(&mut lines).await.unwrap();
             assert_eq!(attach["method"], "speech.attach");
-            assert_eq!(attach["params"]["name"], crate::speech::host());
+            assert_eq!(
+                attach["params"]["name"],
+                speaker_name(&crate::speech::host())
+            );
             assert_eq!(attach["params"]["engine"], "fake");
             if by_drop {
                 drop(speaker);

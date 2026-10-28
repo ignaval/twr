@@ -1324,20 +1324,17 @@ mod tests {
     /// Real time: a real process runs, and paused time would race past the backoff's reset.
     #[tokio::test]
     async fn an_ssh_link_reconnects_with_batch_mode_and_backs_off() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = dir.path().join("ssh");
         let log = dir.path().join("args");
         // A fake ssh: records its arguments, says hello as the proxy, then hangs up.
-        std::fs::write(
+        crate::test_support::install(
             &fake,
             format!(
                 "#!/bin/sh\necho \"$*\" >> {}\necho '{{\"proxy\": 1, \"host\": \"h\", \"workspaces\": []}}'\n",
                 log.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let spec = SshSpec::new("h", Workspaces::All)
             .unwrap()
             .with_program(&fake);

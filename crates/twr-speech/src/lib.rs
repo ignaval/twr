@@ -30,6 +30,8 @@ pub mod player;
 pub mod service;
 pub mod speaker;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 
 pub use engine::{engine_available, from_config, Engine, Prefs};
 pub use link::{LinkSpec, SshSpec, Workspaces};
