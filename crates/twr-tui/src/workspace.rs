@@ -588,11 +588,7 @@ impl AppState {
     /// docks, shows or hides it (kept across runs); on a narrower screen, opens or closes the
     /// drawer.
     pub fn toggle_workspaces(&mut self) -> Vec<Action> {
-        if self.workspace.is_none() {
-            self.view.status =
-                Some("workspaces: not here (this TUI was opened on a socket)".into());
-            return Vec::new();
-        }
+        // (On a socket too: the Threads screen lists the cards alone then.)
         if self.compact() {
             // From the decisions overlay, which hides every screen: to the Threads one, which
             // lists the workspaces.
@@ -605,6 +601,11 @@ impl AppState {
                 crate::app::CompactPane::Threads
             };
             self.show_pane(pane);
+            return Vec::new();
+        }
+        if self.workspace.is_none() {
+            self.view.status =
+                Some("workspaces: not here (this TUI was opened on a socket)".into());
             return Vec::new();
         }
         if self.view.width >= crate::sidebar::DOCK_MIN_WIDTH {
@@ -729,7 +730,12 @@ impl AppState {
     /// current one's cards and the buttons ([`AppState::ws_screen_key`]), stopping at its
     /// ends. With nothing selected it starts from the current workspace's card.
     fn step_screen(&mut self, delta: isize) {
-        let cards = self.compact_threads();
+        // The cards as the last frame drew them: none where it had no room for one.
+        let cards = if self.view.panes.list.is_some() {
+            self.compact_threads()
+        } else {
+            Vec::new()
+        };
         let mut rows: Vec<Result<WsRow, String>> = Vec::new();
         let mut nested = false;
         for tab in &self.tabs {

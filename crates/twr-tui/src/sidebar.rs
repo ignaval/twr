@@ -46,6 +46,9 @@ const WORKER_ROWS_SHORT: usize = 3;
 /// The share of the sidebar's rows the nested cards get first, when they need them, before
 /// the other workspaces' cards are shortened ([`Dock::new`]): three fifths.
 const CARDS_SHARE: (usize, usize) = (3, 5);
+/// The fewest rows a card is drawn in (its borders and a row): the nested cards get them
+/// first, where the sidebar has them.
+const CARD_ROWS: usize = 3;
 /// Widest the drawer gets.
 const DRAWER_MAX_WIDTH: u16 = 34;
 /// Rows of a card's reply.
@@ -212,7 +215,9 @@ impl Dock {
         let width = usize::from(list.width);
         let cards_w = list.width.saturating_sub(NEST);
         let needed = usize::from(needed(cards_w));
-        let want = needed.min(avail * CARDS_SHARE.0 / CARDS_SHARE.1);
+        // (A card's three rows at least, where the column has them: fewer draw none.)
+        let share = (avail * CARDS_SHARE.0 / CARDS_SHARE.1).max(CARD_ROWS.min(avail));
+        let want = needed.min(share);
         let keyed = dock.keyed.as_ref();
         let mut detail = Detail::Full;
         let mut laid = groups(state, width, &|_| detail, keyed);
@@ -2556,6 +2561,15 @@ mod tests {
             }
         }
         assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("default".into())));
+        // Shorter still, the cards keep a card's rows: one is drawn.
+        let text = rows(&mut st, 40, 11).join("\n");
+        assert!(st.view.panes.list.is_some(), "{text}");
+        // A TUI on a socket has its Threads screen too: Ctrl-T shows it.
+        let mut st = crate::app::tests::three_threads();
+        st.view.compact_width = 60;
+        rows(&mut st, 40, 20);
+        st.handle_key(crate::app::tests::ctrl('t'));
+        assert_eq!(st.view.compact_pane, crate::app::CompactPane::Threads);
     }
 
     /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:
