@@ -244,7 +244,22 @@ impl Dock {
             // Still too many rows: the cards get their share, the current workspace's card
             // its own rows, and the others what is left, those nearest it first, or the one
             // the keys or a tap on `more` chose ([`AppState::ws_anchor`]).
-            let region = want.min(avail.saturating_sub(current.len()));
+            let mut region = want.min(avail.saturating_sub(current.len()));
+            // A workspace the keys selected past the cards (on the compact screen) keeps a
+            // row of its own; the cards then get what is left, none when that draws no card.
+            let selected = dock.keyed.as_ref().filter(|k| {
+                matches!(k, WsRow::Workspace(_))
+                    && before
+                        .iter()
+                        .chain(&after)
+                        .any(|(_, r)| r.as_ref() == Some(*k))
+            });
+            if selected.is_some() && avail <= region + current.len() {
+                region = avail.saturating_sub(current.len() + 1);
+                if region < CARD_ROWS {
+                    region = 0;
+                }
+            }
             let cut = clip(
                 &mut before,
                 &mut after,
@@ -2562,6 +2577,24 @@ mod tests {
         }
         assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("default".into())));
         // Shorter still, the cards keep a card's rows: one is drawn.
+        let text = rows(&mut st, 40, 11).join("\n");
+        assert!(st.view.panes.list.is_some(), "{text}");
+        // There, a workspace the arrows select past the cards is drawn, in their place, and
+        // back up the cards come again.
+        for _ in 0..10 {
+            st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
+            rows(&mut st, 40, 11);
+            if matches!(st.ws_keyed(), Some(WsRow::Workspace(n)) if n != "default") {
+                break;
+            }
+        }
+        let Some(WsRow::Workspace(name)) = st.ws_keyed() else {
+            panic!("{:?}", st.ws_keyed());
+        };
+        let text = rows(&mut st, 40, 11).join("\n");
+        assert!(text.contains(name.as_str()), "{name}: {text}");
+        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
+        rows(&mut st, 40, 11);
         let text = rows(&mut st, 40, 11).join("\n");
         assert!(st.view.panes.list.is_some(), "{text}");
         // A TUI on a socket has its Threads screen too: Ctrl-T shows it.
