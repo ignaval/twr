@@ -143,6 +143,27 @@ pub struct BackgroundTask {
     /// time): what a later hub kills of it when the hub that ran it stopped first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<JobGroup>,
+    /// When it started: the time of the update that started it (`None` in snapshots from
+    /// before it was kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// The tool call it runs in the foreground of, as its latest update says
+    /// ([`crate::event::FOREGROUND_CALL_KEY`]): part of the open turn's work, waited for, not
+    /// background work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_call: Option<String>,
+    /// Started in the foreground of a call and moved to the background while it ran, as its
+    /// latest update says ([`crate::event::DETACHED_KEY`]): nothing waits for it any longer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+}
+
+impl BackgroundTask {
+    /// Whether it is background work: not a task a tool call of the open turn waits for in
+    /// the foreground ([`BackgroundTask::foreground_call`]).
+    pub fn in_background(&self) -> bool {
+        self.foreground_call.is_none()
+    }
 }
 
 /// A job's process group ([`BackgroundTask::group`]).
@@ -817,7 +838,15 @@ impl ThreadView {
                                     .and_then(|e| e.get("twr"))
                                     .and_then(|t| t.get("job"))
                                     .is_some_and(|j| j.get("shell").is_some()),
+                            started_at: Some(ev.ts),
+                            foreground_call: None,
+                            detached: false,
                         });
+                    // Where it runs, as its latest update says (each says it).
+                    task.foreground_call = twr_str(p.ext.as_ref(), FOREGROUND_CALL_KEY)
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string);
+                    task.detached = is_detached(p);
                     if !p.description.is_empty() {
                         task.description.clone_from(&p.description);
                     }

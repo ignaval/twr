@@ -2183,6 +2183,17 @@ impl Core {
                         .unwrap_or_default()
                 };
                 let urgent = hung || p.reason != AttentionReason::Stalled;
+                // A hung-turn card says what the hub read of the turn's work when it raised it
+                // (`hub::stall`): evidence as of then, which get_thread's `work` brings up to
+                // date.
+                let reading = twr_ext(&p.ext)
+                    .and_then(|t| t.get(HUNG_KEY))
+                    .and_then(|h| h.get("state"))
+                    .and_then(Value::as_str)
+                    .filter(|_| hung)
+                    .map_or(String::new(), |s| {
+                        format!(" reading={s} raised_at={}", ev.ts.format("%H:%M:%SZ"))
+                    });
                 Notice {
                     key: ev.id.clone(),
                     urgent,
@@ -2192,8 +2203,8 @@ impl Core {
                     for_watches: false,
                     idle: None,
                     line: format!(
-                        "- thread={name} reason={reason} attn_id={} options=[{}] summary={} \
-                         thread_id={}",
+                        "- thread={name} reason={reason}{reading} attn_id={} options=[{}] \
+                         summary={} thread_id={}",
                         p.attn_id,
                         cut(&p.options.join(", "), NOTICE_OPTIONS_MAX),
                         quoted(&cut(&p.summary, NOTICE_SUMMARY_MAX)),

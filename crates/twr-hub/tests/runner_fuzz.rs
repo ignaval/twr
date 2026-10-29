@@ -2793,6 +2793,10 @@ impl World {
         for t in &self.threads {
             let mut j = h.get_thread(&t.id).unwrap();
             j.as_object_mut().unwrap().remove("live");
+            // (When its `work` was read is the clock's, not the log's.)
+            if let Some(w) = j.get_mut("work").and_then(Value::as_object_mut) {
+                w.remove("as_of");
+            }
             threads.insert(t.id.clone(), j);
         }
         let attention: Vec<Value> = h.attention_list(true);

@@ -1087,7 +1087,7 @@ pub(super) mod tests {
                 .registry
                 .list()
                 .into_iter()
-                .map(|v| core.thread_json(v))
+                .map(|v| without_now(core.thread_json(v)))
                 .collect();
             Views {
                 registry: core.registry.clone(),
@@ -2425,6 +2425,15 @@ struct NotSerialized {
         hub.shutdown().await;
     }
 
+    /// Thread object `j` without when its `work` was read (`work.as_of`, the clock's): what
+    /// the log says of it.
+    pub(in crate::hub) fn without_now(mut j: Value) -> Value {
+        if let Some(w) = j.get_mut("work").and_then(Value::as_object_mut) {
+            w.remove("as_of");
+        }
+        j
+    }
+
     /// What clients and the orchestrator get from `hub`: every thread (deleted ones too), the
     /// attention items, the orchestrator's watches and queued lines, the trash as the log
     /// knows it, the control head.
@@ -2436,7 +2445,7 @@ struct NotSerialized {
         let threads: serde_json::Map<String, Value> = ids
             .iter()
             .map(|id| {
-                let mut j = hub.get_thread(id).unwrap();
+                let mut j = without_now(hub.get_thread(id).unwrap());
                 j.as_object_mut().unwrap().remove("live");
                 (id.clone(), j)
             })

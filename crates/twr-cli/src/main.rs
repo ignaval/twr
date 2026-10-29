@@ -1225,6 +1225,18 @@ enum ThreadCmd {
         #[arg(long, short)]
         all: bool,
     },
+    /// Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its
+    /// reading (working, waiting on its background work, on a tool call, nothing in flight,
+    /// unknown), the open turn's tool calls, its tasks (background, foreground, detached:
+    /// moved to the background after its call returned, nothing waits for them) and jobs,
+    /// prompts queued behind it, its last progress apart from heartbeats, and its open items.
+    Show {
+        /// Thread id, name, alias or unique prefix.
+        thread: String,
+        /// Print the `work` object as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -1981,6 +1993,9 @@ async fn run_simple(
         Cmd::Thread {
             cmd: ThreadCmd::List { all },
         } => thread_list(&socket, all).await,
+        Cmd::Thread {
+            cmd: ThreadCmd::Show { thread, json },
+        } => thread_show(&socket, &thread, json).await,
         Cmd::Thread {
             cmd:
                 ThreadCmd::New {
@@ -6503,6 +6518,54 @@ fn parked_footer(hidden: &[String]) -> String {
     )
 }
 
+/// How many of thread `t`'s tasks are background work: not one a tool call of its open turn
+/// waits for (`foreground_call`), which its turn stands for.
+fn bg_count(t: &Value) -> usize {
+    match t["background_tasks"].as_object() {
+        Some(tasks) => tasks
+            .values()
+            .filter(|task| task["foreground_call"].is_null())
+            .count(),
+        None => usize::try_from(t["background_task_count"].as_u64().unwrap_or(0)).unwrap_or(0),
+    }
+}
+
+/// `twr thread show`: what thread `thread` has in flight ([`twr_core::work::Work::lines`]),
+/// and its open items.
+async fn thread_show(socket: &Path, thread: &str, json: bool) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    let t = c.call("thread.get", json!({ "thread": thread })).await?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&t["work"])?);
+        return Ok(());
+    }
+    outln!("{}", show_text(&t));
+    Ok(())
+}
+
+/// What `twr thread show` prints of thread object `t`.
+fn show_text(t: &Value) -> String {
+    let mut out = vec![format!(
+        "{} ({}){}",
+        str_of(&t["name"]),
+        str_of(&t["status"]),
+        match t["activity"].as_str().unwrap_or_default() {
+            "" => String::new(),
+            a => format!(": {a}"),
+        }
+    )];
+    match serde_json::from_value::<twr_core::work::Work>(t["work"].clone()) {
+        Ok(w) => out.extend(w.lines().into_iter().map(|l| format!("  {l}"))),
+        Err(_) => out.push("  (this hub does not say what the thread has in flight)".into()),
+    }
+    if let Some(items) = t["open_attention"].as_object().filter(|m| !m.is_empty()) {
+        for (id, reason) in items {
+            out.push(format!("  open item: {id} ({})", str_of(reason)));
+        }
+    }
+    out.join("\n")
+}
+
 async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let threads = c.call("thread.list", Value::Null).await?;
@@ -6532,7 +6595,7 @@ async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
                 if t["retired"].as_bool() == Some(true) {
                     "retired".to_string()
                 } else {
-                    let count = t["background_task_count"].as_u64().unwrap_or(0);
+                    let count = bg_count(t);
                     if count == 0 {
                         str_of(&t["status"]).to_string()
                     } else {
@@ -10336,6 +10399,54 @@ mod tests {
                 "turns": 2, "costed_turns": 2}})
             ),
             "10k tok $0.50"
+        );
+    }
+
+    /// `twr thread show` says what the hub's `work` says, a line each, and the open items; an
+    /// older hub without `work` is said so. `twr thread list` counts as `bg` only the tasks no
+    /// call of the turn waits for.
+    #[test]
+    fn thread_show_says_the_work_and_bg_counts_background_only() {
+        let t = json!({
+            "name": "api", "status": "running", "activity": "re-reviewing · waiting",
+            "work": {
+                "as_of": "2026-10-28T22:12:53Z", "state": "waiting_on_work", "sight": "full",
+                "turn": 15, "turn_started_at": "2026-10-28T21:28:00Z",
+                "calls": [{"id": "c2", "tool": "Bash", "what": "Wait for round 3 answer",
+                           "since": "2026-10-28T22:07:46Z", "task": "bsv"}],
+                "tasks": [
+                    {"id": "bu3", "what": "Re-review (round 3)", "kind": "background",
+                     "since": "2026-10-28T22:07:44Z", "progress_at": "2026-10-28T22:07:44Z",
+                     "alive_at": "2026-10-28T22:07:44Z"},
+                    {"id": "bsv", "what": "Wait for round 3 answer", "kind": "foreground",
+                     "since": "2026-10-28T22:07:50Z", "alive_at": "2026-10-28T22:07:50Z"}],
+                "queued": {"count": 1, "oldest_at": "2026-10-28T21:58:00Z",
+                           "from": "orchestrator"},
+                "progress_at": "2026-10-28T22:07:50Z"
+            },
+            "background_tasks": {"bu3": {}, "bsv": {"foreground_call": "c2"}},
+            "background_task_count": 2,
+            "open_attention": {"h1": "stalled"}
+        });
+        assert_eq!(
+            show_text(&t),
+            "api (running): re-reviewing · waiting
+  state: waiting_on_work
+  turn 15, started 44m ago
+  call: Bash \"Wait for round 3 answer\" open 5m (task bsv)
+  background: Re-review (round 3) [bu3], running 5m, last update 5m ago
+  foreground: Wait for round 3 answer [bsv], running 5m, last update 5m ago
+  queued: 1 prompt(s), the oldest (orchestrator) waiting 14m
+  last progress: 5m ago
+  as of 22:12:53 UTC
+  open item: h1 (stalled)"
+        );
+        assert_eq!(bg_count(&t), 1);
+        assert_eq!(bg_count(&json!({"background_task_count": 3})), 3);
+        let old = show_text(&json!({"name": "api", "status": "idle"}));
+        assert_eq!(
+            old,
+            "api (idle)\n  (this hub does not say what the thread has in flight)"
         );
     }
 

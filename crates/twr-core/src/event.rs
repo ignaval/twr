@@ -931,6 +931,55 @@ pub const STEP_KEY: &str = "step";
 /// says it ([`crate::activity::tool_phrase`]).
 pub const PURPOSE_KEY: &str = "purpose";
 
+/// `ext.twr` key of a runtime's `task.updated`: the tool call (its `call_id`) the task runs in
+/// the foreground of, while that call waits for it (a string). Claude Code says so of a Bash
+/// command or subagent it did not start in the background (`task_started` with
+/// `is_backgrounded: false` and its `tool_use_id`). Every update of the task carries it until
+/// the task is moved to the background ([`DETACHED_KEY`]), so the latest update says it.
+pub const FOREGROUND_CALL_KEY: &str = "foreground_call";
+
+/// `ext.twr` key (`true`) of a runtime's `task.updated`: the task was started in the foreground
+/// of a tool call and moved to the background while it ran (Claude Code: its Bash timeout ran
+/// out, or the user put it there), so the call returned and the task runs on unwaited. Every
+/// later update of the task carries it.
+pub const DETACHED_KEY: &str = "detached";
+
+/// `ext.twr` key of a tool call: the task (its id) the call blocks on until it ends (a
+/// string). Claude Code's `TaskOutput` call does unless it says `block: false`: a task moved to
+/// the background ([`DETACHED_KEY`]) is waited for again while such a call is open.
+pub const WAITS_FOR_KEY: &str = "waits_for";
+
+/// Whether task update `p` says its task was moved to the background ([`DETACHED_KEY`]).
+pub fn is_detached(p: &TaskUpdated) -> bool {
+    p.ext
+        .as_ref()
+        .and_then(|e| e.get("twr"))
+        .and_then(|t| t.get(DETACHED_KEY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+/// Whether task update `p`'s `ext` says no more than where its task runs
+/// ([`FOREGROUND_CALL_KEY`], [`DETACHED_KEY`]), and that the same as `foreground_call` and
+/// `detached` (what its thread's view holds of it): an update the hub may leave unrecorded
+/// as one without `ext` (`hub::coalesce`).
+pub fn task_ext_unchanged(p: &TaskUpdated, foreground_call: Option<&str>, detached: bool) -> bool {
+    // (No `ext` says it runs in neither place: news when the view holds it in one.)
+    let Some(ext) = &p.ext else {
+        return foreground_call.is_none() && !detached;
+    };
+    let Some(twr) = ext.get("twr").and_then(Value::as_object) else {
+        return false;
+    };
+    ext.len() == 1
+        && !twr.is_empty()
+        && twr
+            .keys()
+            .all(|k| k == FOREGROUND_CALL_KEY || k == DETACHED_KEY)
+        && twr_str(p.ext.as_ref(), FOREGROUND_CALL_KEY).filter(|c| !c.is_empty()) == foreground_call
+        && is_detached(p) == detached
+}
+
 /// `ext.twr.<key>` of `ext`, when it is a string.
 pub fn twr_str<'a>(ext: Option<&'a JsonMap>, key: &str) -> Option<&'a str> {
     ext?.get("twr")?.get(key)?.as_str()

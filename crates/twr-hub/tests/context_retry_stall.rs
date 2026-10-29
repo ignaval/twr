@@ -610,7 +610,10 @@ async fn a_silent_turn_is_stalled_until_activity_resumes() {
     let (turn, a) = raised(&evs).pop().unwrap();
     assert_eq!(turn, Some(1));
     assert_eq!(a.reason, AttentionReason::Stalled);
-    assert_eq!(a.summary, "No activity for 1 s");
+    assert_eq!(
+        a.summary,
+        "No activity for 1 s; nothing in flight that twr can see"
+    );
     assert_eq!(evs.last().unwrap().source, Source::Hub);
     // One item per thread, however long the silence lasts; it closes when output arrives.
     let evs = until(&mut sub, |e| e.kind() == "attention.resolved").await;
