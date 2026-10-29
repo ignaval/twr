@@ -85,7 +85,7 @@ pub enum Target {
     No,
     /// The notice in the status bar: dismisses it.
     Notice,
-    /// The status bar's `sidebar hidden · Ctrl-B shows`: shows the sidebar.
+    /// The status bar's `Threads hidden · Ctrl-B shows`: shows the sidebar.
     Sidebar,
     /// The status bar's `Focus · N hidden · Ctrl-F all`: Focus mode off.
     FocusOff,

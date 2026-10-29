@@ -90,7 +90,7 @@ There are no modes: the input box always takes what you type, so you can write t
 | Esc | close a popup, else release the selection, else back to the orchestrator from a dive; never clears what you typed |
 | Ctrl-↑↓, Alt-↑↓ | scroll the main pane a line |
 | Ctrl-O | show or fold tool calls (the orchestrator's, or in a dive the thread's) and the hub's updates |
-| Ctrl-B | show or hide the sidebar: the workspaces, the current one's thread cards nested (Ctrl-T too) |
+| Ctrl-B | show or hide Threads, the sidebar: the workspaces, the current one's thread cards nested (Ctrl-T too) |
 | Ctrl-F | toggle Focus mode: working threads and anything needing you |
 | Ctrl-G | stack view or grid view (`Enter` on a tile opens its popup) |
 | PgUp, PgDn, mouse wheel | scroll the main pane; scrolled up, it stays put as text streams in |
@@ -113,7 +113,7 @@ There are no modes: the input box always takes what you type, so you can write t
 | `/parked [on\|off]` | list parked threads among the cards, or hide them |
 | `/pin [thread]` | pin or unpin a thread's card |
 | `/grid`, `/decisions` | the grid view; the decision audit table (`Esc` closes it) |
-| `/sidebar [on\|off]` | show or hide the sidebar |
+| `/sidebar [on\|off]` | show or hide Threads, the sidebar |
 | `/focus [on\|off]` | show only working threads and threads needing you, or list all |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal |
 | `/help` | commands and keys |

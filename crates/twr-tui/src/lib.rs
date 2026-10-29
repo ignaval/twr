@@ -3431,7 +3431,7 @@ async fn drive(
                     Saved::WsSidebar(on, Err(e)) => {
                         let how = if on { "shown" } else { "hidden" };
                         state.view.status = Some(format!(
-                            "sidebar {how}, but not remembered for the next runs: {e}"
+                            "Threads sidebar {how}, but not remembered for the next runs: {e}"
                         ));
                     }
                     Saved::WsSidebar(_, Ok(())) => {}

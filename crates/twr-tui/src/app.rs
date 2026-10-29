@@ -3842,9 +3842,9 @@ impl AppState {
         self.view.sidebar_hidden = !on;
         self.view.shown = None;
         self.view.status = Some(if on {
-            "sidebar shown (Ctrl-B hides it)".into()
+            "Threads sidebar shown (Ctrl-B hides it)".into()
         } else {
-            "sidebar hidden (Ctrl-B shows it)".into()
+            "Threads sidebar hidden (Ctrl-B shows it)".into()
         });
         self.ensure_focus();
         vec![Action::WsSidebar(on)]
@@ -4666,7 +4666,7 @@ impl AppState {
     /// not any more; the view stays where it is.
     fn focus_cards(&mut self) {
         if self.view.sidebar_hidden {
-            self.view.status = Some("the sidebar is hidden (Ctrl-B shows it)".into());
+            self.view.status = Some("the Threads sidebar is hidden (Ctrl-B shows it)".into());
             return;
         }
         self.view.main_focus = false;
@@ -22158,12 +22158,12 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone the action popup's rows are two rows tall, both the row's, none over
-        /// another, and its `✕` is too (its top border and the row under it); a question
-        /// waiting for `y` has its answers two rows tall under it. A tap on a second row does
-        /// what one on the first does.
+        /// On a phone the action popup's rows are menu choices two rows tall, both the row's,
+        /// none over another, and its `✕` is a row (its top border); a question waiting for `y`
+        /// has its answers two rows tall under it. A tap on a second row does what one on the
+        /// first does.
         #[test]
-        fn phone_popups_and_questions_have_two_row_controls() {
+        fn phone_popups_and_questions_have_two_row_choices() {
             let mut st = compact();
             st.show_pane(CompactPane::Threads);
             frame(&mut st, 40, 30);
@@ -22190,12 +22190,12 @@ pub(crate) mod tests {
                 .filter(|(_, t)| *t == Target::Close)
                 .map(|(r, _)| r.height)
                 .sum();
-            assert_eq!(close, 2, "{targets:?}");
+            assert_eq!(close, 1, "{targets:?}");
             // The second row of a row picks it.
             let (r, kind) = rows[1];
             tap_at(&mut st, 40, 30, r.x + 2, r.y + 1);
             assert_eq!(st.action_popup().and_then(|p| p.sel), Some(kind));
-            // The second row of the `✕` closes it.
+            // The `✕` closes it.
             let under = targets
                 .iter()
                 .filter(|(_, t)| *t == Target::Close)
@@ -22263,10 +22263,10 @@ pub(crate) mod tests {
             }
         }
 
-        /// On a phone a dive's `‹ back` band is two rows, both of them back; the help's `✕` is
-        /// two rows too, and its second row closes it.
+        /// On a phone a dive's `‹ back` band is a row, as on a desktop; the help's `✕` is a row
+        /// too, its top border, and closes it.
         #[test]
-        fn phone_back_band_and_help_close_on_two_rows() {
+        fn phone_back_band_and_help_close_on_one_row() {
             let mut st = compact();
             st.dive("t-beta");
             frame(&mut st, 40, 20);
@@ -22279,8 +22279,8 @@ pub(crate) mod tests {
                 .map(|(r, _)| *r)
                 .collect();
             assert_eq!(back.len(), 1, "{:?}", st.view.panes.targets);
-            assert_eq!(back[0].height, 2);
-            tap_at(&mut st, 40, 20, back[0].x + 2, back[0].y + 1);
+            assert_eq!(back[0].height, 1);
+            tap_at(&mut st, 40, 20, back[0].x + 2, back[0].y);
             assert!(st.view.dive.is_none(), "back");
             st.view.help = true;
             frame(&mut st, 40, 20);
@@ -22294,7 +22294,7 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 closes.iter().map(|r| r.height).sum::<u16>(),
-                2,
+                1,
                 "{closes:?}"
             );
             let under = closes.iter().max_by_key(|r| r.y).unwrap();
@@ -22357,11 +22357,11 @@ pub(crate) mod tests {
             }
         }
 
-        /// On a phone the settings' `✕` is two rows (its top border and a row under it kept
-        /// above what scrolls), and a setting is tapped only where at least two of its rows,
-        /// or all of them, show; the new-workspace dialog's `✕` is two rows too.
+        /// On a phone the settings' `✕` is a row (its top border), and a setting, a menu
+        /// choice, is tapped only where at least two of its rows, or all of them, show; the
+        /// new-workspace dialog's `✕` is a row too.
         #[test]
-        fn phone_settings_and_dialog_close_on_two_rows() {
+        fn phone_settings_and_dialog_close_on_one_row() {
             let mut st = compact();
             frame(&mut st, 40, 12);
             st.open_settings();
@@ -22374,7 +22374,7 @@ pub(crate) mod tests {
                     .filter(|(_, t)| *t == Target::Close)
                     .map(|(r, _)| r.height)
                     .sum();
-                assert_eq!(close, 2, "{targets:?}\n{text}");
+                assert_eq!(close, 1, "{targets:?}\n{text}");
                 for (r, t) in &targets {
                     if matches!(t, Target::Setting(_)) {
                         assert!(r.height >= 2, "{t:?} {r:?}");
@@ -22399,7 +22399,7 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 closes.iter().map(|r| r.height).sum::<u16>(),
-                2,
+                1,
                 "{closes:?}"
             );
             let under = closes.iter().max_by_key(|r| r.y).unwrap();
@@ -23499,10 +23499,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// On a phone every control is two rows tall, both rows its own, none over another's
-    /// ([`crate::ui::TAP_ROWS`]), wherever it is: the status bar's notice and notes, the `/`
-    /// popup, the orchestrator picker, the decision table, the trash, the conversation's
-    /// controls (folded lines, `↓ lines below`), the queued messages and the take-back.
+    /// On a phone the tabs and the menu choices are two rows tall, both rows their own
+    /// ([`crate::ui::TAP_ROWS`]): a popup's rows, the `/` completions, the orchestrator
+    /// picker's runtimes, the settings, `[ yes ]` and `[ no ]`, the Threads screen's entries.
+    /// Every other control is a row tall, as drawn, as on a desktop: the status bar's notice
+    /// and notes, `✕ close`, the decision table, the conversation's controls (folded lines,
+    /// `↓ lines below`), the queued messages and the take-back.
     mod phone_targets {
         use super::*;
         use crate::select::Target;
@@ -23530,17 +23532,44 @@ pub(crate) mod tests {
             out
         }
 
-        /// Every control the last frame drew covers two rows at least (its rects together,
-        /// a border's row and the one under it), and none is over another's.
-        fn two_rows_each(st: &AppState, what: &str) {
+        /// A tab or a menu choice: two rows tall on a phone.
+        fn menu(t: &Target) -> bool {
+            matches!(
+                t,
+                Target::Screen(_)
+                    | Target::Row(_)
+                    | Target::Suggestion(_)
+                    | Target::Runtime(_)
+                    | Target::Setting(_)
+                    | Target::Yes
+                    | Target::No
+                    | Target::Workspace(_)
+            )
+        }
+
+        /// The rows control `t` covers in the last frame (its rects together).
+        fn rows_of(st: &AppState, t: &Target) -> std::collections::BTreeSet<u16> {
+            st.view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, x)| x == t)
+                .flat_map(|(r, _)| r.top()..r.bottom())
+                .collect()
+        }
+
+        /// Every control the last frame drew: a tab or a menu choice two rows at least, any
+        /// other a row (each row of a note wrapped over two its own rect); none over
+        /// another's.
+        fn as_drawn(st: &AppState, what: &str) {
             let targets = &st.view.panes.targets;
             for (k, (a, ta)) in targets.iter().enumerate() {
-                let rows: std::collections::BTreeSet<u16> = targets
-                    .iter()
-                    .filter(|(_, t)| t == ta)
-                    .flat_map(|(r, _)| r.top()..r.bottom())
-                    .collect();
-                assert!(rows.len() >= 2, "{what}: {ta:?} {a:?} on {rows:?}");
+                let rows = rows_of(st, ta);
+                if menu(ta) {
+                    assert!(rows.len() >= 2, "{what}: {ta:?} {a:?} on {rows:?}");
+                } else {
+                    assert_eq!(a.height, 1, "{what}: {ta:?} {a:?} on {rows:?}");
+                }
                 for (b, tb) in &targets[k + 1..] {
                     assert!(
                         ta == tb || !a.intersects(*b),
@@ -23550,8 +23579,8 @@ pub(crate) mod tests {
             }
         }
 
-        /// The second row of control `t` (the row under its first).
-        fn second_row(st: &AppState, t: &Target) -> (u16, u16) {
+        /// A cell of control `t` on its first row, `down` rows under it.
+        fn cell_of(st: &AppState, t: &Target, down: u16) -> (u16, u16) {
             let rects: Vec<Rect> = st
                 .view
                 .panes
@@ -23565,11 +23594,22 @@ pub(crate) mod tests {
                 .map(|r| r.y)
                 .min()
                 .unwrap_or_else(|| panic!("no {t:?}"));
+            let y = top + down;
             let r = rects
                 .iter()
-                .find(|r| r.top() <= top + 1 && top + 1 < r.bottom())
-                .unwrap();
-            (r.x + r.width / 2, top + 1)
+                .find(|r| r.top() <= y && y < r.bottom())
+                .unwrap_or_else(|| panic!("{t:?} has no row {y}"));
+            (r.x + r.width / 2, y)
+        }
+
+        /// The second row of menu choice `t` (the row under its first).
+        fn second_row(st: &AppState, t: &Target) -> (u16, u16) {
+            cell_of(st, t, 1)
+        }
+
+        /// The row of a one-row control `t`.
+        fn row_of(st: &AppState, t: &Target) -> (u16, u16) {
+            cell_of(st, t, 0)
         }
 
         fn phone() -> AppState {
@@ -23578,32 +23618,33 @@ pub(crate) mod tests {
             st
         }
 
-        /// The status bar's notice and a note: bands two rows tall; the notice's second row
-        /// clears it, Focus mode's ends it.
+        /// The status bar's notice and a note are a row each, as they read; a tap on the
+        /// notice clears it, on Focus mode's note ends it.
         #[test]
-        fn status_notes_are_two_rows() {
+        fn status_notes_are_one_row() {
             for (w, h) in [(40u16, 20u16), (40, 30), (59, 16)] {
                 let mut st = phone();
                 st.view.focus_mode = true;
                 st.view.status = Some("hub: not_found".into());
                 frame(&mut st, w, h);
-                two_rows_each(&st, &format!("{w}x{h}"));
-                let (x, y) = second_row(&st, &Target::Notice);
+                as_drawn(&st, &format!("{w}x{h}"));
+                let (x, y) = row_of(&st, &Target::Notice);
                 tap_at(&mut st, w, h, x, y);
                 assert!(st.view.status.is_none(), "{w}x{h}");
-                let (x, y) = second_row(&st, &Target::FocusOff);
+                let (x, y) = row_of(&st, &Target::FocusOff);
                 tap_at(&mut st, w, h, x, y);
                 assert!(!st.view.focus_mode, "{w}x{h}");
             }
         }
 
-        /// The `/` popup's rows are two rows tall; a tap on a second row completes it.
+        /// The `/` popup's rows are menu choices two rows tall, a tap on a second row
+        /// completing it; its top border, a row, closes it.
         #[test]
         fn the_slash_popup_rows_are_two_rows() {
             let mut st = phone();
             st.view.input.set("/");
             frame(&mut st, 40, 24);
-            two_rows_each(&st, "slash popup");
+            as_drawn(&st, "slash popup");
             let first = st
                 .view
                 .panes
@@ -23614,12 +23655,15 @@ pub(crate) mod tests {
                     _ => None,
                 })
                 .unwrap();
+            // No row of its own under the top border closes it: the first choice is there.
+            let (_, top) = row_of(&st, &Target::Close);
+            assert_eq!(row_of(&st, &first).1, top + 1);
             let (x, y) = second_row(&st, &first);
             tap_at(&mut st, 40, 24, x, y);
             assert_ne!(st.view.input.as_str(), "/", "completed");
         }
 
-        /// The orchestrator picker's runtimes are two rows tall, its close too.
+        /// The orchestrator picker's runtimes are two rows tall, its close one, its border's.
         #[test]
         fn the_picker_rows_are_two_rows() {
             let mut st = phone();
@@ -23634,7 +23678,7 @@ pub(crate) mod tests {
                 switch: false,
             });
             frame(&mut st, 40, 24);
-            two_rows_each(&st, "picker");
+            as_drawn(&st, "picker");
             let (x, y) = second_row(&st, &Target::Runtime(1));
             tap_at(&mut st, 40, 24, x, y);
             assert_eq!(st.view.picker.as_ref().map(|p| p.selected), Some(1));
@@ -23655,53 +23699,50 @@ pub(crate) mod tests {
                 model: None,
                 switch: false,
             });
-            for sel in [0, 1] {
-                st.view.picker.as_mut().unwrap().selected = sel;
-                let text = screen_text(&frame(&mut st, 40, 10));
-                two_rows_each(&st, &format!("picker {sel}"));
-                assert!(
-                    st.view
-                        .panes
-                        .targets
-                        .iter()
-                        .any(|(_, t)| *t == Target::Runtime(sel)),
-                    "{sel}:\n{text}"
-                );
-                // Every runtime named on screen is a whole band with its tap.
-                for (i, name) in ["claude-code", "codex"].iter().enumerate() {
-                    let drawn = text.lines().any(|l| l.contains(name));
-                    let tapped = st
-                        .view
-                        .panes
-                        .targets
-                        .iter()
-                        .any(|(_, t)| *t == Target::Runtime(i));
-                    assert!(!drawn || tapped, "{sel}: {name} drawn, not tapped:\n{text}");
+            for h in [8u16, 9, 10] {
+                for sel in [0, 1] {
+                    st.view.picker.as_mut().unwrap().selected = sel;
+                    let text = screen_text(&frame(&mut st, 40, h));
+                    as_drawn(&st, &format!("picker {sel} 40x{h}"));
+                    assert!(
+                        st.view
+                            .panes
+                            .targets
+                            .iter()
+                            .any(|(_, t)| *t == Target::Runtime(sel)),
+                        "{sel} 40x{h}:\n{text}"
+                    );
+                    // Every runtime named on screen is a whole band with its tap.
+                    for (i, name) in ["claude-code", "codex"].iter().enumerate() {
+                        let drawn = text.lines().any(|l| l.contains(name));
+                        let tapped = st
+                            .view
+                            .panes
+                            .targets
+                            .iter()
+                            .any(|(_, t)| *t == Target::Runtime(i));
+                        assert!(!drawn || tapped, "{sel}: {name} drawn, not tapped:\n{text}");
+                    }
                 }
             }
         }
 
-        /// A status message taller than the phone's bar is cut to it, `…` at its end, still
-        /// two rows a tap clears.
+        /// A status message longer than the phone's bar still shows, and a tap on it clears it.
         #[test]
         fn a_long_notice_is_cut_not_dropped() {
             let mut st = phone();
             st.view.status = Some(format!("error: {}", "the hub said no. ".repeat(40)));
             let text = screen_text(&frame(&mut st, 40, 20));
-            assert!(
-                text.contains("error: the hub") && text.contains('…'),
-                "{text}"
-            );
-            two_rows_each(&st, "long notice");
-            let (x, y) = second_row(&st, &Target::Notice);
+            assert!(text.contains("error: the hub"), "{text}");
+            let (x, y) = row_of(&st, &Target::Notice);
             tap_at(&mut st, 40, 20, x, y);
             assert!(st.view.status.is_none());
         }
 
-        /// A band the conversation's view cuts at its top or bottom (a folded line, `■ stop`)
-        /// is no control: no link is left on what shows of it, its padding perhaps.
+        /// The conversation's controls on a phone are its rows as drawn: no row is added to
+        /// one (a row with a link always has its text), as the view scrolls.
         #[test]
-        fn a_band_cut_by_the_view_is_not_tapped() {
+        fn conversation_controls_have_no_padding() {
             let mut st = crate::app::tests::without_worker_requests(with_orch());
             st.view.compact_width = 60;
             orch_conversation(&mut st);
@@ -23710,26 +23751,28 @@ pub(crate) mod tests {
             for i in 0..20 {
                 st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
             }
-            frame(&mut st, 40, 20);
+            let mut buf = frame(&mut st, 40, 20);
+            let mut links = 0;
             for step in 0..40 {
                 let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
-                let links = &pane.links;
-                let mut k = 0;
-                while k < links.len() {
-                    let Some(link) = links[k].clone().filter(|l| !l.starts_with("request:")) else {
-                        k += 1;
+                for (k, link) in pane.links.iter().enumerate() {
+                    let Some(link) = link.as_deref().filter(|l| !l.starts_with("request:")) else {
                         continue;
                     };
-                    let n = links[k..]
-                        .iter()
-                        .take_while(|l| l.as_deref() == Some(&link))
-                        .count();
-                    assert!(n >= 2, "step {step}: {link} on {n} row(s) at {k}");
-                    k += n;
+                    links += 1;
+                    let y = pane.area.y + k as u16;
+                    let row: String = (pane.area.left()..pane.area.right())
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect();
+                    assert!(
+                        !row.trim().is_empty(),
+                        "step {step}: {link} on a blank row {y}"
+                    );
                 }
                 st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
-                frame(&mut st, 40, 20);
+                buf = frame(&mut st, 40, 20);
             }
+            assert!(links > 0, "a control seen");
             assert!(st.view.scroll > 0);
         }
 
@@ -23745,60 +23788,54 @@ pub(crate) mod tests {
             }
         }
 
-        /// The decision table on a phone: its close, its filters and its rows two rows tall;
-        /// a filter's second row moves it on.
+        /// The decision table on a phone: its close, its filters and its rows a row each; a
+        /// tap on a filter moves it on.
         #[test]
-        fn the_decision_table_controls_are_two_rows() {
+        fn the_decision_table_controls_are_one_row() {
             let mut st = with_decisions();
             st.view.compact_width = 60;
             open_decisions(&mut st);
             frame(&mut st, 50, 24);
-            two_rows_each(&st, "decisions");
+            as_drawn(&st, "decisions");
             let before = st.view.decision_filter.site;
-            let (x, y) = second_row(&st, &Target::SiteFilter);
+            let (x, y) = row_of(&st, &Target::SiteFilter);
             tap_at(&mut st, 50, 24, x, y);
             assert_ne!(st.view.decision_filter.site, before);
         }
 
-        /// The trash's close is two rows.
+        /// The trash's close is its top border's row, no row of its own under it.
         #[test]
-        fn the_trash_close_is_two_rows() {
+        fn the_trash_close_is_one_row() {
             let mut st = phone();
             st.view.trash = Some(json!({"items": []}));
-            frame(&mut st, 40, 20);
-            two_rows_each(&st, "trash");
-            let (x, y) = second_row(&st, &Target::Close);
+            let text = screen_text(&frame(&mut st, 40, 20));
+            as_drawn(&st, "trash");
+            assert!(!text.contains("✕ close \n"), "{text}");
+            let (x, y) = row_of(&st, &Target::Close);
             tap_at(&mut st, 40, 20, x, y);
             assert!(st.view.trash.is_none());
         }
 
-        /// The conversation's controls: a folded line is two rows, both expanding it; scrolled
-        /// up, `↓ lines below` is two rows, both following the bottom again.
+        /// The conversation's controls: a tap on a folded line expands it; scrolled up,
+        /// `↓ lines below` is a row, a tap on it following the bottom again.
         #[test]
-        fn conversation_controls_are_two_rows() {
+        fn conversation_controls_are_one_row() {
             let mut st = crate::app::tests::without_worker_requests(with_orch());
             st.view.compact_width = 60;
             orch_conversation(&mut st);
             frame(&mut st, 40, 24);
             let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
-            let rows: Vec<Option<String>> = pane.links.clone();
-            let mut k = 0;
-            let mut tapped = None;
-            while k < rows.len() {
-                let Some(link) = rows[k].clone().filter(|l| !l.starts_with("request:")) else {
-                    k += 1;
-                    continue;
-                };
-                let n = rows[k..]
-                    .iter()
-                    .take_while(|l| l.as_deref() == Some(&link))
-                    .count();
-                assert!(n >= 2, "{link} on {n} row(s)");
-                tapped.get_or_insert((link, pane.area.y + k as u16 + 1));
-                k += n;
-            }
-            let (link, y) = tapped.expect("a folded line");
-            tap_at(&mut st, 40, 24, 5, y);
+            let (k, link) = pane
+                .links
+                .iter()
+                .enumerate()
+                .find_map(|(k, l)| {
+                    l.clone()
+                        .filter(|l| !l.starts_with("request:"))
+                        .map(|l| (k, l))
+                })
+                .expect("a folded line");
+            tap_at(&mut st, 40, 24, 5, pane.area.y + k as u16);
             // Replies enough to scroll up from.
             let mut o = ThreadScript::new("t-orch");
             o.at(500);
@@ -23819,16 +23856,16 @@ pub(crate) mod tests {
             }
             frame(&mut st, 40, 24);
             assert!(st.view.scroll > 0, "scrolled");
-            two_rows_each(&st, "scrolled up");
-            let (x, y) = second_row(&st, &Target::Follow);
+            as_drawn(&st, "scrolled up");
+            let (x, y) = row_of(&st, &Target::Follow);
             tap_at(&mut st, 40, 24, x, y);
             assert_eq!(st.view.scroll, 0, "following again");
         }
 
-        /// `↶ take back` is a band two rows tall over the input box, its own row: a tap on its
-        /// second row arms it, a second takes the message back.
+        /// `↶ take back` on a phone is the input box's top border, a row, as on a desktop: a
+        /// tap arms it, a second takes the message back.
         #[test]
-        fn take_back_is_two_rows() {
+        fn take_back_is_one_row() {
             let mut st = with_orch();
             st.view.compact_width = 60;
             send_line(
@@ -23837,12 +23874,15 @@ pub(crate) mod tests {
                 serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
                                    "turn": null, "pending": 1}),
             );
-            frame(&mut st, 40, 24);
-            two_rows_each(&st, "take back");
-            let (x, y) = second_row(&st, &Target::TakeBack);
+            let text = screen_text(&frame(&mut st, 40, 24));
+            as_drawn(&st, "take back");
+            let input = st.view.panes.get(&PaneId::Input).unwrap().area;
+            let (x, y) = row_of(&st, &Target::TakeBack);
+            assert_eq!(y + 1, input.y, "{text}");
+            assert_eq!(text.matches("take back").count(), 1, "{text}");
             assert!(tap_at(&mut st, 40, 24, x, y).is_empty());
             assert!(st.unsend_hint().is_some());
-            let (x, y) = second_row(&st, &Target::TakeBack);
+            let (x, y) = row_of(&st, &Target::TakeBack);
             assert_eq!(
                 tap_at(&mut st, 40, 24, x, y),
                 [Action::Withdraw {
@@ -23852,7 +23892,7 @@ pub(crate) mod tests {
             );
         }
 
-        /// A request selected in a phone's conversation is drawn whole, its two-row footer
+        /// A request selected in a phone's conversation is drawn whole, its footer row
         /// counted, or read in the detail view: every frame, never cut.
         #[test]
         fn a_selected_request_is_whole_or_in_the_detail_view() {
@@ -23909,8 +23949,8 @@ pub(crate) mod tests {
             assert_eq!(st.focused(), Some("t-gamma"));
         }
 
-        /// Block navigation on a phone sees the rows as drawn, controls two rows tall: its
-        /// rows are the pane's, link for link.
+        /// Block navigation on a phone sees the rows as drawn: its rows are the pane's, link
+        /// for link.
         #[test]
         fn phone_block_navigation_sees_the_rows_drawn() {
             let mut st = crate::app::tests::without_worker_requests(with_orch());
@@ -23925,10 +23965,10 @@ pub(crate) mod tests {
             assert_eq!(pane.links, links);
         }
 
-        /// `↶ take back` and the input box's top border are one control: an action popup
-        /// over its band leaves none of it, never its border's one row.
+        /// With an action popup open over a phone's conversation, the take-back is still its
+        /// one row, the popup's two-row choices over none of it.
         #[test]
-        fn take_back_is_covered_whole() {
+        fn take_back_stays_one_row_under_a_popup() {
             let mut st = with_orch();
             st.view.compact_width = 60;
             send_line(
@@ -23938,25 +23978,12 @@ pub(crate) mod tests {
                                    "turn": null, "pending": 1}),
             );
             frame(&mut st, 40, 30);
-            let takes = |st: &AppState| {
-                st.view
-                    .panes
-                    .targets
-                    .iter()
-                    .filter(|(_, t)| *t == Target::TakeBack)
-                    .map(|(r, _)| *r)
-                    .collect::<Vec<_>>()
-            };
-            assert!(
-                matches!(takes(&st)[..], [r] if r.height == 2),
-                "{:?}",
-                takes(&st)
-            );
+            assert_eq!(rows_of(&st, &Target::TakeBack).len(), 1);
             st.handle_key(key(KeyCode::Enter));
             assert!(st.view.action.is_some(), "a popup opens");
             frame(&mut st, 40, 30);
-            two_rows_each(&st, "popup open");
-            assert!(takes(&st).iter().all(|r| r.height == 2), "{:?}", takes(&st));
+            as_drawn(&st, "popup open");
+            assert!(rows_of(&st, &Target::TakeBack).len() <= 1);
         }
 
         /// The status bar's `Ctrl-B shows` on a phone does what Ctrl-B does there: the
@@ -23966,7 +23993,7 @@ pub(crate) mod tests {
             let mut st = phone();
             st.view.sidebar_hidden = true;
             frame(&mut st, 40, 24);
-            let (x, y) = second_row(&st, &Target::Sidebar);
+            let (x, y) = row_of(&st, &Target::Sidebar);
             tap_at(&mut st, 40, 24, x, y);
             assert_eq!(st.view.compact_pane, CompactPane::Threads);
             assert!(
@@ -24001,12 +24028,11 @@ pub(crate) mod tests {
             assert_eq!(again.focused(), Some("t-beta"));
         }
 
-        /// On short phone screens no control is drawn shorter than its two rows: the queue
-        /// shows the messages it has room for whole, each with its tap; the decision table's
-        /// filters and rows, and the conversation's lines-below row, are left out where they
-        /// would be cut.
+        /// On short phone screens every control is drawn as tall as it is and tapped where
+        /// drawn: the queue's messages each with its tap, the decision table, the
+        /// conversation's lines-below row.
         #[test]
-        fn short_phones_draw_no_control_cut() {
+        fn short_phones_draw_controls_as_tall_as_they_are() {
             let mut st = with_orch();
             st.view.compact_width = 60;
             assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
@@ -24021,7 +24047,7 @@ pub(crate) mod tests {
             );
             for h in 10..=16 {
                 let text = screen_text(&frame(&mut st, 40, h));
-                two_rows_each(&st, &format!("queue 40x{h}"));
+                as_drawn(&st, &format!("queue 40x{h}"));
                 let drawn = text.lines().filter(|l| l.contains("⧗ queued")).count();
                 let tapped = st
                     .view
@@ -24037,7 +24063,7 @@ pub(crate) mod tests {
             open_decisions(&mut st);
             for h in 6..=12 {
                 frame(&mut st, 40, h);
-                two_rows_each(&st, &format!("decisions 40x{h}"));
+                as_drawn(&st, &format!("decisions 40x{h}"));
             }
             let mut st = crate::app::tests::without_worker_requests(with_orch());
             st.view.compact_width = 60;
@@ -24046,14 +24072,13 @@ pub(crate) mod tests {
             st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
             for h in 8..=12 {
                 frame(&mut st, 40, h);
-                two_rows_each(&st, &format!("follow 40x{h}"));
+                as_drawn(&st, &format!("follow 40x{h}"));
             }
         }
 
-        /// The queued messages above the input box are two rows each; a tap on a second row
-        /// selects that one.
+        /// The queued messages above the input box are a row each; a tap on one selects it.
         #[test]
-        fn queued_messages_are_two_rows() {
+        fn queued_messages_are_one_row() {
             let mut st = with_orch();
             st.view.compact_width = 60;
             assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
@@ -24068,8 +24093,9 @@ pub(crate) mod tests {
                 ]}),
             );
             frame(&mut st, 40, 24);
-            two_rows_each(&st, "queue");
-            let (x, y) = second_row(&st, &Target::Queued(8));
+            as_drawn(&st, "queue");
+            let (x, y) = row_of(&st, &Target::Queued(8));
+            assert_eq!(row_of(&st, &Target::Queued(7)).1 + 1, y);
             tap_at(&mut st, 40, 24, x, y);
             assert_eq!(st.view.queued, Some(8));
         }

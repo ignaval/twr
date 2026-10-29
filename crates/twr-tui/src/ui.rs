@@ -151,22 +151,9 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else if state.view.settings.is_some() {
         crate::settings::render(frame, body, state, &mut panes);
     } else if state.view.help {
-        render_help(
-            frame,
-            body,
-            state.view.help_scroll,
-            state.compact(),
-            &mut panes,
-        );
+        render_help(frame, body, state.view.help_scroll, &mut panes);
     } else if let Some(trash) = &state.view.trash {
-        render_trash(
-            frame,
-            body,
-            trash,
-            state.view.trash_scroll,
-            state.compact(),
-            &mut panes,
-        );
+        render_trash(frame, body, trash, state.view.trash_scroll, &mut panes);
     } else if render_action_popup(frame, body, state, &mut panes).is_some() {
     } else {
         render_popup(frame, body, state, &mut panes);
@@ -439,8 +426,8 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
     ),
     (
         "Ctrl-B",
-        "show or hide the sidebar, the workspaces with their threads, the current one's as \
-         cards (/sidebar); in the compact layout the Threads screen",
+        "show or hide Threads, the sidebar: the workspaces with their threads, the current \
+         one's as cards (/sidebar); in the compact layout the Threads screen",
     ),
     ("Ctrl-T", "the same as Ctrl-B (/spaces)"),
     (
@@ -531,9 +518,9 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     ),
     (
         "controls",
-        "a workspace's card in the sidebar, or a thread under another workspace's card, \
-         switches to it, + New workspace asks for a name, ⚙ Settings opens the settings, the \
-         sidebar's ‹ hides it and the tab strip's ≡ shows it; the Chat, Needs you and Threads tabs switch screens (a whole share of \
+        "a workspace's card in Threads, or a thread under another workspace's card, \
+         switches to it, + New workspace asks for a name, ⚙ Settings opens the settings, \
+         Threads' ‹ hides it and the tab strip's ≡ shows it; the Chat, Needs you and Threads tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
@@ -577,7 +564,9 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
          Needs you (a row per thread) and Threads (the workspaces, the current one's cards \
          nested under it, the others' threads, one list that scrolls), switched with /c, /n and \
-         /t (/w) or a tap on their tabs; every control two rows tall, either row a tap on it; \
+         /t (/w) or a tap on their tabs; the tabs and menu choices (a popup's rows, \
+         completions, the picker's runtimes, settings, the Threads and Needs you entries) two \
+         rows tall, either row a tap on it, every other control a row; \
          ↑↓ on an empty line pick a row, a workspace or a card, Enter \
          opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
@@ -708,15 +697,12 @@ pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// The help overlay, centered over whatever is on screen, `scroll` rows down. Its rows wrap
 /// to its width ([`help_lines`]); taller than the screen, it scrolls (↑↓, PgUp/PgDn,
 /// Home/End, the wheel), and its bottom border says `↓ more` while there is more below.
-fn render_help(frame: &mut Frame, area: Rect, scroll: u16, phone: bool, panes: &mut Panes) {
+fn render_help(frame: &mut Frame, area: Rect, scroll: u16, panes: &mut Panes) {
     let width = area.width.min(HELP_MAX_WIDTH);
     let lines = help_lines(usize::from(width.saturating_sub(2)).max(1));
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    // On a phone, a row under the top border closes it too: its `✕` two rows tall, kept
-    // above what scrolls.
-    let spacer = u16::from(phone);
-    let rect = centered(area, width, rows.saturating_add(2 + spacer));
-    let fit = rect.height.saturating_sub(2 + spacer);
+    let rect = centered(area, width, rows.saturating_add(2));
+    let fit = rect.height.saturating_sub(2);
     panes.help_max = rows.saturating_sub(fit);
     let scroll = scroll.min(panes.help_max);
     let hints: &[&str] = if scroll < panes.help_max {
@@ -749,32 +735,11 @@ fn render_help(frame: &mut Frame, area: Rect, scroll: u16, phone: bool, panes: &
         .title(close_title())
         // On the border: shown whatever the scroll.
         .title_bottom(Span::styled(hint, Style::default().fg(Color::DarkGray)));
-    let inner = block.inner(rect);
-    let close = Rect {
-        height: spacer.min(inner.height),
-        ..inner
-    };
-    let inner = Rect {
-        y: inner.y + close.height,
-        height: inner.height - close.height,
-        ..inner
-    };
     panes.cover(None);
-    panes.add(PaneId::Help, inner);
+    panes.add(PaneId::Help, block.inner(rect));
     close_row(panes, rect, Target::Close);
-    if !close.is_empty() {
-        panes.target(close, Target::Close);
-    }
     frame.render_widget(Clear, rect);
-    frame.render_widget(block, rect);
-    if !close.is_empty() {
-        let text = format!("{:>w$}", "✕ close ", w = usize::from(close.width));
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
-            close,
-        );
-    }
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), rect);
 }
 
 /// The trash overlay's lines for a `trash.list` result: one row per item (short id, thread,
@@ -849,14 +814,7 @@ pub fn trash_lines(r: &Value) -> Vec<Line<'static>> {
 }
 
 /// The trash overlay, centered over whatever is on screen.
-fn render_trash(
-    frame: &mut Frame,
-    area: Rect,
-    trash: &Value,
-    scroll: u16,
-    phone: bool,
-    panes: &mut Panes,
-) {
+fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes: &mut Panes) {
     // Wrapped to the overlay's width: nothing runs past its border.
     let width = area.width.min(120);
     let inner = usize::from(width.saturating_sub(2)).max(1);
@@ -865,10 +823,7 @@ fn render_trash(
         .flat_map(|l| wrap_line(l, inner))
         .collect();
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    // On a phone, a row under the top border closes it too: its `✕` two rows tall, kept
-    // above what scrolls.
-    let spacer = u16::from(phone);
-    let rect = centered(area, width, rows.saturating_add(2 + spacer));
+    let rect = centered(area, width, rows.saturating_add(2));
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -876,7 +831,7 @@ fn render_trash(
         .title(" twr trash ")
         .title(close_title());
     // Taller than the screen: it scrolls, and says so.
-    let fit = rect.height.saturating_sub(2 + spacer);
+    let fit = rect.height.saturating_sub(2);
     panes.trash_max = rows.saturating_sub(fit);
     let scroll = scroll.min(panes.trash_max);
     if rows > fit {
@@ -897,32 +852,11 @@ fn render_trash(
         .unwrap_or_else(|| truncate(&format!("{at} "), room));
         block = block.title_bottom(Line::from(footer).right_aligned());
     }
-    let inner = block.inner(rect);
-    let close = Rect {
-        height: spacer.min(inner.height),
-        ..inner
-    };
-    let inner = Rect {
-        y: inner.y + close.height,
-        height: inner.height - close.height,
-        ..inner
-    };
     panes.cover(None);
-    panes.add(PaneId::Help, inner);
+    panes.add(PaneId::Help, block.inner(rect));
     close_row(panes, rect, Target::Close);
-    if !close.is_empty() {
-        panes.target(close, Target::Close);
-    }
     frame.render_widget(Clear, rect);
-    frame.render_widget(block, rect);
-    if !close.is_empty() {
-        let text = format!("{:>w$}", "✕ close ", w = usize::from(close.width));
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
-            close,
-        );
-    }
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), rect);
 }
 
 /// The orchestrator picker's lines: what it is for, one row per runtime (installed or not,
@@ -1017,18 +951,10 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     // Wrapped here to the width it gets (a phone is narrower than its heading), so the rows
     // of each runtime are known: a tap on them picks it.
     let inner_w = usize::from(width.min(area.width).saturating_sub(2)).max(1);
-    // On a phone each runtime is a band two rows tall, and a row under the top border closes
-    // it too ([`TAP_ROWS`]).
+    // On a phone each runtime is a menu choice, a band two rows tall ([`TAP_ROWS`]).
     let phone = state.compact();
     let runtimes = state.view.picker.as_ref().map_or(0, |p| p.runtimes.len());
     let mut rows: Vec<Line<'static>> = Vec::new();
-    if phone {
-        let close = format!("{:>inner_w$}", "✕ close ");
-        rows.push(Line::from(Span::styled(
-            close,
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
     let mut spans = Vec::new();
     for (k, line) in lines.into_iter().enumerate() {
         let start = rows.len();
@@ -1041,18 +967,18 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
         }
         spans.push(start..rows.len());
     }
-    // A phone too short for it all: the rows under its close row scroll to keep the selected
-    // runtime whole, and a runtime the window cuts is left blank, never drawn without its tap.
+    // A phone too short for it all: its rows scroll to keep the selected runtime whole, and a
+    // runtime the window cuts is left blank, never drawn without its tap.
     let room = usize::from(area.height.saturating_sub(2));
-    if phone && rows.len() > room && room > 1 {
+    if phone && rows.len() > room && room > 0 {
         let sel = state.view.picker.as_ref().map_or(0, |p| p.selected);
         let off = spans.get(3 + sel).map_or(0, |s: &std::ops::Range<usize>| {
-            s.end.saturating_sub(room).min(s.start.saturating_sub(1))
+            s.end.saturating_sub(room).min(s.start)
         });
-        rows.drain(1..1 + off);
+        rows.drain(..off);
         for (k, span) in spans.iter_mut().enumerate() {
-            let shifted = span.start.saturating_sub(off).max(1)..span.end.saturating_sub(off);
-            let whole = span.start > off && span.end - off <= room;
+            let shifted = span.start.saturating_sub(off)..span.end.saturating_sub(off);
+            let whole = span.start >= off && span.end - off <= room;
             *span = if whole || shifted.is_empty() {
                 shifted
             } else {
@@ -1088,9 +1014,6 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     close_row(panes, rect, Target::Close);
-    if phone && inner.height > 0 {
-        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
-    }
     // Its runtimes, from the fourth line ([`picker_lines`]): the rows each wrapped into (on a
     // phone, only one drawn whole).
     for (i, span) in spans.iter().skip(3).take(runtimes).enumerate() {
@@ -1126,7 +1049,7 @@ fn render_stack(
     // The main pane's thread's queued messages are listed right above the input box.
     let [top, queued, input] = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(queue_height(state) + take_back_rows(state)),
+        Constraint::Length(queue_height(state)),
         Constraint::Length(input_height(
             state,
             Rect {
@@ -1138,35 +1061,28 @@ fn render_stack(
     .areas(upper);
     let noted = docked.unwrap_or(false);
     render_main(frame, top, state, panes);
-    let back = take_back_rows(state).min(queued.height);
-    render_queue(
-        frame,
-        Rect {
-            height: queued.height - back,
-            ..queued
-        },
-        state,
-        panes,
-    );
-    render_take_back(frame, queued, back, state, panes);
+    render_queue(frame, queued, state, panes);
     render_input(frame, input, state, panes);
     // The note on hidden parked threads the card area had no room for leads the hints.
     let parked = parked_note(state).filter(|_| !noted);
     render_status(frame, status, state, panes, parked);
 }
 
-/// Rows of the compact layout's tab bar, and of each control a phone taps on its screens
-/// ([`crate::sidebar::render_phone`], the Needs you list's rows): two, as tall as a finger.
+/// Rows of the compact layout's tab bar: two, as tall as a finger.
 pub const TAB_BAR_ROWS: u16 = 2;
-/// Rows of a control on the compact layout's screens: as tall as the tab bar's.
+/// Rows of a menu choice on a phone, as tall as a tab: a popup's rows (actions, a question's
+/// answers, completions), the orchestrator picker's runtimes, a setting, `[ yes ]` and
+/// `[ no ]`, the Threads and Needs you lists' entries. Every other control (headers, the
+/// conversation's folds and footers, `■ stop`, the lines-below row, queued messages, take
+/// back, notices, `✕ close`, buttons) is a row tall, as on a desktop.
 pub const TAP_ROWS: u16 = TAB_BAR_ROWS;
-/// The fills of a phone's controls drawn as bands ([`tap_band`]), neighbors alternating.
+/// The fills of a phone's menu choices drawn as bands ([`tap_band`]), neighbors alternating.
 pub(crate) const BAND: Color = Color::Indexed(236);
 pub(crate) const BAND_ALT: Color = Color::Indexed(238);
 
-/// `lines`, a control on a phone, as a band: at least [`TAP_ROWS`] rows, each filled to
+/// `lines`, a menu choice on a phone, as a band: at least [`TAP_ROWS`] rows, each filled to
 /// `width` cells with `bg` behind its text (where it has none of its own), so that its rows
-/// show as one control.
+/// show as one choice.
 pub(crate) fn tap_band(
     mut lines: Vec<Line<'static>>,
     width: usize,
@@ -1187,64 +1103,6 @@ pub(crate) fn tap_band(
     lines
 }
 
-/// The transcript's `rows` on a phone: each run of rows a tap acts on (a folded line, a long
-/// block's footer, a running command's `■ stop`; a request's box is many rows already) a band
-/// at least [`TAP_ROWS`] tall, the rows added to it its own (its link, left out of a copy);
-/// `spans` moved with them.
-fn tap_rows(
-    rows: Vec<TranscriptRow>,
-    mut spans: Spans,
-    width: usize,
-) -> (Vec<TranscriptRow>, Spans) {
-    let control = |r: &TranscriptRow| r.2.as_deref().is_some_and(|l| !l.starts_with("request:"));
-    let mut out: Vec<TranscriptRow> = Vec::with_capacity(rows.len());
-    // Where each row went (and where the end is).
-    let mut at: Vec<usize> = Vec::with_capacity(rows.len() + 1);
-    let mut bands = 0usize;
-    let mut i = 0;
-    while i < rows.len() {
-        if !control(&rows[i]) {
-            at.push(out.len());
-            out.push(rows[i].clone());
-            i += 1;
-            continue;
-        }
-        let mut j = i + 1;
-        while j < rows.len() && rows[j].2 == rows[i].2 {
-            j += 1;
-        }
-        let bg = if bands.is_multiple_of(2) {
-            BAND
-        } else {
-            BAND_ALT
-        };
-        bands += 1;
-        let lines = tap_band(rows[i..j].iter().map(|r| r.0.clone()).collect(), width, bg);
-        for (k, line) in lines.into_iter().enumerate() {
-            match rows.get(i + k).filter(|_| i + k < j) {
-                Some(r) => {
-                    at.push(out.len());
-                    out.push((line, r.1, r.2.clone(), r.3));
-                }
-                None => out.push((line, Join::Skip, rows[i].2.clone(), rows[i].3)),
-            }
-        }
-        i = j;
-    }
-    at.push(out.len());
-    let moved = |r: usize| at.get(r).copied().unwrap_or(out.len());
-    for e in &mut spans.entries {
-        *e = moved(e.start)..moved(e.end);
-    }
-    for s in &mut spans.sections {
-        *s = moved(*s);
-    }
-    for (row, _) in &mut spans.runs {
-        *row = moved(*row);
-    }
-    (out, spans)
-}
-
 /// The compact layout (a phone): a tab bar naming its screens, `Chat · Needs you 2 · Threads`,
 /// the current one highlighted ([`render_tab_bar`]), [`TAB_BAR_ROWS`] tall, over that screen: the
 /// conversation alone, what needs the user (one line per thread), or the threads' cards
@@ -1260,14 +1118,12 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
         render_stack(frame, rest, state, panes, None);
         return;
     }
-    let [list, back, input, status] = Layout::vertical([
+    let [list, input, status] = Layout::vertical([
         Constraint::Min(1),
-        Constraint::Length(take_back_rows(state)),
         Constraint::Length(input_height(state, rest)),
         Constraint::Length(status_height(state, rest)),
     ])
     .areas(rest);
-    render_take_back(frame, back, back.height, state, panes);
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
@@ -6530,23 +6386,9 @@ fn render_card_detail(
             .title_bottom(Line::from(" Tab selects it ").left_aligned())
     };
     let inner = block.inner(area);
-    // On a phone, a row under the top border takes you back too: its `✕` two rows tall.
-    let spacer = u16::from(state.compact() && returns && inner.height > 1);
-    let close = Rect {
-        height: spacer,
-        ..inner
-    };
-    let inner = Rect {
-        y: inner.y + spacer,
-        height: inner.height - spacer,
-        ..inner
-    };
     panes.add(PaneId::Thread(orch.to_string()), inner);
     if returns {
         close_row(panes, area, Target::Release);
-        if !close.is_empty() {
-            panes.target(close, Target::Release);
-        }
     }
     let width = usize::from(inner.width);
     let more = if request {
@@ -6590,15 +6432,7 @@ fn render_card_detail(
     if !inner.is_empty() {
         panes.card = Some(window);
     }
-    frame.render_widget(block, area);
-    if !close.is_empty() {
-        let text = format!("{:>w$}", "✕ back ", w = usize::from(close.width));
-        frame.render_widget(
-            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
-            close,
-        );
-    }
-    frame.render_widget(Paragraph::new(shown), inner);
+    frame.render_widget(Paragraph::new(shown).block(block), area);
     record(panes, orch, drawn, inner);
 }
 
@@ -6964,12 +6798,6 @@ impl<'a> BlockView<'a> {
                 state: Some(state),
             },
         );
-        // On a phone, with its controls two rows tall, as drawn ([`tap_rows`]).
-        let (rows, spans) = if state.compact() {
-            tap_rows(rows, spans, usize::from(width))
-        } else {
-            (rows, spans)
-        };
         BlockView { state, rows, spans }
     }
 
@@ -7062,10 +6890,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     let shown = dive.or_else(|| state.orchestrator());
     let works = shown.is_some_and(icon::is_working);
     let working = shown.and_then(|t| working_icon(state, t));
-    // On a phone the band is two rows tall, as its `‹ back` is a control ([`TAP_ROWS`]).
-    let band_rows = if state.compact() { TAP_ROWS } else { 1 };
-    let [band, body] =
-        Layout::vertical([Constraint::Length(band_rows), Constraint::Min(0)]).areas(area);
+    let [band, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     // No border: the header band says who the pane is about and, selected (Shift-←), turns
     // the yellow of a selected card and says so ([`render_band`]).
     render_band(frame, band, state, working, panes);
@@ -7103,13 +6928,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // Keep the banner visible and page long requests within the remaining conversation.
     if let Some(item) = state.selected_request() {
         let rows = request_rows(state, item, inner.width);
-        // With the row (on a phone the two) saying what is below, as the view keeps it.
-        let foot = if state.compact() && inner.height > TAP_ROWS {
-            TAP_ROWS
-        } else {
-            1
-        };
-        if rows.len() + usize::from(foot) > usize::from(inner.height) {
+        // With the row saying what is below, as the view keeps it.
+        if rows.len() >= usize::from(inner.height) {
             render_card_detail(frame, inner, state, &item.thread, panes);
             return;
         }
@@ -7141,12 +6961,6 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     };
     let (mut rows, spans) = transcript_view_spans(entries, inner.width, &collapse, &threads);
     mark_read_aloud(&mut rows, &spans, entries, state);
-    // On a phone, what a tap acts on is two rows tall.
-    let (mut rows, spans) = if state.compact() {
-        tap_rows(rows, spans, usize::from(inner.width))
-    } else {
-        (rows, spans)
-    };
     if entries.is_empty() && state.selected_request().is_none() {
         rows.extend(
             main_hint(state)
@@ -7204,14 +7018,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // New replies must not scroll a selected request away. Esc or an explicit transcript
     // scroll releases the selection; until then its options stay in view, above the row that
     // says what is below when the view is scrolled up (it takes the pane's last row).
-    // (On a phone that row is two, a control a finger taps, and none where the pane has no
-    // more rows than that.)
-    let foot = match state.compact() {
-        true if height > usize::from(TAP_ROWS) => usize::from(TAP_ROWS),
-        true => 0,
-        false => 1,
-    };
-    let shown = |scroll: usize| height - if scroll > 0 && height > 1 { foot } else { 0 };
+    let shown = |scroll: usize| height - usize::from(scroll > 0 && height > 1);
     let scroll = requests
         .iter()
         .find(|(item, _)| state.view.request.as_deref() == Some(item.attn_id.as_str()))
@@ -7222,8 +7029,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
                 // Move just far enough to show the request, leaving room for its reply.
                 max_scroll.saturating_sub(range.start)
             } else if range.end > start + shown(scroll) {
-                // Down to its last row: the footer's rows less below it than there are.
-                rows.len().saturating_sub(range.end).saturating_sub(foot)
+                // Down to its last row: one row less below it than there is, for that row.
+                rows.len().saturating_sub(range.end).saturating_sub(1)
             } else {
                 scroll
             }
@@ -7232,7 +7039,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     let start = rows.len().saturating_sub(height + scroll);
     // Scrolled up, the pane's last row says how much is below ([`render_below`]): the rows it
     // shows end above it.
-    let footer = scroll > 0 && height > 1 && foot > 0;
+    let footer = scroll > 0 && height > 1;
     let end = (start + shown(scroll)).min(rows.len());
     for (item, range) in requests {
         if start <= range.start
@@ -7267,36 +7074,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             ..run.clone()
         });
     }
-    // On a phone, a band ([`tap_rows`]) the view cuts at its top or bottom is no control: a
-    // tap on what is left of it (perhaps only its padding) does nothing.
-    let band = |row: usize| {
-        rows.get(row)
-            .and_then(|r| r.2.clone())
-            .filter(|l| state.compact() && !l.starts_with("request:"))
-    };
-    let mut cut = vec![false; end - start];
-    for (edge, outside) in [
-        (start, start.checked_sub(1)),
-        (end.saturating_sub(1), Some(end)),
-    ] {
-        let Some(link) = outside.and_then(band) else {
-            continue;
-        };
-        let mut row = edge;
-        while (start..end).contains(&row) && band(row).as_ref() == Some(&link) {
-            cut[row - start] = true;
-            row = if edge == start {
-                row + 1
-            } else {
-                row.wrapping_sub(1)
-            };
-        }
-    }
     let mut lines = Vec::with_capacity(end - start);
-    for ((y, (line, join, link, edge)), cut) in
-        (inner.y..).zip(rows[start..end].iter().cloned()).zip(cut)
-    {
-        let link = link.filter(|_| !cut);
+    for (y, (line, join, link, edge)) in (inner.y..).zip(rows[start..end].iter().cloned()) {
         lines.push(line);
         // A row all drawing adds nothing to a copy, though a long block's footer continues
         // the line it cuts for places ([`long_rows`]).
@@ -7327,7 +7106,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         }
     }
     if footer {
-        pane.area.height = inner.height - u16::try_from(foot).unwrap_or(1);
+        pane.area.height = inner.height - 1;
     }
     pane.max_scroll = max_scroll;
     pane.scroll = scroll;
@@ -7361,8 +7140,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // Scrolled up: how much is below, on the pane's last row, which a tap takes back to the
     // bottom (End).
     if footer {
-        let foot = u16::try_from(foot).unwrap_or(1);
-        let row = Rect::new(inner.x, inner.bottom() - foot, inner.width, foot);
+        let row = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
         render_below(frame, row, rows.len() - end, state);
         panes.target(row, Target::Follow);
     }
@@ -7690,10 +7468,6 @@ fn render_below(frame: &mut Frame, row: Rect, below: usize, state: &AppState) {
     let w = u16::try_from(crate::edit::width(&text)).unwrap_or(0);
     let area = Rect::new(row.right() - 1 - w, row.y, w, 1);
     let style = target_fill(state.dived()).add_modifier(Modifier::BOLD);
-    // Two rows on a phone: a band of the fill, the text on its first row.
-    if row.height > 1 {
-        frame.render_widget(Paragraph::new("").style(style), row);
-    }
     frame.render_widget(Paragraph::new(Span::styled(text, style)), area);
 }
 
@@ -7803,47 +7577,7 @@ pub fn queue_height(state: &AppState) -> u16 {
     };
     let shown = q.items.len().min(crate::queue::QUEUE_ROWS);
     let more = usize::from(q.total > shown as u64);
-    // On a phone each one is a control two rows tall ([`TAP_ROWS`]).
-    let tall = if state.compact() {
-        usize::from(TAP_ROWS)
-    } else {
-        1
-    };
-    u16::try_from(shown * tall + more).unwrap_or(0)
-}
-
-/// Rows a phone gives the take-back above the input box, whose top border is its other row:
-/// one while the last message can be taken back ([`AppState::take_back_offered`]).
-pub fn take_back_rows(state: &AppState) -> u16 {
-    u16::from(state.compact() && state.take_back_offered())
-}
-
-/// The take-back's row above the input box on a phone, the last `rows` of `area`: a band of
-/// where a line goes ([`target_fill`]) saying `↶ take back`, a tap on it as one on the box's
-/// top border ([`Target::TakeBack`]).
-fn render_take_back(frame: &mut Frame, area: Rect, rows: u16, state: &AppState, panes: &mut Panes) {
-    if rows == 0 || area.height < rows {
-        return;
-    }
-    let row = Rect {
-        y: area.bottom() - rows,
-        height: rows,
-        ..area
-    };
-    let style = target_fill(state.dived()).add_modifier(Modifier::BOLD);
-    frame.render_widget(
-        Paragraph::new(Line::from(" ↶ take back ").right_aligned()).style(style),
-        row,
-    );
-    // One control with the input box's top border under it: an overlay over either row covers
-    // it whole ([`Panes::cover`]), never leaving one row of it.
-    panes.target(
-        Rect {
-            height: rows + 1,
-            ..row
-        },
-        Target::TakeBack,
-    );
+    u16::try_from(shown + more).unwrap_or(0)
 }
 
 /// The main pane's thread's queued messages, the next to run first, right above the input
@@ -7860,13 +7594,9 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     let width = usize::from(area.width);
     let dim = Style::default().fg(Color::DarkGray);
     let newest_mine = q.newest_mine;
-    // On a phone each one is a band two rows tall, both its own ([`TAP_ROWS`]).
-    let tall = if state.compact() { TAP_ROWS } else { 1 };
-    // As many as the rows given draw whole, with the row saying how many more.
+    // As many as the rows given draw, with the row saying how many more.
     let mut n = q.items.len().min(crate::queue::QUEUE_ROWS);
-    while n > 0
-        && n * usize::from(tall) + usize::from(q.total > n as u64) > usize::from(area.height)
-    {
+    while n > 0 && n + usize::from(q.total > n as u64) > usize::from(area.height) {
         n -= 1;
     }
     let shown: Vec<&crate::queue::Queued> = q.items.iter().take(n).collect();
@@ -7901,30 +7631,15 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
         } else {
             Style::default().fg(Color::Gray)
         };
-        let line = Line::from(vec![
+        lines.push(Line::from(vec![
             Span::styled(text, style),
             Span::styled(" ".repeat(pad), style),
             Span::styled(hint.to_string(), if selected { style } else { dim }),
-        ]);
-        if tall > 1 {
-            let bg = if row.is_multiple_of(2) {
-                BAND
-            } else {
-                BAND_ALT
-            };
-            let fill = if selected {
-                style
-            } else {
-                Style::default().bg(bg)
-            };
-            lines.extend(tap_band(vec![line], width, fill.bg.unwrap_or(bg)));
-        } else {
-            lines.push(line);
-        }
-        let y = area.y + u16::try_from(row).unwrap_or(0) * tall;
-        if y + tall <= area.y + area.height {
+        ]));
+        let y = area.y + u16::try_from(row).unwrap_or(0);
+        if y < area.y + area.height {
             panes.target(
-                Rect::new(area.x, y, area.width, tall),
+                Rect::new(area.x, y, area.width, 1),
                 Target::Queued(it.msg_ref),
             );
         }
@@ -7995,8 +7710,7 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     // While the last message can be taken back, the border's row takes it back: a tap arms
     // the second, as the first Esc does (the title then says so in place of this).
     if state.take_back_offered() {
-        // On a phone the band above the box says it ([`render_take_back`]).
-        if state.unsend_hint().is_none() && !state.compact() {
+        if state.unsend_hint().is_none() {
             block = block.title(
                 Line::from(Span::styled(
                     " ↶ take back ",
@@ -8005,13 +7719,10 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
                 .right_aligned(),
             );
         }
-        // On a phone the band above it has it, this row with it ([`render_take_back`]).
-        if take_back_rows(state) == 0 {
-            panes.target(
-                Rect::new(area.x, area.y, area.width, area.height.min(1)),
-                Target::TakeBack,
-            );
-        }
+        panes.target(
+            Rect::new(area.x, area.y, area.width, area.height.min(1)),
+            Target::TakeBack,
+        );
     }
     let inner = block.inner(area);
     let line = &state.view.input;
@@ -8075,21 +7786,21 @@ fn render_popup(
     let input = panes.get(&PaneId::Input).map(|p| p.area)?;
     // The input box's top border is the row above its text.
     let bottom = input.y.saturating_sub(1);
-    // On a phone each row is a control two rows tall, a row under the top border closes it
-    // too, and it stays under the tab bar ([`TAP_ROWS`]).
+    // On a phone each row is a menu choice two rows tall, and it stays under the tab bar
+    // ([`TAP_ROWS`]).
     let phone = state.compact();
-    let (tall, spacer) = if phone { (TAP_ROWS, 1u16) } else { (1, 0) };
+    let tall = if phone { TAP_ROWS } else { 1 };
     let top = if phone {
         area.y.saturating_add(TAB_BAR_ROWS)
     } else {
         area.y
     };
     let rows = s.items.len().min(POPUP_ROWS);
-    let height = (rows as u16 * tall + 2 + spacer).min(bottom.saturating_sub(top));
-    if height < 2 + spacer + tall {
+    let height = (rows as u16 * tall + 2).min(bottom.saturating_sub(top));
+    if height < 2 + tall {
         return None;
     }
-    let fit = usize::from((height - 2 - spacer) / tall);
+    let fit = usize::from((height - 2) / tall);
     let label_w = s
         .items
         .iter()
@@ -8137,14 +7848,6 @@ fn render_popup(
             }
         })
         .collect();
-    let mut lines = lines;
-    if phone {
-        let close = format!("{:>inner_w$}", "✕ close ");
-        lines.insert(
-            0,
-            Line::from(Span::styled(close, Style::default().fg(Color::DarkGray))),
-        );
-    }
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -8164,11 +7867,8 @@ fn render_popup(
     panes.add(PaneId::Popup, inner);
     // A tap on a row completes it, as Tab does; on the top border, closes it.
     close_row(panes, rect, Target::Close);
-    if spacer > 0 {
-        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
-    }
     for k in 0..fit.min(s.items.len().saturating_sub(first)) {
-        let y = inner.y + spacer + k as u16 * tall;
+        let y = inner.y + k as u16 * tall;
         if y + tall > inner.bottom() {
             break;
         }
@@ -8215,13 +7915,11 @@ fn render_action_popup(
         .width
         .saturating_add(2)
         .min(frame.area().width.saturating_sub(x));
-    // On a phone, a row under its top border closes it too: the `✕` two rows tall.
-    let spacer = u16::from(state.compact());
-    if width < 3 || room < 3 + spacer {
+    if width < 3 || room < 3 {
         return None;
     }
     let inner_w = usize::from(width - 2);
-    let fit = usize::from(room - 2 - spacer);
+    let fit = usize::from(room - 2);
     let dim = Style::default().fg(Color::DarkGray);
     let rows = state.action_rows(&popup.target);
     let matches = state.action_matches(popup, &rows);
@@ -8496,11 +8194,6 @@ fn render_action_popup(
             .collect(),
     ));
     exact = exact && lines.iter().all(|l| l.width() <= inner_w.max(1));
-    if spacer == 1 {
-        // The second row of its `✕`, under the top border.
-        let close = format!("{:>inner_w$}", "✕ close ");
-        lines.insert(0, Line::from(Span::styled(close, dim)));
-    }
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
         .saturating_add(2);
@@ -8550,12 +8243,7 @@ fn render_action_popup(
     // whole are tapped ([`Target::Row`]), its top border closes it.
     panes.cover(Some(rect));
     close_row(panes, rect, Target::Close);
-    if spacer == 1 {
-        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
-    }
-    let spacer = usize::from(spacer);
     for (kind, start, n) in row_at {
-        let start = start + spacer;
         if start + n <= lines.len() && n > 0 {
             let y = inner.y + start as u16;
             panes.target(
@@ -8814,13 +8502,9 @@ fn compact_hints(state: &AppState, dive: bool, main: bool) -> &'static str {
 /// The decisions overlay: its summary, its filters and the table over the whole screen, and
 /// the status bar. It has no input box: its keys are its own ([`AppState::decisions_key`]).
 fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
-    // On a phone its summary (which closes it) and its filters are controls two rows tall,
-    // bands ([`TAP_ROWS`]).
-    let phone = state.compact();
-    let tall = if phone { TAP_ROWS } else { 1 };
     let [summary, filters, table, status] = Layout::vertical([
-        Constraint::Length(tall),
-        Constraint::Length(tall),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(status_height(state, area)),
     ])
@@ -8842,14 +8526,10 @@ fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes:
     frame.render_widget(Paragraph::new(decision_filter_line(state)), filters);
     panes.add(PaneId::Text, summary);
     panes.add(PaneId::Text, filters);
-    // `✕ close` at the summary's end: its whole row closes the overlay (Esc). On a phone too
-    // short for its two rows, and for the filters', they are text.
+    // `✕ close` at the summary's end: its whole row closes the overlay (Esc).
     let close = " ✕ close ";
     let w = crate::edit::width(close) as u16;
-    if summary.width > w && summary.height >= tall {
-        if phone {
-            frame.render_widget(Paragraph::new("").style(Style::default().bg(BAND)), summary);
-        }
+    if summary.width > w {
         let at = Rect::new(summary.right() - w, summary.y, w, 1);
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -8865,9 +8545,7 @@ fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes:
         (" site ", Target::SiteFilter),
         (" provider ", Target::ProviderFilter),
     ] {
-        if let Some(at) =
-            find_text(frame.buffer_mut(), filters, needle).filter(|_| filters.height >= tall)
-        {
+        if let Some(at) = find_text(frame.buffer_mut(), filters, needle) {
             // From its name to the end of its key, `(f)` or `(v)`.
             let key = if target == Target::SiteFilter {
                 "(f)"
@@ -8875,22 +8553,7 @@ fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes:
                 "(v)"
             };
             let end = find_text(frame.buffer_mut(), filters, key).map_or(at.right(), |k| k.right());
-            let cells = Rect::new(at.x, at.y, end.saturating_sub(at.x), tall).intersection(filters);
-            if phone {
-                // Its two rows a band, as a button's.
-                let bg = if target == Target::SiteFilter {
-                    BAND
-                } else {
-                    BAND_ALT
-                };
-                let buf = frame.buffer_mut();
-                for y in cells.top()..cells.bottom() {
-                    for x in cells.left()..cells.right() {
-                        buf[(x, y)].set_bg(bg);
-                    }
-                }
-            }
-            panes.target(cells, target);
+            panes.target(Rect::new(at.x, at.y, end.saturating_sub(at.x), 1), target);
         }
     }
     render_decision_table(frame, table, state, panes);
@@ -9051,19 +8714,15 @@ fn render_decision_table(frame: &mut Frame, area: Rect, state: &AppState, panes:
     let fixed: u16 =
         DECISION_COLUMNS.iter().map(|(_, w)| w).sum::<u16>() + DECISION_COLUMNS.len() as u16;
     let options_width = usize::from(inner.width.saturating_sub(fixed).max(1));
-    // On a phone each row is a control two rows tall, in a band ([`TAP_ROWS`]).
-    let phone = state.compact();
-    let tall = if phone { TAP_ROWS } else { 1 };
-    // On a phone, none where no row fits whole.
-    let fit = usize::from(inner.height.saturating_sub(1) / tall).max(usize::from(!phone));
+    let fit = usize::from(inner.height.saturating_sub(1)).max(1);
     let selected = state.decision_selected();
     let first = table_first_row(selected, fit);
     // Its rows under the header: a tap selects one, a tap on the selected one opens it.
     for (k, r) in rows.iter().skip(first).take(fit).enumerate() {
-        let y = inner.y + 1 + k as u16 * tall;
-        if y + tall <= inner.bottom() {
+        let y = inner.y + 1 + k as u16;
+        if y < inner.bottom() {
             panes.target(
-                Rect::new(inner.x, y, inner.width, tall),
+                Rect::new(inner.x, y, inner.width, 1),
                 Target::Decision(r.id.clone()),
             );
         }
@@ -9079,12 +8738,6 @@ fn render_decision_table(frame: &mut Frame, area: Rect, state: &AppState, panes:
                     .into_iter()
                     .map(Cell::from),
             );
-            let row = if phone {
-                let bg = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
-                row.height(tall).style(Style::default().bg(bg))
-            } else {
-                row
-            };
             if i == selected {
                 row.style(Style::default().add_modifier(Modifier::REVERSED))
             } else {
@@ -9134,10 +8787,6 @@ fn render_status(
     panes.add(PaneId::Text, area);
     if let Some(c) = state.view.confirm.as_ref().filter(|_| state.compact()) {
         render_compact_confirm(frame, area, &c.prompt, panes);
-        return;
-    }
-    if state.compact() {
-        render_compact_status(frame, area, state, panes, parked);
         return;
     }
     let width = usize::from(area.width);
@@ -9419,7 +9068,7 @@ fn status_note_parts(state: &AppState, parked: Option<String>) -> Vec<(String, O
             String::new()
         };
         notes.push((
-            format!("sidebar hidden{waiting} · Ctrl-B shows"),
+            format!("Threads hidden{waiting} · Ctrl-B shows"),
             Some(Target::Sidebar),
         ));
     }
@@ -9440,167 +9089,6 @@ fn status_notes(state: &AppState, parked: Option<String>) -> Option<String> {
         .map(|(n, _)| n)
         .collect();
     (!notes.is_empty()).then(|| notes.join(" · "))
-}
-
-/// A phone's status bar `width` cells wide, in `most` rows at most: its controls, each a band
-/// at least [`TAP_ROWS`] tall with what a tap does (the notice, which a tap clears; each note a
-/// tap acts on), then its text, wrapped: the load, a disk running low, the notes nothing acts
-/// on, the usage and the hints; and the notice it says: a notice the TUI waits to have shown
-/// ([`gating_notice`]) in full where its band, the notes' and a row of text fit in `third`
-/// rows, else its short form, with the notes where they fit too, as the full layout says it.
-fn compact_status(state: &AppState, width: usize, (third, most): (usize, usize)) -> CompactStatus {
-    let Some((text, short)) = gating_notice(state) else {
-        return compact_status_with(state, width, state.view.status.clone(), true);
-    };
-    let rows = |c: &CompactStatus| c.0.iter().map(|(b, _)| b.len()).sum::<usize>() + 1;
-    for (msg, notes, cap) in [(text, true, third), (short, true, most)] {
-        let said = compact_status_with(state, width, Some(msg.to_string()), notes);
-        if rows(&said) <= cap {
-            return said;
-        }
-    }
-    compact_status_with(state, width, Some(short.to_string()), false)
-}
-
-/// What [`compact_status`] draws: the bands with their targets, the text, the notice said.
-type CompactStatus = (
-    Vec<(Vec<Line<'static>>, Target)>,
-    Vec<Line<'static>>,
-    Option<String>,
-);
-
-/// [`compact_status`] saying notice `msg`, and the notes with `notes`.
-fn compact_status_with(
-    state: &AppState,
-    width: usize,
-    msg: Option<String>,
-    notes: bool,
-) -> CompactStatus {
-    let width = width.max(1);
-    let parked = parked_note(state);
-    let dim = Style::default().fg(Color::DarkGray);
-    let mut bands: Vec<(Vec<Line<'static>>, Target)> = Vec::new();
-    let mut band = |lines: Vec<Line<'static>>, target: Target| {
-        let bg = if bands.len().is_multiple_of(2) {
-            BAND
-        } else {
-            BAND_ALT
-        };
-        bands.push((tap_band(lines, width, bg), target));
-    };
-    if let Some(m) = &msg {
-        let style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
-        band(
-            wrap_line(Line::from(Span::styled(m.clone(), style)), width),
-            Target::Notice,
-        );
-    }
-    let mut text: Vec<Span<'static>> = Vec::new();
-    if notes {
-        text.extend(load_spans(state));
-        if !state.disk_low.is_empty() {
-            let boxes: Vec<String> = state
-                .disk_low
-                .iter()
-                .map(|(b, free)| format!("{b} {} free", twr_core::git::human_bytes(*free)))
-                .collect();
-            text.push(Span::styled(
-                format!("disk low: {}", boxes.join(", ")),
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ));
-            text.push(Span::styled(" · ", dim));
-        }
-        let mut plain = Vec::new();
-        for (note, target) in status_note_parts(state, parked) {
-            match target {
-                Some(t) => band(wrap_line(Line::from(Span::styled(note, dim)), width), t),
-                None => plain.push(note),
-            }
-        }
-        if !plain.is_empty() {
-            text.push(Span::styled(format!("{} · ", plain.join(" · ")), dim));
-        }
-    }
-    let hints = hints(state);
-    let hints_w = crate::edit::width(&hints);
-    if let Some(usage) = usage_spans(state, width, hints_w, chrono::Utc::now(), &chrono::Local) {
-        let mut all = usage;
-        all.push(Span::raw(" "));
-        all.extend(text);
-        text = all;
-    }
-    text.push(Span::styled(hints, dim));
-    (bands, wrap_line(Line::from(text), width), msg)
-}
-
-/// The rows a phone's status bar takes on a screen's `area`: a third of it, a band and a row at
-/// least, and at most that, or two thirds for the short form of a notice the TUI waits to have
-/// shown ([`gating_notice`]).
-fn compact_status_cap(state: &AppState, area: Rect) -> (usize, usize) {
-    let third = usize::from(area.height / 3).max(usize::from(TAP_ROWS) + 1);
-    if gating_notice(state).is_some() {
-        (third, usize::from(area.height - area.height / 3).max(third))
-    } else {
-        (third, third)
-    }
-}
-
-/// A phone's status bar over `area` ([`compact_status`]): its controls from the top, each
-/// whole or not at all, the notice drawn whole told as shown; then its text on the row left,
-/// cut with `…`.
-fn render_compact_status(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    panes: &mut Panes,
-    _parked: Option<String>,
-) {
-    let (bands, text, msg) = compact_status(
-        state,
-        usize::from(area.width),
-        (usize::from(area.height), usize::from(area.height)),
-    );
-    let mut y = area.y;
-    for (mut lines, target) in bands {
-        let room = usize::from(area.bottom() - y);
-        let mut whole = true;
-        // A notice taller than the bar is cut to it, `…` at its end, still a control; one the
-        // TUI waits to have shown counts only drawn whole ([`gating_notice`]).
-        if lines.len() > room
-            && target == Target::Notice
-            && gating_notice(state).is_none()
-            && room >= usize::from(TAP_ROWS)
-        {
-            lines.truncate(room);
-            if let Some(last) = lines.last_mut() {
-                *last = ellipsized(std::mem::take(last), usize::from(area.width));
-            }
-            whole = false;
-        }
-        let h = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        if y + h > area.bottom() {
-            break;
-        }
-        let rect = Rect::new(area.x, y, area.width, h);
-        if let Some(msg) = msg.clone().filter(|_| target == Target::Notice && whole) {
-            panes.status = Some((msg, area));
-        }
-        frame.render_widget(Paragraph::new(lines), rect);
-        panes.target(rect, target);
-        y += h;
-    }
-    let rest = Rect::new(area.x, y, area.width, area.bottom() - y);
-    // One row: the text run together, cut where it does not fit.
-    let spans: Vec<Span<'static>> = text
-        .into_iter()
-        .flat_map(|l| {
-            let mut s = l.spans;
-            s.push(Span::raw(" "));
-            s
-        })
-        .collect();
-    let line = Line::from(cut_spans(spans, usize::from(rest.width)));
-    frame.render_widget(Paragraph::new(line), rest);
 }
 
 /// A question waiting for `y` on a phone, over the status bar's `area`: its prompt on the rows
@@ -9809,13 +9297,6 @@ fn status_height(state: &AppState, area: Rect) -> u16 {
         let prompt = wrap(&format!(" {} ", c.prompt), usize::from(area.width).max(1)).len();
         let most = usize::from(area.height / 2).max(usize::from(TAP_ROWS) + 1);
         return u16::try_from((prompt + usize::from(TAP_ROWS)).min(most)).unwrap_or(TAP_ROWS);
-    }
-    if state.compact() {
-        let cap = compact_status_cap(state, area);
-        let (bands, _, _) = compact_status(state, usize::from(area.width), cap);
-        // Its controls, and its text on one row, cut (as the full layout cuts its hints).
-        let rows: usize = bands.iter().map(|(b, _)| b.len()).sum::<usize>() + 1;
-        return u16::try_from(rows.min(cap.1).max(1)).unwrap_or(1);
     }
     let cap = usize::from(area.height / 3).max(1);
     let (width, parked) = (usize::from(area.width), parked_note(state));
