@@ -1041,6 +1041,31 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
         }
         spans.push(start..rows.len());
     }
+    // A phone too short for it all: the rows under its close row scroll to keep the selected
+    // runtime whole, and a runtime the window cuts is left blank, never drawn without its tap.
+    let room = usize::from(area.height.saturating_sub(2));
+    if phone && rows.len() > room && room > 1 {
+        let sel = state.view.picker.as_ref().map_or(0, |p| p.selected);
+        let off = spans.get(3 + sel).map_or(0, |s: &std::ops::Range<usize>| {
+            s.end.saturating_sub(room).min(s.start.saturating_sub(1))
+        });
+        rows.drain(1..1 + off);
+        for (k, span) in spans.iter_mut().enumerate() {
+            let shifted = span.start.saturating_sub(off).max(1)..span.end.saturating_sub(off);
+            let whole = span.start > off && span.end - off <= room;
+            *span = if whole || shifted.is_empty() {
+                shifted
+            } else {
+                if (3..3 + runtimes).contains(&k) {
+                    let n = rows.len();
+                    for row in shifted.clone().filter(|r| *r < n) {
+                        rows[row] = Line::default();
+                    }
+                }
+                shifted.start..shifted.start
+            };
+        }
+    }
     let rect = centered(
         area,
         width,
@@ -1074,7 +1099,7 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
             .saturating_add(u16::try_from(span.start).unwrap_or(u16::MAX));
         let h = u16::try_from(span.len()).unwrap_or(u16::MAX);
         let cells = Rect::new(inner.x, y, inner.width, h).intersection(inner);
-        if phone && cells.height < h {
+        if phone && (h == 0 || cells.height < h) {
             continue;
         }
         panes.target(cells, Target::Runtime(i));
@@ -7229,8 +7254,36 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
             ..run.clone()
         });
     }
+    // On a phone, a band ([`tap_rows`]) the view cuts at its top or bottom is no control: a
+    // tap on what is left of it (perhaps only its padding) does nothing.
+    let band = |row: usize| {
+        rows.get(row)
+            .and_then(|r| r.2.clone())
+            .filter(|l| state.compact() && !l.starts_with("request:"))
+    };
+    let mut cut = vec![false; end - start];
+    for (edge, outside) in [
+        (start, start.checked_sub(1)),
+        (end.saturating_sub(1), Some(end)),
+    ] {
+        let Some(link) = outside.and_then(band) else {
+            continue;
+        };
+        let mut row = edge;
+        while (start..end).contains(&row) && band(row).as_ref() == Some(&link) {
+            cut[row - start] = true;
+            row = if edge == start {
+                row + 1
+            } else {
+                row.wrapping_sub(1)
+            };
+        }
+    }
     let mut lines = Vec::with_capacity(end - start);
-    for (y, (line, join, link, edge)) in (inner.y..).zip(rows[start..end].iter().cloned()) {
+    for ((y, (line, join, link, edge)), cut) in
+        (inner.y..).zip(rows[start..end].iter().cloned()).zip(cut)
+    {
+        let link = link.filter(|_| !cut);
         lines.push(line);
         // A row all drawing adds nothing to a copy, though a long block's footer continues
         // the line it cuts for places ([`long_rows`]).
@@ -9472,13 +9525,28 @@ fn render_compact_status(
         (usize::from(area.height), usize::from(area.height)),
     );
     let mut y = area.y;
-    for (lines, target) in bands {
+    for (mut lines, target) in bands {
+        let room = usize::from(area.bottom() - y);
+        let mut whole = true;
+        // A notice taller than the bar is cut to it, `…` at its end, still a control; one the
+        // TUI waits to have shown counts only drawn whole ([`gating_notice`]).
+        if lines.len() > room
+            && target == Target::Notice
+            && gating_notice(state).is_none()
+            && room >= usize::from(TAP_ROWS)
+        {
+            lines.truncate(room);
+            if let Some(last) = lines.last_mut() {
+                *last = ellipsized(std::mem::take(last), usize::from(area.width));
+            }
+            whole = false;
+        }
         let h = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         if y + h > area.bottom() {
             break;
         }
         let rect = Rect::new(area.x, y, area.width, h);
-        if let Some(msg) = msg.clone().filter(|_| target == Target::Notice) {
+        if let Some(msg) = msg.clone().filter(|_| target == Target::Notice && whole) {
             panes.status = Some((msg, area));
         }
         frame.render_widget(Paragraph::new(lines), rect);

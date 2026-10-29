@@ -5105,10 +5105,7 @@ impl AppState {
                 return (vec![Action::TrashRestore { item, as_name }], true);
             }
             Slash::Parked(on) => self.show_parked(on.unwrap_or(!self.view.show_parked)),
-            Slash::Sidebar(on) => {
-                let on = on.unwrap_or(self.view.sidebar_hidden);
-                return (self.sidebar_or_screen(on), true);
-            }
+            Slash::Sidebar(on) | Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Compact(on) => {
                 let on = on.unwrap_or(!self.compact());
                 self.view.compact = Some(on);
@@ -5165,7 +5162,6 @@ impl AppState {
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
-            Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Settings => return (self.open_settings(), true),
             Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
         }
@@ -23609,6 +23605,111 @@ pub(crate) mod tests {
             let (x, y) = second_row(&st, &Target::Runtime(1));
             tap_at(&mut st, 40, 24, x, y);
             assert_eq!(st.view.picker.as_ref().map(|p| p.selected), Some(1));
+        }
+
+        /// On a phone too short for the picker, it scrolls to keep the selected runtime's band
+        /// whole; a band the window cuts is not drawn, nor tapped.
+        #[test]
+        fn a_short_picker_draws_its_runtimes_whole() {
+            let mut st = phone();
+            st.view.picker = Some(crate::app::Picker {
+                runtimes: vec![
+                    ("claude-code".into(), Some(true)),
+                    ("codex".into(), Some(false)),
+                ],
+                selected: 0,
+                default: "claude-code".into(),
+                model: None,
+                switch: false,
+            });
+            for sel in [0, 1] {
+                st.view.picker.as_mut().unwrap().selected = sel;
+                let text = screen_text(&frame(&mut st, 40, 10));
+                two_rows_each(&st, &format!("picker {sel}"));
+                assert!(
+                    st.view
+                        .panes
+                        .targets
+                        .iter()
+                        .any(|(_, t)| *t == Target::Runtime(sel)),
+                    "{sel}:\n{text}"
+                );
+                // Every runtime named on screen is a whole band with its tap.
+                for (i, name) in ["claude-code", "codex"].iter().enumerate() {
+                    let drawn = text.lines().any(|l| l.contains(name));
+                    let tapped = st
+                        .view
+                        .panes
+                        .targets
+                        .iter()
+                        .any(|(_, t)| *t == Target::Runtime(i));
+                    assert!(!drawn || tapped, "{sel}: {name} drawn, not tapped:\n{text}");
+                }
+            }
+        }
+
+        /// A status message taller than the phone's bar is cut to it, `…` at its end, still
+        /// two rows a tap clears.
+        #[test]
+        fn a_long_notice_is_cut_not_dropped() {
+            let mut st = phone();
+            st.view.status = Some(format!("error: {}", "the hub said no. ".repeat(40)));
+            let text = screen_text(&frame(&mut st, 40, 20));
+            assert!(
+                text.contains("error: the hub") && text.contains('…'),
+                "{text}"
+            );
+            two_rows_each(&st, "long notice");
+            let (x, y) = second_row(&st, &Target::Notice);
+            tap_at(&mut st, 40, 20, x, y);
+            assert!(st.view.status.is_none());
+        }
+
+        /// A band the conversation's view cuts at its top or bottom (a folded line, `■ stop`)
+        /// is no control: no link is left on what shows of it, its padding perhaps.
+        #[test]
+        fn a_band_cut_by_the_view_is_not_tapped() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(500);
+            for i in 0..20 {
+                st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
+            }
+            frame(&mut st, 40, 20);
+            for step in 0..40 {
+                let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+                let links = &pane.links;
+                let mut k = 0;
+                while k < links.len() {
+                    let Some(link) = links[k].clone().filter(|l| !l.starts_with("request:")) else {
+                        k += 1;
+                        continue;
+                    };
+                    let n = links[k..]
+                        .iter()
+                        .take_while(|l| l.as_deref() == Some(&link))
+                        .count();
+                    assert!(n >= 2, "step {step}: {link} on {n} row(s) at {k}");
+                    k += n;
+                }
+                st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+                frame(&mut st, 40, 20);
+            }
+            assert!(st.view.scroll > 0);
+        }
+
+        /// `/sidebar` on a phone does as Ctrl-B: the Threads screen, then back to Chat.
+        #[test]
+        fn slash_sidebar_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            frame(&mut st, 40, 20);
+            for want in [CompactPane::Threads, CompactPane::Chat] {
+                st.view.input.set("/sidebar");
+                st.handle_key(key(KeyCode::Enter));
+                assert_eq!(st.view.compact_pane, want);
+            }
         }
 
         /// The decision table on a phone: its close, its filters and its rows two rows tall;
