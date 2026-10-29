@@ -23819,6 +23819,55 @@ pub(crate) mod tests {
             );
         }
 
+        /// On short phone screens no control is drawn shorter than its two rows: the queue
+        /// shows the messages it has room for whole, each with its tap; the decision table's
+        /// filters and rows, and the conversation's lines-below row, are left out where they
+        /// would be cut.
+        #[test]
+        fn short_phones_draw_no_control_cut() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 3,
+                        "held": false, "items": [
+                    {"ref": 7, "prompt": "one", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 8, "prompt": "two", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 9, "prompt": "three", "truncated": false, "from": "user", "mine": true},
+                ]}),
+            );
+            for h in 10..=16 {
+                let text = screen_text(&frame(&mut st, 40, h));
+                two_rows_each(&st, &format!("queue 40x{h}"));
+                let drawn = text.lines().filter(|l| l.contains("⧗ queued")).count();
+                let tapped = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Queued(_)))
+                    .count();
+                assert_eq!(drawn, tapped, "40x{h}:\n{text}");
+            }
+            let mut st = with_decisions();
+            st.view.compact_width = 60;
+            open_decisions(&mut st);
+            for h in 6..=12 {
+                frame(&mut st, 40, h);
+                two_rows_each(&st, &format!("decisions 40x{h}"));
+            }
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 10);
+            st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+            for h in 8..=12 {
+                frame(&mut st, 40, h);
+                two_rows_each(&st, &format!("follow 40x{h}"));
+            }
+        }
+
         /// The queued messages above the input box are two rows each; a tap on a second row
         /// selects that one.
         #[test]

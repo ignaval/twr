@@ -7192,11 +7192,12 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // New replies must not scroll a selected request away. Esc or an explicit transcript
     // scroll releases the selection; until then its options stay in view, above the row that
     // says what is below when the view is scrolled up (it takes the pane's last row).
-    // (On a phone that row is two, a control a finger taps.)
-    let foot = if state.compact() && height > usize::from(TAP_ROWS) {
-        usize::from(TAP_ROWS)
-    } else {
-        1
+    // (On a phone that row is two, a control a finger taps, and none where the pane has no
+    // more rows than that.)
+    let foot = match state.compact() {
+        true if height > usize::from(TAP_ROWS) => usize::from(TAP_ROWS),
+        true => 0,
+        false => 1,
     };
     let shown = |scroll: usize| height - if scroll > 0 && height > 1 { foot } else { 0 };
     let scroll = requests
@@ -7219,7 +7220,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     let start = rows.len().saturating_sub(height + scroll);
     // Scrolled up, the pane's last row says how much is below ([`render_below`]): the rows it
     // shows end above it.
-    let footer = scroll > 0 && height > 1;
+    let footer = scroll > 0 && height > 1 && foot > 0;
     let end = (start + shown(scroll)).min(rows.len());
     for (item, range) in requests {
         if start <= range.start
@@ -7839,10 +7840,17 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     let width = usize::from(area.width);
     let dim = Style::default().fg(Color::DarkGray);
     let newest_mine = q.newest_mine;
-    let shown: Vec<&crate::queue::Queued> = q.items.iter().take(crate::queue::QUEUE_ROWS).collect();
-    let mut lines: Vec<Line<'static>> = Vec::new();
     // On a phone each one is a band two rows tall, both its own ([`TAP_ROWS`]).
     let tall = if state.compact() { TAP_ROWS } else { 1 };
+    // As many as the rows given draw whole, with the row saying how many more.
+    let mut n = q.items.len().min(crate::queue::QUEUE_ROWS);
+    while n > 0
+        && n * usize::from(tall) + usize::from(q.total > n as u64) > usize::from(area.height)
+    {
+        n -= 1;
+    }
+    let shown: Vec<&crate::queue::Queued> = q.items.iter().take(n).collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
     for (row, it) in shown.iter().enumerate() {
         let selected = state.view.queued == Some(it.msg_ref);
         let hint = if selected {
@@ -8810,10 +8818,11 @@ fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes:
     frame.render_widget(Paragraph::new(decision_filter_line(state)), filters);
     panes.add(PaneId::Text, summary);
     panes.add(PaneId::Text, filters);
-    // `✕ close` at the summary's end: its whole row closes the overlay (Esc).
+    // `✕ close` at the summary's end: its whole row closes the overlay (Esc). On a phone too
+    // short for its two rows, and for the filters', they are text.
     let close = " ✕ close ";
     let w = crate::edit::width(close) as u16;
-    if summary.width > w {
+    if summary.width > w && summary.height >= tall {
         if phone {
             frame.render_widget(Paragraph::new("").style(Style::default().bg(BAND)), summary);
         }
@@ -8832,7 +8841,9 @@ fn render_decisions_view(frame: &mut Frame, area: Rect, state: &AppState, panes:
         (" site ", Target::SiteFilter),
         (" provider ", Target::ProviderFilter),
     ] {
-        if let Some(at) = find_text(frame.buffer_mut(), filters, needle) {
+        if let Some(at) =
+            find_text(frame.buffer_mut(), filters, needle).filter(|_| filters.height >= tall)
+        {
             // From its name to the end of its key, `(f)` or `(v)`.
             let key = if target == Target::SiteFilter {
                 "(f)"
@@ -9019,7 +9030,8 @@ fn render_decision_table(frame: &mut Frame, area: Rect, state: &AppState, panes:
     // On a phone each row is a control two rows tall, in a band ([`TAP_ROWS`]).
     let phone = state.compact();
     let tall = if phone { TAP_ROWS } else { 1 };
-    let fit = usize::from(inner.height.saturating_sub(1) / tall).max(1);
+    // On a phone, none where no row fits whole.
+    let fit = usize::from(inner.height.saturating_sub(1) / tall).max(usize::from(!phone));
     let selected = state.decision_selected();
     let first = table_first_row(selected, fit);
     // Its rows under the header: a tap selects one, a tap on the selected one opens it.
