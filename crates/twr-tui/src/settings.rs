@@ -45,7 +45,7 @@ pub enum Key {
     Notify,
     /// `[tui] compact_width`.
     CompactWidth,
-    /// The workspace sidebar (`tui-state.json`).
+    /// The sidebar, workspaces and their threads (`tui-state.json`).
     WsSidebar,
     /// `[tui] colors`.
     Colors,
@@ -105,13 +105,13 @@ pub enum Change {
     Notify(TerminalAlert),
     /// The compact width.
     CompactWidth(u16),
-    /// The workspace sidebar shown (`true`) or hidden.
+    /// The sidebar shown (`true`) or hidden.
     WsSidebar(bool),
 }
 
 impl Change {
     /// Where in the config file it is kept: the table, the key and the value. `None` for the
-    /// workspace sidebar, kept in `tui-state.json`.
+    /// sidebar, kept in `tui-state.json`.
     pub fn config_key(
         &self,
     ) -> Option<(
@@ -354,14 +354,9 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
             }
             Key::WsSidebar => Row {
                 key,
-                label: "Workspace sidebar",
-                value: if v.ws_sidebar_hidden {
-                    "hidden"
-                } else {
-                    "shown"
-                }
-                .into(),
-                kept: "remembered by the TUI (tui-state.json) · Ctrl-T".into(),
+                label: "Sidebar",
+                value: if v.sidebar_hidden { "hidden" } else { "shown" }.into(),
+                kept: "remembered by the TUI (tui-state.json) · Ctrl-B".into(),
                 editable: !agent,
             },
             Key::CodexAuto => Row {
@@ -435,7 +430,7 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             };
             Change::CompactWidth(next)
         }
-        Key::WsSidebar => Change::WsSidebar(v.ws_sidebar_hidden),
+        Key::WsSidebar => Change::WsSidebar(v.sidebar_hidden),
         Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter => return None,
     })
 }

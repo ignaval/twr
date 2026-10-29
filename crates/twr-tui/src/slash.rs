@@ -125,7 +125,7 @@ pub enum Slash {
     Attach(Option<String>),
     /// `/parked [on|off]`: list parked threads among the cards or hide them; `None` toggles.
     Parked(Option<bool>),
-    /// `/sidebar [on|off]`: show or hide worker cards; `None` toggles.
+    /// `/sidebar [on|off]`: show or hide the sidebar (Ctrl-B); `None` toggles.
     Sidebar(Option<bool>),
     /// `/compact [on|off]`: the compact layout, one screen at a time; `None` toggles.
     Compact(Option<bool>),
@@ -159,7 +159,7 @@ pub enum Slash {
     /// `/ws new [name]`: create a workspace and switch to it; without a name, ask for it
     /// (the new-workspace dialog, [`crate::sidebar`]).
     WsNew(Option<String>),
-    /// `/spaces [on|off]`: show or hide the workspace sidebar (Ctrl-T); `None` toggles.
+    /// `/spaces [on|off]`: the same as `/sidebar` (Ctrl-T); `None` toggles.
     Spaces(Option<bool>),
     /// `/settings`: the settings overlay ([`crate::settings`]).
     Settings,
@@ -477,14 +477,13 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     (
         "/sidebar",
         "/sidebar [on|off]",
-        "show or hide the thread cards (Ctrl-B); returns to the conversation",
+        "show or hide the sidebar: the workspaces with their threads (Ctrl-B)",
         &[ArgKind::OnOff],
     ),
     (
         "/spaces",
         "/spaces [on|off]",
-        "show or hide the workspaces in the sidebar (Ctrl-T): each workspace's orchestrator \
-         and threads, new workspace, settings",
+        "the same as /sidebar (Ctrl-T)",
         &[ArgKind::OnOff],
     ),
     (
