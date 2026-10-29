@@ -136,8 +136,7 @@ pub enum CompactPane {
     Threads,
 }
 
-/// A row of the workspace list the keys select (in its drawer and the compact layout's
-/// Workspaces screen): a workspace's card, by its name, or a button under them.
+/// A row of the workspace list the keys select (on the compact layout's Threads screen): a workspace's card, by its name, or a button under them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WsRow {
     /// A workspace's card: Enter switches to it.
@@ -335,17 +334,12 @@ pub struct ViewState {
     /// Parked threads are listed among the cards and tiles (`/parked`); else only those
     /// pinned or with an open attention item are ([`AppState::order`]).
     pub show_parked: bool,
-    /// Ctrl-B, `/sidebar`: hide the worker cards so the conversation uses the full area.
+    /// Ctrl-B (Ctrl-T), `/sidebar` (`/spaces`), the sidebar's `‹`: the sidebar, the
+    /// workspaces with their threads ([`crate::sidebar`]), is hidden, and the views use the
+    /// whole width. Kept across runs (`tui-state.json`) and across the workspaces shown.
     pub sidebar_hidden: bool,
-    /// Ctrl-T, `/spaces off`, the workspace sidebar's `‹`: the workspace sidebar is not
-    /// docked left of the views ([`crate::sidebar`]). Kept across runs (`tui-state.json`)
-    /// and across the workspaces shown.
-    pub ws_sidebar_hidden: bool,
-    /// The workspace list is open as a drawer over the view's left (Ctrl-T where the sidebar
-    /// is not docked, the tab strip's `≡`); Esc, a click outside it or its `✕` closes it.
-    pub ws_drawer: bool,
-    /// The row of the workspace list the keys select in its drawer and on the compact
-    /// layout's Workspaces screen (`None`: the current workspace's card).
+    /// The row of the workspace list the keys select on the compact layout's Threads screen
+    /// (`None`: the current workspace's card).
     pub ws_sel: Option<WsRow>,
     /// Rows the workspace list is scrolled by the wheel.
     pub ws_scroll: usize,
@@ -406,9 +400,6 @@ pub struct ViewState {
     /// that lost track of what is on it shows only what the frame draws.
     pub repaint: bool,
 }
-
-/// The status when a key would select a card a narrow dive hides ([`AppState::dive_hides_cards`]).
-pub const DIVE_HIDES_CARDS: &str = "the cards are hidden in this dive (Esc goes back to them)";
 
 /// What the card keys say on the compact layout's conversation, which draws no cards.
 pub const COMPACT_LISTS: &str = "/n lists what needs you, /t the threads";
@@ -818,6 +809,9 @@ pub struct ActionPopup {
     /// enough ([`CARD_SETTLE`]): a tap on an answer, Dismiss or Stop runs it only when it is
     /// this one, the item unchanged ([`AppState::tap_row`]). Keys and the wheel arm nothing.
     pub armed: Option<(ActionKind, Option<(String, u64)>)>,
+    /// On a phone, what a tap on a row said (tap it again, read it first): in the popup's
+    /// bottom border, where the status bar would grow under the popup and cut it short.
+    pub hint: Option<String>,
 }
 
 /// A press of the left button ([`ViewState::press`]): where, on which control, and what that
@@ -3742,10 +3736,7 @@ impl AppState {
         let card = self.view.focus.as_deref().is_some_and(|f| {
             f == HUB_THREAD || self.registry.get(f).is_some_and(|t| !t.is_orchestrator())
         });
-        let selected = card
-            && self.view.screen != Screen::Decisions
-            && !self.main_focused()
-            && !self.forced_focus();
+        let selected = card && self.view.screen != Screen::Decisions && !self.main_focused();
         // The detail view as last drawn: an item too long for its card or popup.
         selected || self.view.action.is_some() || self.view.panes.card.is_some()
     }
@@ -3833,25 +3824,30 @@ impl AppState {
         self.ensure_focus();
     }
 
-    /// Sidebar controls always return to the conversation; grid tiles are not a sidebar.
-    fn set_sidebar(&mut self, on: bool) {
-        if self.view.screen != Screen::Stack {
-            self.show(Screen::Stack);
-        }
+    /// Ctrl-B, Ctrl-T, `/sidebar`, `/spaces`, the setting, a tap on the sidebar's `‹` or the
+    /// tab strip's `≡`: shows (`on`) or hides the sidebar, the one there is (the workspaces with
+    /// their threads, [`crate::sidebar`]), in whatever view, kept across runs
+    /// ([`Action::WsSidebar`]). The card selected as it hides is selected again as it shows.
+    pub(crate) fn set_sidebar(&mut self, on: bool) -> Vec<Action> {
         if on && self.view.sidebar_hidden {
+            // Only where hiding it let the selection go (the stack view's cards): the grid's
+            // tiles kept theirs, and a tile selected since stays.
             let focus = self.view.sidebar_focus.take();
-            self.set_focus(focus);
+            if self.view.focus.is_none() {
+                self.set_focus(focus);
+            }
         } else if !on && !self.view.sidebar_hidden {
             self.view.sidebar_focus = self.view.focus.clone();
         }
         self.view.sidebar_hidden = !on;
         self.view.shown = None;
         self.view.status = Some(if on {
-            "thread cards shown (Ctrl-B hides them)".into()
+            "sidebar shown (Ctrl-B hides it)".into()
         } else {
-            "thread cards hidden (Ctrl-B shows them)".into()
+            "sidebar hidden (Ctrl-B shows it)".into()
         });
         self.ensure_focus();
+        vec![Action::WsSidebar(on)]
     }
 
     /// The current orchestrator's id while it has open attention items: its banner in the
@@ -4090,11 +4086,7 @@ impl AppState {
     }
 
     /// Back to the orchestrator conversation (also a dive the hub ended: a reset, a delete).
-    /// The selection a narrow dive forced on its own card ([`AppState::forced_focus`]) goes.
     pub fn back(&mut self) {
-        if self.forced_focus() {
-            self.set_focus(None);
-        }
         self.view.dive = None;
         self.view.focus_before_dive = None;
         self.view.screen = Screen::Stack;
@@ -4109,7 +4101,7 @@ impl AppState {
     /// the card selected when the dive began selected again, unless another card was selected
     /// during the dive (or that card is gone).
     fn leave_dive(&mut self) {
-        let untouched = self.view.focus.is_none() || self.forced_focus();
+        let untouched = self.view.focus.is_none();
         let before = self
             .view
             .focus_before_dive
@@ -4124,13 +4116,6 @@ impl AppState {
                 self.set_focus(Some(before));
             }
         }
-    }
-
-    /// Whether the selection is the one a narrow dive puts on its own card while the cards
-    /// are hidden ([`AppState::note_panes`]), not one the user made: Esc does not release it,
-    /// it leaves the dive.
-    pub fn forced_focus(&self) -> bool {
-        self.dive_hides_cards() && self.view.focus == self.view.dive
     }
 
     /// Tile ids in grid order: [`AppState::order`] with parked threads moved (in order) to the
@@ -4236,9 +4221,6 @@ impl AppState {
 
     /// Leaving the stack view ends a dive: typed lines go to the orchestrator again.
     fn end_dive(&mut self) {
-        if self.forced_focus() {
-            self.set_focus(None);
-        }
         self.view.focus_before_dive = None;
         if self.view.dive.take().is_some() {
             self.sync_main();
@@ -4349,6 +4331,13 @@ impl AppState {
             .collect()
     }
 
+    /// Whether the stack view's worker cards are out of sight: the sidebar hidden, or, as last
+    /// drawn, with no room for them ([`crate::select::Panes::no_cards`]). A request in the
+    /// conversation is then selected alone, its thread's card not.
+    fn cards_unseen(&self) -> bool {
+        self.view.sidebar_hidden || (self.view.panes.no_cards && !self.compact())
+    }
+
     /// The worker request selected in the main conversation (Shift-↑/↓ with the main pane
     /// selected, a click), while it is open. With the sidebar shown its thread's card is
     /// selected with it. With the sidebar hidden its thread has no card: the request, drawn in
@@ -4365,7 +4354,7 @@ impl AppState {
             matches!(
                 i.reason,
                 AttentionReason::Permission | AttentionReason::Question
-            ) && (self.view.sidebar_hidden
+            ) && (self.cards_unseen()
                 || self.view.main_focus
                 || self.focused() == Some(i.thread.as_str()))
                 && self
@@ -4415,7 +4404,7 @@ impl AppState {
         // With the sidebar hidden its thread has no card to select: the selection stays what
         // it was (none, or the orchestrator's card), see [`AppState::selected_request`]. So
         // with the conversation selected: the card it keeps is the one Shift-→ returns to.
-        if !self.view.sidebar_hidden && !self.main_focused() {
+        if !self.cards_unseen() && !self.main_focused() {
             self.set_focus(Some(thread));
         }
         self.view.request = Some(id.into());
@@ -4575,6 +4564,7 @@ impl AppState {
                 .is_some_and(|(_, armed)| *armed != item || !on_screen)
             {
                 p.armed = None;
+                p.hint = None;
             }
         }
     }
@@ -4654,21 +4644,6 @@ impl AppState {
         self.view.focus = thread;
     }
 
-    /// Whether a dive hides the cards: in the stack view on a screen too narrow for their
-    /// column (as last drawn), where they would be a row above it. The dive's own card is the
-    /// selected one meanwhile ([`AppState::note_panes`]), and no key selects another.
-    pub fn dive_hides_cards(&self) -> bool {
-        // The compact layout's lists show the cards whatever the dive.
-        if self.compact() && self.view.compact_pane != CompactPane::Chat {
-            return false;
-        }
-        // Not before the first draw: no width yet.
-        self.view.dive.is_some()
-            && self.view.screen == Screen::Stack
-            && !self.view.sidebar_hidden
-            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.view.width)
-    }
-
     /// Whether the main pane is selected ([`ViewState::main_focus`]): only in the stack view,
     /// where it is drawn.
     pub fn main_focused(&self) -> bool {
@@ -4691,11 +4666,7 @@ impl AppState {
     /// not any more; the view stays where it is.
     fn focus_cards(&mut self) {
         if self.view.sidebar_hidden {
-            self.view.status = Some("the thread cards are hidden (Ctrl-B shows them)".into());
-            return;
-        }
-        if self.dive_hides_cards() {
-            self.view.status = Some(DIVE_HIDES_CARDS.into());
+            self.view.status = Some("the sidebar is hidden (Ctrl-B shows it)".into());
             return;
         }
         self.view.main_focus = false;
@@ -4711,11 +4682,6 @@ impl AppState {
     /// Selects the card `delta` places after the selected one in the current view's order,
     /// wrapping around; with none selected, the first (forward) or the last (backward).
     fn move_focus(&mut self, delta: isize) {
-        let listed = self.compact() && self.view.compact_pane != CompactPane::Chat;
-        if self.dive_hides_cards() && !listed {
-            self.view.status = Some(DIVE_HIDES_CARDS.into());
-            return;
-        }
         let order = self.nav_order();
         if order.is_empty() {
             return;
@@ -5150,7 +5116,7 @@ impl AppState {
                 return (vec![Action::TrashRestore { item, as_name }], true);
             }
             Slash::Parked(on) => self.show_parked(on.unwrap_or(!self.view.show_parked)),
-            Slash::Sidebar(on) => self.set_sidebar(on.unwrap_or(self.view.sidebar_hidden)),
+            Slash::Sidebar(on) | Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Compact(on) => {
                 let on = on.unwrap_or(!self.compact());
                 self.view.compact = Some(on);
@@ -5207,7 +5173,6 @@ impl AppState {
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
             Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
-            Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Settings => return (self.open_settings(), true),
             Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
         }
@@ -5657,12 +5622,6 @@ impl AppState {
             self.view.status = Some("cancelled".into());
             return Vec::new();
         }
-        // The workspace drawer takes its keys; any other closes it and goes on.
-        if self.ws_drawer_open() {
-            if let Some(actions) = self.ws_drawer_key(key) {
-                return actions;
-            }
-        }
         // The decisions overlay has keys of its own, and no input box to type into.
         if self.view.screen == Screen::Decisions {
             if let Some(actions) = self.decisions_key(key) {
@@ -5855,8 +5814,8 @@ impl AppState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('b') if ctrl => self.set_sidebar(self.view.sidebar_hidden),
-            KeyCode::Char('t') if ctrl => return Some(self.toggle_workspaces()),
+            // The one sidebar, whichever: Ctrl-T is Ctrl-B.
+            KeyCode::Char('b' | 't') if ctrl => return Some(self.toggle_workspaces()),
             KeyCode::Char('f') if ctrl => self.set_focus_mode(!self.view.focus_mode),
             KeyCode::Char('o') if ctrl => {
                 self.view.expand_all = !self.view.expand_all;
@@ -5926,7 +5885,7 @@ impl AppState {
             self.set_focus(None);
             return Vec::new();
         }
-        if self.view.focus.is_some() && !self.main_focused() && !self.forced_focus() {
+        if self.view.focus.is_some() && !self.main_focused() {
             self.set_focus(None);
             return Vec::new();
         }
@@ -5956,7 +5915,7 @@ impl AppState {
             || v.queued.is_some()
             || v.request.is_some()
             || (main && v.dive.is_none())
-            || (v.focus.is_some() && !main && !self.forced_focus())
+            || (v.focus.is_some() && !main)
         {
             return EscDoes::Release;
         }
@@ -6485,6 +6444,7 @@ impl AppState {
             filter: String::new(),
             read,
             armed: None,
+            hint: None,
         });
     }
 
@@ -7604,18 +7564,9 @@ impl AppState {
                 self.view.compact_pane = CompactPane::Chat;
             }
         }
-        // The cards hidden by a dive (one that began wider, then the screen narrowed): the keys
-        // about a card act on the thread the header names, not on one out of sight.
-        // Not while the detail view of another card's item shows: it is that card's.
-        if self.dive_hides_cards()
-            && self.view.focus != self.view.dive
-            && self.detail_card().is_none()
-        {
-            self.view.focus = self.view.dive.clone();
-        }
         // No room for a card (a column too short for one): none stays selected out of sight,
         // nor its popup open.
-        if self.view.panes.no_cards && self.detail_card().is_none() && !self.dive_hides_cards() {
+        if self.view.panes.no_cards && self.detail_card().is_none() {
             let nav = self.nav_order();
             if let Some(card) = self.view.focus.clone().filter(|f| !nav.contains(f)) {
                 if matches!(
@@ -7829,19 +7780,6 @@ impl AppState {
                     }
                     self.view.press = None;
                     if !matches!(id, Some(PaneId::Tab(_))) && !workspace_card {
-                        return Vec::new();
-                    }
-                }
-                // So does one outside the workspace drawer.
-                let in_drawer = self
-                    .view
-                    .panes
-                    .drawer
-                    .is_some_and(|d| d.contains(ratatui::layout::Position { x, y }));
-                if self.ws_drawer_open() && !in_drawer {
-                    self.view.ws_drawer = false;
-                    self.view.press = None;
-                    if !matches!(id, Some(PaneId::Tab(_))) {
                         return Vec::new();
                     }
                 }
@@ -8131,7 +8069,7 @@ impl AppState {
                 self.view.status = None;
                 self.view.status_until = None;
             }
-            Target::Sidebar => self.set_sidebar(true),
+            Target::Sidebar => return self.sidebar_or_screen(true),
             Target::FocusOff => self.set_focus_mode(false),
             Target::Parked => self.show_parked(true),
         }
@@ -8145,10 +8083,6 @@ impl AppState {
             return self.picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         }
         if self.view.new_ws.take().is_some() || self.view.settings.take().is_some() {
-            return Vec::new();
-        }
-        if self.ws_drawer_open() {
-            self.view.ws_drawer = false;
             return Vec::new();
         }
         let closed = std::mem::take(&mut self.view.help)
@@ -8417,11 +8351,16 @@ impl AppState {
                 .next()
                 .unwrap_or_default()
                 .to_string();
-            self.view.status = Some(match shown {
+            let said = match shown {
                 Some(true) => format!("tap {label} again to run it"),
                 Some(false) => "just shown: read it, then tap again".to_string(),
                 None => NOT_ON_SCREEN.to_string(),
-            });
+            };
+            let phone = self.compact();
+            match self.view.action.as_mut().filter(|_| phone) {
+                Some(p) => p.hint = Some(said),
+                None => self.view.status = Some(said),
+            }
         }
         Vec::new()
     }
@@ -8676,10 +8615,6 @@ impl AppState {
         if self.view.new_ws.is_some() {
             self.paste_new_ws(text);
             return;
-        }
-        // The drawer closes, and the paste goes where it would.
-        if self.ws_drawer_open() {
-            self.view.ws_drawer = false;
         }
         // Like a key, a paste closes the help or cancels a confirmation, and does nothing else.
         if std::mem::take(&mut self.view.help) {
@@ -9426,8 +9361,10 @@ pub(crate) mod tests {
         rows(&mut st, 50, 24);
         type_line(&mut st, "/n");
         let first = st.focused().map(str::to_string);
+        // The full layout at 60 columns: its sidebar keeps the card selected (narrower, it
+        // has no room for one, and nothing is selected).
         type_line(&mut st, "/compact off");
-        rows(&mut st, 50, 24);
+        rows(&mut st, 60, 24);
         st.handle_key(shift(KeyCode::Left));
         assert!(st.view.main_focus);
         type_line(&mut st, "/compact on");
@@ -9782,11 +9719,15 @@ pub(crate) mod tests {
         type_line(&mut st, "/sidebar");
         assert!(!st.view.sidebar_hidden);
         type_line(&mut st, "/focus off");
+        // In the grid too, Ctrl-B and Ctrl-T hide and show the sidebar, in the grid.
         st.handle_key(ctrl('g'));
         assert_eq!(st.view.screen, Screen::Grid);
         st.handle_key(sidebar);
-        assert_eq!(st.view.screen, Screen::Stack);
+        assert_eq!(st.view.screen, Screen::Grid);
         assert!(st.view.sidebar_hidden);
+        st.handle_key(ctrl('t'));
+        assert_eq!(st.view.screen, Screen::Grid);
+        assert!(!st.view.sidebar_hidden);
     }
 
     /// Nothing is selected after the initial replay either (a card picked during it stays);
@@ -14653,6 +14594,7 @@ pub(crate) mod tests {
             filter: String::new(),
             read: None,
             armed: None,
+            hint: None,
         });
         held.settle_order(t0 + ORDER_DELAY * 2);
         assert_eq!(held.order(), ids(&["a", "b", "c"]), "held by the popup");
@@ -15772,7 +15714,8 @@ pub(crate) mod tests {
         let words = flat(&screen_text(&buf));
         assert!(!words.contains(&flat(short)), "{words}");
         assert!(words.contains("3 background task(s)"), "{words}");
-        assert_eq!(words.contains("saved |"), !dismiss, "{words}");
+        // (A phone's bar has the notice on a band of its own, no `|` after it.)
+        assert_eq!(words.contains("saved"), !dismiss, "{words}");
         let rows = bar_rows(&buf);
         assert!(rows <= grown && rows <= usize::from(h / 3), "{rows} rows");
         grown
@@ -15921,7 +15864,7 @@ pub(crate) mod tests {
     }
 
     /// Nothing under the help overlay, the picker or the `/` popup is drawn: every blocking
-    /// item caps `seen_gseq` then.
+    /// item under one caps `seen_gseq` then. The `/` popup covers the conversation only.
     #[test]
     fn seen_gseq_counts_nothing_under_an_overlay() {
         let mut st = api_and_web_waiting();
@@ -15935,14 +15878,15 @@ pub(crate) mod tests {
         st.view.help = false;
         draw(&mut st, 160, 40);
         assert_eq!(st.seen_gseq(), st.last_gseq);
-        // The `/` popup over the cards it covers: the row of them above a narrow conversation
-        // (the sidebar's stay beside it).
+        // The `/` popup covers the conversation alone: the sidebar's cards stay beside it, also
+        // beside a narrow conversation, drawn and seen.
         st.view.input.clear();
         st.view.input.insert("/");
         let screen = screen_text(&draw(&mut st, 90, 14));
+        assert!(screen.contains("commands"), "{screen}");
         let drawn = drawn_ids(&st);
-        assert!(drawn.len() < 2, "{screen}");
-        assert!(st.seen_gseq() < st.last_gseq, "{screen}");
+        assert_eq!(drawn.len(), 2, "{screen}");
+        assert_eq!(st.seen_gseq(), st.last_gseq, "{screen}");
     }
 
     /// The orchestrator's banner counts as drawn only where it is drawn: in a dive (or the
@@ -16063,7 +16007,8 @@ pub(crate) mod tests {
         assert!(st.hydration_due(now).is_empty(), "already fetching");
         st.hydrated("pb", item.revision, Err("blob.get: timeout".into()), now);
         let screen = screen_flat(&draw(&mut st, 90, 40));
-        assert!(screen.contains("(could not load"), "{screen}");
+        // (Its notice wraps in the banner beside the sidebar.)
+        assert!(screen.contains("(could not"), "{screen}");
         assert!(!drawn_ids(&st).contains(&"pb"));
         assert_eq!(st.seen_gseq(), item.first_revision - 1);
         assert!(st.hydration_due(now).is_empty(), "not due yet");
@@ -16381,19 +16326,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// A confirm card the frame cut short (a terminal too short for its options) is not seen:
-    /// `seen_gseq` stays below it, and no digit answers it (with no popup open they type).
-    /// Its action popup, with room for all of it, draws it in full: it is seen then, and
+    /// A confirm card the frame cut short (a terminal too short for its options, a long status
+    /// taking rows under the conversation) is not seen: `seen_gseq` stays below it, and no
+    /// digit answers it (with no popup open they type). Its action popup, over those rows too,
+    /// with room for all of it, draws it in full: it is seen then, and
     /// answered once read. A dive hides the banner: its popup does not open there.
     #[test]
     fn a_confirm_card_drawn_in_part_is_answered_from_its_popup() {
         let mut st = worker_orch_and_card();
         let first = st.attention.get("cc1").unwrap().first_revision;
         st.set_focus(Some("t-orch".into()));
-        // The tallest height at which the banner is on screen but not its options.
+        // The tallest height at which the banner is on screen but not its options, in a view
+        // 60 columns wide beside the sidebar, a long status wrapped over the rows under it.
+        let w = 95;
+        st.view.status = Some("the hub said something long enough to wrap; ".repeat(6));
         let (h, screen) = (8..30)
             .rev()
-            .map(|h| (h, screen_text(&draw(&mut st, 60, h))))
+            .map(|h| (h, screen_text(&draw(&mut st, w, h))))
             .find(|(_, s)| s.contains("confirm what you asked") && !s.contains("2 Cancel"))
             .expect("a height that cuts the card short");
         assert!(!drawn_ids(&st).contains(&"cc1"), "{screen}");
@@ -16405,7 +16354,7 @@ pub(crate) mod tests {
         assert_eq!(st.view.input.as_str(), "1", "typed");
         st.view.input.clear();
         st.handle_key(key(KeyCode::Enter));
-        let screen = screen_text(&draw(&mut st, 60, h));
+        let screen = screen_text(&draw(&mut st, w, h));
         assert!(drawn_ids(&st).contains(&"cc1"), "{screen}");
         assert_eq!(st.seen_gseq(), st.last_gseq, "{screen}");
         st.note_drawn(Instant::now());
@@ -16450,8 +16399,7 @@ pub(crate) mod tests {
         evs.extend(orch_events(&mut o, "t-orch"));
         evs.push(long_confirm_card("cc1", n));
         control(&mut st, &evs);
-        // What w does, long: its card in the row above the conversation is as tall as a card
-        // gets there, leaving the main pane the rows these tests count on.
+        // What w does, long: its card in the sidebar is as tall as a card gets there.
         st.apply_result(
             "thread.activity",
             &serde_json::json!({"t-w": {"activity": "building ".repeat(100)}}),
@@ -16464,7 +16412,12 @@ pub(crate) mod tests {
     /// them), notes what it showed and pretends it has been there long enough to read. Returns
     /// the screen, flattened.
     fn settled_80x21(st: &mut AppState) -> String {
-        let screen = screen_flat(&draw(st, 80, 21));
+        settled_at(st, 80, 21)
+    }
+
+    /// [`settled_80x21`] at `w` x `h`.
+    fn settled_at(st: &mut AppState, w: u16, h: u16) -> String {
+        let screen = screen_flat(&draw(st, w, h));
         st.note_drawn(Instant::now());
         if let Some(s) = st.view.shown.as_mut() {
             s.since = Instant::now() - CARD_SETTLE - Duration::from_millis(50);
@@ -16477,45 +16430,57 @@ pub(crate) mod tests {
     /// drawn again without the popup (what it covered is on screen again). Returns what the
     /// key did and the screen with the popup.
     fn popup_key_80x21(st: &mut AppState, c: char) -> (Vec<Action>, String) {
+        popup_key_at(st, c, 80, 21)
+    }
+
+    /// [`popup_key_80x21`] at `w` x `h`.
+    fn popup_key_at(st: &mut AppState, c: char, w: u16, h: u16) -> (Vec<Action>, String) {
         st.handle_key(key(KeyCode::Enter));
-        let screen = settled_80x21(st);
+        let screen = settled_at(st, w, h);
         let actions = st.handle_key(key(KeyCode::Char(c)));
         if actions.is_empty() {
             st.handle_key(key(KeyCode::Esc));
         }
-        settled_80x21(st);
+        settled_at(st, w, h);
         (actions, screen)
     }
 
-    /// At 80 x 24, with 3 and 24 actions: a confirm card too long for the banner opens in the
-    /// main pane as a detail view listing every action on rows of its own, then both options;
-    /// it is unseen until scrolled through to its options (PgDn, then the wheel for
-    /// the 24 actions). Its action popup has room for the 3 actions: it draws the card in full
-    /// and answers it. The 24 it has no room for: it says so and answers nothing until the
-    /// detail view has been read to its options; then it lists them and, after the settle, 1
-    /// confirms and 2 cancels. Scrolled back up, the options off screen, it still answers:
-    /// every row of the detail view was on screen.
+    /// At 80 x 15, with 3 and 24 actions: a confirm card too long for the banner opens in the
+    /// main pane as a detail view listing every action on rows of its own, then both options.
+    /// The 3 actions fit it (and so the action popup, as tall as the main pane beside the
+    /// sidebar): the card is seen, and the popup draws it in full and answers it. The 24 are
+    /// unseen until scrolled through to their options (PgDn, then the wheel); the popup has no
+    /// room for them: it says so and answers nothing until the detail view has been read to
+    /// its options; then it lists them and, after the settle, 1 confirms and 2 cancels.
+    /// Scrolled back up, the options off screen, it still answers: every row of the detail
+    /// view was on screen.
     #[test]
     fn a_confirm_card_too_long_for_the_banner_scrolls_in_the_main_pane() {
         for n in [3, 24] {
             let mut st = worker_orch_and_long_card(n);
             let first = st.attention.get("cc1").unwrap().first_revision;
             let rev = revision(&st, "cc1");
-            let screen = settled_80x21(&mut st);
+            let screen = settled_at(&mut st, 80, 15);
             let w = st.view.panes.card.clone().expect("the detail view");
             assert_eq!((w.attn_id.as_str(), w.start), ("cc1", 0), "{n}");
-            assert!(w.end < w.rows, "{n}: needs scrolling");
             assert!(screen.contains("confirm what you asked"), "{n}: {screen}");
-            assert!(screen.contains("PgUp/PgDn"), "{n}: {screen}");
+            // (Wrapped beside the sidebar.)
             assert!(
-                screen
-                    .contains("• allow w (Bash: git fetch origin && git rebase origin/main step0)"),
+                screen.contains("• allow w (Bash: git fetch origin && git"),
                 "{n}: {screen}"
             );
-            assert!(!screen.contains("2 Cancel"), "{n}: {screen}");
-            assert!(st.view.panes.drawn_on("t-orch").is_none(), "{n}");
-            assert_eq!(st.seen_gseq(), first - 1, "{n}");
-            let (actions, popup) = popup_key_80x21(&mut st, '1');
+            if n == 3 {
+                assert_eq!(w.end, w.rows, "{n}: all of it");
+                assert!(screen.contains("2 Cancel"), "{n}: {screen}");
+                assert_eq!(st.seen_gseq(), st.last_gseq, "{n}");
+            } else {
+                assert!(w.end < w.rows, "{n}: needs scrolling");
+                assert!(screen.contains("PgUp/PgDn"), "{n}: {screen}");
+                assert!(!screen.contains("2 Cancel"), "{n}: {screen}");
+                assert!(st.view.panes.drawn_on("t-orch").is_none(), "{n}");
+                assert_eq!(st.seen_gseq(), first - 1, "{n}");
+            }
+            let (actions, popup) = popup_key_at(&mut st, '1', 80, 15);
             if n == 3 {
                 assert!(
                     popup.contains("1 Confirm") && popup.contains("2 Cancel"),
@@ -16536,7 +16501,7 @@ pub(crate) mod tests {
             assert_eq!(st.view.status.as_deref(), Some(NOT_ON_SCREEN));
             // (The status wraps over rows the detail view gets back.)
             st.view.status = None;
-            settled_80x21(&mut st);
+            settled_at(&mut st, 80, 15);
             // Scrolled through: PgDn, and the wheel over the view for the long one.
             let mut screens = vec![screen];
             while st.view.panes.card.as_ref().is_some_and(|w| w.end < w.rows) {
@@ -16550,7 +16515,7 @@ pub(crate) mod tests {
                 } else {
                     st.handle_key(key(KeyCode::PageDown));
                 }
-                screens.push(settled_80x21(&mut st));
+                screens.push(settled_at(&mut st, 80, 15));
                 assert!(screens.len() < 40, "{n}: scrolling ends");
             }
             let all = screens.join("\n");
@@ -16573,7 +16538,7 @@ pub(crate) mod tests {
                 "{n}"
             );
             assert_eq!(st.seen_gseq(), st.last_gseq, "{n}");
-            let (actions, popup) = popup_key_80x21(&mut st, '1');
+            let (actions, popup) = popup_key_at(&mut st, '1', 80, 15);
             assert!(popup.contains("read in full"), "{n}: {popup}");
             assert_eq!(
                 actions,
@@ -16584,9 +16549,9 @@ pub(crate) mod tests {
                 }],
                 "{n}"
             );
-            settled_80x21(&mut st);
+            settled_at(&mut st, 80, 15);
             assert_eq!(
-                popup_key_80x21(&mut st, '2').0,
+                popup_key_at(&mut st, '2', 80, 15).0,
                 [Action::Respond {
                     attn_id: "cc1".into(),
                     revision: rev,
@@ -16597,15 +16562,15 @@ pub(crate) mod tests {
             // Back up: the options are off screen, but every row of the detail view has been
             // on screen: the popup still answers it.
             st.handle_key(key(KeyCode::PageUp));
-            let up = settled_80x21(&mut st);
+            let up = settled_at(&mut st, 80, 15);
             assert!(!up.contains("2 Cancel"), "{n}: {up}");
-            assert_eq!(popup_key_80x21(&mut st, '1').0.len(), 1, "{n}");
+            assert_eq!(popup_key_at(&mut st, '1', 80, 15).0.len(), 1, "{n}");
             // Down again: every row was on screen already, the options are again.
             while st.view.panes.card.as_ref().is_some_and(|w| w.end < w.rows) {
                 st.handle_key(key(KeyCode::PageDown));
-                settled_80x21(&mut st);
+                settled_at(&mut st, 80, 15);
             }
-            assert_eq!(popup_key_80x21(&mut st, '2').0.len(), 1, "{n}");
+            assert_eq!(popup_key_at(&mut st, '2', 80, 15).0.len(), 1, "{n}");
         }
     }
 
@@ -17326,7 +17291,8 @@ pub(crate) mod tests {
         h.at(95);
         control(&mut st, &[h.resolve("dc1")]);
         assert_eq!(st.delete_card("dc1"), None);
-        let screen = screen_flat(&draw(&mut st, 80, 21));
+        // (80 x 15: the banner beside the sidebar gets the conversation's rows but three.)
+        let screen = screen_flat(&draw(&mut st, 80, 15));
         assert!(st.view.panes.card.is_some(), "the detail view: {screen}");
         assert!(screen.contains(" confirm deleting beta "), "{screen}");
         // A proposal keeps its title.
@@ -17686,9 +17652,16 @@ pub(crate) mod tests {
         assert!(shown.contains("twr trash") && shown.contains("2 items in the trash"));
         // Taller than the screen, it scrolls: the arrows and PgUp/PgDn move it, any other key
         // closes it.
-        let buf = crate::ui::draw_offscreen(&mut st, 60, 8, Instant::now());
+        let buf = crate::ui::draw_offscreen(&mut st, 100, 8, Instant::now());
         let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(shown.contains("PgUp/PgDn scroll"), "{shown}");
+        // Beside the sidebar on a narrower screen, its footer keeps where it is, not the keys.
+        let buf = crate::ui::draw_offscreen(&mut st, 60, 8, Instant::now());
+        let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            shown.contains(" rows 1-") && !shown.contains("Dn scroll"),
+            "{shown}"
+        );
         st.handle_key(key(KeyCode::Down));
         assert_eq!((st.view.trash_scroll, st.view.trash.is_some()), (1, true));
         // Never past its end: Up moves at once from the last rows.
@@ -18265,7 +18238,8 @@ pub(crate) mod tests {
             .iter()
             .any(|i| i.attn_id == "capped-inline"));
         st.view.request = None;
-        draw(&mut st, 80, 7);
+        // Four rows: the sidebar's card has no room for its options.
+        draw(&mut st, 80, 4);
         st.note_drawn(Instant::now());
         assert!(
             st.view.panes.items.is_empty(),
@@ -18459,6 +18433,28 @@ pub(crate) mod tests {
     /// same settle guard, and the selection (and the popup) hold while other events arrive.
     /// The popup has nothing about a thread to stop or park. Showing the sidebar again ends
     /// the selection.
+    /// A full layout too narrow for the sidebar draws no card: a request selected in the
+    /// conversation stays selected alone, as with the sidebar hidden, and Enter opens its
+    /// popup.
+    #[test]
+    fn with_no_room_for_the_sidebar_a_request_is_selected_alone() {
+        let mut st = api_and_web_waiting();
+        draw(&mut st, 50, 30);
+        assert!(st.view.panes.no_cards && st.dock_width() == 0);
+        st.select_request("pa");
+        draw(&mut st, 50, 30);
+        assert_eq!(st.view.request.as_deref(), Some("pa"));
+        assert_eq!(st.focused(), None, "no card is selected");
+        assert!(st.selected_request().is_some());
+        st.handle_key(key(KeyCode::Enter));
+        draw(&mut st, 50, 30);
+        assert!(
+            matches!(&st.view.action, Some(p) if p.target == ActionTarget::Request("pa".into())),
+            "{:?}",
+            st.view.action
+        );
+    }
+
     #[test]
     fn with_the_sidebar_hidden_only_a_selected_inline_request_is_answered() {
         let mut st = api_and_web_waiting();
@@ -18993,14 +18989,16 @@ pub(crate) mod tests {
     /// into the replies after it, and stays scrolled up.
     #[test]
     fn a_final_reply_that_differs_keeps_the_view_in_it() {
+        // A conversation 80 columns wide, beside the sidebar.
+        const W: u16 = 115;
         let streamed = |ups: usize| {
             let (mut st, mut a) = alpha_replies(3, |i| format!("before-{i}"));
             st.apply_event(&delta(&mut a, &paragraphs(0, 30)));
-            draw(&mut st, 80, 30);
+            draw(&mut st, W, 30);
             for _ in 0..ups {
                 st.handle_key(key(KeyCode::PageUp));
             }
-            let read = drawn_rows(&mut st, 80, 30);
+            let read = drawn_rows(&mut st, W, 30);
             (st, a, read)
         };
         // The view is on the first fifteen paragraphs, which the final reply keeps.
@@ -19009,7 +19007,7 @@ pub(crate) mod tests {
         st.apply_event(&thread_item(
             &a.text(&format!("{}\n\nended otherwise", paragraphs(0, 15))),
         ));
-        assert_eq!(drawn_rows(&mut st, 80, 30), read);
+        assert_eq!(drawn_rows(&mut st, W, 30), read);
         // The view is further down than the final reply goes.
         let (mut st, mut a, read) = streamed(2);
         assert!(read.iter().any(|r| r.contains("w20q")), "{read:?}");
@@ -19017,7 +19015,7 @@ pub(crate) mod tests {
         for i in 0..30 {
             st.apply_event(&thread_item(&a.text(&format!("after-{i}"))));
         }
-        let rows = drawn_rows(&mut st, 80, 30);
+        let rows = drawn_rows(&mut st, W, 30);
         assert!(rows[0].contains("w2q19"), "{rows:?}");
         assert!(rows[2].contains("after-0"), "{rows:?}");
         assert!(st.view.scroll > 0);
@@ -22613,10 +22611,16 @@ pub(crate) mod tests {
                 let out = tap(&mut st, 40, 20, Target::Row(ActionKind::Answer(1)));
                 assert!(!responds(&out), "{out:?}");
             }
+            // On a phone it says so in the popup's bottom border: the status bar does not grow
+            // under the popup.
+            let hint = |st: &AppState| st.action_popup().and_then(|p| p.hint.clone());
             assert_eq!(
-                st.view.status.as_deref(),
+                hint(&st).as_deref(),
                 Some("just shown: read it, then tap again")
             );
+            assert_eq!(st.view.status, None);
+            let buf = frame(&mut st, 40, 20);
+            assert!(screen_text(&buf).contains("just shown: read it"));
             assert_eq!(
                 st.action_popup().and_then(|p| p.sel),
                 Some(ActionKind::Answer(1))
@@ -22629,7 +22633,7 @@ pub(crate) mod tests {
                 20,
                 Target::Row(ActionKind::Answer(1))
             )));
-            assert!(st.view.status.as_deref().unwrap().contains("again"));
+            assert!(hint(&st).unwrap().contains("again"));
             let out = tap(&mut st, 40, 20, Target::Row(ActionKind::Answer(1)));
             assert!(
                 matches!(&out[..], [Action::Respond { attn_id, decision, .. }]
@@ -23492,6 +23496,582 @@ pub(crate) mod tests {
             assert_eq!(spot(&st, &Target::TakeBack), (x, y));
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty(), "{out:?}");
+        }
+    }
+
+    /// On a phone every control is two rows tall, both rows its own, none over another's
+    /// ([`crate::ui::TAP_ROWS`]), wherever it is: the status bar's notice and notes, the `/`
+    /// popup, the orchestrator picker, the decision table, the trash, the conversation's
+    /// controls (folded lines, `↓ lines below`), the queued messages and the take-back.
+    mod phone_targets {
+        use super::*;
+        use crate::select::Target;
+        use ratatui::layout::Rect;
+        use serde_json::json;
+
+        fn frame(st: &mut AppState, w: u16, h: u16) -> Buffer {
+            crate::ui::draw_offscreen(st, w, h, Instant::now())
+        }
+
+        /// A tap at `(x, y)`, a frame drawn before and after, as the IO loop draws.
+        fn tap_at(st: &mut AppState, w: u16, h: u16, x: u16, y: u16) -> Vec<Action> {
+            use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            let ev = |kind| MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let screen = frame(st, w, h);
+            st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left)), &screen);
+            let screen = frame(st, w, h);
+            let out = st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen);
+            frame(st, w, h);
+            out
+        }
+
+        /// Every control the last frame drew covers two rows at least (its rects together,
+        /// a border's row and the one under it), and none is over another's.
+        fn two_rows_each(st: &AppState, what: &str) {
+            let targets = &st.view.panes.targets;
+            for (k, (a, ta)) in targets.iter().enumerate() {
+                let rows: std::collections::BTreeSet<u16> = targets
+                    .iter()
+                    .filter(|(_, t)| t == ta)
+                    .flat_map(|(r, _)| r.top()..r.bottom())
+                    .collect();
+                assert!(rows.len() >= 2, "{what}: {ta:?} {a:?} on {rows:?}");
+                for (b, tb) in &targets[k + 1..] {
+                    assert!(
+                        ta == tb || !a.intersects(*b),
+                        "{what}: {ta:?} {a:?} {tb:?} {b:?}"
+                    );
+                }
+            }
+        }
+
+        /// The second row of control `t` (the row under its first).
+        fn second_row(st: &AppState, t: &Target) -> (u16, u16) {
+            let rects: Vec<Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, x)| x == t)
+                .map(|(r, _)| *r)
+                .collect();
+            let top = rects
+                .iter()
+                .map(|r| r.y)
+                .min()
+                .unwrap_or_else(|| panic!("no {t:?}"));
+            let r = rects
+                .iter()
+                .find(|r| r.top() <= top + 1 && top + 1 < r.bottom())
+                .unwrap();
+            (r.x + r.width / 2, top + 1)
+        }
+
+        fn phone() -> AppState {
+            let mut st = three_threads();
+            st.view.compact_width = 60;
+            st
+        }
+
+        /// The status bar's notice and a note: bands two rows tall; the notice's second row
+        /// clears it, Focus mode's ends it.
+        #[test]
+        fn status_notes_are_two_rows() {
+            for (w, h) in [(40u16, 20u16), (40, 30), (59, 16)] {
+                let mut st = phone();
+                st.view.focus_mode = true;
+                st.view.status = Some("hub: not_found".into());
+                frame(&mut st, w, h);
+                two_rows_each(&st, &format!("{w}x{h}"));
+                let (x, y) = second_row(&st, &Target::Notice);
+                tap_at(&mut st, w, h, x, y);
+                assert!(st.view.status.is_none(), "{w}x{h}");
+                let (x, y) = second_row(&st, &Target::FocusOff);
+                tap_at(&mut st, w, h, x, y);
+                assert!(!st.view.focus_mode, "{w}x{h}");
+            }
+        }
+
+        /// The `/` popup's rows are two rows tall; a tap on a second row completes it.
+        #[test]
+        fn the_slash_popup_rows_are_two_rows() {
+            let mut st = phone();
+            st.view.input.set("/");
+            frame(&mut st, 40, 24);
+            two_rows_each(&st, "slash popup");
+            let first = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .find_map(|(_, t)| match t {
+                    Target::Suggestion(v) => Some(Target::Suggestion(v.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            let (x, y) = second_row(&st, &first);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_ne!(st.view.input.as_str(), "/", "completed");
+        }
+
+        /// The orchestrator picker's runtimes are two rows tall, its close too.
+        #[test]
+        fn the_picker_rows_are_two_rows() {
+            let mut st = phone();
+            st.view.picker = Some(crate::app::Picker {
+                runtimes: vec![
+                    ("claude-code".into(), Some(true)),
+                    ("codex".into(), Some(false)),
+                ],
+                selected: 0,
+                default: "claude-code".into(),
+                model: None,
+                switch: false,
+            });
+            frame(&mut st, 40, 24);
+            two_rows_each(&st, "picker");
+            let (x, y) = second_row(&st, &Target::Runtime(1));
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.picker.as_ref().map(|p| p.selected), Some(1));
+        }
+
+        /// On a phone too short for the picker, it scrolls to keep the selected runtime's band
+        /// whole; a band the window cuts is not drawn, nor tapped.
+        #[test]
+        fn a_short_picker_draws_its_runtimes_whole() {
+            let mut st = phone();
+            st.view.picker = Some(crate::app::Picker {
+                runtimes: vec![
+                    ("claude-code".into(), Some(true)),
+                    ("codex".into(), Some(false)),
+                ],
+                selected: 0,
+                default: "claude-code".into(),
+                model: None,
+                switch: false,
+            });
+            for sel in [0, 1] {
+                st.view.picker.as_mut().unwrap().selected = sel;
+                let text = screen_text(&frame(&mut st, 40, 10));
+                two_rows_each(&st, &format!("picker {sel}"));
+                assert!(
+                    st.view
+                        .panes
+                        .targets
+                        .iter()
+                        .any(|(_, t)| *t == Target::Runtime(sel)),
+                    "{sel}:\n{text}"
+                );
+                // Every runtime named on screen is a whole band with its tap.
+                for (i, name) in ["claude-code", "codex"].iter().enumerate() {
+                    let drawn = text.lines().any(|l| l.contains(name));
+                    let tapped = st
+                        .view
+                        .panes
+                        .targets
+                        .iter()
+                        .any(|(_, t)| *t == Target::Runtime(i));
+                    assert!(!drawn || tapped, "{sel}: {name} drawn, not tapped:\n{text}");
+                }
+            }
+        }
+
+        /// A status message taller than the phone's bar is cut to it, `…` at its end, still
+        /// two rows a tap clears.
+        #[test]
+        fn a_long_notice_is_cut_not_dropped() {
+            let mut st = phone();
+            st.view.status = Some(format!("error: {}", "the hub said no. ".repeat(40)));
+            let text = screen_text(&frame(&mut st, 40, 20));
+            assert!(
+                text.contains("error: the hub") && text.contains('…'),
+                "{text}"
+            );
+            two_rows_each(&st, "long notice");
+            let (x, y) = second_row(&st, &Target::Notice);
+            tap_at(&mut st, 40, 20, x, y);
+            assert!(st.view.status.is_none());
+        }
+
+        /// A band the conversation's view cuts at its top or bottom (a folded line, `■ stop`)
+        /// is no control: no link is left on what shows of it, its padding perhaps.
+        #[test]
+        fn a_band_cut_by_the_view_is_not_tapped() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(500);
+            for i in 0..20 {
+                st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
+            }
+            frame(&mut st, 40, 20);
+            for step in 0..40 {
+                let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+                let links = &pane.links;
+                let mut k = 0;
+                while k < links.len() {
+                    let Some(link) = links[k].clone().filter(|l| !l.starts_with("request:")) else {
+                        k += 1;
+                        continue;
+                    };
+                    let n = links[k..]
+                        .iter()
+                        .take_while(|l| l.as_deref() == Some(&link))
+                        .count();
+                    assert!(n >= 2, "step {step}: {link} on {n} row(s) at {k}");
+                    k += n;
+                }
+                st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+                frame(&mut st, 40, 20);
+            }
+            assert!(st.view.scroll > 0);
+        }
+
+        /// `/sidebar` on a phone does as Ctrl-B: the Threads screen, then back to Chat.
+        #[test]
+        fn slash_sidebar_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            frame(&mut st, 40, 20);
+            for want in [CompactPane::Threads, CompactPane::Chat] {
+                st.view.input.set("/sidebar");
+                st.handle_key(key(KeyCode::Enter));
+                assert_eq!(st.view.compact_pane, want);
+            }
+        }
+
+        /// The decision table on a phone: its close, its filters and its rows two rows tall;
+        /// a filter's second row moves it on.
+        #[test]
+        fn the_decision_table_controls_are_two_rows() {
+            let mut st = with_decisions();
+            st.view.compact_width = 60;
+            open_decisions(&mut st);
+            frame(&mut st, 50, 24);
+            two_rows_each(&st, "decisions");
+            let before = st.view.decision_filter.site;
+            let (x, y) = second_row(&st, &Target::SiteFilter);
+            tap_at(&mut st, 50, 24, x, y);
+            assert_ne!(st.view.decision_filter.site, before);
+        }
+
+        /// The trash's close is two rows.
+        #[test]
+        fn the_trash_close_is_two_rows() {
+            let mut st = phone();
+            st.view.trash = Some(json!({"items": []}));
+            frame(&mut st, 40, 20);
+            two_rows_each(&st, "trash");
+            let (x, y) = second_row(&st, &Target::Close);
+            tap_at(&mut st, 40, 20, x, y);
+            assert!(st.view.trash.is_none());
+        }
+
+        /// The conversation's controls: a folded line is two rows, both expanding it; scrolled
+        /// up, `↓ lines below` is two rows, both following the bottom again.
+        #[test]
+        fn conversation_controls_are_two_rows() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 24);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let rows: Vec<Option<String>> = pane.links.clone();
+            let mut k = 0;
+            let mut tapped = None;
+            while k < rows.len() {
+                let Some(link) = rows[k].clone().filter(|l| !l.starts_with("request:")) else {
+                    k += 1;
+                    continue;
+                };
+                let n = rows[k..]
+                    .iter()
+                    .take_while(|l| l.as_deref() == Some(&link))
+                    .count();
+                assert!(n >= 2, "{link} on {n} row(s)");
+                tapped.get_or_insert((link, pane.area.y + k as u16 + 1));
+                k += n;
+            }
+            let (link, y) = tapped.expect("a folded line");
+            tap_at(&mut st, 40, 24, 5, y);
+            // Replies enough to scroll up from.
+            let mut o = ThreadScript::new("t-orch");
+            o.at(500);
+            for i in 0..30 {
+                st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
+            }
+            frame(&mut st, 40, 24);
+            assert!(
+                st.view
+                    .expanded
+                    .iter()
+                    .any(|e| link.contains(e.as_str()) || e.contains(&link)),
+                "{link}: {:?}",
+                st.view.expanded
+            );
+            for _ in 0..3 {
+                st.handle_key(key(KeyCode::PageUp));
+            }
+            frame(&mut st, 40, 24);
+            assert!(st.view.scroll > 0, "scrolled");
+            two_rows_each(&st, "scrolled up");
+            let (x, y) = second_row(&st, &Target::Follow);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.scroll, 0, "following again");
+        }
+
+        /// `↶ take back` is a band two rows tall over the input box, its own row: a tap on its
+        /// second row arms it, a second takes the message back.
+        #[test]
+        fn take_back_is_two_rows() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            send_line(
+                &mut st,
+                "deploy api",
+                serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
+                                   "turn": null, "pending": 1}),
+            );
+            frame(&mut st, 40, 24);
+            two_rows_each(&st, "take back");
+            let (x, y) = second_row(&st, &Target::TakeBack);
+            assert!(tap_at(&mut st, 40, 24, x, y).is_empty());
+            assert!(st.unsend_hint().is_some());
+            let (x, y) = second_row(&st, &Target::TakeBack);
+            assert_eq!(
+                tap_at(&mut st, 40, 24, x, y),
+                [Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 7
+                }]
+            );
+        }
+
+        /// A request selected in a phone's conversation is drawn whole, its two-row footer
+        /// counted, or read in the detail view: every frame, never cut.
+        #[test]
+        fn a_selected_request_is_whole_or_in_the_detail_view() {
+            for n in 1..14 {
+                for h in [18u16, 20, 24] {
+                    let mut st = api_and_web_waiting();
+                    st.view.compact_width = 60;
+                    let mut api = ThreadScript::new("t-api");
+                    api.at(80);
+                    let mut long = api.raise("long", Question);
+                    if let EventBody::AttentionRaised(p) = &mut long.body {
+                        p.summary = (0..n).map(|k| format!("line {k} of it\n")).collect();
+                        p.options = vec!["continue".into(), "cancel".into()];
+                    }
+                    control(&mut st, &[long]);
+                    for i in 0..30 {
+                        st.apply_event(&thread_item(
+                            &ThreadScript::new("t-orch").text(&format!("after {i}")),
+                        ));
+                    }
+                    frame(&mut st, 40, h);
+                    st.select_request("long");
+                    for f in 0..4 {
+                        let text = screen_text(&frame(&mut st, 40, h));
+                        let whole = st.view.panes.items.iter().any(|d| d.attn_id == "long");
+                        let detail = st.view.panes.card.is_some();
+                        assert!(whole || detail, "{n} lines, 40x{h}, frame {f}:\n{text}");
+                    }
+                }
+            }
+        }
+
+        /// The grid's selection stays as the sidebar shows again: only the stack view's
+        /// cards, which hiding it let go, get theirs back.
+        #[test]
+        fn showing_the_sidebar_keeps_the_grid_selection() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-alpha".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            st.set_focus(Some("t-beta".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-beta"));
+            // The stack view: hiding lets the card go, showing brings it back.
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-gamma".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), None);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-gamma"));
+        }
+
+        /// Block navigation on a phone sees the rows as drawn, controls two rows tall: its
+        /// rows are the pane's, link for link.
+        #[test]
+        fn phone_block_navigation_sees_the_rows_drawn() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 200);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let links: Vec<Option<String>> = crate::ui::block_rows(&st)
+                .into_iter()
+                .map(|r| r.2)
+                .collect();
+            assert_eq!(pane.links, links);
+        }
+
+        /// `↶ take back` and the input box's top border are one control: an action popup
+        /// over its band leaves none of it, never its border's one row.
+        #[test]
+        fn take_back_is_covered_whole() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            send_line(
+                &mut st,
+                "deploy api",
+                serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
+                                   "turn": null, "pending": 1}),
+            );
+            frame(&mut st, 40, 30);
+            let takes = |st: &AppState| {
+                st.view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::TakeBack)
+                    .map(|(r, _)| *r)
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                matches!(takes(&st)[..], [r] if r.height == 2),
+                "{:?}",
+                takes(&st)
+            );
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.view.action.is_some(), "a popup opens");
+            frame(&mut st, 40, 30);
+            two_rows_each(&st, "popup open");
+            assert!(takes(&st).iter().all(|r| r.height == 2), "{:?}", takes(&st));
+        }
+
+        /// The status bar's `Ctrl-B shows` on a phone does what Ctrl-B does there: the
+        /// Threads screen, the flag as it was.
+        #[test]
+        fn the_sidebar_note_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            st.view.sidebar_hidden = true;
+            frame(&mut st, 40, 24);
+            let (x, y) = second_row(&st, &Target::Sidebar);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.compact_pane, CompactPane::Threads);
+            assert!(
+                st.view.sidebar_hidden,
+                "the full layout's sidebar stays as it was"
+            );
+        }
+
+        /// A workspace's selection comes back as the sidebar is now: hidden since, it waits
+        /// for the sidebar to show; shown since, it is selected again.
+        #[test]
+        fn a_restored_selection_follows_the_sidebar() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.set_focus(Some("t-beta".into()));
+            let saved = st.take_view();
+            let mut back = three_threads();
+            back.view.sidebar_hidden = true;
+            back.restore_view(saved);
+            back.finish_restore();
+            frame(&mut back, 160, 40);
+            assert_eq!(back.focused(), None);
+            back.handle_key(ctrl('b'));
+            assert_eq!(back.focused(), Some("t-beta"));
+            // Left hidden, the selection waiting; shown when it comes back.
+            back.handle_key(ctrl('b'));
+            let saved = back.take_view();
+            let mut again = three_threads();
+            again.restore_view(saved);
+            again.finish_restore();
+            frame(&mut again, 160, 40);
+            assert_eq!(again.focused(), Some("t-beta"));
+        }
+
+        /// On short phone screens no control is drawn shorter than its two rows: the queue
+        /// shows the messages it has room for whole, each with its tap; the decision table's
+        /// filters and rows, and the conversation's lines-below row, are left out where they
+        /// would be cut.
+        #[test]
+        fn short_phones_draw_no_control_cut() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 3,
+                        "held": false, "items": [
+                    {"ref": 7, "prompt": "one", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 8, "prompt": "two", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 9, "prompt": "three", "truncated": false, "from": "user", "mine": true},
+                ]}),
+            );
+            for h in 10..=16 {
+                let text = screen_text(&frame(&mut st, 40, h));
+                two_rows_each(&st, &format!("queue 40x{h}"));
+                let drawn = text.lines().filter(|l| l.contains("⧗ queued")).count();
+                let tapped = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Queued(_)))
+                    .count();
+                assert_eq!(drawn, tapped, "40x{h}:\n{text}");
+            }
+            let mut st = with_decisions();
+            st.view.compact_width = 60;
+            open_decisions(&mut st);
+            for h in 6..=12 {
+                frame(&mut st, 40, h);
+                two_rows_each(&st, &format!("decisions 40x{h}"));
+            }
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 10);
+            st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+            for h in 8..=12 {
+                frame(&mut st, 40, h);
+                two_rows_each(&st, &format!("follow 40x{h}"));
+            }
+        }
+
+        /// The queued messages above the input box are two rows each; a tap on a second row
+        /// selects that one.
+        #[test]
+        fn queued_messages_are_two_rows() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 2,
+                        "held": false, "items": [
+                    {"ref": 7, "prompt": "fix the tests too", "truncated": false,
+                     "from": "user", "mine": true},
+                    {"ref": 8, "prompt": "then deploy", "truncated": false,
+                     "from": "user", "mine": true},
+                ]}),
+            );
+            frame(&mut st, 40, 24);
+            two_rows_each(&st, "queue");
+            let (x, y) = second_row(&st, &Target::Queued(8));
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.queued, Some(8));
         }
     }
 

@@ -2370,9 +2370,9 @@ struct Shared {
     compact: Option<bool>,
     /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
     suggest: Option<bool>,
-    /// The workspace sidebar hidden ([`crate::sidebar`]), for every workspace shown (and,
-    /// in `tui-state.json`, the next runs).
-    ws_sidebar_hidden: bool,
+    /// The sidebar hidden ([`crate::sidebar`], Ctrl-B), for every workspace shown (and, in
+    /// `tui-state.json`, the next runs).
+    sidebar_hidden: bool,
     /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
     /// no setting.
     agent: Option<String>,
@@ -2546,7 +2546,7 @@ pub async fn run_with(
         keys,
         compact: None,
         suggest: None,
-        ws_sidebar_hidden: seen.workspaces_sidebar == Some(false),
+        sidebar_hidden: seen.workspaces_sidebar == Some(false),
         agent,
         saves: Some(saves),
         saved_rx,
@@ -2763,7 +2763,7 @@ async fn drive(
     state.view.compact = ctx.compact;
     state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
     state.view.notify_terminal = ctx.tui.notify.terminal;
-    state.view.ws_sidebar_hidden = ctx.ws_sidebar_hidden;
+    state.view.sidebar_hidden = ctx.sidebar_hidden;
     state.agent = ctx.agent.clone();
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
@@ -3145,7 +3145,7 @@ async fn drive(
                             // Kept for the next runs (and the next workspaces shown).
                             // Kept by the settings writer, in order.
                             Action::WsSidebar(on) => {
-                                ctx.ws_sidebar_hidden = !on;
+                                ctx.sidebar_hidden = !on;
                                 if let (Some(file), Some(saves)) = (&ctx.seen_file, &ctx.saves) {
                                     let _ = saves.send(Save::WsSidebar(file.clone(), on));
                                 }
@@ -3431,7 +3431,7 @@ async fn drive(
                     Saved::WsSidebar(on, Err(e)) => {
                         let how = if on { "shown" } else { "hidden" };
                         state.view.status = Some(format!(
-                            "workspaces {how} in the sidebar, but not remembered for the next runs: {e}"
+                            "sidebar {how}, but not remembered for the next runs: {e}"
                         ));
                     }
                     Saved::WsSidebar(_, Ok(())) => {}
@@ -3499,7 +3499,7 @@ async fn drive(
     // changed here ([`crate::settings`]).
     ctx.compact = state.view.compact;
     ctx.suggest = Some(state.view.suggest);
-    ctx.ws_sidebar_hidden = state.view.ws_sidebar_hidden;
+    ctx.sidebar_hidden = state.view.sidebar_hidden;
     ctx.tui.card_order = state.view.card_order;
     ctx.tui.compact_width = state.view.compact_width;
     ctx.tui.notify.terminal = state.view.notify_terminal;

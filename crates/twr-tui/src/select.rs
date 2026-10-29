@@ -30,7 +30,7 @@ pub enum PaneId {
     Help,
     /// A workspace's tab in the strip ([`crate::workspace`]): a click switches to it.
     Tab(String),
-    /// The workspace sidebar, its drawer or the compact layout's Workspaces screen
+    /// The sidebar's workspace list or the compact layout's Threads screen
     /// ([`crate::sidebar`]): the wheel scrolls it.
     Workspaces,
     /// Any other text: the status bar, headers, the first-run picker.
@@ -291,8 +291,6 @@ pub struct Panes {
     /// it showed first ([`crate::sidebar::render_list`]): the wheel scrolls from there.
     pub ws_max: usize,
     pub ws_start: usize,
-    /// Where the workspace drawer was drawn: a click outside it closes it.
-    pub drawer: Option<Rect>,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,
     /// The column of cards (the sidebar's, the compact Threads screen's) had cards to show
@@ -348,8 +346,6 @@ pub struct ListWindow {
 pub enum ListLayout {
     /// The column of cards beside the main pane.
     Column,
-    /// The row of cards above it (narrow screens).
-    Row,
     /// The grid of tiles, this many to a row.
     Grid(usize),
     /// A compact layout's list, one row per card.
