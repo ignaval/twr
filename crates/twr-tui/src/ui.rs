@@ -7835,7 +7835,15 @@ fn render_take_back(frame: &mut Frame, area: Rect, rows: u16, state: &AppState, 
         Paragraph::new(Line::from(" ↶ take back ").right_aligned()).style(style),
         row,
     );
-    panes.target(row, Target::TakeBack);
+    // One control with the input box's top border under it: an overlay over either row covers
+    // it whole ([`Panes::cover`]), never leaving one row of it.
+    panes.target(
+        Rect {
+            height: rows + 1,
+            ..row
+        },
+        Target::TakeBack,
+    );
 }
 
 /// The main pane's thread's queued messages, the next to run first, right above the input
@@ -7996,10 +8004,13 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
                 .right_aligned(),
             );
         }
-        panes.target(
-            Rect::new(area.x, area.y, area.width, area.height.min(1)),
-            Target::TakeBack,
-        );
+        // On a phone the band above it has it, this row with it ([`render_take_back`]).
+        if take_back_rows(state) == 0 {
+            panes.target(
+                Rect::new(area.x, area.y, area.width, area.height.min(1)),
+                Target::TakeBack,
+            );
+        }
     }
     let inner = block.inner(area);
     let line = &state.view.input;

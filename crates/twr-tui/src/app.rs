@@ -4331,6 +4331,13 @@ impl AppState {
             .collect()
     }
 
+    /// Whether the stack view's worker cards are out of sight: the sidebar hidden, or, as last
+    /// drawn, with no room for them ([`crate::select::Panes::no_cards`]). A request in the
+    /// conversation is then selected alone, its thread's card not.
+    fn cards_unseen(&self) -> bool {
+        self.view.sidebar_hidden || (self.view.panes.no_cards && !self.compact())
+    }
+
     /// The worker request selected in the main conversation (Shift-↑/↓ with the main pane
     /// selected, a click), while it is open. With the sidebar shown its thread's card is
     /// selected with it. With the sidebar hidden its thread has no card: the request, drawn in
@@ -4347,7 +4354,7 @@ impl AppState {
             matches!(
                 i.reason,
                 AttentionReason::Permission | AttentionReason::Question
-            ) && (self.view.sidebar_hidden
+            ) && (self.cards_unseen()
                 || self.view.main_focus
                 || self.focused() == Some(i.thread.as_str()))
                 && self
@@ -4397,7 +4404,7 @@ impl AppState {
         // With the sidebar hidden its thread has no card to select: the selection stays what
         // it was (none, or the orchestrator's card), see [`AppState::selected_request`]. So
         // with the conversation selected: the card it keeps is the one Shift-→ returns to.
-        if !self.view.sidebar_hidden && !self.main_focused() {
+        if !self.cards_unseen() && !self.main_focused() {
             self.set_focus(Some(thread));
         }
         self.view.request = Some(id.into());
@@ -18426,6 +18433,28 @@ pub(crate) mod tests {
     /// same settle guard, and the selection (and the popup) hold while other events arrive.
     /// The popup has nothing about a thread to stop or park. Showing the sidebar again ends
     /// the selection.
+    /// A full layout too narrow for the sidebar draws no card: a request selected in the
+    /// conversation stays selected alone, as with the sidebar hidden, and Enter opens its
+    /// popup.
+    #[test]
+    fn with_no_room_for_the_sidebar_a_request_is_selected_alone() {
+        let mut st = api_and_web_waiting();
+        draw(&mut st, 50, 30);
+        assert!(st.view.panes.no_cards && st.dock_width() == 0);
+        st.select_request("pa");
+        draw(&mut st, 50, 30);
+        assert_eq!(st.view.request.as_deref(), Some("pa"));
+        assert_eq!(st.focused(), None, "no card is selected");
+        assert!(st.selected_request().is_some());
+        st.handle_key(key(KeyCode::Enter));
+        draw(&mut st, 50, 30);
+        assert!(
+            matches!(&st.view.action, Some(p) if p.target == ActionTarget::Request("pa".into())),
+            "{:?}",
+            st.view.action
+        );
+    }
+
     #[test]
     fn with_the_sidebar_hidden_only_a_selected_inline_request_is_answered() {
         let mut st = api_and_web_waiting();
@@ -23894,6 +23923,40 @@ pub(crate) mod tests {
                 .map(|r| r.2)
                 .collect();
             assert_eq!(pane.links, links);
+        }
+
+        /// `↶ take back` and the input box's top border are one control: an action popup
+        /// over its band leaves none of it, never its border's one row.
+        #[test]
+        fn take_back_is_covered_whole() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            send_line(
+                &mut st,
+                "deploy api",
+                serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
+                                   "turn": null, "pending": 1}),
+            );
+            frame(&mut st, 40, 30);
+            let takes = |st: &AppState| {
+                st.view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::TakeBack)
+                    .map(|(r, _)| *r)
+                    .collect::<Vec<_>>()
+            };
+            assert!(
+                matches!(takes(&st)[..], [r] if r.height == 2),
+                "{:?}",
+                takes(&st)
+            );
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.view.action.is_some(), "a popup opens");
+            frame(&mut st, 40, 30);
+            two_rows_each(&st, "popup open");
+            assert!(takes(&st).iter().all(|r| r.height == 2), "{:?}", takes(&st));
         }
 
         /// On short phone screens no control is drawn shorter than its two rows: the queue
