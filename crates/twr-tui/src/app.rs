@@ -22265,6 +22265,45 @@ pub(crate) mod tests {
             }
         }
 
+        /// On a phone a dive's `‹ back` band is two rows, both of them back; the help's `✕` is
+        /// two rows too, and its second row closes it.
+        #[test]
+        fn phone_back_band_and_help_close_on_two_rows() {
+            let mut st = compact();
+            st.dive("t-beta");
+            frame(&mut st, 40, 20);
+            let back: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Back)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(back.len(), 1, "{:?}", st.view.panes.targets);
+            assert_eq!(back[0].height, 2);
+            tap_at(&mut st, 40, 20, back[0].x + 2, back[0].y + 1);
+            assert!(st.view.dive.is_none(), "back");
+            st.view.help = true;
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                2,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(!st.view.help);
+        }
+
         /// On the shortest phones the action popup still lists a row to act on: the item's
         /// text gives way to it (then not drawn in full, so read in the main pane to answer).
         #[test]
