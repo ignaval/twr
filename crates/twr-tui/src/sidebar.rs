@@ -2024,7 +2024,9 @@ pub(crate) mod tests {
         assert!(!text.contains("hub not running"), "{text}");
         let list = st.view.panes.list.unwrap().area;
         assert!(list.height >= 18 * 3 / 5 - 3, "{list:?}\n{text}");
-        // Shorter still: the furthest give way to `↓ more`.
+        // Shorter still (the full layout kept, `/compact off`: so short a screen is a phone's
+        // on its side): the furthest give way to `↓ more`.
+        st.view.compact = Some(false);
         let text = rows(&mut st, 140, 10).join("\n");
         assert!(text.contains("↓ more"), "{text}");
         assert!(

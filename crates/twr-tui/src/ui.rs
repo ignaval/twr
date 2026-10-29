@@ -1068,6 +1068,11 @@ fn render_stack(
     render_status(frame, status, state, panes, parked);
 }
 
+/// On a phone, the most rows an option of the action popup takes as a row of its own (a menu
+/// choice's two, [`TAP_ROWS`], which the shortest popup has room for under a row of its
+/// text); a taller one is listed in full in the popup's text, and its row by its first line.
+pub const SHEET_OPTION_ROWS: usize = TAP_ROWS as usize;
+
 /// Rows of the compact layout's tab bar: two, as tall as a finger.
 pub const TAB_BAR_ROWS: u16 = 2;
 /// Rows of a menu choice on a phone, as tall as a tab: a popup's rows (actions, a question's
@@ -7915,11 +7920,17 @@ fn render_action_popup(
         .width
         .saturating_add(2)
         .min(frame.area().width.saturating_sub(x));
-    if width < 3 || room < 3 {
+    // (On a phone it may cover the input box too: below.)
+    let most = if state.compact() {
+        input.bottom().saturating_add(1).saturating_sub(top)
+    } else {
+        room
+    };
+    if width < 3 || most < 3 {
         return None;
     }
     let inner_w = usize::from(width - 2);
-    let fit = usize::from(room - 2);
+    let fit = usize::from(room.saturating_sub(2));
     let dim = Style::default().fg(Color::DarkGray);
     let rows = state.action_rows(&popup.target);
     let matches = state.action_matches(popup, &rows);
@@ -8010,148 +8021,314 @@ fn render_action_popup(
         let rule = usize::from(!head.is_empty() && !shown.is_empty());
         head.len() + rule + shown.iter().map(|&i| row_lines(i).len()).sum::<usize>()
     };
-    // A report (no item) takes the room the rows leave (with a filter, those it keeps, maybe
-    // none: the rest go first when they do not all fit); what does not fit ends in `…`.
-    if item.is_none() {
-        let kept = if popup.filter.is_empty() {
-            all.clone()
-        } else {
-            matches.clone()
-        };
-        let room = fit.saturating_sub(height_of(&[], &kept) + usize::from(!kept.is_empty()));
-        if head.len() > room {
-            head.truncate(room);
-            if let Some(last) = head.last_mut() {
-                *last = ellipsized(std::mem::take(last), head_w);
-            }
-        }
-    }
-    // A report's popup whose filter matches no row shows the report alone: no row would be
-    // drawn under it, so none takes its room. (An item's keeps its options: it counts as
-    // drawn only with them.)
-    let mut shown = if item.is_none() && !popup.filter.is_empty() && matches.is_empty() {
-        Vec::new()
-    } else {
-        all.clone()
-    };
-    let mut whole = true;
     // The item's detail view has had every row of its whole text on screen for this revision
     // ([`crate::app::CardView::read_in_full`]): read in full, whatever the popup has room for
     // now. A capped preview read to its end is not, nor is the full text fetched after it.
     let detail_read = item.is_some_and(|i| {
         state.incomplete(i).is_none() && state.view.card_view.read_in_full(&i.attn_id, i.revision)
     });
-    // On a phone, its rows two rows tall, the item fits when its text and its options do: the
-    // other rows are windowed ([`TAP_ROWS`]).
-    let needed: Vec<usize> = if state.compact() {
-        all.iter()
-            .copied()
-            .filter(|&k| matches!(rows[k].kind, ActionKind::Answer(_)))
-            .collect()
-    } else {
-        all.clone()
-    };
-    if let Some(i) = item.filter(|_| height_of(&head, &needed) > fit) {
-        let read = detail_read || popup.read.as_ref() == Some(&(i.attn_id.clone(), i.revision));
-        let note = if read {
-            "read in full in the main pane: answer it here"
+    // On a phone the popup is a sheet: its text is never cut nor sent to the main pane to be
+    // read; it scrolls in the rows the popup's rows leave it ([`Panes::sheet`]), those keeping
+    // a window of their own under it, and a row between them says how much of it is out of
+    // view (a tap pages it, [`Target::More`]).
+    let (lines, row_at, whole, options_cut, windowed, sheet, bottom) = if state.compact() {
+        let shown: Vec<usize> = if item.is_none() && !popup.filter.is_empty() && matches.is_empty()
+        {
+            Vec::new()
         } else {
-            // Not room for it: no option is listed, and the main pane shows it to be read.
-            shown.retain(|&k| !matches!(rows[k].kind, ActionKind::Answer(_)));
-            whole = false;
-            panes.long_item = Some(card.clone());
-            "too long to show here: it is open in the main pane. Esc, read it to its end \
-             (PgUp/PgDn), then Enter here again to answer it"
+            all.clone()
         };
-        head = wrap_line(Line::from(Span::styled(note, dim)), head_w);
-        exact = true;
-    }
-    let mut lines: Vec<Line<'static>> = head
-        .iter()
-        .map(|l| {
-            let mut l = l.clone();
-            l.spans.insert(0, Span::raw(" "));
-            l
-        })
-        .collect();
-    // Not even a row's room under the item's text (a short screen; on a phone, a row's two
-    // rows, [`TAP_ROWS`]): its end is cut, and it is not drawn in full.
-    let row_h = if state.compact() {
-        usize::from(TAP_ROWS)
-    } else {
-        1
-    };
-    if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) + row_h > fit {
-        lines.truncate(fit.saturating_sub(1 + row_h));
-        // Read in full in its detail view, it stays so (its note is what was cut); an item
-        // not read, cut, is opened there to be read, as one too long for the popup.
-        if item.is_none() || !detail_read {
-            whole = false;
+        let mut body: Vec<Line<'static>> = head
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.spans.insert(0, Span::raw(" "));
+                l
+            })
+            .collect();
+        // Its room when it does not fit above the input box: down over it too (it takes no
+        // keys while the popup is open, and shows no cursor).
+        let low = input.bottom().saturating_add(1).min(frame.area().bottom());
+        let full_fit = usize::from(low.saturating_sub(top).saturating_sub(2)).max(fit);
+        // An option taller than [`SHEET_OPTION_ROWS`] joins the text in full, as the detail
+        // view lists the options: there it is read, and its row lists it by its first line
+        // ([`draw_row`] below). By the width alone: the text keeps its rows (and what of
+        // them was read) whatever the height.
+        let answer = |i: usize| matches!(rows[i].kind, ActionKind::Answer(_));
+        let tall = |i: usize| answer(i) && row_lines(i).len() > SHEET_OPTION_ROWS;
+        if let Some(it) = item.filter(|_| shown.iter().any(|&i| tall(i))) {
+            body.push(Line::default());
+            body.extend(option_rows(&it.options, head_w).into_iter().map(|mut l| {
+                l.spans.insert(0, Span::raw(" "));
+                l
+            }));
         }
-        if item.is_some() && !detail_read {
-            panes.long_item = Some(card.clone());
-        }
-        // A report cut short says so.
-        if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {
-            *last = ellipsized(std::mem::take(last), inner_w);
-        }
-    }
-    let rule = usize::from(!lines.is_empty() && !shown.is_empty());
-    if rule == 1 {
-        lines.push(Line::from(Span::styled("─".repeat(inner_w), dim)));
-    }
-    // The rows that fit: when they don't all, those the filter leaves out go first, then a
-    // window of them keeps the highlighted one in view.
-    let room = fit.saturating_sub(lines.len());
-    // An option taller than that room (a narrow screen) never fits: once its item's detail
-    // view was read in full, it is listed on a row by its number and first line, there to be
-    // picked and answered; else it is not drawn, and not answered.
-    let draw_row = |i: usize| -> Vec<Line<'static>> {
-        let full = row_lines(i);
-        if !(detail_read && matches!(rows[i].kind, ActionKind::Answer(_)) && full.len() > room) {
-            return full;
-        }
-        let label = &rows[i].label;
-        let mut first = label.lines().next().unwrap_or_default().to_string();
-        if label.trim_end().contains('\n') {
-            first.push('…');
-        }
-        let mark = " (read in full)";
-        let text = inner_w.saturating_sub(1);
-        let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
-        row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
-    };
-    let mut drawn: Vec<usize> = shown.clone();
-    let mut windowed = false;
-    if shown.iter().map(|&i| draw_row(i).len()).sum::<usize>() > room {
-        windowed = true;
-        if !popup.filter.is_empty() {
-            drawn.retain(|i| matches.contains(i));
-        }
-        let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
-        let at = popup
-            .sel
-            .and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
-        // On a phone, whole rows within the room: the highlighted one first, then the
-        // options (the item stays answerable however tall its rows are, when they fit), then
-        // the rest in their order.
-        if state.compact() {
-            let answer = |i: usize| matches!(rows[i].kind, ActionKind::Answer(_));
-            let order: Vec<usize> = at
-                .into_iter()
-                .chain((0..drawn.len()).filter(|&k| answer(drawn[k])))
-                .chain(0..drawn.len())
-                .collect();
-            let (mut keep, mut used) = (Vec::new(), 0);
-            for k in order {
-                if !keep.contains(&drawn[k]) && used + heights[k] <= room {
-                    keep.push(drawn[k]);
-                    used += heights[k];
+        // What the sheet's text is of: the item (and revision), else what the popup is on.
+        // (A report or a queued message by its text too: a new one starts from its top.)
+        let (key, revision) = match item {
+            Some(i) => (i.attn_id.clone(), i.revision),
+            None => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for l in &body {
+                    for span in &l.spans {
+                        span.content.hash(&mut h);
+                    }
+                }
+                (format!("{:?}", popup.target), h.finish())
+            }
+        };
+        let sv = &state.view.sheet_view;
+        let draw_row = |i: usize| -> Vec<Line<'static>> {
+            if !tall(i) {
+                return row_lines(i);
+            }
+            let label = &rows[i].label;
+            let mut first = label.lines().next().unwrap_or_default().to_string();
+            if label.trim_end().contains('\n') {
+                first.push('…');
+            }
+            let mark = " (in full above)";
+            let text = inner_w.saturating_sub(1);
+            let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
+            row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
+        };
+        let n = body.len();
+        let total: usize = shown.iter().map(|&i| draw_row(i).len()).sum();
+        let over = n + usize::from(n > 0 && total > 0) + total > fit;
+        let (fit, low) = if over { (full_fit, low) } else { (fit, bottom) };
+        let windowed = n + usize::from(n > 0) + total > fit && total > 0;
+        // The highlighted row the window keeps in view: one moved to (the popup opens on
+        // Talk, after the options, which the window shows first).
+        let sel = popup.sel.filter(|_| popup.moved);
+        // The tallest row: the window has room for any one of them.
+        let one = shown.iter().map(|&i| draw_row(i).len()).max().unwrap_or(0);
+        // The line between the text and the rows, where there is room for it, a row of the
+        // text and a row (else the text's cue is in the bottom border).
+        let rule = usize::from(n > 0 && total > 0 && (!windowed || fit >= 2 + one));
+        // The rows' room: all of them where all fits; else half the room, the tallest row at
+        // least, or what the text leaves, a row kept for the text. Never what is highlighted:
+        // the rows stay where they are as a tap moves the highlight.
+        let rows_room = if !windowed {
+            total
+        } else {
+            let avail = fit.saturating_sub(rule);
+            (avail / 2)
+                .max(one)
+                .max(avail.saturating_sub(n))
+                .min(total)
+                .min(avail.saturating_sub(n.min(1)))
+        };
+        // A window of the rows keeping the highlighted one in view (with a filter, of the
+        // rows it keeps).
+        let mut drawn = shown.clone();
+        let (mut above, mut below) = (0, 0);
+        if total > rows_room {
+            if !popup.filter.is_empty() {
+                drawn.retain(|i| matches.contains(i));
+            }
+            let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
+            let at = sel.and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
+            let fits = |a: usize, b: usize| heights[a..=b].iter().sum::<usize>() <= rows_room;
+            // Where the last frame's window started, while the highlighted row is in it; else
+            // as little moved as it takes to show it: up to it, or down to the first window
+            // it ends.
+            let last = state
+                .view
+                .panes
+                .popup_start
+                .as_ref()
+                .filter(|(t, _)| *t == popup.target)
+                .map(|(_, s)| *s)
+                .filter(|&s| s < drawn.len());
+            let mut start = match (at, last) {
+                (None, _) => 0,
+                (Some(at), Some(s)) if s <= at && fits(s, at) => s,
+                (Some(at), Some(s)) if at < s => at,
+                (Some(_), _) => 0,
+            };
+            if let Some(at) = at {
+                while start < at && !fits(start, at) {
+                    start += 1;
                 }
             }
-            keep.sort_unstable();
-            drawn = keep;
+            panes.popup_start = Some((popup.target.clone(), start));
+            let (mut end, mut used) = (start, 0);
+            while end < drawn.len() && used + heights[end] <= rows_room {
+                used += heights[end];
+                end += 1;
+            }
+            (above, below) = (start, drawn.len() - end);
+            drawn = drawn[start..end].to_vec();
+        }
+        let used: usize = drawn.iter().map(|&i| draw_row(i).len()).sum();
+        // The text takes the rest.
+        let body_room = n.min(fit.saturating_sub(rule + used));
+        let max_scroll = n - body_room;
+        let start = sv.start_of(
+            &key,
+            revision,
+            u16::try_from(head_w).unwrap_or(u16::MAX),
+            max_scroll,
+        );
+        let end = (start + body_room).min(n);
+        let window = crate::select::CardWindow {
+            thread: card.clone(),
+            attn_id: key,
+            revision,
+            width: u16::try_from(head_w).unwrap_or(u16::MAX),
+            rows: n,
+            complete: exact && item.is_none_or(|i| state.incomplete(i).is_none()),
+            start,
+            end,
+            max_scroll,
+            page: u16::try_from(body_room).unwrap_or(u16::MAX),
+            area: Rect::default(),
+        };
+        // Read in full: every row of the text on screen now or before, here (not the detail
+        // view's, wrapped at another width).
+        let whole = window.complete && sv.all_seen(&window);
+        let mut lines: Vec<Line<'static>> = body[start..end].to_vec();
+        let mut more = None;
+        if rule == 1 {
+            let cue = if max_scroll == 0 {
+                String::new()
+            } else if end < n {
+                format!(" ↓ {} more lines · tap ", n - end)
+            } else {
+                format!(" ↑ {start} lines above · tap: top ")
+            };
+            let cue = truncate_cells(&cue, inner_w.saturating_sub(2));
+            let rest = inner_w.saturating_sub(2 + crate::edit::width(&cue));
+            let style = if end < n {
+                Style::default().fg(Color::Yellow)
+            } else {
+                dim
+            };
+            if max_scroll > 0 {
+                more = Some(lines.len());
+            }
+            lines.push(Line::from(vec![
+                Span::styled("─".repeat(2.min(inner_w)), dim),
+                Span::styled(cue, style),
+                Span::styled("─".repeat(rest), dim),
+            ]));
+        }
+        let options_cut = shown.iter().any(|i| answer(*i) && !drawn.contains(i));
+        let mut row_at = Vec::new();
+        for &i in &drawn {
+            let row = draw_row(i);
+            row_at.push((rows[i].kind, lines.len(), row.len()));
+            lines.extend(row);
+        }
+        // Its text noted as drawn even when it shows whole (read, it stays read when a resize
+        // leaves it less room); paged and scrolled only when it does not.
+        let sheet = (n > 0 || windowed).then_some((window, more, (above, below)));
+        let windowed = windowed && (above > 0 || below > 0);
+        (lines, row_at, whole, options_cut, windowed, sheet, low)
+    } else {
+        // A report (no item) takes the room the rows leave (with a filter, those it keeps, maybe
+        // none: the rest go first when they do not all fit); what does not fit ends in `…`.
+        if item.is_none() {
+            let kept = if popup.filter.is_empty() {
+                all.clone()
+            } else {
+                matches.clone()
+            };
+            let room = fit.saturating_sub(height_of(&[], &kept) + usize::from(!kept.is_empty()));
+            if head.len() > room {
+                head.truncate(room);
+                if let Some(last) = head.last_mut() {
+                    *last = ellipsized(std::mem::take(last), head_w);
+                }
+            }
+        }
+        // A report's popup whose filter matches no row shows the report alone: no row would be
+        // drawn under it, so none takes its room. (An item's keeps its options: it counts as
+        // drawn only with them.)
+        let mut shown = if item.is_none() && !popup.filter.is_empty() && matches.is_empty() {
+            Vec::new()
         } else {
+            all.clone()
+        };
+        let mut whole = true;
+        if let Some(i) = item.filter(|_| height_of(&head, &all) > fit) {
+            let read = detail_read || popup.read.as_ref() == Some(&(i.attn_id.clone(), i.revision));
+            let note = if read {
+                "read in full in the main pane: answer it here"
+            } else {
+                // Not room for it: no option is listed, and the main pane shows it to be read.
+                shown.retain(|&k| !matches!(rows[k].kind, ActionKind::Answer(_)));
+                whole = false;
+                panes.long_item = Some(card.clone());
+                "too long to show here: it is open in the main pane. Esc, read it to its end \
+                 (PgUp/PgDn), then Enter here again to answer it"
+            };
+            head = wrap_line(Line::from(Span::styled(note, dim)), head_w);
+            exact = true;
+        }
+        let mut lines: Vec<Line<'static>> = head
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.spans.insert(0, Span::raw(" "));
+                l
+            })
+            .collect();
+        // Not even a row's room under the item's text (a short screen): its end is cut, and it
+        // is not drawn in full.
+        if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) + 1 > fit {
+            lines.truncate(fit.saturating_sub(2));
+            // Read in full in its detail view, it stays so (its note is what was cut); an item
+            // not read, cut, is opened there to be read, as one too long for the popup.
+            if item.is_none() || !detail_read {
+                whole = false;
+            }
+            if item.is_some() && !detail_read {
+                panes.long_item = Some(card.clone());
+            }
+            // A report cut short says so.
+            if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {
+                *last = ellipsized(std::mem::take(last), inner_w);
+            }
+        }
+        let rule = usize::from(!lines.is_empty() && !shown.is_empty());
+        if rule == 1 {
+            lines.push(Line::from(Span::styled("─".repeat(inner_w), dim)));
+        }
+        // The rows that fit: when they don't all, those the filter leaves out go first, then a
+        // window of them keeps the highlighted one in view.
+        let room = fit.saturating_sub(lines.len());
+        // An option taller than that room (a narrow screen) never fits: once its item's detail
+        // view was read in full, it is listed on a row by its number and first line, there to be
+        // picked and answered; else it is not drawn, and not answered.
+        let draw_row = |i: usize| -> Vec<Line<'static>> {
+            let full = row_lines(i);
+            if !(detail_read && matches!(rows[i].kind, ActionKind::Answer(_)) && full.len() > room)
+            {
+                return full;
+            }
+            let label = &rows[i].label;
+            let mut first = label.lines().next().unwrap_or_default().to_string();
+            if label.trim_end().contains('\n') {
+                first.push('…');
+            }
+            let mark = " (read in full)";
+            let text = inner_w.saturating_sub(1);
+            let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
+            row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
+        };
+        let mut drawn: Vec<usize> = shown.clone();
+        let mut windowed = false;
+        if shown.iter().map(|&i| draw_row(i).len()).sum::<usize>() > room {
+            windowed = true;
+            if !popup.filter.is_empty() {
+                drawn.retain(|i| matches.contains(i));
+            }
+            let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
+            let at = popup
+                .sel
+                .and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
             let mut start = 0;
             if let Some(at) = at {
                 while start < at && heights[start..=at].iter().sum::<usize>() > room {
@@ -8165,25 +8342,26 @@ fn render_action_popup(
             }
             drawn = drawn[start..end].to_vec();
         }
-    }
-    // Every option must be drawn for the item to be, unless its detail view was read in full:
-    // then only an option drawn is answered ([`Panes::popup_partial`]).
-    let options_cut = shown
-        .iter()
-        .any(|i| matches!(rows[*i].kind, ActionKind::Answer(_)) && !drawn.contains(i));
-    // Where each row drawn starts and how many lines it takes: a tap on any of them is a tap
-    // on the row.
-    let mut row_at = Vec::new();
-    for &i in &drawn {
-        let row = draw_row(i);
-        row_at.push((rows[i].kind, lines.len(), row.len()));
-        lines.extend(row);
-    }
-    if lines.len() > fit {
-        // Still taller than the room (a great many rows): cut, and not drawn in full.
-        lines.truncate(fit);
-        whole = false;
-    }
+        // Every option must be drawn for the item to be, unless its detail view was read in full:
+        // then only an option drawn is answered ([`Panes::popup_partial`]).
+        let options_cut = shown
+            .iter()
+            .any(|i| matches!(rows[*i].kind, ActionKind::Answer(_)) && !drawn.contains(i));
+        // Where each row drawn starts and how many lines it takes: a tap on any of them is a tap
+        // on the row.
+        let mut row_at = Vec::new();
+        for &i in &drawn {
+            let row = draw_row(i);
+            row_at.push((rows[i].kind, lines.len(), row.len()));
+            lines.extend(row);
+        }
+        if lines.len() > fit {
+            // Still taller than the room (a great many rows): cut, and not drawn in full.
+            lines.truncate(fit);
+            whole = false;
+        }
+        (lines, row_at, whole, options_cut, windowed, None, bottom)
+    };
     // The rows drawn whole: only those run from Enter (a row cut off draws no target either).
     panes.popup_rows = Some((
         popup.target.clone(),
@@ -8222,8 +8400,36 @@ fn render_action_popup(
         (ActionTarget::Queued(_), _) => " queued message ".to_string(),
     };
     let hint = popup.hint.as_ref().filter(|_| state.compact());
+    // On a phone, how many rows are out of view above and below the window of them; a text
+    // with no rows under it to keep its line, its own.
+    let rows_cue = sheet
+        .as_ref()
+        .map(|(_, _, (above, below))| (*above, *below))
+        .filter(|_| state.compact() && windowed);
+    let text_cue = sheet
+        .as_ref()
+        .filter(|(w, more, _)| more.is_none() && w.max_scroll > 0)
+        .map(|(w, ..)| {
+            if w.end < w.rows {
+                format!("↓ {} more lines", w.rows - w.end)
+            } else {
+                format!("↑ {} lines above", w.start)
+            }
+        });
     let footer = match (popup.filter.is_empty(), windowed) {
         _ if hint.is_some() => format!(" {} ", hint.map_or("", String::as_str)),
+        _ if text_cue.is_some() => format!(" {} · Esc closes ", text_cue.unwrap_or_default()),
+        (true, true) if rows_cue.is_some() => {
+            let (above, below) = rows_cue.unwrap_or_default();
+            let mut cue = Vec::new();
+            if above > 0 {
+                cue.push(format!("↑{above}"));
+            }
+            if below > 0 {
+                cue.push(format!("↓{below}"));
+            }
+            format!(" {} more rows · Esc closes ", cue.join(" "))
+        }
         (true, false) => " Enter runs · Esc closes ".to_string(),
         (true, true) => " ↑↓ more rows · Esc closes ".to_string(),
         (false, _) => format!(" filter: {} ", popup.filter),
@@ -8252,7 +8458,26 @@ fn render_action_popup(
             );
         }
     }
-    let partial = whole && options_cut && detail_read;
+    // The sheet's text, scrolled in its rows ([`Panes::sheet`]), and the line under it,
+    // which pages it (or, with no rows under it, the bottom border).
+    if let Some((mut w, more, _)) = sheet {
+        let shown = u16::try_from(w.end - w.start).unwrap_or(u16::MAX);
+        w.area = Rect::new(inner.x, inner.y, inner.width, shown.min(inner.height));
+        if w.max_scroll > 0 {
+            let cue = match more {
+                Some(at) => inner.y + u16::try_from(at).unwrap_or(u16::MAX),
+                None => rect.bottom().saturating_sub(1),
+            };
+            panes.target(
+                Rect::new(rect.x, cue, rect.width, 1).intersection(rect),
+                Target::More(crate::select::Scrolled::Sheet),
+            );
+        }
+        panes.sheet = Some(w);
+    }
+    // Some of the options drawn, its text read in full (in its detail view, or on a phone in
+    // the popup itself): only an option drawn is answered.
+    let partial = whole && options_cut && (detail_read || state.compact());
     panes.popup_partial = partial;
     if let Some(i) = item
         .filter(|i| whole && (!options_cut || partial) && exact && state.incomplete(i).is_none())
@@ -8434,7 +8659,16 @@ fn screen_hints(state: &AppState) -> &'static str {
         if matches!(p.target, crate::app::ActionTarget::Queued(_)) {
             return "↑↓/tap pick · Enter/tap again run · type to filter · Esc close";
         }
-        return if compact {
+        return if compact
+            && state
+                .view
+                .panes
+                .sheet
+                .as_ref()
+                .is_some_and(|w| w.max_scroll > 0)
+        {
+            "wheel/PgDn read · 1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
+        } else if compact {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
         } else {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Tab/Shift-↑↓ other card · Esc close"
@@ -8786,7 +9020,7 @@ fn render_status(
 ) {
     panes.add(PaneId::Text, area);
     if let Some(c) = state.view.confirm.as_ref().filter(|_| state.compact()) {
-        render_compact_confirm(frame, area, &c.prompt, panes);
+        render_compact_confirm(frame, area, state, &c.prompt, panes);
         return;
     }
     let width = usize::from(area.width);
@@ -9092,10 +9326,19 @@ fn status_notes(state: &AppState, parked: Option<String>) -> Option<String> {
 }
 
 /// A question waiting for `y` on a phone, over the status bar's `area`: its prompt on the rows
-/// it takes (cut with `…` where they do not all fit), then `[ yes ]` and `[ no ]` side by side
-/// on its last [`TAP_ROWS`] rows, each a filled block those rows tall, all of it its target
-/// ([`Target::Yes`], [`Target::No`]).
-fn render_compact_confirm(frame: &mut Frame, area: Rect, prompt: &str, panes: &mut Panes) {
+/// it takes, then `[ yes ]` and `[ no ]` side by side on its last [`TAP_ROWS`] rows, each a
+/// filled block those rows tall, all of it its target ([`Target::Yes`], [`Target::No`]). A
+/// prompt taller than its rows is never cut: it scrolls in them ([`Panes::ask`], the wheel
+/// over it), its last row saying how much of it is below (a tap pages it, [`Target::More`]),
+/// and its `yes` is dimmed, no control, until every row of it has been on screen: only a
+/// prompt read to its end is answered.
+fn render_compact_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    prompt: &str,
+    panes: &mut Panes,
+) {
     let band = TAP_ROWS.min(area.height);
     let text = Rect {
         height: area.height - band,
@@ -9106,17 +9349,62 @@ fn render_compact_confirm(frame: &mut Frame, area: Rect, prompt: &str, panes: &m
         .fg(Color::Black)
         .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
-    let mut lines: Vec<Line<'static>> = wrap(&format!(" {prompt} "), width)
+    let lines: Vec<Line<'static>> = wrap(&format!(" {prompt} "), width)
         .into_iter()
         .map(|l| Line::from(Span::styled(l, style)))
         .collect();
-    if lines.len() > usize::from(text.height) {
-        lines.truncate(usize::from(text.height));
-        if let Some(last) = lines.last_mut() {
-            *last = ellipsized(std::mem::take(last), width);
-        }
+    // Cut: its last row is the cue (with a row of it left above), else the one row it has.
+    let cut = lines.len() > usize::from(text.height);
+    let cue = cut && text.height >= 2;
+    let room = usize::from(text.height) - usize::from(cue);
+    let max_scroll = lines.len().saturating_sub(room);
+    let view = &state.view.ask_view;
+    let start = view.start_of(prompt, 0, area.width, max_scroll);
+    let end = (start + room).min(lines.len());
+    let shown = Rect {
+        height: u16::try_from(room).unwrap_or(0),
+        ..text
+    };
+    let window = crate::select::CardWindow {
+        thread: String::new(),
+        attn_id: prompt.to_string(),
+        revision: 0,
+        width: area.width,
+        rows: lines.len(),
+        complete: true,
+        start,
+        end,
+        max_scroll,
+        page: shown.height,
+        area: shown,
+    };
+    let read = view.all_seen(&window);
+    frame.render_widget(Paragraph::new(lines[start..end].to_vec()), shown);
+    // Noted as drawn even whole (read, it stays read when a resize leaves it less room).
+    panes.ask = Some(window);
+    // Its cue, which a tap pages (with no row for it, only the wheel scrolls it: no control
+    // where none is drawn).
+    if cue {
+        let more = if end < lines.len() {
+            format!(" ↓ {} more lines · tap ", lines.len() - end)
+        } else {
+            format!(" ↑ {start} lines above · tap: top ")
+        };
+        let row = Rect {
+            y: text.bottom() - 1,
+            height: 1,
+            ..text
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(truncate_cells(&more, width))).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            row,
+        );
+        panes.target(row, Target::More(crate::select::Scrolled::Ask));
     }
-    frame.render_widget(Paragraph::new(lines), text);
     if band < TAP_ROWS {
         return;
     }
@@ -9136,13 +9424,24 @@ fn render_compact_confirm(frame: &mut Frame, area: Rect, prompt: &str, panes: &m
         (yes, CONFIRM_YES, Target::Yes),
         (no, CONFIRM_NO, Target::No),
     ] {
+        // Not read to its end: `yes` dimmed, and no control.
+        let unread = target == Target::Yes && !read;
+        let style = if unread {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            button
+        };
         frame.render_widget(
             Paragraph::new(Line::from(label))
                 .alignment(Alignment::Center)
-                .style(button),
+                .style(style),
             rect,
         );
-        panes.target(rect, target);
+        if !unread {
+            panes.target(rect, target);
+        }
     }
 }
 
@@ -9295,7 +9594,9 @@ fn status_height(state: &AppState, area: Rect) -> u16 {
     // On a phone, a question waiting for `y` gets its answers two rows tall under it.
     if let Some(c) = state.view.confirm.as_ref().filter(|_| state.compact()) {
         let prompt = wrap(&format!(" {} ", c.prompt), usize::from(area.width).max(1)).len();
-        let most = usize::from(area.height / 2).max(usize::from(TAP_ROWS) + 1);
+        // Cut, a row of it and the row saying how much is below it at least.
+        let least = usize::from(TAP_ROWS) + if prompt > 1 { 2 } else { 1 };
+        let most = usize::from(area.height / 2).max(least);
         return u16::try_from((prompt + usize::from(TAP_ROWS)).min(most)).unwrap_or(TAP_ROWS);
     }
     let cap = usize::from(area.height / 3).max(1);
