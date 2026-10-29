@@ -102,7 +102,7 @@ impl Detail {
 /// that the worker cards nested in it ([`Dock::cards`]) are drawn with the views, under the
 /// overlays, and the rest after them ([`Dock::render`]).
 ///
-/// With the workspaces docked ([`AppState::ws_docked`]): a header, `WORKSPACES` and the `‹`
+/// With the workspaces docked ([`AppState::ws_docked`]): a header, `THREADS` and the `‹`
 /// that hides them (the whole row); then, with the cards in the column, each workspace's
 /// card in order, the current one's followed by the worker cards, indented under its mark,
 /// and the others' by their threads ([`worker_rows`]); the buttons on the last two rows. The
@@ -344,7 +344,7 @@ impl Dock {
         if let Some(head) = self.header {
             let dim = Style::default().fg(Color::DarkGray);
             let room = usize::from(head.width);
-            let label = " WORKSPACES";
+            let label = " THREADS";
             let close = "‹ ";
             let gap = room.saturating_sub(crate::edit::width(label) + crate::edit::width(close));
             frame.render_widget(
@@ -944,7 +944,7 @@ enum Entry {
     /// A thread's card of the current workspace, `.1` rows ([`crate::ui::card_height`]),
     /// nested under its card.
     Card(String, u16),
-    /// `+ New workspace` and `⚙ Settings`, side by side, [`crate::ui::TAP_ROWS`] tall.
+    /// `+ New workspace` and `⚙ Settings`, side by side, a row tall.
     Buttons,
 }
 
@@ -954,7 +954,7 @@ impl Entry {
             Entry::Rows(lines, _) => u16::try_from(lines.len()).unwrap_or(u16::MAX),
             Entry::Gap => 1,
             Entry::Card(_, h) => *h,
-            Entry::Buttons => crate::ui::TAP_ROWS,
+            Entry::Buttons => 1,
         }
     }
 }
@@ -1009,8 +1009,9 @@ fn phone_worker_rows(state: &AppState, tab: &Tab, width: usize) -> Vec<Vec<Line<
 /// The compact layout's Threads screen over `area`, in a TUI opened on a workspace: each
 /// workspace's card (its name and status), the current one's thread cards nested under it,
 /// as tall as their text, beside its mark, every other one's threads on two rows each
-/// ([`phone_worker_rows`]); then `+ New workspace` and `⚙ Settings` side by side. Every control
-/// is at least [`crate::ui::TAP_ROWS`] rows tall, all its rows its target. One list that
+/// ([`phone_worker_rows`]); then `+ New workspace` and `⚙ Settings` side by side, a row tall.
+/// Every workspace or thread entry is at least [`crate::ui::TAP_ROWS`] rows tall, all its rows
+/// its target. One list that
 /// scrolls a whole entry at a time: with the wheel (a swipe), else as little as keeps what
 /// the keys or a tap selected in view ([`AppState::ws_keyed`], the selected card), the
 /// current workspace's card while nothing is; `↑` and `↓` at its right edge say there is
@@ -1121,8 +1122,8 @@ pub fn render_phone(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut
         if room == 0 {
             break;
         }
-        // Whole; but a card first and taller than the screen is cut to it (a control never:
-        // shorter than its two rows, it is not drawn, and not tapped).
+        // Whole; but a card first and taller than the screen is cut to it (an entry never: not
+        // drawn whole, it is not drawn, and not tapped).
         let eh = entry.height();
         let cut = i == start && matches!(entry, Entry::Card(..)) && room >= 3;
         if eh > room && !cut {
@@ -1333,15 +1334,10 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     let room = inner_w.saturating_sub(NAME_LABEL.len() + 1);
     let skip = name.chars().count().saturating_sub(room);
     let shown: String = name.chars().skip(skip).collect();
-    // On a phone, a row under the top border closes it too: its `✕` two rows tall.
-    let spacer = u16::from(state.compact());
-    let mut lines: Vec<Line<'static>> = (0..spacer)
-        .map(|_| Line::from(Span::styled(format!("{:>inner_w$}", "✕ close "), dim)))
-        .collect();
-    lines.push(Line::from(vec![
+    let mut lines = vec![Line::from(vec![
         Span::raw(NAME_LABEL),
         Span::styled(shown.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ]));
+    ])];
     let (note, style) = match state.new_ws_error(name) {
         Some(why) if !name.is_empty() => (why, Style::default().fg(Color::Red)),
         _ => (
@@ -1371,16 +1367,13 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
-    if spacer > 0 && inner.height > 0 {
-        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
-    }
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
     // The cursor after the name, on its row.
     let label = u16::try_from(NAME_LABEL.len()).unwrap_or(u16::MAX);
     let x = inner.x + label + u16::try_from(crate::edit::width(&shown)).unwrap_or(u16::MAX);
-    if inner.height > spacer && x < inner.x + inner.width {
-        frame.set_cursor_position((x, inner.y + spacer));
+    if inner.height > 0 && x < inner.x + inner.width {
+        frame.set_cursor_position((x, inner.y));
     }
 }
 
@@ -1880,10 +1873,7 @@ pub(crate) mod tests {
             assert!(st.ws_docked() && !st.tabs_shown(), "{text}");
             let dock = st.dock_width();
             let col = |y: usize| r[y].chars().take(usize::from(dock)).collect::<String>();
-            assert!(
-                col(0).contains("WORKSPACES") && col(0).contains('‹'),
-                "{text}"
-            );
+            assert!(col(0).contains("THREADS") && col(0).contains('‹'), "{text}");
             let left: Vec<String> = (0..40).map(col).collect();
             let left = left.join("\n");
             for want in [
@@ -2053,7 +2043,7 @@ pub(crate) mod tests {
         let mut st = in_workspaces("default");
         let r = rows(&mut st, 140, 40);
         assert!(st.ws_docked() && st.cards_docked() && !st.tabs_shown());
-        assert!(r[0].contains("WORKSPACES"), "{}", r.join("\n"));
+        assert!(r[0].contains("THREADS"), "{}", r.join("\n"));
         assert!(st.view.panes.list.is_some());
         for k in ['b', 't'] {
             let a = st.handle_key(crate::app::tests::ctrl(k));
@@ -2061,7 +2051,7 @@ pub(crate) mod tests {
             let r = rows(&mut st, 140, 40);
             assert!(!st.ws_docked() && !st.cards_docked() && st.tabs_shown());
             assert_eq!(st.dock_width(), 0);
-            assert!(!r.join("\n").contains("WORKSPACES"), "{}", r.join("\n"));
+            assert!(!r.join("\n").contains("THREADS"), "{}", r.join("\n"));
             assert!(st.view.panes.list.is_none(), "no card drawn");
             assert!(st.view.panes.get(&PaneId::Workspaces).is_none());
             assert!(r[0].starts_with(" ≡  default"), "{}", r[0]);
@@ -2072,7 +2062,7 @@ pub(crate) mod tests {
             assert_eq!(a, vec![Action::WsSidebar(true)], "Ctrl-{k}");
             let r = rows(&mut st, 140, 40);
             assert!(st.ws_docked() && st.cards_docked() && !st.tabs_shown());
-            assert!(r[0].contains("WORKSPACES"), "{}", r.join("\n"));
+            assert!(r[0].contains("THREADS"), "{}", r.join("\n"));
         }
         // The grid: the sidebar lists the workspaces beside the tiles, and hides whole.
         st.handle_key(crate::app::tests::ctrl('g'));
@@ -2083,7 +2073,7 @@ pub(crate) mod tests {
         let r = rows(&mut st, 140, 40);
         assert_eq!(st.view.screen, Screen::Grid, "the view stays");
         assert_eq!(st.dock_width(), 0);
-        assert!(!r.join("\n").contains("WORKSPACES"));
+        assert!(!r.join("\n").contains("THREADS"));
         // Back to the stack, it is still hidden: one flag for every view.
         st.handle_key(crate::app::tests::ctrl('g'));
         rows(&mut st, 140, 40);
@@ -2133,7 +2123,7 @@ pub(crate) mod tests {
         let mut st = in_workspaces("default");
         let r = rows(&mut st, 90, 30);
         assert!(st.ws_docked() && st.cards_docked() && !st.tabs_shown());
-        assert!(r[0].contains("WORKSPACES"), "{}", r.join("\n"));
+        assert!(r[0].contains("THREADS"), "{}", r.join("\n"));
         assert!(st.view.panes.list.is_some(), "{}", r.join("\n"));
         assert_eq!(st.dock_width(), crate::ui::side_width(90) + 1 + NEST);
         st.handle_key(crate::app::tests::ctrl('b'));
@@ -2276,14 +2266,12 @@ pub(crate) mod tests {
             );
             let targets = st.view.panes.targets.clone();
             for (k, (a, ta)) in targets.iter().enumerate() {
-                if matches!(
-                    ta,
-                    Target::Screen(_)
-                        | Target::Workspace(_)
-                        | Target::NewWorkspace
-                        | Target::Settings
-                ) {
+                // The tabs and the entries two rows tall, the buttons a row.
+                if matches!(ta, Target::Screen(_) | Target::Workspace(_)) {
                     assert!(a.height >= 2, "{ta:?} {a:?} at {w}x{h}: {text}");
+                }
+                if matches!(ta, Target::NewWorkspace | Target::Settings) {
+                    assert_eq!(a.height, 1, "{ta:?} {a:?} at {w}x{h}: {text}");
                 }
                 for (b, tb) in &targets[k + 1..] {
                     assert!(ta == tb || !a.intersects(*b), "{ta:?} {tb:?} at {w}x{h}");
@@ -2309,14 +2297,11 @@ pub(crate) mod tests {
             }
             assert_eq!(st.ws_keyed(), Some(WsRow::Settings), "{w}x{h}");
         }
-        // A list with less than a control's two rows draws none of them, not one cut short.
+        // A list with less than an entry's two rows draws none of them, not one cut short.
         for h in [6u16, 7] {
             let text = rows(&mut st, 40, h).join("\n");
             for (a, t) in &st.view.panes.targets {
-                if matches!(
-                    t,
-                    Target::Workspace(_) | Target::NewWorkspace | Target::Settings
-                ) {
+                if matches!(t, Target::Workspace(_)) {
                     assert!(a.height >= 2, "{t:?} {a:?} at 40x{h}: {text}");
                 }
             }
@@ -2325,7 +2310,7 @@ pub(crate) mod tests {
         // the Threads screen as it was.
         let r = rows(&mut st, 160, 40);
         assert!(!st.compact() && st.ws_docked() && st.cards_docked());
-        assert!(r[0].contains("WORKSPACES"), "{}", r.join("\n"));
+        assert!(r[0].contains("THREADS"), "{}", r.join("\n"));
         let r = rows(&mut st, 40, 20);
         assert!(
             st.ws_screen() && r[0].contains("Threads"),
@@ -2393,12 +2378,12 @@ pub(crate) mod tests {
         assert!(r.contains("+ New workspace"), "{r}");
         st.handle_key(crate::app::tests::ctrl('t'));
         let r = rows(&mut st, 160, 40).join("\n");
-        assert!(!r.contains("WORKSPACES") && !r.contains('≡'), "{r}");
+        assert!(!r.contains("THREADS") && !r.contains('≡'), "{r}");
         // A TUI opened on a socket has no workspaces: its sidebar has the cards alone, and
         // Ctrl-T hides it as Ctrl-B does.
         let mut st = crate::app::tests::with_orch();
         let r = rows(&mut st, 160, 40).join("\n");
-        assert!(!r.contains("WORKSPACES"), "{r}");
+        assert!(!r.contains("THREADS"), "{r}");
         assert!(st.cards_docked());
         let a = st.handle_key(crate::app::tests::ctrl('t'));
         assert_eq!(a, vec![Action::WsSidebar(false)]);
@@ -2571,7 +2556,7 @@ pub(crate) mod tests {
             "[tui.notify] terminal",
             "Compact below",
             "60 columns",
-            "Sidebar",
+            "Threads sidebar",
             "shown",
             "Colors",
             "[tui] colors",
@@ -2810,7 +2795,7 @@ pub(crate) mod tests {
         swipe(&mut st);
         let end = rows(&mut st, 40, 20).join("\n");
         assert!(end.contains("more-7") && end.contains("Settings"), "{end}");
-        // The second row of a workspace's card and of a button are theirs.
+        // The second row of a workspace's card is its own; a button is a row.
         let r = rows(&mut st, 40, 20);
         let m = r
             .iter()
@@ -2827,7 +2812,7 @@ pub(crate) mod tests {
             .position(|l| l.contains("Settings"))
             .unwrap_or_else(|| panic!("{}", r.join("\n")));
         let b = u16::try_from(b).unwrap();
-        tap_at(&mut st, 40, 20, 30, b + 1);
+        tap_at(&mut st, 40, 20, 30, b);
         assert!(st.view.settings.is_some());
         st.view.settings = None;
         // A key brings the selection back: Up to the start.

@@ -477,7 +477,7 @@ pub const COMMANDS: &[(&str, &str, &str, &[ArgKind])] = &[
     (
         "/sidebar",
         "/sidebar [on|off]",
-        "show or hide the sidebar: the workspaces with their threads (Ctrl-B)",
+        "show or hide Threads, the sidebar: the workspaces with their threads (Ctrl-B)",
         &[ArgKind::OnOff],
     ),
     (

@@ -14,10 +14,10 @@ twr ws                       # list them
 
 ## In the TUI
 
-A sidebar on the left lists every workspace, a card each, with its threads under it. The current workspace's worker cards are nested under its card; each other workspace lists its threads, a row each:
+Threads, the sidebar on the left, lists every workspace, a card each, with its threads under it. The current workspace's worker cards are nested under its card; each other workspace lists its threads, a row each:
 
 ```
- WORKSPACES                         ‹
+ THREADS                            ‹
 ▌_ default                      ⚠1 ●2
 ▌  working · waiting on you
 ▌ ┌ beta ─────── sonnet-4-5 ─ manual ┐
@@ -52,7 +52,7 @@ It is the TUI's only sidebar, narrower below 100 columns. `Ctrl-B` (or `Ctrl-T`,
  ≡  default ⚠1 ●2 │ client-x ●1 │ scratch ○
 ```
 
-The `≡` at its left shows the sidebar again, as `Ctrl-B` does. In the [compact layout](tui.md#on-a-phone) the workspaces are on its `Threads` screen, as in the sidebar, the current one's thread cards nested under its card, in a list that scrolls, every control on it two rows tall. Switch with:
+The `≡` at its left shows the sidebar again, as `Ctrl-B` does. In the [compact layout](tui.md#on-a-phone) the workspaces are on its `Threads` screen, as in the sidebar, the current one's thread cards nested under its card, in a list that scrolls, each workspace and thread entry on it two rows tall. Switch with:
 
 - a click on a card, a thread under another workspace's card, or a tab;
 - `Alt-1` to `Alt-9` for the workspace at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
