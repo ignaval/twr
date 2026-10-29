@@ -8185,9 +8185,9 @@ fn render_action_popup(
             page: u16::try_from(body_room).unwrap_or(u16::MAX),
             area: Rect::default(),
         };
-        // Read in full: every row of the text on screen now or before, here (not the detail
-        // view's, wrapped at another width).
-        let whole = window.complete && sv.all_seen(&window);
+        // Its whole text is in the sheet, to scroll to: drawn in full wherever it is scrolled
+        // (but a capped preview, or a row cut at the width).
+        let whole = window.complete;
         let mut lines: Vec<Line<'static>> = body[start..end].to_vec();
         let mut more = None;
         if rule == 1 {
@@ -8221,8 +8221,8 @@ fn render_action_popup(
             row_at.push((rows[i].kind, lines.len(), row.len()));
             lines.extend(row);
         }
-        // Its text noted as drawn even when it shows whole (read, it stays read when a resize
-        // leaves it less room); paged and scrolled only when it does not.
+        // Its text's window (and the rows' cue), even when it shows whole; paged and scrolled
+        // only when it does not.
         let sheet = (n > 0 || windowed).then_some((window, more, (above, below)));
         let windowed = windowed && (above > 0 || below > 0);
         (lines, row_at, whole, options_cut, windowed, sheet, low)
@@ -8667,7 +8667,7 @@ fn screen_hints(state: &AppState) -> &'static str {
                 .as_ref()
                 .is_some_and(|w| w.max_scroll > 0)
         {
-            "wheel/PgDn read · 1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
+            "wheel/PgDn scroll · 1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
         } else if compact {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
         } else {
@@ -9329,9 +9329,8 @@ fn status_notes(state: &AppState, parked: Option<String>) -> Option<String> {
 /// it takes, then `[ yes ]` and `[ no ]` side by side on its last [`TAP_ROWS`] rows, each a
 /// filled block those rows tall, all of it its target ([`Target::Yes`], [`Target::No`]). A
 /// prompt taller than its rows is never cut: it scrolls in them ([`Panes::ask`], the wheel
-/// over it), its last row saying how much of it is below (a tap pages it, [`Target::More`]),
-/// and its `yes` is dimmed, no control, until every row of it has been on screen: only a
-/// prompt read to its end is answered.
+/// over it), its last row saying how much of it is below (a tap pages it, [`Target::More`]);
+/// `yes` and `no` answer it wherever it is scrolled.
 fn render_compact_confirm(
     frame: &mut Frame,
     area: Rect,
@@ -9378,9 +9377,7 @@ fn render_compact_confirm(
         page: shown.height,
         area: shown,
     };
-    let read = view.all_seen(&window);
     frame.render_widget(Paragraph::new(lines[start..end].to_vec()), shown);
-    // Noted as drawn even whole (read, it stays read when a resize leaves it less room).
     panes.ask = Some(window);
     // Its cue, which a tap pages (with no row for it, only the wheel scrolls it: no control
     // where none is drawn).
@@ -9424,24 +9421,13 @@ fn render_compact_confirm(
         (yes, CONFIRM_YES, Target::Yes),
         (no, CONFIRM_NO, Target::No),
     ] {
-        // Not read to its end: `yes` dimmed, and no control.
-        let unread = target == Target::Yes && !read;
-        let style = if unread {
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::REVERSED)
-        } else {
-            button
-        };
         frame.render_widget(
             Paragraph::new(Line::from(label))
                 .alignment(Alignment::Center)
-                .style(style),
+                .style(button),
             rect,
         );
-        if !unread {
-            panes.target(rect, target);
-        }
+        panes.target(rect, target);
     }
 }
 

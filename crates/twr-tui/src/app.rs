@@ -331,21 +331,11 @@ pub struct ViewState {
     /// The confirm card's detail view: how far it is scrolled and which of its rows have been
     /// on screen ([`CardView`]).
     pub card_view: CardView,
-    /// On a phone, the action popup's text, as [`ViewState::card_view`] for the detail view
-    /// ([`crate::select::Panes::sheet`]): its item counts as read in full once every row of
-    /// it has been on screen.
-    pub sheet_view: CardView,
-    /// On a phone, the prompt of the question waiting for `y` ([`crate::select::Panes::ask`]):
-    /// its `yes` is drawn once every row of it has been on screen.
-    pub ask_view: CardView,
-    /// The prompt of the question waiting for `y` as a phone last drew it cut: answered on a
-    /// phone, it waits [`CARD_SETTLE`] after its `yes` came, by key as by tap, though a resize
-    /// since shows it whole. Cleared when that question ends or another takes its place.
-    pub ask_cut: Option<String>,
-    /// On a phone, the action popup's text (its key and revision, as [`ViewState::sheet_view`])
-    /// read in full, and since when: with no item to answer (a report, a queued message), its
-    /// rows run CARD_SETTLE after.
-    pub sheet_read: Option<(String, u64, Instant)>,
+    /// On a phone, how far the action popup's text is scrolled ([`crate::select::Panes::sheet`]).
+    pub sheet_view: TextScroll,
+    /// On a phone, how far the prompt of the question waiting for `y` is scrolled
+    /// ([`crate::select::Panes::ask`]).
+    pub ask_view: TextScroll,
     /// Parked threads are listed among the cards and tiles (`/parked`); else only those
     /// pinned or with an open attention item are ([`AppState::order`]).
     pub show_parked: bool,
@@ -511,44 +501,47 @@ impl CardView {
             && !self.seen.is_empty()
             && self.seen.iter().all(|s| *s)
     }
+}
 
-    /// Where a window of this view's text starts: as far down as it was scrolled, for the
-    /// same item and revision wrapped at the same width (another height keeps the place: the
-    /// keyboard opening or closing), else its top (wrapped again, it is read again from
-    /// there); within the furthest it scrolls.
-    pub fn start_of(&self, attn_id: &str, revision: u64, width: u16, max_scroll: usize) -> usize {
-        let same = self.attn_id == attn_id && self.revision == revision && self.width == width;
+/// On a phone, where a text scrolled in the rows it has is (the action popup's, the prompt of
+/// the question waiting for `y`, [`crate::select::CardWindow`]): which text, wrapped at which
+/// width, and how many rows down. Another text, or another width (which wraps it again),
+/// starts at its top; another height keeps the place (the keyboard opening or closing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextScroll {
+    /// The text: an attention id, else what it is of (`CardWindow::attn_id`).
+    pub key: String,
+    /// Its revision (for a text with none, a hash of it).
+    pub revision: u64,
+    /// The width it was wrapped at.
+    pub width: u16,
+    /// Rows scrolled from its top.
+    pub scroll: usize,
+}
+
+impl TextScroll {
+    /// Where a window of text `key` (`revision`, wrapped at `width`) starts: as far down as
+    /// it was scrolled when it is this text at this width, else its top; within the furthest
+    /// it scrolls.
+    pub fn start_of(&self, key: &str, revision: u64, width: u16, max_scroll: usize) -> usize {
+        let same = self.key == key && self.revision == revision && self.width == width;
         if same { self.scroll } else { 0 }.min(max_scroll)
     }
 
-    /// Whether every row of `w`'s text is on screen in it or has been before (in this
-    /// layout): what the frame drawing `w` may count as read.
-    pub fn all_seen(&self, w: &crate::select::CardWindow) -> bool {
-        let before = self.is_of(w).then_some(&self.seen);
-        (0..w.rows).all(|r| (w.start..w.end).contains(&r) || before.is_some_and(|s| s[r]))
-    }
-
-    /// Notes window `w` as drawn: its rows on screen have been, from a fresh view, scrolled
-    /// where `w` starts, when `w` is of another item, revision or width.
+    /// Notes window `w` as drawn: of another text or width, scrolled where `w` starts.
     pub fn note(&mut self, w: &crate::select::CardWindow) {
-        if !self.is_of(w) {
-            *self = CardView {
-                scroll: w.start,
-                attn_id: w.attn_id.clone(),
+        if self.key != w.attn_id || self.revision != w.revision || self.width != w.width {
+            *self = TextScroll {
+                key: w.attn_id.clone(),
                 revision: w.revision,
                 width: w.width,
-                seen: vec![false; w.rows],
-                complete: w.complete,
+                scroll: w.start,
             };
-        }
-        for seen in self.seen.iter_mut().take(w.end).skip(w.start) {
-            *seen = true;
         }
     }
 
-    /// Scrolls the view as window `w` drew it down or up `n` rows, at most a page less a row,
-    /// so no row is skipped (every row must have been on screen before its options answer
-    /// it).
+    /// Scrolls the text as window `w` drew it down or up `n` rows, at most a page less a row
+    /// (a row of the last page stays in view).
     pub fn scroll_by(&mut self, w: &crate::select::CardWindow, down: bool, n: usize) {
         let step = n.min(usize::from(w.page.saturating_sub(1))).max(1);
         self.scroll = if down {
@@ -1014,14 +1007,6 @@ pub const MAIN_SELECTED: &str = "the conversation is selected: Shift-→ selects
 
 /// The status bar when the action popup's answer or Dismiss runs while the selected item is
 /// not on screen with its options.
-/// What a phone says to `y` while the prompt of the question waiting for it is cut and has not
-/// been read to its end ([`AppState::ask_unread`]).
-pub const ASK_UNREAD: &str = "read it to its end first: scroll it, or tap ↓ more";
-
-/// What a phone says to an answer while the action popup's text has not been read to its end
-/// ([`crate::select::Panes::sheet`]).
-pub const SHEET_UNREAD: &str = "read it to its end first: scroll the text, or tap ↓ more";
-
 pub const NOT_ON_SCREEN: &str =
     "the selected item is not on screen with its options; select a card you can read";
 
@@ -4584,41 +4569,30 @@ impl AppState {
             (Some(p), _) => Some((p, now)),
             (None, _) => None,
         };
-        // The rows of a confirm card's detail view this frame showed have been on screen, and
-        // on a phone those of the action popup's text and of the question waiting for `y`.
+        // The rows of a confirm card's detail view this frame showed have been on screen.
         if let Some(w) = self.view.panes.card.clone() {
-            self.view.card_view.note(&w);
+            let cv = &mut self.view.card_view;
+            if !cv.is_of(&w) {
+                let same = cv.attn_id == w.attn_id && cv.revision == w.revision;
+                *cv = CardView {
+                    scroll: if same { cv.scroll } else { 0 },
+                    attn_id: w.attn_id.clone(),
+                    revision: w.revision,
+                    width: w.width,
+                    seen: vec![false; w.rows],
+                    complete: w.complete,
+                };
+            }
+            for seen in cv.seen.iter_mut().take(w.end).skip(w.start) {
+                *seen = true;
+            }
         }
+        // On a phone, which text the action popup and the question waiting for `y` scroll.
         if let Some(w) = self.view.panes.sheet.clone() {
             self.view.sheet_view.note(&w);
         }
-        // Since when the sheet's text (that text, of that item and revision) has been read.
-        let read = self
-            .view
-            .panes
-            .sheet
-            .as_ref()
-            .filter(|w| w.complete && self.view.sheet_view.all_seen(w))
-            .map(|w| (w.attn_id.clone(), w.revision));
-        self.view.sheet_read = match (read, self.view.sheet_read.take()) {
-            (Some((id, rev)), Some(s)) if s.0 == id && s.1 == rev => Some(s),
-            (Some((id, rev)), _) => Some((id, rev, now)),
-            (None, _) => None,
-        };
-        // The question waiting for `y` gone or replaced: what was read and cut of it goes.
-        let prompt = self.view.confirm.as_ref().map(|c| c.prompt.clone());
-        if self.view.ask_cut.is_some() && self.view.ask_cut != prompt {
-            self.view.ask_cut = None;
-        }
-        if prompt.is_none() {
-            self.view.ask_view = CardView::default();
-        }
         if let Some(w) = self.view.panes.ask.clone() {
             self.view.ask_view.note(&w);
-            // Cut once, it stays so for its answer (a resize showing it whole is no settle).
-            if w.max_scroll > 0 {
-                self.view.ask_cut = Some(w.attn_id.clone());
-            }
         }
         // Never an item known only by its capped preview ([`Incomplete`]).
         let top = self
@@ -5711,31 +5685,6 @@ impl AppState {
         }
         // A pending confirmation eats the next key: `y` runs it (or its alternative's key
         // its alternative), anything else cancels.
-        // On a phone, a prompt cut to the rows it has is answered only once read to its end,
-        // and on screen so for CARD_SETTLE, as its `yes` is.
-        if self.view.confirm.is_some() && !ctrl && self.ask_cut() && !self.confirm_read() {
-            let alt = self
-                .view
-                .confirm
-                .as_ref()
-                .and_then(|c| c.alt.as_ref())
-                .map(|a| a.0);
-            let answer = match key.code {
-                KeyCode::Char(got) => {
-                    got.eq_ignore_ascii_case(&'y')
-                        || alt.is_some_and(|k| got.eq_ignore_ascii_case(&k))
-                }
-                _ => false,
-            };
-            if answer {
-                self.view.status = Some(if self.ask_unread() {
-                    ASK_UNREAD.into()
-                } else {
-                    "just shown: read it, then answer again".into()
-                });
-                return Vec::new();
-            }
-        }
         if let Some(c) = self.view.confirm.take() {
             if !ctrl && matches!(key.code, KeyCode::Char('y' | 'Y')) {
                 self.view.status = Some(c.pending);
@@ -6866,15 +6815,6 @@ impl AppState {
             return Vec::new();
         };
         if let ActionTarget::Queued(r) = target {
-            // A message longer than the popup is read to its end before it goes or is sent.
-            if matches!(kind, ActionKind::Delete | ActionKind::SendNow) && !self.sheet_settled() {
-                self.view.status = Some(if self.sheet_unread() {
-                    SHEET_UNREAD.into()
-                } else {
-                    "just shown: read it, then again".into()
-                });
-                return Vec::new();
-            }
             self.view.action = None;
             return match kind {
                 ActionKind::Edit => self.retract_queued(r, Retract::Edit),
@@ -6902,14 +6842,6 @@ impl AppState {
                     self.view.action = None;
                 }
                 return actions;
-            }
-            // Stop, as an answer: only with its item (if any) on screen in full, read.
-            ActionKind::Stop if !self.item_read() => {
-                self.view.status = Some(match self.view.shown {
-                    None => self.unread_note().to_string(),
-                    Some(_) => "just shown: read it, then stop again".to_string(),
-                });
-                return Vec::new();
             }
             _ => self.view.action = None,
         }
@@ -7647,11 +7579,11 @@ impl AppState {
         };
         // Only the card on screen, once the user has had time to read it.
         let Some(s) = &self.view.shown else {
-            self.view.status = Some(self.unread_note().into());
+            self.view.status = Some(NOT_ON_SCREEN.into());
             return Vec::new();
         };
         let same = s.attn_id == item.attn_id && s.revision == item.revision;
-        if !same || !self.settled_since(s.since) {
+        if !same || s.since.elapsed() < CARD_SETTLE {
             self.view.status = Some("the card just changed; read it and dismiss again".into());
             return Vec::new();
         }
@@ -7672,9 +7604,16 @@ impl AppState {
     /// page less a row, so no row is skipped (every row must have been on screen before its
     /// options answer it).
     fn scroll_card(&mut self, down: bool, n: usize) {
-        if let Some(w) = self.view.panes.card.as_ref() {
-            self.view.card_view.scroll_by(w, down, n);
-        }
+        let Some(w) = self.view.panes.card.as_ref() else {
+            return;
+        };
+        let step = n.min(usize::from(w.page.saturating_sub(1))).max(1);
+        let cv = &mut self.view.card_view;
+        cv.scroll = if down {
+            cv.scroll.saturating_add(step).min(w.max_scroll)
+        } else {
+            cv.scroll.min(w.max_scroll).saturating_sub(step)
+        };
     }
 
     /// On a phone, scrolls the action popup's text (or the prompt of the question waiting for
@@ -7688,15 +7627,6 @@ impl AppState {
         };
         if let Some(w) = w {
             view.scroll_by(w, down, n);
-        }
-        // What a tap said (read it first) is stale once the text moves.
-        if let Some(p) = self
-            .view
-            .action
-            .as_mut()
-            .filter(|_| which == Scrolled::Sheet)
-        {
-            p.hint = None;
         }
     }
 
@@ -7712,14 +7642,6 @@ impl AppState {
             Some(w) if w.end < w.rows => view.scroll_by(w, true, usize::MAX),
             Some(_) => view.scroll = 0,
             None => {}
-        }
-        if let Some(p) = self
-            .view
-            .action
-            .as_mut()
-            .filter(|_| which == Scrolled::Sheet)
-        {
-            p.hint = None;
         }
     }
 
@@ -8340,9 +8262,6 @@ impl AppState {
         let Some(c) = &self.view.confirm else {
             return false;
         };
-        if self.ask_unread() {
-            return false;
-        }
         let at = self.input_at.unwrap_or_else(Instant::now);
         self.view
             .confirm_seen
@@ -8355,52 +8274,6 @@ impl AppState {
             })
     }
 
-    /// The selected attention item, if any, has been on screen in full for [`CARD_SETTLE`]
-    /// ([`ViewState::shown`]); true with none.
-    fn item_read(&self) -> bool {
-        let Some(item) = self.selected_attention() else {
-            return true;
-        };
-        self.view.shown.as_ref().is_some_and(|s| {
-            s.attn_id == item.attn_id && s.revision == item.revision && self.settled_since(s.since)
-        })
-    }
-
-    /// Whether what came on screen at `since` had been there [`CARD_SETTLE`] when the input
-    /// being handled was read ([`AppState::input_at`]; now, without one): a key or tap read
-    /// earlier and handled late was meant for what was there then.
-    fn settled_since(&self, since: Instant) -> bool {
-        self.input_at
-            .unwrap_or_else(Instant::now)
-            .checked_duration_since(since)
-            .is_some_and(|d| d >= CARD_SETTLE)
-    }
-
-    /// On a phone, the action popup's text (with no item: a report, a queued message) has
-    /// been on screen in full for [`CARD_SETTLE`] ([`ViewState::sheet_read`]); true where no
-    /// sheet was drawn (a desktop's popup).
-    fn sheet_settled(&self) -> bool {
-        let Some(w) = self.view.panes.sheet.as_ref() else {
-            return true;
-        };
-        self.view
-            .sheet_read
-            .as_ref()
-            .is_some_and(|(id, rev, since)| {
-                *id == w.attn_id && *rev == w.revision && self.settled_since(*since)
-            })
-    }
-
-    /// On a phone, the action popup's text as last drawn has rows that have not been on
-    /// screen ([`crate::select::Panes::sheet`]).
-    fn sheet_unread(&self) -> bool {
-        self.view
-            .panes
-            .sheet
-            .as_ref()
-            .is_some_and(|w| !self.view.sheet_view.all_seen(w))
-    }
-
     /// On a phone, the action popup's text as last drawn had more rows than its room: it
     /// scrolls ([`crate::select::Panes::sheet`]).
     fn sheet_scrolls(&self) -> bool {
@@ -8409,49 +8282,6 @@ impl AppState {
             .sheet
             .as_ref()
             .is_some_and(|w| w.max_scroll > 0)
-    }
-
-    /// Why the selected item is not answered, not drawn in full: on a phone, its text in the
-    /// action popup not read to its end yet ([`SHEET_UNREAD`]); else [`NOT_ON_SCREEN`].
-    fn unread_note(&self) -> &'static str {
-        if self.sheet_unread() {
-            SHEET_UNREAD
-        } else {
-            NOT_ON_SCREEN
-        }
-    }
-
-    /// On a phone, the question waiting for `y` was last drawn with a prompt taller than its
-    /// rows ([`crate::select::Panes::ask`]).
-    fn ask_cut(&self) -> bool {
-        let prompt = self.view.confirm.as_ref().map(|c| &c.prompt);
-        // Cut once (this question, on a phone), it stays so for its answer while the phone's
-        // layout is on; the full layout keeps its own rules.
-        self.compact()
-            && (self
-                .view
-                .ask_cut
-                .as_ref()
-                .is_some_and(|p| Some(p) == prompt)
-                || self
-                    .view
-                    .panes
-                    .ask
-                    .as_ref()
-                    .is_some_and(|w| w.max_scroll > 0 && Some(&w.attn_id) == prompt))
-    }
-
-    /// On a phone, the question waiting for `y` was last drawn cut to the rows it had
-    /// ([`crate::select::Panes::ask`]), and not every row of its prompt has been on screen.
-    fn ask_unread(&self) -> bool {
-        self.compact()
-            && self.view.panes.ask.as_ref().is_some_and(|w| {
-                self.view
-                    .confirm
-                    .as_ref()
-                    .is_some_and(|c| c.prompt == w.attn_id)
-                    && !self.view.ask_view.all_seen(w)
-            })
     }
 
     /// A key while an offer the TUI made by itself is on screen ([`Confirm::offer`]): `y`
@@ -8647,14 +8477,13 @@ impl AppState {
         // On screen in full (the popup, or the main pane, drew it whole: [`ViewState::shown`])
         // and read: unchanged for CARD_SETTLE.
         let shown = match &item {
-            // (Nothing to answer: read once its text in the popup has been, on a phone.)
-            None => (!self.sheet_unread()).then(|| self.sheet_settled()),
+            None => Some(true),
             Some((id, rev)) => self
                 .view
                 .shown
                 .as_ref()
                 .filter(|s| s.attn_id == *id && s.revision == *rev)
-                .map(|s| self.settled_since(s.since)),
+                .map(|s| s.since.elapsed() >= CARD_SETTLE),
         };
         let read = shown == Some(true);
         // Armed on this item, and the item still on screen in full: it runs.
@@ -8679,7 +8508,7 @@ impl AppState {
             let said = match shown {
                 Some(true) => format!("tap {label} again to run it"),
                 Some(false) => "just shown: read it, then tap again".to_string(),
-                None => self.unread_note().to_string(),
+                None => NOT_ON_SCREEN.to_string(),
             };
             let phone = self.compact();
             match self.view.action.as_mut().filter(|_| phone) {
@@ -8987,11 +8816,11 @@ impl AppState {
         // time to read it: one drawn just now replaced what the key was meant for, and one not
         // drawn (hidden in this view, scrolled away, cut short) was never read.
         let Some(s) = &self.view.shown else {
-            self.view.status = Some(self.unread_note().into());
+            self.view.status = Some(NOT_ON_SCREEN.into());
             return Vec::new();
         };
         let same = s.attn_id == item.attn_id && s.revision == item.revision;
-        if !same || !self.settled_since(s.since) {
+        if !same || s.since.elapsed() < CARD_SETTLE {
             self.view.status = Some("the question just changed; read it and answer again".into());
             return Vec::new();
         }
@@ -23028,11 +22857,11 @@ pub(crate) mod tests {
             );
         }
 
-        /// An item the popup cannot draw in full is never answered by a tap: too long for
-        /// it, its text not read to its end, a tap on an option answers nothing. An option
-        /// drawn on a card is only text: a tap on it selects the card.
+        /// On a phone a long item's popup draws it in full, its text scrolling: an option
+        /// tapped twice answers it. An option drawn on a card is only text: a tap on it
+        /// selects the card.
         #[test]
-        fn a_tap_never_answers_an_item_only_partly_drawn() {
+        fn a_long_item_is_answered_by_taps_from_its_popup() {
             // Too long: no option to tap.
             let mut st = compact();
             let mut d = ThreadScript::new("t-delta");
@@ -23052,17 +22881,14 @@ pub(crate) mod tests {
             st.handle_key(key(KeyCode::Enter));
             frame(&mut st, 40, 20);
             read(&mut st);
-            // Its options are drawn under its text, which is not read to its end: a tap,
-            // then another, on one answers nothing, and says to read it first.
+            // Its options are drawn under its text, which scrolls in the popup: drawn in
+            // full there, a tap picks one and a second answers it, unscrolled.
             assert!(st.view.action.is_some());
             let yes = Target::Row(ActionKind::Answer(1));
             assert!(drawn_control(&st, &yes), "{:?}", st.view.panes.targets);
-            for _ in 0..2 {
-                assert!(!responds(&tap(&mut st, 40, 20, yes.clone())));
-                read(&mut st);
-            }
-            let screen = screen_text(&frame(&mut st, 40, 20));
-            assert!(screen.contains("read it to its end first"), "{screen}");
+            assert!(!responds(&tap(&mut st, 40, 20, yes.clone())));
+            read(&mut st);
+            assert!(responds(&tap(&mut st, 40, 20, yes.clone())));
             // An option drawn on a card is text: a tap there selects the card, twice opens its
             // popup, and answers nothing.
             let mut st = three_threads();

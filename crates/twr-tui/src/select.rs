@@ -297,15 +297,14 @@ pub struct Panes {
     /// The confirm card's detail view, when the draw showed it ([`CardWindow`]), not hidden
     /// under an overlay.
     pub card: Option<CardWindow>,
-    /// On a phone, the action popup's text (its item, a report, a queued message) when it
-    /// had more rows than the popup's room above its rows ([`CardWindow`]): the wheel over
-    /// it, PgUp/PgDn and Ctrl-↑↓ scroll it, its rows staying where they are
+    /// On a phone, the action popup's text (its item, a report, a queued message) as drawn
+    /// in the rows its options leave it ([`CardWindow`]): when it has more rows than that, the
+    /// wheel over it, PgUp/PgDn and Ctrl-↑↓ scroll it, its options staying where they are
     /// ([`crate::app::ViewState::sheet_view`]).
     pub sheet: Option<CardWindow>,
     /// On a phone, the prompt of the question waiting for `y` as the status bar drew it
-    /// ([`CardWindow`], its `attn_id` the prompt): the wheel over it scrolls it, and its
-    /// `yes` is drawn once every row of it has been on screen
-    /// ([`crate::app::ViewState::ask_view`]).
+    /// ([`CardWindow`], its `attn_id` the prompt): when it has more rows than the status bar
+    /// gives it, the wheel over it scrolls it ([`crate::app::ViewState::ask_view`]).
     pub ask: Option<CardWindow>,
     /// The trash overlay's furthest scroll as drawn (its rows past its height).
     pub trash_max: u16,
