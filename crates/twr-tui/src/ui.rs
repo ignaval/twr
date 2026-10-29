@@ -8074,10 +8074,15 @@ fn render_action_popup(
             l
         })
         .collect();
-    // Not even a row's room under the item's text (a short screen): its end is cut, and it is
-    // not drawn in full.
-    if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) >= fit {
-        lines.truncate(fit.saturating_sub(2));
+    // Not even a row's room under the item's text (a short screen; on a phone, a row's two
+    // rows, [`TAP_ROWS`]): its end is cut, and it is not drawn in full.
+    let row_h = if state.compact() {
+        usize::from(TAP_ROWS)
+    } else {
+        1
+    };
+    if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) + row_h > fit {
+        lines.truncate(fit.saturating_sub(1 + row_h));
         whole = false;
         // A report cut short says so.
         if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {

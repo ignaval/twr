@@ -1416,7 +1416,7 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workspace::{OrchGlance, Tab, WorkerGlance};
 

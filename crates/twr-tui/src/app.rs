@@ -4642,9 +4642,11 @@ impl AppState {
         self.view.block = None;
         self.view.queued = None;
         self.view.detail = None;
-        // Another card selected: the cards follow the selection again.
+        // Another card selected: the cards (and the compact Threads screen's list, which the
+        // wheel may have moved) follow the selection again.
         if self.view.focus != thread {
             self.view.card_scroll = None;
+            self.view.ws_wheeled = false;
         }
         self.view.focus = thread;
     }
@@ -22257,6 +22259,61 @@ pub(crate) mod tests {
                         assert!(st.action_popup().is_some(), "40x{h}");
                     }
                 }
+            }
+        }
+
+        /// On the shortest phones the action popup still lists a row to act on: the item's
+        /// text gives way to it (then not drawn in full, so read in the main pane to answer).
+        #[test]
+        fn a_short_phone_popup_keeps_a_row_to_act_on() {
+            for (w, h) in [(40u16, 12u16), (40, 13), (80, 12)] {
+                let mut st = compact();
+                st.view.compact = Some(true);
+                st.show_pane(CompactPane::Needs);
+                frame(&mut st, w, h);
+                st.handle_key(key(KeyCode::Enter));
+                frame(&mut st, w, h);
+                assert!(st.action_popup().is_some(), "{w}x{h}");
+                let rows = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Row(_)))
+                    .count();
+                assert!(rows >= 1, "{w}x{h}: {:?}", st.view.panes.targets);
+            }
+        }
+
+        /// After a swipe moved the compact Threads list, a card Tab selects stays in view on
+        /// the frames after, not only the first.
+        #[test]
+        fn a_card_selected_after_a_swipe_stays_in_view() {
+            use crossterm::event::{MouseEvent, MouseEventKind};
+            let mut st = crate::sidebar::tests::in_workspaces("default");
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 14);
+            for _ in 0..20 {
+                let screen = frame(&mut st, 40, 14);
+                let area = st.view.panes.phone.unwrap();
+                st.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x + 3,
+                        row: area.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &screen,
+                );
+            }
+            st.handle_key(key(KeyCode::Tab));
+            let card = st.focused().unwrap().to_string();
+            for _ in 0..3 {
+                frame(&mut st, 40, 14);
+                assert!(
+                    st.view.panes.get(&PaneId::Thread(card.clone())).is_some(),
+                    "{card} in view"
+                );
             }
         }
 
