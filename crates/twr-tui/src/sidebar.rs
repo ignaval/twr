@@ -16,7 +16,7 @@
 //! compact layout it is the Workspaces screen. The tab strip is drawn only where the column
 //! does not list the workspaces, so they never show twice.
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -107,18 +107,11 @@ impl Detail {
 /// at last, a row each still too many, the ones furthest from the current workspace give way
 /// to `↑ more` / `↓ more`. Without the cards in the column, the workspaces are a list that
 /// scrolls on its own ([`render_list`]); without the workspaces, the column is the cards.
-///
-/// The compact layout's Threads screen is laid out the same way ([`Place::Screen`]): the
-/// whole screen, without the border and the header, the cards always on it, a workspace's
-/// card or a button the keys select there ([`AppState::ws_keyed`]) filled.
+/// (The compact layout's Threads screen lists the same, a phone's way: [`render_phone`].)
 #[derive(Debug, Clone)]
 pub struct Dock {
     /// The column, its border included.
     area: Rect,
-    /// Where it is.
-    place: Place,
-    /// The row the keys select, on the compact screen.
-    keyed: Option<WsRow>,
     /// The workspaces' header row.
     header: Option<Rect>,
     /// The workspaces as a list of their own ([`render_list`]), without the cards.
@@ -139,42 +132,16 @@ pub struct Dock {
     after: Option<(Detail, Rect)>,
 }
 
-/// Where a [`Dock`] is laid out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Place {
-    /// The sidebar left of the views: a border on its right, a header when it has the
-    /// workspaces ([`AppState::ws_docked`]).
-    Docked,
-    /// The compact layout's Threads screen: all of it, the workspaces on it when the TUI shows
-    /// workspaces (not opened on a socket).
-    Screen,
-}
-
 impl Dock {
-    /// The sidebar over `area` (or the compact Threads screen, `place`), the cards in it when
-    /// `cards` ([`AppState::cards_docked`]), `needed(width)` the rows the cards take at that
-    /// width when they all show.
-    pub fn new(
-        state: &AppState,
-        area: Rect,
-        place: Place,
-        cards: bool,
-        needed: impl FnOnce(u16) -> u16,
-    ) -> Dock {
-        let (inner, ws) = match place {
-            Place::Docked => (
-                Rect {
-                    width: area.width.saturating_sub(1),
-                    ..area
-                },
-                state.ws_docked(),
-            ),
-            Place::Screen => (area, state.workspace.is_some()),
+    /// The sidebar over `area`, the cards in it when `cards` ([`AppState::cards_docked`]),
+    /// `needed(width)` the rows the cards take at that width when they all show.
+    pub fn new(state: &AppState, area: Rect, cards: bool, needed: impl FnOnce(u16) -> u16) -> Dock {
+        let inner = Rect {
+            width: area.width.saturating_sub(1),
+            ..area
         };
         let mut dock = Dock {
             area,
-            place,
-            keyed: (place == Place::Screen).then(|| state.ws_keyed()).flatten(),
             header: None,
             list: None,
             rows: Vec::new(),
@@ -184,22 +151,18 @@ impl Dock {
             more: Vec::new(),
             after: None,
         };
-        if !ws {
+        if !state.ws_docked() {
             dock.cards = cards.then_some(inner).filter(|r| !r.is_empty());
             return dock;
         }
         if inner.width < 3 || inner.height < 2 {
             return dock;
         }
-        let list = if place == Place::Docked {
-            dock.header = Some(Rect { height: 1, ..inner });
-            Rect {
-                y: inner.y + 1,
-                height: inner.height - 1,
-                ..inner
-            }
-        } else {
-            inner
+        dock.header = Some(Rect { height: 1, ..inner });
+        let list = Rect {
+            y: inner.y + 1,
+            height: inner.height - 1,
+            ..inner
         };
         if !cards {
             dock.list = Some(list);
@@ -218,15 +181,14 @@ impl Dock {
         // (A card's three rows at least, where the column has them: fewer draw none.)
         let share = (avail * CARDS_SHARE.0 / CARDS_SHARE.1).max(CARD_ROWS.min(avail));
         let want = needed.min(share);
-        let keyed = dock.keyed.as_ref();
         let mut detail = Detail::Full;
-        let mut laid = groups(state, width, &|_| detail, keyed);
+        let mut laid = groups(state, width, &|_| detail, None);
         for less in [Detail::Short, Detail::Threads, Detail::Name] {
             if avail >= laid.len() + want {
                 break;
             }
             detail = less;
-            laid = groups(state, width, &|_| detail, keyed);
+            laid = groups(state, width, &|_| detail, None);
         }
         let Groups {
             mut before,
@@ -324,7 +286,7 @@ impl Dock {
         };
         let room = usize::from(rows.height);
         let width = usize::from(rows.width);
-        let keyed = self.keyed.as_ref();
+        let keyed = None;
         // Nearest first, each workspace after the current one shows the most the rows left
         // allow.
         let at = state
@@ -371,12 +333,10 @@ impl Dock {
         if area.width < 3 || area.height < 2 {
             return;
         }
-        if self.place == Place::Docked {
-            let block = Block::default()
-                .borders(Borders::RIGHT)
-                .border_style(Style::default().fg(Color::DarkGray));
-            frame.render_widget(block, area);
-        }
+        let block = Block::default()
+            .borders(Borders::RIGHT)
+            .border_style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(block, area);
         if let Some(head) = self.header {
             let dim = Style::default().fg(Color::DarkGray);
             let room = usize::from(head.width);
@@ -431,7 +391,7 @@ impl Dock {
             frame.render_widget(Paragraph::new(vec![mark; usize::from(marks.height)]), marks);
         }
         if let Some(buttons) = self.buttons {
-            render_buttons(frame, buttons, panes, self.keyed.as_ref());
+            render_buttons(frame, buttons, panes, None);
         }
     }
 }
@@ -932,20 +892,10 @@ fn card_rows(
 /// `└ +3 more` when they do not all fit. None while its hub does not answer: what it said
 /// before is no longer news.
 fn worker_rows(state: &AppState, tab: &Tab, width: usize, max: usize) -> Vec<Line<'static>> {
-    if max == 0 || !matches!(state.tab_hub(tab), TabHub::Running { .. }) {
+    if max == 0 {
         return Vec::new();
     }
-    let Some(mut workers) = state.tab_glance(tab).and_then(|g| g.workers) else {
-        return Vec::new();
-    };
-    workers.retain(|w| !w.parked);
-    let group = |w: &WorkerGlance| match w.status {
-        ThreadStatus::Waiting => 0,
-        ThreadStatus::Error => 1,
-        ThreadStatus::Running | ThreadStatus::Background | ThreadStatus::Attached => 2,
-        _ => 3,
-    };
-    workers.sort_by_key(group);
+    let workers = listed_workers(state, tab);
     let dim = Style::default().fg(Color::DarkGray);
     let shown = if workers.len() > max {
         max - 1
@@ -959,16 +909,7 @@ fn worker_rows(state: &AppState, tab: &Tab, width: usize, max: usize) -> Vec<Lin
         .enumerate()
         .map(|(i, w)| {
             let last = i + 1 == shown && more == 0;
-            let (word, style) = match w.status {
-                ThreadStatus::Waiting => (
-                    "waiting on you",
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                ThreadStatus::Error => ("failed", Style::default().fg(Color::Red)),
-                s => (s.as_str(), Style::default().fg(crate::ui::status_color(s))),
-            };
+            let (word, style) = status_word(w.status);
             let spans = vec![
                 Span::styled(if last { "   └ " } else { "   ├ " }, dim),
                 Span::styled(
@@ -986,6 +927,316 @@ fn worker_rows(state: &AppState, tab: &Tab, width: usize, max: usize) -> Vec<Lin
         lines.push(Line::from(Span::styled(format!("   └ +{more} more"), dim)));
     }
     lines
+}
+
+/// Workspace `tab`'s threads that are not parked, as its hub last said them, those waiting on
+/// the user first, then failed ones, those at work, and the rest, oldest first in each; none
+/// while its hub does not answer: what it said before is no longer news.
+fn listed_workers(state: &AppState, tab: &Tab) -> Vec<WorkerGlance> {
+    if !matches!(state.tab_hub(tab), TabHub::Running { .. }) {
+        return Vec::new();
+    }
+    let Some(mut workers) = state.tab_glance(tab).and_then(|g| g.workers) else {
+        return Vec::new();
+    };
+    workers.retain(|w| !w.parked);
+    let group = |w: &WorkerGlance| match w.status {
+        ThreadStatus::Waiting => 0,
+        ThreadStatus::Error => 1,
+        ThreadStatus::Running | ThreadStatus::Background | ThreadStatus::Attached => 2,
+        _ => 3,
+    };
+    workers.sort_by_key(group);
+    workers
+}
+
+/// How a thread row says status `s`, and its style.
+fn status_word(s: ThreadStatus) -> (&'static str, Style) {
+    match s {
+        ThreadStatus::Waiting => (
+            "waiting on you",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        ThreadStatus::Error => ("failed", Style::default().fg(Color::Red)),
+        s => (s.as_str(), Style::default().fg(crate::ui::status_color(s))),
+    }
+}
+
+/// One entry of the compact Threads screen ([`render_phone`]), drawn whole (or, first and
+/// taller than the screen, cut), never half.
+enum Entry {
+    /// A workspace's card, or one of its threads, [`crate::ui::TAP_ROWS`] rows at least: a
+    /// tap anywhere on it switches to workspace `.1`.
+    Rows(Vec<Line<'static>>, String),
+    /// A blank row between two workspaces.
+    Gap,
+    /// A thread's card of the current workspace, `.1` rows ([`crate::ui::card_height`]),
+    /// nested under its card.
+    Card(String, u16),
+    /// `+ New workspace` and `⚙ Settings`, side by side, [`crate::ui::TAP_ROWS`] tall.
+    Buttons,
+}
+
+impl Entry {
+    fn height(&self) -> u16 {
+        match self {
+            Entry::Rows(lines, _) => u16::try_from(lines.len()).unwrap_or(u16::MAX),
+            Entry::Gap => 1,
+            Entry::Card(_, h) => *h,
+            Entry::Buttons => crate::ui::TAP_ROWS,
+        }
+    }
+}
+
+/// Another workspace's threads on a phone ([`render_phone`]): each on two rows, `├ api` and
+/// its status under it, at most [`WORKER_ROWS_SHORT`], the last `└ +3 more` when they do not
+/// all fit.
+fn phone_worker_rows(state: &AppState, tab: &Tab, width: usize) -> Vec<Vec<Line<'static>>> {
+    let workers = listed_workers(state, tab);
+    let max = WORKER_ROWS_SHORT;
+    let shown = if workers.len() > max {
+        max - 1
+    } else {
+        workers.len()
+    };
+    let more = workers.len() - shown;
+    let dim = Style::default().fg(Color::DarkGray);
+    let cut = |spans: Vec<Span<'static>>| Line::from(crate::ui::cut_spans(spans, width));
+    let mut rows: Vec<Vec<Line<'static>>> = workers
+        .iter()
+        .take(shown)
+        .enumerate()
+        .map(|(i, w)| {
+            let last = i + 1 == shown && more == 0;
+            let (word, style) = status_word(w.status);
+            vec![
+                cut(vec![
+                    Span::styled(if last { "   └ " } else { "   ├ " }, dim),
+                    Span::styled(
+                        w.name.clone(),
+                        Style::default()
+                            .fg(crate::color::color_of(w.color, &w.id))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                cut(vec![
+                    Span::styled(if last { "       " } else { "   │   " }, dim),
+                    Span::styled(word, style),
+                ]),
+            ]
+        })
+        .collect();
+    if more > 0 {
+        rows.push(vec![
+            Line::from(Span::styled(format!("   └ +{more} more"), dim)),
+            Line::default(),
+        ]);
+    }
+    rows
+}
+
+/// The compact layout's Threads screen over `area`, in a TUI opened on a workspace: each
+/// workspace's card (its name and status), the current one's thread cards nested under it,
+/// as tall as their text, beside its mark, every other one's threads on two rows each
+/// ([`phone_worker_rows`]); then `+ New workspace` and `⚙ Settings` side by side. Every control
+/// is at least [`crate::ui::TAP_ROWS`] rows tall, all its rows its target. One list that
+/// scrolls a whole entry at a time: with the wheel (a swipe), else as little as keeps what
+/// the keys or a tap selected in view ([`AppState::ws_keyed`], the selected card), the
+/// current workspace's card while nothing is; `↑` and `↓` at its right edge say there is
+/// more. A screen too short for a card draws none, and none is selectable then.
+pub fn render_phone(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
+    use crate::app::CompactPane;
+    use crate::select::{ListLayout, ListWindow};
+    if area.is_empty() {
+        return;
+    }
+    let width = usize::from(area.width);
+    let tall = usize::from(crate::ui::TAP_ROWS);
+    let keyed = state.ws_keyed();
+    let cards = state.compact_threads();
+    let layout = ListLayout::Compact(CompactPane::Threads);
+    let cards_w = area.width.saturating_sub(NEST);
+    let at = state
+        .tabs
+        .iter()
+        .position(|t| state.workspace.as_deref() == Some(t.name.as_str()));
+    let mut entries: Vec<Entry> = Vec::new();
+    let nest = |entries: &mut Vec<Entry>, panes: &mut Panes| {
+        for id in &cards {
+            let h = crate::ui::card_height(state, panes, id, layout, cards_w);
+            entries.push(Entry::Card(id.clone(), h));
+        }
+    };
+    for (i, tab) in state.tabs.iter().enumerate() {
+        if i > 0 {
+            entries.push(Entry::Gap);
+        }
+        let selected = keyed.as_ref() == Some(&WsRow::Workspace(tab.name.clone()));
+        let mut lines = card_rows(state, tab, width, selected, Detail::Short);
+        if lines.len() < tall {
+            lines.resize(tall, Line::default());
+        }
+        entries.push(Entry::Rows(lines, tab.name.clone()));
+        if Some(i) == at {
+            nest(&mut entries, panes);
+        } else {
+            for rows in phone_worker_rows(state, tab, width) {
+                entries.push(Entry::Rows(rows, tab.name.clone()));
+            }
+        }
+    }
+    if at.is_none() {
+        nest(&mut entries, panes);
+    }
+    entries.push(Entry::Gap);
+    entries.push(Entry::Buttons);
+    let heights: Vec<u32> = entries.iter().map(|e| u32::from(e.height())).collect();
+    let h = u32::from(area.height);
+    let sum = |a: usize, b: usize| heights[a..b].iter().sum::<u32>();
+    // The furthest it scrolls: the first entry from which the rest all fit.
+    let mut max = entries.len();
+    while max > 0 && sum(max - 1, entries.len()) <= h {
+        max -= 1;
+    }
+    let max = max.min(entries.len() - 1);
+    // What the keys or a tap selected (else the current workspace's card): kept in view, unless
+    // the wheel moved the list since it was selected.
+    let first_of = |name: &str| {
+        entries
+            .iter()
+            .position(|e| matches!(e, Entry::Rows(_, n) if n == name))
+    };
+    let selected = match (&keyed, state.focused()) {
+        (Some(WsRow::Workspace(name)), _) => first_of(name),
+        (Some(WsRow::New | WsRow::Settings), _) => Some(entries.len() - 1),
+        (None, Some(card)) => entries
+            .iter()
+            .position(|e| matches!(e, Entry::Card(id, _) if id == card)),
+        (None, None) => None,
+    };
+    let key = selected.map(|i| match &entries[i] {
+        Entry::Rows(_, n) => format!("ws:{n}"),
+        Entry::Card(id, _) => format!("card:{id}"),
+        _ => "buttons".to_string(),
+    });
+    let follow = !state.view.ws_wheeled || state.view.panes.phone_sel != key;
+    let mut start = state.view.ws_scroll.min(max);
+    let anchor = selected.or_else(|| state.workspace.as_deref().and_then(first_of));
+    if let Some(s) = anchor.filter(|_| follow) {
+        if s < start {
+            start = s;
+        } else {
+            while start < s && sum(start, s + 1) > h {
+                start += 1;
+            }
+        }
+    }
+    panes.add(PaneId::Workspaces, area);
+    panes.phone = Some(area);
+    panes.phone_sel = key;
+    panes.ws_start = start;
+    panes.ws_max = max;
+    panes.no_cards = !cards.is_empty() && area.height < 3;
+    panes.list = Some(ListWindow {
+        layout,
+        area,
+        start: 0,
+        max: 0,
+    });
+    let mut y = area.y;
+    let mut end = start;
+    for (i, entry) in entries.iter().enumerate().skip(start) {
+        let room = area.bottom() - y;
+        if room == 0 {
+            break;
+        }
+        // Whole; but a card first and taller than the screen is cut to it (a control never:
+        // shorter than its two rows, it is not drawn, and not tapped).
+        let eh = entry.height();
+        let cut = i == start && matches!(entry, Entry::Card(..)) && room >= 3;
+        if eh > room && !cut {
+            break;
+        }
+        let eh = eh.min(room);
+        let rect = Rect::new(area.x, y, area.width, eh);
+        match entry {
+            Entry::Rows(lines, name) => {
+                frame.render_widget(Paragraph::new(lines.clone()), rect);
+                panes.target(rect, Target::Workspace(name.clone()));
+                if state.view.animate && first_of(name) == Some(i) && tab_active(state, name) {
+                    panes.moves(Rect::new(rect.x + 1, rect.y, 1, 1).intersection(rect));
+                }
+            }
+            Entry::Gap => {}
+            Entry::Card(id, _) => {
+                if eh >= 3 && cards_w > 0 {
+                    let mark = Line::from(Span::styled("▌", Style::default().fg(Color::Cyan)));
+                    frame.render_widget(
+                        Paragraph::new(vec![mark; usize::from(eh)]),
+                        Rect { width: 1, ..rect },
+                    );
+                    let slot = Rect::new(area.x + NEST, y, cards_w, eh);
+                    crate::ui::draw_card(frame, slot, state, id, (None, None), panes);
+                }
+            }
+            Entry::Buttons => render_phone_buttons(frame, rect, panes, keyed.as_ref()),
+        }
+        y += eh;
+        end = i + 1;
+    }
+    // More above, more below: at its right edge.
+    let dim = Style::default().fg(Color::DarkGray);
+    let corner = |frame: &mut Frame, y: u16, text: &str| {
+        let cell = Rect::new(area.right() - 1, y, 1, 1);
+        frame.render_widget(Paragraph::new(Span::styled(text.to_string(), dim)), cell);
+    };
+    if start > 0 {
+        corner(frame, area.y, "↑");
+    }
+    if end < entries.len() {
+        corner(frame, area.bottom() - 1, "↓");
+    }
+}
+
+/// `+ New workspace` and `⚙ Settings` over `rect`, side by side, each a filled block as tall as
+/// `rect` (its whole block its target), a column apart; the one the keys select (`selected`)
+/// filled as a selected card is.
+fn render_phone_buttons(
+    frame: &mut Frame,
+    rect: Rect,
+    panes: &mut Panes,
+    selected: Option<&WsRow>,
+) {
+    let [new, settings] =
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(rect);
+    let new = Rect {
+        width: new.width.saturating_sub(1),
+        ..new
+    };
+    let off = Style::default()
+        .fg(Color::Indexed(252))
+        .bg(Color::Indexed(238));
+    for (area, row, text, target) in [
+        (new, WsRow::New, "+ New workspace", Target::NewWorkspace),
+        (settings, WsRow::Settings, "⚙ Settings", Target::Settings),
+    ] {
+        let style = if selected == Some(&row) {
+            crate::ui::selected_fill()
+        } else {
+            off
+        };
+        let room = usize::from(area.width);
+        let label = if crate::edit::width(text) < room {
+            format!(" {text}")
+        } else {
+            crate::ui::truncate_cells(text, room)
+        };
+        frame.render_widget(Paragraph::new(Line::from(label)).style(style), area);
+        panes.target(area, target);
+    }
+    panes.add(PaneId::Text, rect);
 }
 
 /// Workspace activity, with waiting and failure indications retained while other work
@@ -1113,10 +1364,15 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     let room = inner_w.saturating_sub(NAME_LABEL.len() + 1);
     let skip = name.chars().count().saturating_sub(room);
     let shown: String = name.chars().skip(skip).collect();
-    let mut lines = vec![Line::from(vec![
+    // On a phone, a row under the top border closes it too: its `✕` two rows tall.
+    let spacer = u16::from(state.compact());
+    let mut lines: Vec<Line<'static>> = (0..spacer)
+        .map(|_| Line::from(Span::styled(format!("{:>inner_w$}", "✕ close "), dim)))
+        .collect();
+    lines.push(Line::from(vec![
         Span::raw(NAME_LABEL),
         Span::styled(shown.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ])];
+    ]));
     let (note, style) = match state.new_ws_error(name) {
         Some(why) if !name.is_empty() => (why, Style::default().fg(Color::Red)),
         _ => (
@@ -1146,18 +1402,21 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
+    if spacer > 0 && inner.height > 0 {
+        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
+    }
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
     // The cursor after the name, on its row.
     let label = u16::try_from(NAME_LABEL.len()).unwrap_or(u16::MAX);
     let x = inner.x + label + u16::try_from(crate::edit::width(&shown)).unwrap_or(u16::MAX);
-    if inner.height > 0 && x < inner.x + inner.width {
-        frame.set_cursor_position((x, inner.y));
+    if inner.height > spacer && x < inner.x + inner.width {
+        frame.set_cursor_position((x, inner.y + spacer));
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::workspace::{OrchGlance, Tab, WorkerGlance};
 
@@ -1921,33 +2180,33 @@ mod tests {
         assert_eq!(st.view.input.as_str(), "h");
     }
 
-    /// In the compact layout the workspaces are on the Threads screen, as in the sidebar: each
-    /// workspace's card, the current one's thread cards nested under it, the others' threads
-    /// a row each, the buttons; its tab says what waits in the others, and the tab strip is
-    /// gone. ↑↓ on an empty line step through the workspaces, the cards and the buttons as
-    /// drawn; Enter on a workspace switches; a tap on its card switches too.
+    /// In the compact layout the workspaces are on the Threads screen: each workspace's card
+    /// (its name and status), the current one's thread cards nested under it, whole, the others'
+    /// threads on two rows each, then the buttons; one list that scrolls. Its tab, two rows,
+    /// says what waits in the others. ↑↓ on an empty line step through the workspaces, the
+    /// cards and the buttons, the list following; Enter on a workspace switches, and so does a
+    /// tap on any row of its card or of its threads.
     #[test]
     fn the_compact_threads_screen_lists_the_workspaces() {
         use crossterm::event::KeyCode;
         let mut st = with_workers(in_workspaces("default"));
-        let r = rows(&mut st, 40, 20);
+        let r = rows(&mut st, 40, 30);
         assert!(st.compact() && !st.tabs_shown());
         assert!(r[0].contains("Threads ⚠2"), "{}", r.join("\n"));
         assert!(!r.join("\n").contains("≡"));
-        // Its tab, a row tall, its whole share of the bar.
+        // Its tab, two rows tall, its whole share of the bar.
         let screen = Target::Screen(crate::app::CompactPane::Threads);
-        let tab = cells(&mut st, 40, 20, &screen);
+        let tab = cells(&mut st, 40, 30, &screen);
         assert_eq!(tab.len(), 1);
-        assert_eq!((tab[0].right(), tab[0].y, tab[0].height), (40, 0, 1));
-        tap(&mut st, 40, 20, &screen);
+        assert_eq!((tab[0].right(), tab[0].y, tab[0].height), (40, 0, 2));
+        tap(&mut st, 40, 30, &screen);
         assert!(st.ws_screen());
-        let r = rows(&mut st, 40, 20);
+        let r = rows(&mut st, 40, 30);
         let text = r.join("\n");
         assert!(
-            text.contains("client-x") && text.contains("+ New workspace"),
+            text.contains("default") && text.contains("working"),
             "{text}"
         );
-        assert!(text.contains("├ deploy · waiting on you"), "{text}");
         let cards: Vec<Rect> = st
             .view
             .panes
@@ -1958,20 +2217,21 @@ mod tests {
             .collect();
         assert!(!cards.is_empty(), "{text}");
         assert!(cards.iter().all(|c| c.x == NEST + 1), "nested: {text}");
-        // Down from the current workspace: its cards, then the next workspace.
+        // Down from the current workspace: its cards, then the next workspace, in view.
         st.handle_key(crate::app::tests::key(KeyCode::Down));
-        let first = st.focused().map(str::to_string);
-        assert!(first.is_some() && st.ws_keyed().is_none());
+        assert!(st.focused().is_some() && st.ws_keyed().is_none());
         let mut steps = 0;
         while st.ws_keyed().is_none() && steps < 20 {
             st.handle_key(crate::app::tests::key(KeyCode::Down));
+            rows(&mut st, 40, 30);
             steps += 1;
         }
         assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("client-x".into())));
         assert!(st.focused().is_none(), "one selection at a time");
-        let r = rows(&mut st, 40, 20);
+        let r = rows(&mut st, 40, 30);
+        let text = r.join("\n");
         let y = r.iter().position(|l| l.contains("client-x")).unwrap();
-        let buf = crate::app::tests::draw(&mut st, 40, 20);
+        let buf = crate::app::tests::draw(&mut st, 40, 30);
         let x = r[y]
             .find("client-x")
             .map(|b| r[y][..b].chars().count())
@@ -1980,19 +2240,24 @@ mod tests {
         assert_eq!(
             cell.bg,
             crate::ui::selected_fill().bg.unwrap(),
-            "filled: {}",
-            r.join("\n")
+            "filled: {text}"
         );
+        // Its threads, each on two rows: who, then how it is.
+        let deploy = r.iter().position(|l| l.contains("├ deploy")).unwrap();
+        assert!(r[deploy + 1].contains("waiting on you"), "{text}");
         // Up: back on the last card.
         st.handle_key(crate::app::tests::key(KeyCode::Up));
         assert!(st.focused().is_some() && st.ws_keyed().is_none());
         st.handle_key(crate::app::tests::key(KeyCode::Down));
+        rows(&mut st, 40, 30);
         let a = st.handle_key(crate::app::tests::key(KeyCode::Enter));
         assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
-        // A tap on a card switches.
+        // A tap on the second row of one of its threads switches too.
         st.switching = None;
-        let a = tap(&mut st, 40, 20, &Target::Workspace("scratch".into()));
-        assert_eq!(workspace_action(&a), Some(("scratch".into(), false)));
+        let r = rows(&mut st, 40, 30);
+        let deploy = u16::try_from(r.iter().position(|l| l.contains("├ deploy")).unwrap()).unwrap();
+        let a = tap_at(&mut st, 40, 30, 10, deploy + 1);
+        assert_eq!(workspace_action(&a), Some(("client-x".into(), false)));
         // Ctrl-T and /w show it too, and Ctrl-T on it goes back to the conversation.
         let mut st = in_workspaces("default");
         rows(&mut st, 40, 20);
@@ -2006,14 +2271,25 @@ mod tests {
     }
 
     /// On a phone's sizes, portrait and landscape, the compact Threads screen keeps its tab bar
-    /// a row, every workspace named, the buttons, and a card in view; turned from one to the
-    /// other, or past the compact width and back, it is laid out again at once.
+    /// two rows, and every control on it two rows at least, all of them its target, none over
+    /// another's; ↑↓ reach every workspace and the buttons, each in view as it is selected;
+    /// turned from one size to another, or past the compact width and back, it is laid out
+    /// again at once.
     #[test]
     fn the_compact_threads_screen_fits_a_phone() {
+        use crossterm::event::KeyCode;
         let mut st = with_workers(in_workspaces("default"));
         st.view.compact_width = 120;
         st.show_pane(crate::app::CompactPane::Threads);
-        for (w, h) in [(40, 20), (50, 30), (60, 18), (100, 14), (40, 12), (100, 24)] {
+        for (w, h) in [
+            (40, 20),
+            (50, 30),
+            (60, 18),
+            (100, 14),
+            (40, 12),
+            (100, 24),
+            (40, 9),
+        ] {
             let r = rows(&mut st, w, h);
             let text = r.join("\n");
             assert!(st.compact() && st.ws_screen(), "{w}x{h}");
@@ -2021,22 +2297,52 @@ mod tests {
                 r[0].contains("Chat") && r[0].contains("Threads"),
                 "{w}x{h}: {text}"
             );
-            assert!(!r[1].contains("Chat"), "one row: {w}x{h}: {text}");
-            for name in ["default", "+ New workspace", "⚙ Settings"] {
-                assert!(text.contains(name), "{name} at {w}x{h}: {text}");
+            let targets = st.view.panes.targets.clone();
+            for (k, (a, ta)) in targets.iter().enumerate() {
+                if matches!(
+                    ta,
+                    Target::Screen(_)
+                        | Target::Workspace(_)
+                        | Target::NewWorkspace
+                        | Target::Settings
+                ) {
+                    assert!(a.height >= 2, "{ta:?} {a:?} at {w}x{h}: {text}");
+                }
+                for (b, tb) in &targets[k + 1..] {
+                    assert!(ta == tb || !a.intersects(*b), "{ta:?} {tb:?} at {w}x{h}");
+                }
             }
-            assert!(
-                text.contains("client-x") || text.contains("↓ more"),
-                "{w}x{h}: {text}"
-            );
-            let cards = st
-                .view
-                .panes
-                .panes
-                .iter()
-                .filter(|p| matches!(p.id, PaneId::Thread(_)))
-                .count();
-            assert!(cards >= 1, "{w}x{h}: {text}");
+            // Every workspace and the buttons, one after the other, each in view.
+            st.view.ws_sel = None;
+            st.set_focus(None);
+            for _ in 0..30 {
+                st.handle_key(crate::app::tests::key(KeyCode::Down));
+                let text = rows(&mut st, w, h).join("\n");
+                match st.ws_keyed() {
+                    Some(WsRow::Workspace(name)) => {
+                        assert!(text.contains(&*name), "{name} {w}x{h}: {text}")
+                    }
+                    Some(WsRow::New) => assert!(text.contains("+ New"), "{w}x{h}: {text}"),
+                    Some(WsRow::Settings) => {
+                        assert!(text.contains("Settings"), "{w}x{h}: {text}");
+                        break;
+                    }
+                    None => {}
+                }
+            }
+            assert_eq!(st.ws_keyed(), Some(WsRow::Settings), "{w}x{h}");
+        }
+        // A list with less than a control's two rows draws none of them, not one cut short.
+        for h in [6u16, 7] {
+            let text = rows(&mut st, 40, h).join("\n");
+            for (a, t) in &st.view.panes.targets {
+                if matches!(
+                    t,
+                    Target::Workspace(_) | Target::NewWorkspace | Target::Settings
+                ) {
+                    assert!(a.height >= 2, "{t:?} {a:?} at 40x{h}: {text}");
+                }
+            }
         }
         // Widened past the compact layout: the sidebar, the same hierarchy; narrowed again,
         // the Threads screen as it was.
@@ -2482,11 +2788,13 @@ mod tests {
         assert_eq!(g.orch.unwrap().preview.as_deref(), Some("new reply"));
     }
 
-    /// More workspaces than the compact Threads screen has rows for: those furthest from the
-    /// current one give way to `↓ more`, and a tap on it brings the next into view, as the
-    /// arrows do, step by step to the last; the cards keep their share meanwhile.
+    /// More workspaces than the compact Threads screen shows at once: it scrolls. The wheel (a
+    /// swipe) moves it an entry at a time, leaving the selection; a key brings the selection
+    /// back into view; every control tapped on its second row does what its first row does
+    /// (a workspace's card, the buttons).
     #[test]
     fn the_compact_screen_reveals_the_workspaces_it_cut() {
+        use crossterm::event::{KeyCode, KeyModifiers, MouseEvent, MouseEventKind};
         let mut st = in_workspaces("default");
         let mut tabs = st.tabs.clone();
         for i in 0..8 {
@@ -2497,79 +2805,116 @@ mod tests {
         st.handle_key(crate::app::tests::ctrl('t'));
         let first = rows(&mut st, 40, 20).join("\n");
         assert!(
-            first.contains("default") && first.contains("↓ more") && !first.contains("more-7"),
+            first.contains("default") && !first.contains("more-7"),
             "{first}"
         );
-        // Each tap on `↓ more` brings the next one cut into view.
-        for _ in 0..12 {
-            let text = rows(&mut st, 40, 20).join("\n");
-            if text.contains("more-7") {
-                break;
+        // The wheel over it scrolls to its end, the buttons there.
+        let area = st.view.panes.phone.unwrap();
+        let swipe = |st: &mut AppState| {
+            for _ in 0..60 {
+                let screen = crate::app::tests::draw(st, 40, 20);
+                st.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x + 3,
+                        row: area.y + 3,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &screen,
+                );
             }
-            let Some((r, _)) = st
-                .view
-                .panes
-                .targets
-                .iter()
-                .rev()
-                .find(|(_, t)| matches!(t, Target::WsMore(_)))
-                .cloned()
-            else {
-                panic!("{text}");
-            };
-            tap_at(&mut st, 40, 20, r.x + 1, r.y);
-            // Every `more` target is on its own row, where the rows moved to.
-            let text = rows(&mut st, 40, 20);
-            for (r, t) in &st.view.panes.targets {
-                if matches!(t, Target::WsMore(_)) {
-                    assert!(
-                        text[usize::from(r.y)].contains("more"),
-                        "{}",
-                        text.join("\n")
-                    );
-                }
-            }
-        }
+        };
+        swipe(&mut st);
         let end = rows(&mut st, 40, 20).join("\n");
-        assert!(end.contains("more-7") && end.contains("default"), "{end}");
-        assert!(st.view.panes.list.is_some(), "the cards still show: {end}");
-        // The arrows reach them too: back up to the current workspace's cards.
-        let mut st = in_workspaces("default");
-        let mut tabs = st.tabs.clone();
-        for i in 0..8 {
-            tabs.push(Tab::new(format!("more-{i}")));
+        assert!(end.contains("more-7") && end.contains("Settings"), "{end}");
+        // The second row of a workspace's card and of a button are theirs.
+        let r = rows(&mut st, 40, 20);
+        let m = r
+            .iter()
+            .position(|l| l.contains("more-7"))
+            .unwrap_or_else(|| panic!("{}", r.join("\n")));
+        let m = u16::try_from(m).unwrap();
+        let a = tap_at(&mut st, 40, 20, 10, m + 1);
+        assert_eq!(workspace_action(&a), Some(("more-7".into(), false)));
+        st.switching = None;
+        swipe(&mut st);
+        let r = rows(&mut st, 40, 20);
+        let b = r
+            .iter()
+            .position(|l| l.contains("Settings"))
+            .unwrap_or_else(|| panic!("{}", r.join("\n")));
+        let b = u16::try_from(b).unwrap();
+        tap_at(&mut st, 40, 20, 30, b + 1);
+        assert!(st.view.settings.is_some());
+        st.view.settings = None;
+        // A key brings the selection back: Up to the start.
+        for _ in 0..40 {
+            st.handle_key(crate::app::tests::key(KeyCode::Up));
         }
-        st.set_tabs(tabs);
-        rows(&mut st, 40, 20);
-        st.handle_key(crate::app::tests::ctrl('t'));
-        for _ in 0..30 {
-            st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Down));
-            rows(&mut st, 40, 20);
-        }
-        assert_eq!(st.ws_keyed(), Some(WsRow::Settings));
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
-        st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
         let text = rows(&mut st, 40, 20).join("\n");
-        assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("more-7".into())));
-        assert!(text.contains("more-7"), "{text}");
-        // On a short screen too, each workspace the arrows select is drawn, back to the first.
-        for _ in 0..30 {
-            st.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Up));
-            let text = rows(&mut st, 40, 12).join("\n");
-            if let Some(WsRow::Workspace(name)) = st.ws_keyed() {
-                assert!(text.contains(name.as_str()), "{name}: {text}");
-            }
-        }
         assert_eq!(st.ws_keyed(), Some(WsRow::Workspace("default".into())));
-        // Shorter still, the cards keep a card's rows: one is drawn.
-        let text = rows(&mut st, 40, 11).join("\n");
-        assert!(st.view.panes.list.is_some(), "{text}");
+        assert!(text.contains("default"), "{text}");
         // A TUI on a socket has its Threads screen too: Ctrl-T shows it.
         let mut st = crate::app::tests::three_threads();
         st.view.compact_width = 60;
         rows(&mut st, 40, 20);
         st.handle_key(crate::app::tests::ctrl('t'));
         assert_eq!(st.view.compact_pane, crate::app::CompactPane::Threads);
+    }
+
+    /// On the shortest phone screens the arrows select only what is drawn: a card where a card
+    /// is drawn, a workspace whose row is (in the cards' place, or the current one's, where
+    /// one row is all there is); Enter acts only on what it can see. A card selected before
+    /// the screen got that short is let go, and Tab selects none there.
+    #[test]
+    fn short_phone_screens_select_only_what_they_draw() {
+        use crossterm::event::KeyCode;
+        for h in [8u16, 9, 10, 11, 12] {
+            let mut st = with_workers(in_workspaces("default"));
+            let mut tabs = st.tabs.clone();
+            for i in 0..8 {
+                tabs.push(Tab::new(format!("more-{i}")));
+            }
+            st.set_tabs(tabs);
+            rows(&mut st, 40, h);
+            st.handle_key(crate::app::tests::ctrl('t'));
+            // A card selected on a taller screen, then this one: it lets go of it there.
+            rows(&mut st, 40, 30);
+            st.handle_key(crate::app::tests::key(KeyCode::Down));
+            rows(&mut st, 40, 30);
+            assert!(st.focused().is_some(), "40x30");
+            let text = rows(&mut st, 40, h).join("\n");
+            if st.view.panes.no_cards {
+                assert!(st.focused().is_none(), "40x{h}: {text}");
+                st.handle_key(crate::app::tests::key(KeyCode::Tab));
+                rows(&mut st, 40, h);
+                assert!(st.focused().is_none(), "Tab, 40x{h}");
+            }
+            st.view.ws_sel = None;
+            for step in 0..30 {
+                let key = if step < 20 {
+                    KeyCode::Down
+                } else {
+                    KeyCode::Up
+                };
+                st.handle_key(crate::app::tests::key(key));
+                let text = rows(&mut st, 40, h).join("\n");
+                if let Some(WsRow::Workspace(name)) = st.ws_keyed() {
+                    assert!(text.contains(name.as_str()), "40x{h} {name}: {text}");
+                }
+                if let Some(card) = st.focused() {
+                    assert!(
+                        st.view.panes.list.is_some()
+                            && st
+                                .view
+                                .panes
+                                .get(&PaneId::Thread(card.to_string()))
+                                .is_some(),
+                        "40x{h} {card}: {text}"
+                    );
+                }
+            }
+        }
     }
 
     /// The first-run picker (or the help) over the view leaves the docked sidebar on screen:
@@ -2985,7 +3330,8 @@ mod tests {
         assert_eq!(g.orch.unwrap().preview.as_deref(), Some("reply B"));
     }
 
-    /// From the compact layout's decisions overlay, Ctrl-T shows the Workspaces screen.
+    /// From the compact layout's decisions overlay, Ctrl-T shows the Threads screen, which
+    /// lists the workspaces.
     #[test]
     fn ctrl_t_leaves_the_compact_decisions_for_the_workspaces() {
         let mut st = in_workspaces("default");
@@ -2994,7 +3340,7 @@ mod tests {
         st.handle_key(crate::app::tests::ctrl('t'));
         assert!(st.ws_screen());
         let r = rows(&mut st, 40, 20).join("\n");
-        assert!(r.contains("+ New workspace"), "{r}");
+        assert!(r.contains("default") && r.contains("working"), "{r}");
     }
 
     /// A drawer opened on a narrower screen does not come back once the docked sidebar,

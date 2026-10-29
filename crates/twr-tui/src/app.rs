@@ -4152,6 +4152,21 @@ impl AppState {
     /// Selection order of the current screen: what it draws that can be selected. The
     /// decisions screen draws no card: nothing.
     pub fn nav_order(&self) -> Vec<String> {
+        let mut nav = self.nav_listed();
+        // A column of cards too short for one (as last drawn): none of its cards.
+        if self.view.panes.no_cards {
+            let column = if self.compact() {
+                self.compact_threads()
+            } else {
+                self.order()
+            };
+            nav.retain(|id| !column.contains(id));
+        }
+        nav
+    }
+
+    /// [`AppState::nav_order`] by what the screen lists, drawn or not.
+    fn nav_listed(&self) -> Vec<String> {
         // The compact layout's lists are what its keys move through.
         if self.compact() && self.view.screen != Screen::Decisions {
             match self.view.compact_pane {
@@ -4630,9 +4645,11 @@ impl AppState {
         self.view.block = None;
         self.view.queued = None;
         self.view.detail = None;
-        // Another card selected: the cards follow the selection again.
+        // Another card selected: the cards (and the compact Threads screen's list, which the
+        // wheel may have moved) follow the selection again.
         if self.view.focus != thread {
             self.view.card_scroll = None;
+            self.view.ws_wheeled = false;
         }
         self.view.focus = thread;
     }
@@ -7596,6 +7613,20 @@ impl AppState {
         {
             self.view.focus = self.view.dive.clone();
         }
+        // No room for a card (a column too short for one): none stays selected out of sight,
+        // nor its popup open.
+        if self.view.panes.no_cards && self.detail_card().is_none() && !self.dive_hides_cards() {
+            let nav = self.nav_order();
+            if let Some(card) = self.view.focus.clone().filter(|f| !nav.contains(f)) {
+                if matches!(
+                    self.view.action.as_ref().map(|p| &p.target),
+                    Some(ActionTarget::Card(c)) if *c == card
+                ) {
+                    self.view.action = None;
+                }
+                self.set_focus(None);
+            }
+        }
         if let Some(p) = self.view.panes.get(&PaneId::Transcript) {
             self.view.scroll = p.scroll;
             self.view.anchor = p.anchor.clone().filter(|_| p.scroll > 0);
@@ -8544,6 +8575,20 @@ impl AppState {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
             return;
         }
+        // The compact Threads screen scrolls as one list, its cards with it (not under a
+        // popup, which takes the wheel).
+        let over_popup = self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Popup);
+        if self.ws_screen()
+            && !over_popup
+            && self
+                .view
+                .panes
+                .phone
+                .is_some_and(|r| r.contains((x, y).into()))
+        {
+            self.ws_wheel(up);
+            return;
+        }
         let arrow = KeyEvent::new(
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
@@ -9159,13 +9204,14 @@ pub(crate) mod tests {
         type_line(&mut st, "/n");
         let lines = rows(&mut st, 50, 24);
         let text = lines.join("\n");
-        let perm = lines
-            .iter()
-            .position(|l| l.contains("beta · permission · Bash: rm -rf"));
-        let review = lines
-            .iter()
-            .position(|l| l.contains("alpha · review · turn gave up"));
+        // Two rows each: who and what, then what it asks.
+        let perm = lines.iter().position(|l| l.contains("beta · permission"));
+        let review = lines.iter().position(|l| l.contains("alpha · review"));
         assert!(perm.is_some() && review.is_some(), "{text}");
+        let (perm, review) = (perm.unwrap(), review.unwrap());
+        assert!(lines[perm + 1].contains("Bash: rm -rf"), "{text}");
+        assert!(lines[review + 1].contains("turn gave up"), "{text}");
+        assert_eq!(review, perm + 2, "{text}");
         assert_eq!(st.focused(), Some("t-beta"));
         st.handle_key(key(KeyCode::Down));
         assert_eq!(st.focused(), Some("t-alpha"));
@@ -22114,12 +22160,307 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone, the tab bar switches screens: every cell of its row (a row on any
-        /// screen) is the tab of the third of the width it is in, the gap after a tab
-        /// included, and a tap anywhere in it shows that screen.
+        /// On a phone the action popup's rows are two rows tall, both the row's, none over
+        /// another, and its `✕` is too (its top border and the row under it); a question
+        /// waiting for `y` has its answers two rows tall under it. A tap on a second row does
+        /// what one on the first does.
+        #[test]
+        fn phone_popups_and_questions_have_two_row_controls() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            st.handle_key(key(KeyCode::Enter));
+            frame(&mut st, 40, 30);
+            assert!(st.action_popup().is_some());
+            let targets = st.view.panes.targets.clone();
+            let rows: Vec<(ratatui::layout::Rect, ActionKind)> = targets
+                .iter()
+                .filter_map(|(r, t)| match t {
+                    Target::Row(k) => Some((*r, *k)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{targets:?}");
+            for (k, (a, _)) in rows.iter().enumerate() {
+                assert_eq!(a.height, 2, "{rows:?}");
+                for (b, _) in &rows[k + 1..] {
+                    assert!(!a.intersects(*b), "{rows:?}");
+                }
+            }
+            let close: u16 = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| r.height)
+                .sum();
+            assert_eq!(close, 2, "{targets:?}");
+            // The second row of a row picks it.
+            let (r, kind) = rows[1];
+            tap_at(&mut st, 40, 30, r.x + 2, r.y + 1);
+            assert_eq!(st.action_popup().and_then(|p| p.sel), Some(kind));
+            // The second row of the `✕` closes it.
+            let under = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .max_by_key(|r| r.y)
+                .unwrap();
+            tap_at(&mut st, 40, 30, under.x + 1, under.y);
+            assert!(st.action_popup().is_none());
+            // A question waiting for `y`: its answers two rows tall; `no`'s second row cancels.
+            st.view.confirm = Some(Confirm {
+                action: Action::Quit,
+                prompt: "quit? y/n".into(),
+                pending: String::new(),
+                alt: None,
+                offer: false,
+            });
+            frame(&mut st, 40, 30);
+            let answers: Vec<(ratatui::layout::Rect, Target)> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::Yes | Target::No))
+                .cloned()
+                .collect();
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            assert!(answers.iter().all(|(r, _)| r.height == 2), "{answers:?}");
+            assert!(!answers[0].0.intersects(answers[1].0));
+            let no = answers.iter().find(|(_, t)| *t == Target::No).unwrap().0;
+            tap_at(&mut st, 40, 30, no.x + 1, no.y + 1);
+            assert!(st.view.confirm.is_none());
+        }
+
+        /// On short phones the action popup draws only whole two-row rows, the highlighted one
+        /// first: a row it draws is one Enter may run, and one it could not draw never runs.
+        #[test]
+        fn a_short_phone_popup_runs_only_rows_it_drew_whole() {
+            for h in [16u16, 12, 10] {
+                let mut st = compact();
+                st.show_pane(CompactPane::Threads);
+                frame(&mut st, 40, h);
+                st.handle_key(key(KeyCode::Enter));
+                for _ in 0..8 {
+                    st.handle_key(key(KeyCode::Down));
+                    frame(&mut st, 40, h);
+                    let sel = st.action_popup().and_then(|p| p.sel);
+                    let drawn = st
+                        .view
+                        .panes
+                        .popup_rows
+                        .clone()
+                        .map(|(_, k)| k)
+                        .unwrap_or_default();
+                    for (r, t) in &st.view.panes.targets {
+                        if matches!(t, Target::Row(_)) {
+                            assert_eq!(r.height, 2, "40x{h} {t:?}");
+                        }
+                    }
+                    if let Some(sel) = sel.filter(|k| !drawn.contains(k)) {
+                        let out = st.handle_key(key(KeyCode::Enter));
+                        assert!(out.is_empty(), "40x{h} {sel:?}: {out:?}");
+                        assert!(st.action_popup().is_some(), "40x{h}");
+                    }
+                }
+            }
+        }
+
+        /// On a phone a dive's `‹ back` band is two rows, both of them back; the help's `✕` is
+        /// two rows too, and its second row closes it.
+        #[test]
+        fn phone_back_band_and_help_close_on_two_rows() {
+            let mut st = compact();
+            st.dive("t-beta");
+            frame(&mut st, 40, 20);
+            let back: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Back)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(back.len(), 1, "{:?}", st.view.panes.targets);
+            assert_eq!(back[0].height, 2);
+            tap_at(&mut st, 40, 20, back[0].x + 2, back[0].y + 1);
+            assert!(st.view.dive.is_none(), "back");
+            st.view.help = true;
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                2,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(!st.view.help);
+        }
+
+        /// On the shortest phones the action popup still lists a row to act on: the item's
+        /// text gives way to it (then not drawn in full, so read in the main pane to answer).
+        #[test]
+        fn a_short_phone_popup_keeps_a_row_to_act_on() {
+            for (w, h) in [(40u16, 12u16), (40, 13), (80, 12)] {
+                let mut st = compact();
+                st.view.compact = Some(true);
+                st.show_pane(CompactPane::Needs);
+                frame(&mut st, w, h);
+                st.handle_key(key(KeyCode::Enter));
+                frame(&mut st, w, h);
+                assert!(st.action_popup().is_some(), "{w}x{h}");
+                let rows = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Row(_)))
+                    .count();
+                assert!(rows >= 1, "{w}x{h}: {:?}", st.view.panes.targets);
+            }
+        }
+
+        /// After a swipe moved the compact Threads list, a card Tab selects stays in view on
+        /// the frames after, not only the first.
+        #[test]
+        fn a_card_selected_after_a_swipe_stays_in_view() {
+            use crossterm::event::{MouseEvent, MouseEventKind};
+            let mut st = crate::sidebar::tests::in_workspaces("default");
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 14);
+            for _ in 0..20 {
+                let screen = frame(&mut st, 40, 14);
+                let area = st.view.panes.phone.unwrap();
+                st.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x + 3,
+                        row: area.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &screen,
+                );
+            }
+            st.handle_key(key(KeyCode::Tab));
+            let card = st.focused().unwrap().to_string();
+            for _ in 0..3 {
+                frame(&mut st, 40, 14);
+                assert!(
+                    st.view.panes.get(&PaneId::Thread(card.clone())).is_some(),
+                    "{card} in view"
+                );
+            }
+        }
+
+        /// On a phone the settings' `✕` is two rows (its top border and a row under it kept
+        /// above what scrolls), and a setting is tapped only where at least two of its rows,
+        /// or all of them, show; the new-workspace dialog's `✕` is two rows too.
+        #[test]
+        fn phone_settings_and_dialog_close_on_two_rows() {
+            let mut st = compact();
+            frame(&mut st, 40, 12);
+            st.open_settings();
+            for _ in 0..6 {
+                let buf = frame(&mut st, 40, 12);
+                let text = screen_text(&buf);
+                let targets = st.view.panes.targets.clone();
+                let close: u16 = targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::Close)
+                    .map(|(r, _)| r.height)
+                    .sum();
+                assert_eq!(close, 2, "{targets:?}\n{text}");
+                for (r, t) in &targets {
+                    if matches!(t, Target::Setting(_)) {
+                        assert!(r.height >= 2, "{t:?} {r:?}");
+                    }
+                }
+                st.handle_key(key(KeyCode::Down));
+            }
+            st.view.settings = None;
+            // (A TUI opened on a workspace: one on a socket makes none.)
+            st.workspace = Some("default".into());
+            st.set_tabs(vec![crate::workspace::Tab::new("default")]);
+            st.open_new_ws(None);
+            assert!(st.view.new_ws.is_some());
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                2,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(st.view.new_ws.is_none());
+        }
+
+        /// On a phone opened on a socket, a screen too short for a card selects none: Tab and
+        /// the arrows leave the cards alone, and Enter opens no card's popup.
+        #[test]
+        fn a_short_phone_on_a_socket_selects_no_card_it_cannot_draw() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            frame(&mut st, 40, 8);
+            assert!(st.view.panes.no_cards);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Tab));
+            st.handle_key(key(KeyCode::Down));
+            frame(&mut st, 40, 8);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.action_popup().is_none());
+        }
+
+        /// On a phone each Needs you row is two rows tall, both of them its own: a tap on its
+        /// second row selects it as one on its first does, and the next row starts under it.
+        #[test]
+        fn a_needs_row_is_two_rows_both_tapped() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Needs);
+            frame(&mut st, 40, 20);
+            let rows: Vec<(String, ratatui::layout::Rect)> = st
+                .view
+                .panes
+                .panes
+                .iter()
+                .filter_map(|p| match &p.id {
+                    PaneId::Thread(id) => Some((id.clone(), p.area)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{rows:?}");
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].1.height, 2, "{pair:?}");
+                assert_eq!(pair[1].1.y, pair[0].1.bottom(), "{pair:?}");
+            }
+            let (id, area) = rows[1].clone();
+            tap_at(&mut st, 40, 20, 5, area.y + 1);
+            assert_eq!(st.focused(), Some(id.as_str()));
+        }
+
+        /// On a phone, the tab bar switches screens: every cell of its two rows is the tab of
+        /// the third of the width it is in, the gap after a tab included, and a tap anywhere in
+        /// it, its second row too, shows that screen.
         #[test]
         fn the_compact_tab_bar_switches_screens_by_thirds() {
-            for (w, h, rows) in [(40u16, 20u16, 1u16), (40, 30, 1), (40, 12, 1), (30, 20, 1)] {
+            let rows = crate::ui::TAB_BAR_ROWS;
+            for (w, h) in [(40u16, 20u16), (40, 30), (40, 12), (30, 20)] {
                 let mut st = compact();
                 frame(&mut st, w, h);
                 assert!(st.compact(), "{w}x{h}");
@@ -22716,12 +23057,26 @@ pub(crate) mod tests {
             type_line(&mut st, "/n");
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-beta".into()));
             read(&mut st);
+            // (On a phone its rows are two rows tall: ↓ brings Stop into view.)
+            for _ in 0..10 {
+                if st.action_popup().and_then(|p| p.sel) == Some(ActionKind::Stop) {
+                    break;
+                }
+                st.handle_key(key(KeyCode::Down));
+                frame(&mut st, 40, 20);
+            }
+            read(&mut st);
             tap(&mut st, 40, 20, Target::Row(ActionKind::Stop));
             assert!(st.view.action.as_ref().unwrap().armed.is_some());
             frame(&mut st, 40, 13);
             assert!(st.view.shown.is_none(), "no room for the item");
-            let out = tap(&mut st, 40, 13, Target::Row(ActionKind::Stop));
-            assert!(out.is_empty(), "{out:?}");
+            // (On a phone, rows two rows tall may leave no room for Stop at all: then there is
+            // nothing to tap.)
+            let stop = Target::Row(ActionKind::Stop);
+            if st.view.panes.targets.iter().any(|(_, t)| *t == stop) {
+                let out = tap(&mut st, 40, 13, stop);
+                assert!(out.is_empty(), "{out:?}");
+            }
         }
 
         /// A decision that arrives between the press and the release on the
@@ -23043,11 +23398,8 @@ pub(crate) mod tests {
             }
             control(&mut st, &[again]);
             let screen = frame(&mut st, 40, 20);
-            assert_ne!(
-                st.view.panes.target_at(x, y),
-                Some(&Target::Row(ActionKind::Answer(1))),
-                "another row there now"
-            );
+            // (Its rows two rows tall on a phone, the same row may still be under the press:
+            // the revision it was pressed on is what refuses it.)
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty());
             assert!(st.action_popup().is_some(), "it stays");

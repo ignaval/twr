@@ -457,6 +457,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // On a phone, a row under the top border closes it too: its `✕` two rows tall, kept
+    // above what scrolls.
+    let spacer = u16::from(state.compact());
     let path = s.path.as_deref().unwrap_or("no config file here");
     for l in crate::ui::wrap_line(
         Line::from(Span::styled(format!("file: {path}"), dim)),
@@ -509,10 +512,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
         width,
         u16::try_from(lines.len())
             .unwrap_or(u16::MAX)
-            .saturating_add(2),
+            .saturating_add(2 + spacer),
     );
     // Taller than the screen (a phone), it scrolls to keep the selected row in view.
-    let fit = usize::from(rect.height.saturating_sub(2));
+    let fit = usize::from(rect.height.saturating_sub(2 + spacer));
     let mut scroll = 0;
     if let Some((_, span)) = spans.get(s.selected) {
         if span.end > fit {
@@ -526,13 +529,28 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
         .title(" settings ")
         .title(crate::ui::close_title());
     let inner = block.inner(rect);
+    let close = Rect {
+        height: spacer.min(inner.height),
+        ..inner
+    };
+    let inner = Rect {
+        y: inner.y + close.height,
+        height: inner.height - close.height,
+        ..inner
+    };
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
+    if !close.is_empty() {
+        panes.target(close, Target::Close);
+    }
     for (key, span) in spans {
-        // Its rows on screen, under the scroll.
+        // Its rows on screen, under the scroll; on a phone only one showing two rows at least
+        // (or all of its rows) is tapped.
         let (start, end) = (span.start.max(scroll), span.end.min(scroll + fit));
-        if start >= end {
+        let whole = start == span.start && end == span.end;
+        if start >= end || (spacer > 0 && !whole && end - start < usize::from(crate::ui::TAP_ROWS))
+        {
             continue;
         }
         let y = inner
@@ -544,7 +562,12 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     }
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), rect);
+    frame.render_widget(block, rect);
+    if !close.is_empty() {
+        let text = format!("{:>w$}", "✕ close ", w = usize::from(close.width));
+        frame.render_widget(Paragraph::new(Span::styled(text, dim)), close);
+    }
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 /// `path` as shown: under the home directory, with `~`.

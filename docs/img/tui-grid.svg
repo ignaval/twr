@@ -62,20 +62,20 @@
 <text x="988.4" y="99.5" fill="#c9d1d9" textLength="336">terraform plan failed: the state lock is</text>
 <text x="14" y="117.5" fill="#39c5cf">▌</text>
 <text x="39.2" y="117.5" fill="#6e7681" textLength="176.4">ratelimit wants to r…</text>
-<text x="240.8" y="117.5" fill="#d29922" textLength="285.6">twr/7… · changes made · +1 vs main</text>
+<text x="240.8" y="117.5" fill="#d29922" textLength="285.6">twr/d… · changes made · +1 vs main</text>
 <text x="534.8" y="117.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
 <text x="618.8" y="117.5" fill="#d29922" class="b">1</text>
 <text x="635.6" y="117.5" fill="#c9d1d9" textLength="67.2">per line</text>
 <text x="719.6" y="117.5" fill="#d29922" class="b">2</text>
 <text x="736.4" y="117.5" fill="#c9d1d9" textLength="100.8">on the total</text>
 <text x="988.4" y="117.5" fill="#c9d1d9" textLength="142.8">held by run 81719</text>
-<text x="618.8" y="135.5" fill="#39c5cf" textLength="277.2">twr/7dc2c50eea74d75c/invoice-rou…</text>
+<text x="618.8" y="135.5" fill="#39c5cf" textLength="277.2">twr/d42b16aa90a91be8/invoice-rou…</text>
 <text x="904.4" y="135.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
 <text x="988.4" y="135.5" fill="#d29922" class="b">1</text>
 <text x="1005.2" y="135.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
 <text x="22.4" y="153.5" fill="#6e7681">○</text>
 <text x="39.2" y="153.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
-<text x="988.4" y="153.5" fill="#39c5cf" textLength="159.6">twr/7dc2c50eea74d7…</text>
+<text x="988.4" y="153.5" fill="#39c5cf" textLength="159.6">twr/d42b16aa90a91b…</text>
 <text x="1156.4" y="153.5" fill="#6e7681" textLength="193.2">· 1 turn · 22 tok $0.00</text>
 <text x="39.2" y="171.5" fill="#6e7681" textLength="126">hub not running</text>
 <text x="249.2" y="189.5" fill="#6e7681" textLength="42">web ·</text>
@@ -108,7 +108,7 @@
 <text x="618.8" y="279.5" fill="#39c5cf" textLength="151.2">twr/… · +1 vs main</text>
 <text x="778.4" y="279.5" fill="#6e7681" textLength="193.2">· 1 turn · 44 tok $0.00</text>
 <text x="988.4" y="279.5" fill="#6e7681" textLength="243.6">contrast needs a design call.</text>
-<text x="988.4" y="297.5" fill="#d29922" textLength="285.6">twr/7… · changes made · −1 vs main</text>
+<text x="988.4" y="297.5" fill="#d29922" textLength="285.6">twr/d… · changes made · −1 vs main</text>
 <text x="1282.4" y="297.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
 <text x="249.2" y="405.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
 <text x="383.6" y="405.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
