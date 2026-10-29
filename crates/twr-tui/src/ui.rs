@@ -140,7 +140,13 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else if state.view.settings.is_some() {
         crate::settings::render(frame, body, state, &mut panes);
     } else if state.view.help {
-        render_help(frame, body, state.view.help_scroll, &mut panes);
+        render_help(
+            frame,
+            body,
+            state.view.help_scroll,
+            state.compact(),
+            &mut panes,
+        );
     } else if let Some(trash) = &state.view.trash {
         render_trash(frame, body, trash, state.view.trash_scroll, &mut panes);
     } else if state.ws_drawer_open() {
@@ -692,12 +698,15 @@ pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// The help overlay, centered over whatever is on screen, `scroll` rows down. Its rows wrap
 /// to its width ([`help_lines`]); taller than the screen, it scrolls (↑↓, PgUp/PgDn,
 /// Home/End, the wheel), and its bottom border says `↓ more` while there is more below.
-fn render_help(frame: &mut Frame, area: Rect, scroll: u16, panes: &mut Panes) {
+fn render_help(frame: &mut Frame, area: Rect, scroll: u16, phone: bool, panes: &mut Panes) {
     let width = area.width.min(HELP_MAX_WIDTH);
     let lines = help_lines(usize::from(width.saturating_sub(2)).max(1));
     let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let rect = centered(area, width, rows.saturating_add(2));
-    let fit = rect.height.saturating_sub(2);
+    // On a phone, a row under the top border closes it too: its `✕` two rows tall, kept
+    // above what scrolls.
+    let spacer = u16::from(phone);
+    let rect = centered(area, width, rows.saturating_add(2 + spacer));
+    let fit = rect.height.saturating_sub(2 + spacer);
     panes.help_max = rows.saturating_sub(fit);
     let scroll = scroll.min(panes.help_max);
     let hints: &[&str] = if scroll < panes.help_max {
@@ -730,11 +739,32 @@ fn render_help(frame: &mut Frame, area: Rect, scroll: u16, panes: &mut Panes) {
         .title(close_title())
         // On the border: shown whatever the scroll.
         .title_bottom(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+    let inner = block.inner(rect);
+    let close = Rect {
+        height: spacer.min(inner.height),
+        ..inner
+    };
+    let inner = Rect {
+        y: inner.y + close.height,
+        height: inner.height - close.height,
+        ..inner
+    };
     panes.cover(None);
-    panes.add(PaneId::Help, block.inner(rect));
+    panes.add(PaneId::Help, inner);
     close_row(panes, rect, Target::Close);
+    if !close.is_empty() {
+        panes.target(close, Target::Close);
+    }
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), rect);
+    frame.render_widget(block, rect);
+    if !close.is_empty() {
+        let text = format!("{:>w$}", "✕ close ", w = usize::from(close.width));
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
+            close,
+        );
+    }
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), inner);
 }
 
 /// The trash overlay's lines for a `trash.list` result: one row per item (short id, thread,
@@ -6409,9 +6439,23 @@ fn render_card_detail(
             .title_bottom(Line::from(" Tab selects it ").left_aligned())
     };
     let inner = block.inner(area);
+    // On a phone, a row under the top border takes you back too: its `✕` two rows tall.
+    let spacer = u16::from(state.compact() && returns && inner.height > 1);
+    let close = Rect {
+        height: spacer,
+        ..inner
+    };
+    let inner = Rect {
+        y: inner.y + spacer,
+        height: inner.height - spacer,
+        ..inner
+    };
     panes.add(PaneId::Thread(orch.to_string()), inner);
     if returns {
         close_row(panes, area, Target::Release);
+        if !close.is_empty() {
+            panes.target(close, Target::Release);
+        }
     }
     let width = usize::from(inner.width);
     let more = if request {
@@ -6455,7 +6499,15 @@ fn render_card_detail(
     if !inner.is_empty() {
         panes.card = Some(window);
     }
-    frame.render_widget(Paragraph::new(shown).block(block), area);
+    frame.render_widget(block, area);
+    if !close.is_empty() {
+        let text = format!("{:>w$}", "✕ back ", w = usize::from(close.width));
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(Color::DarkGray))),
+            close,
+        );
+    }
+    frame.render_widget(Paragraph::new(shown), inner);
     record(panes, orch, drawn, inner);
 }
 
@@ -6913,7 +6965,10 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     let shown = dive.or_else(|| state.orchestrator());
     let works = shown.is_some_and(icon::is_working);
     let working = shown.and_then(|t| working_icon(state, t));
-    let [band, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+    // On a phone the band is two rows tall, as its `‹ back` is a control ([`TAP_ROWS`]).
+    let band_rows = if state.compact() { TAP_ROWS } else { 1 };
+    let [band, body] =
+        Layout::vertical([Constraint::Length(band_rows), Constraint::Min(0)]).areas(area);
     // No border: the header band says who the pane is about and, selected (Shift-←), turns
     // the yellow of a selected card and says so ([`render_band`]).
     render_band(frame, band, state, working, panes);
@@ -8083,7 +8138,14 @@ fn render_action_popup(
     };
     if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) + row_h > fit {
         lines.truncate(fit.saturating_sub(1 + row_h));
-        whole = false;
+        // Read in full in its detail view, it stays so (its note is what was cut); an item
+        // not read, cut, is opened there to be read, as one too long for the popup.
+        if item.is_none() || !detail_read {
+            whole = false;
+        }
+        if item.is_some() && !detail_read {
+            panes.long_item = Some(card.clone());
+        }
         // A report cut short says so.
         if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {
             *last = ellipsized(std::mem::take(last), inner_w);
