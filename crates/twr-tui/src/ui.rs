@@ -7995,7 +7995,8 @@ fn render_input(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     // While the last message can be taken back, the border's row takes it back: a tap arms
     // the second, as the first Esc does (the title then says so in place of this).
     if state.take_back_offered() {
-        if state.unsend_hint().is_none() {
+        // On a phone the band above the box says it ([`render_take_back`]).
+        if state.unsend_hint().is_none() && !state.compact() {
             block = block.title(
                 Line::from(Span::styled(
                     " ↶ take back ",

@@ -8069,7 +8069,7 @@ impl AppState {
                 self.view.status = None;
                 self.view.status_until = None;
             }
-            Target::Sidebar => return self.set_sidebar(true),
+            Target::Sidebar => return self.sidebar_or_screen(true),
             Target::FocusOff => self.set_focus_mode(false),
             Target::Parked => self.show_parked(true),
         }
@@ -23957,6 +23957,48 @@ pub(crate) mod tests {
             frame(&mut st, 40, 30);
             two_rows_each(&st, "popup open");
             assert!(takes(&st).iter().all(|r| r.height == 2), "{:?}", takes(&st));
+        }
+
+        /// The status bar's `Ctrl-B shows` on a phone does what Ctrl-B does there: the
+        /// Threads screen, the flag as it was.
+        #[test]
+        fn the_sidebar_note_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            st.view.sidebar_hidden = true;
+            frame(&mut st, 40, 24);
+            let (x, y) = second_row(&st, &Target::Sidebar);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.compact_pane, CompactPane::Threads);
+            assert!(
+                st.view.sidebar_hidden,
+                "the full layout's sidebar stays as it was"
+            );
+        }
+
+        /// A workspace's selection comes back as the sidebar is now: hidden since, it waits
+        /// for the sidebar to show; shown since, it is selected again.
+        #[test]
+        fn a_restored_selection_follows_the_sidebar() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.set_focus(Some("t-beta".into()));
+            let saved = st.take_view();
+            let mut back = three_threads();
+            back.view.sidebar_hidden = true;
+            back.restore_view(saved);
+            back.finish_restore();
+            frame(&mut back, 160, 40);
+            assert_eq!(back.focused(), None);
+            back.handle_key(ctrl('b'));
+            assert_eq!(back.focused(), Some("t-beta"));
+            // Left hidden, the selection waiting; shown when it comes back.
+            back.handle_key(ctrl('b'));
+            let saved = back.take_view();
+            let mut again = three_threads();
+            again.restore_view(saved);
+            again.finish_restore();
+            frame(&mut again, 160, 40);
+            assert_eq!(again.focused(), Some("t-beta"));
         }
 
         /// On short phone screens no control is drawn shorter than its two rows: the queue

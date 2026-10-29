@@ -1455,6 +1455,21 @@ impl AppState {
         // Before the selection is checked against what the view draws (`ensure_focus`, once
         // this returns): the detail's card counts as drawn.
         self.view.detail = r.detail.filter(|card| !self.card_items(card).is_empty());
+        // The sidebar is one for every workspace: shown or hidden since this one was left, its
+        // selection goes where the sidebar keeps it, as Ctrl-B would have put it.
+        if self.view.screen == Screen::Stack && !self.compact() {
+            if self.view.sidebar_hidden {
+                let hidden = self.view.focus.clone().filter(|f| {
+                    !self.stack_nav().contains(f) && self.view.detail.as_ref() != Some(f)
+                });
+                if let Some(f) = hidden {
+                    self.view.sidebar_focus.get_or_insert(f);
+                    self.view.focus = None;
+                }
+            } else if self.view.focus.is_none() {
+                self.view.focus = self.view.sidebar_focus.take();
+            }
+        }
         let card = &r.card_view;
         if self
             .attention
