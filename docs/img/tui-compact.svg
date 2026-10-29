@@ -5,40 +5,48 @@
 <rect x="14" y="14" width="100.8" height="18" fill="#444444"/>
 <rect x="123.2" y="14" width="109.2" height="18" fill="#444444"/>
 <rect x="240.8" y="14" width="84" height="18" fill="#c9d1d9"/>
-<rect x="30.8" y="32" width="260.4" height="18" fill="#c9d1d9"/>
-<rect x="291.2" y="32" width="25.2" height="18" fill="#d29922"/>
-<rect x="316.4" y="32" width="25.2" height="18" fill="#c9d1d9"/>
+<rect x="14" y="32" width="100.8" height="18" fill="#444444"/>
+<rect x="123.2" y="32" width="109.2" height="18" fill="#444444"/>
+<rect x="39.2" y="86" width="58.8" height="18" fill="#ffa198"/>
 <rect x="22.4" y="302" width="134.4" height="18" fill="#5fd7d7"/>
-<rect x="22.4" y="38.8" width="8.4" height="11.2" fill="#d7875f"/>
-<rect x="39.2" y="92.8" width="8.4" height="11.2" fill="#d7875f"/>
+<rect x="39.2" y="218.8" width="8.4" height="11.2" fill="#d7875f"/>
 <path d="M18.2 311H22.4M266 311H345.8M18.2 347H345.8M18.2 311V347M345.8 311V347" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M35 77H39.2M148.4 77H156.8M282.8 77H291.2M341.6 77H345.8M35 131H39.2M106.4 131H274.4M341.6 131H345.8M35 77V131M345.8 77V131" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<path d="M35 59H39.2M140 59H156.8M282.8 59H291.2M35 185H345.8M35 59V185M345.8 68V185" stroke="#875fff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 203H39.2M148.4 203H156.8M282.8 203H291.2M341.6 203H345.8M35 257H345.8M35 203V257M345.8 203V257" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
 <text x="47.6" y="27.5" fill="#d0d0d0" textLength="33.6">Chat</text>
 <text x="131.6" y="27.5" fill="#ffd700" class="b" textLength="92.4">Needs you 3</text>
 <text x="266" y="27.5" fill="#0d1117" class="b" textLength="58.8">Threads</text>
-<text x="14" y="45.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="45.5" fill="#0d1117" class="b" textLength="58.8">default</text>
-<text x="299.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠2 ●1</text>
 <text x="14" y="63.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="63.5" fill="#d29922" class="b" textLength="201.6">working · waiting on you</text>
+<text x="47.6" y="63.5" fill="#875fff" class="b" textLength="84">deploy-fix</text>
+<text x="165.2" y="63.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="299.6" y="63.5" fill="#6e7681" textLength="50.4">auto ↑</text>
 <text x="14" y="81.5" fill="#39c5cf">▌</text>
-<text x="47.6" y="81.5" fill="#af5f00" class="b" textLength="92.4">checkout-ui</text>
-<text x="165.2" y="81.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="299.6" y="81.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="39.2" y="81.5" fill="#ff7b72" class="b" textLength="50.4">failed</text>
 <text x="14" y="99.5" fill="#39c5cf">▌</text>
-<text x="56" y="99.5" fill="#3fb950" class="b" textLength="58.8">running</text>
-<text x="123.2" y="99.5" fill="#6e7681">·</text>
-<text x="140" y="99.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="47.6" y="99.5" fill="#1b1f24" class="b" textLength="42">ERROR</text>
+<text x="106.4" y="99.5" fill="#c9d1d9" textLength="218.4">deploy-fix: turn 1 failed:</text>
 <text x="14" y="117.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="117.5" fill="#d29922" textLength="302.4">twr/… · changes made · +1/−1 vs main</text>
+<text x="39.2" y="117.5" fill="#c9d1d9" textLength="268.8">terraform plan failed: the state</text>
 <text x="14" y="135.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="135.5" fill="#d29922" textLength="67.2">↑ 3 more</text>
-<text x="274.4" y="135.5" fill="#d29922" textLength="67.2">↓ 3 more</text>
-<text x="22.4" y="171.5" fill="#6e7681">○</text>
-<text x="39.2" y="171.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
-<text x="39.2" y="189.5" fill="#6e7681" textLength="126">hub not running</text>
-<text x="22.4" y="279.5" fill="#39c5cf" textLength="126">+ New workspace</text>
-<text x="22.4" y="297.5" fill="#39c5cf" textLength="84">⚙ Settings</text>
+<text x="39.2" y="135.5" fill="#c9d1d9" textLength="210">lock is held by run 81719</text>
+<text x="14" y="153.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="153.5" fill="#d29922" class="b">1</text>
+<text x="56" y="153.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
+<text x="14" y="171.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="171.5" fill="#39c5cf" textLength="260.4">twr/d42b16aa90a91be8/deploy-fix</text>
+<text x="14" y="189.5" fill="#39c5cf">▌</text>
+<text x="14" y="207.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="207.5" fill="#af5f00" class="b" textLength="92.4">checkout-ui</text>
+<text x="165.2" y="207.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="299.6" y="207.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="14" y="225.5" fill="#39c5cf">▌</text>
+<text x="56" y="225.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="123.2" y="225.5" fill="#6e7681">·</text>
+<text x="140" y="225.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="14" y="243.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="243.5" fill="#d29922" textLength="302.4">twr/… · changes made · +1/−1 vs main</text>
+<text x="14" y="261.5" fill="#39c5cf">▌</text>
+<text x="341.6" y="297.5" fill="#6e7681">↓</text>
 <text x="30.8" y="315.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
 <text x="165.2" y="315.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
 <text x="22.4" y="333.5" fill="#6e7681" textLength="210">message the orchestrator…</text>

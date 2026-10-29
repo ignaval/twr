@@ -8120,18 +8120,20 @@ fn render_action_popup(
         let at = popup
             .sel
             .and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
-        // On a phone the options come first, then the highlighted row, then the rest in their
-        // order as they fit: the item stays answerable however tall its rows are.
+        // On a phone, whole rows within the room: the highlighted one first, then the
+        // options (the item stays answerable however tall its rows are, when they fit), then
+        // the rest in their order.
         if state.compact() {
-            let first = |i: usize| matches!(rows[i].kind, ActionKind::Answer(_));
-            let mut keep: Vec<usize> = drawn.iter().copied().filter(|&i| first(i)).collect();
-            if let Some(k) = at.map(|a| drawn[a]).filter(|k| !keep.contains(k)) {
-                keep.push(k);
-            }
-            let mut used: usize = keep.iter().map(|&i| draw_row(i).len()).sum();
-            for (k, &i) in drawn.iter().enumerate() {
-                if !keep.contains(&i) && used + heights[k] <= room {
-                    keep.push(i);
+            let answer = |i: usize| matches!(rows[i].kind, ActionKind::Answer(_));
+            let order: Vec<usize> = at
+                .into_iter()
+                .chain((0..drawn.len()).filter(|&k| answer(drawn[k])))
+                .chain(0..drawn.len())
+                .collect();
+            let (mut keep, mut used) = (Vec::new(), 0);
+            for k in order {
+                if !keep.contains(&drawn[k]) && used + heights[k] <= room {
+                    keep.push(drawn[k]);
                     used += heights[k];
                 }
             }
@@ -8165,15 +8167,20 @@ fn render_action_popup(
         row_at.push((rows[i].kind, lines.len(), row.len()));
         lines.extend(row);
     }
-    panes.popup_rows = Some((
-        popup.target.clone(),
-        drawn.iter().map(|&i| rows[i].kind).collect(),
-    ));
     if lines.len() > fit {
         // Still taller than the room (a great many rows): cut, and not drawn in full.
         lines.truncate(fit);
         whole = false;
     }
+    // The rows drawn whole: only those run from Enter (a row cut off draws no target either).
+    panes.popup_rows = Some((
+        popup.target.clone(),
+        row_at
+            .iter()
+            .filter(|(_, start, n)| start + n <= lines.len())
+            .map(|(kind, ..)| *kind)
+            .collect(),
+    ));
     exact = exact && lines.iter().all(|l| l.width() <= inner_w.max(1));
     if spacer == 1 {
         // The second row of its `✕`, under the top border.

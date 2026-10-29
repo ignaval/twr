@@ -22226,6 +22226,90 @@ pub(crate) mod tests {
             assert!(st.view.confirm.is_none());
         }
 
+        /// On short phones the action popup draws only whole two-row rows, the highlighted one
+        /// first: a row it draws is one Enter may run, and one it could not draw never runs.
+        #[test]
+        fn a_short_phone_popup_runs_only_rows_it_drew_whole() {
+            for h in [16u16, 12, 10] {
+                let mut st = compact();
+                st.show_pane(CompactPane::Threads);
+                frame(&mut st, 40, h);
+                st.handle_key(key(KeyCode::Enter));
+                for _ in 0..8 {
+                    st.handle_key(key(KeyCode::Down));
+                    frame(&mut st, 40, h);
+                    let sel = st.action_popup().and_then(|p| p.sel);
+                    let drawn = st
+                        .view
+                        .panes
+                        .popup_rows
+                        .clone()
+                        .map(|(_, k)| k)
+                        .unwrap_or_default();
+                    for (r, t) in &st.view.panes.targets {
+                        if matches!(t, Target::Row(_)) {
+                            assert_eq!(r.height, 2, "40x{h} {t:?}");
+                        }
+                    }
+                    if let Some(sel) = sel.filter(|k| !drawn.contains(k)) {
+                        let out = st.handle_key(key(KeyCode::Enter));
+                        assert!(out.is_empty(), "40x{h} {sel:?}: {out:?}");
+                        assert!(st.action_popup().is_some(), "40x{h}");
+                    }
+                }
+            }
+        }
+
+        /// On a phone the settings' `✕` is two rows (its top border and a row under it kept
+        /// above what scrolls), and a setting is tapped only where at least two of its rows,
+        /// or all of them, show; the new-workspace dialog's `✕` is two rows too.
+        #[test]
+        fn phone_settings_and_dialog_close_on_two_rows() {
+            let mut st = compact();
+            frame(&mut st, 40, 12);
+            st.open_settings();
+            for _ in 0..6 {
+                let buf = frame(&mut st, 40, 12);
+                let text = screen_text(&buf);
+                let targets = st.view.panes.targets.clone();
+                let close: u16 = targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::Close)
+                    .map(|(r, _)| r.height)
+                    .sum();
+                assert_eq!(close, 2, "{targets:?}\n{text}");
+                for (r, t) in &targets {
+                    if matches!(t, Target::Setting(_)) {
+                        assert!(r.height >= 2, "{t:?} {r:?}");
+                    }
+                }
+                st.handle_key(key(KeyCode::Down));
+            }
+            st.view.settings = None;
+            // (A TUI opened on a workspace: one on a socket makes none.)
+            st.workspace = Some("default".into());
+            st.set_tabs(vec![crate::workspace::Tab::new("default")]);
+            st.open_new_ws(None);
+            assert!(st.view.new_ws.is_some());
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                2,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(st.view.new_ws.is_none());
+        }
+
         /// On a phone opened on a socket, a screen too short for a card selects none: Tab and
         /// the arrows leave the cards alone, and Enter opens no card's popup.
         #[test]

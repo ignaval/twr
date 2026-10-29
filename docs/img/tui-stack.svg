@@ -58,7 +58,7 @@
 <text x="131.6" y="171.5" fill="#c9d1d9" textLength="33.6">deny</text>
 <text x="459.2" y="171.5" fill="#c9d1d9" textLength="403.2">Round tax per line or once on the invoice total?</text>
 <text x="14" y="189.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="189.5" fill="#d29922" textLength="386.4">twr/7dc2c50eea74d… · changes made · +1 vs main</text>
+<text x="39.2" y="189.5" fill="#d29922" textLength="386.4">twr/d42b16aa90a91… · changes made · +1 vs main</text>
 <text x="14" y="207.5" fill="#39c5cf">▌</text>
 <text x="459.2" y="207.5" fill="#6e7681" textLength="42">task:</text>
 <text x="509.6" y="207.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
@@ -85,7 +85,7 @@
 <text x="140" y="297.5" fill="#d29922" class="b">2</text>
 <text x="156.8" y="297.5" fill="#c9d1d9" textLength="100.8">on the total</text>
 <text x="14" y="315.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="315.5" fill="#39c5cf" textLength="310.8">twr/7dc2c50eea74d75c/invoice-rounding</text>
+<text x="39.2" y="315.5" fill="#39c5cf" textLength="310.8">twr/d42b16aa90a91be8/invoice-rounding</text>
 <text x="467.6" y="315.5" fill="#008700" class="b" textLength="184.8">ratelimit · permission</text>
 <text x="14" y="333.5" fill="#39c5cf">▌</text>
 <text x="459.2" y="333.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
@@ -113,7 +113,7 @@
 <text x="39.2" y="441.5" fill="#d29922" class="b">1</text>
 <text x="56" y="441.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
 <text x="14" y="459.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="459.5" fill="#39c5cf" textLength="260.4">twr/7dc2c50eea74d75c/deploy-fix</text>
+<text x="39.2" y="459.5" fill="#39c5cf" textLength="260.4">twr/d42b16aa90a91be8/deploy-fix</text>
 <text x="459.2" y="459.5" fill="#d29922" class="b">1</text>
 <text x="476" y="459.5" fill="#c9d1d9" textLength="42">allow</text>
 <text x="534.8" y="459.5" fill="#d29922" class="b">2</text>
@@ -131,7 +131,7 @@
 <text x="442.4" y="513.5" fill="#949494">❯</text>
 <text x="459.2" y="513.5" fill="#ffffff" textLength="201.6">What needs me right now?</text>
 <text x="14" y="531.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="531.5" fill="#d29922" textLength="386.4">twr/7dc2c50eea… · changes made · +1/−1 vs main</text>
+<text x="39.2" y="531.5" fill="#d29922" textLength="386.4">twr/d42b16aa90… · changes made · +1/−1 vs main</text>
 <text x="14" y="549.5" fill="#39c5cf">▌</text>
 <text x="358.4" y="549.5" fill="#af5f00" textLength="67.2">↓ 3 more</text>
 <text x="459.2" y="549.5" fill="#949494" textLength="50.4">Called</text>

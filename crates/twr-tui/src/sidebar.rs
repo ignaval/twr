@@ -1364,10 +1364,15 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     let room = inner_w.saturating_sub(NAME_LABEL.len() + 1);
     let skip = name.chars().count().saturating_sub(room);
     let shown: String = name.chars().skip(skip).collect();
-    let mut lines = vec![Line::from(vec![
+    // On a phone, a row under the top border closes it too: its `✕` two rows tall.
+    let spacer = u16::from(state.compact());
+    let mut lines: Vec<Line<'static>> = (0..spacer)
+        .map(|_| Line::from(Span::styled(format!("{:>inner_w$}", "✕ close "), dim)))
+        .collect();
+    lines.push(Line::from(vec![
         Span::raw(NAME_LABEL),
         Span::styled(shown.clone(), Style::default().add_modifier(Modifier::BOLD)),
-    ])];
+    ]));
     let (note, style) = match state.new_ws_error(name) {
         Some(why) if !name.is_empty() => (why, Style::default().fg(Color::Red)),
         _ => (
@@ -1397,13 +1402,16 @@ pub fn render_new(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
+    if spacer > 0 && inner.height > 0 {
+        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
+    }
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
     // The cursor after the name, on its row.
     let label = u16::try_from(NAME_LABEL.len()).unwrap_or(u16::MAX);
     let x = inner.x + label + u16::try_from(crate::edit::width(&shown)).unwrap_or(u16::MAX);
-    if inner.height > 0 && x < inner.x + inner.width {
-        frame.set_cursor_position((x, inner.y));
+    if inner.height > spacer && x < inner.x + inner.width {
+        frame.set_cursor_position((x, inner.y + spacer));
     }
 }
 
