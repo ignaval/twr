@@ -1,9 +1,9 @@
 //! Long cards on a phone: an item, a report or a question waiting for `y` taller than the
-//! screen is read whole and answered by touch (taps, and the wheel a swipe sends) and by keys,
-//! in the rows the screen has, upright, with the keyboard open, or on its side; the answer
-//! sent is the option tapped, on the item and revision on screen, and only once its whole text
-//! has been on screen. Driven as the IO loop drives the TUI: a frame before and after each
-//! input.
+//! screen is answered by touch (taps, and the wheel a swipe sends) and by keys from the rows the
+//! screen first shows, upright, with the keyboard open, or on its side, its whole text there to
+//! scroll through when you want to; the answer sent is the option tapped, on the item and
+//! revision on screen, never one moved under the finger. Driven as the IO loop drives the TUI:
+//! a frame before and after each input.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -56,9 +56,6 @@ fn settle(st: &mut AppState) {
         s.since = then;
     }
     if let Some((_, since)) = st.view.confirm_seen.as_mut() {
-        *since = then;
-    }
-    if let Some((_, _, since)) = st.view.sheet_read.as_mut() {
         *since = then;
     }
 }
@@ -287,11 +284,44 @@ fn targets_agree(st: &AppState, buf: &Buffer, what: &str) {
     }
 }
 
-/// From Needs you, by touch alone, upright, keyboard open and on its side: every line of a
-/// long question is read in its popup (swiped over its text), and a tap, then another, on an
-/// option sends that option for that item and revision; the controls lie on their text.
+/// Where the action popup's text is scrolled to (its first row drawn), and how many rows it has.
+fn text_at(st: &AppState) -> (usize, usize) {
+    let w = st.view.panes.sheet.as_ref().expect("the popup's text");
+    (w.start, w.rows)
+}
+
+/// From Needs you, by touch alone, upright, keyboard open and on its side: a long question is
+/// answered from the first rows it shows, its text never scrolled (more of it below), with the
+/// option tapped twice, for that item and revision; the controls lie on their text.
 #[test]
-fn a_long_question_is_read_whole_and_answered_by_touch_from_needs_you() {
+fn a_long_question_is_answered_by_touch_from_its_first_rows() {
+    for size in [UPRIGHT, KEYBOARD, LANDSCAPE] {
+        let mut st = phone();
+        raise_long(&mut st, Question, "q1", 30, 4);
+        open_from_needs(&mut st, size);
+        let buf = frame(&mut st, size);
+        targets_agree(&st, &buf, &format!("{size:?}"));
+        assert!(
+            lines(&buf).iter().any(|l| l.contains("more lines")),
+            "{size:?}"
+        );
+        assert_eq!(text_at(&st).0, 0);
+        let out = answer_by_taps(&mut st, size, 3);
+        assert_eq!(st.view.sheet_view.scroll, 0, "{size:?}: never scrolled");
+        assert_eq!(
+            responded(&out),
+            Some(("q1", revision_of(&st, "q1"), "choice 03")),
+            "{size:?}: {out:?}\n{}",
+            screen(&mut st, size)
+        );
+    }
+}
+
+/// The whole text is there to read when you want to: swiped through, every line comes on
+/// screen, and then (scrolled to its end, or back to its top by its cue) an option answers as
+/// it did before.
+#[test]
+fn the_whole_text_scrolls_into_view_when_wanted() {
     for size in [UPRIGHT, KEYBOARD, LANDSCAPE] {
         let mut st = phone();
         raise_long(&mut st, Question, "q1", 30, 4);
@@ -304,20 +334,18 @@ fn a_long_question_is_read_whole_and_answered_by_touch_from_needs_you() {
                 "{size:?}: {line} never on screen: {seen:?}"
             );
         }
-        let buf = frame(&mut st, size);
-        targets_agree(&st, &buf, &format!("{size:?}"));
-        let out = answer_by_taps(&mut st, size, 3);
-        assert_eq!(
-            responded(&out),
-            Some(("q1", revision_of(&st, "q1"), "choice 03")),
-            "{size:?}: {out:?}\n{}",
-            screen(&mut st, size)
-        );
+        let (at, rows) = text_at(&st);
+        assert!(at > 0 && at < rows, "{size:?}");
+        let out = tap(&mut st, size, &Target::More(Scrolled::Sheet)).expect("its cue");
+        assert!(out.is_empty() && st.view.action.is_some());
+        assert_eq!(text_at(&st).0, 0, "{size:?}: back at its top");
+        let out = answer_by_taps(&mut st, size, 2);
+        assert_eq!(responded(&out).map(|r| r.2), Some("choice 02"), "{size:?}");
     }
 }
 
 /// A permission whose command wraps over many rows, and a hung turn's card with choices:
-/// the same sheet, read to its end, answered with the option tapped.
+/// answered from their first rows, the rest of the command there to scroll to.
 #[test]
 fn a_long_permission_and_a_hung_card_are_answered_by_touch() {
     for size in [UPRIGHT, KEYBOARD, LANDSCAPE] {
@@ -336,9 +364,6 @@ fn a_long_permission_and_a_hung_card_are_answered_by_touch() {
         }
         control(&mut st, &[d.created("delta"), d.turn_started("build"), p]);
         open_from_needs(&mut st, size);
-        let seen: String = read_to_end(&mut st, size, 200).into_iter().collect();
-        let joined: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(joined.contains("crate13"), "{size:?}: {seen}");
         let options = st.attention.get("p1").unwrap().options.clone();
         let out = answer_by_taps(&mut st, size, 2);
         assert_eq!(
@@ -346,11 +371,29 @@ fn a_long_permission_and_a_hung_card_are_answered_by_touch() {
             Some(("p1", revision_of(&st, "p1"), options[1].as_str())),
             "{size:?}: {out:?}"
         );
+        // Its whole command, scrolled through.
+        let mut st = phone();
+        let mut d = ThreadScript::new("t-delta");
+        d.at(70);
+        let mut p = d.raise("p1", Permission);
+        if let EventBody::AttentionRaised(a) = &mut p.body {
+            a.summary = format!(
+                "Bash: {}",
+                (0..14)
+                    .map(|i| format!("cargo build -p crate{i:02}"))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            );
+        }
+        control(&mut st, &[d.created("delta"), d.turn_started("build"), p]);
+        open_from_needs(&mut st, size);
+        let seen: String = read_to_end(&mut st, size, 200).into_iter().collect();
+        let joined: String = seen.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(joined.contains("crate13"), "{size:?}: {seen}");
 
         let mut st = phone();
         raise_long(&mut st, Stalled, "h1", 16, 3);
         open_from_needs(&mut st, size);
-        read_to_end(&mut st, size, 200);
         let out = answer_by_taps(&mut st, size, 3);
         assert_eq!(
             responded(&out),
@@ -369,7 +412,6 @@ fn options_beyond_the_screen_scroll_into_reach() {
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 12, 14);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 100);
     let out = answer_by_taps(&mut st, size, 14);
     assert_eq!(
         responded(&out),
@@ -380,7 +422,6 @@ fn options_beyond_the_screen_scroll_into_reach() {
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 12, 14);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 100);
     st.handle_key(key(KeyCode::Down));
     frame(&mut st, size);
     assert_eq!(
@@ -409,62 +450,59 @@ fn options_beyond_the_screen_scroll_into_reach() {
     );
 }
 
-/// No answer before the text was read to its end: a tap (or two) on an option says to read
-/// it first, and so does its digit; PgDn (and Ctrl-↓) read it, the popup staying; PgUp goes
-/// back to its top without forgetting it was read; then the option answers.
+/// What guarded answers before still does: a digit pressed as the popup first shows the item
+/// (within CARD_SETTLE) answers nothing, nor does a first tap on an option (it picks it); once
+/// it has been on screen a moment, a digit answers from the first rows, unscrolled, and PgDn
+/// and Ctrl-↓ scroll the text without closing the popup.
 #[test]
-fn an_option_answers_only_once_the_text_was_read_to_its_end() {
+fn an_option_answers_from_the_first_rows_once_the_item_settles() {
     let size = UPRIGHT;
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 40, 3);
     open_from_needs(&mut st, size);
+    assert!(
+        st.handle_key(key(KeyCode::Char('1'))).is_empty(),
+        "just shown"
+    );
     settle(&mut st);
     let row = Target::Row(ActionKind::Answer(1));
-    for _ in 0..2 {
-        let out = tap(&mut st, size, &row).expect("option 1 drawn under the text");
-        assert!(out.is_empty(), "{out:?}");
-        settle(&mut st);
-    }
-    let shown = screen(&mut st, size);
-    assert!(shown.contains("read it to its end first"), "{shown}");
-    assert!(st.handle_key(key(KeyCode::Char('1'))).is_empty());
-    for _ in 0..40 {
-        st.handle_key(key(KeyCode::PageDown));
-        frame(&mut st, size);
-    }
-    st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
-    assert!(
-        st.view.action.is_some(),
-        "the keys scroll it, the popup stays"
-    );
-    for _ in 0..40 {
-        st.handle_key(key(KeyCode::PageUp));
-        frame(&mut st, size);
-    }
-    let shown = screen(&mut st, size);
-    assert!(shown.contains("line 00"), "{shown}");
+    let out = tap(&mut st, size, &row).expect("option 1 under the first rows");
+    assert!(out.is_empty(), "a first tap picks it: {out:?}");
     settle(&mut st);
-    let out = st.handle_key(key(KeyCode::Char('1')));
     assert_eq!(
-        responded(&out),
-        Some(("q1", revision_of(&st, "q1"), "choice 01"))
+        responded(&st.handle_key(key(KeyCode::Char('1')))).map(|r| r.2),
+        Some("choice 01")
     );
+    assert_eq!(st.view.sheet_view.scroll, 0, "answered unscrolled");
+    // Scrolling is there by keys too, the popup staying.
+    let mut st = phone();
+    raise_long(&mut st, Question, "q1", 40, 3);
+    open_from_needs(&mut st, size);
+    st.handle_key(key(KeyCode::PageDown));
+    frame(&mut st, size);
+    st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+    frame(&mut st, size);
+    assert!(st.view.action.is_some());
+    assert!(text_at(&st).0 > 0);
+    st.handle_key(key(KeyCode::PageUp));
+    st.handle_key(key(KeyCode::PageUp));
+    frame(&mut st, size);
+    assert_eq!(text_at(&st).0, 0);
 }
 
 /// A swipe is no tap: pressed on an option, the rows moved under the finger by the wheel,
-/// then released, runs nothing (another row is under it); a drag over the options selects
-/// text; pressed on one option and released on the next runs neither; a tap on the text's
-/// cue pages it, answering nothing.
+/// then released, runs nothing (another row is under it); a drag over the options copies text
+/// and answers nothing; pressed on one option and released on the next runs neither; a tap on
+/// the text's cue pages it, answering nothing.
 #[test]
 fn swipes_and_drags_never_answer_a_neighbouring_option() {
     let size = KEYBOARD;
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 20, 12);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 100);
     settle(&mut st);
     let left = MouseButton::Left;
-    // Highlighted and armed by a first tap: a second would run it.
+    // Picked by a first tap: a second would run it.
     let one = Target::Row(ActionKind::Answer(1));
     assert!(tap(&mut st, size, &one).unwrap().is_empty());
     settle(&mut st);
@@ -520,19 +558,19 @@ fn swipes_and_drags_never_answer_a_neighbouring_option() {
         "{out:?}"
     );
     assert!(st.view.action.is_some(), "the popup stays");
-    // The text's cue: a tap pages it (back to its top here), the popup staying.
+    // The text's cue: a tap pages it, the popup staying.
     let more = Target::More(Scrolled::Sheet);
+    let before = text_at(&st).0;
     let out = tap(&mut st, size, &more).expect("the text's cue");
     assert!(out.is_empty() && st.view.action.is_some(), "{out:?}");
-    let shown = screen(&mut st, size);
-    assert!(shown.contains("QUESTION"), "back at its top: {shown}");
+    assert_ne!(text_at(&st).0, before, "paged");
 }
 
-/// The keyboard opening and closing (the height changing) keeps the text's place and what
-/// of it was read, the controls on their text; turned on its side (another width, the text
-/// wrapped again) it must be read again.
+/// The keyboard opening and closing (the height changing) keeps the text's place and the
+/// controls on their text, and disarms a picked option (its rows moved); turned on its side
+/// (another width, the text wrapped again) it starts at its top. Answered after each.
 #[test]
-fn a_resize_keeps_the_place_and_a_new_width_reads_again() {
+fn a_resize_keeps_the_place_and_the_targets_on_their_text() {
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 30, 4);
     open_from_needs(&mut st, UPRIGHT);
@@ -549,50 +587,54 @@ fn a_resize_keeps_the_place_and_a_new_width_reads_again() {
     };
     let was = top(&mut st, UPRIGHT);
     assert!(!was.contains("QUESTION"), "scrolled: {was}");
-    // The keyboard opens: the same row at the top.
+    settle(&mut st);
+    assert!(tap(&mut st, UPRIGHT, &Target::Row(ActionKind::Answer(1)))
+        .unwrap()
+        .is_empty());
+    assert!(st.view.action.as_ref().unwrap().armed.is_some());
+    // The keyboard opens: the same row at the top, the pick gone.
     assert_eq!(top(&mut st, KEYBOARD), was);
+    assert!(st.view.action.as_ref().unwrap().armed.is_none());
     let buf = frame(&mut st, KEYBOARD);
     targets_agree(&st, &buf, "keyboard");
-    // Read on to its end with it open; it closes: read, answered upright.
-    read_to_end(&mut st, KEYBOARD, 200);
-    let buf = frame(&mut st, UPRIGHT);
-    targets_agree(&st, &buf, "upright");
-    let out = answer_by_taps(&mut st, UPRIGHT, 2);
+    let out = answer_by_taps(&mut st, KEYBOARD, 2);
     assert_eq!(responded(&out).map(|r| r.2), Some("choice 02"));
-    // Read upright, then turned (wider): wrapped again, read again before it answers.
+    // Scrolled upright, then turned (wider): from its top, answered there.
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 30, 4);
     open_from_needs(&mut st, UPRIGHT);
-    read_to_end(&mut st, UPRIGHT, 200);
+    for _ in 0..6 {
+        let p = popup(&st);
+        wheel(&mut st, UPRIGHT, p.x + 1, p.y, true);
+    }
     let wide = (50, 20);
-    frame(&mut st, wide);
+    let buf = frame(&mut st, wide);
+    targets_agree(&st, &buf, "wide");
+    assert_eq!(text_at(&st).0, 0, "wrapped again, from its top");
     settle(&mut st);
-    assert!(st.handle_key(key(KeyCode::Char('2'))).is_empty());
-    read_to_end(&mut st, wide, 200);
-    settle(&mut st);
-    let out = st.handle_key(key(KeyCode::Char('2')));
-    let status = st.view.status.clone();
     assert_eq!(
-        responded(&out).map(|r| r.2),
-        Some("choice 02"),
-        "{status:?}\n{}",
-        screen(&mut st, wide)
+        responded(&st.handle_key(key(KeyCode::Char('2')))).map(|r| r.2),
+        Some("choice 02")
     );
 }
 
 /// The item raised again while its popup is open (new text, new revision): the text shows
-/// from its top, a tap armed on it before runs nothing, and the new text is read before an
-/// option answers it, under its new revision. Resolved while open, nothing of it answers.
+/// from its top, an option picked on it before runs nothing, and a digit pressed as it changes
+/// answers nothing; then it is answered under its new revision, from its first rows.
+/// Resolved while open, nothing of it answers.
 #[test]
 fn an_item_replaced_or_resolved_while_open_is_never_answered_as_it_was() {
     let size = KEYBOARD;
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 30, 4);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 200);
+    for _ in 0..4 {
+        let p = popup(&st);
+        wheel(&mut st, size, p.x + 1, p.y, true);
+    }
     settle(&mut st);
     let one = Target::Row(ActionKind::Answer(1));
-    assert!(tap(&mut st, size, &one).unwrap().is_empty(), "armed");
+    assert!(tap(&mut st, size, &one).unwrap().is_empty(), "picked");
     let old = revision_of(&st, "q1");
     let mut d = ThreadScript::new("t-delta");
     d.at(200);
@@ -608,14 +650,10 @@ fn an_item_replaced_or_resolved_while_open_is_never_answered_as_it_was() {
     assert_ne!(revision_of(&st, "q1"), old);
     let shown = screen(&mut st, size);
     assert!(shown.contains("QUESTION"), "from its top: {shown}");
-    settle(&mut st);
-    for _ in 0..2 {
-        let out = tap(&mut st, size, &one).unwrap_or_default();
-        assert!(responded(&out).is_none(), "not read yet: {out:?}");
-        settle(&mut st);
-    }
-    let seen = read_to_end(&mut st, size, 200);
-    assert!(seen.iter().any(|r| r.contains("new line 29")), "{seen:?}");
+    // Tapped (or a digit pressed) as it changed: nothing runs.
+    let out = tap(&mut st, size, &one).unwrap_or_default();
+    assert!(responded(&out).is_none(), "{out:?}");
+    assert!(responded(&st.handle_key(key(KeyCode::Char('1')))).is_none());
     let out = answer_by_taps(&mut st, size, 1);
     assert_eq!(
         responded(&out),
@@ -625,7 +663,6 @@ fn an_item_replaced_or_resolved_while_open_is_never_answered_as_it_was() {
     let mut st = phone();
     raise_long(&mut st, Question, "q1", 30, 4);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 200);
     settle(&mut st);
     let mut d = ThreadScript::new("t-delta");
     d.at(200);
@@ -640,7 +677,8 @@ fn an_item_replaced_or_resolved_while_open_is_never_answered_as_it_was() {
 }
 
 /// The orchestrator's confirm card listing many actions, in the conversation on a phone: a
-/// tap on it opens its popup, read to its end, Confirm is tapped.
+/// tap on it opens its popup, and Confirm is tapped from its first rows; its whole list is
+/// there to scroll through.
 #[test]
 fn a_long_confirm_card_is_confirmed_from_the_conversation() {
     for size in [UPRIGHT, KEYBOARD] {
@@ -661,11 +699,6 @@ fn a_long_confirm_card_is_confirmed_from_the_conversation() {
             tap_at(&mut st, size, at.x + 2, at.y);
         }
         assert!(st.view.action.is_some(), "{}", screen(&mut st, size));
-        let seen = read_to_end(&mut st, size, 300)
-            .into_iter()
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(seen.contains("step21"), "{size:?}: {seen}");
         let out = answer_by_taps(&mut st, size, 1);
         assert_eq!(
             responded(&out),
@@ -673,63 +706,68 @@ fn a_long_confirm_card_is_confirmed_from_the_conversation() {
             "{size:?}"
         );
     }
+    let mut st = worker_orch_and_long_card(24);
+    st.view.compact_width = twr_core::config::TuiConfig::default().compact_width;
+    frame(&mut st, KEYBOARD);
+    st.handle_key(key(KeyCode::Enter));
+    assert!(st.view.action.is_some());
+    let seen = read_to_end(&mut st, KEYBOARD, 300)
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(seen.contains("step21"), "{seen}");
 }
 
 /// A question waiting for `y` whose prompt is taller than its rows with the keyboard open:
-/// never cut, it scrolls (a tap on its `↓ more` in the place of `yes`, the wheel over it),
-/// and `yes` (or `y`) answers only once all of it has been on screen.
+/// never cut, it scrolls (a tap on its `↓ more` row, the wheel over it) to every clause, and
+/// `[ yes ]` and `y` answer it whatever it shows.
 #[test]
-fn a_long_yes_no_prompt_scrolls_and_waits_to_be_read() {
+fn a_long_yes_no_prompt_scrolls_and_answers_wherever_it_is() {
     let size = KEYBOARD;
+    let ask = |st: &mut AppState| {
+        st.view.confirm = Some(crate::app::Confirm {
+            action: Action::Stop {
+                thread: "t-beta".into(),
+            },
+            prompt: format!(
+                "switch the orchestrator to codex? {} y to confirm, any other key cancels",
+                (0..12)
+                    .map(|i| format!("clause {i:02} says more."))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            pending: "stopping".into(),
+            alt: None,
+            offer: false,
+        });
+    };
     let mut st = phone();
-    let prompt = format!(
-        "switch the orchestrator to codex? {} y to confirm, any other key cancels",
-        (0..12)
-            .map(|i| format!("clause {i:02} says more."))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    st.view.confirm = Some(crate::app::Confirm {
-        action: Action::Stop {
-            thread: "t-beta".into(),
-        },
-        prompt,
-        pending: "stopping".into(),
-        alt: None,
-        offer: false,
-    });
+    ask(&mut st);
     let buf = frame(&mut st, size);
-    settle(&mut st);
-    assert!(
-        rects(&st, &Target::Yes).is_empty(),
-        "{}",
-        lines(&buf).join("\n")
-    );
-    assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
-    assert!(st.view.confirm.is_some(), "`y` waits, the question stays");
-    // The prompt's rows in the order they came into view (one at a time here).
+    targets_agree(&st, &buf, "prompt");
+    assert!(st.view.panes.ask.as_ref().is_some_and(|w| w.max_scroll > 0));
+    assert!(lines(&buf).iter().any(|l| l.contains("more lines")));
+    // Its rows in the order they came into view.
     let mut rows: Vec<String> = Vec::new();
     for k in 0..40 {
         let buf = frame(&mut st, size);
         targets_agree(&st, &buf, "prompt");
-        if let Some(w) = st.view.panes.ask.clone() {
-            for y in w.area.top()..w.area.bottom() {
-                let row: String = (w.area.left()..w.area.right())
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect();
-                if !rows.contains(&row) {
-                    rows.push(row);
-                }
+        let w = st.view.panes.ask.clone().expect("the prompt scrolls");
+        for y in w.area.top()..w.area.bottom() {
+            let row: String = (w.area.left()..w.area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            if !rows.contains(&row) {
+                rows.push(row);
             }
         }
-        if !rects(&st, &Target::Yes).is_empty() {
+        if w.end >= w.rows {
             break;
         }
         if k % 2 == 0 {
             let out = tap(&mut st, size, &Target::More(Scrolled::Ask)).expect("its ↓ more");
             assert!(out.is_empty());
         } else {
-            let w = st.view.panes.ask.clone().expect("the prompt scrolls");
             wheel(&mut st, size, w.area.x + 1, w.area.y, true);
         }
         assert!(st.view.confirm.is_some(), "paging it cancels nothing");
@@ -743,18 +781,62 @@ fn a_long_yes_no_prompt_scrolls_and_waits_to_be_read() {
         );
     }
     assert!(flat.contains("anyotherkeycancels"), "{seen}");
+    // From its first rows: `yes` (once on screen a moment, as before) and `y`.
+    let mut st = phone();
+    ask(&mut st);
+    frame(&mut st, size);
     settle(&mut st);
     assert!(matches!(
         tap(&mut st, size, &Target::Yes)
-            .expect("yes, once read")
+            .expect("yes from the first rows")
             .as_slice(),
+        [Action::Stop { .. }]
+    ));
+    let mut st = phone();
+    ask(&mut st);
+    frame(&mut st, size);
+    assert!(matches!(
+        st.handle_key(key(KeyCode::Char('y'))).as_slice(),
         [Action::Stop { .. }]
     ));
 }
 
-/// A free-text reply: a long draft in the input box (which grows) leaves a long item's
-/// popup its text and options (the popup covers the box), and the draft stays; `talk to` it
-/// opens its conversation with what was typed there to send.
+/// The shortest phones: on its side (80 x 9) a cut prompt keeps its cue row above `yes` and
+/// `no`, a row of the prompt above it.
+#[test]
+fn a_cut_prompt_on_its_side_shows_its_cue() {
+    let size = LANDSCAPE;
+    let mut st = phone();
+    st.view.confirm = Some(crate::app::Confirm {
+        action: Action::Stop {
+            thread: "t-beta".into(),
+        },
+        prompt: format!(
+            "stop beta? {} y to confirm, any other key cancels",
+            "it has a long explanation of what stopping it does. ".repeat(6)
+        ),
+        pending: "stopping".into(),
+        alt: None,
+        offer: false,
+    });
+    for _ in 0..40 {
+        let buf = frame(&mut st, size);
+        targets_agree(&st, &buf, "landscape prompt");
+        assert!(!rects(&st, &Target::Yes).is_empty(), "yes drawn throughout");
+        let w = st.view.panes.ask.clone().expect("the prompt's window");
+        assert!(w.end > w.start, "a row of the prompt shows");
+        if w.end >= w.rows {
+            break;
+        }
+        let shown = lines(&buf).join("\n");
+        assert!(shown.contains("more lines"), "{shown}");
+        tap(&mut st, size, &Target::More(Scrolled::Ask)).expect("its cue");
+    }
+}
+
+/// A free-text reply: a long draft in the input box (which grows) leaves a long item's popup
+/// its text and options (the popup covers the box), and the draft stays; `talk to` it opens its
+/// conversation with what was typed there to send.
 #[test]
 fn a_long_draft_leaves_the_popup_its_rows_and_talk_takes_the_reply() {
     let size = KEYBOARD;
@@ -794,10 +876,9 @@ fn a_long_draft_leaves_the_popup_its_rows_and_talk_takes_the_reply() {
     assert_eq!(st.view.input.as_str(), "my own answer, typed");
 }
 
-/// The rows never move under the finger: a tap highlighting an option (before the text was
-/// read, and after, the window of rows scrolled down) leaves every row where it was drawn, so
-/// a second tap on the same spot is on the same option; from its own spot each option runs
-/// only itself.
+/// The rows never move under the finger: a tap picking an option (the window at its top, and
+/// scrolled down by ↓) leaves every row where it was drawn, so from its own spot each option
+/// is picked and only the one tapped twice runs.
 #[test]
 fn a_tap_never_moves_the_rows_under_the_finger() {
     let answers = |st: &AppState| -> Vec<(Rect, Target)> {
@@ -810,106 +891,51 @@ fn a_tap_never_moves_the_rows_under_the_finger() {
             .collect()
     };
     for size in [UPRIGHT, KEYBOARD, LANDSCAPE] {
-        let mut st = phone();
-        raise_long(&mut st, Question, "q1", 24, 12);
-        open_from_needs(&mut st, size);
-        settle(&mut st);
-        frame(&mut st, size);
-        // Unread: each tap only highlights, and the rows stay.
-        let before = answers(&st);
-        for (r, t) in before.clone() {
-            for _ in 0..2 {
-                tap_at(&mut st, size, r.x + 2, r.y);
+        for down in [0, 9] {
+            let mut st = phone();
+            raise_long(&mut st, Question, "q1", 24, 12);
+            open_from_needs(&mut st, size);
+            for _ in 0..down {
+                st.handle_key(key(KeyCode::Down));
+                frame(&mut st, size);
+            }
+            settle(&mut st);
+            frame(&mut st, size);
+            let drawn = answers(&st);
+            assert!(!drawn.is_empty());
+            for (r, t) in drawn.clone() {
+                settle(&mut st);
+                let out = tap_at(&mut st, size, r.x + 2, r.y);
+                assert!(responded(&out).is_none(), "{size:?}: {out:?}");
                 assert_eq!(
                     answers(&st),
-                    before,
+                    drawn,
                     "{size:?}: a tap on {t:?} moved the rows"
                 );
-                assert_eq!(
-                    st.view.action.as_ref().unwrap().sel,
-                    match t {
-                        Target::Row(k) => Some(k),
-                        _ => None,
-                    }
-                );
+                let picked = match &t {
+                    Target::Row(k) => Some(*k),
+                    _ => None,
+                };
+                assert_eq!(st.view.action.as_ref().unwrap().sel, picked);
             }
-        }
-        // Read, the window scrolled down by ↓ to option 9, then a tap on each row drawn.
-        read_to_end(&mut st, size, 200);
-        settle(&mut st);
-        for _ in 0..20 {
-            if st.view.action.as_ref().unwrap().sel == Some(ActionKind::Answer(9)) {
-                break;
-            }
-            st.handle_key(key(KeyCode::Down));
-            frame(&mut st, size);
-        }
-        let drawn = answers(&st);
-        assert!(
-            drawn
-                .iter()
-                .any(|(_, t)| *t == Target::Row(ActionKind::Answer(9))),
-            "{size:?}: {drawn:?}"
-        );
-        for (r, t) in drawn.clone() {
+            let (r, t) = drawn.last().cloned().unwrap();
             settle(&mut st);
             let out = tap_at(&mut st, size, r.x + 2, r.y);
-            assert!(responded(&out).is_none(), "{size:?}: {out:?}");
-            assert_eq!(
-                answers(&st),
-                drawn,
-                "{size:?}: a tap on {t:?} moved the rows"
-            );
-        }
-        // The last one tapped, tapped again on its spot: it, and only it, runs.
-        let (r, t) = drawn.last().cloned().unwrap();
-        settle(&mut st);
-        let out = tap_at(&mut st, size, r.x + 2, r.y);
-        if let Target::Row(ActionKind::Answer(n)) = t {
-            assert_eq!(
-                responded(&out).map(|r| r.2.to_string()),
-                Some(format!("choice {n:02}")),
-                "{size:?}"
-            );
+            if let Target::Row(ActionKind::Answer(n)) = t {
+                assert_eq!(
+                    responded(&out).map(|r| r.2.to_string()),
+                    Some(format!("choice {n:02}")),
+                    "{size:?}"
+                );
+            }
         }
     }
 }
 
-/// Read whole while it fits (upright), the text stays read when the keyboard opening leaves
-/// it a scrolled window: answered at once, without reading it again.
+/// A worker's report longer than the screen: all of it scrolls into view in its popup; another
+/// report coming for it starts from its top.
 #[test]
-fn a_text_read_whole_stays_read_when_the_keyboard_opens() {
-    let mut st = phone();
-    raise_long(&mut st, Question, "q1", 2, 2);
-    open_from_needs(&mut st, UPRIGHT);
-    assert!(
-        st.view
-            .panes
-            .sheet
-            .as_ref()
-            .is_some_and(|w| w.max_scroll == 0),
-        "whole upright: {}",
-        screen(&mut st, UPRIGHT)
-    );
-    frame(&mut st, KEYBOARD);
-    assert!(
-        st.view
-            .panes
-            .sheet
-            .as_ref()
-            .is_some_and(|w| w.max_scroll > 0),
-        "scrolled with the keyboard open: {}",
-        screen(&mut st, KEYBOARD)
-    );
-    settle(&mut st);
-    let out = st.handle_key(key(KeyCode::Char('1')));
-    assert_eq!(responded(&out).map(|r| r.2), Some("choice 01"));
-}
-
-/// A worker's report longer than the screen reads whole in its popup; another report coming
-/// for it starts from its top.
-#[test]
-fn a_long_report_reads_whole_and_a_new_one_starts_at_its_top() {
+fn a_long_report_scrolls_and_a_new_one_starts_at_its_top() {
     let size = KEYBOARD;
     let mut st = phone();
     let mut c = ThreadScript::new("t-gamma");
@@ -948,174 +974,61 @@ fn a_long_report_reads_whole_and_a_new_one_starts_at_its_top() {
     );
 }
 
-/// Enter on `stop` in the popup of an item not read to its end stops nothing; read, it does.
+/// A queued message longer than the popup: Delete runs from its first rows, as on a desktop;
+/// all of it is there to scroll through.
 #[test]
-fn stop_waits_for_the_text_to_be_read_as_an_answer_does() {
-    let size = UPRIGHT;
-    let mut st = phone();
-    raise_long(&mut st, Question, "q1", 40, 2);
-    open_from_needs(&mut st, size);
-    let stop = ActionKind::Stop;
-    for _ in 0..20 {
-        if st.view.action.as_ref().unwrap().sel == Some(stop) {
-            break;
-        }
-        st.handle_key(key(KeyCode::Down));
-        frame(&mut st, size);
-    }
-    settle(&mut st);
-    assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
-    assert!(st.view.action.is_some());
-    read_to_end(&mut st, size, 200);
-    settle(&mut st);
-    assert!(matches!(
-        st.handle_key(key(KeyCode::Enter)).as_slice(),
-        [Action::Stop { .. }]
-    ));
-}
-
-/// A cut prompt waiting for `y`, on its side: its cue row is drawn (a row of the prompt
-/// above it), and `y` pressed as its last page comes waits CARD_SETTLE like its `yes`.
-#[test]
-fn a_cut_prompt_on_its_side_shows_its_cue_and_y_waits_the_settle() {
-    let size = LANDSCAPE;
-    let mut st = phone();
-    st.view.confirm = Some(crate::app::Confirm {
-        action: Action::Stop {
-            thread: "t-beta".into(),
-        },
-        prompt: format!(
-            "stop beta? {} y to confirm, any other key cancels",
-            "it has a long explanation of what stopping it does. ".repeat(6)
-        ),
-        pending: "stopping".into(),
-        alt: None,
-        offer: false,
-    });
-    for _ in 0..40 {
-        let buf = frame(&mut st, size);
-        targets_agree(&st, &buf, "landscape prompt");
-        let w = st.view.panes.ask.clone().expect("the prompt's window");
-        assert!(w.end > w.start, "a row of the prompt shows");
-        if w.end >= w.rows {
-            break;
-        }
-        let shown = lines(&buf).join("\n");
-        assert!(shown.contains("more lines"), "{shown}");
-        tap(&mut st, size, &Target::More(Scrolled::Ask)).expect("its cue");
-    }
-    // Its end just came: `y` waits.
-    assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
-    assert!(st.view.confirm.is_some());
-    frame(&mut st, size);
-    settle(&mut st);
-    assert!(matches!(
-        st.handle_key(key(KeyCode::Char('y'))).as_slice(),
-        [Action::Stop { .. }]
-    ));
-}
-
-/// A queued message longer than the popup: Delete and Send now wait until it has been read to
-/// its end, by key as by tap.
-#[test]
-fn a_long_queued_message_is_read_before_it_is_deleted() {
+fn a_long_queued_message_scrolls_and_is_deleted_from_its_first_rows() {
     let size = KEYBOARD;
-    let mut st = with_orch();
-    st.view.compact_width = twr_core::config::TuiConfig::default().compact_width;
-    assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
-    let prompt = (0..20)
-        .map(|i| format!("queued line {i:02} of a long message"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    st.apply_result(
-        "thread.queue",
-        &serde_json::json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 1,
-                "held": false, "items": [{"ref": 7, "prompt": prompt, "truncated": false,
-                "from": "user", "mine": true}]}),
-    );
-    frame(&mut st, size);
-    st.select_queued(7);
-    frame(&mut st, size);
-    st.handle_key(key(KeyCode::Enter));
-    assert_eq!(
-        st.view.action.as_ref().map(|p| p.target.clone()),
-        Some(crate::app::ActionTarget::Queued(7))
-    );
-    frame(&mut st, size);
-    let delete = ActionKind::Delete;
-    for _ in 0..10 {
-        if st.view.action.as_ref().unwrap().sel == Some(delete) {
-            break;
-        }
-        st.handle_key(key(KeyCode::Down));
+    let open = || {
+        let mut st = with_orch();
+        st.view.compact_width = twr_core::config::TuiConfig::default().compact_width;
+        assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+        let prompt = (0..20)
+            .map(|i| format!("queued line {i:02} of a long message"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        st.apply_result(
+            "thread.queue",
+            &serde_json::json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 1,
+                    "held": false, "items": [{"ref": 7, "prompt": prompt, "truncated": false,
+                    "from": "user", "mine": true}]}),
+        );
         frame(&mut st, size);
-    }
-    settle(&mut st);
-    assert!(st.handle_key(key(KeyCode::Enter)).is_empty(), "unread");
-    assert_eq!(st.view.status.as_deref(), Some(crate::app::SHEET_UNREAD));
-    let out = tap(&mut st, size, &Target::Row(delete)).unwrap_or_default();
-    assert!(out.is_empty());
+        st.select_queued(7);
+        frame(&mut st, size);
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            st.view.action.as_ref().map(|p| p.target.clone()),
+            Some(crate::app::ActionTarget::Queued(7))
+        );
+        frame(&mut st, size);
+        st
+    };
+    let mut st = open();
     let seen = read_to_end(&mut st, size, 100);
     assert!(
         seen.iter().any(|r| r.contains("queued line 19")),
         "{seen:?}"
     );
-    // Its end just came: not yet.
-    assert!(st.handle_key(key(KeyCode::Enter)).is_empty(), "just read");
-    assert!(st.view.action.is_some());
-    frame(&mut st, size);
-    settle(&mut st);
+    let mut st = open();
+    assert_eq!(text_at(&st).0, 0);
+    for _ in 0..10 {
+        if st.view.action.as_ref().unwrap().sel == Some(ActionKind::Delete) {
+            break;
+        }
+        st.handle_key(key(KeyCode::Down));
+        frame(&mut st, size);
+    }
     assert!(
         !st.handle_key(key(KeyCode::Enter)).is_empty(),
-        "read: it goes"
+        "deleted unscrolled"
     );
 }
 
-/// A prompt cut with the keyboard open, read to its end, then shown whole as the keyboard
-/// closes: `y` still waits CARD_SETTLE since its `yes` came.
+/// An option of many rows is listed in full in the text (its row by its first line), so its
+/// whole label can be read, and it is answered.
 #[test]
-fn a_cut_prompt_shown_whole_by_a_resize_still_waits_the_settle() {
-    let mut st = phone();
-    st.view.confirm = Some(crate::app::Confirm {
-        action: Action::Stop {
-            thread: "t-beta".into(),
-        },
-        prompt: format!(
-            "stop beta? {} y to confirm",
-            "a clause of its prompt. ".repeat(5)
-        ),
-        pending: "stopping".into(),
-        alt: None,
-        offer: false,
-    });
-    for _ in 0..20 {
-        frame(&mut st, KEYBOARD);
-        if !rects(&st, &Target::Yes).is_empty() {
-            break;
-        }
-        tap(&mut st, KEYBOARD, &Target::More(Scrolled::Ask)).expect("its cue");
-    }
-    frame(&mut st, UPRIGHT);
-    assert!(st
-        .view
-        .panes
-        .ask
-        .as_ref()
-        .is_some_and(|w| w.max_scroll == 0));
-    assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
-    frame(&mut st, UPRIGHT);
-    settle(&mut st);
-    assert!(matches!(
-        st.handle_key(key(KeyCode::Char('y'))).as_slice(),
-        [Action::Stop { .. }]
-    ));
-}
-
-/// An option of many rows is listed in full in the text (its row by its first line), so the
-/// text keeps its rows as the keyboard opens and closes: read with it open, it is still read
-/// with it closed.
-#[test]
-fn a_tall_option_keeps_the_text_read_across_heights() {
+fn a_tall_option_is_listed_in_full_in_the_text() {
     let mut st = phone();
     let mut d = ThreadScript::new("t-delta");
     d.at(70);
@@ -1132,96 +1045,15 @@ fn a_tall_option_keeps_the_text_read_across_heights() {
     }
     control(&mut st, &[d.created("delta"), d.turn_started("ask"), q]);
     open_from_needs(&mut st, KEYBOARD);
+    let shown = screen(&mut st, KEYBOARD);
+    assert!(shown.contains("(in full above)"), "{shown}");
     let seen = read_to_end(&mut st, KEYBOARD, 100);
     assert!(seen.iter().any(|r| r.contains("plan step 7")), "{seen:?}");
-    let shown = screen(&mut st, UPRIGHT);
-    assert!(shown.contains("(in full above)"), "{shown}");
-    settle(&mut st);
-    let out = st.handle_key(key(KeyCode::Char('2')));
-    assert_eq!(responded(&out).map(|r| r.2), Some("the second"), "{shown}");
-}
-
-/// On a phone, a confirm card read in its detail view in the conversation is read again in
-/// its popup (wrapped at the popup's width) before it is confirmed there.
-#[test]
-fn the_detail_view_lends_the_phone_popup_no_reading() {
-    let size = UPRIGHT;
-    let mut st = worker_orch_and_long_card(24);
-    st.view.compact_width = twr_core::config::TuiConfig::default().compact_width;
-    frame(&mut st, size);
-    for _ in 0..60 {
-        frame(&mut st, size);
-        if st.view.panes.card.as_ref().is_none_or(|w| w.end >= w.rows) {
-            break;
-        }
-        st.handle_key(key(KeyCode::PageDown));
-    }
+    let out = answer_by_taps(&mut st, UPRIGHT, 1);
     assert!(
-        st.view
-            .card_view
-            .read_in_full("cc1", revision_of(&st, "cc1")),
-        "the detail view read: {}",
-        screen(&mut st, size)
+        responded(&out).is_some_and(|r| r.2.starts_with("plan step 0")),
+        "{out:?}"
     );
-    st.handle_key(key(KeyCode::Enter));
-    assert!(st.view.action.is_some());
-    frame(&mut st, size);
-    settle(&mut st);
-    assert!(
-        st.handle_key(key(KeyCode::Char('1'))).is_empty(),
-        "not read here"
-    );
-    read_to_end(&mut st, size, 300);
-    settle(&mut st);
-    assert_eq!(
-        responded(&st.handle_key(key(KeyCode::Char('1')))).map(|r| r.2),
-        Some("Confirm")
-    );
-}
-
-/// A prompt cut on a phone on its side, unread, then the screen grows to a desktop's: the
-/// full layout's own rules answer it (its status bar, as before); a phone's guard of a cut
-/// prompt lives only as long as its question.
-#[test]
-fn a_cut_prompt_guard_is_the_phones_and_ends_with_its_question() {
-    let mut st = phone();
-    let ask = |st: &mut AppState| {
-        st.view.confirm = Some(crate::app::Confirm {
-            action: Action::Stop {
-                thread: "t-beta".into(),
-            },
-            prompt: format!(
-                "stop beta? {} y to confirm",
-                "a clause of its prompt. ".repeat(12)
-            ),
-            pending: "stopping".into(),
-            alt: None,
-            offer: false,
-        });
-    };
-    ask(&mut st);
-    frame(&mut st, LANDSCAPE);
-    assert!(st.compact());
-    assert!(st.view.ask_cut.is_some());
-    assert!(
-        st.handle_key(key(KeyCode::Char('y'))).is_empty(),
-        "unread on the phone"
-    );
-    assert!(st.view.confirm.is_some());
-    let desk = (160, 40);
-    frame(&mut st, desk);
-    assert!(!st.compact());
-    assert!(matches!(
-        st.handle_key(key(KeyCode::Char('y'))).as_slice(),
-        [Action::Stop { .. }]
-    ));
-    // Answered: the same prompt asked again starts unread, uncut.
-    frame(&mut st, desk);
-    assert!(st.view.ask_cut.is_none());
-    assert!(st.view.ask_view.seen.is_empty());
-    ask(&mut st);
-    frame(&mut st, desk);
-    assert!(st.view.ask_cut.is_none(), "not the answered one's");
 }
 
 /// The shortest phone screen (80 x 8 on its side): an option of three rows is listed in full
@@ -1239,7 +1071,6 @@ fn every_option_is_reachable_on_the_shortest_screen() {
     }
     control(&mut st, &[d.created("delta"), d.turn_started("ask"), q]);
     open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 50);
     let buf = frame(&mut st, size);
     targets_agree(&st, &buf, "80x8");
     let out = answer_by_taps(&mut st, size, 1);
@@ -1248,25 +1079,5 @@ fn every_option_is_reachable_on_the_shortest_screen() {
         Some("first\nsecond row\nthird row"),
         "{}",
         screen(&mut st, size)
-    );
-}
-
-/// An answer read 100 ms after the item came in full on screen but handled later (a slow
-/// frame) answers nothing: the settle counts from when the input was read.
-#[test]
-fn an_answer_read_early_and_handled_late_answers_nothing() {
-    let size = KEYBOARD;
-    let mut st = phone();
-    raise_long(&mut st, Question, "q1", 12, 2);
-    open_from_needs(&mut st, size);
-    read_to_end(&mut st, size, 100);
-    settle(&mut st);
-    let since = st.view.shown.as_ref().expect("read in full").since;
-    st.input_at = Some(since + Duration::from_millis(100));
-    assert!(st.handle_key(key(KeyCode::Char('1'))).is_empty());
-    st.input_at = None;
-    assert_eq!(
-        responded(&st.handle_key(key(KeyCode::Char('1')))).map(|r| r.2),
-        Some("choice 01")
     );
 }
