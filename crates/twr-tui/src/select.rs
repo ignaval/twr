@@ -110,6 +110,20 @@ pub enum Target {
     /// A row of the settings, by what it sets: selects it, and a tap on the selected one
     /// changes it (Enter).
     Setting(crate::settings::Key),
+    /// On a phone, the row under a text cut to the rows it has, saying how much of it is
+    /// below (`↓ 12 more lines`), or, once its end is in view, above: a tap scrolls it a page
+    /// down, or back to its top ([`crate::app::AppState`]'s `page_text`). Which text: the
+    /// action popup's ([`Panes::sheet`]) or the question waiting for `y`'s ([`Panes::ask`]).
+    More(Scrolled),
+}
+
+/// A text a phone scrolls in the rows it has ([`Target::More`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scrolled {
+    /// The action popup's text ([`Panes::sheet`]).
+    Sheet,
+    /// The question waiting for `y`'s prompt ([`Panes::ask`]).
+    Ask,
 }
 
 /// How a drawn row continues the row above it in the copied text.
@@ -283,6 +297,16 @@ pub struct Panes {
     /// The confirm card's detail view, when the draw showed it ([`CardWindow`]), not hidden
     /// under an overlay.
     pub card: Option<CardWindow>,
+    /// On a phone, the action popup's text (its item, a report, a queued message) when it
+    /// had more rows than the popup's room above its rows ([`CardWindow`]): the wheel over
+    /// it, PgUp/PgDn and Ctrl-↑↓ scroll it, its rows staying where they are
+    /// ([`crate::app::ViewState::sheet_view`]).
+    pub sheet: Option<CardWindow>,
+    /// On a phone, the prompt of the question waiting for `y` as the status bar drew it
+    /// ([`CardWindow`], its `attn_id` the prompt): the wheel over it scrolls it, and its
+    /// `yes` is drawn once every row of it has been on screen
+    /// ([`crate::app::ViewState::ask_view`]).
+    pub ask: Option<CardWindow>,
     /// The trash overlay's furthest scroll as drawn (its rows past its height).
     pub trash_max: u16,
     /// The help overlay's furthest scroll as drawn (its rows past its height).
@@ -310,6 +334,11 @@ pub struct Panes {
     /// The action popup's rows the draw showed, whole, and what it was open on: Enter runs
     /// only one of them ([`crate::app::AppState`]'s `action_key`).
     pub popup_rows: Option<(crate::app::ActionTarget, Vec<crate::app::ActionKind>)>,
+    /// On a phone, the first of the action popup's rows the draw showed in its window of them
+    /// (its index among those it lists), and what the popup was open on: the next frame keeps
+    /// that window while the highlighted row is in it, so that a tap never scrolls the rows
+    /// under the finger.
+    pub popup_start: Option<(crate::app::ActionTarget, usize)>,
     /// The action popup drew its item counting its detail view read in full for this revision
     /// (every row of it was on screen, [`crate::app::CardView`]), with only some of the options
     /// listed: only an option it drew may be answered.
@@ -411,8 +440,10 @@ impl Panes {
                 self.moving.retain(|c| !c.intersects(a));
                 self.targets.retain(|(r, _)| !r.intersects(a));
                 self.routine.retain(|r| !r.area.intersects(a));
-                if self.card.as_ref().is_some_and(|c| c.area.intersects(a)) {
-                    self.card = None;
+                for w in [&mut self.card, &mut self.sheet, &mut self.ask] {
+                    if w.as_ref().is_some_and(|c| c.area.intersects(a)) {
+                        *w = None;
+                    }
                 }
             }
             None => {
@@ -422,6 +453,8 @@ impl Panes {
                 self.targets.clear();
                 self.routine.clear();
                 self.card = None;
+                self.sheet = None;
+                self.ask = None;
             }
         }
     }

@@ -25,6 +25,8 @@ pub mod edit;
 pub mod firstrun;
 pub mod icon;
 pub mod keys;
+#[cfg(test)]
+mod long_card_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
