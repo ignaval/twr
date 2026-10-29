@@ -499,6 +499,35 @@ pub fn compaction_cases() -> Vec<(&'static str, Vec<Event>)> {
     v.push(s.report(Some(2), Grade::Success));
     cases.push(("interim report", v));
 
+    // A foreground task (its call waits for it), renewed, then moved to the background while
+    // it runs: where it runs is what its latest update says, its start what its first said.
+    let mut s = ThreadScript::new("f");
+    let mut v = vec![s.created("f"), s.started("s"), s.turn_started("go")];
+    let placed = |s: &mut ThreadScript, key: &str, value: serde_json::Value, beat: bool| {
+        let mut p = TaskUpdated {
+            task_id: "w".into(),
+            running: true,
+            description: if beat {
+                String::new()
+            } else {
+                "Wait for tests".into()
+            },
+            heartbeat: beat,
+            ..Default::default()
+        };
+        crate::event::set_twr_ext(&mut p.ext, key, value);
+        s.event(EventBody::TaskUpdated(p))
+    };
+    v.push(placed(&mut s, FOREGROUND_CALL_KEY, json!("c1"), false));
+    for _ in 0..3 {
+        v.push(placed(&mut s, FOREGROUND_CALL_KEY, json!("c1"), true));
+    }
+    v.push(placed(&mut s, DETACHED_KEY, json!(true), false));
+    for _ in 0..3 {
+        v.push(placed(&mut s, DETACHED_KEY, json!(true), true));
+    }
+    cases.push(("a foreground task moved to the background", v));
+
     let mut s = ThreadScript::new("w");
     let mut v = vec![s.created("w"), s.started("s"), s.turn_started("go")];
     v.push(task(&mut s, "bg", true, "a"));

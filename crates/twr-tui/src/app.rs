@@ -424,6 +424,8 @@ pub struct ThreadActivity {
     pub activity: String,
     pub said: Option<String>,
     pub task: Option<String>,
+    /// What it has in flight (`work`, [`twr_core::work::Work`]); `None` from an older hub.
+    pub work: Option<twr_core::work::Work>,
 }
 
 /// An overlay's scroll keys (the help's, the trash's): ↑↓ a row, PgUp/PgDn ten, Home/End its
@@ -3532,6 +3534,7 @@ impl AppState {
                                 activity: text(&a["activity"]).unwrap_or_default(),
                                 said: text(&a["said"]),
                                 task: text(&a["task"]),
+                                work: serde_json::from_value(a["work"].clone()).ok(),
                             };
                             (id.clone(), activity)
                         })
@@ -25065,6 +25068,7 @@ pub(crate) mod tests {
                         activity: text.into(),
                         said: None,
                         task: None,
+                        work: None,
                     },
                 );
             };
