@@ -1152,9 +1152,11 @@ pub fn render_phone(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut
         if room == 0 {
             break;
         }
-        // Whole, but the first one where it is taller than the screen: cut to it.
+        // Whole; but a card first and taller than the screen is cut to it (a control never:
+        // shorter than its two rows, it is not drawn, and not tapped).
         let eh = entry.height();
-        if eh > room && i > start {
+        let cut = i == start && matches!(entry, Entry::Card(..)) && room >= 3;
+        if eh > room && !cut {
             break;
         }
         let eh = eh.min(room);
@@ -2321,6 +2323,18 @@ mod tests {
                 }
             }
             assert_eq!(st.ws_keyed(), Some(WsRow::Settings), "{w}x{h}");
+        }
+        // A list with less than a control's two rows draws none of them, not one cut short.
+        for h in [6u16, 7] {
+            let text = rows(&mut st, 40, h).join("\n");
+            for (a, t) in &st.view.panes.targets {
+                if matches!(
+                    t,
+                    Target::Workspace(_) | Target::NewWorkspace | Target::Settings
+                ) {
+                    assert!(a.height >= 2, "{t:?} {a:?} at 40x{h}: {text}");
+                }
+            }
         }
         // Widened past the compact layout: the sidebar, the same hierarchy; narrowed again,
         // the Threads screen as it was.

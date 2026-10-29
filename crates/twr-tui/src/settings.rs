@@ -457,6 +457,14 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // On a phone, a row under the top border closes it too: its `✕` two rows tall.
+    let spacer = state.compact();
+    if spacer {
+        lines.push(Line::from(Span::styled(
+            format!("{:>inner_w$}", "✕ close "),
+            dim,
+        )));
+    }
     let path = s.path.as_deref().unwrap_or("no config file here");
     for l in crate::ui::wrap_line(
         Line::from(Span::styled(format!("file: {path}"), dim)),
@@ -529,6 +537,9 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
+    if spacer && scroll == 0 && inner.height > 0 {
+        panes.target(Rect::new(inner.x, inner.y, inner.width, 1), Target::Close);
+    }
     for (key, span) in spans {
         // Its rows on screen, under the scroll.
         let (start, end) = (span.start.max(scroll), span.end.min(scroll + fit));

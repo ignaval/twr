@@ -8570,8 +8570,11 @@ impl AppState {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
             return;
         }
-        // The compact Threads screen scrolls as one list, its cards with it.
+        // The compact Threads screen scrolls as one list, its cards with it (not under a
+        // popup, which takes the wheel).
+        let over_popup = self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Popup);
         if self.ws_screen()
+            && !over_popup
             && self
                 .view
                 .panes
@@ -22152,6 +22155,95 @@ pub(crate) mod tests {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
+        /// On a phone the action popup's rows are two rows tall, both the row's, none over
+        /// another, and its `✕` is too (its top border and the row under it); a question
+        /// waiting for `y` has its answers two rows tall under it. A tap on a second row does
+        /// what one on the first does.
+        #[test]
+        fn phone_popups_and_questions_have_two_row_controls() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            st.handle_key(key(KeyCode::Enter));
+            frame(&mut st, 40, 30);
+            assert!(st.action_popup().is_some());
+            let targets = st.view.panes.targets.clone();
+            let rows: Vec<(ratatui::layout::Rect, ActionKind)> = targets
+                .iter()
+                .filter_map(|(r, t)| match t {
+                    Target::Row(k) => Some((*r, *k)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{targets:?}");
+            for (k, (a, _)) in rows.iter().enumerate() {
+                assert_eq!(a.height, 2, "{rows:?}");
+                for (b, _) in &rows[k + 1..] {
+                    assert!(!a.intersects(*b), "{rows:?}");
+                }
+            }
+            let close: u16 = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| r.height)
+                .sum();
+            assert_eq!(close, 2, "{targets:?}");
+            // The second row of a row picks it.
+            let (r, kind) = rows[1];
+            tap_at(&mut st, 40, 30, r.x + 2, r.y + 1);
+            assert_eq!(st.action_popup().and_then(|p| p.sel), Some(kind));
+            // The second row of the `✕` closes it.
+            let under = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .max_by_key(|r| r.y)
+                .unwrap();
+            tap_at(&mut st, 40, 30, under.x + 1, under.y);
+            assert!(st.action_popup().is_none());
+            // A question waiting for `y`: its answers two rows tall; `no`'s second row cancels.
+            st.view.confirm = Some(Confirm {
+                action: Action::Quit,
+                prompt: "quit? y/n".into(),
+                pending: String::new(),
+                alt: None,
+                offer: false,
+            });
+            frame(&mut st, 40, 30);
+            let answers: Vec<(ratatui::layout::Rect, Target)> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::Yes | Target::No))
+                .cloned()
+                .collect();
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            assert!(answers.iter().all(|(r, _)| r.height == 2), "{answers:?}");
+            assert!(!answers[0].0.intersects(answers[1].0));
+            let no = answers.iter().find(|(_, t)| *t == Target::No).unwrap().0;
+            tap_at(&mut st, 40, 30, no.x + 1, no.y + 1);
+            assert!(st.view.confirm.is_none());
+        }
+
+        /// On a phone opened on a socket, a screen too short for a card selects none: Tab and
+        /// the arrows leave the cards alone, and Enter opens no card's popup.
+        #[test]
+        fn a_short_phone_on_a_socket_selects_no_card_it_cannot_draw() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            frame(&mut st, 40, 8);
+            assert!(st.view.panes.no_cards);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Tab));
+            st.handle_key(key(KeyCode::Down));
+            frame(&mut st, 40, 8);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.action_popup().is_none());
+        }
+
         /// On a phone each Needs you row is two rows tall, both of them its own: a tap on its
         /// second row selects it as one on its first does, and the next row starts under it.
         #[test]
@@ -22782,12 +22874,26 @@ pub(crate) mod tests {
             type_line(&mut st, "/n");
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-beta".into()));
             read(&mut st);
+            // (On a phone its rows are two rows tall: ↓ brings Stop into view.)
+            for _ in 0..10 {
+                if st.action_popup().and_then(|p| p.sel) == Some(ActionKind::Stop) {
+                    break;
+                }
+                st.handle_key(key(KeyCode::Down));
+                frame(&mut st, 40, 20);
+            }
+            read(&mut st);
             tap(&mut st, 40, 20, Target::Row(ActionKind::Stop));
             assert!(st.view.action.as_ref().unwrap().armed.is_some());
             frame(&mut st, 40, 13);
             assert!(st.view.shown.is_none(), "no room for the item");
-            let out = tap(&mut st, 40, 13, Target::Row(ActionKind::Stop));
-            assert!(out.is_empty(), "{out:?}");
+            // (On a phone, rows two rows tall may leave no room for Stop at all: then there is
+            // nothing to tap.)
+            let stop = Target::Row(ActionKind::Stop);
+            if st.view.panes.targets.iter().any(|(_, t)| *t == stop) {
+                let out = tap(&mut st, 40, 13, stop);
+                assert!(out.is_empty(), "{out:?}");
+            }
         }
 
         /// A decision that arrives between the press and the release on the
@@ -23109,11 +23215,8 @@ pub(crate) mod tests {
             }
             control(&mut st, &[again]);
             let screen = frame(&mut st, 40, 20);
-            assert_ne!(
-                st.view.panes.target_at(x, y),
-                Some(&Target::Row(ActionKind::Answer(1))),
-                "another row there now"
-            );
+            // (Its rows two rows tall on a phone, the same row may still be under the press:
+            // the revision it was pressed on is what refuses it.)
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty());
             assert!(st.action_popup().is_some(), "it stays");
