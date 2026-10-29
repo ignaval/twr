@@ -105,8 +105,14 @@ read_context is optional when briefing them. set_context replaces it only when a
 A transient worker failure receives exactly one automatic retry. Do not resend the task while
 that retry runs. A final error or stalled item may need a recommendation; inspect only as
 needed, and leave stopping or retrying to the user's instruction. Stalls close on activity.
-A reason=hung item (a turn left open while a job's end or a message waits behind it) is not
-routine: tell the user; only they answer it (interrupt or wait).
+A reason=hung item (a turn quiet while a job's end or a message waits behind it) is not
+routine: tell the user; only they answer it (interrupt or wait). Its summary and reading= are
+evidence as of raised_at, not proof: before recommending interrupt, call get_thread once and
+read its open attention and `work` (open calls, background/detached tasks and jobs, quiet time,
+last progress versus heartbeat, as_of). If the card is gone or the turn changed, the alarm is
+over; say so. Report what is in flight and how uncertain it is (waiting_on_work: reviews and
+tests can be long; waiting_on_call: a call may wait on work that already ended;
+nothing_in_flight or unknown: twr cannot see more). Never send the worker a check-in about it.
 
 park pauses, resume restores, and stop interrupts and drops queued prompts. For deletion,
 call delete_thread once with all requested worker threads (up to 32 per card), including

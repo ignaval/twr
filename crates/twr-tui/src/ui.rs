@@ -2322,6 +2322,7 @@ fn section_lines(
         .map(|a| one_row(&a.activity))
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
+    let activity = with_work(state, t, activity);
     match after_state(&activity, &status_text, status) {
         After::Nothing => {}
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
@@ -2335,6 +2336,27 @@ fn section_lines(
         }
     }
     (lines, line)
+}
+
+/// `activity` (a card's activity line) followed by what thread `t` has in flight while its
+/// turn is quiet, or twr cannot see its runtime ([`twr_core::work::Work::line`], as the hub's
+/// last `thread.activity` read it): `… · quiet 5m · Bash "Wait for the review" 5m ·
+/// background: Re-review 6m · 1 queued 12m`.
+fn with_work(state: &AppState, t: &ThreadView, activity: String) -> String {
+    let Some(w) = state
+        .activity
+        .get(&t.id)
+        .and_then(|a| a.work.as_ref())
+        .filter(|w| {
+            w.turn.is_some() && (w.state.quiet() || w.state == twr_core::work::State::Unknown)
+        })
+    else {
+        return activity;
+    };
+    match w.line() {
+        line if line.is_empty() => activity,
+        line => format!("{activity} · {line}"),
+    }
 }
 
 /// What a status section says after the state ([`section_lines`]).
@@ -2416,7 +2438,13 @@ fn card_status(t: &ThreadView) -> String {
         },
         s => s.as_str().to_string(),
     };
-    match t.background_tasks.len() {
+    // (A task a tool call of its turn waits for in the foreground is that call's.)
+    match t
+        .background_tasks
+        .values()
+        .filter(|b| b.in_background())
+        .count()
+    {
         0 => word,
         n => format!("{word} ({n} bg)"),
     }
@@ -11735,6 +11763,68 @@ mod tests {
                 assert!(row.contains("twr/a-rather-…"), "{w}: {row}");
             }
         }
+    }
+
+    /// A card whose turn is quiet says what it has in flight after its activity, as the hub's
+    /// `work` read it (a working one does not); its `bg` count leaves out the task a call of
+    /// its turn waits for in the foreground.
+    #[test]
+    fn a_quiet_card_says_what_it_has_in_flight() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-api");
+        let mut waiter = TaskUpdated {
+            task_id: "w".into(),
+            running: true,
+            ..Default::default()
+        };
+        twr_core::event::set_twr_ext(&mut waiter.ext, "foreground_call", "c2".into());
+        let evs = vec![
+            s.at(0).created("api"),
+            s.turn_started("review it"),
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "r".into(),
+                running: true,
+                ..Default::default()
+            })),
+            s.event(EventBody::TaskUpdated(waiter)),
+        ];
+        control(&mut st, &evs);
+        let work = |state: &str| {
+            serde_json::json!({
+                "as_of": "2026-10-28T22:12:53Z", "state": state, "sight": "full", "turn": 1,
+                "turn_started_at": "2026-10-28T22:00:00Z",
+                "calls": [{"id": "c2", "tool": "Bash", "what": "Wait for the review",
+                           "since": "2026-10-28T22:07:46Z", "task": "w"}],
+                "tasks": [{"id": "r", "what": "Re-review", "kind": "background",
+                           "since": "2026-10-28T22:07:44Z", "alive_at": "2026-10-28T22:07:44Z"}],
+                "progress_at": "2026-10-28T22:07:50Z"
+            })
+        };
+        let t = st.registry.get("t-api").unwrap().clone();
+        assert_eq!(card_status(&t), "running (1 bg)");
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-api": {"activity": "re-reviewing",
+                                          "work": work("waiting_on_work")}}),
+        );
+        let (_, one) = section_lines(&st, &t, 200, false);
+        let text = line_text(&one);
+        assert!(
+            text.ends_with(
+                "running (1 bg) · re-reviewing · quiet 5m · Bash \"Wait for the review\" 5m · \
+                 background: Re-review 5m"
+            ),
+            "{text}"
+        );
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-api": {"activity": "re-reviewing", "work": work("working")}}),
+        );
+        let (_, one) = section_lines(&st, &t, 200, false);
+        let text = line_text(&one);
+        assert!(text.ends_with("running (1 bg) · re-reviewing"), "{text}");
     }
 
     /// One thread in each state a card shows, each with a report of an earlier turn where it

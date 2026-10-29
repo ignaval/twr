@@ -515,7 +515,10 @@ impl Core {
         // Activity on a thread with an open stalled item resolves it in the same transaction
         // (`hub::stall`), so no crash can leave it open behind the activity.
         let resolutions = self.stall_resolutions(&events);
+        // A hung-turn card they close is said to the orchestrator (`hub::updates`).
+        let closed = self.hung_closures(&events, &resolutions);
         events.extend(resolutions);
+        events.extend(closed);
         // An account whose directory the batch changes has its known usage cleared with it
         // (`hub::usage`).
         let clears = self.usage_clears(&events);

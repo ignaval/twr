@@ -177,6 +177,7 @@ mod usage;
 mod wake;
 mod watches;
 mod withdraw;
+mod work;
 
 pub use accounts::{
     own_account_probe, own_native_dir, own_native_var, AccountAddParams, AccountProbe,
@@ -1866,6 +1867,8 @@ impl Core {
             m.insert("status".into(), json!(v.status()));
             // What it does now, one line (`hub::activity`).
             m.insert("activity".into(), json!(self.activity_line(v)));
+            // What it has in flight, and how sure the hub is (`hub::work`).
+            m.insert("work".into(), json!(self.work(v, Utc::now())));
             m.insert(
                 "background_task_count".into(),
                 json!(v.background_tasks.len()),

@@ -42,6 +42,33 @@ fn mark(ext: Option<JsonMap>, value: Value) -> Option<JsonMap> {
     Some(ext)
 }
 
+/// Whether `batch` ends a turn of `thread`.
+fn ended(batch: &[BatchEvent], thread: &str) -> bool {
+    batch
+        .iter()
+        .any(|x| x.thread == thread && matches!(x.body, EventBody::TurnEnded(_)))
+}
+
+/// What the orchestrator is told when worker `name`'s hung-turn card closes (`p`), its turn
+/// ended in the same batch or not (`turn_ended`): that the alarm is over, and why.
+fn hung_closed_text(name: &str, p: &AttentionResolved, turn_ended: bool) -> String {
+    let how = match &p.answer {
+        Some(a) => format!("answered: {}", cut(&a.decision, 80)),
+        None if turn_ended => "closed: its turn ended".to_string(),
+        None if twr_ext(&p.ext)
+            .is_some_and(|t| t.contains_key(super::stall::NOTHING_WAITS_KEY)) =>
+        {
+            "closed: nothing waits behind its turn any longer".to_string()
+        }
+        None if went_on(&p.ext) => "closed: its runtime went on".to_string(),
+        None => "closed".to_string(),
+    };
+    format!(
+        "{name}'s seems-hung card {} {how}; it is no longer a current alarm.",
+        p.attn_id
+    )
+}
+
 impl Core {
     /// Whether report `p` (of an event of turn `turn`) of worker `thread` is a failure's: it
     /// is graded `gave_up` (as every failed turn is), or its own turn failed, as worker `v`
@@ -195,6 +222,13 @@ impl Core {
                         },
                     )
                 }
+                // A hung-turn card closed: said, so that its alarm is not taken for a current
+                // one (`hub::stall`).
+                (EventBody::AttentionResolved(p), Some(v)) if self.hung_card(&p.attn_id) => (
+                    hung_closed_text(&v.name, p, ended(events, &e.thread)),
+                    Some(e.thread.clone()),
+                    twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                ),
                 (EventBody::AttentionResolved(p), Some(v))
                     if self
                         .attention
@@ -265,6 +299,43 @@ impl Core {
             });
         }
         out
+    }
+
+    /// The updates of the hung-turn cards `resolutions` close (the resolutions the activity of
+    /// `batch` implies, `Core::stall_resolutions`): said as [`Core::conversation_updates`] says
+    /// one the batch closes itself.
+    pub(super) fn hung_closures(
+        &self,
+        batch: &[BatchEvent],
+        resolutions: &[BatchEvent],
+    ) -> Vec<BatchEvent> {
+        let Some(orch) = self.orch.thread.as_ref() else {
+            return Vec::new();
+        };
+        resolutions
+            .iter()
+            .filter_map(|e| {
+                let EventBody::AttentionResolved(p) = &e.body else {
+                    return None;
+                };
+                let v = self
+                    .registry
+                    .get(&e.thread)
+                    .filter(|v| !v.is_orchestrator() && self.hung_card(&p.attn_id))?;
+                Some(BatchEvent {
+                    thread: orch.clone(),
+                    turn: None,
+                    source: Source::Hub,
+                    body: EventBody::ConversationUpdate(ConversationUpdate {
+                        text: hung_closed_text(&v.name, p, ended(batch, &e.thread)),
+                        about_thread: Some(e.thread.clone()),
+                        ext: twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                        ..Default::default()
+                    }),
+                    raw: None,
+                })
+            })
+            .collect()
     }
 
     /// Bounded updates since the preceding turn, supplied as context with a user message. A

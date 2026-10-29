@@ -6,8 +6,10 @@
 //! task once a minute (`heartbeat: true`), and progress comes at most once a second per task.
 //! The hub records less than that, whatever the producer's version:
 //!
-//! - always: a task's end, an update with `ext`, and an update for a task its thread's view
-//!   does not hold (its start, or one the view dropped: a stop cut it, say);
+//! - always: a task's end, an update with `ext` (except one that only says where its task runs,
+//!   as the view already holds it: `ext.twr.foreground_call` / `ext.twr.detached`, which every
+//!   update of such a task carries), and an update for a task its thread's view does not hold
+//!   (its start, or one the view dropped: a stop cut it, say);
 //! - any update when the task's last recorded update is [`heartbeat_every`] old (10 min; a
 //!   quarter of `background_timeout_secs` when that is shorter): its lease is renewed in time
 //!   whatever the update says. A heartbeat (`heartbeat: true`, saying the description the view
@@ -87,7 +89,11 @@ pub(super) fn due(
     at: DateTime<Utc>,
     (progress, heartbeat): (Duration, Duration),
 ) -> Due {
-    let Some(task) = task.filter(|t| p.running && p.ext.is_none() && !t.job) else {
+    let Some(task) = task.filter(|t| {
+        p.running
+            && !t.job
+            && twr_core::event::task_ext_unchanged(p, t.foreground_call.as_deref(), t.detached)
+    }) else {
         // (A heartbeat is no progress, `ext` or not: it moves no activity in the reducers.)
         return Due::Record {
             progress: p.running && !p.heartbeat,
@@ -284,6 +290,9 @@ mod tests {
             group: None,
             quiet: false,
             shell: false,
+            started_at: None,
+            foreground_call: None,
+            detached: false,
         };
         let every = (PROGRESS_EVERY, HEARTBEAT_EVERY);
         let update = |running: bool, description: &str, heartbeat: bool| TaskUpdated {
@@ -334,6 +343,30 @@ mod tests {
         assert_eq!(due(Some(&task), Some(t0), &ext, t0, every), beat);
         ext.heartbeat = false;
         assert_eq!(due(Some(&task), Some(t0), &ext, t0, every), progress);
+        // An `ext` that only says where the task runs, as the view holds it, is no news: a
+        // heartbeat of a foreground task coalesces; a move to the background is recorded.
+        let mut placed = update(true, "", true);
+        twr_core::event::set_twr_ext(&mut placed.ext, "foreground_call", "toolu_1".into());
+        let foreground = BackgroundTask {
+            foreground_call: Some("toolu_1".into()),
+            ..task.clone()
+        };
+        assert_eq!(
+            due(Some(&foreground), None, &placed, secs(599), every),
+            Due::Skip
+        );
+        assert_eq!(due(Some(&task), None, &placed, secs(1), every), beat);
+        // An update with no `ext` at all says it runs in neither place: news for a task the
+        // view holds in the foreground.
+        let bare = update(true, "build", true);
+        assert_eq!(due(Some(&foreground), None, &bare, secs(1), every), beat);
+        assert_eq!(due(Some(&task), None, &bare, secs(1), every), Due::Skip);
+        let mut moved = update(true, "", false);
+        twr_core::event::set_twr_ext(&mut moved.ext, "detached", true.into());
+        assert_eq!(
+            due(Some(&foreground), Some(t0), &moved, t0, every),
+            progress
+        );
         let job = BackgroundTask {
             job: true,
             ..task.clone()
