@@ -6964,6 +6964,12 @@ impl<'a> BlockView<'a> {
                 state: Some(state),
             },
         );
+        // On a phone, with its controls two rows tall, as drawn ([`tap_rows`]).
+        let (rows, spans) = if state.compact() {
+            tap_rows(rows, spans, usize::from(width))
+        } else {
+            (rows, spans)
+        };
         BlockView { state, rows, spans }
     }
 
@@ -7097,7 +7103,13 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // Keep the banner visible and page long requests within the remaining conversation.
     if let Some(item) = state.selected_request() {
         let rows = request_rows(state, item, inner.width);
-        if rows.len() >= usize::from(inner.height) {
+        // With the row (on a phone the two) saying what is below, as the view keeps it.
+        let foot = if state.compact() && inner.height > TAP_ROWS {
+            TAP_ROWS
+        } else {
+            1
+        };
+        if rows.len() + usize::from(foot) > usize::from(inner.height) {
             render_card_detail(frame, inner, state, &item.thread, panes);
             return;
         }

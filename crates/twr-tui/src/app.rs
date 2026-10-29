@@ -3830,8 +3830,12 @@ impl AppState {
     /// ([`Action::WsSidebar`]). The card selected as it hides is selected again as it shows.
     pub(crate) fn set_sidebar(&mut self, on: bool) -> Vec<Action> {
         if on && self.view.sidebar_hidden {
+            // Only where hiding it let the selection go (the stack view's cards): the grid's
+            // tiles kept theirs, and a tile selected since stays.
             let focus = self.view.sidebar_focus.take();
-            self.set_focus(focus);
+            if self.view.focus.is_none() {
+                self.set_focus(focus);
+            }
         } else if !on && !self.view.sidebar_hidden {
             self.view.sidebar_focus = self.view.focus.clone();
         }
@@ -23817,6 +23821,79 @@ pub(crate) mod tests {
                     msg_ref: 7
                 }]
             );
+        }
+
+        /// A request selected in a phone's conversation is drawn whole, its two-row footer
+        /// counted, or read in the detail view: every frame, never cut.
+        #[test]
+        fn a_selected_request_is_whole_or_in_the_detail_view() {
+            for n in 1..14 {
+                for h in [18u16, 20, 24] {
+                    let mut st = api_and_web_waiting();
+                    st.view.compact_width = 60;
+                    let mut api = ThreadScript::new("t-api");
+                    api.at(80);
+                    let mut long = api.raise("long", Question);
+                    if let EventBody::AttentionRaised(p) = &mut long.body {
+                        p.summary = (0..n).map(|k| format!("line {k} of it\n")).collect();
+                        p.options = vec!["continue".into(), "cancel".into()];
+                    }
+                    control(&mut st, &[long]);
+                    for i in 0..30 {
+                        st.apply_event(&thread_item(
+                            &ThreadScript::new("t-orch").text(&format!("after {i}")),
+                        ));
+                    }
+                    frame(&mut st, 40, h);
+                    st.select_request("long");
+                    for f in 0..4 {
+                        let text = screen_text(&frame(&mut st, 40, h));
+                        let whole = st.view.panes.items.iter().any(|d| d.attn_id == "long");
+                        let detail = st.view.panes.card.is_some();
+                        assert!(whole || detail, "{n} lines, 40x{h}, frame {f}:\n{text}");
+                    }
+                }
+            }
+        }
+
+        /// The grid's selection stays as the sidebar shows again: only the stack view's
+        /// cards, which hiding it let go, get theirs back.
+        #[test]
+        fn showing_the_sidebar_keeps_the_grid_selection() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-alpha".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            st.set_focus(Some("t-beta".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-beta"));
+            // The stack view: hiding lets the card go, showing brings it back.
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-gamma".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), None);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-gamma"));
+        }
+
+        /// Block navigation on a phone sees the rows as drawn, controls two rows tall: its
+        /// rows are the pane's, link for link.
+        #[test]
+        fn phone_block_navigation_sees_the_rows_drawn() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 200);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let links: Vec<Option<String>> = crate::ui::block_rows(&st)
+                .into_iter()
+                .map(|r| r.2)
+                .collect();
+            assert_eq!(pane.links, links);
         }
 
         /// On short phone screens no control is drawn shorter than its two rows: the queue
