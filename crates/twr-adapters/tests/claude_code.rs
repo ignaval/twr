@@ -527,6 +527,26 @@ fn a_permission_card_shows_the_inputs_other_fields() {
     );
 }
 
+/// A tool name past 64 KiB marked is cut on the card, so what follows its cut (here a bidi
+/// override) can't be seen: the permission is deny-only, and an allow denies.
+#[test]
+fn a_tool_name_too_long_to_show_is_deny_only() {
+    let tool = format!("{}\u{202e}x", "t".repeat(64 * 1024));
+    let (mut tr, a) = raise(json!({"subtype": "can_use_tool", "tool_name": tool,
+        "input": {"a": 1}, "tool_use_id": "toolu_l"}));
+    assert_eq!(
+        a.summary,
+        format!(
+            "[deny only: the input is too long to show in full] Allow {}… 9 more characters \
+             not shown: {{\"a\":1}}",
+            "t".repeat(64 * 1024)
+        )
+    );
+    assert_eq!(a.options, ["deny"]);
+    let r = answer(&mut tr, "req-1", &Answer::allow());
+    assert_eq!(r["behavior"], "deny", "{r}");
+}
+
 #[test]
 fn exit_plan_mode_is_a_permission() {
     // Same shape as AskUserQuestion's can_use_tool, but not a question: allow/deny only.

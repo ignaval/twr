@@ -29,7 +29,8 @@
 //!   all`, cut at the last whole mark that fits, with N right;
 //! - (c) when even the whole marked command is past [`FULL_INPUT_MAX`] bytes, `full_input` is
 //!   its longest prefix of whole marks that fits plus `… M more characters not shown`, and the
-//!   item is deny-only (its summary says so, its options are `deny` alone);
+//!   item is deny-only (its summary says so, its options are `deny` alone); so is an item whose
+//!   label (a Claude tool name, an ACP kind) is past it marked, the label cut the same way;
 //! - (d) an `allow` answer to the item approves exactly the request it was raised for (Claude:
 //!   `updatedInput` is the request's input; ACP: the request's first `allow_once` option), and
 //!   to a deny-only item it denies.
@@ -551,18 +552,46 @@ fn marked_bytes(s: &str) -> usize {
     marks_of(s).iter().map(|m| m.3).sum()
 }
 
+/// `c` marked by the rule, shown `how`.
+fn mark_one(c: char, how: How) -> String {
+    match (how, c) {
+        (How::Itself, c) => c.to_string(),
+        (How::Mark, '\n') => "⏎".into(),
+        (How::Mark, '\r') => "␍".into(),
+        (How::Mark, _) => "⇥".into(),
+        (How::Escape, c) => format!("⟨U+{:04X}⟩", u32::from(c)),
+    }
+}
+
 /// `s` marked by the rule, whole: an encoder written from the same table as the reader.
 fn mark_whole(s: &str) -> String {
     marks_of(s)
         .into_iter()
-        .map(|(c, how, ..)| match (how, c) {
-            (How::Itself, c) => c.to_string(),
-            (How::Mark, '\n') => "⏎".into(),
-            (How::Mark, '\r') => "␍".into(),
-            (How::Mark, _) => "⇥".into(),
-            (How::Escape, c) => format!("⟨U+{:04X}⟩", u32::from(c)),
-        })
+        .map(|(c, how, ..)| mark_one(c, how))
         .collect()
+}
+
+/// A card's label (a tool name, a kind): `s` marked whole, or, past [`FULL_INPUT_MAX`] bytes
+/// marked, the marks that fit whole then `… N more characters not shown` (N in marked
+/// characters), and whether it was cut: then the user can't see all of what an allow
+/// approves, and the card is deny-only.
+fn mark_label(s: &str) -> (String, bool) {
+    if marked_bytes(s) <= FULL_INPUT_MAX {
+        return (mark_whole(s), false);
+    }
+    let marks = marks_of(s);
+    let total: usize = marks.iter().map(|m| m.2).sum();
+    let (mut out, mut bytes, mut kept) = (String::new(), 0, 0);
+    for &(c, how, chars, b) in &marks {
+        if bytes + b > FULL_INPUT_MAX {
+            break;
+        }
+        out.push_str(&mark_one(c, how));
+        bytes += b;
+        kept += chars;
+    }
+    out.push_str(&format!("… {} more characters not shown", total - kept));
+    (out, true)
 }
 
 /// Splits a card text `<subject> ⟦<other fields>⟧` (or `⟦…⟧` alone) at the one raw `⟦`, which
@@ -1226,8 +1255,9 @@ fn claude_feed(
             Some(s) => (true, s),
             None => (false, a.summary.as_str()),
         };
-        // The label is the runtime's tool name, marked.
-        let line = after_label(summary, &format!("Allow {}", mark_whole(tool)))?;
+        // The label is the runtime's tool name, marked (cut past the cap: deny-only).
+        let (label, label_cut) = mark_label(tool);
+        let line = after_label(summary, &format!("Allow {label}"))?;
         let (subject, fields) = claude_card(tool, &input);
         let full = ext_str(a, "claude", FULL_INPUT_KEY);
         let too_long = match &fields {
@@ -1259,8 +1289,14 @@ fn claude_feed(
                 }
             }
         };
+        if label_cut {
+            st.count("claude: tool name too long, deny only");
+        }
+        let too_long = too_long || label_cut;
         if tagged != too_long {
-            return Err(format!("deny-only tag {tagged}, input too long {too_long}"));
+            return Err(format!(
+                "deny-only tag {tagged}, request too long {too_long}"
+            ));
         }
         check_options(a, too_long)?;
         if fields.is_some() {
@@ -1923,10 +1959,10 @@ fn acp_check(
             .unwrap_or_default();
         let kind = call.get("kind").and_then(Value::as_str).unwrap_or_default();
         // The label is the agent's kind, marked.
-        let label = if kind.is_empty() {
-            "tool call".to_string()
+        let (label, label_cut) = if kind.is_empty() {
+            ("tool call".to_string(), false)
         } else {
-            mark_whole(kind)
+            mark_label(kind)
         };
         if label != kind && !kind.is_empty() {
             st.count("acp: kind marked");
@@ -1955,6 +1991,10 @@ fn acp_check(
         };
         let full = ext_str(a, section, FULL_INPUT_KEY);
         let too_long = check_rendering(line, full, &subject, ACP_SUMMARY_MAX)?;
+        if label_cut {
+            st.count("acp: kind too long, deny only");
+        }
+        let too_long = too_long || label_cut;
         if too_long {
             st.count("acp: too long, deny only");
         } else if full.is_some() {

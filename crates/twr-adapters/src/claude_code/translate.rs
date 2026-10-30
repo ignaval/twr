@@ -1961,13 +1961,16 @@ impl Translator {
         if let Some(full) = &what.full {
             claude.insert(FULL_INPUT_KEY.into(), json!(full));
         }
-        let label = mark_visible(&tool);
+        // A name past [`FULL_INPUT_MAX`] marked is cut: the user can't see all of what an
+        // allow approves, so only `deny` is offered, as for an input that long.
+        let name = render_command(&tool, usize::MAX);
+        let label = name.full.unwrap_or(name.line);
         let mut summary = if what.line.is_empty() {
             format!("Allow {label}?")
         } else {
             format!("Allow {label}: {}", what.line)
         };
-        let allow = !what.too_long;
+        let allow = !what.too_long && !name.too_long;
         let options = if allow {
             vec!["allow".into(), "deny".into()]
         } else {
