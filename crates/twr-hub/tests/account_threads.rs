@@ -1261,13 +1261,19 @@ async fn a_queued_job_is_refused_once_its_account_is_removed() {
     .await;
     let flag = env.path("go");
     let ran = env.path("ran");
-    let wait = format!("while [ ! -e {} ]; do sleep 0.05; done", flag.display());
+    let begun = env.path("begun");
+    let wait = format!(
+        ": > {}; while [ ! -e {} ]; do sleep 0.05; done",
+        begun.display(),
+        flag.display()
+    );
     let first = start_job(&hub, &s, &["sh", "-c", &wait]);
-    // It runs (it holds the one slot) before anything changes.
+    // It runs (it holds the one slot) before anything changes: its command, not only its
+    // `running` state, which comes before the account is checked again at its start gate.
     timeout(WAIT, async {
         loop {
             let jobs = hub.list_jobs(Some(&s)).unwrap();
-            if jobs[0]["state"] == "running" {
+            if jobs[0]["state"] == "running" && begun.exists() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
