@@ -181,13 +181,13 @@ Every job uses the Rust version pinned in `rust-toolchain.toml`. The `release-bu
 
 ## Branches
 
-Work lands on `dev`. `main` moves only for a release, as a fast-forward to the `dev` commit being released, so `main` is always the latest release. twr.tools deploys from `main` (see [Website](#website)), so site and `install.sh` changes go live with the next release too.
+Work lands on `dev` through pull requests. `main` moves only for a release, through a pull request from `dev` merged with a merge commit, whose tree is that of the `dev` commit being released, so `main` is always the latest release. twr.tools deploys from `main` (see [Website](#website)), so site and `install.sh` changes go live with the next release too.
 
 ## Releases
 
-1. On `dev`, set the version in the workspace `Cargo.toml`, commit and push.
+1. On `dev`, set the version in the workspace `Cargo.toml` (`cargo update -w` updates `Cargo.lock`) and move the changelog's `[Unreleased]` notes under it, through a pull request.
 2. The push runs CI. Then run it by hand on that commit, `gh workflow run ci.yml --ref dev`, and wait for it to pass, release builds included (`gh run watch`). Also run the long command fuzz locally, `cargo test --release -p twr-decisions --test command_fuzz -- --ignored --nocapture` (see [The command fuzz](#the-command-fuzz)), and the long [translator](#the-translator-fuzz) and [frame](#the-frame-fuzz) fuzzes.
-3. Fast-forward `main` to it and push: `git push origin dev:main` (refused unless it is a fast-forward). Then push a tag `v<version>` on that commit. `.github/workflows/release.yml` checks that the tag matches the version.
+3. Open a pull request from `dev` to `main` and, once its checks pass, merge it with a merge commit: both branches refuse direct pushes, admins included. Check that the merge commit has the tree of the `dev` commit tested in step 2 (`git diff <that commit> origin/main` prints nothing). Then push a tag `v<version>` on the merge commit. `.github/workflows/release.yml` checks that the tag matches the version.
 4. The workflow builds static musl binaries for Linux x86_64 and aarch64 with cargo-zigbuild, and macOS builds for Apple silicon and Intel with a deployment target of 11.0.
 5. Each archive holds `twr`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES.html` (generated with cargo-about from the dependency graph), `README.md` and `docs/` without `docs/tools/`.
 6. The release job writes `sha256sums.txt` (a line naming the release, `# twr release <tag>`, then the checksums of the archives and of the tagged commit's `install.sh`) and signs it and that `install.sh` with the release key (the `release` environment's secret `TWR_RELEASE_SIGNING_KEY`; without it the release fails), adds build provenance attestations for the four archives (`actions/attest-build-provenance`), and publishes a GitHub Release with `twr-<target>.tar.gz` for each target, `sha256sums.txt`, `install.sh`, their `.sig` files and install instructions, verification included.
@@ -212,7 +212,7 @@ These GitHub settings close gaps the workflows can't close by themselves:
 - **SHA-pinned actions.** Settings → Actions → General only allows actions pinned to a full commit SHA. The workflows comply.
 - **The `release` environment.** The `release` job in `release.yml` runs in it. It deploys only from `v*` tags and `main` (a manual rebuild runs from `main`), and publishing waits for a maintainer's approval.
 - **A tag ruleset for `v*`.** Only admins can create, move or delete a `v*` tag, so only they can start a release or change a released one.
-- **Branch protection on `main` and `dev`.** Changes from others go through a pull request with the CI jobs green. Force pushes and deletion are refused. Admins are not bound.
+- **Branch protection on `main` and `dev`.** Changes go through a pull request with the CI jobs green, admins' too (`enforce_admins`). Force pushes and deletion are refused.
 - **Security features.** Private vulnerability reporting (see [SECURITY.md](../SECURITY.md)), secret scanning with push protection, and Dependabot alerts. `.github/dependabot.yml` has Dependabot propose weekly updates of the Cargo dependencies and the pinned actions, against `dev`.
 
 `docs/tools/github-settings.sh` applies the tag ruleset, the branch protection and the environment's reviewer, and keeps its deployment policy. It lists the required checks by job name: when a job of `ci.yml` is added or renamed, update the list and run the script again. The SHA-pin rule, the environment's deployment policy and the security features are set in the repository's settings.
