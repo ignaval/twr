@@ -1174,6 +1174,26 @@ fn a_permission_kind_is_marked() {
         panic!("{out:?}")
     };
     assert_eq!(a.summary, "Allow read⟨U+202E⟩⏎: ls");
+    assert_eq!(a.options, ["allow", "deny"]);
+
+    // A kind past 64 KiB marked is cut, so what follows its cut (here a bidi override) can't
+    // be seen: the card is deny-only.
+    let kind = format!("{}\u{202e}x", "k".repeat(64 * 1024));
+    let ask = json!({"jsonrpc": "2.0", "id": 10, "method": "session/request_permission",
+        "params": {"sessionId": "S1", "toolCall": {"toolCallId": "t2", "kind": kind,
+        "title": "ls"},
+        "options": [{"optionId": "y", "kind": "allow_once", "name": "Yes"}]}});
+    let out = tr.translate(&ask.to_string());
+    let EventBody::AttentionRaised(a) = &out.events.last().unwrap().body else {
+        panic!("{out:?}")
+    };
+    let head = format!(
+        "[deny only: the request is too long to show in full] Allow {}… 9 more characters not \
+         shown: ls",
+        "k".repeat(64 * 1024)
+    );
+    assert_eq!(a.summary, head);
+    assert_eq!(a.options, ["deny"]);
 }
 
 /// Plan-exit consent, standard ACP: a `switch_mode` permission the user allows (e.g. Claude's

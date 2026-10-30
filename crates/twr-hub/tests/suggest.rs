@@ -253,7 +253,9 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
         .unwrap();
     // SAFETY: signal 0 checks the process exists; nothing is sent.
     let alive = || unsafe { libc::kill(left, 0) } == 0 && !zombie(left);
-    for _ in 0..50 {
+    // The call killed its group before it returned; a loaded CI runner can take over a
+    // second to run the killed `sleep` to its exit. A leak lives 300 s.
+    for _ in 0..500 {
         if !alive() {
             break;
         }
@@ -261,7 +263,8 @@ async fn a_suggestion_comes_from_one_bare_cli_call_per_turn() {
     }
     assert!(
         !alive(),
-        "what the CLI left running ({left}) outlived the call"
+        "what the CLI left running ({left}) outlived the call by 10 s: {:?}",
+        std::fs::read_to_string(format!("/proc/{left}/stat"))
     );
     // Asked again (another TUI): the same answer, no second run.
     let again = hub

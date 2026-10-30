@@ -20,7 +20,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::app::{Action, AppState, Confirm, DecisionFilter, Screen, Transcript, WsRow};
 use crate::edit::LineInput;
 use crate::notify::{Notifier, WorkspaceAlert};
-use crate::select::Anchor;
+use crate::select::{Anchor, Target};
 
 /// A workspace in the tab strip and the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +55,57 @@ pub struct Glance {
     pub active: bool,
     /// Its orchestrator; `None` when it has none.
     pub orch: Option<OrchGlance>,
+    /// Its worker threads, oldest first, for the rows under its card in the sidebar
+    /// ([`WorkerGlance`]); `None` when its hub did not say.
+    pub workers: Option<Vec<WorkerGlance>>,
+}
+
+/// One of a workspace's worker threads, as its hub said it ([`Glance::workers`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WorkerGlance {
+    /// Its thread id.
+    pub id: String,
+    /// Its name.
+    pub name: String,
+    /// Its status.
+    pub status: ThreadStatus,
+    /// Its color, as its hub's registry holds it ([`twr_core::reduce::ThreadView::color`]).
+    pub color: Option<u8>,
+    /// It is parked.
+    pub parked: bool,
+}
+
+impl WorkerGlance {
+    /// The workers of a `hub.glance`'s `workers` or a `thread.list` (its orchestrators left
+    /// out); `None` when `list` is not a list.
+    fn list(list: &serde_json::Value) -> Option<Vec<WorkerGlance>> {
+        let list = list.as_array()?;
+        Some(
+            list.iter()
+                .filter(|t| t["role"] != "orchestrator")
+                .filter_map(|t| {
+                    Some(WorkerGlance {
+                        id: t["id"].as_str()?.to_string(),
+                        name: t["name"].as_str()?.to_string(),
+                        status: status_of(&t["status"]),
+                        color: t["color"].as_u64().and_then(|c| u8::try_from(c).ok()),
+                        parked: t["parked"] == true,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    /// A thread of the current workspace's registry as its hub would say it.
+    pub fn of(t: &twr_core::reduce::ThreadView) -> WorkerGlance {
+        WorkerGlance {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            status: t.status(),
+            color: t.color,
+            parked: t.parked,
+        }
+    }
 }
 
 /// A workspace's orchestrator, as its hub said it ([`Glance`]).
@@ -91,11 +142,12 @@ impl Glance {
         Glance {
             active: v["active"] == true,
             orch,
+            workers: WorkerGlance::list(&v["workers"]),
         }
     }
 
     /// What an older hub's `thread.list` says (no `hub.glance`): the current orchestrator's
-    /// status, without its reply, and whether a thread works.
+    /// status, without its reply, whether a thread works, and its workers.
     pub fn from_threads(threads: &serde_json::Value) -> Glance {
         let list = threads.as_array().map(Vec::as_slice).unwrap_or_default();
         let orch = list
@@ -111,7 +163,11 @@ impl Glance {
             !(t["role"] == "orchestrator" && t["retired"] == true)
                 && matches!(t["status"].as_str(), Some("running" | "background"))
         });
-        Glance { active, orch }
+        Glance {
+            active,
+            orch,
+            workers: WorkerGlance::list(threads),
+        }
     }
 }
 
@@ -234,7 +290,6 @@ pub struct SavedView {
     expand_all: bool,
     long_expanded: HashSet<String>,
     show_parked: bool,
-    sidebar_hidden: bool,
     sidebar_focus: Option<String>,
     focus_mode: bool,
     /// The compact layout's screen.
@@ -386,42 +441,74 @@ impl AppState {
     }
 
     /// Whether the tab strip is drawn: there are workspaces to switch to, and nothing else
-    /// lists them: the workspace sidebar is not docked, and the compact layout, whose
-    /// Workspaces screen lists them, is not on.
+    /// lists them: the sidebar is hidden (or has no room, [`crate::sidebar::dock_width`]), and
+    /// the compact layout, whose Threads screen lists them, is not on.
     pub fn tabs_shown(&self) -> bool {
-        self.switchable() && !self.ws_docked() && !self.compact()
+        self.switchable() && !self.compact() && (!self.ws_docked() || self.dock_width() == 0)
     }
 
-    /// Whether the workspace sidebar is docked left of the views ([`crate::sidebar`]): the
-    /// TUI opened on a workspace, the sidebar is not hidden, the layout is the full one and
-    /// the screen is [`crate::sidebar::DOCK_MIN_WIDTH`] columns wide or more.
+    /// Whether the sidebar left of the views lists the workspaces ([`crate::sidebar`]): the
+    /// TUI opened on a workspace, the sidebar shown (Ctrl-B), the layout the full one.
     pub fn ws_docked(&self) -> bool {
-        self.workspace.is_some()
-            && !self.view.ws_sidebar_hidden
-            && !self.compact()
-            && self.view.width >= crate::sidebar::DOCK_MIN_WIDTH
+        self.workspace.is_some() && !self.view.sidebar_hidden && !self.compact()
     }
 
-    /// The columns the views get: the terminal's, less the docked workspace sidebar's.
+    /// Whether the worker cards are in the sidebar, under the current workspace's card
+    /// ([`AppState::ws_docked`]; alone, in a TUI opened on a socket): the stack view of the
+    /// full layout, the sidebar shown (Ctrl-B). The grid has them as its tiles.
+    pub fn cards_docked(&self) -> bool {
+        !self.compact() && self.view.screen == Screen::Stack && !self.view.sidebar_hidden
+    }
+
+    /// The columns of the sidebar, its border included ([`crate::sidebar::dock_width`]); 0
+    /// when nothing is docked.
+    pub fn dock_width(&self) -> u16 {
+        self.dock_width_at(self.view.width)
+    }
+
+    /// [`AppState::dock_width`] on a screen `width` columns wide.
+    pub fn dock_width_at(&self, width: u16) -> u16 {
+        crate::sidebar::dock_width(width, self.cards_docked(), self.ws_docked())
+    }
+
+    /// The columns the views get: the terminal's, less the sidebar's.
     pub fn content_width(&self) -> u16 {
-        if self.ws_docked() {
-            self.view.width.saturating_sub(crate::sidebar::DOCK_WIDTH)
-        } else {
-            self.view.width
-        }
+        self.view.width.saturating_sub(self.dock_width())
     }
 
-    /// Whether the workspace list is open as a drawer: opened, and not docked or in the
-    /// compact layout (a resize may have made room for it since).
-    pub fn ws_drawer_open(&self) -> bool {
-        self.view.ws_drawer && self.workspace.is_some() && !self.compact() && !self.ws_docked()
-    }
-
-    /// Whether the compact layout's Workspaces screen shows.
+    /// Whether the compact layout's Threads screen shows the workspaces, the current one's
+    /// cards nested under its card ([`crate::sidebar::Place::Screen`]): a TUI opened on a
+    /// workspace (not a socket).
     pub fn ws_screen(&self) -> bool {
         self.compact()
-            && self.view.compact_pane == crate::app::CompactPane::Workspaces
+            && self.workspace.is_some()
+            && self.view.compact_pane == crate::app::CompactPane::Threads
             && self.view.screen != Screen::Decisions
+    }
+
+    /// The workspace the sidebar and the compact Threads screen keep in view when they cut
+    /// workspaces ([`crate::sidebar::Dock`]): the one the keys or a tap on `more` chose, while
+    /// it is listed; else the current one's neighbors are kept.
+    pub fn ws_anchor(&self) -> Option<WsRow> {
+        self.view
+            .ws_sel
+            .clone()
+            .filter(|r| matches!(r, WsRow::Workspace(n) if self.tabs.iter().any(|t| &t.name == n)))
+    }
+
+    /// The workspace's card or the button the keys select on that screen, while no thread's
+    /// card is: the arrows move from the cards to the workspaces and back
+    /// ([`AppState::ws_screen_key`]).
+    pub fn ws_keyed(&self) -> Option<WsRow> {
+        let listed = |r: &WsRow| match r {
+            WsRow::Workspace(name) => self.tabs.iter().any(|t| &t.name == name),
+            WsRow::New | WsRow::Settings => true,
+        };
+        self.view
+            .ws_sel
+            .clone()
+            .filter(listed)
+            .filter(|_| self.view.focus.is_none())
     }
 
     /// The instance label the views draw (`[name]`): none while the tab strip or the
@@ -434,177 +521,80 @@ impl AppState {
         }
     }
 
-    /// The row of the workspace list the keys select: the one chosen, while it is still
-    /// listed, else the current workspace's card.
-    pub fn ws_selected(&self) -> Option<WsRow> {
-        let listed = |r: &WsRow| match r {
-            WsRow::Workspace(name) => self.tabs.iter().any(|t| &t.name == name),
-            WsRow::New | WsRow::Settings => true,
-        };
-        self.view
-            .ws_sel
-            .clone()
-            .filter(listed)
-            .or_else(|| self.workspace.clone().map(WsRow::Workspace))
-    }
-
-    /// The rows of the workspace list, in order: the workspaces, then the buttons.
-    fn ws_rows(&self) -> Vec<WsRow> {
-        let mut rows: Vec<WsRow> = self
-            .tabs
-            .iter()
-            .map(|t| WsRow::Workspace(t.name.clone()))
-            .collect();
-        rows.push(WsRow::New);
-        rows.push(WsRow::Settings);
-        rows
-    }
-
-    /// Moves the keys' selection in the workspace list by `delta` rows, stopping at its ends;
-    /// the list follows it again.
-    fn step_ws_sel(&mut self, delta: isize) {
-        self.view.ws_wheeled = false;
-        let rows = self.ws_rows();
-        let at = self
-            .ws_selected()
-            .and_then(|s| rows.iter().position(|r| *r == s))
-            .unwrap_or(0);
-        let to = at.saturating_add_signed(delta).min(rows.len() - 1);
-        self.view.ws_sel = rows.get(to).cloned();
-        // The list follows the selection, not where the wheel left it.
-        self.view.ws_scroll = 0;
-    }
-
-    /// Ctrl-T, `/spaces`, a tap on the tab strip's `≡` or the sidebar's `‹`: in the compact
-    /// layout, the Workspaces screen (or back to the conversation from it); where the sidebar
-    /// docks, shows or hides it (kept across runs); on a narrower screen, opens or closes the
-    /// drawer.
+    /// Ctrl-B, Ctrl-T, `/sidebar` and `/spaces` without `on` or `off`, a tap on the sidebar's
+    /// `‹` or the tab strip's `≡`: shows or hides the sidebar ([`AppState::set_sidebar`]); in
+    /// the compact layout, its Threads screen, which lists the same, or back to the
+    /// conversation from it.
     pub fn toggle_workspaces(&mut self) -> Vec<Action> {
-        if self.workspace.is_none() {
-            self.view.status =
-                Some("workspaces: not here (this TUI was opened on a socket)".into());
-            return Vec::new();
+        let on = if self.compact() {
+            !(self.view.compact_pane == crate::app::CompactPane::Threads
+                && self.view.screen != Screen::Decisions)
+        } else {
+            self.view.sidebar_hidden
+        };
+        self.sidebar_or_screen(on)
+    }
+
+    /// `/sidebar on|off`, `/spaces on|off`: the sidebar shown (`on`) or hidden, kept across
+    /// runs; in the compact layout, its Threads screen shown (from the decisions overlay too),
+    /// or the conversation.
+    pub fn spaces(&mut self, on: Option<bool>) -> Vec<Action> {
+        match on {
+            None => self.toggle_workspaces(),
+            Some(on) => self.sidebar_or_screen(on),
         }
-        if self.compact() {
-            // From the decisions overlay, which hides every screen: to the Workspaces one.
-            let pane = if self.view.screen == Screen::Decisions {
-                self.toggle_decisions();
-                crate::app::CompactPane::Workspaces
-            } else if self.view.compact_pane == crate::app::CompactPane::Workspaces {
-                crate::app::CompactPane::Chat
+    }
+
+    /// The sidebar shown (`on`) or hidden; in the compact layout, which has none, its Threads
+    /// screen, which lists the same, or the conversation.
+    pub(crate) fn sidebar_or_screen(&mut self, on: bool) -> Vec<Action> {
+        if !self.compact() {
+            return self.set_sidebar(on);
+        }
+        if on && self.view.screen == Screen::Decisions {
+            self.toggle_decisions();
+        }
+        let shown = self.view.compact_pane == crate::app::CompactPane::Threads
+            && self.view.screen != Screen::Decisions;
+        if on != shown {
+            self.show_pane(if on {
+                crate::app::CompactPane::Threads
             } else {
-                crate::app::CompactPane::Workspaces
-            };
-            self.show_pane(pane);
-            return Vec::new();
+                crate::app::CompactPane::Chat
+            });
         }
-        if self.view.width >= crate::sidebar::DOCK_MIN_WIDTH {
-            return self.set_ws_sidebar(self.view.ws_sidebar_hidden);
-        }
-        self.set_ws_drawer(!self.view.ws_drawer);
         Vec::new()
     }
 
-    /// `/spaces on|off`: the workspace sidebar shown or hidden (kept across runs), and where it
-    /// does not dock, its drawer (or the compact Workspaces screen) opened or closed with it.
-    pub fn spaces(&mut self, on: Option<bool>) -> Vec<Action> {
-        let Some(on) = on else {
-            return self.toggle_workspaces();
-        };
-        if self.workspace.is_none() {
-            self.view.status =
-                Some("workspaces: not here (this TUI was opened on a socket)".into());
-            return Vec::new();
-        }
-        let actions = self.set_ws_sidebar(on);
-        if self.compact() {
-            if on && self.view.screen == Screen::Decisions {
-                self.toggle_decisions();
-            }
-            let shown = self.ws_screen();
-            if on != shown {
-                self.show_pane(if on {
-                    crate::app::CompactPane::Workspaces
-                } else {
-                    crate::app::CompactPane::Chat
-                });
-            }
-        } else if self.view.width < crate::sidebar::DOCK_MIN_WIDTH {
-            self.set_ws_drawer(on);
-        }
-        actions
-    }
-
-    /// Shows (`on`) or hides the docked workspace sidebar; the IO loop keeps it
-    /// ([`Action::WsSidebar`]).
-    pub fn set_ws_sidebar(&mut self, on: bool) -> Vec<Action> {
-        self.view.ws_sidebar_hidden = !on;
-        // A drawer opened on a narrower screen is not to come back with it.
-        self.view.ws_drawer = false;
-        self.view.status = Some(if on {
-            "workspace sidebar shown (Ctrl-T hides it)".into()
-        } else {
-            "workspace sidebar hidden (Ctrl-T shows it)".into()
-        });
-        vec![Action::WsSidebar(on)]
-    }
-
-    /// Opens (`open`) or closes the workspace drawer, its selection on the current workspace.
-    fn set_ws_drawer(&mut self, open: bool) {
-        self.view.ws_drawer = open;
-        self.view.ws_sel = None;
-        self.view.ws_scroll = 0;
-        self.view.ws_wheeled = false;
-        if open {
-            // What it opens over is about something else now.
-            self.view.action = None;
-        }
-    }
-
-    /// The keys of the drawer while it is open: ↑↓ (Home, End) select a row, Enter acts on
-    /// it, Esc and Ctrl-T close it. `None` for any other key, which closes it and goes where
-    /// it would.
-    pub(crate) fn ws_drawer_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
-        let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
-        match key.code {
-            KeyCode::Up if plain => self.step_ws_sel(-1),
-            KeyCode::Down if plain => self.step_ws_sel(1),
-            KeyCode::Home if plain => {
-                self.view.ws_wheeled = false;
-                self.view.ws_sel = self.ws_rows().first().cloned();
-            }
-            KeyCode::End if plain => {
-                self.view.ws_wheeled = false;
-                self.view.ws_sel = self.ws_rows().last().cloned();
-            }
-            KeyCode::Enter if plain => {
-                let row = self.ws_selected()?;
-                return Some(self.ws_activate(row));
-            }
-            KeyCode::Esc => self.set_ws_drawer(false),
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.set_ws_drawer(false)
-            }
-            _ => {
-                self.set_ws_drawer(false);
-                return None;
-            }
-        }
-        Some(Vec::new())
-    }
-
-    /// The compact layout's Workspaces screen's keys, on an empty line: ↑↓ select a row,
-    /// Enter acts on it. `None` for the rest.
+    /// The compact Threads screen's keys with the workspaces on it ([`AppState::ws_screen`]),
+    /// on an empty line: ↑↓ step through what it lists, as drawn: each workspace's card, the
+    /// current one's followed by its threads' cards, then the buttons ([`AppState::ws_keyed`]
+    /// on a workspace or a button, the selected card on a thread). Enter on a workspace or a
+    /// button acts on it; on a card it goes on to open its popup, as anywhere. `None` for the
+    /// rest.
     pub(crate) fn ws_screen_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         if !self.ws_screen() || !self.view.input.is_empty() {
             return None;
         }
         let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
         match key.code {
-            KeyCode::Up if plain => self.step_ws_sel(-1),
-            KeyCode::Down if plain => self.step_ws_sel(1),
+            KeyCode::Up if plain => self.step_screen(-1),
+            KeyCode::Down if plain => self.step_screen(1),
             KeyCode::Enter if key.modifiers.is_empty() => {
-                let row = self.ws_selected()?;
+                let row = self.ws_keyed()?;
+                // Only what the last frame drew: a screen too short for it shows it not.
+                let target = match &row {
+                    WsRow::Workspace(name) => Target::Workspace(name.clone()),
+                    WsRow::New => Target::NewWorkspace,
+                    WsRow::Settings => Target::Settings,
+                };
+                if !self.view.panes.targets.iter().any(|(_, t)| *t == target) {
+                    self.view.status = Some(
+                        "not on screen: a taller screen shows it (Alt-1..9 and /ws switch too)"
+                            .into(),
+                    );
+                    return Some(Vec::new());
+                }
                 return Some(self.ws_activate(row));
             }
             _ => return None,
@@ -612,13 +602,62 @@ impl AppState {
         Some(Vec::new())
     }
 
+    /// Moves the compact Threads screen's selection `delta` rows through the workspaces, the
+    /// current one's cards and the buttons ([`AppState::ws_screen_key`]), stopping at its
+    /// ends. With nothing selected it starts from the current workspace's card.
+    fn step_screen(&mut self, delta: isize) {
+        // The list follows the selection again, not where the wheel left it.
+        self.view.ws_wheeled = false;
+        // The cards as the last frame drew them: none where it had no room for one.
+        let cards = if !self.view.panes.no_cards {
+            self.compact_threads()
+        } else {
+            Vec::new()
+        };
+        let mut rows: Vec<Result<WsRow, String>> = Vec::new();
+        let mut nested = false;
+        for tab in &self.tabs {
+            rows.push(Ok(WsRow::Workspace(tab.name.clone())));
+            if self.workspace.as_deref() == Some(tab.name.as_str()) {
+                rows.extend(cards.iter().cloned().map(Err));
+                nested = true;
+            }
+        }
+        if !nested {
+            rows.extend(cards.iter().cloned().map(Err));
+        }
+        rows.push(Ok(WsRow::New));
+        rows.push(Ok(WsRow::Settings));
+        let at = match (self.ws_keyed(), self.view.focus.clone()) {
+            (Some(row), _) => rows.iter().position(|r| r.as_ref() == Ok(&row)),
+            (None, Some(card)) => rows.iter().position(|r| r.as_ref() == Err(&card)),
+            (None, None) => None,
+        }
+        .or_else(|| {
+            let current = WsRow::Workspace(self.workspace.clone()?);
+            rows.iter().position(|r| r.as_ref() == Ok(&current))
+        })
+        .unwrap_or(0);
+        let to = at.saturating_add_signed(delta).min(rows.len() - 1);
+        match rows[to].clone() {
+            Ok(row) => {
+                self.set_focus(None);
+                self.view.ws_sel = Some(row);
+            }
+            Err(card) => {
+                self.view.ws_sel = None;
+                self.view.main_focus = false;
+                self.set_focus(Some(card));
+            }
+        }
+    }
+
     /// Enter on a row of the workspace list, or a tap on it: a workspace's card switches to
-    /// it (the drawer closes), `+ New workspace` asks for a name, `⚙ Settings` opens them.
+    /// it, `+ New workspace` asks for a name, `⚙ Settings` opens them.
     pub(crate) fn ws_activate(&mut self, row: WsRow) -> Vec<Action> {
         self.view.ws_sel = Some(row.clone());
         match row {
             WsRow::Workspace(name) => {
-                self.set_ws_drawer(false);
                 if self.workspace.as_deref() == Some(name.as_str()) {
                     self.view.status = Some(format!("already in workspace {name}"));
                     return Vec::new();
@@ -678,7 +717,6 @@ impl AppState {
             ));
             return Vec::new();
         }
-        self.set_ws_drawer(false);
         match name {
             Some(name) => self.create_ws(name),
             None => {
@@ -762,7 +800,6 @@ impl AppState {
     /// `⚙ Settings`, `/settings`: opens the settings overlay ([`crate::settings`]), reading
     /// what the config file says now, and asks the hub for its own.
     pub fn open_settings(&mut self) -> Vec<Action> {
-        self.set_ws_drawer(false);
         self.view.action = None;
         let file = twr_core::paths::Paths::from_env()
             .ok()
@@ -855,7 +892,7 @@ impl AppState {
             Change::Notify(alert) => self.view.notify_terminal = *alert,
             Change::CompactWidth(w) => self.view.compact_width = *w,
             Change::WsSidebar(on) => {
-                let actions = self.set_ws_sidebar(*on);
+                let actions = self.set_sidebar(*on);
                 // The overlay stays open over it.
                 return actions;
             }
@@ -1038,7 +1075,16 @@ impl AppState {
                 preview,
             }
         });
-        Some(Glance { active, orch })
+        let workers = threads
+            .iter()
+            .filter(|t| !t.is_orchestrator())
+            .map(|t| WorkerGlance::of(t))
+            .collect();
+        Some(Glance {
+            active,
+            orch,
+            workers: Some(workers),
+        })
     }
 
     /// Keeps what the current workspace's card shows ([`AppState::tab_glance`]) as its tab's
@@ -1259,7 +1305,6 @@ impl AppState {
             expand_all: v.expand_all,
             long_expanded: v.long_expanded.clone(),
             show_parked: v.show_parked,
-            sidebar_hidden: v.sidebar_hidden,
             sidebar_focus: v.sidebar_focus.clone(),
             focus_mode: v.focus_mode,
             compact_pane: v.compact_pane,
@@ -1323,7 +1368,6 @@ impl AppState {
         v.expand_all = saved.expand_all;
         v.long_expanded = saved.long_expanded;
         v.show_parked = saved.show_parked;
-        v.sidebar_hidden = saved.sidebar_hidden;
         v.sidebar_focus = saved.sidebar_focus;
         v.focus_mode = saved.focus_mode;
         v.compact_pane = saved.compact_pane;
@@ -1411,6 +1455,21 @@ impl AppState {
         // Before the selection is checked against what the view draws (`ensure_focus`, once
         // this returns): the detail's card counts as drawn.
         self.view.detail = r.detail.filter(|card| !self.card_items(card).is_empty());
+        // The sidebar is one for every workspace: shown or hidden since this one was left, its
+        // selection goes where the sidebar keeps it, as Ctrl-B would have put it.
+        if self.view.screen == Screen::Stack && !self.compact() {
+            if self.view.sidebar_hidden {
+                let hidden = self.view.focus.clone().filter(|f| {
+                    !self.stack_nav().contains(f) && self.view.detail.as_ref() != Some(f)
+                });
+                if let Some(f) = hidden {
+                    self.view.sidebar_focus.get_or_insert(f);
+                    self.view.focus = None;
+                }
+            } else if self.view.focus.is_none() {
+                self.view.focus = self.view.sidebar_focus.take();
+            }
+        }
         let card = &r.card_view;
         if self
             .attention
@@ -1498,6 +1557,7 @@ mod tests {
                 preview: Some("done".into()),
                 ..Default::default()
             }),
+            workers: None,
         };
         let running = TabHub::Running {
             threads: 1,
@@ -1560,6 +1620,7 @@ mod tests {
                     preview: Some("polled".into()),
                     ..Default::default()
                 }),
+                workers: None,
             }),
         }]);
         let g = st.tab_glance(&st.tabs[0].clone()).unwrap();
@@ -1797,13 +1858,15 @@ mod tests {
         );
     }
 
-    /// A click on a tab switches to its workspace.
+    /// A click on a tab of the strip switches to its workspace.
     #[test]
     fn a_click_on_a_tab_switches() {
         use crate::select::PaneId;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut st = in_workspaces("default", &["default", "a"]);
-        let screen = crate::app::tests::draw(&mut st, 100, 30);
+        // The sidebar hidden (Ctrl-B): the tab strip lists the workspaces.
+        st.view.sidebar_hidden = true;
+        let screen = crate::app::tests::draw(&mut st, 90, 30);
         let tab = st
             .view
             .panes
@@ -1839,7 +1902,8 @@ mod tests {
         let mut back = AppState::new();
         back.restore_view(saved.clone());
         assert_eq!(back.view.input.as_str(), "half a line");
-        assert!(back.view.sidebar_hidden);
+        // The sidebar is one for every workspace: the IO loop sets it, not the saved view.
+        assert!(!back.view.sidebar_hidden);
         assert_eq!(back.view.dive, None, "not before the replay");
         // The thread is gone: no dive, and no pin.
         back.finish_restore();
@@ -2175,8 +2239,10 @@ mod tests {
         use crate::select::PaneId;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mut st = in_workspaces("default", &["default", "a"]);
+        // The sidebar hidden (Ctrl-B): the tab strip lists the workspaces.
+        st.view.sidebar_hidden = true;
         st.view.help = true;
-        let screen = crate::app::tests::draw(&mut st, 100, 30);
+        let screen = crate::app::tests::draw(&mut st, 90, 30);
         let tab = st.view.panes.get(&PaneId::Tab("a".into())).unwrap().area;
         let at = |kind| MouseEvent {
             kind,
@@ -2345,8 +2411,6 @@ mod tests {
         let mut st = in_workspaces("a", &["default", "a"]);
         control(&mut st, &evs);
         st.attach_via = attach_via(None, Some("a"), None);
-        // The cards as wide as without the workspace sidebar.
-        st.view.ws_sidebar_hidden = true;
         let screen = crate::app::tests::draw(&mut st, 160, 40);
         let text: String = (0..40)
             .map(|y| {
@@ -2356,7 +2420,22 @@ mod tests {
                     + "\n"
             })
             .collect();
-        assert!(text.contains("`twr -w a trash restore`"), "{text}");
+        // The hub's card in the sidebar, its rows as one line of words.
+        let a = st
+            .view
+            .panes
+            .get(&crate::select::PaneId::Thread(HUB_THREAD.into()))
+            .expect("the hub's card")
+            .area;
+        let hub: Vec<String> = (a.y..a.bottom())
+            .map(|y| (a.x..a.right()).map(|x| screen[(x, y)].symbol()).collect())
+            .collect();
+        let hub = hub
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(hub.contains("`twr -w a trash restore`"), "{text}");
         assert!(text.contains("echo `twr thread list`"), "{text}");
         assert!(!text.contains("twr -w a thread list"), "{text}");
         let hub = st.attention.get("d1").unwrap();

@@ -73,6 +73,9 @@ pub(super) struct Activity {
     text: String,
     /// The start of the agent's latest message, at most [`HEAD_KEEP`] bytes.
     head: String,
+    /// What it has in flight, as the log says (`hub::work`).
+    #[serde(default)]
+    pub(super) work: super::work::WorkFold,
 }
 
 impl Activity {
@@ -186,6 +189,7 @@ impl Core {
         if ev.body.is_agent() && ev.turn.is_some() && ev.turn != open {
             return;
         }
+        self.track_work(ev);
         let at = ev.ts;
         let act = |a: &mut Activity, last: String| {
             a.last = Some(one_line(&last, DOING_MAX));
@@ -487,6 +491,7 @@ impl Core {
     /// `thread.activity`: every listed thread's activity, by thread id.
     pub(super) fn activity_json(&self) -> Value {
         let mut out = Map::new();
+        let now = Utc::now();
         for v in self.registry.list() {
             let a = self.activity.get(&v.id);
             out.insert(
@@ -497,6 +502,8 @@ impl Core {
                     "said": a.and_then(|a| a.said.as_deref()),
                     "task": a.and_then(|a| a.task.as_deref()),
                     "at": a.and_then(|a| a.at),
+                    // What it has in flight, and how sure the hub is (`hub::work`).
+                    "work": self.work(v, now),
                 }),
             );
         }

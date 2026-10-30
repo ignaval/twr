@@ -11,7 +11,7 @@ body:
     attributes:
       label: twr version
       description: The output of `twr --version`.
-      placeholder: twr 0.2.0
+      placeholder: twr 0.3.0
     validations:
       required: true
   - type: input

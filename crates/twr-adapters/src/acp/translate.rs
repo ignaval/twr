@@ -145,7 +145,7 @@ use twr_core::usage::UsageWindow;
 
 use crate::attn::IssuedIds;
 use crate::claude_code::translate::{
-    error_line, is_destructive, mark_visible, one_line, render_command, FULL_INPUT_KEY,
+    error_line, is_destructive, one_line, render_command, FULL_INPUT_KEY,
 };
 use crate::codex::translate::question_answer;
 use crate::usage::{Limit, LimitKind};
@@ -2418,14 +2418,16 @@ impl<D: Dialect> Translator<D> {
         if let Some(full) = &r.full {
             ours.insert(FULL_INPUT_KEY.into(), json!(full));
         }
-        let too_long = r.too_long;
+        let mut too_long = r.too_long;
         let what = r.line;
         // The agent's kind for the call, marked like the title (an invisible character in it
-        // shows).
+        // shows). One past `FULL_INPUT_MAX` marked is cut, and the request too long too.
         let label = if kind.is_empty() {
             "tool call".to_string()
         } else {
-            mark_visible(kind)
+            let k = render_command(kind, usize::MAX);
+            too_long |= k.too_long;
+            k.full.unwrap_or(k.line)
         };
         let mut summary = if what.is_empty() {
             format!("Allow {label}?")

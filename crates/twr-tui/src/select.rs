@@ -30,7 +30,7 @@ pub enum PaneId {
     Help,
     /// A workspace's tab in the strip ([`crate::workspace`]): a click switches to it.
     Tab(String),
-    /// The workspace sidebar, its drawer or the compact layout's Workspaces screen
+    /// The sidebar's workspace list or the compact layout's Threads screen
     /// ([`crate::sidebar`]): the wheel scrolls it.
     Workspaces,
     /// Any other text: the status bar, headers, the first-run picker.
@@ -85,7 +85,7 @@ pub enum Target {
     No,
     /// The notice in the status bar: dismisses it.
     Notice,
-    /// The status bar's `sidebar hidden · Ctrl-B shows`: shows the sidebar.
+    /// The status bar's `Threads hidden · Ctrl-B shows`: shows the sidebar.
     Sidebar,
     /// The status bar's `Focus · N hidden · Ctrl-F all`: Focus mode off.
     FocusOff,
@@ -94,9 +94,12 @@ pub enum Target {
     /// A queued message listed above the input box, by its ref: selects it, and a tap on the
     /// selected one opens its action popup (Enter).
     Queued(i64),
-    /// A workspace's card in the workspace sidebar, its drawer or the compact layout's
-    /// Workspaces screen (every row of the card): switches to it, as its tab does.
+    /// A workspace's card in the sidebar, its drawer or the compact layout's Threads screen
+    /// (every row of the card, its threads' rows included): switches to it, as its tab does.
     Workspace(String),
+    /// `↑ more` or `↓ more` where the sidebar or the compact Threads screen cut workspaces
+    /// (the whole row): brings this one, the nearest cut, into view.
+    WsMore(String),
     /// `+ New workspace` under the workspaces (the whole row): asks for the new one's name.
     NewWorkspace,
     /// `⚙ Settings` under the workspaces (the whole row): opens the settings, as `/settings`.
@@ -107,6 +110,20 @@ pub enum Target {
     /// A row of the settings, by what it sets: selects it, and a tap on the selected one
     /// changes it (Enter).
     Setting(crate::settings::Key),
+    /// On a phone, the row under a text cut to the rows it has, saying how much of it is
+    /// below (`↓ 12 more lines`), or, once its end is in view, above: a tap scrolls it a page
+    /// down, or back to its top ([`crate::app::AppState`]'s `page_text`). Which text: the
+    /// action popup's ([`Panes::sheet`]) or the question waiting for `y`'s ([`Panes::ask`]).
+    More(Scrolled),
+}
+
+/// A text a phone scrolls in the rows it has ([`Target::More`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scrolled {
+    /// The action popup's text ([`Panes::sheet`]).
+    Sheet,
+    /// The question waiting for `y`'s prompt ([`Panes::ask`]).
+    Ask,
 }
 
 /// How a drawn row continues the row above it in the copied text.
@@ -280,6 +297,15 @@ pub struct Panes {
     /// The confirm card's detail view, when the draw showed it ([`CardWindow`]), not hidden
     /// under an overlay.
     pub card: Option<CardWindow>,
+    /// On a phone, the action popup's text (its item, a report, a queued message) as drawn
+    /// in the rows its options leave it ([`CardWindow`]): when it has more rows than that, the
+    /// wheel over it, PgUp/PgDn and Ctrl-↑↓ scroll it, its options staying where they are
+    /// ([`crate::app::ViewState::sheet_view`]).
+    pub sheet: Option<CardWindow>,
+    /// On a phone, the prompt of the question waiting for `y` as the status bar drew it
+    /// ([`CardWindow`], its `attn_id` the prompt): when it has more rows than the status bar
+    /// gives it, the wheel over it scrolls it ([`crate::app::ViewState::ask_view`]).
+    pub ask: Option<CardWindow>,
     /// The trash overlay's furthest scroll as drawn (its rows past its height).
     pub trash_max: u16,
     /// The help overlay's furthest scroll as drawn (its rows past its height).
@@ -288,10 +314,15 @@ pub struct Panes {
     /// it showed first ([`crate::sidebar::render_list`]): the wheel scrolls from there.
     pub ws_max: usize,
     pub ws_start: usize,
-    /// Where the workspace drawer was drawn: a click outside it closes it.
-    pub drawer: Option<Rect>,
     /// The cards (or the grid's tiles) as drawn ([`ListWindow`]).
     pub list: Option<ListWindow>,
+    /// The column of cards (the sidebar's, the compact Threads screen's) had cards to show
+    /// but no room for one: none of them is selectable ([`crate::app::AppState::nav_order`]).
+    pub no_cards: bool,
+    /// The compact Threads screen's list as drawn ([`crate::sidebar::render_phone`]): the wheel
+    /// over it scrolls it; and what it kept in view, selected then (a key of it).
+    pub phone: Option<Rect>,
+    pub phone_sel: Option<String>,
     /// The card (or tile) the list as drawn shows first: when cards come or go above it, the
     /// list keeps showing it first rather than the card now at its index.
     pub list_first: Option<String>,
@@ -302,6 +333,11 @@ pub struct Panes {
     /// The action popup's rows the draw showed, whole, and what it was open on: Enter runs
     /// only one of them ([`crate::app::AppState`]'s `action_key`).
     pub popup_rows: Option<(crate::app::ActionTarget, Vec<crate::app::ActionKind>)>,
+    /// On a phone, the first of the action popup's rows the draw showed in its window of them
+    /// (its index among those it lists), and what the popup was open on: the next frame keeps
+    /// that window while the highlighted row is in it, so that a tap never scrolls the rows
+    /// under the finger.
+    pub popup_start: Option<(crate::app::ActionTarget, usize)>,
     /// The action popup drew its item counting its detail view read in full for this revision
     /// (every row of it was on screen, [`crate::app::CardView`]), with only some of the options
     /// listed: only an option it drew may be answered.
@@ -338,8 +374,6 @@ pub struct ListWindow {
 pub enum ListLayout {
     /// The column of cards beside the main pane.
     Column,
-    /// The row of cards above it (narrow screens).
-    Row,
     /// The grid of tiles, this many to a row.
     Grid(usize),
     /// A compact layout's list, one row per card.
@@ -405,8 +439,10 @@ impl Panes {
                 self.moving.retain(|c| !c.intersects(a));
                 self.targets.retain(|(r, _)| !r.intersects(a));
                 self.routine.retain(|r| !r.area.intersects(a));
-                if self.card.as_ref().is_some_and(|c| c.area.intersects(a)) {
-                    self.card = None;
+                for w in [&mut self.card, &mut self.sheet, &mut self.ask] {
+                    if w.as_ref().is_some_and(|c| c.area.intersects(a)) {
+                        *w = None;
+                    }
                 }
             }
             None => {
@@ -416,6 +452,8 @@ impl Panes {
                 self.targets.clear();
                 self.routine.clear();
                 self.card = None;
+                self.sheet = None;
+                self.ask = None;
             }
         }
     }

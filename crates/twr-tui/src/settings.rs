@@ -45,7 +45,7 @@ pub enum Key {
     Notify,
     /// `[tui] compact_width`.
     CompactWidth,
-    /// The workspace sidebar (`tui-state.json`).
+    /// The sidebar, workspaces and their threads (`tui-state.json`).
     WsSidebar,
     /// `[tui] colors`.
     Colors,
@@ -105,13 +105,13 @@ pub enum Change {
     Notify(TerminalAlert),
     /// The compact width.
     CompactWidth(u16),
-    /// The workspace sidebar shown (`true`) or hidden.
+    /// The sidebar shown (`true`) or hidden.
     WsSidebar(bool),
 }
 
 impl Change {
     /// Where in the config file it is kept: the table, the key and the value. `None` for the
-    /// workspace sidebar, kept in `tui-state.json`.
+    /// sidebar, kept in `tui-state.json`.
     pub fn config_key(
         &self,
     ) -> Option<(
@@ -354,14 +354,9 @@ fn rows(state: &AppState, s: &Settings) -> Vec<Row> {
             }
             Key::WsSidebar => Row {
                 key,
-                label: "Workspace sidebar",
-                value: if v.ws_sidebar_hidden {
-                    "hidden"
-                } else {
-                    "shown"
-                }
-                .into(),
-                kept: "remembered by the TUI (tui-state.json) · Ctrl-T".into(),
+                label: "Threads sidebar",
+                value: if v.sidebar_hidden { "hidden" } else { "shown" }.into(),
+                kept: "remembered by the TUI (tui-state.json) · Ctrl-B".into(),
                 editable: !agent,
             },
             Key::CodexAuto => Row {
@@ -435,7 +430,7 @@ pub fn step(state: &AppState, key: Key, forward: bool) -> Option<Change> {
             };
             Change::CompactWidth(next)
         }
-        Key::WsSidebar => Change::WsSidebar(v.ws_sidebar_hidden),
+        Key::WsSidebar => Change::WsSidebar(v.sidebar_hidden),
         Key::SuggestModel | Key::SummaryEvery | Key::CodexAuto | Key::WakeAfter => return None,
     })
 }
@@ -457,6 +452,8 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     let inner_w = usize::from(width.saturating_sub(2)).max(1);
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines: Vec<Line<'static>> = Vec::new();
+    // On a phone each setting is a menu choice two rows tall (its value, where it is kept).
+    let phone = state.compact();
     let path = s.path.as_deref().unwrap_or("no config file here");
     for l in crate::ui::wrap_line(
         Line::from(Span::styled(format!("file: {path}"), dim)),
@@ -530,9 +527,11 @@ pub fn render(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes
     panes.add(PaneId::Text, inner);
     crate::ui::close_row(panes, rect, Target::Close);
     for (key, span) in spans {
-        // Its rows on screen, under the scroll.
+        // Its rows on screen, under the scroll; on a phone only one showing two rows at least
+        // (or all of its rows) is tapped.
         let (start, end) = (span.start.max(scroll), span.end.min(scroll + fit));
-        if start >= end {
+        let whole = start == span.start && end == span.end;
+        if start >= end || (phone && !whole && end - start < usize::from(crate::ui::TAP_ROWS)) {
             continue;
         }
         let y = inner

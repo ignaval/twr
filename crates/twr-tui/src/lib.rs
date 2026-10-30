@@ -25,6 +25,8 @@ pub mod edit;
 pub mod firstrun;
 pub mod icon;
 pub mod keys;
+#[cfg(test)]
+mod long_card_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
@@ -1843,9 +1845,10 @@ async fn poll_tabs(ws: &dyn Workspaces, due: Vec<String>) -> Vec<workspace::Poll
 /// How the hub of workspace `name` on `socket` is, for its tab and its sidebar card: stopped
 /// when nothing listens (it is never started to be asked), busy when it does not answer within
 /// [`TAB_TIMEOUT`] (or is another workspace's), else its counts and what it says of its
-/// orchestrator, in one `hub.glance`. A hub older than that method answers `thread.list` and
-/// `attention.list` instead, as tabs asked before: the same counts, its orchestrator's status
-/// without its latest reply.
+/// orchestrator and its workers, in one `hub.glance` (and its `thread.list` from a hub whose
+/// glance does not list its workers yet). A hub older than that method answers `thread.list`
+/// and `attention.list` instead, as tabs asked before: the same counts, its orchestrator's
+/// status without its latest reply.
 async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<workspace::Glance>) {
     use workspace::{Glance, TabHub};
     let Ok(Ok(mut c)) = tokio::time::timeout(TAB_TIMEOUT, Client::connect(socket)).await else {
@@ -1868,9 +1871,19 @@ async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<wor
         }
     })
     .await;
-    let Ok(Ok(answer)) = answer else {
+    let Ok(Ok(mut answer)) = answer else {
         return (TabHub::Busy, None);
     };
+    // A hub that predates the glance's `workers` names them in `thread.list`, read-only too,
+    // asked on a clock of its own: its glance stands without them.
+    if let Ok(g) = &mut answer {
+        if g.is_object() && g["workers"].is_null() {
+            let list = tokio::time::timeout(TAB_TIMEOUT, c.call("thread.list", Value::Null)).await;
+            if let Ok(Ok(threads)) = list {
+                g["workers"] = threads;
+            }
+        }
+    }
     let count = |v: &Value| {
         v.as_u64()
             .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
@@ -2359,9 +2372,9 @@ struct Shared {
     compact: Option<bool>,
     /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
     suggest: Option<bool>,
-    /// The workspace sidebar hidden ([`crate::sidebar`]), for every workspace shown (and,
-    /// in `tui-state.json`, the next runs).
-    ws_sidebar_hidden: bool,
+    /// The sidebar hidden ([`crate::sidebar`], Ctrl-B), for every workspace shown (and, in
+    /// `tui-state.json`, the next runs).
+    sidebar_hidden: bool,
     /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
     /// no setting.
     agent: Option<String>,
@@ -2535,7 +2548,7 @@ pub async fn run_with(
         keys,
         compact: None,
         suggest: None,
-        ws_sidebar_hidden: seen.workspaces_sidebar == Some(false),
+        sidebar_hidden: seen.workspaces_sidebar == Some(false),
         agent,
         saves: Some(saves),
         saved_rx,
@@ -2752,7 +2765,7 @@ async fn drive(
     state.view.compact = ctx.compact;
     state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
     state.view.notify_terminal = ctx.tui.notify.terminal;
-    state.view.ws_sidebar_hidden = ctx.ws_sidebar_hidden;
+    state.view.sidebar_hidden = ctx.sidebar_hidden;
     state.agent = ctx.agent.clone();
     state.view.suggest_model = ctx.tui.suggest_model.clone();
     state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
@@ -3134,7 +3147,7 @@ async fn drive(
                             // Kept for the next runs (and the next workspaces shown).
                             // Kept by the settings writer, in order.
                             Action::WsSidebar(on) => {
-                                ctx.ws_sidebar_hidden = !on;
+                                ctx.sidebar_hidden = !on;
                                 if let (Some(file), Some(saves)) = (&ctx.seen_file, &ctx.saves) {
                                     let _ = saves.send(Save::WsSidebar(file.clone(), on));
                                 }
@@ -3420,7 +3433,7 @@ async fn drive(
                     Saved::WsSidebar(on, Err(e)) => {
                         let how = if on { "shown" } else { "hidden" };
                         state.view.status = Some(format!(
-                            "workspace sidebar {how}, but not remembered for the next runs: {e}"
+                            "Threads sidebar {how}, but not remembered for the next runs: {e}"
                         ));
                     }
                     Saved::WsSidebar(_, Ok(())) => {}
@@ -3488,7 +3501,7 @@ async fn drive(
     // changed here ([`crate::settings`]).
     ctx.compact = state.view.compact;
     ctx.suggest = Some(state.view.suggest);
-    ctx.ws_sidebar_hidden = state.view.ws_sidebar_hidden;
+    ctx.sidebar_hidden = state.view.sidebar_hidden;
     ctx.tui.card_order = state.view.card_order;
     ctx.tui.compact_width = state.view.compact_width;
     ctx.tui.notify.terminal = state.view.notify_terminal;
@@ -4395,6 +4408,8 @@ mod tests {
     enum Fake {
         /// `hub.glance` with this.
         Glance(Value),
+        /// `hub.glance` without its `workers`, and `thread.list` with these.
+        Mid(Value, Value),
         /// An older hub: no `hub.glance`, `thread.list` and `attention.list` with these.
         Old(Value, Value),
         /// Takes the connection and never answers.
@@ -4434,7 +4449,10 @@ mod tests {
                         }
                         let answer = match (method.as_str(), &fake) {
                             ("hello", _) => json!({"result": {"workspace": name}}),
-                            ("hub.glance", Fake::Glance(g)) => json!({"result": g}),
+                            ("hub.glance", Fake::Glance(g) | Fake::Mid(g, _)) => {
+                                json!({"result": g})
+                            }
+                            ("thread.list", Fake::Mid(_, t)) => json!({"result": t}),
                             ("thread.list", Fake::Old(t, _)) => json!({"result": t}),
                             ("attention.list", Fake::Old(_, a)) => json!({"result": a}),
                             _ => json!({"error": {"code": "method_not_found", "message": method}}),
@@ -4488,8 +4506,17 @@ mod tests {
             "active": true,
             "orchestrator": {"id": "o", "name": "orch", "status": "waiting",
                              "preview": "Approve the deploy?", "preview_seq": 9},
+            "workers": [{"id": "w1", "name": "api", "status": "running", "color": 3,
+                         "parked": false}],
         });
-        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance));
+        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance.clone()));
+        let mut bare = glance;
+        bare.as_object_mut().unwrap().remove("workers");
+        let listed = json!([
+            {"id": "o", "role": "orchestrator", "name": "orch", "status": "waiting"},
+            {"id": "w2", "name": "web", "status": "waiting", "parked": true},
+        ]);
+        let (mid_sock, mid_asked) = fake_hub(dir.path(), "mid", Fake::Mid(bare, listed));
         let threads = json!([
             {"role": "orchestrator", "status": "running"},
             {"role": "orchestrator", "status": "idle", "retired": true},
@@ -4501,6 +4528,7 @@ mod tests {
         let ws = Fakes(
             [
                 ("new", new_sock),
+                ("mid", mid_sock),
                 ("old", old_sock),
                 ("silent", silent_sock),
                 ("stopped", dir.path().join("stopped.sock")),
@@ -4530,7 +4558,32 @@ mod tests {
         let o = g.orch.unwrap();
         assert_eq!(o.status, twr_core::reduce::ThreadStatus::Waiting);
         assert_eq!(o.preview.as_deref(), Some("Approve the deploy?"));
+        assert_eq!(
+            g.workers.unwrap(),
+            [workspace::WorkerGlance {
+                id: "w1".into(),
+                name: "api".into(),
+                status: twr_core::reduce::ThreadStatus::Running,
+                color: Some(3),
+                parked: false,
+            }]
+        );
         assert_eq!(*new_asked.lock().unwrap(), ["hello", "hub.glance"]);
+        // A hub whose glance predates its workers names them in its thread list.
+        let mid = by("mid");
+        assert!(matches!(mid.hub, TabHub::Running { threads: 3, .. }));
+        let workers = mid.glance.unwrap().workers.unwrap();
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| (w.name.as_str(), w.status, w.parked))
+                .collect::<Vec<_>>(),
+            [("web", twr_core::reduce::ThreadStatus::Waiting, true)]
+        );
+        assert_eq!(
+            *mid_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list"]
+        );
         let old = by("old");
         assert_eq!(
             old.hub,

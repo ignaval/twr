@@ -53,6 +53,7 @@ pub mod speech;
 pub mod testkit;
 pub mod trace;
 pub mod usage;
+pub mod work;
 
 /// twr's version: the package version, plus `+dev.<build>` for a build made from a checkout by
 /// `docs/tools/dev-install.sh`, which sets `TWR_BUILD` (the commit, `.dirty` with uncommitted

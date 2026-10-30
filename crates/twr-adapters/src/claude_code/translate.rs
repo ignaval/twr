@@ -41,7 +41,8 @@
 //!   request (one deny) and withdraws the still-open siblings as
 //!   `attention.resolved{by: timeout, answer: null}`.
 //! - A tool call says what it is for when the agent said: a Bash call's `description`
-//!   becomes `ext.twr.purpose` ([`PURPOSE_KEY`]). The step the agent's own plan has in
+//!   becomes `ext.twr.purpose` ([`PURPOSE_KEY`]); a blocking `TaskOutput` call names the task
+//!   it waits for as `ext.twr.waits_for` ([`WAITS_FOR_KEY`]). The step the agent's own plan has in
 //!   progress goes on the call that changes it as `ext.twr.step` ([`STEP_KEY`]; empty: none):
 //!   a `TodoWrite`'s `in_progress` todo (its `activeForm`, else its `content`), or the task a
 //!   `TaskUpdate` sets `in_progress` (its `activeForm`, else its `subject`, as the call or the
@@ -178,8 +179,8 @@ use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
     AttentionReason, AttentionResolved, EventBody, JsonMap, PromptCache, ResolvedBy,
-    SessionPayload, TurnEnded, TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY,
-    RUNTIME_TURN_KEY, STEP_KEY,
+    SessionPayload, TaskUpdated, TurnEnded, TurnFrom, TurnResult, TurnStarted, Usage, DETACHED_KEY,
+    FOREGROUND_CALL_KEY, PURPOSE_KEY, RUNTIME_TURN_KEY, STEP_KEY, WAITS_FOR_KEY,
 };
 
 /// Key of this runtime's extras (`data.ext.claude`).
@@ -450,6 +451,11 @@ pub struct Translator {
     notifying: std::collections::HashSet<String>,
     /// Tasks a subagent owns.
     subagent_tasks: std::collections::HashSet<String>,
+    /// The main agent's tasks a tool call of its waits for in the foreground: task -> call
+    /// (`ext.twr.foreground_call` on each of their updates).
+    foreground_tasks: HashMap<String, String>,
+    /// Its tasks moved to the background while their call waited (`ext.twr.detached`).
+    detached_tasks: std::collections::HashSet<String>,
     /// What is awaited, and until when.
     watch: Option<(Watch, DateTime<Utc>)>,
     /// A turn was ended for its missing `result`: a `result` before the next run shows (its
@@ -528,6 +534,8 @@ impl Translator {
             usage: crate::usage::Reads::default(),
             notifying: Default::default(),
             subagent_tasks: Default::default(),
+            foreground_tasks: Default::default(),
+            detached_tasks: Default::default(),
             watch: None,
             absorb_result: false,
             notice_quiet: false,
@@ -1156,7 +1164,18 @@ impl Translator {
         } else {
             self.tasks.update(id, running, description)
         };
-        if let Some(task) = event {
+        if let Some(mut task) = event {
+            // Where it runs, on each of its updates: the latest one recorded says it.
+            if let Some(call) = self.foreground_tasks.get(id) {
+                set_twr_ext(&mut task.ext, FOREGROUND_CALL_KEY, json!(call));
+            } else if self.detached_tasks.contains(id) {
+                set_twr_ext(&mut task.ext, DETACHED_KEY, json!(true));
+            }
+            // Its end, however it came: where it ran is forgotten.
+            if !task.running {
+                self.foreground_tasks.remove(id);
+                self.detached_tasks.remove(id);
+            }
             out.events.push(Emitted {
                 body: EventBody::TaskUpdated(task),
                 turn: None,
@@ -1186,10 +1205,20 @@ impl Translator {
         // Whose task it is: one the main agent put in the background notifies it when it ends
         // (a run of Claude's own); a subagent's, or one in the foreground of a turn, does not.
         if subtype == "task_started" && !id.is_empty() {
+            // A launch says afresh where it runs (a reused id is another task).
+            self.foreground_tasks.remove(id);
+            self.detached_tasks.remove(id);
             if v.get("owned_by_subagent").and_then(Value::as_bool) == Some(true) {
                 self.subagent_tasks.insert(id.to_string());
             } else if v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
                 self.notifying.insert(id.to_string());
+            } else if let Some(call) = opt_str(v, "tool_use_id")
+                .filter(|c| !c.is_empty())
+                .filter(|_| v.get("is_backgrounded").and_then(Value::as_bool) == Some(false))
+            {
+                // In the foreground of the call that started it: that call waits for it.
+                self.foreground_tasks.insert(id.to_string(), call);
+                self.detached_tasks.remove(id);
             }
         }
         // Moved to the background while it runs (a finished task's late patch revives
@@ -1199,6 +1228,7 @@ impl Translator {
             && self.tasks.running.contains_key(id)
         {
             self.notifying.insert(id.to_string());
+            self.detach(id, line, out);
         }
         // A resumed subagent can reuse its task id. An explicit new launch overrides the
         // terminal tombstone; late progress alone never does.
@@ -1226,10 +1256,36 @@ impl Translator {
         );
         if terminal {
             self.subagent_tasks.remove(id);
+            self.foreground_tasks.remove(id);
+            self.detached_tasks.remove(id);
             if self.notifying.remove(id) && ended {
                 self.open_notice_turn(out, line);
             }
         }
+    }
+
+    /// Foreground task `id` was moved to the background while it runs (its call returned, or
+    /// the user put it there): recorded at once, with [`DETACHED_KEY`].
+    fn detach(&mut self, id: &str, line: &str, out: &mut Translated) {
+        if self.foreground_tasks.remove(id).is_none() {
+            return;
+        }
+        self.detached_tasks.insert(id.to_string());
+        let Some((description, _)) = self.tasks.running.get(id) else {
+            return;
+        };
+        let mut task = TaskUpdated {
+            task_id: id.to_string(),
+            running: true,
+            description: description.clone(),
+            ..Default::default()
+        };
+        set_twr_ext(&mut task.ext, DETACHED_KEY, json!(true));
+        out.events.push(Emitted {
+            body: EventBody::TaskUpdated(task),
+            turn: None,
+            raw: Some(line.into()),
+        });
     }
 
     /// A compaction's start, failure or end (see the module docs).
@@ -1574,6 +1630,14 @@ impl Translator {
                     {
                         set_twr_ext(&mut ext, PURPOSE_KEY, json!(one_line(&purpose, 200)));
                     }
+                    // A blocking wait on a task: that task is waited for while the call is open.
+                    if tool == "TaskOutput"
+                        && input.get("block").and_then(Value::as_bool) != Some(false)
+                    {
+                        if let Some(task) = opt_str(&input, "task_id").filter(|t| !t.is_empty()) {
+                            set_twr_ext(&mut ext, WAITS_FOR_KEY, json!(task));
+                        }
+                    }
                     if parent.is_none() {
                         if let Some(step) = self.steps.call(&id, &tool, &input) {
                             set_twr_ext(&mut ext, STEP_KEY, json!(one_line(&step, 200)));
@@ -1671,14 +1735,19 @@ impl Translator {
             .find_map(|key| result.get(*key).and_then(Value::as_str))
         {
             let status = str_at(result, "status");
-            self.task(
-                id,
-                !crate::background::terminal(status),
-                "background task",
-                false,
-                line,
-                out,
-            );
+            let running = !crate::background::terminal(status);
+            // A foreground command whose call returned while it runs (its timeout ran out): it
+            // goes on in the background, unwaited.
+            if running && self.foreground_tasks.contains_key(id) {
+                self.detach(id, line, out);
+            }
+            // (A task known by now keeps what it said it does.)
+            let description = if self.tasks.running.contains_key(id) {
+                ""
+            } else {
+                "background task"
+            };
+            self.task(id, running, description, false, line, out);
         }
         if let Some(task) = result.get("task") {
             let status = str_at(task, "status");
@@ -1892,13 +1961,16 @@ impl Translator {
         if let Some(full) = &what.full {
             claude.insert(FULL_INPUT_KEY.into(), json!(full));
         }
-        let label = mark_visible(&tool);
+        // A name past [`FULL_INPUT_MAX`] marked is cut: the user can't see all of what an
+        // allow approves, so only `deny` is offered, as for an input that long.
+        let name = render_command(&tool, usize::MAX);
+        let label = name.full.unwrap_or(name.line);
         let mut summary = if what.line.is_empty() {
             format!("Allow {label}?")
         } else {
             format!("Allow {label}: {}", what.line)
         };
-        let allow = !what.too_long;
+        let allow = !what.too_long && !name.too_long;
         let options = if allow {
             vec!["allow".into(), "deny".into()]
         } else {
@@ -3349,6 +3421,57 @@ mod tests {
     /// changes the step the main agent's plan has in progress, that step: a `TodoWrite`'s
     /// item in progress, or the task a `TaskUpdate` starts (its id from its `TaskCreate`'s
     /// result), cleared once that task is completed. A subagent's plan is not the thread's.
+    /// A blocking `TaskOutput` call names the task it waits for; one that does not block, or
+    /// another tool, names none.
+    #[test]
+    fn a_blocking_task_output_call_names_the_task_it_waits_for() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("go", 1);
+        let waits = |t: &mut Translator, id: &str, name: &str, input: Value| {
+            let line = json!({
+                "type": "assistant",
+                "parent_tool_use_id": null,
+                "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]},
+            });
+            t.translate(&line.to_string())
+                .events
+                .iter()
+                .find_map(|e| match &e.body {
+                    EventBody::AgentToolCall(c) => Some(
+                        twr_core::event::twr_str(c.ext.as_ref(), WAITS_FOR_KEY).map(str::to_string),
+                    ),
+                    _ => None,
+                })
+                .expect("a tool call")
+        };
+        assert_eq!(
+            waits(&mut t, "t1", "TaskOutput", json!({"task_id": "b1"})),
+            Some("b1".into())
+        );
+        assert_eq!(
+            waits(
+                &mut t,
+                "t2",
+                "TaskOutput",
+                json!({"task_id": "b1", "block": true, "timeout": 600000})
+            ),
+            Some("b1".into())
+        );
+        assert_eq!(
+            waits(
+                &mut t,
+                "t3",
+                "TaskOutput",
+                json!({"task_id": "b1", "block": false})
+            ),
+            None
+        );
+        assert_eq!(
+            waits(&mut t, "t4", "BashOutput", json!({"bash_id": "b1"})),
+            None
+        );
+    }
+
     #[test]
     fn tool_calls_carry_their_purpose_and_the_plans_step() {
         let mut t = Translator::new(TranslatorOptions::default());
@@ -3836,6 +3959,156 @@ mod tests {
 
     /// Only the main agent's background tasks notify it: a foreground task's end, or a
     /// subagent's task's (even one it put in the background), opens nothing; a task moved to
+    /// A task the main agent runs in the foreground of a call says that call on each of its
+    /// updates (`ext.twr.foreground_call`); once Claude moves it to the background (its call's
+    /// Bash timeout ran out, or a `task_updated` patch), it says it is detached, keeping what
+    /// it said it does, until its end. One started in the background, or a subagent's, says
+    /// neither.
+    #[test]
+    fn foreground_tasks_say_their_call_and_moved_ones_say_they_are_detached() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        let placed = |events: &[Emitted], id: &str| -> Vec<(bool, Option<Value>, bool, String)> {
+            events
+                .iter()
+                .filter_map(|e| match &e.body {
+                    EventBody::TaskUpdated(p) if p.task_id == id => Some((
+                        p.running,
+                        p.ext
+                            .as_ref()
+                            .and_then(|x| x.get("twr"))
+                            .and_then(|x| x.get(FOREGROUND_CALL_KEY))
+                            .cloned(),
+                        twr_core::event::is_detached(p),
+                        p.description.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let started = feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "w1",
+                    json!({"is_backgrounded": false, "tool_use_id": "toolu_w",
+                           "description": "Wait for tests"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "tool_use_id": "toolu_b",
+                           "description": "Run tests"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "s1",
+                    json!({"is_backgrounded": false, "owned_by_subagent": true,
+                           "tool_use_id": "toolu_s", "description": "Sub"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "p1",
+                    json!({"is_backgrounded": false, "tool_use_id": "toolu_p",
+                           "description": "Build"}),
+                ),
+            ],
+        );
+        assert_eq!(
+            placed(&started, "w1"),
+            [(true, Some(json!("toolu_w")), false, "Wait for tests".into())]
+        );
+        assert_eq!(
+            placed(&started, "b1"),
+            [(true, None, false, "Run tests".into())]
+        );
+        assert_eq!(placed(&started, "s1"), [(true, None, false, "Sub".into())]);
+        // The call's Bash timeout ran out: moved to the background, its call returned.
+        let moved = feed(
+            &mut t,
+            &[&json!({"type": "user", "session_id": "s",
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_w",
+                    "content": "Command did not complete within its 600s timeout and was \
+                                moved to the background (ID: w1)."}]},
+                "tool_use_result": {"backgroundTaskId": "w1"}})
+            .to_string()],
+        );
+        assert_eq!(
+            placed(&moved, "w1"),
+            [(true, None, true, "Wait for tests".into())],
+            "{moved:?}"
+        );
+        // Put there by a patch.
+        let patched = feed(
+            &mut t,
+            &[&task_line(
+                "task_updated",
+                "p1",
+                json!({"patch": {"is_backgrounded": true}}),
+            )],
+        );
+        assert_eq!(placed(&patched, "p1"), [(true, None, true, "Build".into())]);
+        let ended = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "w1",
+                json!({"status": "killed"}),
+            )],
+        );
+        assert_eq!(
+            placed(&ended, "w1"),
+            [(false, None, true, "Wait for tests".into())]
+        );
+        // A launch that does not say where it runs is placed nowhere; an id reused for a
+        // launch in the background after its foreground task ended (through its tool
+        // result) is that new task's, placed afresh.
+        let unsaid = feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "u1",
+                json!({"tool_use_id": "toolu_u", "description": "Unsaid"}),
+            )],
+        );
+        assert_eq!(
+            placed(&unsaid, "u1"),
+            [(true, None, false, "Unsaid".into())]
+        );
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "r1",
+                json!({"is_backgrounded": false, "tool_use_id": "toolu_r",
+                       "description": "First"}),
+            )],
+        );
+        let done = feed(
+            &mut t,
+            &[&json!({"type": "user", "session_id": "s",
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_r", "content": "ok"}]},
+                "tool_use_result": {"task": {"task_id": "r1", "status": "completed"}}})
+            .to_string()],
+        );
+        assert_eq!(placed(&done, "r1").len(), 1, "{done:?}");
+        assert!(!placed(&done, "r1")[0].0);
+        let again = feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "r1",
+                json!({"is_backgrounded": true, "tool_use_id": "toolu_r2",
+                       "description": "Second"}),
+            )],
+        );
+        assert_eq!(placed(&again, "r1"), [(true, None, false, "Second".into())]);
+    }
+
     /// the background later (a `task_updated` patch) does.
     #[test]
     fn only_the_main_agents_background_tasks_open_a_turn_when_they_end() {

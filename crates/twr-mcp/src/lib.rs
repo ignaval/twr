@@ -1093,7 +1093,8 @@ impl TwrMcp {
         description = "List all threads (workers and the orchestrator) with status, activity \
                        (one line on what it is doing now, e.g. `implementing X · running tests`, \
                        `waiting for permission: …`, `done: …`), project, runtime, queued \
-                       prompts, background_task_count and background_tasks, and open attention. Status background means the turn ended but work remains. \
+                       prompts, background_task_count and background_tasks, work (what it has \
+                       in flight: see get_thread), and open attention. Status background means the turn ended but work remains. \
                        `account` only on a runtime with several logged-in accounts \
                        (list_accounts), or with account_removed: true when the thread's \
                        account was removed (it cannot start until it moves to another one). JSON.",
@@ -1109,7 +1110,13 @@ impl TwrMcp {
 
     #[tool(
         description = "Get one thread's full state, including status, activity (one line on \
-                       what it is doing now), background_task_count, \
+                       what it is doing now), work (what it has in flight as of work.as_of: \
+                       state working, waiting_on_work, waiting_on_call, nothing_in_flight, \
+                       compacting, unknown...; its open tool calls; tasks with kind \
+                       background, foreground, detached (its call returned; nothing waits for \
+                       it) or job; quiet time from progress_at, heartbeats apart as alive_at; \
+                       queued prompts; sight: how much twr can see of the runtime), \
+                       background_task_count, \
                        background_tasks and its open attention items \
                        (attn_id, reason, summary, options), and its `account` as list_threads \
                        shows it. JSON, led by thread_name and thread (its id).",

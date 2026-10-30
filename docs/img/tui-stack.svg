@@ -2,125 +2,162 @@
 <title>twr stack view: the conversation with the orchestrator, and the worker thread cards with a permission and a question</title>
 <style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
-<rect x="232.4" y="14" width="781.2" height="18" fill="#5fd7d7"/>
-<rect x="30.8" y="32" width="134.4" height="18" fill="#c9d1d9"/>
-<rect x="165.2" y="32" width="25.2" height="18" fill="#d29922"/>
-<rect x="190.4" y="32" width="33.6" height="18" fill="#c9d1d9"/>
-<rect x="1030.4" y="50" width="100.8" height="18" fill="#ff7b72"/>
-<rect x="1030.4" y="248" width="84" height="18" fill="#d29922"/>
-<rect x="1030.4" y="446" width="58.8" height="18" fill="#ffa198"/>
-<rect x="232.4" y="500" width="781.2" height="18" fill="#3a3a3a"/>
-<rect x="240.8" y="698" width="134.4" height="18" fill="#5fd7d7"/>
+<rect x="442.4" y="14" width="260.4" height="18" fill="#5fd7d7"/>
+<rect x="30.8" y="32" width="344.4" height="18" fill="#c9d1d9"/>
+<rect x="375.2" y="32" width="25.2" height="18" fill="#d29922"/>
+<rect x="400.4" y="32" width="33.6" height="18" fill="#c9d1d9"/>
+<rect x="39.2" y="140" width="100.8" height="18" fill="#ff7b72"/>
+<rect x="39.2" y="248" width="84" height="18" fill="#d29922"/>
+<rect x="39.2" y="374" width="58.8" height="18" fill="#ffa198"/>
+<rect x="442.4" y="500" width="218.4" height="18" fill="#3a3a3a"/>
+<rect x="450.8" y="698" width="134.4" height="18" fill="#5fd7d7"/>
 <rect x="22.4" y="38.8" width="8.4" height="11.2" fill="#d7875f"/>
-<rect x="1030.4" y="632.8" width="8.4" height="11.2" fill="#d7875f"/>
-<path d="M236.6 707H240.8M484.4 707H1017.8M236.6 743H1017.8M236.6 707V743M1017.8 707V743" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M1026.2 221H1030.4M1181.6 221H1223.6M1290.8 221H1299.2M1349.6 221H1353.8M1026.2 401H1353.8M1026.2 419H1030.4M1131.2 419H1164.8M1290.8 419H1299.2M1349.6 419H1353.8M1026.2 599H1353.8M1026.2 617H1030.4M1139.6 617H1164.8M1290.8 617H1299.2M1349.6 617H1353.8M1026.2 725H1282.4M1349.6 725H1353.8M228.2 14V770M1026.2 221V401M1026.2 419V599M1026.2 617V725M1353.8 221V401M1353.8 419V599M1353.8 617V725" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M236.6 311H249.2M450.8 311H1009.4M236.6 473H1009.4M236.6 311V473M1009.4 311V473" stroke="#af87af" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M236.6 149H249.2M492.8 149H1009.4M236.6 275H1009.4M236.6 149V275M1009.4 149V275" stroke="#af87ff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M1026.2 23H1030.4M1122.8 23H1164.8M1290.8 23H1299.2M1349.6 23H1353.8M1026.2 203H1353.8M1026.2 23V203M1353.8 23V203" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<rect x="39.2" y="506.8" width="8.4" height="11.2" fill="#d7875f"/>
+<path d="M446.6 311H459.2M660.8 311H1353.8M446.6 473H1353.8M446.6 311V473M1353.8 311V473" stroke="#008700" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M446.6 707H450.8M694.4 707H1353.8M446.6 743H1353.8M446.6 707V743M1353.8 707V743" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M438.2 14V770" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 347H39.2M207.2 347H240.8M366.8 347H375.2M425.6 347H429.8M35 473H429.8M35 347V473M429.8 347V473" stroke="#875fff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M446.6 149H459.2M702.8 149H1353.8M35 221H39.2M190.4 221H240.8M366.8 221H375.2M425.6 221H429.8M446.6 275H1353.8M35 329H429.8M446.6 149V275M1353.8 149V275M35 221V329M429.8 221V329" stroke="#87afff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 491H39.2M198.8 491H240.8M366.8 491H375.2M425.6 491H429.8M35 545H358.4M425.6 545H429.8M35 491V545M429.8 491V545" stroke="#af5f00" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M35 113H39.2M182 113H240.8M366.8 113H375.2M425.6 113H429.8M35 203H429.8M35 113V203M429.8 113V203" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
 <text x="22.4" y="27.5" fill="#6e7681" class="b" textLength="84">WORKSPACES</text>
-<text x="207.2" y="27.5" fill="#6e7681">‹</text>
-<text x="240.8" y="27.5" fill="#000000" class="b" textLength="100.8">ORCHESTRATOR</text>
-<text x="358.4" y="27.5" fill="#000000" textLength="134.4">acp · scripted-1</text>
-<text x="1038.8" y="27.5" fill="#d29922" class="b" textLength="75.6">ratelimit</text>
-<text x="1173.2" y="27.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="1307.6" y="27.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="417.2" y="27.5" fill="#6e7681">‹</text>
+<text x="450.8" y="27.5" fill="#000000" class="b" textLength="100.8">ORCHESTRATOR</text>
+<text x="568.4" y="27.5" fill="#000000" textLength="134.4">acp · scripted-1</text>
 <text x="14" y="45.5" fill="#39c5cf">▌</text>
 <text x="39.2" y="45.5" fill="#0d1117" class="b" textLength="58.8">default</text>
-<text x="173.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠2 ●1</text>
-<text x="1030.4" y="45.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="383.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠2 ●1</text>
+<text x="459.2" y="45.5" fill="#875fff" textLength="84">deploy-fix</text>
+<text x="551.6" y="45.5" fill="#6e7681" textLength="260.4">· hub update (ctrl+o to expand)</text>
 <text x="14" y="63.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="63.5" fill="#6e7681" textLength="33.6">idle</text>
-<text x="249.2" y="63.5" fill="#949494" textLength="50.4">Called</text>
-<text x="308" y="63.5" fill="#949494" class="b">1</text>
-<text x="324.8" y="63.5" fill="#949494" textLength="33.6">tool</text>
-<text x="366.8" y="63.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
-<text x="1038.8" y="63.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
-<text x="1139.6" y="63.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
+<text x="39.2" y="63.5" fill="#d29922" class="b" textLength="201.6">working · waiting on you</text>
 <text x="14" y="81.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="81.5" fill="#6e7681" textLength="109.2">Three things.</text>
-<text x="1030.4" y="81.5" fill="#d29922" class="b">1</text>
-<text x="1047.2" y="81.5" fill="#c9d1d9" textLength="42">allow</text>
-<text x="1106" y="81.5" fill="#d29922" class="b">2</text>
-<text x="1122.8" y="81.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="39.2" y="81.5" fill="#6e7681" textLength="394.8">Three things. ratelimit wants to run cargo test</text>
+<text x="459.2" y="81.5" fill="#949494" textLength="50.4">Called</text>
+<text x="518" y="81.5" fill="#949494" class="b">1</text>
+<text x="534.8" y="81.5" fill="#949494" textLength="33.6">tool</text>
+<text x="576.8" y="81.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
 <text x="14" y="99.5" fill="#39c5cf">▌</text>
-<text x="39.2" y="99.5" fill="#6e7681" textLength="176.4">ratelimit wants to r…</text>
-<text x="232.4" y="99.5" fill="#c9d1d9" textLength="739.2">● deploy-fix failed: turn 1 failed: terraform plan failed: the state lock is held by run</text>
-<text x="249.2" y="117.5" fill="#c9d1d9" textLength="50.4">81719.</text>
-<text x="22.4" y="135.5" fill="#6e7681">○</text>
-<text x="39.2" y="135.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
-<text x="39.2" y="153.5" fill="#6e7681" textLength="126">hub not running</text>
-<text x="257.6" y="153.5" fill="#af87ff" class="b" textLength="226.8">invoice-rounding · question</text>
-<text x="249.2" y="171.5" fill="#c9d1d9" textLength="403.2">Round tax per line or once on the invoice total?</text>
-<text x="1030.4" y="189.5" fill="#d29922" textLength="319.2">twr/31556… · changes made · +1 vs main</text>
-<text x="249.2" y="207.5" fill="#6e7681" textLength="42">task:</text>
-<text x="299.6" y="207.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
-<text x="249.2" y="225.5" fill="#6e7681" textLength="42">said:</text>
-<text x="299.6" y="225.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
-<text x="1038.8" y="225.5" fill="#6e7681" class="b" textLength="134.4">invoice-rounding</text>
-<text x="1232" y="225.5" fill="#6e7681" textLength="50.4">fake-1</text>
-<text x="1307.6" y="225.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="1030.4" y="243.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
-<text x="249.2" y="261.5" fill="#d29922" class="b">1</text>
-<text x="266" y="261.5" fill="#c9d1d9" textLength="67.2">per line</text>
-<text x="350" y="261.5" fill="#d29922" class="b">2</text>
-<text x="366.8" y="261.5" fill="#c9d1d9" textLength="100.8">on the total</text>
-<text x="1038.8" y="261.5" fill="#1b1f24" class="b" textLength="67.2">QUESTION</text>
-<text x="1122.8" y="261.5" fill="#c9d1d9" textLength="218.4">Round tax per line or once</text>
-<text x="1030.4" y="279.5" fill="#c9d1d9" textLength="176.4">on the invoice total?</text>
-<text x="1030.4" y="297.5" fill="#d29922" class="b">1</text>
-<text x="1047.2" y="297.5" fill="#c9d1d9" textLength="67.2">per line</text>
-<text x="1131.2" y="297.5" fill="#d29922" class="b">2</text>
-<text x="1148" y="297.5" fill="#c9d1d9" textLength="100.8">on the total</text>
-<text x="257.6" y="315.5" fill="#af87af" class="b" textLength="184.8">ratelimit · permission</text>
-<text x="249.2" y="333.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
-<text x="249.2" y="369.5" fill="#6e7681" textLength="42">task:</text>
-<text x="299.6" y="369.5" fill="#b1bac4" textLength="680.4">I'll add a per-IP limit to POST /login. First, how a request reaches the handler.</text>
-<text x="249.2" y="387.5" fill="#6e7681" textLength="42">said:</text>
-<text x="299.6" y="387.5" fill="#b1bac4" textLength="672">Added a test: six logins from one IP inside a minute, and the sixth must get 429</text>
-<text x="1030.4" y="387.5" fill="#39c5cf" textLength="310.8">twr/31556ead16d4cc24/invoice-rounding</text>
-<text x="249.2" y="405.5" fill="#b1bac4" textLength="714">with Retry-After: 60. It uses a paused clock, so it runs in milliseconds. Running the</text>
-<text x="249.2" y="423.5" fill="#b1bac4" textLength="327.6">auth tests to check nothing else broke.</text>
-<text x="1038.8" y="423.5" fill="#6e7681" class="b" textLength="84">deploy-fix</text>
-<text x="1173.2" y="423.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="1307.6" y="423.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="1030.4" y="441.5" fill="#ff7b72" class="b" textLength="50.4">failed</text>
-<text x="249.2" y="459.5" fill="#d29922" class="b">1</text>
-<text x="266" y="459.5" fill="#c9d1d9" textLength="42">allow</text>
-<text x="324.8" y="459.5" fill="#d29922" class="b">2</text>
-<text x="341.6" y="459.5" fill="#c9d1d9" textLength="33.6">deny</text>
-<text x="1038.8" y="459.5" fill="#1b1f24" class="b" textLength="42">ERROR</text>
-<text x="1097.6" y="459.5" fill="#c9d1d9" textLength="218.4">deploy-fix: turn 1 failed:</text>
-<text x="1030.4" y="477.5" fill="#c9d1d9" textLength="310.8">terraform plan failed: the state lock</text>
-<text x="1030.4" y="495.5" fill="#c9d1d9" textLength="168">is held by run 81719</text>
-<text x="232.4" y="513.5" fill="#949494">❯</text>
-<text x="249.2" y="513.5" fill="#ffffff" textLength="201.6">What needs me right now?</text>
-<text x="1030.4" y="513.5" fill="#d29922" class="b">1</text>
-<text x="1047.2" y="513.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
-<text x="249.2" y="549.5" fill="#949494" textLength="50.4">Called</text>
-<text x="308" y="549.5" fill="#949494" class="b">2</text>
-<text x="324.8" y="549.5" fill="#949494" textLength="42">tools</text>
-<text x="375.2" y="549.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
-<text x="232.4" y="585.5" fill="#c9d1d9" textLength="722.4">● Three things. ratelimit wants to run cargo test -p api auth:: to check its new login</text>
-<text x="1030.4" y="585.5" fill="#39c5cf" textLength="260.4">twr/31556ead16d4cc24/deploy-fix</text>
-<text x="249.2" y="603.5" fill="#c9d1d9" textLength="756">limiter: select its card and press Enter, then 1 allows. invoice-rounding asks whether tax</text>
-<text x="249.2" y="621.5" fill="#c9d1d9" textLength="722.4">is rounded per line or once on the invoice total. deploy-fix stopped because run 81719</text>
-<text x="1038.8" y="621.5" fill="#6e7681" class="b" textLength="92.4">checkout-ui</text>
-<text x="1173.2" y="621.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
-<text x="1307.6" y="621.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="249.2" y="639.5" fill="#c9d1d9" textLength="630">still holds the Terraform state lock; I can retry it once that run is done.</text>
-<text x="1047.2" y="639.5" fill="#3fb950" class="b" textLength="58.8">running</text>
-<text x="1114.4" y="639.5" fill="#6e7681">·</text>
-<text x="1131.2" y="639.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
-<text x="249.2" y="675.5" fill="#c9d1d9" textLength="739.2">The rest is fine: checkout-ui is building the coupon field, and the changelog, the quick</text>
-<text x="249.2" y="693.5" fill="#c9d1d9" textLength="361.2">start and the accessibility fixes are done.</text>
-<text x="249.2" y="711.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
-<text x="383.6" y="711.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
-<text x="1030.4" y="711.5" fill="#d29922" textLength="319.2">twr/31… · changes made · +1/−1 vs main</text>
-<text x="240.8" y="729.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
-<text x="1282.4" y="729.5" fill="#6e7681" textLength="67.2">↓ 3 more</text>
+<text x="39.2" y="99.5" fill="#6e7681" textLength="386.4">-p api auth:: to check its new login limiter:…</text>
+<text x="14" y="117.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="117.5" fill="#6e7681" textLength="42">api ·</text>
+<text x="98" y="117.5" fill="#008700" class="b" textLength="75.6">ratelimit</text>
+<text x="249.2" y="117.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="383.6" y="117.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="442.4" y="117.5" fill="#c9d1d9" textLength="798">● deploy-fix failed: turn 1 failed: terraform plan failed: the state lock is held by run 81719.</text>
+<text x="14" y="135.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="135.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="14" y="153.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="153.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
+<text x="148.4" y="153.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
+<text x="467.6" y="153.5" fill="#87afff" class="b" textLength="226.8">invoice-rounding · question</text>
+<text x="14" y="171.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="171.5" fill="#d29922" class="b">1</text>
+<text x="56" y="171.5" fill="#c9d1d9" textLength="42">allow</text>
+<text x="114.8" y="171.5" fill="#d29922" class="b">2</text>
+<text x="131.6" y="171.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="459.2" y="171.5" fill="#c9d1d9" textLength="403.2">Round tax per line or once on the invoice total?</text>
+<text x="14" y="189.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="189.5" fill="#d29922" textLength="386.4">twr/d42b16aa90a91… · changes made · +1 vs main</text>
+<text x="14" y="207.5" fill="#39c5cf">▌</text>
+<text x="459.2" y="207.5" fill="#6e7681" textLength="42">task:</text>
+<text x="509.6" y="207.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
+<text x="14" y="225.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="225.5" fill="#87afff" class="b" textLength="134.4">invoice-rounding</text>
+<text x="249.2" y="225.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="383.6" y="225.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="459.2" y="225.5" fill="#6e7681" textLength="42">said:</text>
+<text x="509.6" y="225.5" fill="#b1bac4" textLength="319.2">Checking how invoice totals round tax.</text>
+<text x="14" y="243.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="243.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="14" y="261.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="261.5" fill="#1b1f24" class="b" textLength="67.2">QUESTION</text>
+<text x="131.6" y="261.5" fill="#c9d1d9" textLength="277.2">Round tax per line or once on the</text>
+<text x="459.2" y="261.5" fill="#d29922" class="b">1</text>
+<text x="476" y="261.5" fill="#c9d1d9" textLength="67.2">per line</text>
+<text x="560" y="261.5" fill="#d29922" class="b">2</text>
+<text x="576.8" y="261.5" fill="#c9d1d9" textLength="100.8">on the total</text>
+<text x="14" y="279.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="279.5" fill="#c9d1d9" textLength="117.6">invoice total?</text>
+<text x="14" y="297.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="297.5" fill="#d29922" class="b">1</text>
+<text x="56" y="297.5" fill="#c9d1d9" textLength="67.2">per line</text>
+<text x="140" y="297.5" fill="#d29922" class="b">2</text>
+<text x="156.8" y="297.5" fill="#c9d1d9" textLength="100.8">on the total</text>
+<text x="14" y="315.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="315.5" fill="#39c5cf" textLength="310.8">twr/d42b16aa90a91be8/invoice-rounding</text>
+<text x="467.6" y="315.5" fill="#008700" class="b" textLength="184.8">ratelimit · permission</text>
+<text x="14" y="333.5" fill="#39c5cf">▌</text>
+<text x="459.2" y="333.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
+<text x="14" y="351.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="351.5" fill="#6e7681" textLength="58.8">infra ·</text>
+<text x="114.8" y="351.5" fill="#875fff" class="b" textLength="84">deploy-fix</text>
+<text x="249.2" y="351.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="383.6" y="351.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="14" y="369.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="369.5" fill="#ff7b72" class="b" textLength="50.4">failed</text>
+<text x="459.2" y="369.5" fill="#6e7681" textLength="42">task:</text>
+<text x="509.6" y="369.5" fill="#b1bac4" textLength="680.4">I'll add a per-IP limit to POST /login. First, how a request reaches the handler.</text>
+<text x="14" y="387.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="387.5" fill="#1b1f24" class="b" textLength="42">ERROR</text>
+<text x="106.4" y="387.5" fill="#c9d1d9" textLength="302.4">deploy-fix: turn 1 failed: terraform</text>
+<text x="459.2" y="387.5" fill="#6e7681" textLength="42">said:</text>
+<text x="509.6" y="387.5" fill="#b1bac4" textLength="823.2">Added a test: six logins from one IP inside a minute, and the sixth must get 429 with Retry-After:</text>
+<text x="14" y="405.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="405.5" fill="#c9d1d9" textLength="352.8">plan failed: the state lock is held by run</text>
+<text x="459.2" y="405.5" fill="#b1bac4" textLength="840">60. It uses a paused clock, so it runs in milliseconds. Running the auth tests to check nothing else</text>
+<text x="14" y="423.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="423.5" fill="#c9d1d9" textLength="42">81719</text>
+<text x="459.2" y="423.5" fill="#b1bac4" textLength="50.4">broke.</text>
+<text x="14" y="441.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="441.5" fill="#d29922" class="b">1</text>
+<text x="56" y="441.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
+<text x="14" y="459.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="459.5" fill="#39c5cf" textLength="260.4">twr/d42b16aa90a91be8/deploy-fix</text>
+<text x="459.2" y="459.5" fill="#d29922" class="b">1</text>
+<text x="476" y="459.5" fill="#c9d1d9" textLength="42">allow</text>
+<text x="534.8" y="459.5" fill="#d29922" class="b">2</text>
+<text x="551.6" y="459.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="14" y="477.5" fill="#39c5cf">▌</text>
+<text x="14" y="495.5" fill="#39c5cf">▌</text>
+<text x="47.6" y="495.5" fill="#6e7681" textLength="42">web ·</text>
+<text x="98" y="495.5" fill="#af5f00" class="b" textLength="92.4">checkout-ui</text>
+<text x="249.2" y="495.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="383.6" y="495.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="14" y="513.5" fill="#39c5cf">▌</text>
+<text x="56" y="513.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="123.2" y="513.5" fill="#6e7681">·</text>
+<text x="140" y="513.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="442.4" y="513.5" fill="#949494">❯</text>
+<text x="459.2" y="513.5" fill="#ffffff" textLength="201.6">What needs me right now?</text>
+<text x="14" y="531.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="531.5" fill="#d29922" textLength="386.4">twr/d42b16aa90… · changes made · +1/−1 vs main</text>
+<text x="14" y="549.5" fill="#39c5cf">▌</text>
+<text x="358.4" y="549.5" fill="#af5f00" textLength="67.2">↓ 3 more</text>
+<text x="459.2" y="549.5" fill="#949494" textLength="50.4">Called</text>
+<text x="518" y="549.5" fill="#949494" class="b">2</text>
+<text x="534.8" y="549.5" fill="#949494" textLength="42">tools</text>
+<text x="585.2" y="549.5" fill="#6e7681" textLength="151.2">(ctrl+o to expand)</text>
+<text x="14" y="567.5" fill="#39c5cf">▌</text>
+<text x="14" y="585.5" fill="#39c5cf">▌</text>
+<text x="442.4" y="585.5" fill="#c9d1d9" textLength="890.4">● Three things. ratelimit wants to run cargo test -p api auth:: to check its new login limiter: select its</text>
+<text x="14" y="603.5" fill="#39c5cf">▌</text>
+<text x="459.2" y="603.5" fill="#c9d1d9" textLength="882">card and press Enter, then 1 allows. invoice-rounding asks whether tax is rounded per line or once on the</text>
+<text x="14" y="621.5" fill="#39c5cf">▌</text>
+<text x="459.2" y="621.5" fill="#c9d1d9" textLength="873.6">invoice total. deploy-fix stopped because run 81719 still holds the Terraform state lock; I can retry it</text>
+<text x="14" y="639.5" fill="#39c5cf">▌</text>
+<text x="459.2" y="639.5" fill="#c9d1d9" textLength="184.8">once that run is done.</text>
+<text x="14" y="657.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="657.5" fill="#6e7681" textLength="302.4">1 parked hidden · /parked shows them</text>
+<text x="459.2" y="675.5" fill="#c9d1d9" textLength="856.8">The rest is fine: checkout-ui is building the coupon field, and the changelog, the quick start and the</text>
+<text x="22.4" y="693.5" fill="#6e7681">○</text>
+<text x="39.2" y="693.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
+<text x="459.2" y="693.5" fill="#c9d1d9" textLength="243.6">accessibility fixes are done.</text>
+<text x="39.2" y="711.5" fill="#6e7681" textLength="126">hub not running</text>
+<text x="459.2" y="711.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="593.6" y="711.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="450.8" y="729.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
 <text x="22.4" y="747.5" fill="#39c5cf" textLength="126">+ New workspace</text>
-<text x="1030.4" y="747.5" fill="#6e7681" textLength="302.4">1 parked hidden · /parked shows them</text>
 <text x="22.4" y="765.5" fill="#39c5cf" textLength="84">⚙ Settings</text>
-<text x="232.4" y="765.5" fill="#6e7681" textLength="1125.6">Enter send · Ctrl-J new line · Tab/Shift-↑↓ select · Enter on an empty line: actions · Shift-← conversation · / commands · @ threads ·</text>
+<text x="442.4" y="765.5" fill="#6e7681" textLength="915.6">Enter send · Ctrl-J new line · Tab/Shift-↑↓ select · Enter on an empty line: actions · Shift-← conversation ·</text>
 </svg>

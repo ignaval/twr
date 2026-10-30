@@ -37,8 +37,8 @@ pub const CARD_HEIGHT: u16 = 11;
 pub const COMPACT_CARD_HEIGHT: u16 = 7;
 /// Narrowest a card may get before cards start scrolling horizontally.
 pub const CARD_MIN_WIDTH: u16 = 30;
-/// Narrowest terminal whose cards go in a side column next to the main pane; narrower ones
-/// get a row of cards above it.
+/// Narrowest terminal whose sidebar gets its full width ([`side_width`]); narrower ones get a
+/// narrower one.
 pub const SIDE_MIN_WIDTH: u16 = 100;
 /// The most rows a grid tile gets, borders included.
 pub const TILE_HEIGHT: u16 = 9;
@@ -49,9 +49,16 @@ pub const POPUP_ROWS: usize = 8;
 /// Shown when the hub has no worker threads.
 pub const EMPTY_STATE: &str = "no worker threads — /new <project>, or ask the orchestrator";
 
-/// Width of the side column of cards at terminal width `width`.
+/// Width of the sidebar's column of cards at terminal width `width`: three tenths of it, 34 to
+/// 48 columns, from [`SIDE_MIN_WIDTH`]; narrower, two fifths, 24 to 34, so the conversation
+/// keeps the rest.
 pub fn side_width(width: u16) -> u16 {
-    (width * 3 / 10).clamp(34, 48)
+    let side = if width >= SIDE_MIN_WIDTH {
+        (u32::from(width) * 3 / 10).clamp(34, 48)
+    } else {
+        (u32::from(width) * 2 / 5).clamp(24, 34)
+    };
+    u16::try_from(side).unwrap_or(48)
 }
 
 /// Draws the current view (stack, grid or decisions), the orchestrator picker, the help or
@@ -98,24 +105,39 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     } else {
         area
     };
-    // The workspace sidebar, docked left of every view: the strip is not drawn then. It is
-    // drawn after the overlays, which stay right of it: its cards stay on screen and
-    // tappable, as the strip's tabs do.
-    let (dock, body) = if state.ws_docked() {
-        let [dock, rest] = Layout::horizontal([
-            Constraint::Length(crate::sidebar::DOCK_WIDTH),
-            Constraint::Min(0),
-        ])
-        .areas(body);
+    // The sidebar, docked left of every view ([`crate::sidebar`]): the workspaces (the strip
+    // is not drawn then), and in the stack view the worker cards, nested under the current
+    // workspace's card. The cards are drawn first, as the views are: the main pane shows a
+    // confirm card the hub's card cut short ([`hub_detail`]), and an overlay covers them as
+    // it covers a view. The workspaces are drawn after the overlays, which stay right of
+    // them: their cards stay on screen and tappable, as the strip's tabs do.
+    let dock_width = state.dock_width_at(body.width);
+    let (mut dock, body) = if dock_width > 0 && body.width > dock_width {
+        let [dock, rest] =
+            Layout::horizontal([Constraint::Length(dock_width), Constraint::Min(0)]).areas(body);
+        let cards = state.cards_docked();
+        let dock = crate::sidebar::Dock::new(state, dock, cards, |w| column_needed(state, w));
         (Some(dock), rest)
     } else {
         (None, body)
     };
+    let docked = dock.as_mut().and_then(|d| {
+        let cards = d.cards?;
+        let noted = render_card_column(frame, cards, state, &mut panes);
+        d.fit_cards(state, cards_bottom(&mut panes, cards));
+        panes.no_cards = panes.list.is_none() && !state.order().is_empty();
+        Some(noted)
+    });
+    // No room for the sidebar beside the view (a full layout forced on a tiny screen): its
+    // cards are drawn nowhere, so none is selectable.
+    if dock.is_none() && state.cards_docked() {
+        panes.no_cards = !state.order().is_empty();
+    }
     match state.view.screen {
         Screen::Decisions => render_decisions_view(frame, body, state, &mut panes),
         // A phone: one screen at a time.
         _ if state.compact() => render_compact(frame, body, state, &mut panes),
-        Screen::Stack => render_stack(frame, body, state, &mut panes, false),
+        Screen::Stack => render_stack(frame, body, state, &mut panes, docked),
         Screen::Grid => render_grid_view(frame, body, state, &mut panes),
     }
     // What an overlay hides is not on screen: no option key may answer it, no control under
@@ -132,14 +154,12 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
         render_help(frame, body, state.view.help_scroll, &mut panes);
     } else if let Some(trash) = &state.view.trash {
         render_trash(frame, body, trash, state.view.trash_scroll, &mut panes);
-    } else if state.ws_drawer_open() {
-        crate::sidebar::render_drawer(frame, body, state, &mut panes);
     } else if render_action_popup(frame, body, state, &mut panes).is_some() {
     } else {
         render_popup(frame, body, state, &mut panes);
     }
     if let Some(dock) = dock {
-        crate::sidebar::render_docked(frame, dock, state, &mut panes);
+        dock.render(frame, state, &mut panes);
     }
     if let Some(sel) = &state.view.selection {
         sel.highlight(frame.buffer_mut());
@@ -154,11 +174,11 @@ pub fn render(frame: &mut Frame, state: &AppState) -> Panes {
     panes
 }
 
-/// The tab strip's control of the workspace sidebar.
+/// The tab strip's control of the sidebar.
 const MENU: &str = " ≡ ";
 
-/// The workspaces' tab strip ([`crate::workspace`]), after the `≡` that shows the workspace
-/// sidebar (or its drawer): each tab's name with its badges (`⚠n`
+/// The workspaces' tab strip ([`crate::workspace`]) while the sidebar is hidden, after the `≡`
+/// that shows it again: each tab's name with its badges (`⚠n`
 /// items waiting on the user, `●n` threads running, `○` a stopped hub, `…` one that did not
 /// answer), the current one highlighted. A click on a tab switches to it
 /// ([`PaneId::Tab`]). When they don't all fit, the tabs around the current one show, with
@@ -228,8 +248,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
         spans.push(Span::styled(text, style));
         w
     };
-    // The workspace sidebar's control: shows it, or opens it as a drawer where it does not
-    // fit ([`crate::sidebar`]).
+    // The sidebar's control: shows it ([`crate::sidebar`]).
     let menu = x;
     x += push(&mut spans, MENU.into(), Style::default().fg(Color::Cyan));
     panes.target(
@@ -405,12 +424,12 @@ pub const HELP_KEYS: &[(&str, &str)] = &[
         "Ctrl-G",
         "the grid of threads, or back to the stack (/grid)",
     ),
-    ("Ctrl-B", "show or hide the thread sidebar (/sidebar)"),
     (
-        "Ctrl-T",
-        "show or hide the workspace sidebar (/spaces); on a narrower screen open it as a \
-         drawer (↑↓ Enter, Esc closes), in the compact layout the Workspaces screen",
+        "Ctrl-B",
+        "show or hide Threads, the sidebar: the workspaces with their threads, the current \
+         one's as cards (/sidebar); in the compact layout the Threads screen",
     ),
+    ("Ctrl-T", "the same as Ctrl-B (/spaces)"),
     (
         "Ctrl-F",
         "Focus mode: working threads and anything needing you (/focus)",
@@ -499,9 +518,9 @@ pub const HELP_MOUSE: &[(&str, &str)] = &[
     ),
     (
         "controls",
-        "a workspace's card in the sidebar switches to it, + New workspace asks for a name, \
-         ⚙ Settings opens the settings, the sidebar's ‹ hides it and the tab strip's ≡ shows \
-         it; the Chat, Needs you, Threads and Workspaces tabs switch screens (a whole share of \
+        "a workspace's card in Threads, or a thread under another workspace's card, \
+         switches to it, + New workspace asks for a name, ⚙ Settings opens the settings, \
+         Threads' ‹ hides it and the tab strip's ≡ shows it; the Chat, Needs you and Threads tabs switch screens (a whole share of \
          the bar each); \
          ‹ back leaves a dive, ‹ stack the grid; the ↓ below row follows the bottom; ✕ \
          closes an overlay, a popup or a detail view; ↶ take back, tapped twice, takes back the message you just sent; [ yes ] and \
@@ -543,8 +562,12 @@ pub const HELP_PHONE: &[(&str, &str)] = &[
     (
         "compact layout",
         "below [tui] compact_width columns (60), or /compact on: one screen at a time, Chat, \
-         Needs you (a line per thread), Threads (the cards) and Workspaces, switched with /c, \
-         /n, /t and /w or a tap on their tabs; ↑↓ on an empty line pick a row or card, Enter \
+         Needs you (a row per thread) and Threads (the workspaces, the current one's cards \
+         nested under it, the others' threads, one list that scrolls), switched with /c, /n and \
+         /t (/w) or a tap on their tabs; the tabs and menu choices (a popup's rows, \
+         completions, the picker's runtimes, settings, the Threads and Needs you entries) two \
+         rows tall, either row a tap on it, every other control a row; \
+         ↑↓ on an empty line pick a row, a workspace or a card, Enter \
          opens it, its \
          digits answer it; a tap picks one, a tap on the picked one opens it",
     ),
@@ -812,14 +835,22 @@ fn render_trash(frame: &mut Frame, area: Rect, trash: &Value, scroll: u16, panes
     panes.trash_max = rows.saturating_sub(fit);
     let scroll = scroll.min(panes.trash_max);
     if rows > fit {
-        block = block.title_bottom(
-            Line::from(format!(
-                " rows {}-{} of {rows} · ↑↓ PgUp/PgDn scroll · any other key closes ",
-                scroll + 1,
-                (scroll + fit).min(rows)
-            ))
-            .right_aligned(),
+        // Its parts give way from the end where the border is narrower than all of them.
+        let at = format!(
+            " rows {}-{} of {rows}",
+            scroll + 1,
+            (scroll + fit).min(rows)
         );
+        let room = usize::from(rect.width.saturating_sub(2));
+        let footer = [
+            format!("{at} · ↑↓ PgUp/PgDn scroll · any other key closes "),
+            format!("{at} · ↑↓ PgUp/PgDn scroll "),
+            format!("{at} "),
+        ]
+        .into_iter()
+        .find(|f| crate::edit::width(f) <= room)
+        .unwrap_or_else(|| truncate(&format!("{at} "), room));
+        block = block.title_bottom(Line::from(footer).right_aligned());
     }
     panes.cover(None);
     panes.add(PaneId::Help, block.inner(rect));
@@ -920,12 +951,46 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     // Wrapped here to the width it gets (a phone is narrower than its heading), so the rows
     // of each runtime are known: a tap on them picks it.
     let inner_w = usize::from(width.min(area.width).saturating_sub(2)).max(1);
+    // On a phone each runtime is a menu choice, a band two rows tall ([`TAP_ROWS`]).
+    let phone = state.compact();
+    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.runtimes.len());
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut spans = Vec::new();
-    for line in lines {
+    for (k, line) in lines.into_iter().enumerate() {
         let start = rows.len();
-        rows.extend(wrap_line(line, inner_w));
+        let wrapped = wrap_line(line, inner_w);
+        if phone && (3..3 + runtimes).contains(&k) {
+            let bg = if k.is_multiple_of(2) { BAND } else { BAND_ALT };
+            rows.extend(tap_band(wrapped, inner_w, bg));
+        } else {
+            rows.extend(wrapped);
+        }
         spans.push(start..rows.len());
+    }
+    // A phone too short for it all: its rows scroll to keep the selected runtime whole, and a
+    // runtime the window cuts is left blank, never drawn without its tap.
+    let room = usize::from(area.height.saturating_sub(2));
+    if phone && rows.len() > room && room > 0 {
+        let sel = state.view.picker.as_ref().map_or(0, |p| p.selected);
+        let off = spans.get(3 + sel).map_or(0, |s: &std::ops::Range<usize>| {
+            s.end.saturating_sub(room).min(s.start)
+        });
+        rows.drain(..off);
+        for (k, span) in spans.iter_mut().enumerate() {
+            let shifted = span.start.saturating_sub(off)..span.end.saturating_sub(off);
+            let whole = span.start >= off && span.end - off <= room;
+            *span = if whole || shifted.is_empty() {
+                shifted
+            } else {
+                if (3..3 + runtimes).contains(&k) {
+                    let n = rows.len();
+                    for row in shifted.clone().filter(|r| *r < n) {
+                        rows[row] = Line::default();
+                    }
+                }
+                shifted.start..shifted.start
+            };
+        }
     }
     let rect = centered(
         area,
@@ -949,86 +1014,53 @@ fn render_picker(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pa
     panes.cover(None);
     panes.add(PaneId::Text, inner);
     close_row(panes, rect, Target::Close);
-    // Its runtimes, from the fourth line ([`picker_lines`]): the rows each wrapped into.
-    let runtimes = state.view.picker.as_ref().map_or(0, |p| p.runtimes.len());
+    // Its runtimes, from the fourth line ([`picker_lines`]): the rows each wrapped into (on a
+    // phone, only one drawn whole).
     for (i, span) in spans.iter().skip(3).take(runtimes).enumerate() {
         let y = inner
             .y
             .saturating_add(u16::try_from(span.start).unwrap_or(u16::MAX));
         let h = u16::try_from(span.len()).unwrap_or(u16::MAX);
         let cells = Rect::new(inner.x, y, inner.width, h).intersection(inner);
+        if phone && (h == 0 || cells.height < h) {
+            continue;
+        }
         panes.target(cells, Target::Runtime(i));
     }
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(rows).block(block), rect);
 }
 
-/// The stack view: the main pane, its input box and status bar, and the worker cards beside
-/// or above it, unless `hide_cards` (the compact layout's conversation).
+/// The stack view: the main pane, its input box and status bar; the worker cards are in the
+/// sidebar (`docked`: whether it drew the note on hidden parked threads), or not drawn (the
+/// sidebar hidden, the compact layout's conversation).
 fn render_stack(
     frame: &mut Frame,
     area: Rect,
     state: &AppState,
     panes: &mut Panes,
-    hide_cards: bool,
+    docked: Option<bool>,
 ) {
     let [upper, status] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(status_height(state, area)),
     ])
     .areas(area);
-    // Too narrow for a column of cards, a dive takes the whole height: its header band names
-    // the thread and says Esc gets back, to the row of cards as it was.
-    let narrow_dive = upper.width < SIDE_MIN_WIDTH && state.view.dive.is_some();
-    let (left, side) = if !hide_cards && !state.view.sidebar_hidden && upper.width >= SIDE_MIN_WIDTH
-    {
-        let [left, side] = Layout::horizontal([
-            Constraint::Min(0),
-            Constraint::Length(side_width(upper.width)),
-        ])
-        .areas(upper);
-        (left, Some(side))
-    } else {
-        (upper, None)
-    };
-    // The input box is under the main pane only: the column of cards beside it keeps its
-    // height however many rows the box grows to. The main pane's thread's queued messages are
-    // listed right above it.
+    // The main pane's thread's queued messages are listed right above the input box.
     let [top, queued, input] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(queue_height(state)),
         Constraint::Length(input_height(
             state,
             Rect {
-                width: left.width,
+                width: upper.width,
                 ..area
             },
         )),
     ])
-    .areas(left);
-    let noted = if let Some(side) = side {
-        // The cards first: the main pane shows a confirm card the hub's card cut short
-        // ([`hub_detail`]).
-        let noted = render_card_column(frame, side, state, panes);
-        // A column apart from the cards: the main pane has no border of its own.
-        let main = Rect {
-            width: top.width.saturating_sub(1),
-            ..top
-        };
-        render_main(frame, main, state, panes);
-        noted
-    } else if hide_cards || state.view.sidebar_hidden || narrow_dive {
-        render_main(frame, top, state, panes);
-        false
-    } else {
-        // As tall as its tallest card shown.
-        let row = card_row(state, top.width, panes);
-        let [cards, main] =
-            Layout::vertical([Constraint::Length(row.height()), Constraint::Min(3)]).areas(top);
-        let noted = render_cards(frame, cards, state, panes, row);
-        render_main(frame, main, state, panes);
-        noted
-    };
+    .areas(upper);
+    let noted = docked.unwrap_or(false);
+    render_main(frame, top, state, panes);
     render_queue(frame, queued, state, panes);
     render_input(frame, input, state, panes);
     // The note on hidden parked threads the card area had no room for leads the hints.
@@ -1036,21 +1068,59 @@ fn render_stack(
     render_status(frame, status, state, panes, parked);
 }
 
+/// On a phone, the most rows an option of the action popup takes as a row of its own (a menu
+/// choice's two, [`TAP_ROWS`], which the shortest popup has room for under a row of its
+/// text); a taller one is listed in full in the popup's text, and its row by its first line.
+pub const SHEET_OPTION_ROWS: usize = TAP_ROWS as usize;
+
+/// Rows of the compact layout's tab bar: two, as tall as a finger.
+pub const TAB_BAR_ROWS: u16 = 2;
+/// Rows of a menu choice on a phone, as tall as a tab: a popup's rows (actions, a question's
+/// answers, completions), the orchestrator picker's runtimes, a setting, `[ yes ]` and
+/// `[ no ]`, the Threads and Needs you lists' entries. Every other control (headers, the
+/// conversation's folds and footers, `■ stop`, the lines-below row, queued messages, take
+/// back, notices, `✕ close`, buttons) is a row tall, as on a desktop.
+pub const TAP_ROWS: u16 = TAB_BAR_ROWS;
+/// The fills of a phone's menu choices drawn as bands ([`tap_band`]), neighbors alternating.
+pub(crate) const BAND: Color = Color::Indexed(236);
+pub(crate) const BAND_ALT: Color = Color::Indexed(238);
+
+/// `lines`, a menu choice on a phone, as a band: at least [`TAP_ROWS`] rows, each filled to
+/// `width` cells with `bg` behind its text (where it has none of its own), so that its rows
+/// show as one choice.
+pub(crate) fn tap_band(
+    mut lines: Vec<Line<'static>>,
+    width: usize,
+    bg: Color,
+) -> Vec<Line<'static>> {
+    if lines.len() < usize::from(TAP_ROWS) {
+        lines.resize(usize::from(TAP_ROWS), Line::default());
+    }
+    for line in &mut lines {
+        let fill = width.saturating_sub(line.width());
+        line.spans.push(Span::raw(" ".repeat(fill)));
+        for span in &mut line.spans {
+            if span.style.bg.is_none() {
+                span.style = span.style.bg(bg);
+            }
+        }
+    }
+    lines
+}
+
 /// The compact layout (a phone): a tab bar naming its screens, `Chat · Needs you 2 · Threads`,
-/// the current one highlighted ([`render_tab_bar`]), over that screen: the conversation alone,
-/// what needs the user (one line per thread), or the threads' cards, each list with the input
-/// box and status bar under it.
+/// the current one highlighted ([`render_tab_bar`]), [`TAB_BAR_ROWS`] tall, over that screen: the
+/// conversation alone, what needs the user (one line per thread), or the threads' cards
+/// (nested under the current workspace's card among the workspaces', [`render_compact_threads`]),
+/// each list with the input box and status bar under it.
 fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
-    let [bar, rest] = Layout::vertical([
-        Constraint::Length(tab_bar_height(area.height)),
-        Constraint::Min(0),
-    ])
-    .areas(area);
+    let [bar, rest] =
+        Layout::vertical([Constraint::Length(TAB_BAR_ROWS), Constraint::Min(0)]).areas(area);
     render_tab_bar(frame, bar, state, panes);
     let pane = state.view.compact_pane;
     if pane == CompactPane::Chat {
-        render_stack(frame, rest, state, panes, true);
+        render_stack(frame, rest, state, panes, None);
         return;
     }
     let [list, input, status] = Layout::vertical([
@@ -1062,41 +1132,20 @@ fn render_compact(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut P
     if pane == CompactPane::Needs {
         let rows = compact_needs_rows(state, usize::from(list.width));
         render_compact_rows(frame, list, state, panes, rows);
-    } else if pane == CompactPane::Workspaces {
-        crate::sidebar::render_screen(frame, list, state, panes);
     } else {
-        render_compact_cards(frame, list, state, panes);
+        render_compact_threads(frame, list, state, panes);
     }
     render_input(frame, input, state, panes);
     render_status(frame, status, state, panes, None);
 }
 
-/// Rows of the compact layout's tab bar on a screen `height` rows tall: 3 (its names on the
-/// middle one) from [`TAB_BAR_TALL_FROM`] rows, 2 from [`TAB_BAR_SHORT_FROM`] (a phone with its
-/// keyboard up has about 20), and 1 on a shorter one, which keeps its rows for the screen
-/// itself.
-pub fn tab_bar_height(height: u16) -> u16 {
-    if height >= TAB_BAR_TALL_FROM {
-        3
-    } else if height >= TAB_BAR_SHORT_FROM {
-        2
-    } else {
-        1
-    }
-}
-
-/// From this many rows the compact layout's tab bar is 3 rows tall ([`tab_bar_height`]).
-pub const TAB_BAR_TALL_FROM: u16 = 24;
-/// From this many rows (and up to [`TAB_BAR_TALL_FROM`]) it is 2 rows tall.
-pub const TAB_BAR_SHORT_FROM: u16 = 14;
-
-/// The compact layout's tab bar over `bar`: `Chat`, `Needs you 2`, `Threads` and, when the TUI
-/// can switch workspaces, `Workspaces` (`⚠2`: what waits on the user in the others), each a
-/// filled tab an equal share of the width wide and the bar's height tall, its name centered
-/// (`Needs 2`, `Spaces`, then cut, where it does not fit), the current one reversed and bold,
-/// `Needs you` and `Workspaces` yellow while something waits. A tap anywhere in a tab's share
-/// (the gap after it included) shows its screen, as `/c`, `/n`, `/t` and `/w` do: the whole bar
-/// is tappable.
+/// The compact layout's tab bar over `bar` ([`TAB_BAR_ROWS`]): `Chat`, `Needs you 2` and `Threads` (`⚠2`:
+/// what waits on the user in the other workspaces, which it lists too), each a filled tab an
+/// equal share of the width wide and the bar's rows tall, its name centered on its first row
+/// (`Needs 2`, `Thr ⚠2`, then cut, where it
+/// does not fit), the current one reversed and bold, `Needs you` and `Threads` yellow while
+/// something waits. A tap anywhere in a tab's share (the gap after it included) shows its
+/// screen, as `/c`, `/n` and `/t` do: the whole bar is tappable.
 fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let pane = state.view.compact_pane;
@@ -1112,26 +1161,19 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             (CompactPane::Needs, "Needs you".into(), "Needs".into())
         },
-        (CompactPane::Threads, "Threads".into(), "Threads".into()),
     ];
-    // The workspaces, with what waits on the user in the others (a TUI opened on a socket
-    // has none to show).
+    // The threads, with what waits on the user in the other workspaces it lists (a TUI opened
+    // on a socket has none).
     let elsewhere = other_waiting(state);
-    if state.workspace.is_some() {
-        names.push(if elsewhere > 0 {
-            (
-                CompactPane::Workspaces,
-                format!("Workspaces ⚠{elsewhere}"),
-                format!("Spaces ⚠{elsewhere}"),
-            )
-        } else {
-            (
-                CompactPane::Workspaces,
-                "Workspaces".into(),
-                "Spaces".into(),
-            )
-        });
-    }
+    names.push(if elsewhere > 0 {
+        (
+            CompactPane::Threads,
+            format!("Threads ⚠{elsewhere}"),
+            format!("Thr ⚠{elsewhere}"),
+        )
+    } else {
+        (CompactPane::Threads, "Threads".into(), "Threads".into())
+    });
     panes.add(PaneId::Text, bar);
     // Fixed 256-color values, like the header band's ([`target_fill`]): legible on dark and
     // light terminals alike. Without colors, unfilled: a fill is drawn reversed then
@@ -1159,7 +1201,7 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         let style = if *p == pane {
             Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD)
         } else if (*p == CompactPane::Needs && needs > 0)
-            || (*p == CompactPane::Workspaces && elsewhere > 0)
+            || (*p == CompactPane::Threads && elsewhere > 0)
         {
             off.fg(Color::Indexed(220)).add_modifier(Modifier::BOLD)
         } else {
@@ -1173,10 +1215,8 @@ fn render_tab_bar(frame: &mut Frame, bar: Rect, state: &AppState, panes: &mut Pa
         } else {
             truncate_cells(short, room)
         };
-        let mut rows = vec![Line::default(); usize::from(tab.height.saturating_sub(1) / 2)];
-        rows.push(Line::from(label));
         frame.render_widget(
-            Paragraph::new(rows)
+            Paragraph::new(Line::from(label))
                 .alignment(Alignment::Center)
                 .style(style),
             tab,
@@ -1195,10 +1235,48 @@ fn other_waiting(state: &AppState) -> usize {
         .sum()
 }
 
-/// The compact layout's Threads screen: the threads' cards, as the stack view draws them, in a
-/// column as wide as the screen ([`render_column`]), the orchestrator's first while it asks.
-/// Scrolled like the column, by the wheel, else as little as the selection takes; a tap
-/// selects a card, and a tap on the selected one opens its action popup.
+/// The compact layout's Threads screen over `area`: in a TUI opened on a workspace, the
+/// workspaces with their threads, the current one's cards nested under its card, as one list
+/// that scrolls ([`crate::sidebar::render_phone`]); on a socket, the cards alone.
+fn render_compact_threads(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
+    if state.workspace.is_some() {
+        crate::sidebar::render_phone(frame, area, state, panes);
+    } else {
+        render_compact_cards(frame, area, state, panes);
+        // No room for a card: none is selectable ([`Panes::no_cards`]).
+        cards_bottom(panes, area);
+        panes.no_cards = panes.list.is_none() && !state.compact_threads().is_empty();
+    }
+}
+
+/// The row after the last card drawn in the column over `area`, which the list of cards then
+/// takes up to ([`crate::sidebar::Dock::fit_cards`]); its bottom when anything else is drawn
+/// there (the empty pane, the note on hidden parked threads), which keeps its rows. Where it
+/// drew no card (too few rows), it lists none: no key selects a card it did not draw.
+fn cards_bottom(panes: &mut Panes, area: Rect) -> u16 {
+    let mut bottom = area.y;
+    for p in panes.panes.iter().filter(|p| p.area.intersects(area)) {
+        match p.id {
+            // (A card's pane is its inside: its bottom border is the row under it.)
+            PaneId::Thread(_) => bottom = bottom.max(p.area.bottom() + 1),
+            _ => return area.bottom(),
+        }
+    }
+    let bottom = bottom.min(area.bottom());
+    if panes.list.is_some_and(|l| l.area == area) {
+        if bottom == area.y {
+            panes.list = None;
+        } else if let Some(list) = panes.list.as_mut() {
+            list.area.height = bottom - area.y;
+        }
+    }
+    bottom
+}
+
+/// The compact layout's Threads screen's cards: as the stack view draws them, in a column as
+/// wide as `area` ([`render_column`]), the orchestrator's first while it asks. Scrolled like
+/// the column, by the wheel, else as little as the selection takes; a tap selects a card, and
+/// a tap on the selected one opens its action popup.
 fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Panes) {
     use crate::app::CompactPane;
     let order = state.compact_threads();
@@ -1213,12 +1291,13 @@ fn render_compact_cards(frame: &mut Frame, area: Rect, state: &AppState, panes: 
     render_column(frame, area, area, state, panes, &order, focus, layout);
 }
 
-/// A compact list's rows: the card each is about, and its line.
-type CompactRows = Vec<(String, Line<'static>)>;
+/// A compact list's rows: the card each is about, and its lines ([`TAP_ROWS`]).
+type CompactRows = Vec<(String, Vec<Line<'static>>)>;
 
-/// "Needs you": one line per card that waits on the user, its most urgent item,
-/// `api · permission · Bash: git push` (the name in its card's color, [`card_color`]), and
-/// `(+2 more)` when it has more (answering one shows the next), most urgent first.
+/// "Needs you": a row per card that waits on the user, its most urgent item, on two lines:
+/// `api · permission` (the name in its card's color, [`card_color`]) and `(+2 more)` when it
+/// has more (answering one shows the next), then what it asks, `  Bash: git push`; most urgent
+/// first.
 fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
     use twr_core::event::AttentionReason;
     let mut rows = Vec::new();
@@ -1269,9 +1348,15 @@ fn compact_needs_rows(state: &AppState, width: usize) -> CompactRows {
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        spans.push(Span::raw(" · "));
-        spans.push(Span::raw(summary));
-        rows.push((id, Line::from(cut_spans(spans, width))));
+        // What it asks on the row under it: each row as tall as a control on a phone.
+        let ask = vec![Span::raw("  "), Span::raw(summary)];
+        rows.push((
+            id,
+            vec![
+                Line::from(cut_spans(spans, width)),
+                Line::from(cut_spans(ask, width)),
+            ],
+        ));
     }
     rows
 }
@@ -1313,7 +1398,14 @@ fn render_compact_rows(
         );
         return;
     }
-    let height = usize::from(area.height).max(1);
+    // Each row as tall as a control on a phone ([`TAP_ROWS`]): how many of them fit (none,
+    // shorter than one: then none is selectable either).
+    let tall = usize::from(TAP_ROWS);
+    let height = usize::from(area.height) / tall;
+    if height == 0 {
+        panes.no_cards = true;
+        return;
+    }
     let focus = state.focused();
     // Scrolled like the cards: by the wheel, else as little as the selection takes.
     let order: Vec<String> = rows.iter().map(|(id, _)| id.clone()).collect();
@@ -1330,47 +1422,24 @@ fn render_compact_rows(
         start,
         max,
     });
+    let width = usize::from(area.width);
     for (i, (id, line)) in rows.into_iter().skip(start).take(height).enumerate() {
-        let rect = Rect::new(area.x, area.y + i as u16, area.width, 1);
-        let mut line = line;
+        let y = area.y + u16::try_from(i * tall).unwrap_or(u16::MAX);
+        let rect = Rect::new(area.x, y, area.width, TAP_ROWS).intersection(area);
+        let mut lines = line;
+        lines.resize(tall, Line::default());
         if Some(id.as_str()) == focus {
-            let pad = usize::from(area.width).saturating_sub(line.width());
-            line.spans.push(Span::raw(" ".repeat(pad)));
-            for span in &mut line.spans {
-                span.style = span.style.add_modifier(Modifier::REVERSED);
+            for line in &mut lines {
+                let pad = width.saturating_sub(line.width());
+                line.spans.push(Span::raw(" ".repeat(pad)));
+                for span in &mut line.spans {
+                    span.style = span.style.add_modifier(Modifier::REVERSED);
+                }
             }
         }
         panes.add(PaneId::Thread(id), rect);
-        frame.render_widget(Paragraph::new(line), rect);
+        frame.render_widget(Paragraph::new(lines), rect);
     }
-}
-
-/// Width of the input box on a screen `width` columns wide: in the stack view with the cards
-/// in a column, the main pane's width (the column runs down beside the box), else the whole
-/// width.
-pub fn input_box_width(state: &AppState, width: u16) -> u16 {
-    if state.compact() {
-        return width;
-    }
-    if state.view.screen == Screen::Stack && !state.view.sidebar_hidden && width >= SIDE_MIN_WIDTH {
-        width.saturating_sub(side_width(width))
-    } else {
-        width
-    }
-}
-
-/// Which slice of `n` cards to show in `width` columns so that `focus` stays visible.
-/// Returns `(start, count)`.
-pub fn visible_window(n: usize, focus: Option<usize>, width: u16) -> (usize, usize) {
-    let fit = usize::from((width / CARD_MIN_WIDTH).max(1));
-    let count = fit.min(n);
-    let focus = focus.unwrap_or(0);
-    let start = if count == 0 {
-        0
-    } else {
-        (focus + 1).saturating_sub(count)
-    };
-    (start, count)
 }
 
 /// Which slice of cards `heights` tall to show in a column `height` rows tall so that `focus`
@@ -1549,7 +1618,7 @@ pub fn parked_note(state: &AppState) -> Option<String> {
 
 /// The card of `id` (a worker or [`HUB_THREAD`]) at `slot`, with the `more` labels on its
 /// bottom border (left, right). The card's pane is recorded for the mouse.
-fn draw_card(
+pub(crate) fn draw_card(
     frame: &mut Frame,
     slot: Rect,
     state: &AppState,
@@ -1583,121 +1652,23 @@ fn record(panes: &mut Panes, thread: &str, drawn: Option<(String, u64)>, inner: 
     }
 }
 
-/// The row of cards above a narrow conversation, before it is drawn: the cards listed, the
-/// first shown, how many show, the furthest it scrolls, and the height each shown card is drawn
-/// at ([`card_height`]).
-struct CardRow {
-    order: Vec<String>,
-    start: usize,
-    count: usize,
-    max: usize,
-    heights: Vec<u16>,
-}
-
-impl CardRow {
-    /// Rows it takes: its tallest card's, or the empty pane's 3.
-    fn height(&self) -> u16 {
-        self.heights.iter().copied().max().unwrap_or(3)
-    }
-}
-
-/// The row of cards `width` columns wide ([`CardRow`]): as many cards as fit at
-/// [`CARD_MIN_WIDTH`], keeping the selected one in view unless the wheel scrolled them
-/// ([`list_start`]), each as tall as its text.
-fn card_row(state: &AppState, width: u16, panes: &mut Panes) -> CardRow {
-    let order = state.order();
-    if order.is_empty() {
-        return CardRow {
-            order,
-            start: 0,
-            count: 0,
-            max: 0,
-            heights: Vec::new(),
-        };
-    }
-    let focus_idx = kept_in_view(state).and_then(|f| order.iter().position(|id| id == f));
-    let (fresh, count) = visible_window(order.len(), focus_idx, width);
-    let max = order.len() - count;
-    let layout = ListLayout::Row;
-    let start = list_start(state, layout, &order, 1, focus_idx, fresh, max, |_| count);
-    let slots = row_slots(Rect::new(0, 0, width, 1), count);
-    let heights = slots
-        .iter()
-        .zip(&order[start..start + count])
-        .map(|(slot, id)| card_height(state, panes, id, layout, slot.width))
-        .collect();
-    CardRow {
-        order,
-        start,
-        count,
-        max,
-        heights,
-    }
-}
-
 /// `count` slots side by side over `area`, as wide as one another.
 fn row_slots(area: Rect, count: usize) -> std::rc::Rc<[Rect]> {
     Layout::horizontal(vec![Constraint::Ratio(1, count as u32); count]).split(area)
 }
 
-/// The worker cards in a row over `area` (narrow terminals), as [`card_row`] laid them out,
-/// each at its own height from the top of the row. Returns whether the note on hidden parked
-/// threads ([`parked_note`]) is drawn: only the empty pane has room for it.
-fn render_cards(
-    frame: &mut Frame,
-    area: Rect,
-    state: &AppState,
-    panes: &mut Panes,
-    row: CardRow,
-) -> bool {
-    let CardRow {
-        order,
-        start,
-        count,
-        max,
-        heights,
-    } = row;
-    if order.is_empty() {
-        return render_empty(frame, area, state, panes);
-    }
-    panes.list_first = order.get(start).cloned();
-    panes.list = Some(ListWindow {
-        layout: ListLayout::Row,
-        area,
-        start,
-        max,
-    });
-    let slots = row_slots(area, count);
-    for ((slot, height), (i, id)) in slots
-        .iter()
-        .zip(heights)
-        .zip(order.iter().enumerate().skip(start).take(count))
-    {
-        let left = (i == start && start > 0).then(|| format!("< {start} more"));
-        let right = (i + 1 == start + count && start + count < order.len())
-            .then(|| format!("{} more >", order.len() - i - 1));
-        let slot = Rect {
-            height: height.min(slot.height),
-            ..*slot
-        };
-        draw_card(frame, slot, state, id, (left, right), panes);
-    }
-    false
-}
-
-/// The card the row or column of cards keeps in view: the selected one, else, with none
+/// The card the column of cards keeps in view: the selected one, else, with none
 /// selected, the thread dived into (where typed lines go).
 fn kept_in_view(state: &AppState) -> Option<&str> {
     state.focused().or(state.view.dive.as_deref())
 }
 
-/// The most rows card `id` gets on list `layout`, borders included: in the row of cards above
-/// a narrow conversation [`CARD_HEIGHT`], in the grid [`TILE_HEIGHT`], in a column (and on the
+/// The most rows card `id` gets on list `layout`, borders included: in the grid
+/// [`TILE_HEIGHT`], in a column (and on the
 /// compact Threads screen) [`CARD_HEIGHT`] for the hub's card and a card with an item open,
 /// else [`COMPACT_CARD_HEIGHT`]. What does not fit is cut ([`card_rows`]).
 fn card_cap(state: &AppState, id: &str, layout: ListLayout) -> u16 {
     match layout {
-        ListLayout::Row => CARD_HEIGHT,
         ListLayout::Grid(_) => TILE_HEIGHT,
         ListLayout::Column | ListLayout::Compact(_) => {
             if id == HUB_THREAD || state.top_attention(id).is_some() {
@@ -1713,7 +1684,7 @@ fn card_cap(state: &AppState, id: &str, layout: ListLayout) -> u16 {
 /// there (its rows, [`card_rows`], within the list's most, [`card_cap`], and its borders; at
 /// least 3), or taller while it waits to shrink ([`crate::order::drawn_height`]). What it
 /// measured is recorded for the next frame ([`Panes::fits`]).
-fn card_height(
+pub(crate) fn card_height(
     state: &AppState,
     panes: &mut Panes,
     id: &str,
@@ -1801,6 +1772,40 @@ fn render_card_column(frame: &mut Frame, area: Rect, state: &AppState, panes: &m
     noted
 }
 
+/// The rows the column of cards [`render_card_column`] draws `width` columns wide would take
+/// to show every card at its height, its note on hidden parked threads included, or the
+/// empty pane's text whole: what the sidebar gives it when it has the room
+/// ([`crate::sidebar::Dock`]). Measured apart, so the frame's own measures are the column's.
+pub(crate) fn column_needed(state: &AppState, width: u16) -> u16 {
+    let order = state.order();
+    let note = parked_note(state);
+    if order.is_empty() {
+        let inner = usize::from(width.saturating_sub(2)).max(1);
+        let message = if state.view.focus_mode {
+            "no threads working or needing you · Ctrl-F shows all"
+        } else {
+            EMPTY_STATE
+        };
+        let rows = wrap(message, inner).len() + note.map_or(0, |n| wrap(&n, inner).len());
+        return u16::try_from(rows + 2).unwrap_or(u16::MAX);
+    }
+    let mut scratch = Panes::default();
+    let cards: u32 = order
+        .iter()
+        .map(|id| {
+            u32::from(card_height(
+                state,
+                &mut scratch,
+                id,
+                ListLayout::Column,
+                width,
+            ))
+        })
+        .sum();
+    let note = note.filter(|n| n.chars().count() < usize::from(width));
+    u16::try_from(cards + u32::from(note.is_some())).unwrap_or(u16::MAX)
+}
+
 /// Cards `order` in a column over `area` (the list's whole `column`, its note included), as
 /// many as fit at their heights ([`card_height`]), keeping card `focus` in view unless the
 /// wheel scrolled them ([`list_start`]); the edge cards say how many more there are (`↑ 2
@@ -1853,13 +1858,12 @@ fn one_row(s: &str) -> String {
 }
 
 /// The card or tile drawn selected: the selected one, unless the main pane is
-/// ([`AppState::main_focused`]) or the selection is only the one a narrow dive puts on its
-/// hidden card ([`AppState::forced_focus`]). Typing goes on whatever is drawn selected: where
+/// ([`AppState::main_focused`]). Typing goes on whatever is drawn selected: where
 /// the line goes is drawn in its own color ([`target_color`]: the main pane's header band and
 /// the input box), and the card of the thread dived into with a double border
 /// ([`Look::Target`]).
 fn highlighted(state: &AppState) -> Option<&str> {
-    if state.main_focused() || state.forced_focus() {
+    if state.main_focused() {
         None
     } else {
         state.focused()
@@ -1983,16 +1987,6 @@ fn card_block(
     (block, unsaid)
 }
 
-/// A card's or tile's right bottom label: how full its thread's context is, when its runtime
-/// said (`ctx 34%`, [`twr_core::event::ContextSize::short`]), before the `more` label `right`.
-fn with_context(t: &ThreadView, right: Option<String>) -> Option<String> {
-    let ctx = t.context.map(|c| c.short());
-    match (ctx, right) {
-        (Some(c), Some(r)) => Some(format!("{c} · {r}")),
-        (c, r) => c.or(r),
-    }
-}
-
 /// `block`, a card or tile `width` columns wide, with its bottom border's labels: the `more`
 /// labels (left, right: `↑ 2 more`, `↓ 3 more`), and after the left one the box `token` when
 /// the title had no room for the state of its box ([`card_block`]), so that state is always on
@@ -2069,7 +2063,6 @@ fn render_card(
     let (block, unsaid) = card_block(state, t, pinned, area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let more_right = with_context(t, more_right);
     let block = card_bottom(block, area.width, (more_left, more_right), token);
 
     let inner = block.inner(area);
@@ -2296,6 +2289,7 @@ fn section_lines(
         .map(|a| one_row(&a.activity))
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| twr_core::activity::fallback(t).to_string());
+    let activity = with_work(state, t, activity);
     match after_state(&activity, &status_text, status) {
         After::Nothing => {}
         After::Joined(rest) => spans.push(Span::styled(rest, doing)),
@@ -2309,6 +2303,27 @@ fn section_lines(
         }
     }
     (lines, line)
+}
+
+/// `activity` (a card's activity line) followed by what thread `t` has in flight while its
+/// turn is quiet, or twr cannot see its runtime ([`twr_core::work::Work::line`], as the hub's
+/// last `thread.activity` read it): `… · quiet 5m · Bash "Wait for the review" 5m ·
+/// background: Re-review 6m · 1 queued 12m`.
+fn with_work(state: &AppState, t: &ThreadView, activity: String) -> String {
+    let Some(w) = state
+        .activity
+        .get(&t.id)
+        .and_then(|a| a.work.as_ref())
+        .filter(|w| {
+            w.turn.is_some() && (w.state.quiet() || w.state == twr_core::work::State::Unknown)
+        })
+    else {
+        return activity;
+    };
+    match w.line() {
+        line if line.is_empty() => activity,
+        line => format!("{activity} · {line}"),
+    }
 }
 
 /// What a status section says after the state ([`section_lines`]).
@@ -2390,7 +2405,13 @@ fn card_status(t: &ThreadView) -> String {
         },
         s => s.as_str().to_string(),
     };
-    match t.background_tasks.len() {
+    // (A task a tool call of its turn waits for in the foreground is that call's.)
+    match t
+        .background_tasks
+        .values()
+        .filter(|b| b.in_background())
+        .count()
+    {
         0 => word,
         n => format!("{word} ({n} bg)"),
     }
@@ -3086,7 +3107,7 @@ pub fn model_full(t: &ThreadView) -> String {
 }
 
 /// `spans` cut to `width` characters, the last one shown being `…` when they are cut.
-fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+pub(crate) fn cut_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     let total: usize = spans.iter().map(|s| crate::edit::width(&s.content)).sum();
     if total <= width {
         return spans;
@@ -3797,7 +3818,7 @@ fn render_tile(
     let (block, unsaid) = card_block(state, t, state.view.pins.contains(&t.id), area.width);
     let block = card_border(block, look, card_color(t));
     let token = box_token(state, t).filter(|_| unsaid);
-    let block = card_bottom(block, area.width, (None, with_context(t, None)), token);
+    let block = card_bottom(block, area.width, (None, None), token);
     let inner = block.inner(area);
     let body = tile_body(state, t, inner.width);
     let status_row = body
@@ -3833,7 +3854,7 @@ fn tile_body(state: &AppState, t: &ThreadView, width: u16) -> CardBody {
     card_body(state, t, usize::from(width), Some((&turns, &spent)))
 }
 
-fn status_color(s: ThreadStatus) -> Color {
+pub(crate) fn status_color(s: ThreadStatus) -> Color {
     match s {
         ThreadStatus::Running | ThreadStatus::Background => Color::Green,
         ThreadStatus::Waiting => Color::Yellow,
@@ -6912,6 +6933,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pane
     // Keep the banner visible and page long requests within the remaining conversation.
     if let Some(item) = state.selected_request() {
         let rows = request_rows(state, item, inner.width);
+        // With the row saying what is below, as the view keeps it.
         if rows.len() >= usize::from(inner.height) {
             render_card_detail(frame, inner, state, &item.thread, panes);
             return;
@@ -7577,7 +7599,12 @@ fn render_queue(frame: &mut Frame, area: Rect, state: &AppState, panes: &mut Pan
     let width = usize::from(area.width);
     let dim = Style::default().fg(Color::DarkGray);
     let newest_mine = q.newest_mine;
-    let shown: Vec<&crate::queue::Queued> = q.items.iter().take(crate::queue::QUEUE_ROWS).collect();
+    // As many as the rows given draw, with the row saying how many more.
+    let mut n = q.items.len().min(crate::queue::QUEUE_ROWS);
+    while n > 0 && n + usize::from(q.total > n as u64) > usize::from(area.height) {
+        n -= 1;
+    }
+    let shown: Vec<&crate::queue::Queued> = q.items.iter().take(n).collect();
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (row, it) in shown.iter().enumerate() {
         let selected = state.view.queued == Some(it.msg_ref);
@@ -7764,12 +7791,21 @@ fn render_popup(
     let input = panes.get(&PaneId::Input).map(|p| p.area)?;
     // The input box's top border is the row above its text.
     let bottom = input.y.saturating_sub(1);
+    // On a phone each row is a menu choice two rows tall, and it stays under the tab bar
+    // ([`TAP_ROWS`]).
+    let phone = state.compact();
+    let tall = if phone { TAP_ROWS } else { 1 };
+    let top = if phone {
+        area.y.saturating_add(TAB_BAR_ROWS)
+    } else {
+        area.y
+    };
     let rows = s.items.len().min(POPUP_ROWS);
-    let height = (rows as u16 + 2).min(bottom.saturating_sub(area.y));
-    if height < 3 {
+    let height = (rows as u16 * tall + 2).min(bottom.saturating_sub(top));
+    if height < 2 + tall {
         return None;
     }
-    let fit = usize::from(height - 2);
+    let fit = usize::from((height - 2) / tall);
     let label_w = s
         .items
         .iter()
@@ -7796,7 +7832,7 @@ fn render_popup(
         .enumerate()
         .skip(first)
         .take(fit)
-        .map(|(i, item)| {
+        .flat_map(|(i, item)| {
             let label = format!(" {:<label_w$} ", truncate(&item.label, label_w));
             let detail = truncate(&item.detail, inner_w.saturating_sub(label_w + 3));
             let mut label_style = Style::default().fg(Color::Cyan);
@@ -7805,10 +7841,16 @@ fn render_popup(
                 label_style = label_style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
                 detail_style = Style::default().add_modifier(Modifier::REVERSED);
             }
-            Line::from(vec![
+            let line = Line::from(vec![
                 Span::styled(label, label_style),
                 Span::styled(format!(" {detail}"), detail_style),
-            ])
+            ]);
+            if phone {
+                let bg = if i.is_multiple_of(2) { BAND } else { BAND_ALT };
+                tap_band(vec![line], inner_w, bg)
+            } else {
+                vec![line]
+            }
         })
         .collect();
     let mut block = Block::default()
@@ -7830,8 +7872,12 @@ fn render_popup(
     panes.add(PaneId::Popup, inner);
     // A tap on a row completes it, as Tab does; on the top border, closes it.
     close_row(panes, rect, Target::Close);
-    for k in 0..usize::from(inner.height).min(s.items.len().saturating_sub(first)) {
-        let row = Rect::new(inner.x, inner.y + k as u16, inner.width, 1);
+    for k in 0..fit.min(s.items.len().saturating_sub(first)) {
+        let y = inner.y + k as u16 * tall;
+        if y + tall > inner.bottom() {
+            break;
+        }
+        let row = Rect::new(inner.x, y, inner.width, tall);
         panes.target(row, Target::Suggestion(s.items[first + k].value.clone()));
     }
     frame.render_widget(Clear, rect);
@@ -7862,17 +7908,29 @@ fn render_action_popup(
     let input = panes.get(&PaneId::Input).map(|p| p.area)?;
     // The input box's top border is the row above its text.
     let bottom = input.y.saturating_sub(1);
-    let room = bottom.saturating_sub(area.y);
+    // On a phone it stays under the tab bar, whose tabs stay whole.
+    let top = if state.compact() {
+        area.y.saturating_add(TAB_BAR_ROWS)
+    } else {
+        area.y
+    };
+    let room = bottom.saturating_sub(top);
     let x = input.x.saturating_sub(1);
     let width = input
         .width
         .saturating_add(2)
         .min(frame.area().width.saturating_sub(x));
-    if width < 3 || room < 3 {
+    // (On a phone it may cover the input box too: below.)
+    let most = if state.compact() {
+        input.bottom().saturating_add(1).saturating_sub(top)
+    } else {
+        room
+    };
+    if width < 3 || most < 3 {
         return None;
     }
     let inner_w = usize::from(width - 2);
-    let fit = usize::from(room - 2);
+    let fit = usize::from(room.saturating_sub(2));
     let dim = Style::default().fg(Color::DarkGray);
     let rows = state.action_rows(&popup.target);
     let matches = state.action_matches(popup, &rows);
@@ -7924,6 +7982,31 @@ fn render_action_popup(
                 );
             }
         }
+        // On a phone each row is two rows tall, in a band (alternate shades, so its rows tell
+        // apart), all of it the row's ([`TAP_ROWS`]).
+        if state.compact() {
+            let tall = usize::from(TAP_ROWS);
+            let band = if i.is_multiple_of(2) { 236 } else { 238 };
+            let pad = Line::from(Span::raw(" ".repeat(inner_w)));
+            if lines.len() < tall {
+                lines.resize(tall, pad);
+            }
+            if !selected {
+                for line in &mut lines {
+                    let fill = inner_w.saturating_sub(line.width());
+                    line.spans.push(Span::raw(" ".repeat(fill)));
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(Color::Indexed(band));
+                    }
+                }
+            } else {
+                for line in &mut lines {
+                    for span in &mut line.spans {
+                        span.style = span.style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
+                    }
+                }
+            }
+        }
         lines
     };
     let row_lines = |i: usize| row_lines_as(i, &rows[i].label);
@@ -7938,141 +8021,356 @@ fn render_action_popup(
         let rule = usize::from(!head.is_empty() && !shown.is_empty());
         head.len() + rule + shown.iter().map(|&i| row_lines(i).len()).sum::<usize>()
     };
-    // A report (no item) takes the room the rows leave (with a filter, those it keeps, maybe
-    // none: the rest go first when they do not all fit); what does not fit ends in `…`.
-    if item.is_none() {
-        let kept = if popup.filter.is_empty() {
-            all.clone()
-        } else {
-            matches.clone()
-        };
-        let room = fit.saturating_sub(height_of(&[], &kept) + usize::from(!kept.is_empty()));
-        if head.len() > room {
-            head.truncate(room);
-            if let Some(last) = head.last_mut() {
-                *last = ellipsized(std::mem::take(last), head_w);
-            }
-        }
-    }
-    // A report's popup whose filter matches no row shows the report alone: no row would be
-    // drawn under it, so none takes its room. (An item's keeps its options: it counts as
-    // drawn only with them.)
-    let mut shown = if item.is_none() && !popup.filter.is_empty() && matches.is_empty() {
-        Vec::new()
-    } else {
-        all.clone()
-    };
-    let mut whole = true;
     // The item's detail view has had every row of its whole text on screen for this revision
     // ([`crate::app::CardView::read_in_full`]): read in full, whatever the popup has room for
     // now. A capped preview read to its end is not, nor is the full text fetched after it.
     let detail_read = item.is_some_and(|i| {
         state.incomplete(i).is_none() && state.view.card_view.read_in_full(&i.attn_id, i.revision)
     });
-    if let Some(i) = item.filter(|_| height_of(&head, &all) > fit) {
-        let read = detail_read || popup.read.as_ref() == Some(&(i.attn_id.clone(), i.revision));
-        let note = if read {
-            "read in full in the main pane: answer it here"
+    // On a phone the popup is a sheet: its text is never cut nor sent to the main pane to be
+    // read; it scrolls in the rows the popup's rows leave it ([`Panes::sheet`]), those keeping
+    // a window of their own under it, and a row between them says how much of it is out of
+    // view (a tap pages it, [`Target::More`]).
+    let (lines, row_at, whole, options_cut, windowed, sheet, bottom) = if state.compact() {
+        let shown: Vec<usize> = if item.is_none() && !popup.filter.is_empty() && matches.is_empty()
+        {
+            Vec::new()
         } else {
-            // Not room for it: no option is listed, and the main pane shows it to be read.
-            shown.retain(|&k| !matches!(rows[k].kind, ActionKind::Answer(_)));
-            whole = false;
-            panes.long_item = Some(card.clone());
-            "too long to show here: it is open in the main pane. Esc, read it to its end \
-             (PgUp/PgDn), then Enter here again to answer it"
+            all.clone()
         };
-        head = wrap_line(Line::from(Span::styled(note, dim)), head_w);
-        exact = true;
-    }
-    let mut lines: Vec<Line<'static>> = head
-        .iter()
-        .map(|l| {
-            let mut l = l.clone();
-            l.spans.insert(0, Span::raw(" "));
-            l
-        })
-        .collect();
-    // Not even a row's room under the item's text (a short screen): its end is cut, and it is
-    // not drawn in full.
-    if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) >= fit {
-        lines.truncate(fit.saturating_sub(2));
-        whole = false;
-        // A report cut short says so.
-        if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {
-            *last = ellipsized(std::mem::take(last), inner_w);
+        let mut body: Vec<Line<'static>> = head
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.spans.insert(0, Span::raw(" "));
+                l
+            })
+            .collect();
+        // Its room when it does not fit above the input box: down over it too (it takes no
+        // keys while the popup is open, and shows no cursor).
+        let low = input.bottom().saturating_add(1).min(frame.area().bottom());
+        let full_fit = usize::from(low.saturating_sub(top).saturating_sub(2)).max(fit);
+        // An option taller than [`SHEET_OPTION_ROWS`] joins the text in full, as the detail
+        // view lists the options: there it is read, and its row lists it by its first line
+        // ([`draw_row`] below). By the width alone: the text keeps its rows (and what of
+        // them was read) whatever the height.
+        let answer = |i: usize| matches!(rows[i].kind, ActionKind::Answer(_));
+        let tall = |i: usize| answer(i) && row_lines(i).len() > SHEET_OPTION_ROWS;
+        if let Some(it) = item.filter(|_| shown.iter().any(|&i| tall(i))) {
+            body.push(Line::default());
+            body.extend(option_rows(&it.options, head_w).into_iter().map(|mut l| {
+                l.spans.insert(0, Span::raw(" "));
+                l
+            }));
         }
-    }
-    let rule = usize::from(!lines.is_empty() && !shown.is_empty());
-    if rule == 1 {
-        lines.push(Line::from(Span::styled("─".repeat(inner_w), dim)));
-    }
-    // The rows that fit: when they don't all, those the filter leaves out go first, then a
-    // window of them keeps the highlighted one in view.
-    let room = fit.saturating_sub(lines.len());
-    // An option taller than that room (a narrow screen) never fits: once its item's detail
-    // view was read in full, it is listed on a row by its number and first line, there to be
-    // picked and answered; else it is not drawn, and not answered.
-    let draw_row = |i: usize| -> Vec<Line<'static>> {
-        let full = row_lines(i);
-        if !(detail_read && matches!(rows[i].kind, ActionKind::Answer(_)) && full.len() > room) {
-            return full;
+        // What the sheet's text is of: the item (and revision), else what the popup is on.
+        // (A report or a queued message by its text too: a new one starts from its top.)
+        let (key, revision) = match item {
+            Some(i) => (i.attn_id.clone(), i.revision),
+            None => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                for l in &body {
+                    for span in &l.spans {
+                        span.content.hash(&mut h);
+                    }
+                }
+                (format!("{:?}", popup.target), h.finish())
+            }
+        };
+        let sv = &state.view.sheet_view;
+        let draw_row = |i: usize| -> Vec<Line<'static>> {
+            if !tall(i) {
+                return row_lines(i);
+            }
+            let label = &rows[i].label;
+            let mut first = label.lines().next().unwrap_or_default().to_string();
+            if label.trim_end().contains('\n') {
+                first.push('…');
+            }
+            let mark = " (in full above)";
+            let text = inner_w.saturating_sub(1);
+            let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
+            row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
+        };
+        let n = body.len();
+        let total: usize = shown.iter().map(|&i| draw_row(i).len()).sum();
+        let over = n + usize::from(n > 0 && total > 0) + total > fit;
+        let (fit, low) = if over { (full_fit, low) } else { (fit, bottom) };
+        let windowed = n + usize::from(n > 0) + total > fit && total > 0;
+        // The highlighted row the window keeps in view: one moved to (the popup opens on
+        // Talk, after the options, which the window shows first).
+        let sel = popup.sel.filter(|_| popup.moved);
+        // The tallest row: the window has room for any one of them.
+        let one = shown.iter().map(|&i| draw_row(i).len()).max().unwrap_or(0);
+        // The line between the text and the rows, where there is room for it, a row of the
+        // text and a row (else the text's cue is in the bottom border).
+        let rule = usize::from(n > 0 && total > 0 && (!windowed || fit >= 2 + one));
+        // The rows' room: all of them where all fits; else half the room, the tallest row at
+        // least, or what the text leaves, a row kept for the text. Never what is highlighted:
+        // the rows stay where they are as a tap moves the highlight.
+        let rows_room = if !windowed {
+            total
+        } else {
+            let avail = fit.saturating_sub(rule);
+            (avail / 2)
+                .max(one)
+                .max(avail.saturating_sub(n))
+                .min(total)
+                .min(avail.saturating_sub(n.min(1)))
+        };
+        // A window of the rows keeping the highlighted one in view (with a filter, of the
+        // rows it keeps).
+        let mut drawn = shown.clone();
+        let (mut above, mut below) = (0, 0);
+        if total > rows_room {
+            if !popup.filter.is_empty() {
+                drawn.retain(|i| matches.contains(i));
+            }
+            let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
+            let at = sel.and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
+            let fits = |a: usize, b: usize| heights[a..=b].iter().sum::<usize>() <= rows_room;
+            // Where the last frame's window started, while the highlighted row is in it; else
+            // as little moved as it takes to show it: up to it, or down to the first window
+            // it ends.
+            let last = state
+                .view
+                .panes
+                .popup_start
+                .as_ref()
+                .filter(|(t, _)| *t == popup.target)
+                .map(|(_, s)| *s)
+                .filter(|&s| s < drawn.len());
+            let mut start = match (at, last) {
+                (None, _) => 0,
+                (Some(at), Some(s)) if s <= at && fits(s, at) => s,
+                (Some(at), Some(s)) if at < s => at,
+                (Some(_), _) => 0,
+            };
+            if let Some(at) = at {
+                while start < at && !fits(start, at) {
+                    start += 1;
+                }
+            }
+            panes.popup_start = Some((popup.target.clone(), start));
+            let (mut end, mut used) = (start, 0);
+            while end < drawn.len() && used + heights[end] <= rows_room {
+                used += heights[end];
+                end += 1;
+            }
+            (above, below) = (start, drawn.len() - end);
+            drawn = drawn[start..end].to_vec();
         }
-        let label = &rows[i].label;
-        let mut first = label.lines().next().unwrap_or_default().to_string();
-        if label.trim_end().contains('\n') {
-            first.push('…');
+        let used: usize = drawn.iter().map(|&i| draw_row(i).len()).sum();
+        // The text takes the rest.
+        let body_room = n.min(fit.saturating_sub(rule + used));
+        let max_scroll = n - body_room;
+        let start = sv.start_of(
+            &key,
+            revision,
+            u16::try_from(head_w).unwrap_or(u16::MAX),
+            max_scroll,
+        );
+        let end = (start + body_room).min(n);
+        let window = crate::select::CardWindow {
+            thread: card.clone(),
+            attn_id: key,
+            revision,
+            width: u16::try_from(head_w).unwrap_or(u16::MAX),
+            rows: n,
+            complete: exact && item.is_none_or(|i| state.incomplete(i).is_none()),
+            start,
+            end,
+            max_scroll,
+            page: u16::try_from(body_room).unwrap_or(u16::MAX),
+            area: Rect::default(),
+        };
+        // Its whole text is in the sheet, to scroll to: drawn in full wherever it is scrolled
+        // (but a capped preview, or a row cut at the width).
+        let whole = window.complete;
+        let mut lines: Vec<Line<'static>> = body[start..end].to_vec();
+        let mut more = None;
+        if rule == 1 {
+            let cue = if max_scroll == 0 {
+                String::new()
+            } else if end < n {
+                format!(" ↓ {} more lines · tap ", n - end)
+            } else {
+                format!(" ↑ {start} lines above · tap: top ")
+            };
+            let cue = truncate_cells(&cue, inner_w.saturating_sub(2));
+            let rest = inner_w.saturating_sub(2 + crate::edit::width(&cue));
+            let style = if end < n {
+                Style::default().fg(Color::Yellow)
+            } else {
+                dim
+            };
+            if max_scroll > 0 {
+                more = Some(lines.len());
+            }
+            lines.push(Line::from(vec![
+                Span::styled("─".repeat(2.min(inner_w)), dim),
+                Span::styled(cue, style),
+                Span::styled("─".repeat(rest), dim),
+            ]));
         }
-        let mark = " (read in full)";
-        let text = inner_w.saturating_sub(1);
-        let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
-        row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
-    };
-    let mut drawn: Vec<usize> = shown.clone();
-    let mut windowed = false;
-    if shown.iter().map(|&i| draw_row(i).len()).sum::<usize>() > room {
-        windowed = true;
-        if !popup.filter.is_empty() {
-            drawn.retain(|i| matches.contains(i));
+        let options_cut = shown.iter().any(|i| answer(*i) && !drawn.contains(i));
+        let mut row_at = Vec::new();
+        for &i in &drawn {
+            let row = draw_row(i);
+            row_at.push((rows[i].kind, lines.len(), row.len()));
+            lines.extend(row);
         }
-        let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
-        let at = popup
-            .sel
-            .and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
-        let mut start = 0;
-        if let Some(at) = at {
-            while start < at && heights[start..=at].iter().sum::<usize>() > room {
-                start += 1;
+        // Its text's window (and the rows' cue), even when it shows whole; paged and scrolled
+        // only when it does not.
+        let sheet = (n > 0 || windowed).then_some((window, more, (above, below)));
+        let windowed = windowed && (above > 0 || below > 0);
+        (lines, row_at, whole, options_cut, windowed, sheet, low)
+    } else {
+        // A report (no item) takes the room the rows leave (with a filter, those it keeps, maybe
+        // none: the rest go first when they do not all fit); what does not fit ends in `…`.
+        if item.is_none() {
+            let kept = if popup.filter.is_empty() {
+                all.clone()
+            } else {
+                matches.clone()
+            };
+            let room = fit.saturating_sub(height_of(&[], &kept) + usize::from(!kept.is_empty()));
+            if head.len() > room {
+                head.truncate(room);
+                if let Some(last) = head.last_mut() {
+                    *last = ellipsized(std::mem::take(last), head_w);
+                }
             }
         }
-        let (mut end, mut used) = (start, 0);
-        while end < drawn.len() && used + heights[end] <= room {
-            used += heights[end];
-            end += 1;
+        // A report's popup whose filter matches no row shows the report alone: no row would be
+        // drawn under it, so none takes its room. (An item's keeps its options: it counts as
+        // drawn only with them.)
+        let mut shown = if item.is_none() && !popup.filter.is_empty() && matches.is_empty() {
+            Vec::new()
+        } else {
+            all.clone()
+        };
+        let mut whole = true;
+        if let Some(i) = item.filter(|_| height_of(&head, &all) > fit) {
+            let read = detail_read || popup.read.as_ref() == Some(&(i.attn_id.clone(), i.revision));
+            let note = if read {
+                "read in full in the main pane: answer it here"
+            } else {
+                // Not room for it: no option is listed, and the main pane shows it to be read.
+                shown.retain(|&k| !matches!(rows[k].kind, ActionKind::Answer(_)));
+                whole = false;
+                panes.long_item = Some(card.clone());
+                "too long to show here: it is open in the main pane. Esc, read it to its end \
+                 (PgUp/PgDn), then Enter here again to answer it"
+            };
+            head = wrap_line(Line::from(Span::styled(note, dim)), head_w);
+            exact = true;
         }
-        drawn = drawn[start..end].to_vec();
-    }
-    // Every option must be drawn for the item to be, unless its detail view was read in full:
-    // then only an option drawn is answered ([`Panes::popup_partial`]).
-    let options_cut = shown
-        .iter()
-        .any(|i| matches!(rows[*i].kind, ActionKind::Answer(_)) && !drawn.contains(i));
-    // Where each row drawn starts and how many lines it takes: a tap on any of them is a tap
-    // on the row.
-    let mut row_at = Vec::new();
-    for &i in &drawn {
-        let row = draw_row(i);
-        row_at.push((rows[i].kind, lines.len(), row.len()));
-        lines.extend(row);
-    }
+        let mut lines: Vec<Line<'static>> = head
+            .iter()
+            .map(|l| {
+                let mut l = l.clone();
+                l.spans.insert(0, Span::raw(" "));
+                l
+            })
+            .collect();
+        // Not even a row's room under the item's text (a short screen): its end is cut, and it
+        // is not drawn in full.
+        if !shown.is_empty() && lines.len() + usize::from(!lines.is_empty()) + 1 > fit {
+            lines.truncate(fit.saturating_sub(2));
+            // Read in full in its detail view, it stays so (its note is what was cut); an item
+            // not read, cut, is opened there to be read, as one too long for the popup.
+            if item.is_none() || !detail_read {
+                whole = false;
+            }
+            if item.is_some() && !detail_read {
+                panes.long_item = Some(card.clone());
+            }
+            // A report cut short says so.
+            if let Some(last) = lines.last_mut().filter(|_| item.is_none()) {
+                *last = ellipsized(std::mem::take(last), inner_w);
+            }
+        }
+        let rule = usize::from(!lines.is_empty() && !shown.is_empty());
+        if rule == 1 {
+            lines.push(Line::from(Span::styled("─".repeat(inner_w), dim)));
+        }
+        // The rows that fit: when they don't all, those the filter leaves out go first, then a
+        // window of them keeps the highlighted one in view.
+        let room = fit.saturating_sub(lines.len());
+        // An option taller than that room (a narrow screen) never fits: once its item's detail
+        // view was read in full, it is listed on a row by its number and first line, there to be
+        // picked and answered; else it is not drawn, and not answered.
+        let draw_row = |i: usize| -> Vec<Line<'static>> {
+            let full = row_lines(i);
+            if !(detail_read && matches!(rows[i].kind, ActionKind::Answer(_)) && full.len() > room)
+            {
+                return full;
+            }
+            let label = &rows[i].label;
+            let mut first = label.lines().next().unwrap_or_default().to_string();
+            if label.trim_end().contains('\n') {
+                first.push('…');
+            }
+            let mark = " (read in full)";
+            let text = inner_w.saturating_sub(1);
+            let first = truncate_cells(&first, text.saturating_sub(crate::edit::width(mark)));
+            row_lines_as(i, &truncate_cells(&format!("{first}{mark}"), text))
+        };
+        let mut drawn: Vec<usize> = shown.clone();
+        let mut windowed = false;
+        if shown.iter().map(|&i| draw_row(i).len()).sum::<usize>() > room {
+            windowed = true;
+            if !popup.filter.is_empty() {
+                drawn.retain(|i| matches.contains(i));
+            }
+            let heights: Vec<usize> = drawn.iter().map(|&i| draw_row(i).len()).collect();
+            let at = popup
+                .sel
+                .and_then(|k| drawn.iter().position(|&i| rows[i].kind == k));
+            let mut start = 0;
+            if let Some(at) = at {
+                while start < at && heights[start..=at].iter().sum::<usize>() > room {
+                    start += 1;
+                }
+            }
+            let (mut end, mut used) = (start, 0);
+            while end < drawn.len() && used + heights[end] <= room {
+                used += heights[end];
+                end += 1;
+            }
+            drawn = drawn[start..end].to_vec();
+        }
+        // Every option must be drawn for the item to be, unless its detail view was read in full:
+        // then only an option drawn is answered ([`Panes::popup_partial`]).
+        let options_cut = shown
+            .iter()
+            .any(|i| matches!(rows[*i].kind, ActionKind::Answer(_)) && !drawn.contains(i));
+        // Where each row drawn starts and how many lines it takes: a tap on any of them is a tap
+        // on the row.
+        let mut row_at = Vec::new();
+        for &i in &drawn {
+            let row = draw_row(i);
+            row_at.push((rows[i].kind, lines.len(), row.len()));
+            lines.extend(row);
+        }
+        if lines.len() > fit {
+            // Still taller than the room (a great many rows): cut, and not drawn in full.
+            lines.truncate(fit);
+            whole = false;
+        }
+        (lines, row_at, whole, options_cut, windowed, None, bottom)
+    };
+    // The rows drawn whole: only those run from Enter (a row cut off draws no target either).
     panes.popup_rows = Some((
         popup.target.clone(),
-        drawn.iter().map(|&i| rows[i].kind).collect(),
+        row_at
+            .iter()
+            .filter(|(_, start, n)| start + n <= lines.len())
+            .map(|(kind, ..)| *kind)
+            .collect(),
     ));
-    if lines.len() > fit {
-        // Still taller than the room (a great many rows): cut, and not drawn in full.
-        lines.truncate(fit);
-        whole = false;
-    }
     exact = exact && lines.iter().all(|l| l.width() <= inner_w.max(1));
     let height = u16::try_from(lines.len())
         .unwrap_or(u16::MAX)
@@ -8101,7 +8399,37 @@ fn render_action_popup(
         (ActionTarget::Request(_), None) => " ? ".to_string(),
         (ActionTarget::Queued(_), _) => " queued message ".to_string(),
     };
+    let hint = popup.hint.as_ref().filter(|_| state.compact());
+    // On a phone, how many rows are out of view above and below the window of them; a text
+    // with no rows under it to keep its line, its own.
+    let rows_cue = sheet
+        .as_ref()
+        .map(|(_, _, (above, below))| (*above, *below))
+        .filter(|_| state.compact() && windowed);
+    let text_cue = sheet
+        .as_ref()
+        .filter(|(w, more, _)| more.is_none() && w.max_scroll > 0)
+        .map(|(w, ..)| {
+            if w.end < w.rows {
+                format!("↓ {} more lines", w.rows - w.end)
+            } else {
+                format!("↑ {} lines above", w.start)
+            }
+        });
     let footer = match (popup.filter.is_empty(), windowed) {
+        _ if hint.is_some() => format!(" {} ", hint.map_or("", String::as_str)),
+        _ if text_cue.is_some() => format!(" {} · Esc closes ", text_cue.unwrap_or_default()),
+        (true, true) if rows_cue.is_some() => {
+            let (above, below) = rows_cue.unwrap_or_default();
+            let mut cue = Vec::new();
+            if above > 0 {
+                cue.push(format!("↑{above}"));
+            }
+            if below > 0 {
+                cue.push(format!("↓{below}"));
+            }
+            format!(" {} more rows · Esc closes ", cue.join(" "))
+        }
         (true, false) => " Enter runs · Esc closes ".to_string(),
         (true, true) => " ↑↓ more rows · Esc closes ".to_string(),
         (false, _) => format!(" filter: {} ", popup.filter),
@@ -8130,7 +8458,26 @@ fn render_action_popup(
             );
         }
     }
-    let partial = whole && options_cut && detail_read;
+    // The sheet's text, scrolled in its rows ([`Panes::sheet`]), and the line under it,
+    // which pages it (or, with no rows under it, the bottom border).
+    if let Some((mut w, more, _)) = sheet {
+        let shown = u16::try_from(w.end - w.start).unwrap_or(u16::MAX);
+        w.area = Rect::new(inner.x, inner.y, inner.width, shown.min(inner.height));
+        if w.max_scroll > 0 {
+            let cue = match more {
+                Some(at) => inner.y + u16::try_from(at).unwrap_or(u16::MAX),
+                None => rect.bottom().saturating_sub(1),
+            };
+            panes.target(
+                Rect::new(rect.x, cue, rect.width, 1).intersection(rect),
+                Target::More(crate::select::Scrolled::Sheet),
+            );
+        }
+        panes.sheet = Some(w);
+    }
+    // Some of the options drawn, its text read in full (in its detail view, or on a phone in
+    // the popup itself): only an option drawn is answered.
+    let partial = whole && options_cut && (detail_read || state.compact());
     panes.popup_partial = partial;
     if let Some(i) = item
         .filter(|i| whole && (!options_cut || partial) && exact && state.incomplete(i).is_none())
@@ -8312,7 +8659,16 @@ fn screen_hints(state: &AppState) -> &'static str {
         if matches!(p.target, crate::app::ActionTarget::Queued(_)) {
             return "↑↓/tap pick · Enter/tap again run · type to filter · Esc close";
         }
-        return if compact {
+        return if compact
+            && state
+                .view
+                .panes
+                .sheet
+                .as_ref()
+                .is_some_and(|w| w.max_scroll > 0)
+        {
+            "wheel/PgDn scroll · 1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
+        } else if compact {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Esc close"
         } else {
             "1-9 answer · ↑↓/tap pick · Enter/tap again run · type to filter · Tab/Shift-↑↓ other card · Esc close"
@@ -8663,6 +9019,10 @@ fn render_status(
     parked: Option<String>,
 ) {
     panes.add(PaneId::Text, area);
+    if let Some(c) = state.view.confirm.as_ref().filter(|_| state.compact()) {
+        render_compact_confirm(frame, area, state, &c.prompt, panes);
+        return;
+    }
     let width = usize::from(area.width);
     let (msg, notes) = status_msg(state, width, usize::from(area.height), parked.clone());
     let mut rows = status_head(state, msg.as_deref(), notes, width, parked.clone());
@@ -8942,7 +9302,7 @@ fn status_note_parts(state: &AppState, parked: Option<String>) -> Vec<(String, O
             String::new()
         };
         notes.push((
-            format!("sidebar hidden{waiting} · Ctrl-B shows"),
+            format!("Threads hidden{waiting} · Ctrl-B shows"),
             Some(Target::Sidebar),
         ));
     }
@@ -8963,6 +9323,112 @@ fn status_notes(state: &AppState, parked: Option<String>) -> Option<String> {
         .map(|(n, _)| n)
         .collect();
     (!notes.is_empty()).then(|| notes.join(" · "))
+}
+
+/// A question waiting for `y` on a phone, over the status bar's `area`: its prompt on the rows
+/// it takes, then `[ yes ]` and `[ no ]` side by side on its last [`TAP_ROWS`] rows, each a
+/// filled block those rows tall, all of it its target ([`Target::Yes`], [`Target::No`]). A
+/// prompt taller than its rows is never cut: it scrolls in them ([`Panes::ask`], the wheel
+/// over it), its last row saying how much of it is below (a tap pages it, [`Target::More`]);
+/// `yes` and `no` answer it wherever it is scrolled.
+fn render_compact_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AppState,
+    prompt: &str,
+    panes: &mut Panes,
+) {
+    let band = TAP_ROWS.min(area.height);
+    let text = Rect {
+        height: area.height - band,
+        ..area
+    };
+    let width = usize::from(area.width).max(1);
+    let style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let lines: Vec<Line<'static>> = wrap(&format!(" {prompt} "), width)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, style)))
+        .collect();
+    // Cut: its last row is the cue (with a row of it left above), else the one row it has.
+    let cut = lines.len() > usize::from(text.height);
+    let cue = cut && text.height >= 2;
+    let room = usize::from(text.height) - usize::from(cue);
+    let max_scroll = lines.len().saturating_sub(room);
+    let view = &state.view.ask_view;
+    let start = view.start_of(prompt, 0, area.width, max_scroll);
+    let end = (start + room).min(lines.len());
+    let shown = Rect {
+        height: u16::try_from(room).unwrap_or(0),
+        ..text
+    };
+    let window = crate::select::CardWindow {
+        thread: String::new(),
+        attn_id: prompt.to_string(),
+        revision: 0,
+        width: area.width,
+        rows: lines.len(),
+        complete: true,
+        start,
+        end,
+        max_scroll,
+        page: shown.height,
+        area: shown,
+    };
+    frame.render_widget(Paragraph::new(lines[start..end].to_vec()), shown);
+    panes.ask = Some(window);
+    // Its cue, which a tap pages (with no row for it, only the wheel scrolls it: no control
+    // where none is drawn).
+    if cue {
+        let more = if end < lines.len() {
+            format!(" ↓ {} more lines · tap ", lines.len() - end)
+        } else {
+            format!(" ↑ {start} lines above · tap: top ")
+        };
+        let row = Rect {
+            y: text.bottom() - 1,
+            height: 1,
+            ..text
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(truncate_cells(&more, width))).style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            row,
+        );
+        panes.target(row, Target::More(crate::select::Scrolled::Ask));
+    }
+    if band < TAP_ROWS {
+        return;
+    }
+    let buttons = Rect {
+        y: area.bottom() - band,
+        height: band,
+        ..area
+    };
+    let [yes, no] =
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(buttons);
+    let yes = Rect {
+        width: yes.width.saturating_sub(1),
+        ..yes
+    };
+    let button = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
+    for (rect, label, target) in [
+        (yes, CONFIRM_YES, Target::Yes),
+        (no, CONFIRM_NO, Target::No),
+    ] {
+        frame.render_widget(
+            Paragraph::new(Line::from(label))
+                .alignment(Alignment::Center)
+                .style(button),
+            rect,
+        );
+        panes.target(rect, target);
+    }
 }
 
 /// The question waiting for `y`'s `yes` in the status bar, to tap ([`Target::Yes`]): its
@@ -9111,6 +9577,14 @@ fn load_spans(state: &AppState) -> Vec<Span<'static>> {
 /// ([`status_msg`]) takes the rows its short form needs, up to two thirds of the screen, as
 /// long as the bar shows it (told or not); dismissed or replaced, the bar is as before.
 fn status_height(state: &AppState, area: Rect) -> u16 {
+    // On a phone, a question waiting for `y` gets its answers two rows tall under it.
+    if let Some(c) = state.view.confirm.as_ref().filter(|_| state.compact()) {
+        let prompt = wrap(&format!(" {} ", c.prompt), usize::from(area.width).max(1)).len();
+        // Cut, a row of it and the row saying how much is below it at least.
+        let least = usize::from(TAP_ROWS) + if prompt > 1 { 2 } else { 1 };
+        let most = usize::from(area.height / 2).max(least);
+        return u16::try_from((prompt + usize::from(TAP_ROWS)).min(most)).unwrap_or(TAP_ROWS);
+    }
     let cap = usize::from(area.height / 3).max(1);
     let (width, parked) = (usize::from(area.width), parked_note(state));
     let (msg, notes) = status_msg(state, width, cap, parked.clone());
@@ -9202,6 +9676,34 @@ mod tests {
         lines.join("\n")
     }
 
+    /// The width of a screen whose views get `cols` columns beside the sidebar `st` docks on
+    /// it ([`AppState::dock_width_at`]).
+    fn screen_for(st: &AppState, cols: u16) -> u16 {
+        (cols..=cols.saturating_add(60))
+            .find(|w| w - st.dock_width_at(*w) == cols)
+            .unwrap_or(cols)
+    }
+
+    /// The cells of `line`, a row of a screen `w` columns wide, right of the sidebar: the
+    /// views' own.
+    fn view_part(st: &AppState, w: u16, line: &str) -> String {
+        line.chars()
+            .skip(usize::from(st.dock_width_at(w)))
+            .collect()
+    }
+
+    /// The rows `lines` of a screen `w` columns wide, right of the sidebar ([`view_part`]).
+    fn view_screen(st: &AppState, w: u16, lines: &[String]) -> String {
+        let rows: Vec<String> = lines.iter().map(|l| view_part(st, w, l)).collect();
+        rows.join("\n")
+    }
+
+    /// The last row of `st` on a screen whose views get `cols` columns, those columns alone.
+    fn view_last(st: &AppState, cols: u16) -> String {
+        let w = screen_for(st, cols);
+        view_part(st, w, &draw(st, w, 24).pop().unwrap())
+    }
+
     /// Draws `state` at `w` x `h` keeping the panes (as the IO loop does); returns the rows.
     fn draw_panes(state: &mut AppState, w: u16, h: u16) -> Vec<String> {
         let buf = crate::app::tests::draw(state, w, h);
@@ -9258,8 +9760,8 @@ mod tests {
     /// its header band turns from the fill of where text goes to the yellow of a selected
     /// card and says, at its right, that it is selected and how to get back (as much as fits),
     /// also once Ctrl-↑ scrolled it and its last row says how much is below; Shift-→ puts the
-    /// selection back on the card. So at every width: beside a column of cards, under a row
-    /// of them, and with no room for the whole label.
+    /// selection back on the card. So at every width: beside the sidebar's cards, wide and
+    /// narrow (the label cut to what fits), and with no room for the sidebar or the whole label.
     #[test]
     fn the_selected_pane_has_a_yellow_band() {
         use crossterm::event::KeyModifiers;
@@ -9280,7 +9782,8 @@ mod tests {
         };
         for (w, label) in [
             (160, "selected · Shift-↑↓ blocks · Shift-→ cards"),
-            (80, "selected · Shift-↑↓ blocks · Shift-→ cards"),
+            (100, "selected · Shift-↑↓ blocks · Shift-→ cards"),
+            (80, "selected · Shift-→ cards"),
             (44, "selected · Shift-→ cards"),
             (30, "selected"),
         ] {
@@ -9321,12 +9824,13 @@ mod tests {
         }
     }
 
-    /// Too narrow for a column of cards, a dive gives the conversation the whole height: no
-    /// row of cards, a header band naming the thread and saying Esc gets back. Esc brings
-    /// the row back, with the card selected before the dive selected again. So on phone
-    /// sizes and at 80x24; from 100 columns the cards stay beside the dive.
+    /// A dive keeps the cards wherever the sidebar docks, narrow or wide: the conversation
+    /// beside them starts under a header band naming the thread and saying Esc gets back, and
+    /// Tab still selects a card. Esc ends the dive with the card selected before it selected
+    /// again. Too narrow for the sidebar, the dive has the screen alone, as the conversation
+    /// had before it: no card is drawn either way.
     #[test]
-    fn a_narrow_dive_hides_the_cards_and_esc_brings_them_back() {
+    fn a_dive_keeps_the_cards_and_esc_brings_the_selection_back() {
         let cards = |st: &AppState| {
             st.view
                 .panes
@@ -9335,17 +9839,27 @@ mod tests {
                 .filter(|p| matches!(p.id, PaneId::Thread(_)))
                 .count()
         };
-        for (w, h) in [(30, 20), (40, 20), (45, 30), (80, 24), (99, 24)] {
+        for (w, h) in [
+            (30, 20),
+            (40, 20),
+            (45, 30),
+            (60, 20),
+            (80, 24),
+            (99, 24),
+            (100, 30),
+        ] {
+            let docked = w >= 55;
             let mut st = conversation_beside_cards();
             st.set_focus(Some("t-beta".into()));
             draw_panes(&mut st, w, h);
-            assert!(cards(&st) > 0, "{w}x{h}");
+            assert_eq!(cards(&st) > 0, docked, "{w}x{h}");
             st.dive("t-gamma");
             let lines = draw_panes(&mut st, w, h);
             let s = screen(&lines);
-            assert_eq!(cards(&st), 0, "{w}x{h}: {s}");
+            assert_eq!(cards(&st) > 0, docked, "{w}x{h}: {s}");
+            let head = view_part(&st, w, &lines[0]);
             assert!(
-                lines[0].contains("gamma") && lines[0].contains("Esc"),
+                head.contains("gamma") && head.contains("Esc"),
                 "{w}x{h}: {s}"
             );
             let main = st.view.panes.get(&PaneId::Transcript).unwrap().area;
@@ -9356,18 +9870,21 @@ mod tests {
             st.handle_key(key(KeyCode::Esc));
             assert_eq!(st.view.dive, None);
             let lines = draw_panes(&mut st, w, h);
-            assert!(cards(&st) > 0, "{w}x{h}: {}", screen(&lines));
-            assert_eq!(st.focused(), Some("t-beta"), "{w}x{h}");
+            assert_eq!(cards(&st) > 0, docked, "{w}x{h}: {}", screen(&lines));
+            if docked {
+                assert_eq!(st.focused(), Some("t-beta"), "{w}x{h}");
+                st.dive("t-gamma");
+                draw_panes(&mut st, w, h);
+                st.handle_key(key(KeyCode::Tab));
+                assert!(st.focused().is_some(), "{w}x{h}: Tab selects a card");
+                assert_eq!(st.view.dive.as_deref(), Some("t-gamma"), "{w}x{h}");
+            }
         }
-        // Wide enough for the column, the cards stay beside the dive.
-        let mut st = conversation_beside_cards();
-        st.dive("t-gamma");
-        draw_panes(&mut st, 100, 30);
-        assert!(cards(&st) > 0);
     }
 
-    /// On a phone-sized screen, a dive's header keeps saying how to get back, `‹ back` to tap
-    /// and the key: a long name gives up `talking to`, then its end.
+    /// In a view as narrow as a phone, beside the sidebar or alone, a dive's header keeps
+    /// saying how to get back, `‹ back` to tap and the key: a long name gives up `talking to`,
+    /// then its end.
     #[test]
     fn a_narrow_dive_header_keeps_esc() {
         let mut st = conversation_beside_cards();
@@ -9375,21 +9892,26 @@ mod tests {
         t.at(60);
         crate::app::tests::control(&mut st, &[t.created("invoice-rounding-for-eu")]);
         st.dive("t-long");
-        for (w, head) in [
+        for (cols, head) in [
             (30, " ‹ back  invoice-…  Esc: back"),
             (40, " ‹ back  invoice-rounding-f…  Esc: back"),
             (50, " ‹ back  invoice-rounding-for-eu  Esc: back"),
             (60, " ‹ back  talking to invoice-rounding-for-eu  Esc: back"),
         ] {
+            let w = screen_for(&st, cols);
             let lines = draw_panes(&mut st, w, 20);
-            assert!(lines[0].contains(head), "{w}: {}", lines[0]);
+            assert!(
+                view_part(&st, w, &lines[0]).contains(head),
+                "{w}: {}",
+                lines[0]
+            );
         }
     }
 
     /// A taller input box lists the same cards: the box is under the main pane, and the
-    /// column of cards keeps its height beside it. (It once spanned the whole width, so a
-    /// growing box took its rows from the column too and the last card there went, e.g.
-    /// `t-eps` at 160x32.)
+    /// column of cards in the sidebar keeps its height beside it. (It once spanned the whole
+    /// width, so a growing box took its rows from the column too and the last card there went,
+    /// e.g. `t-eps` at 160x32.)
     #[test]
     fn a_taller_input_box_lists_the_same_cards() {
         let drawn = |st: &AppState| -> Vec<String> {
@@ -9412,7 +9934,7 @@ mod tests {
             assert_eq!(drawn(&st), nav, "{w}x{h}: {}", screen(&lines));
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             let column = st.view.panes.get(&card(&nav[0])).unwrap().area;
-            assert!(input.right() < column.x, "{w}x{h}: {input:?} {column:?}");
+            assert!(column.right() < input.x, "{w}x{h}: {input:?} {column:?}");
         }
         assert_eq!(
             drawn(&{
@@ -9425,12 +9947,11 @@ mod tests {
         );
     }
 
-    /// A narrow dive hides the cards, so no key selects one: Tab and the Shift-arrows say so
-    /// and the dive's card stays selected, so the action popup Enter opens is the thread's the
-    /// header names. A dive that began wider, with another card selected, selects its own card
-    /// once the screen is narrow; Esc still brings back the card selected before the dive.
+    /// A dive on a narrow screen keeps the cards in the sidebar beside it: Tab and the
+    /// Shift-arrows select another card, and a screen narrowed during a dive leaves the
+    /// selection alone; Esc still brings back the card selected before the dive.
     #[test]
-    fn a_narrow_dive_keeps_its_own_card_selected() {
+    fn a_narrow_dive_keeps_the_cards_beside_it() {
         use crossterm::event::KeyModifiers;
         let mut st = conversation_beside_cards();
         st.set_focus(Some("t-gamma".into()));
@@ -9440,31 +9961,23 @@ mod tests {
         draw_panes(&mut st, 80, 24);
         st.handle_key(key(KeyCode::Enter));
         assert_eq!(st.view.dive.as_deref(), Some("t-gamma"));
-        draw_panes(&mut st, 80, 24);
+        let lines = draw_panes(&mut st, 80, 24);
+        assert!(st.view.panes.list.is_some(), "{}", screen(&lines));
+        assert!(st
+            .view
+            .panes
+            .get(&PaneId::Thread("t-gamma".into()))
+            .is_some());
         for k in [
             key(KeyCode::Tab),
             KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT),
-            KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT),
         ] {
             st.handle_key(k);
-            assert_eq!(st.focused(), Some("t-gamma"), "{k:?}");
-            assert_eq!(
-                st.view.status.as_deref(),
-                Some(crate::app::DIVE_HIDES_CARDS)
-            );
+            draw_panes(&mut st, 80, 24);
+            assert!(st.focused().is_some(), "{k:?}");
         }
-        st.handle_key(key(KeyCode::Enter));
-        draw_panes(&mut st, 80, 24);
-        for c in "stop".chars() {
-            st.handle_key(key(KeyCode::Char(c)));
-        }
-        assert_eq!(
-            st.handle_key(key(KeyCode::Enter)),
-            [crate::app::Action::Stop {
-                thread: "t-gamma".into()
-            }]
-        );
+        st.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_ne!(st.focused(), Some("t-gamma"));
         // Begun wide, with another card selected during it, then narrowed.
         let mut st = conversation_beside_cards();
         st.set_focus(Some("t-beta".into()));
@@ -9474,11 +9987,13 @@ mod tests {
         st.dive("t-gamma");
         draw_panes(&mut st, 160, 40);
         st.handle_key(key(KeyCode::Tab));
-        assert_ne!(st.focused(), Some("t-gamma"));
+        let picked = st.focused().map(str::to_string);
+        assert_ne!(picked.as_deref(), Some("t-gamma"));
         draw_panes(&mut st, 80, 24);
-        assert_eq!(st.focused(), Some("t-gamma"));
+        assert_eq!(st.focused(), picked.as_deref());
         st.handle_key(key(KeyCode::Esc));
-        assert_eq!(st.focused(), Some("t-beta"));
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None);
     }
 
     /// A hidden thread dived into leaves the listing with the dive: Esc still selects the card
@@ -9719,8 +10234,8 @@ mod tests {
                 ("c", TabHub::Busy),
             ],
         );
-        // (Wide enough, the workspace sidebar lists them instead: hidden here.)
-        st.view.ws_sidebar_hidden = true;
+        // (The sidebar, shown, lists them instead: hidden here.)
+        st.view.sidebar_hidden = true;
         for (w, h) in [(160, 42), (80, 24)] {
             for view in [Screen::Stack, Screen::Grid, Screen::Decisions] {
                 st.view.screen = view;
@@ -9887,12 +10402,22 @@ mod tests {
         assert!(strip.trim_end().ends_with(" ›"), "{strip}");
     }
 
-    /// The TUI starts typing: the input box shows, ready to send to the orchestrator.
+    /// The TUI starts typing: the input box shows, ready to send to the orchestrator. The
+    /// sidebar says there are no worker threads, wrapped in its box.
     #[test]
     fn empty_state() {
         let st = AppState::new();
-        let s = screen(&draw(&st, 80, 24));
-        assert!(s.contains(EMPTY_STATE), "{s}");
+        let lines = draw(&st, 80, 24);
+        let s = screen(&lines);
+        let dock = usize::from(st.dock_width_at(80));
+        let side: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let side: String = l.chars().take(dock).collect();
+                side.trim_matches(['│', ' ']).to_string()
+            })
+            .collect();
+        assert!(flat(&side).contains(EMPTY_STATE), "{s}");
         assert!(!s.contains("INPUT"), "no mode badge: {s}");
         assert!(s.contains("Enter sends"), "{s}");
     }
@@ -9946,11 +10471,7 @@ mod tests {
             assert_eq!(st.view.action, None);
             assert!(st.view.input.is_empty());
             assert_eq!(after.width, width, "the full width: the pane has no border");
-            if width < SIDE_MIN_WIDTH {
-                assert!(after.height > before.height, "the card row is gone");
-            } else {
-                assert!(after.width > before.width, "the side column is gone");
-            }
+            assert!(after.width > before.width, "the side column is gone");
             let s = flat(&lines);
             assert!(
                 s.contains("2 need you") && s.contains("Ctrl-B shows"),
@@ -10026,8 +10547,8 @@ mod tests {
         }
     }
 
-    /// Wide: the main pane on the left, the worker cards in a column on the right, the
-    /// permission first; each card says status, runtime, model and mode.
+    /// Wide: the worker cards in a column in the sidebar on the left, the main pane right of
+    /// it, the permission first; each card says status, runtime, model and mode.
     #[test]
     fn three_threads_permission_is_first_with_card_text() {
         let mut st = three_threads();
@@ -10037,10 +10558,10 @@ mod tests {
         let (beta, alpha, gamma) = (at("t-beta"), at("t-alpha"), at("t-gamma"));
         assert!(beta.y < alpha.y && alpha.y < gamma.y, "{}", screen(&lines));
         assert_eq!(beta.y, 1, "the permission card is the first card");
-        assert_eq!(
-            beta.x,
-            120 - side_width(120) + 1,
-            "the cards are on the right"
+        assert_eq!(beta.x, 1, "the cards are on the left");
+        assert!(
+            st.view.panes.get(&PaneId::Transcript).unwrap().area.x > beta.right(),
+            "the main pane right of them"
         );
         // As tall as their text: gamma, running with nothing open and no git state, its
         // state alone; beta its state and its permission (summary, options, note).
@@ -10084,7 +10605,8 @@ mod tests {
         assert!(alpha_card.starts_with('┏'), "{alpha_card}");
         let s = screen(&lines);
         assert!(
-            lines[0].starts_with(" ORCHESTRATOR  starts with your first message "),
+            view_part(&st, 120, &lines[0])
+                .starts_with(" ORCHESTRATOR  starts with your first message "),
             "{s}"
         );
         // The empty input box is there, saying who a line goes to.
@@ -10097,8 +10619,9 @@ mod tests {
     }
 
     /// The text of the main pane's header (its band, the top row).
-    fn header(lines: &[String], w: usize) -> String {
-        lines[0].chars().take(w).collect()
+    fn header(st: &AppState, lines: &[String], w: usize) -> String {
+        let width = u16::try_from(lines[0].chars().count()).unwrap();
+        view_part(st, width, &lines[0]).chars().take(w).collect()
     }
 
     /// A working card shows a frame of the icon before its status, a waiting one none; the
@@ -10254,7 +10777,7 @@ mod tests {
         st.view.animate = true;
         st.view.frame = 4;
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(head.starts_with(" ORCHESTRATOR  claude-code"), "{head}");
         assert!(!head.contains('▄'), "idle: {head}");
 
@@ -10262,7 +10785,7 @@ mod tests {
         o.at(200);
         control(&mut st, &[o.turn_started("what needs me?")]);
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ▄ ORCHESTRATOR  claude-code"),
             "working: {head}"
@@ -10271,19 +10794,19 @@ mod tests {
 
         control(&mut st, &[o.raise("op1", AttentionReason::Question)]);
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(!head.contains('▄'), "waiting on the user: {head}");
 
         st.dive("t-gamma");
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ▄ ‹ back  talking to gamma  fake · "),
             "dive: {head}"
         );
         st.dive("t-beta");
         let lines = draw_panes(&mut st, 120, 40);
-        let head = header(&lines, 80);
+        let head = header(&st, &lines, 80);
         assert!(
             head.starts_with(" ‹ back  talking to beta  fake · "),
             "{head}"
@@ -10945,30 +11468,28 @@ mod tests {
         assert!(s.contains("twr asks"), "{s}");
         assert!(s.contains("Which thread should get"), "{s}");
         assert!(s.contains("1 alpha  2 beta  3 new_thread"), "{s}");
-        let at = |id: &str| st.view.panes.get(&card(id)).unwrap().area;
-        assert!(at(HUB_THREAD).y < at("t-beta").y, "{s}");
-        // Narrow: the leftmost card of the row.
-        let lines = draw(&st, 90, 30);
-        let row = &lines[0];
+        let at = |st: &AppState, id: &str| st.view.panes.get(&card(id)).unwrap().area;
+        assert!(at(&st, HUB_THREAD).y < at(&st, "t-beta").y, "{s}");
+        // Narrow: the first card of the narrower sidebar too.
+        let lines = draw_panes(&mut st, 90, 30);
+        assert!(lines[0].starts_with("┏ twr asks"), "{}", screen(&lines));
         assert!(
-            col(row, "twr asks").unwrap() < col(row, "beta").unwrap(),
-            "{row}"
+            at(&st, HUB_THREAD).y < at(&st, "t-beta").y,
+            "{}",
+            screen(&lines)
         );
     }
 
+    /// A narrow terminal docks a narrower sidebar, the selected card in view.
     #[test]
     fn narrow_terminal_keeps_focused_card_visible() {
         let mut st = three_threads();
         st.set_focus(Some("t-gamma".into()));
         let lines = draw(&st, 60, 24);
-        let top = &lines[0];
-        assert!(top.contains(" gamma "), "{top}");
-        assert!(top.contains(" alpha "));
-        assert!(!top.contains(" beta "));
-        assert!(screen(&lines).contains("< 1 more"));
-        assert_eq!(visible_window(3, Some(2), 60), (1, 2));
-        assert_eq!(visible_window(3, Some(0), 60), (0, 2));
-        assert_eq!(visible_window(3, None, 10), (0, 1));
+        assert!(screen(&lines).contains(" gamma "), "{}", screen(&lines));
+        assert_eq!(side_width(60), 24);
+        assert_eq!(side_width(99), 34);
+        assert_eq!(side_width(100), 34);
     }
 
     /// The side column shows the cards that fit, keeping the selected one in view, with
@@ -11027,7 +11548,7 @@ mod tests {
         for ev in &evs {
             st.apply_event(&thread_item(ev));
         }
-        let text = screen(&draw(&st, 160, 30));
+        let text = view_screen(&st, 160, &draw(&st, 160, 30));
         assert!(
             text.starts_with(
                 " ‹ back  talking to beta  fake · default model · mode manual · Esc returns to \
@@ -11036,14 +11557,14 @@ mod tests {
             "{text}"
         );
         // Narrower, the header keeps what fits: who it talks to, then how to get back.
-        let text = screen(&draw(&st, 120, 30));
+        let text = view_screen(&st, 120, &draw(&st, 120, 30));
         assert!(
             text.starts_with(
                 " ‹ back  talking to beta  fake · default model · mode manual · Esc: back "
             ),
             "{text}"
         );
-        let text = screen(&draw(&st, 100, 30));
+        let text = view_screen(&st, 100, &draw(&st, 100, 30));
         assert!(
             text.starts_with(" ‹ back  talking to beta  mode manual · Esc: back "),
             "{text}"
@@ -11153,15 +11674,14 @@ mod tests {
     fn status_bar_shows_errors_and_hints() {
         let mut st = three_threads();
         st.view.status = Some("hub: not_found".into());
-        let lines = draw(&st, 160, 24);
-        let last = lines.last().unwrap();
+        let last = view_last(&st, 160);
         assert!(
             last.starts_with("hub: not_found"),
             "no mode badge before it: {last}"
         );
         assert!(last.contains("| Enter send · "), "{last}");
         st.view.status = None;
-        let last = draw(&st, 160, 24).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(last.starts_with("Enter send · "), "{last}");
     }
 
@@ -11224,7 +11744,7 @@ mod tests {
             (40, None),
             (30, None),
         ] {
-            let last = draw(&st, w, 24).pop().unwrap();
+            let last = view_last(&st, w);
             match usage {
                 Some(u) => {
                     assert!(last.starts_with(u), "{w}: {last}");
@@ -11287,13 +11807,13 @@ mod tests {
     fn usage_starts_the_last_row_beside_status_notes() {
         let mut st = with_usage(three_threads(), 22.0, 44.0);
         st.view.status = Some("hub: not_found".into());
-        let last = draw(&st, 280, 24).pop().unwrap();
+        let last = view_last(&st, 280);
         assert!(last.starts_with("left: Claude 5h 78%"), "{last}");
         assert!(last.contains("ago hub: not_found | Enter send"), "{last}");
 
         // Wrapped status notes still leave the usage at the start of the last row.
         st.view.status = Some("a long status message ".repeat(8));
-        let last = draw(&st, 120, 24).pop().unwrap();
+        let last = view_last(&st, 120);
         assert!(last.starts_with("C 78%/56% | G 58% "), "{last}");
         assert!(last.contains("Enter send"), "{last}");
     }
@@ -11301,10 +11821,10 @@ mod tests {
     #[test]
     fn usage_rendering_clamps_remaining_percentages() {
         let st = with_usage(three_threads(), 104.4, -3.0);
-        let last = draw(&st, 280, 24).pop().unwrap();
+        let last = view_last(&st, 280);
         assert!(last.starts_with("left: Claude 5h 0% resets "), "{last}");
         assert!(last.contains("wk 100%"), "{last}");
-        let last = draw(&st, 80, 24).pop().unwrap();
+        let last = view_last(&st, 80);
         assert!(last.starts_with("C 0%/100% | G 58% Enter send"), "{last}");
     }
 
@@ -11384,7 +11904,7 @@ mod tests {
         st.summary.stats.calls = 2;
         st.summary.stats.cost_usd = 0.0004;
         assert_eq!(text(&st, 200, 30).as_deref(), Some("summaries 2 · $0.0004"));
-        let last = draw(&st, 160, 24).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(last.starts_with("summaries 2 · $0.0004 "), "{last}");
     }
 
@@ -11421,9 +11941,10 @@ mod tests {
     #[test]
     fn usage_colors_windows_near_their_limit() {
         let st = with_usage(three_threads(), 90.0, 75.0);
-        let buf = draw_buf(&st, 280, 24);
+        let w = screen_for(&st, 280);
+        let buf = draw_buf(&st, w, 24);
         let y = 23;
-        let row: String = (0..280).map(|x| buf[(x, y)].symbol()).collect();
+        let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
         let at = |needle: &str| {
             let byte = row
                 .find(needle)
@@ -11476,7 +11997,8 @@ mod tests {
             st.apply_control(&ev);
             st
         };
-        for w in [220u16, 80] {
+        // (A view 80 columns wide, beside the sidebar.)
+        for w in [220u16, screen_for(&stale, 80)] {
             let buf = draw_buf(&stale, w, 24);
             let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
             let byte = row.find("10%").unwrap_or_else(|| panic!("10% in {row}"));
@@ -11681,6 +12203,68 @@ mod tests {
         }
     }
 
+    /// A card whose turn is quiet says what it has in flight after its activity, as the hub's
+    /// `work` read it (a working one does not); its `bg` count leaves out the task a call of
+    /// its turn waits for in the foreground.
+    #[test]
+    fn a_quiet_card_says_what_it_has_in_flight() {
+        use crate::app::tests::control;
+        use twr_core::event::TaskUpdated;
+        let mut st = AppState::new();
+        let mut s = ThreadScript::new("t-api");
+        let mut waiter = TaskUpdated {
+            task_id: "w".into(),
+            running: true,
+            ..Default::default()
+        };
+        twr_core::event::set_twr_ext(&mut waiter.ext, "foreground_call", "c2".into());
+        let evs = vec![
+            s.at(0).created("api"),
+            s.turn_started("review it"),
+            s.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: "r".into(),
+                running: true,
+                ..Default::default()
+            })),
+            s.event(EventBody::TaskUpdated(waiter)),
+        ];
+        control(&mut st, &evs);
+        let work = |state: &str| {
+            serde_json::json!({
+                "as_of": "2026-10-28T22:12:53Z", "state": state, "sight": "full", "turn": 1,
+                "turn_started_at": "2026-10-28T22:00:00Z",
+                "calls": [{"id": "c2", "tool": "Bash", "what": "Wait for the review",
+                           "since": "2026-10-28T22:07:46Z", "task": "w"}],
+                "tasks": [{"id": "r", "what": "Re-review", "kind": "background",
+                           "since": "2026-10-28T22:07:44Z", "alive_at": "2026-10-28T22:07:44Z"}],
+                "progress_at": "2026-10-28T22:07:50Z"
+            })
+        };
+        let t = st.registry.get("t-api").unwrap().clone();
+        assert_eq!(card_status(&t), "running (1 bg)");
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-api": {"activity": "re-reviewing",
+                                          "work": work("waiting_on_work")}}),
+        );
+        let (_, one) = section_lines(&st, &t, 200, false);
+        let text = line_text(&one);
+        assert!(
+            text.ends_with(
+                "running (1 bg) · re-reviewing · quiet 5m · Bash \"Wait for the review\" 5m · \
+                 background: Re-review 5m"
+            ),
+            "{text}"
+        );
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-api": {"activity": "re-reviewing", "work": work("working")}}),
+        );
+        let (_, one) = section_lines(&st, &t, 200, false);
+        let text = line_text(&one);
+        assert!(text.ends_with("running (1 bg) · re-reviewing"), "{text}");
+    }
+
     /// One thread in each state a card shows, each with a report of an earlier turn where it
     /// has one: running, waiting on background work (its turn's interim report), waiting for a
     /// permission, done (success), failed, needing review, parked and stopped; and the hub's
@@ -11761,8 +12345,8 @@ mod tests {
     /// report, cut to the rows the card has. Never the activity next to a report of an
     /// earlier turn, never a report of an earlier turn while it works, never a `report:` label
     /// or a `›`. Who runs it is in the title. In the column
-    /// (34, 40 and 48 columns), the row above a narrow conversation, the grid, and the compact
-    /// layout's Threads screen (40 columns).
+    /// (34, 40 and 48 columns), the narrower one beside a narrow conversation (24 and 34), the
+    /// grid, and the compact layout's Threads screen (40 columns).
     #[test]
     fn a_card_shows_one_section_for_each_state() {
         let expect: [(&str, &[&str], &[&str]); 8] = [
@@ -11826,7 +12410,7 @@ mod tests {
             }
             // Who runs it is in the title (its model cut on a narrow card), not in the section.
             let title = text.lines().next().unwrap_or_default();
-            assert!(title.contains("default m"), "{what} {name}\n{text}");
+            assert!(title.contains("def"), "{what} {name}\n{text}");
             assert!(!words.contains("default model"), "{what} {name}\n{text}");
         };
         for w in [100, 134, 160] {
@@ -11841,14 +12425,14 @@ mod tests {
                 check(&format!("column {w}"), &text, name);
             }
         }
-        // The row of cards above a narrow conversation: each card, selected to show it.
+        // The narrower sidebar beside a narrow conversation: each card, selected to show it.
         for w in [60, 90] {
             for (name, ..) in &expect {
                 let mut st = one_of_each_state();
                 st.set_focus(Some(format!("t-{name}")));
                 let lines = draw_panes(&mut st, w, 40);
                 let text = pane_text(&st, &lines, &card(&format!("t-{name}")));
-                check(&format!("row {w}"), &text, name);
+                check(&format!("narrow {w}"), &text, name);
             }
         }
         let mut st = one_of_each_state();
@@ -11875,7 +12459,8 @@ mod tests {
     /// work after a long interim report: with nothing selected, with another card selected and
     /// selected itself, it shows its state, what it waits on and the report under them, up to
     /// the rows the list gives it, the last one cut with `…`. In the column (120, 160 and 200
-    /// columns), the row above a narrow conversation, the grid and the compact Threads screen.
+    /// columns), the narrower one beside a narrow conversation (90), the grid and the compact
+    /// Threads screen.
     #[test]
     fn an_unselected_card_shows_its_whole_section() {
         use crate::app::tests::control;
@@ -11941,7 +12526,7 @@ mod tests {
             ("column 120", 120, 45, plain, COMPACT_CARD_HEIGHT),
             ("column 160", 160, 45, plain, COMPACT_CARD_HEIGHT),
             ("column 200", 200, 45, plain, COMPACT_CARD_HEIGHT),
-            ("row 90", 90, 40, plain, CARD_HEIGHT),
+            ("column 90", 90, 40, plain, COMPACT_CARD_HEIGHT),
             ("grid 160", 160, 40, grid, TILE_HEIGHT),
             ("compact 40", 40, 30, compact, COMPACT_CARD_HEIGHT),
         ];
@@ -12096,8 +12681,10 @@ mod tests {
         control(&mut st, &evs);
         st.set_focus(Some("t-cap".into()));
         st.handle_key(key(KeyCode::Enter));
-        // Its own rows: a narrow popup cuts the turn and grade line, never the notice.
-        for w in [40, 160] {
+        // Its own rows: a narrow popup cuts the turn and grade line, never the notice. (60
+        // columns: the narrowest screen in the full layout with the sidebar's cards, and so
+        // the popup of one, beside a 35-column conversation.)
+        for w in [60, 160] {
             let lines = draw_panes(&mut st, w, 40);
             let popup = pane_text(&st, &lines, &PaneId::Popup);
             assert!(popup.contains("a preview"), "{w}:\n{popup}");
@@ -12281,7 +12868,7 @@ mod tests {
         let name = |id: &str| {
             rows.iter()
                 .find(|(i, _)| i == id)
-                .map(|(_, l)| l.spans[0].clone())
+                .map(|(_, l)| l[0].spans[0].clone())
                 .unwrap()
         };
         assert_eq!(name(HUB_THREAD).content, "twr");
@@ -12313,11 +12900,9 @@ mod tests {
 
     /// A card (or tile) is as tall as its text: no blank row inside it, whatever it says
     /// (a permission, a question or a report in paragraphs, a review, a report with its git
-    /// state, an activity line, a parked thread), in the column at every width, the row of
-    /// cards above a narrow conversation, the grid, and the compact Threads screen. In the
-    /// row, each card is as tall as its own text from the top of the row, and the row as
-    /// tall as its tallest card. An item's own blank rows are its content: drawn, between
-    /// its paragraphs.
+    /// state, an activity line, a parked thread), in the column at every width (the narrower
+    /// one beside a narrow conversation too), the grid, and the compact Threads screen. An
+    /// item's own blank rows are its content: drawn, between its paragraphs.
     #[test]
     fn no_card_has_a_blank_row_inside() {
         for (w, h) in [(100, 60), (120, 60), (160, 60), (80, 60)] {
@@ -12340,23 +12925,6 @@ mod tests {
             let (blank, drawn) = blank_rows(&st, &lines, &order);
             assert!(blank.is_empty(), "{w}x{h}:\n{}", blank.join("\n"));
             assert!(drawn >= 2, "{w}x{h}:\n{}", screen(&lines));
-            if w < SIDE_MIN_WIDTH {
-                let shown: Vec<Rect> = order
-                    .iter()
-                    .filter_map(|id| st.view.panes.get(&card(id)).map(|p| p.area))
-                    .collect();
-                assert!(shown.iter().all(|a| a.y == 1), "top-aligned: {shown:?}");
-                assert!(
-                    shown.iter().any(|a| a.height != shown[0].height),
-                    "{shown:?}"
-                );
-                let row = shown.iter().map(|a| a.bottom() + 1).max().unwrap();
-                let band = lines[usize::from(row)].clone();
-                assert!(
-                    band.contains("ORCHESTRATOR"),
-                    "right under the row:\n{band}"
-                );
-            }
         }
         for (w, h) in [(100, 60), (130, 60), (180, 60)] {
             for mut st in [five_saying_things(), five_saying_paragraphs()] {
@@ -12539,7 +13107,8 @@ mod tests {
     /// for it is shown up to the most a card gets there and ends in `…`, and a git line it
     /// did not have shows; the cards after it move then. Text that gets shorter does not move
     /// them at once: the card keeps its height until the shorter text has held for the delay.
-    /// So in the column at every width, the row of cards and the grid.
+    /// So in the column at every width, the narrower one beside a narrow conversation too, and
+    /// the grid.
     #[test]
     fn cards_grow_with_their_text_at_once_and_shrink_after_the_delay() {
         use crate::app::tests::control;
@@ -12606,15 +13175,16 @@ mod tests {
             let t1 = t0 + Duration::from_secs(1);
             let lines = draw_panes_at(&mut st, w, h, t1);
             let a = pane_text(&st, &lines, &card("t-a"));
-            assert!(a.contains("Rewrote the parser"), "{at}:\n{a}");
+            assert!(card_words(&a).contains("Rewrote the parser"), "{at}:\n{a}");
             assert!(a.contains('…'), "{at}: the report is cut:\n{a}");
             let tall = card_at(&st, "t-a");
             assert!(tall.height > short.height, "{at}:\n{a}");
-            if !grid && w >= SIDE_MIN_WIDTH {
+            if !grid {
                 assert_eq!(tall.height + 2, COMPACT_CARD_HEIGHT, "{at}:\n{a}");
             }
             let b = pane_text(&st, &lines, &card("t-b"));
-            assert!(b.contains("twr/a-much-l"), "{at}:\n{b}");
+            // (The branch cut to the room a narrow card leaves.)
+            assert!(b.contains("twr/a-"), "{at}:\n{b}");
             let grown = areas(&st);
             // The report gets short again: nothing moves until the delay is over.
             control(&mut st, &[report(&mut s[0], 1, "Short again.")]);
@@ -12715,7 +13285,7 @@ mod tests {
         draw_panes_at(&mut st, w, h, free + ORDER_DELAY * 2);
         assert_eq!(card_at(&st, "t-a").height, tall, "held by the pointer");
         // The pointer leaves: the wait starts again, and the card shrinks after it.
-        st.view.pointer = Some((1, 5, free + ORDER_DELAY * 2));
+        st.view.pointer = Some((w - 2, 5, free + ORDER_DELAY * 2));
         let left = free + ORDER_DELAY * 3;
         draw_panes_at(&mut st, w, h, left);
         assert_eq!(card_at(&st, "t-a").height, tall);
@@ -12794,9 +13364,10 @@ mod tests {
     /// `— twr attach <name>` after it (a report logged with one shows without it).
     #[test]
     fn a_cards_report_is_the_report_alone() {
-        for w in [44, 60, 80, 120, 160] {
+        // From 55 columns, the narrowest screen with a sidebar beside the conversation.
+        for w in [55, 60, 80, 120, 160] {
             let mut st = reported_thread();
-            // Selected, so a narrow row of cards shows it.
+            // Selected, so the sidebar keeps it in view.
             st.set_focus(Some("t-rep".into()));
             let lines = draw_panes(&mut st, w, 50);
             let text = pane_text(&st, &lines, &card("t-rep"));
@@ -12829,43 +13400,6 @@ mod tests {
     }
 
     /// A tile says what its thread's turns spent after the turn count.
-    /// A card and a tile say how full their thread's context is on their bottom border, once
-    /// its runtime said, and what a compaction left after it.
-    #[test]
-    fn cards_say_how_full_the_context_is() {
-        let mut st = crate::app::tests::five_threads();
-        let mut z = ThreadScript::new("t-zeta");
-        z.at(40);
-        let evs = vec![z.created("zeta"), z.turn_started("go")];
-        crate::app::tests::control(&mut st, &evs);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(!screen.contains("ctx "), "nothing said yet: {screen}");
-        let mut end = z.turn_ended(twr_core::event::TurnResult::Completed);
-        if let EventBody::TurnEnded(p) = &mut end.body {
-            p.context = Some(twr_core::event::ContextSize {
-                tokens: 342_000,
-                window: Some(1_000_000),
-            });
-        }
-        crate::app::tests::control(&mut st, &[end]);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 34%"), "{screen}");
-        let compacted = z.event(EventBody::ContextCompacted(
-            twr_core::event::ContextCompacted {
-                trigger: "manual".into(),
-                pre_tokens: Some(342_000),
-                post_tokens: Some(20_000),
-                ..Default::default()
-            },
-        ));
-        crate::app::tests::control(&mut st, &[compacted]);
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 2%"), "{screen}");
-        st.view.screen = Screen::Grid;
-        let screen = draw(&st, 180, 40).join("\n");
-        assert!(screen.contains("ctx 2%"), "a tile too: {screen}");
-    }
-
     #[test]
     fn grid_tiles_say_what_the_turns_spent() {
         let mut st = grid_state();
@@ -12983,15 +13517,20 @@ mod tests {
         assert_eq!(buf[(9, 1)].symbol(), "b");
         assert!(!buf[(9, 1)].modifier.contains(Modifier::DIM));
 
-        // Stack view at 180: beta, alpha, delta, gamma, eps (36 columns each).
+        // The stack view's sidebar at 90 columns: delta's name dim in its title, alpha's not.
         let mut st = st;
-        // A row of cards at 90 columns: beta, alpha, delta (30 columns each, too narrow for
-        // the project: the name at x = 2).
         st.view.screen = Screen::Stack;
-        let buf = draw_buf(&st, 90, 30);
-        assert_eq!(buf[(2 + 2 * 30, 0)].symbol(), "d");
-        assert!(buf[(2 + 2 * 30, 0)].modifier.contains(Modifier::DIM));
-        assert!(!buf[(2 + 30, 0)].modifier.contains(Modifier::DIM));
+        let buf = crate::app::tests::draw(&mut st, 90, 30);
+        let name = |id: &str, name: &str| {
+            let a = st.view.panes.get(&card(id)).unwrap().area;
+            let y = a.y - 1;
+            let title: String = (a.x..a.right()).map(|x| buf[(x, y)].symbol()).collect();
+            let x = a.x + u16::try_from(col(&title, name).unwrap()).unwrap();
+            assert_eq!(buf[(x, y)].symbol(), &name[..1], "{title}");
+            buf[(x, y)].modifier.contains(Modifier::DIM)
+        };
+        assert!(name("t-delta", "delta"));
+        assert!(!name("t-alpha", "alpha"));
     }
 
     #[test]
@@ -13109,8 +13648,9 @@ mod tests {
     /// · 2 behind`, the short form `+3/−2 vs dev` where that does not fit (then the branch cut
     /// or left out),
     /// nothing when it is even with its base or that is not known (a branch with no upstream
-    /// shows no `0`s either). In the column (34 and 48 columns), the row of cards, the grid
-    /// and the compact layout's Threads screen at 40x20.
+    /// shows no `0`s either). In the column (34 and 48 columns), the narrower one beside a
+    /// narrow conversation (32 columns), the grid and the compact layout's Threads screen at
+    /// 40x20.
     #[test]
     fn a_cards_git_line_says_how_far_it_is_from_its_base() {
         use crate::app::tests::control;
@@ -13144,14 +13684,7 @@ mod tests {
                 false,
                 "twr/api · changes made · +3/−2 vs dev",
             ),
-            // (One card in the row: as wide as the screen.)
-            (
-                90,
-                40,
-                false,
-                false,
-                "twr/api · changes made · 3 ahead of dev · 2 behind",
-            ),
+            (80, 40, false, false, "changes made · +3/−2 vs dev"),
             (90, 40, true, false, "changes made · +3/−2 vs dev · 1 turn"),
             (40, 20, false, true, "twr/api · changes made · +3/−2 vs dev"),
         ];
@@ -13282,26 +13815,19 @@ mod tests {
         }
     }
 
-    /// The compact layout's tab bar is 3 rows tall from [`TAB_BAR_TALL_FROM`] rows, 2 from
-    /// [`TAB_BAR_SHORT_FROM`] (a phone with its keyboard up, about 20) and 1 on a shorter
-    /// screen; each name is centered in its third of the width, on the middle row (the first
-    /// of two), the current one reversed. Where `Needs you 2` does not fit its third, it says
-    /// `Needs 2`; the screen under the bar keeps the rest.
+    /// The compact layout's tab bar is two rows tall on any screen, each tab filling both, as
+    /// tall as a finger; each name is centered in its third of the width on its first row, the
+    /// current one reversed.
+    /// Where `Needs you 2` does not fit its third, it says `Needs 2`.
     #[test]
     fn the_compact_tab_bar_fits_the_screen() {
-        assert_eq!(tab_bar_height(40), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM), 3);
-        assert_eq!(tab_bar_height(TAB_BAR_TALL_FROM - 1), 2);
-        assert_eq!(tab_bar_height(20), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM), 2);
-        assert_eq!(tab_bar_height(TAB_BAR_SHORT_FROM - 1), 1);
-        assert_eq!(tab_bar_height(8), 1);
-        for (w, h, rows, names) in [
-            (40u16, 30u16, 3u16, ["Chat", "Needs you 2", "Threads"]),
-            (40, 20, 2, ["Chat", "Needs you 2", "Threads"]),
-            (40, 12, 1, ["Chat", "Needs you 2", "Threads"]),
-            (30, 20, 2, ["Chat", "Needs 2", "Threads"]),
-            (59, 20, 2, ["Chat", "Needs you 2", "Threads"]),
+        let rows = TAB_BAR_ROWS;
+        for (w, h, names) in [
+            (40u16, 30u16, ["Chat", "Needs you 2", "Threads"]),
+            (40, 20, ["Chat", "Needs you 2", "Threads"]),
+            (40, 12, ["Chat", "Needs you 2", "Threads"]),
+            (30, 20, ["Chat", "Needs 2", "Threads"]),
+            (59, 20, ["Chat", "Needs you 2", "Threads"]),
         ] {
             let mut st = crate::app::tests::three_threads();
             st.view.compact_width = 60;
@@ -13309,7 +13835,7 @@ mod tests {
             let buf = crate::app::tests::draw(&mut st, w, h);
             let lines = buffer_lines(&buf);
             let what = format!("{w}x{h}:\n{}", screen(&lines));
-            let middle = usize::from((rows - 1) / 2);
+            let middle = 0;
             let words: Vec<&str> = lines[middle].split_whitespace().collect();
             assert_eq!(words.join(" "), names.join(" "), "{what}");
             // Centered in its tab: its third of the width, but the column after it (the last
@@ -13352,8 +13878,8 @@ mod tests {
         }
     }
 
-    /// Hidden parked threads are counted: a dim row under the side column of cards, the
-    /// head of the hints when the cards are a row, the grid's header, the empty pane.
+    /// Hidden parked threads are counted: a dim row under the column of cards, the
+    /// head of the hints when the cards fill the column, the grid's header, the empty pane.
     #[test]
     fn hidden_parked_threads_are_counted_where_the_cards_are() {
         use crate::app::tests::{control, with_parked_zeta};
@@ -13365,9 +13891,12 @@ mod tests {
             .iter()
             .position(|l| l.contains(note))
             .unwrap_or_else(|| panic!("{}", screen(&lines)));
-        assert!(row < 39, "above the status bar");
-        assert!(!lines[39].contains(note));
-        // Cards in a row: the hints say it.
+        // Under the cards in the sidebar, not among the hints.
+        let dock = usize::from(st.dock_width_at(160));
+        let side: String = lines[row].chars().take(dock).collect();
+        assert!(side.contains(note), "{}", screen(&lines));
+        assert_eq!(screen(&lines).matches(note).count(), 1);
+        // The cards fill the narrower sidebar beside a narrow conversation: the hints say it.
         let lines = draw(&st, 90, 30);
         assert!(lines[29].contains(note), "{}", lines[29]);
         assert_eq!(screen(&lines).matches(note).count(), 1);
@@ -13375,15 +13904,18 @@ mod tests {
         let long = "the delete card for web is waiting for you; ".repeat(4);
         st.view.status = Some(long.clone());
         let lines = draw(&st, 90, 30);
-        let bar = flat(&lines[26..]);
+        // (The bar is right of the sidebar.)
+        let bar: Vec<String> = lines[22..].iter().map(|l| view_part(&st, 90, l)).collect();
+        let bar = flat(&bar);
         assert!(bar.contains(long.trim()), "{bar}");
         assert!(bar.contains(note), "{bar}");
-        assert_eq!(screen(&lines).matches("/parked shows them").count(), 1);
+        assert_eq!(bar.matches("/parked shows them").count(), 1);
         // Wide characters count as two cells.
         let wide = "削除カードが待っています".repeat(4);
         st.view.status = Some(wide.clone());
         let lines = draw(&st, 90, 30);
-        let bar = flat(&lines[26..]);
+        let bar: Vec<String> = lines[22..].iter().map(|l| view_part(&st, 90, l)).collect();
+        let bar = flat(&bar);
         // (A wide character's second cell reads as a space.)
         assert!(
             bar.contains(note) && bar.replace(' ', "").contains(&wide),
@@ -13412,12 +13944,21 @@ mod tests {
         let s = screen(&draw(&st, 160, 40));
         assert!(s.contains("no worker threads") && s.contains(note), "{s}");
         assert_eq!(s.matches(note).count(), 1, "{s}");
-        // Narrow, the empty row has no room for it: the hints say it, once.
+        // The narrower sidebar's empty pane says it too, wrapped, and the hints do not.
         let lines = draw(&st, 90, 30);
         let s = screen(&lines);
-        assert!(s.contains("no worker threads"), "{s}");
-        assert!(lines[29].contains(note), "{s}");
-        assert_eq!(s.matches(note).count(), 1, "{s}");
+        let dock = usize::from(st.dock_width_at(90));
+        let side: Vec<String> = lines
+            .iter()
+            .map(|l| {
+                let side: String = l.chars().take(dock).collect();
+                side.trim_matches(['│', ' ']).to_string()
+            })
+            .collect();
+        let side = flat(&side);
+        assert!(side.contains("no worker threads"), "{s}");
+        assert_eq!(side.matches(note).count(), 1, "{s}");
+        assert!(!s.contains("/parked shows them ·"), "{s}");
         st.view.screen = Screen::Grid;
         let lines = draw(&st, 160, 40);
         let s = screen(&lines);
@@ -13478,7 +14019,7 @@ mod tests {
     #[test]
     fn key_help_follows_the_view_and_confirmation_takes_the_status_bar() {
         let mut st = five_threads();
-        let last = |st: &AppState| draw(st, 180, 30).pop().unwrap();
+        let last = |st: &AppState| view_last(st, 180);
         let l = last(&st);
         assert!(
             l.contains("Ctrl-G grid") && l.contains("Enter on an empty line: actions"),
@@ -13520,10 +14061,10 @@ mod tests {
     #[test]
     fn help_overlay_lists_the_commands_and_keys() {
         let mut st = three_threads();
-        let l = draw(&st, 200, 40).pop().unwrap();
+        let l = view_last(&st, 200);
         assert!(l.contains("? help"), "{l}");
         st.handle_key(key(KeyCode::Esc));
-        let l = draw(&st, 200, 40).pop().unwrap();
+        let l = view_last(&st, 200);
         assert!(l.contains("/ commands"), "{l}");
         for c in "/help".chars() {
             st.handle_key(key(KeyCode::Char(c)));
@@ -13602,9 +14143,10 @@ mod tests {
     }
 
     /// The help overlay wraps to the screen's width and scrolls, so every command and key
-    /// shows whole on any screen: on a phone, at 80x24, on a wide terminal. Below 70 columns
-    /// each command or key has a row of its own, what it does indented under it; from 70 on,
-    /// a table's first column is as wide as its longest entry. ↑↓, PgUp/PgDn, Home/End and
+    /// shows whole on any screen: on a phone, at 80x24, on a wide terminal. In an overlay
+    /// narrower than 70 columns (the view's, right of the sidebar) each command or key has a
+    /// row of its own, what it does indented under it; from 70 on, a table's first column is
+    /// as wide as its longest entry. ↑↓, PgUp/PgDn, Home/End and
     /// the wheel scroll it; Esc or `q` closes it.
     #[test]
     fn the_help_wraps_and_scrolls_on_any_screen() {
@@ -13643,7 +14185,7 @@ mod tests {
                 .iter()
                 .position(|r| r.trim_start().starts_with("/open [thread]"))
                 .unwrap();
-            if w < HELP_STACKED_BELOW {
+            if area.width + 2 < HELP_STACKED_BELOW {
                 assert_eq!(rows[open].trim(), "/open [thread]", "{w}x{h}");
                 assert!(rows[open + 1].starts_with("    talk"), "{w}x{h}: {rows:?}");
             } else {
@@ -13848,17 +14390,19 @@ mod tests {
         st.back();
         st.set_focus(Some("t-ops".into()));
 
-        // Narrow: one 30-column card; its title drops the project and the runtime, keeps
-        // the model and the mode.
-        let lines = draw(&st, 30, 24);
+        // Narrow: a 30-column card (the sidebar beside a narrow conversation, 75 columns);
+        // its title drops the project and the runtime, keeps the model and the mode.
+        let lines = draw_panes(&mut st, 75, 24);
+        let c = pane_text(&st, &lines, &card("t-ops"));
+        let rows: Vec<&str> = c.lines().collect();
         assert_eq!(
-            lines[0],
+            rows[0],
             "┏ ops ━━━━ opus-4-1 ━ manual ┓",
             "{}",
             screen(&lines)
         );
         assert_eq!(
-            lines[1].trim_matches(['┃', ' ']),
+            rows[1].trim_matches(['┃', ' ']),
             "idle · not started",
             "{}",
             screen(&lines)
@@ -14032,8 +14576,14 @@ mod tests {
             let l = pane_text(&st, &lines, &card("t-loc"));
             assert!(title(&l).contains("claude-code · sonnet"), "{l}");
             assert!(!l.contains('@'), "{l}");
-            // Narrow: the same heights whatever the token says.
-            let narrow = draw_panes(&mut st, 30, 40);
+            // Narrow (the sidebar's narrowest cards, 24 columns): the same heights whatever
+            // the token says.
+            let narrow = draw_panes(&mut st, 55, 40);
+            let job = st.view.panes.get(&card("t-job")).unwrap().area;
+            let narrow: Vec<String> = narrow
+                .iter()
+                .map(|l| l.chars().take(usize::from(job.right() + 1)).collect())
+                .collect();
             let both = (areas(&st), {
                 draw_panes(&mut st, 160, 40);
                 areas(&st)
@@ -14049,8 +14599,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}", screen(&narrow)));
             let body = |i: usize| narrow[at + i].trim_matches(['┃', ' ']).to_string();
             assert_eq!(body(1), "idle · not started", "{}", screen(&narrow));
-            // The project and the runtime give way, never the box's state.
-            assert!(has_token(&narrow[at], "gpu", word), "{}", screen(&narrow));
+            // The project and the runtime give way, never the box's state: in the title, or
+            // in the bottom border where the title has no room for it whole.
+            let bottom = &narrow[usize::from(job.bottom())];
+            assert!(
+                has_token(&narrow[at], "gpu", word) || has_token(bottom, "gpu", word),
+                "{}",
+                screen(&narrow)
+            );
 
             // Grid tiles.
             st.view.screen = Screen::Grid;
@@ -14482,19 +15038,20 @@ mod tests {
             s.contains("ORCHESTRATOR  claude-code:personal · claude-opus-4-1-20250805"),
             "{s}"
         );
-        // Narrow cards: the account without the runtime, then without the model.
+        // Narrow cards: the account without the runtime, then without the model. (40
+        // columns in the sidebar at 134, 30 beside a narrow conversation at 75.)
         st.set_focus(Some("t-job".into()));
-        let lines = draw(&st, 40, 24);
+        let lines = draw_panes(&mut st, 134, 24);
         assert_eq!(
-            lines[0],
+            card_title(&st, &lines, "t-job"),
             "┏ job ━━━━━━━ work · opus-4-1 ━ manual ┓",
             "{}",
             screen(&lines)
         );
         st.set_focus(Some("t-ops".into()));
-        let lines = draw(&st, 30, 24);
+        let lines = draw_panes(&mut st, 75, 24);
         assert_eq!(
-            lines[0],
+            card_title(&st, &lines, "t-ops"),
             "┏ ops ━━━━ personal ━ manual ┓",
             "{}",
             screen(&lines)
@@ -14787,9 +15344,9 @@ mod tests {
         assert_eq!(text(who_fit(&st, loc, 7)), None);
     }
 
-    /// The same, drawn: a card at its narrowest (30 columns), in the side column (34), a
-    /// 30-column tile and a tile at its narrowest (40) show the box's state whole whatever the
-    /// box's name, and the card keeps its height.
+    /// The same, drawn: a card at its narrowest (24 columns, in the sidebar beside a narrow
+    /// conversation), in the side column (34), a 30-column tile and a tile at its narrowest
+    /// (40) show the box's state whole whatever the box's name, and the card keeps its height.
     #[test]
     fn cards_and_tiles_show_the_box_state_with_a_long_box_name() {
         let mut heights: HashMap<(u16, bool), u16> = HashMap::new();
@@ -14797,7 +15354,7 @@ mod tests {
             for (entry, word) in box_cases() {
                 let mut st = on_box("job", &name, entry.clone(), |_| Vec::new());
                 for (screen_, width) in [
-                    (Screen::Stack, 30u16),
+                    (Screen::Stack, 55u16),
                     (Screen::Stack, 100),
                     (Screen::Grid, 30),
                     (Screen::Grid, 40),
@@ -15102,7 +15659,9 @@ mod tests {
                 let what = format!("{name}{word} {width}: {row:?}");
                 assert!(has_token(&row, name, word), "{what}");
                 let col = |byte: usize| u16::try_from(row[..byte].chars().count()).unwrap();
-                let at = row.find('@').unwrap();
+                // (The header's, after its `‹ back`: the card in the sidebar names it too.)
+                let back = row.find("‹ back").unwrap();
+                let at = back + row[back..].find('@').unwrap();
                 let from = at + row[at..].find(word).unwrap();
                 let to = from + word.len();
                 // `‹ back` up to the word: the header's colors.
@@ -15532,7 +16091,7 @@ mod tests {
     #[test]
     fn decisions_key_help() {
         let mut st = decisions_state();
-        let last = draw(&st, 160, 20).pop().unwrap();
+        let last = view_last(&st, 160);
         assert!(
             last.contains("Enter open thread")
                 && last.contains("f site")
@@ -15542,7 +16101,7 @@ mod tests {
             "{last}"
         );
         st.handle_key(key(KeyCode::Esc));
-        let last = draw(&st, 180, 20).pop().unwrap();
+        let last = view_last(&st, 180);
         assert!(last.contains("Ctrl-G grid"), "{last}");
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("abc", 4), "abc");
@@ -15560,7 +16119,8 @@ mod tests {
         let lines = draw_panes(&mut st, 160, 40);
         let s = screen(&lines);
         assert!(
-            lines[0].starts_with(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805 "),
+            view_part(&st, 160, &lines[0])
+                .starts_with(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805 "),
             "{s}"
         );
         for part in [
@@ -15582,24 +16142,22 @@ mod tests {
         assert_eq!(buf[(a.x + 2, a.y + 2)].symbol(), "L");
         assert_eq!(buf[(a.x + 2, a.y + 2)].fg, MUTED);
         assert_eq!(buf[(a.x + 4, a.y)].bg, Color::Indexed(237));
-        // Narrow: cards in a row above, the header cut to fit.
-        let lines = draw_panes(&mut st, 60, 30);
-        let head = lines
-            .iter()
-            .find(|l| l.starts_with(" ORCHESTRATOR"))
-            .unwrap_or_else(|| panic!("{}", screen(&lines)));
+        // Narrow, beside the narrower sidebar: the header cut to fit the view's columns.
+        let w = screen_for(&st, 60);
+        let lines = draw_panes(&mut st, w, 30);
+        let head = view_part(&st, w, &lines[0]);
         assert!(
-            head.contains("ORCHESTRATOR  claude-code · claude-opus-4-1-20250805"),
-            "{head}"
+            head.contains(" ORCHESTRATOR  claude-code · claude-opus-4-1-20250805"),
+            "{}",
+            screen(&lines)
         );
-        let lines = draw_panes(&mut st, 40, 30);
-        let head = lines
-            .iter()
-            .find(|l| l.starts_with(" ORCHESTRATOR"))
-            .unwrap();
+        let w = screen_for(&st, 40);
+        let lines = draw_panes(&mut st, w, 30);
         assert_eq!(
-            head,
-            &format!("{:40}", " ORCHESTRATOR  claude-code · claude-op…")
+            view_part(&st, w, &lines[0]),
+            format!("{:40}", " ORCHESTRATOR  claude-code · claude-op…"),
+            "{}",
+            screen(&lines)
         );
         // Very narrow: the label alone, then the label cut.
         let lines = draw_panes(&mut st, 20, 30);
@@ -15710,11 +16268,22 @@ mod tests {
         st.view.help = true;
         assert!(drawn(&mut st, 160, 40).is_empty());
         st.view.help = false;
-        // A narrow row of cards: only the cards in it.
+        // The narrower sidebar beside a narrow conversation: its cards' items, drawn whole,
+        // and the banner's.
         st.set_focus(Some("t-gamma".into()));
         let narrow = drawn(&mut st, 60, 24);
-        assert!(!narrow.iter().any(|(t, _)| t == "t-beta"), "{narrow:?}");
-        assert!(narrow.contains(&pair("t-alpha", "rv1")), "{narrow:?}");
+        for want in [
+            pair("t-orch", "oq1"),
+            pair("t-beta", "pm1"),
+            pair("t-alpha", "rv1"),
+        ] {
+            assert!(narrow.contains(&want), "{want:?} in {narrow:?}");
+        }
+        // Shorter, the sidebar scrolls to the selected card: only the cards in view.
+        let short = drawn(&mut st, 60, 12);
+        assert!(st.view.panes.get(&card("t-beta")).is_none(), "{short:?}");
+        assert!(!short.iter().any(|(t, _)| t == "t-beta"), "{short:?}");
+        assert!(short.contains(&pair("t-alpha", "rv1")), "{short:?}");
         // A summary too long for any card: its options never show whole, so it is never
         // reported (nor answerable).
         let mut b = ThreadScript::new("t-beta");
@@ -15870,8 +16439,8 @@ mod tests {
     /// (`thread.activity`'s `activity`) after its state, wrapped over the rows its section has
     /// and cut with `…` at the last; before the hub said, its state alone (its status's word,
     /// `working`, would say it twice). A card with an item open shows the item instead, not the
-    /// activity too. So at every width: beside the conversation, in the row above it and in
-    /// the grid.
+    /// activity too. So at every width: beside the conversation, wide or narrow, and in the
+    /// grid.
     #[test]
     fn cards_and_tiles_say_what_each_thread_is_doing() {
         let mut st = three_threads();
@@ -15898,13 +16467,7 @@ mod tests {
             );
             // Wrapped over the rows the section has, the last one cut with `…`.
             let rows: Vec<&str> = gamma.lines().collect();
-            // (In the row of cards above a narrow conversation, the tall card's height.)
-            let height = if w >= SIDE_MIN_WIDTH {
-                COMPACT_CARD_HEIGHT
-            } else {
-                CARD_HEIGHT
-            };
-            assert_eq!(rows.len(), usize::from(height), "{w}: {gamma}");
+            assert_eq!(rows.len(), usize::from(COMPACT_CARD_HEIGHT), "{w}: {gamma}");
             assert!(rows[rows.len() - 2].contains("x…"), "cut with …: {gamma}");
             assert!(
                 rows[0].contains("default mo"),
@@ -15965,8 +16528,10 @@ mod tests {
         let buf = crate::app::tests::draw(&mut st, 160, 40);
         let s = screen(&buffer_lines(&buf));
         assert!(titled(&s, '┏', "gamma"), "{s}");
-        // Where the line goes: the header band's fill (the pane has no border).
-        assert_eq!(buf[(0, 0)].bg, target_fill(None).bg.unwrap(), "{s}");
+        // Where the line goes: the header band's fill (the pane has no border), right of the
+        // sidebar.
+        let x0 = st.dock_width_at(160);
+        assert_eq!(buf[(x0, 0)].bg, target_fill(None).bg.unwrap(), "{s}");
         st.set_focus(None);
         let s = screen(&draw(&st, 160, 40));
         assert!(!s.contains('┏'), "nothing selected: {s}");
@@ -15988,11 +16553,11 @@ mod tests {
             .unwrap() as u16;
         assert_eq!(buf[(x, row as u16)].fg, color_of(&st, "t-beta"), "{s}");
         assert_eq!(
-            buf[(0, 0)].bg,
+            buf[(x0, 0)].bg,
             target_fill(st.dived()).bg.unwrap(),
             "the band: {s}"
         );
-        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
+        assert_eq!(buf[(x0, 0)].bg, color_of(&st, "t-beta"), "the band: {s}");
         assert_eq!(s.matches('╔').count(), 1, "only the dive's card: {s}");
         st.set_focus(Some("t-beta".into()));
         let s = screen(&draw(&st, 160, 40));
@@ -16080,7 +16645,9 @@ mod tests {
         let prompt = st.view.confirm.as_ref().expect("asks y").prompt.clone();
         assert!(prompt.chars().count() > 80, "{prompt}");
         let lines = draw(&st, 80, 30);
-        let bar = flat(&lines[20..]);
+        // The bar is under the conversation, right of the sidebar.
+        let bar: Vec<String> = lines[16..].iter().map(|l| view_part(&st, 80, l)).collect();
+        let bar = flat(&bar);
         assert!(bar.contains(&flat(&[prompt])), "{bar}");
     }
 
@@ -16167,28 +16734,27 @@ mod tests {
     fn the_header_band_and_the_input_box_say_where_a_line_goes() {
         use crate::app::tests::with_orch;
         let mut st = with_orch();
-        // The main pane, a column apart from the cards.
-        let main_w = 120 - side_width(120) - 1;
+        // The main pane, right of the sidebar's border.
         let check = |st: &mut AppState, fill: Style, border: Color, label: &str| {
             let buf = crate::app::tests::draw(st, 120, 40);
-            let band: String = (0..main_w).map(|x| buf[(x, 0)].symbol()).collect();
+            let x0 = st.dock_width_at(120);
+            let band: String = (x0..120).map(|x| buf[(x, 0)].symbol()).collect();
             assert!(band.starts_with(label), "{band}");
-            for x in 0..main_w {
+            for x in x0..120 {
                 assert_eq!(buf[(x, 0)].bg, fill.bg.unwrap(), "the whole row: {x}");
             }
-            assert_eq!(buf[(1, 0)].fg, fill.fg.unwrap());
-            assert!(buf[(1, 0)].modifier.contains(Modifier::BOLD));
+            assert_eq!(buf[(x0 + 1, 0)].fg, fill.fg.unwrap());
+            assert!(buf[(x0 + 1, 0)].modifier.contains(Modifier::BOLD));
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             let (lx, ly) = (input.x + 1, input.y - 1);
             assert_eq!(buf[(lx, ly)].symbol(), "→");
             assert_eq!(buf[(lx, ly)].bg, fill.bg.unwrap(), "the input's label");
             assert_eq!(buf[(input.x - 1, input.y)].fg, border, "the input's border");
-            // The main pane has none: its first column is the conversation's, and the column
-            // between it and the cards is blank.
-            assert!(!"┃│".contains(buf[(0, 1)].symbol()), "no border");
+            // The main pane has none: its first column is the conversation's, right of the
+            // sidebar's border.
+            assert!(!"┃│".contains(buf[(x0, 1)].symbol()), "no border");
             for y in 0..input.y - 1 {
-                assert_eq!(buf[(main_w, y)].symbol(), " ", "the gap: {y}");
-                assert_eq!(buf[(main_w, y)].bg, Color::Reset, "the gap: {y}");
+                assert_eq!(buf[(x0 - 1, y)].symbol(), "│", "the sidebar's border: {y}");
             }
         };
         check(&mut st, target_fill(None), Color::Cyan, " ORCHESTRATOR  ");
@@ -16201,13 +16767,14 @@ mod tests {
         // A working thread's icon leads the band, on the terminal's own background.
         st.dive("t-gamma");
         let buf = crate::app::tests::draw(&mut st, 120, 40);
-        assert_eq!(buf[(1, 0)].symbol(), "_");
+        let x0 = st.dock_width_at(120);
+        assert_eq!(buf[(x0 + 1, 0)].symbol(), "_");
         assert_eq!(
-            (buf[(1, 0)].fg, buf[(1, 0)].bg),
+            (buf[(x0 + 1, 0)].fg, buf[(x0 + 1, 0)].bg),
             (icon::ACCENT, Color::Reset)
         );
-        assert_eq!(buf[(3, 0)].symbol(), "‹");
-        assert_eq!(buf[(3, 0)].bg, target_fill(st.dived()).bg.unwrap());
+        assert_eq!(buf[(x0 + 3, 0)].symbol(), "‹");
+        assert_eq!(buf[(x0 + 3, 0)].bg, target_fill(st.dived()).bg.unwrap());
         // With a draft and a card selected, the input's border keeps the color; its label the
         // fill.
         st.set_focus(Some("t-beta".into()));
@@ -16611,7 +17178,7 @@ mod tests {
         let rows = compact_needs_rows(&st, 60);
         assert!(!rows.is_empty());
         for (id, line) in rows {
-            let name = &line.spans[0];
+            let name = &line[0].spans[0];
             assert_eq!(name.content, st.registry.get(&id).unwrap().name);
             assert_eq!(name.style.fg, Some(color_of(&st, &id)), "{id}");
         }
@@ -16771,8 +17338,9 @@ mod tests {
             st.dive(id);
             let color = color_of(&st, id);
             let buf = crate::app::tests::draw(&mut st, 120, 40);
-            assert_eq!(buf[(0, 0)].bg, color, "{id}");
-            let back = (0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
+            let x0 = st.dock_width_at(120);
+            assert_eq!(buf[(x0, 0)].bg, color, "{id}");
+            let back = (x0..120).find(|x| buf[(*x, 0)].symbol() == "‹").unwrap();
             assert_eq!(buf[(back, 0)].fg, crate::color::text_on(color), "{id}");
             let input = st.view.panes.get(&PaneId::Input).unwrap().area;
             assert_eq!(buf[(input.x - 1, input.y)].fg, color, "{id}: the border");
@@ -16812,7 +17380,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(buf[(0, 0)].bg, Color::Magenta, "the band");
+        let x0 = st.dock_width_at(160);
+        assert_eq!(buf[(x0, 0)].bg, Color::Magenta, "the band");
         let cards = card_corners(&st, &buf);
         let corner = |id: &str| cards.iter().find(|(i, ..)| i == id).unwrap().1;
         assert_eq!(corner("t-alpha").fg, Color::DarkGray);
@@ -16829,7 +17398,7 @@ mod tests {
             "{s}"
         );
         assert!(
-            buf[(0, 0)].modifier.contains(Modifier::REVERSED),
+            buf[(x0, 0)].modifier.contains(Modifier::REVERSED),
             "the band"
         );
         let cards = card_corners(&st, &buf);
@@ -16841,7 +17410,7 @@ mod tests {
         // Full color draws as it always did.
         st.view.colors = crate::color::Depth::Full;
         let buf = crate::app::tests::draw(&mut st, 160, 40);
-        assert_eq!(buf[(0, 0)].bg, color_of(&st, "t-beta"));
+        assert_eq!(buf[(x0, 0)].bg, color_of(&st, "t-beta"));
         // The compact tab bar without colors: the current tab alone is reversed.
         let mut st = three_threads();
         st.view.compact_width = 60;
@@ -18264,9 +18833,9 @@ mod tests {
     }
 
     /// A finished thread's report takes the rows its title (who runs it is there now) and its
-    /// fixed height leave: 4 on a card in the column (34 and 48 columns) and on the compact
-    /// Threads screen at 40x20, 8 in the row of cards above a narrow conversation (its cards are
-    /// all 11 rows tall), 6 on a grid tile; its last row ends in `…`, the git line under it.
+    /// fixed height leave: 4 on a card in the column (32, 34 and 48 columns) and on the
+    /// compact Threads screen at 40x20, 6 on a grid tile; its last row ends in `…`, the git
+    /// line under it.
     #[test]
     fn the_status_section_takes_up_to_four_rows() {
         use crate::app::tests::control;
@@ -18298,7 +18867,7 @@ mod tests {
         for (w, h, grid, compact, rows) in [
             (100u16, 40u16, false, false, 4),
             (160, 40, false, false, 4),
-            (60, 40, false, false, 8),
+            (80, 40, false, false, 4),
             (40, 20, false, true, 4),
             (90, 40, true, false, 6),
         ] {
@@ -18616,7 +19185,14 @@ mod tests {
                         let first = text.lines().nth(1).unwrap_or_default();
                         assert!(first.contains(&card_status(t)), "{what}:\n{text}");
                         if t.status() != ThreadStatus::Waiting {
-                            assert!(first.contains(" · implementing"), "{what}:\n{text}");
+                            // Right after it: wrapped to the next row on a narrow card, or
+                            // cut with `…` where an item takes the rest.
+                            let body = text.lines().skip(1).collect::<Vec<_>>().join("\n");
+                            let status = flat(&[card_status(t)]);
+                            assert!(
+                                card_words(&body).contains(&format!("{status} · im")),
+                                "{what}:\n{text}"
+                            );
                         }
                     }
                 }
