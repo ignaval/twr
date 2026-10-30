@@ -64,11 +64,15 @@ pub fn grade(ctx: &GradeContext) -> Option<(Grade, f64)> {
 }
 
 /// The code block_kind rule: the adapter flagged the failure as a sign-in failure → user
-/// blocked (never retried, whatever a later rung would say); transient → transient;
-/// otherwise abstain (the caller's default is [`BlockKind::UserBlocked`]).
+/// blocked (never retried, whatever a later rung would say); a usage or spending limit →
+/// limited (never retried at once); transient → transient; otherwise abstain (the caller's
+/// default is [`BlockKind::UserBlocked`]).
 pub fn block_kind(ctx: &BlockContext) -> Option<BlockKind> {
     if ctx.auth_failed {
         return Some(BlockKind::UserBlocked);
+    }
+    if ctx.limited {
+        return Some(BlockKind::Limited);
     }
     ctx.transient.then_some(BlockKind::Transient)
 }

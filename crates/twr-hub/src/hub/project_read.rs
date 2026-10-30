@@ -799,8 +799,7 @@ impl Hub {
     fn local_git(&self) -> Result<std::sync::Arc<dyn twr_core::git::GitOps>, RpcError> {
         Ok(self
             .inner
-            .hosts
-            .get(LOCAL_BOX)
+            .host(LOCAL_BOX)
             .ok_or_else(|| internal("the hub has no local box"))?
             .git())
     }

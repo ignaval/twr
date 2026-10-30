@@ -3,7 +3,8 @@
 //! its absolute path had been given, and the result says which one (`project_found`). Several
 //! are `ambiguous`, none is `not_found` naming the roots; folders that are not git
 //! repositories are ignored; an empty `project_roots` turns the lookup off; a configured
-//! project wins; a thread on a remote box never searches the hub's disk.
+//! project wins; a thread on a remote box never searches the hub's disk, and a project the
+//! box does not have says to run `twr box project`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -212,6 +213,15 @@ async fn a_thread_on_a_remote_box_does_not_search_the_hub() {
             ..Default::default()
         },
     );
+    // A project of the hub whose repository the box does not have.
+    let ghost = r.root.join("missing").join("ghost");
+    config.projects.insert(
+        "ghost".into(),
+        ProjectConfig {
+            repo: ghost.clone(),
+            ..Default::default()
+        },
+    );
     let mut o = opts(&r.root.join("hub"), config);
     o.stop_timeout = Duration::from_secs(5);
     let listener = RunnerListener::bind(&o.config.hub).await.unwrap().unwrap();
@@ -222,6 +232,7 @@ async fn a_thread_on_a_remote_box_does_not_search_the_hub() {
     let mut ro = RunnerOptions::new(&url, Secret::new(TOKEN), BOX, &rdir);
     ro.backoff_min = Duration::from_millis(20);
     ro.backoff_max = Duration::from_millis(200);
+    ro.refused_retry = Duration::from_millis(200);
     let mut box_opts = LocalBoxOptions::new(&rdir, BOX);
     box_opts.adapters = Arc::new(|name: &str| -> Option<Arc<dyn Adapter>> {
         match name {
@@ -268,6 +279,55 @@ async fn a_thread_on_a_remote_box_does_not_search_the_hub() {
         !remote.message.contains(local.to_str().unwrap()),
         "{remote}"
     );
+    // What to do: find or clone it on the box.
+    assert!(
+        remote
+            .message
+            .contains("run `twr box project gpu orbit` to find or clone it there"),
+        "{remote}"
+    );
+    // A configured project whose repository is not on the box says so too.
+    let missing = hub
+        .new_thread(
+            NewThread {
+                project: "ghost".into(),
+                runtime: Some("fake".into()),
+                name: Some("ghost".into()),
+                box_name: Some(BOX.into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        missing
+            .message
+            .contains("project \"ghost\" is not on box \"gpu\""),
+        "{missing}"
+    );
+    assert!(
+        missing.message.contains(ghost.to_str().unwrap())
+            && missing
+                .message
+                .contains("run `twr box project gpu ghost` to find or clone it there"),
+        "{missing}"
+    );
+    // An absolute path that is not there: no hint (nothing to record).
+    let path = hub
+        .new_thread(
+            NewThread {
+                project: ghost.to_string_lossy().into_owned(),
+                runtime: Some("fake".into()),
+                name: Some("path".into()),
+                box_name: Some(BOX.into()),
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap_err();
+    assert!(!path.message.contains("twr box project"), "{path}");
     assert!(hub.list_threads().is_empty());
 
     // The same name on the hub's own box is found.

@@ -108,6 +108,15 @@ impl Adapter for FailingOrch {
 }
 
 async fn start_with(orch: Arc<dyn Adapter>, spawns: mpsc::UnboundedReceiver<OrchRt>) -> TestHub {
+    start_tweaked(orch, spawns, |_| {}).await
+}
+
+/// [`start_with`], with the hub's options changed by `tweak`.
+async fn start_tweaked(
+    orch: Arc<dyn Adapter>,
+    spawns: mpsc::UnboundedReceiver<OrchRt>,
+    tweak: impl FnOnce(&mut HubOptions),
+) -> TestHub {
     let dir = tempfile::tempdir().unwrap();
     let paths = Paths::with_home(dir.path());
     let listener = server::bind(&paths.socket).await.unwrap();
@@ -128,6 +137,7 @@ async fn start_with(orch: Arc<dyn Adapter>, spawns: mpsc::UnboundedReceiver<Orch
     // The orchestrator runtime runs in this process: there is no process for its MCP server
     // to descend from, so the token is taken from this process's connections.
     opts.orchestrator_token_unverified = true;
+    tweak(&mut opts);
     let hub = Hub::open(opts).await.unwrap();
     let task = tokio::spawn(server::serve(
         hub.clone(),
@@ -373,6 +383,152 @@ async fn the_orchestrator_calls_only_its_methods() {
     // Still the orchestrator, and the hub still runs.
     let info = o.call("hub.info", Value::Null).await.unwrap();
     assert_eq!(info["identity"], "orchestrator");
+    drop(rt);
+    th.stop().await;
+}
+
+/// The orchestrator cannot compact a worker's context: neither through `thread.compact` nor by
+/// sending the runtime's own command as a prompt (`/compact`, any case, with or without
+/// instructions; delivered as is, Claude Code and Grok Build would run it), now or held for
+/// other threads. The user's own `/compact` message is pointed to `thread.compact`.
+#[tokio::test]
+async fn the_orchestrator_cannot_compact_a_worker() {
+    let mut th = start().await;
+    let mut c = th.client("cli").await;
+    let rt = th.with_orchestrator(&mut c).await;
+    let mut o = Client::connect(&th.socket).await.unwrap();
+    o.hello(json!({"client": "orchestrator", "token": rt.token()}))
+        .await
+        .unwrap();
+    let e = o
+        .call("thread.compact", json!({"thread": "api"}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::UNAUTHORIZED);
+    for prompt in [
+        "/compact",
+        "  /COMPACT keep the plan",
+        "/Compact\nfocus on tests",
+    ] {
+        let e = o
+            .call("thread.send", json!({"thread": "api", "prompt": prompt}))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::UNAUTHORIZED, "{prompt:?}");
+        let e = o
+            .call(
+                "thread.send",
+                json!({"thread": "api", "prompt": prompt, "after": ["web"]}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), codes::UNAUTHORIZED, "after: {prompt:?}");
+    }
+    // A word that only starts like it is a prompt as any.
+    o.call(
+        "thread.send",
+        json!({"thread": "api", "prompt": "/compacting is next"}),
+    )
+    .await
+    .unwrap();
+    // The user's own is pointed to the compaction's way.
+    let e = c
+        .call(
+            "thread.send",
+            json!({"thread": "web", "prompt": "/compact"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::BAD_REQUEST);
+    drop(rt);
+    th.stop().await;
+}
+
+/// What the orchestrator reads of the boxes over its connection: each box's name, state,
+/// whether it is online, its version and its agents, and of each agent whether it is found
+/// and signed in (`hub.info`, `box.agents`), where the user's connection reads everything; a
+/// fresh probe of a box's agents is the user's alone.
+#[tokio::test]
+async fn the_orchestrator_reads_the_boxes_state_only() {
+    use futures::FutureExt;
+    use twr_core::runner::{AgentInfo, AgentLogin};
+    let (tx, spawns) = mpsc::unbounded_channel();
+    let mut th = start_tweaked(Arc::new(OrchAdapter(tx)), spawns, |o| {
+        o.config.boxes.insert(
+            "gpu".into(),
+            twr_core::config::BoxConfig {
+                token: Some("gpu-token-0123456789abcdef0123456789".into()),
+                ssh: Some("me@gpu.invalid".into()),
+                ..Default::default()
+            },
+        );
+        o.agent_probe = Some(Arc::new(|| {
+            async {
+                vec![AgentInfo {
+                    runtime: "claude-code".into(),
+                    found: true,
+                    path: Some("/home/me/.local/bin/claude".into()),
+                    version: Some("2.1.302 (Claude Code)".into()),
+                    login: AgentLogin::LoggedIn,
+                    method: Some("claude.ai".into()),
+                    note: None,
+                }]
+            }
+            .boxed()
+        }));
+    })
+    .await;
+    let mut c = th.client("cli").await;
+    let rt = th.with_orchestrator(&mut c).await;
+    let mut o = Client::connect(&th.socket).await.unwrap();
+    o.hello(json!({"client": "orchestrator", "token": rt.token()}))
+        .await
+        .unwrap();
+    timeout(WAIT, async {
+        while th.hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hub's own probe");
+
+    let full = c.call("hub.info", Value::Null).await.unwrap();
+    assert_eq!(full["boxes"][0]["transport"], "token", "{full}");
+    assert_eq!(full["agents"][0]["path"], "/home/me/.local/bin/claude");
+    let info = o.call("hub.info", Value::Null).await.unwrap();
+    assert_eq!(info["identity"], "orchestrator");
+    assert_eq!(
+        info["boxes"],
+        json!([{"name": "gpu", "state": "offline", "online": false, "version": null, "agents": []}])
+    );
+    assert_eq!(
+        info["agents"],
+        json!([{"runtime": "claude-code", "found": true, "login": "logged_in"}])
+    );
+    assert!(!info.to_string().contains("/home/me"), "{info}");
+    let local = o.call("box.agents", json!({"box": "local"})).await.unwrap();
+    assert_eq!(
+        local,
+        json!({"box": "local", "online": true, "agents": [{"runtime": "claude-code", "found": true, "login": "logged_in"}]})
+    );
+    let gpu = o.call("box.agents", json!({"box": "gpu"})).await.unwrap();
+    assert_eq!(gpu, json!({"box": "gpu", "online": false, "agents": []}));
+    let e = o
+        .call("box.agents", json!({"box": "local", "refresh": true}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::UNAUTHORIZED);
+    // The user's: everything, a fresh probe too (`box_offline` for a box that is not there).
+    let mine = c
+        .call("box.agents", json!({"box": "local", "refresh": true}))
+        .await
+        .unwrap();
+    assert_eq!(mine["agents"][0]["method"], "claude.ai", "{mine}");
+    let e = c
+        .call("box.agents", json!({"box": "gpu", "refresh": true}))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), codes::BOX_OFFLINE);
     drop(rt);
     th.stop().await;
 }
@@ -685,4 +841,28 @@ async fn reset_over_the_socket_changes_only_the_selected_instance() {
     drop((old_rt, fresh_rt, b_rt));
     a.stop().await;
     b.stop().await;
+}
+
+/// A suggested message goes to the orchestrator only: routed (no `to`, or `to: null`), an
+/// `@thread yes` in it would answer as the user, so it is refused and nothing is sent.
+#[tokio::test]
+async fn a_suggested_say_must_go_to_the_orchestrator() {
+    let th = start().await;
+    let mut c = th.client("tui").await;
+    for params in [
+        json!({"message": "@api yes", "suggested": true}),
+        json!({"message": "@api yes", "suggested": true, "to": null}),
+    ] {
+        let e = c.call("say", params.clone()).await.unwrap_err();
+        assert_eq!(code(&e), "bad_request", "{params}: {e:#}");
+    }
+    let r = c
+        .call(
+            "say",
+            json!({"message": "and the docs", "suggested": true, "to": "orchestrator"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    th.stop().await;
 }

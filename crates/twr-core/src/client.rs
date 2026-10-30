@@ -2,7 +2,9 @@
 //!
 //! One [`Client`] carries sequential request/response calls. Subscriptions use a dedicated
 //! connection: [`Client::subscribe`] consumes the client, waits for the acknowledgement and
-//! then yields [`StreamItem`]s.
+//! then yields [`StreamItem`]s. A speaker's connection ([`SpeechLink`]) goes both ways: it
+//! reads `speech` items and reports its state on the same connection; [`Client::into_raw`]
+//! hands over the connection's lines as they are (`twr speech feed`'s proxy).
 
 use std::path::Path;
 
@@ -10,12 +12,12 @@ use anyhow::{anyhow, Context};
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::blob::BlobFetch;
 use crate::proto::{
-    codes, read_frame, write_frame, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
+    codes, encode_line, read_message, Request, RpcError, ServerMessage, StreamItem, BLOB_CHUNK_MAX,
     PROTOCOL_VERSION,
 };
 
@@ -86,6 +88,114 @@ fn check_socket_owner(path: &Path, peer: std::io::Result<u32>, me: u32) -> anyho
     }
 }
 
+/// How long a call whose request could not be written waits for what the hub said as it
+/// closed the connection ([`parting_words`]): it is already there, or never comes.
+const PARTING_READ: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The hub closed a call's connection before answering it: it stopped or restarted (or
+/// crashed) since the connection was opened, or could not read the request. [`Client::call`]
+/// returns it (`err.downcast_ref::<HubClosed>()`).
+#[derive(Debug)]
+pub struct HubClosed {
+    /// The method called.
+    pub method: String,
+    /// Whether the hub may have done it: it got some or all of the request and closed before
+    /// it answered. When not, nothing was done ([`HubClosed::resendable`]).
+    pub maybe_done: bool,
+    /// What the hub said as it closed: its error for the connection (request 0), such as
+    /// [`codes::STOPPING`] or a request it could not read ([`codes::BAD_REQUEST`]).
+    pub said: Option<RpcError>,
+    /// The I/O error that showed the connection was closed, if one did.
+    io: Option<std::io::Error>,
+}
+
+impl HubClosed {
+    /// The error for `method` ([`HubClosed::maybe_done`], [`HubClosed::said`]), with the I/O
+    /// error that showed it (`io`).
+    pub fn new(
+        method: &str,
+        maybe_done: bool,
+        said: Option<RpcError>,
+        io: Option<std::io::Error>,
+    ) -> HubClosed {
+        HubClosed {
+            method: method.to_string(),
+            maybe_done,
+            said,
+            io,
+        }
+    }
+
+    /// Whether the request can be sent again on a new connection: the hub did nothing with it
+    /// and did not refuse it (it closed this connection, it stopped). Even a `thread.send` then
+    /// goes once.
+    pub fn resendable(&self) -> bool {
+        !self.maybe_done && self.said.as_ref().is_none_or(|e| e.code == codes::STOPPING)
+    }
+}
+
+impl std::fmt::Display for HubClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let method = &self.method;
+        match &self.said {
+            Some(e) if e.code != codes::STOPPING => {
+                return write!(
+                    f,
+                    "the hub refused the request for {method} and closed the connection: {}",
+                    e.message
+                );
+            }
+            _ => {}
+        }
+        if self.maybe_done {
+            write!(
+                f,
+                "the hub closed the connection before answering {method}; it may have been \
+                 done, so check before trying again"
+            )?;
+        } else {
+            write!(
+                f,
+                "the hub closed the connection before {method} reached it (nothing was done)"
+            )?;
+        }
+        if let Some(e) = &self.said {
+            write!(f, ": {}", e.message)?;
+        } else if let Some(e) = &self.io {
+            write!(f, " ({e})")?;
+        }
+        write!(f, "; is it running? `twr info`")
+    }
+}
+
+// Without a source: the I/O error is part of the message, before what to do.
+impl std::error::Error for HubClosed {}
+
+/// Whether I/O error `e` on a hub connection means the hub closed it.
+fn connection_closed(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::*;
+    matches!(
+        e.kind(),
+        BrokenPipe | ConnectionReset | ConnectionAborted | NotConnected | UnexpectedEof
+    )
+}
+
+/// The hub's error for a connection it closed (a response to request 0), read from what is
+/// left of it.
+async fn parting_words(reader: &mut Reader) -> Option<RpcError> {
+    loop {
+        match read_message(reader).await {
+            Ok(Some(ServerMessage::Response(r))) if r.id == 0 => {
+                if let Err(e) = r.result {
+                    return Some(e);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    }
+}
+
 impl Client {
     /// Connects to the hub socket at `path`. A path too long for a Unix socket fails with a
     /// clear message ([`crate::paths::check_socket_path`]), and so does a socket whose listener
@@ -125,17 +235,56 @@ impl Client {
             method: method.to_string(),
             params,
         };
-        write_frame(&mut self.writer, &req)
-            .await
-            .context("writing request to hub")?;
-        loop {
-            let msg: Option<ServerMessage> = read_frame(&mut self.reader)
+        let line = encode_line(&req).context("encoding request")?;
+        let mut sent = 0;
+        while sent < line.len() {
+            let e = match self.writer.write(&line.as_bytes()[sent..]).await {
+                Ok(0) => std::io::Error::from(std::io::ErrorKind::WriteZero),
+                Ok(n) => {
+                    sent += n;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => e,
+            };
+            if !connection_closed(&e) && e.kind() != std::io::ErrorKind::WriteZero {
+                return Err(anyhow::Error::new(e).context("writing request to hub"));
+            }
+            // None of it was taken: the hub had closed the connection, and did nothing. (Some
+            // of it may be a request the hub reads to its end: then it may have done it.) What
+            // the hub said as it hung up may be waiting to be read.
+            let said = tokio::time::timeout(PARTING_READ, parting_words(&mut self.reader))
                 .await
-                .context("reading from hub")?;
+                .unwrap_or(None);
+            return Err(HubClosed::new(method, sent > 0, said, Some(e)).into());
+        }
+        // Written whole (a socket's flush does nothing, another stream's may), the hub may have
+        // it: a failure from here on may come after it was done.
+        if let Err(e) = self.writer.flush().await {
+            if !connection_closed(&e) {
+                return Err(anyhow::Error::new(e).context("writing request to hub"));
+            }
+            return Err(HubClosed::new(method, true, None, Some(e)).into());
+        }
+        loop {
+            let msg = match read_message(&mut self.reader).await {
+                Ok(msg) => msg,
+                Err(e) if connection_closed(&e) => {
+                    return Err(HubClosed::new(method, true, None, Some(e)).into());
+                }
+                Err(e) => return Err(anyhow::Error::new(e).context("reading from hub")),
+            };
             match msg {
-                None => return Err(anyhow!("hub closed the connection during {method}")),
+                None => return Err(HubClosed::new(method, true, None, None).into()),
                 Some(ServerMessage::Response(r)) if r.id == id => {
                     return r.result.map_err(anyhow::Error::new);
+                }
+                // The hub's error for the connection (request 0), which it closes next: it is
+                // stopping (it read nothing more, this request included), or it could not read
+                // the request's line (malformed, or longer than `MAX_FRAME`).
+                Some(ServerMessage::Response(r)) if r.id == 0 && r.result.is_err() => {
+                    let said = r.result.err();
+                    return Err(HubClosed::new(method, false, said, None).into());
                 }
                 Some(ServerMessage::Response(r)) => {
                     tracing::debug!(id = r.id, "ignoring response to another request");
@@ -185,6 +334,15 @@ impl Client {
     ) -> anyhow::Result<T> {
         let v = self.request(method, params).await?;
         serde_json::from_value(v).with_context(|| format!("decoding {method} result"))
+    }
+
+    /// `summary.thread`: a one-line summary of where a worker thread stands (users only).
+    pub async fn summary_thread(
+        &mut self,
+        params: &crate::proto::SummaryThreadParams,
+    ) -> anyhow::Result<crate::proto::SummaryThreadResult> {
+        self.call_as("summary.thread", serde_json::to_value(params)?)
+            .await
     }
 
     /// Fetches a whole blob with chunked `blob.get` calls (each at most [`BLOB_CHUNK_MAX`]
@@ -255,6 +413,164 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The connection's line halves, as they are: each line the hub sends as JSON, and lines
+    /// of yours written as given. For a proxy that passes lines on (`twr speech feed`).
+    pub fn into_raw(self) -> (RawReader, RawWriter) {
+        (RawReader(self.reader), RawWriter(self.writer))
+    }
+}
+
+/// The hub's side of a connection, line by line ([`Client::into_raw`]).
+pub struct RawReader(Reader);
+
+impl RawReader {
+    /// The next line the hub sent, as JSON; `Ok(None)` when it closed the connection.
+    pub async fn next(&mut self) -> anyhow::Result<Option<Value>> {
+        crate::proto::read_frame(&mut self.0)
+            .await
+            .context("reading from hub")
+    }
+}
+
+/// Your side of a connection, line by line ([`Client::into_raw`]).
+pub struct RawWriter(Writer);
+
+impl RawWriter {
+    /// Writes `line` as one line.
+    pub async fn send(&mut self, line: &Value) -> anyhow::Result<()> {
+        let text = encode_line(line).context("encoding request")?;
+        self.0
+            .write_all(text.as_bytes())
+            .await
+            .context("writing to hub")?;
+        self.0.flush().await.context("writing to hub")
+    }
+}
+
+/// A speaker's connection to a hub (`speech.attach`): the `speech` items it gets, and its
+/// state reported back on the same connection (`speech.state`). Dropping it closes the
+/// connection, which detaches the speaker.
+pub struct SpeechLink {
+    items: tokio::sync::mpsc::Receiver<anyhow::Result<crate::speech::SpeechItem>>,
+    writer: std::sync::Arc<tokio::sync::Mutex<RawWriter>>,
+    next_id: std::sync::atomic::AtomicU64,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl std::fmt::Debug for SpeechLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpeechLink").finish_non_exhaustive()
+    }
+}
+
+impl Drop for SpeechLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SpeechLink {
+    /// Attaches a speaker on `client`'s connection (after its `hello`): `speech.attach` with
+    /// `params`, its ack, then the link. The hub's error (`conflict`: another speaker of
+    /// this device is attached) is an [`RpcError`].
+    pub async fn attach(
+        client: Client,
+        params: &crate::speech::SpeechAttachParams,
+    ) -> anyhow::Result<(crate::speech::SpeechAttachAck, SpeechLink)> {
+        let (mut reader, mut writer) = client.into_raw();
+        writer
+            .send(&serde_json::json!({
+                "id": 1, "method": "speech.attach", "params": params,
+            }))
+            .await?;
+        let ack = loop {
+            let Some(line) = reader.next().await? else {
+                anyhow::bail!("the hub closed the connection before it attached the speaker");
+            };
+            if line.get("stream").is_some() {
+                continue;
+            }
+            let id = line.get("id").and_then(Value::as_u64);
+            if let Some(err) = line.get("error") {
+                let e: RpcError = serde_json::from_value(err.clone())
+                    .unwrap_or_else(|_| RpcError::new(codes::INTERNAL, err.to_string()));
+                return Err(anyhow::Error::new(e));
+            }
+            if id == Some(1) {
+                break serde_json::from_value(line.get("result").cloned().unwrap_or(Value::Null))
+                    .context("reading the hub's speech.attach ack")?;
+            }
+        };
+        let (tx, items) = tokio::sync::mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            loop {
+                let line = match reader.next().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => return,
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                };
+                if line.get("stream").and_then(Value::as_str) == Some("speech") {
+                    let item =
+                        serde_json::from_value(line.get("item").cloned().unwrap_or(Value::Null));
+                    match item {
+                        Ok(item) => {
+                            if tx.send(Ok(item)).await.is_err() {
+                                return;
+                            }
+                        }
+                        // An item of a newer hub: skipped.
+                        Err(e) => tracing::debug!("skipping a speech item: {e}"),
+                    }
+                    continue;
+                }
+                // The hub's error for the connection, which it closes next.
+                if line.get("id").and_then(Value::as_u64) == Some(0) {
+                    if let Some(err) = line.get("error") {
+                        let _ = tx
+                            .send(Err(anyhow!("the hub closed the connection: {err}")))
+                            .await;
+                        return;
+                    }
+                }
+                if let Some(err) = line.get("error") {
+                    tracing::debug!("speech.state refused: {err}");
+                }
+            }
+        });
+        Ok((
+            ack,
+            SpeechLink {
+                items,
+                writer: std::sync::Arc::new(tokio::sync::Mutex::new(writer)),
+                next_id: std::sync::atomic::AtomicU64::new(2),
+                task,
+            },
+        ))
+    }
+
+    /// The next item; `None` once the connection ended (the hub went away), `Some(Err)` when
+    /// it failed.
+    pub async fn next(&mut self) -> Option<anyhow::Result<crate::speech::SpeechItem>> {
+        self.items.recv().await
+    }
+
+    /// Reports the speaker's state (`speech.state`), without waiting for the answer.
+    pub async fn state(&self, state: &crate::speech::SpeechStateParams) -> anyhow::Result<()> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.writer
+            .lock()
+            .await
+            .send(&serde_json::json!({"id": id, "method": "speech.state", "params": state}))
+            .await
+    }
+}
+
 impl BlobFetch for Client {
     fn fetch(
         &mut self,
@@ -289,7 +605,7 @@ impl Subscription {
     /// Next pushed item; `Ok(None)` when the hub closes the stream.
     pub async fn next(&mut self) -> anyhow::Result<Option<StreamItem>> {
         loop {
-            let msg: Option<ServerMessage> = read_frame(&mut self.reader)
+            let msg: Option<ServerMessage> = read_message(&mut self.reader)
                 .await
                 .context("reading subscription")?;
             match msg {
@@ -321,10 +637,88 @@ impl Subscription {
 mod tests {
     use super::*;
     use crate::event::{Event, EventBody, SessionPayload, Source};
-    use crate::proto::{codes, Response, RpcError, StreamKind};
+    use crate::proto::{codes, read_frame, write_frame, Response, RpcError, StreamKind};
     use futures::StreamExt;
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A speaker's link reads its items and reports its state on the same connection, the
+    /// two interleaved; a refused attach is the hub's error.
+    #[tokio::test]
+    async fn speech_link_goes_both_ways() {
+        use crate::speech::*;
+        let (ours, theirs) = tokio::io::duplex(64 * 1024);
+        let client = Client::from_io(ours);
+        let server = tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let req: Value = read_frame(&mut r).await.unwrap().unwrap();
+            assert_eq!(req["method"], "speech.attach");
+            assert_eq!(req["params"]["device"], "dev1");
+            let line = |v: Value| format!("{v}\n");
+            w.write_all(
+                line(json!({"id": 1, "result": {"orchestrator": "o1", "head": 7}})).as_bytes(),
+            )
+            .await
+            .unwrap();
+            let item = json!({"stream": "speech", "item": {"item": "ctl", "op": "stop"}});
+            w.write_all(line(item.clone()).as_bytes()).await.unwrap();
+            // The state request comes in while items go out.
+            let st: Value = read_frame(&mut r).await.unwrap().unwrap();
+            assert_eq!(st["method"], "speech.state");
+            assert_eq!(st["params"]["queued"], 2);
+            w.write_all(line(json!({"id": st["id"], "result": {}})).as_bytes())
+                .await
+                .unwrap();
+            let unknown = json!({"stream": "speech", "item": {"item": "future-kind"}});
+            w.write_all(line(unknown).as_bytes()).await.unwrap();
+            w.write_all(line(item).as_bytes()).await.unwrap();
+        });
+        let params = SpeechAttachParams {
+            device: "dev1".into(),
+            name: "test".into(),
+            engine: "fake".into(),
+            voice: None,
+            live: true,
+            read: default_read(),
+            turn_from: TurnsRead::All,
+            watermarks: Default::default(),
+            catchup_secs: 120,
+        };
+        let (ack, mut link) = SpeechLink::attach(client, &params).await.unwrap();
+        assert_eq!(ack.orchestrator.as_deref(), Some("o1"));
+        assert_eq!(ack.head, 7);
+        let stop = SpeechItem::Ctl {
+            op: CtlOp::Stop,
+            value: None,
+        };
+        assert_eq!(link.next().await.unwrap().unwrap(), stop);
+        link.state(&SpeechStateParams {
+            queued: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        // The unknown item is skipped; the next one comes.
+        assert_eq!(link.next().await.unwrap().unwrap(), stop);
+        server.await.unwrap();
+        assert!(link.next().await.is_none());
+
+        let (ours, theirs) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let (r, mut w) = tokio::io::split(theirs);
+            let mut r = tokio::io::BufReader::new(r);
+            let _: Value = read_frame(&mut r).await.unwrap().unwrap();
+            let refused = json!({"id": 1, "error": {"code": "conflict", "message": "another"}});
+            w.write_all(format!("{refused}\n").as_bytes())
+                .await
+                .unwrap();
+        });
+        let e = SpeechLink::attach(Client::from_io(ours), &params)
+            .await
+            .unwrap_err();
+        assert_eq!(e.downcast_ref::<RpcError>().unwrap().code, codes::CONFLICT);
+    }
 
     /// A release client never reads the test token file, let alone sends it; a debug one
     /// sends what the file holds, trimmed.
@@ -338,6 +732,218 @@ mod tests {
         );
         assert_eq!(user_token_of(" \n"), None);
         assert_eq!(user_token_of(&"x".repeat(257)), None);
+    }
+
+    /// A client and the hub's end of its connection.
+    fn pair() -> (Client, tokio::net::UnixStream) {
+        let (c, h) = tokio::net::UnixStream::pair().unwrap();
+        (Client::from_io(c), h)
+    }
+
+    fn line(r: &Response) -> Vec<u8> {
+        let mut l = serde_json::to_vec(r).unwrap();
+        l.push(b'\n');
+        l
+    }
+
+    fn stopping() -> Response {
+        Response::err(0, RpcError::new(codes::STOPPING, "the hub is stopping"))
+    }
+
+    async fn closed_on(c: &mut Client) -> (HubClosed, String) {
+        let e = c
+            .call("thread.send", json!({"thread": "w1", "prompt": "hi"}))
+            .await
+            .unwrap_err();
+        let shown = format!("{e:#}");
+        let closed = e.downcast::<HubClosed>().expect("a HubClosed");
+        (closed, shown)
+    }
+
+    /// A connection the hub closed as it stopped (the TUI's, the MCP server's, kept open):
+    /// the next call cannot be written, so nothing was done, and the error says why the hub
+    /// went (what it said as it closed) and what to check, not "Broken pipe".
+    #[tokio::test]
+    async fn a_call_on_a_connection_the_hub_closed_says_so() {
+        let (mut c, mut hub) = pair();
+        hub.write_all(&line(&stopping())).await.unwrap();
+        drop(hub);
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(!closed.maybe_done && closed.resendable(), "{closed:?}");
+        assert_eq!(closed.said.as_ref().unwrap().code, codes::STOPPING);
+        assert_eq!(
+            shown,
+            "the hub closed the connection before thread.send reached it (nothing was done): \
+             the hub is stopping; is it running? `twr info`"
+        );
+
+        // A hub that said nothing (one that crashed, or older than the notice).
+        let (mut c, hub) = pair();
+        drop(hub);
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(closed.resendable(), "{closed:?}");
+        assert!(
+            shown.starts_with(
+                "the hub closed the connection before thread.send reached it (nothing was \
+                 done) (Broken pipe"
+            ) && shown.ends_with("; is it running? `twr info`"),
+            "{shown}"
+        );
+    }
+
+    /// The hub read the request and closed before it answered: it may have been done, so it
+    /// is not sent again, and the error says to check.
+    #[tokio::test]
+    async fn a_call_the_hub_had_is_not_sent_again() {
+        let (mut c, hub) = pair();
+        let reader = tokio::spawn(async move {
+            let mut r = BufReader::new(hub);
+            let mut got = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut r, &mut got)
+                .await
+                .unwrap();
+            got
+        });
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(reader.await.unwrap().contains("thread.send"));
+        assert!(closed.maybe_done && !closed.resendable(), "{closed:?}");
+        assert_eq!(
+            shown,
+            "the hub closed the connection before answering thread.send; it may have been \
+             done, so check before trying again; is it running? `twr info`"
+        );
+    }
+
+    /// A stream that takes every byte, then fails to flush: the hub may have the request.
+    struct FlushFails(tokio::io::DuplexStream);
+
+    impl AsyncRead for FlushFails {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for FlushFails {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// A stream that takes as many bytes as it holds, then fails.
+    struct TakesSome(usize);
+
+    impl AsyncRead for TakesSome {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TakesSome {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let n = self.0.min(buf.len());
+            self.0 -= n;
+            std::task::Poll::Ready(if n == 0 {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            } else {
+                Ok(n)
+            })
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A request the stream took part of (all but its newline, say: a hub reads a last line
+    /// without one) may have been done; one it took none of was not.
+    #[tokio::test]
+    async fn only_a_request_none_of_which_was_taken_is_resendable() {
+        let (closed, _) = closed_on(&mut Client::from_io(TakesSome(0))).await;
+        assert!(closed.resendable(), "{closed:?}");
+        let line = encode_line(&Request {
+            id: 1,
+            method: "thread.send".into(),
+            params: json!({"thread": "w1", "prompt": "hi"}),
+        })
+        .unwrap();
+        for taken in [1, line.len() - 1] {
+            let (closed, _) = closed_on(&mut Client::from_io(TakesSome(taken))).await;
+            assert!(
+                closed.maybe_done && !closed.resendable(),
+                "{taken}: {closed:?}"
+            );
+        }
+    }
+
+    /// A request written whole whose flush fails may have been done: never resent.
+    #[tokio::test]
+    async fn a_failed_flush_after_a_whole_request_is_not_resendable() {
+        let (c, _hub) = tokio::io::duplex(1 << 16);
+        let mut c = Client::from_io(FlushFails(c));
+        let (closed, _) = closed_on(&mut c).await;
+        assert!(closed.maybe_done && !closed.resendable(), "{closed:?}");
+    }
+
+    /// A request the hub could not read (an oversized line, malformed JSON) is refused with
+    /// its error for the connection (request 0), which the client used to skip.
+    #[tokio::test]
+    async fn a_request_the_hub_cannot_read_is_refused_with_why() {
+        let (mut c, hub) = pair();
+        tokio::spawn(async move {
+            let mut r = BufReader::new(hub);
+            let mut got = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut r, &mut got)
+                .await
+                .unwrap();
+            let e = RpcError::new(codes::BAD_REQUEST, "frame exceeds MAX_FRAME");
+            r.get_mut()
+                .write_all(&line(&Response::err(0, e)))
+                .await
+                .unwrap();
+        });
+        let (closed, shown) = closed_on(&mut c).await;
+        assert!(!closed.maybe_done && !closed.resendable(), "{closed:?}");
+        assert_eq!(
+            shown,
+            "the hub refused the request for thread.send and closed the connection: frame \
+             exceeds MAX_FRAME"
+        );
     }
 
     fn item(seq: u64) -> StreamItem {

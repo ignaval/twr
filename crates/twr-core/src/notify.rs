@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::event::{
-    is_confirm_card, is_delete_card, AttentionReason, Event, EventBody, Grade, JsonMap, Source,
-    TurnFrom, TurnResult, DELETE_KEY, HUB_THREAD,
+    is_confirm_card, is_delete_card, is_hung_card, AttentionReason, Event, EventBody, Grade,
+    JsonMap, Source, TurnFrom, TurnResult, DELETE_KEY, HUB_THREAD,
 };
 use crate::reduce::{AttentionStack, Registry};
 
@@ -44,6 +44,8 @@ pub enum NotifyEvent {
     Error,
     /// A finished turn graded `gave_up` or `needs_verification`.
     Review,
+    /// A turn silent while something waits to start the next one (a hung-turn card).
+    Hung,
     /// A running turn silent for `stall_after_secs`.
     Stalled,
     /// A worker finished a turn (`report.ready`), when no failure or review covers it.
@@ -64,6 +66,7 @@ impl NotifyEvent {
         NotifyEvent::Confirm,
         NotifyEvent::Error,
         NotifyEvent::Review,
+        NotifyEvent::Hung,
         NotifyEvent::Report,
         NotifyEvent::Reply,
     ];
@@ -76,6 +79,7 @@ impl NotifyEvent {
             NotifyEvent::Confirm => "waits for your confirmation",
             NotifyEvent::Error => "failed",
             NotifyEvent::Review => "needs review",
+            NotifyEvent::Hung => "seems hung",
             NotifyEvent::Stalled => "is stalled",
             NotifyEvent::Report => "finished",
             NotifyEvent::Reply => "replied",
@@ -160,17 +164,23 @@ impl Candidate {
 }
 
 /// The rules: which events are wanted, what was already turned into a candidate, and the
-/// orchestrator turns users started (whose end is a reply).
-#[derive(Debug, Clone, Default)]
+/// orchestrator turns users started (whose end is a reply). Serialized whole (sets sorted) in
+/// the hub's checkpoints of its folded state. Equal policies remember the same (the compacted
+/// backlog's tests compare them, [`crate::compact`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
+    #[serde(serialize_with = "crate::sorted::set")]
     events: HashSet<NotifyEvent>,
     /// Keys already given out, oldest first (bounded by [`KEYS_MAX`]).
     order: VecDeque<String>,
+    #[serde(serialize_with = "crate::sorted::set")]
     given: HashSet<String>,
     /// Open orchestrator turns a user started: (thread, turn).
+    #[serde(serialize_with = "crate::sorted::set")]
     user_turns: HashSet<(String, u64)>,
     /// Per thread, the turns whose report is known: a rewrite of one only revises it,
     /// whatever the thread did since. Kept across a delete: a deleted thread can be restored.
+    #[serde(serialize_with = "crate::sorted::map_of_sets")]
     reported: HashMap<String, HashSet<u64>>,
 }
 
@@ -181,6 +191,45 @@ impl Policy {
             events: events.iter().copied().collect(),
             ..Default::default()
         }
+    }
+
+    /// A policy for `events` that remembers what `memory` (a policy of any events, folded from
+    /// the same items: a hub's snapshot, `crate::client_state`) does. It then gives for each
+    /// later item what a policy for `events` folded from those items would: keys of events not
+    /// wanted are never looked up (whether an event is wanted is asked first), and no key given
+    /// in a replay can come again (an attention key names the raise that opened the item, a
+    /// report or reply key its turn, and a report known is a revision).
+    pub fn adopt(events: &[NotifyEvent], memory: &Policy) -> Policy {
+        Policy {
+            events: events.iter().copied().collect(),
+            ..memory.clone()
+        }
+    }
+
+    /// This memory without what it keeps of `threads` (gone for good: purged from the trash):
+    /// their reports known and their report and reply keys. What the compacted backlog leaves
+    /// out of a purged thread (`crate::compact`) changes nothing else of it.
+    pub fn without_threads(&self, threads: &HashSet<String>) -> Policy {
+        let theirs = |key: &str| {
+            ["report:", "reply:"].iter().any(|p| {
+                key.strip_prefix(p)
+                    .and_then(|rest| rest.rsplit_once(':'))
+                    .is_some_and(|(t, _)| threads.contains(t))
+            })
+        };
+        let mut p = self.clone();
+        p.reported.retain(|t, _| !threads.contains(t));
+        p.user_turns.retain(|(t, _)| !threads.contains(t));
+        p.given.retain(|k| !theirs(k));
+        p.order.retain(|k| !theirs(k));
+        p
+    }
+
+    /// The wanted events, most urgent first.
+    pub fn wanted(&self) -> Vec<NotifyEvent> {
+        let mut out: Vec<NotifyEvent> = self.events.iter().copied().collect();
+        out.sort();
+        out
     }
 
     /// Whether `event` is wanted.
@@ -219,6 +268,7 @@ impl Policy {
                         AttentionReason::Question => NotifyEvent::Question,
                         AttentionReason::Error => NotifyEvent::Error,
                         AttentionReason::Review => NotifyEvent::Review,
+                        AttentionReason::Stalled if is_hung_card(&p.ext) => NotifyEvent::Hung,
                         AttentionReason::Stalled => NotifyEvent::Stalled,
                     }
                 };
@@ -264,8 +314,9 @@ impl Policy {
                         .insert(turn);
                     // An interim report: the turn ended with background tasks still running,
                     // and the runtime's own turn after them reports again. The thread's tasks
-                    // say so too, for a report that lacks the marker.
-                    let interim = !view.background_tasks.is_empty()
+                    // say so too, for a report that lacks the marker (its own tasks: a `!`
+                    // command of the user's starts no turn that reports again).
+                    let interim = view.own_background()
                         || p.ext
                             .as_ref()
                             .and_then(|e| e.get("twr"))
@@ -301,7 +352,9 @@ impl Policy {
                 let turn = ev.turn?;
                 // The user's message, or the runtime going on by itself (a background task
                 // of the user's request finished); never a hub notice or handoff.
-                let user = matches!(ev.source, Source::User(_)) || p.from == TurnFrom::Runtime;
+                // (Not a compaction the user asked for: it replies nothing.)
+                let user = (matches!(ev.source, Source::User(_)) || p.from == TurnFrom::Runtime)
+                    && !crate::event::is_compact_turn(p);
                 if user && registry.get(&ev.thread)?.is_current_orchestrator() {
                     self.user_turns.insert((ev.thread.clone(), turn));
                 }
@@ -943,6 +996,18 @@ mod tests {
         said.source = Source::User("tui".into());
         f.push(said);
         assert_eq!(f.push(o.turn_ended(TurnResult::Error)), None);
+        // A compaction the user asked for replies nothing.
+        let mut compact = o.turn_started("/compact");
+        compact.source = Source::User("tui".into());
+        if let EventBody::TurnStarted(p) = &mut compact.body {
+            crate::event::set_twr_ext(
+                &mut p.ext,
+                crate::event::COMPACT_TURN_KEY,
+                serde_json::json!(true),
+            );
+        }
+        f.push(compact);
+        assert_eq!(f.push(o.turn_ended(TurnResult::Completed)), None);
     }
 
     #[test]

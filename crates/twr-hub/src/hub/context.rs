@@ -808,7 +808,7 @@ impl Hub {
         {
             return Ok(());
         }
-        let Some(host) = self.inner.hosts.get(LOCAL_BOX) else {
+        let Some(host) = self.inner.host(LOCAL_BOX) else {
             return Ok(());
         };
         // Git's output stays in the hub's log: it can echo the repository's configuration,

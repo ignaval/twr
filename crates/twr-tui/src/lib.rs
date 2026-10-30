@@ -13,15 +13,37 @@
 //! The TUI is only a view: reports, routing and attention all live in the hub, so nothing here is
 //! required for the report path to work without a screen.
 
+pub mod accounts;
 pub mod app;
+#[cfg(test)]
+mod bench;
+pub mod color;
+#[cfg(test)]
+mod compact_tests;
+pub mod config_edit;
 pub mod edit;
+pub mod firstrun;
 pub mod icon;
 pub mod keys;
+#[cfg(test)]
+mod long_card_tests;
 pub mod md;
 pub mod notify;
 pub mod order;
+pub mod queue;
 pub mod select;
+pub mod settings;
+pub mod shell;
+pub mod sidebar;
 pub mod slash;
+mod snapshot;
+#[cfg(test)]
+mod snapshot_tests;
+pub mod speaker;
+pub mod speech;
+pub mod suggest;
+pub mod summary;
+pub mod terminal_setup;
 pub mod ui;
 pub mod workspace;
 
@@ -35,11 +57,12 @@ use crossterm::event::{
     EnableFocusChange, EnableMouseCapture, Event as TermEvent, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use twr_core::blob::{has_capped, hydrate_deep, BlobFetch};
-use twr_core::client::Client;
+use twr_core::client::{Client, HubClosed};
+use twr_core::client_state::ClientFold;
 use twr_core::event::EventBody;
 use twr_core::proto::StreamItem;
 
@@ -56,6 +79,11 @@ pub fn submit_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Say { text, seen_gseq } => Some((
             "say",
             json!({ "message": text, "seen_gseq": seen_gseq, "to": "orchestrator" }),
+        )),
+        Action::SaySuggested { text, seen_gseq } => Some((
+            "say",
+            json!({ "message": text, "seen_gseq": seen_gseq, "to": "orchestrator",
+                    "suggested": true }),
         )),
         Action::Send { thread, text } => {
             Some(("thread.send", json!({"thread": thread, "prompt": text})))
@@ -102,6 +130,26 @@ fn is_dry_run(result: &Value) -> bool {
 /// `trash.empty`, `trash.restore` or `orchestrator.use` did (`None` for other methods, and for a `thread.send` that started a
 /// turn: the transcript shows it).
 pub fn result_status(method: &str, result: &Value) -> Option<String> {
+    // The hub's advisory on a call that makes, changes, restarts or starts a thread's runtime
+    // (its box reports the runtime's CLI missing): said after what was done, alone when
+    // nothing else is said (a `thread.send` that started a turn).
+    let warning = matches!(
+        method,
+        "thread.new" | "thread.set_model" | "thread.set_mode" | "thread.send"
+    )
+    .then(|| result["warning"].as_str())
+    .flatten()
+    .filter(|w| !w.trim().is_empty());
+    match (method_status(method, result), warning) {
+        (Some(status), Some(w)) => Some(format!("{status}; warning: {w}")),
+        (Some(status), None) => Some(status),
+        (None, Some(w)) => Some(format!("warning: {w}")),
+        (None, None) => None,
+    }
+}
+
+/// [`result_status`] before the hub's advisory.
+fn method_status(method: &str, result: &Value) -> Option<String> {
     match method {
         "say" => {}
         "thread.send" => return queued_note(result),
@@ -135,17 +183,42 @@ pub fn result_status(method: &str, result: &Value) -> Option<String> {
             let value = |k: &str| result[k].as_str().unwrap_or("default").to_string();
             let now = format!("model {}, effort {}", value("model"), value("effort"));
             if result["changed"].as_bool() == Some(false) {
+                // Asked for an account it is on: the hub's message names it
+                // (`api already runs on claude-code:work with ...`). Asked for the runtime
+                // alone, or the model: what it has, as without accounts.
+                let on_account = match (result["runtime"].as_str(), result["account"].as_str()) {
+                    (Some(rt), Some(a)) => format!("{name} already runs on {rt}:{a} "),
+                    _ => String::new(),
+                };
+                if let Some(m) = result["message"]
+                    .as_str()
+                    .filter(|m| !on_account.is_empty() && m.starts_with(&on_account))
+                {
+                    return Some(m.to_string());
+                }
                 return Some(format!("{name} already has {now}"));
             }
-            // A move to another runtime: the hub's message says when its session starts.
-            if result["runtime_changed"].as_bool() == Some(true) {
+            // A move to another runtime or account: the hub's message says when its session
+            // starts.
+            if result["runtime_changed"].as_bool() == Some(true)
+                || result["account_changed"].as_bool() == Some(true)
+            {
                 let runtime = result["runtime"].as_str().unwrap_or("?");
+                let same_runtime = result["runtime_changed"].as_bool() != Some(true);
+                let to = match result["account"].as_str() {
+                    Some(a) if same_runtime => format!("{runtime}:{a}"),
+                    _ => runtime.to_string(),
+                };
                 let mut msg = result["message"]
                     .as_str()
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("{name} moves to {runtime} with {now}"));
+                    .unwrap_or_else(|| format!("{name} moves to {to} with {now}"));
                 if result["applies"].as_str() == Some("after_turn") {
-                    msg.push_str("; the current turn finishes on the previous runtime first");
+                    msg.push_str(if same_runtime {
+                        "; the current turn finishes on the previous account first"
+                    } else {
+                        "; the current turn finishes on the previous runtime first"
+                    });
                 }
                 if result["stops_background_tasks"].as_bool() == Some(true) {
                     msg.push_str("; its background tasks end with it");
@@ -210,6 +283,13 @@ pub fn result_status(method: &str, result: &Value) -> Option<String> {
             return Some(msg);
         }
         "thread.resume" => return Some("resumed".into()),
+        "thread.compact" => {
+            let name = result["thread_name"].as_str().unwrap_or("the thread");
+            return Some(match result["state"].as_str() {
+                Some("started") => format!("{name} compacts its context now"),
+                _ => format!("{name} compacts its context after its running turn"),
+            });
+        }
         "thread.trim" => {
             let name = result["thread_name"].as_str().unwrap_or("?");
             let deleted = result["deleted"].as_array().map_or(0, Vec::len);
@@ -303,10 +383,13 @@ pub fn result_status(method: &str, result: &Value) -> Option<String> {
                     h["summary_note"].as_str().unwrap_or("skipped")
                 )
             };
-            let mut msg = format!(
-                "the orchestrator is now {} (a new session{handoff})",
-                result["runtime"].as_str().unwrap_or("?")
-            );
+            // With its account while its runtime shows account labels: `claude-code:work`.
+            let rt = result["runtime"].as_str().unwrap_or("?");
+            let runtime = match result["account"].as_str() {
+                Some(a) if result["account_shown"].as_bool() == Some(true) => format!("{rt}:{a}"),
+                _ => rt.to_string(),
+            };
+            let mut msg = format!("the orchestrator is now {runtime} (a new session{handoff})");
             if let Some(w) = result["warning"].as_str() {
                 msg.push_str(&format!("; warning: {w}"));
             }
@@ -373,7 +456,16 @@ pub fn error_status(method: &str, error: &str) -> String {
 /// The hub request for an [`Action`], or `None` for actions handled locally.
 pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
     match action {
-        Action::Quit | Action::Copy { .. } | Action::Mouse(_) | Action::Workspace { .. } => None,
+        Action::Quit
+        | Action::Copy { .. }
+        | Action::Mouse(_)
+        | Action::Workspace { .. }
+        | Action::WsSidebar(_)
+        | Action::Setting(_)
+        | Action::SettingsFile
+        | Action::TerminalSetup { .. } => None,
+        Action::ConfigShow => Some(("config.show", Value::Null)),
+        Action::Speech { method, params } => Some((*method, params.clone())),
         // The revision of the card on screen: an item raised again since (it may ask
         // something else now) is not answered by this key (`conflict`).
         Action::Respond {
@@ -388,11 +480,39 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             Some(("attention.respond", p))
         }
-        Action::Say { .. } | Action::Send { .. } => submit_request(action),
+        Action::Say { .. } | Action::SaySuggested { .. } | Action::Send { .. } => {
+            submit_request(action)
+        }
         Action::Withdraw { thread, msg_ref } => Some((
             "message.withdraw",
             json!({"thread": thread, "ref": msg_ref}),
         )),
+        Action::SendNow { thread, msg_ref } => Some((
+            "message.send_now",
+            json!({"thread": thread, "ref": msg_ref}),
+        )),
+        Action::ShellRun {
+            thread,
+            command,
+            cwd,
+            share,
+            launch,
+        } => {
+            // `launch` is the TUI's own (serve_calls takes it out).
+            let mut p = json!({ "command": command, "share": share, "launch": launch });
+            if let Some(t) = thread {
+                p["thread"] = json!(t);
+            }
+            if let Some(c) = cwd {
+                p["cwd"] = json!(c);
+            }
+            Some(("shell.run", p))
+        }
+        Action::ShellCd { cwd, dir } => Some(("shell.cd", json!({ "cwd": cwd, "dir": dir }))),
+        Action::JobCancel { job } => Some(("job.cancel", json!({ "job": job }))),
+        Action::ShellStopLaunch { launch } => {
+            Some((SHELL_STOP_LAUNCH, json!({ "launch": launch })))
+        }
         Action::SetMode { thread, mode } => {
             Some(("thread.set_mode", json!({"thread": thread, "mode": mode})))
         }
@@ -415,6 +535,18 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if let Some(e) = effort {
                 p["effort"] = json!(e);
+            }
+            Some(("thread.set_model", p))
+        }
+        // `outside_pin` only when set: a hub before accounts takes no such field.
+        Action::SetAccount {
+            thread,
+            account,
+            outside_pin,
+        } => {
+            let mut p = json!({ "thread": thread, "account": account });
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
             }
             Some(("thread.set_model", p))
         }
@@ -446,6 +578,7 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
         Action::Park { thread } => Some(("thread.park", json!({"thread": thread}))),
         Action::Resume { thread } => Some(("thread.resume", json!({"thread": thread}))),
         Action::Trim { thread } => Some(("thread.trim", json!({"thread": thread}))),
+        Action::CompactContext { thread } => Some(("thread.compact", json!({"thread": thread}))),
         Action::ResetOrchestrator => Some(("orchestrator.reset", json!({}))),
         Action::UseOrchestrator {
             runtime,
@@ -465,6 +598,8 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             project,
             runtime,
             name,
+            account,
+            outside_pin,
         } => {
             let mut p = json!({ "project": project_param(project) });
             if let Some(r) = runtime {
@@ -472,6 +607,12 @@ pub fn action_request(action: &Action) -> Option<(&'static str, Value)> {
             }
             if let Some(n) = name {
                 p["name"] = json!(n);
+            }
+            if let Some(a) = account {
+                p["account"] = json!(a);
+            }
+            if *outside_pin {
+                p["outside_pin"] = json!(true);
             }
             Some(("thread.new", p))
         }
@@ -516,10 +657,11 @@ fn enhance_keyboard() -> keys::Keys {
         KEYBOARD_PUSHED.store(true, Ordering::SeqCst);
         return keys::Keys {
             shift_enter: true,
-            notice: None,
+            ..keys::Keys::default()
         };
     }
     let mut notice = None;
+    let mut tmux_asked = false;
     if std::env::var_os("TMUX").is_some_and(|t| !t.is_empty()) {
         let extended = keys::tmux_option("extended-keys");
         let format = keys::tmux_option("extended-keys-format");
@@ -532,13 +674,15 @@ fn enhance_keyboard() -> keys::Keys {
                     .is_ok()
                 {
                     MODIFY_OTHER_KEYS.store(true, Ordering::SeqCst);
+                    tmux_asked = true;
                 }
             }
             keys::TmuxPlan::Unreadable => notice = Some(keys::TMUX_NOTICE),
             keys::TmuxPlan::Nothing => {}
         }
     }
-    if keys::under_mosh() {
+    let mosh = keys::under_mosh();
+    if mosh {
         notice = Some(keys::MOSH_NOTICE);
     }
     // Whether Shift-Enter gets through tmux depends on the terminal around it too: the first
@@ -546,6 +690,8 @@ fn enhance_keyboard() -> keys::Keys {
     keys::Keys {
         shift_enter: false,
         notice,
+        tmux_asked,
+        mosh,
     }
 }
 
@@ -596,20 +742,81 @@ pub fn repaint<B: ratatui::backend::Backend>(
     Ok(())
 }
 
+/// Writes what this run told the user that is not saved yet ([`AppState::seen`]) to `file`,
+/// off the IO loop (the file's lock may be another TUI's for a moment); nowhere without one.
+fn save_seen(state: &mut AppState, file: Option<&Path>) {
+    if !std::mem::take(&mut state.seen_dirty) {
+        return;
+    }
+    let Some(file) = file else {
+        return;
+    };
+    let (file, seen) = (file.to_path_buf(), state.seen.clone());
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = firstrun::save(&file, &seen) {
+            twr_core::trace::mark_with(|| format!("tui: saving {}: {e}", file.display()));
+        }
+    });
+}
+
+/// Writes setting `change` to the config file the environment names, where the settings
+/// keep it ([`settings::Change::config_key`]): `Ok` with the file's path as shown, else why it
+/// was left alone. On the settings writer's thread ([`spawn_settings_writer`]).
+fn save_setting(change: &settings::Change) -> Result<String, String> {
+    let Some((table, key, value)) = change.config_key() else {
+        return Err("not a setting of the config file".into());
+    };
+    let path = twr_core::paths::Paths::from_env()
+        .map_err(|e| format!("no config file here: {e:#}"))?
+        .config_file;
+    config_edit::write_key(&path, table, key, &value)?;
+    Ok(settings::shown_path(&path))
+}
+
 /// Polling period of `thread.activity` (what each thread is doing, for the cards).
 const ACTIVITY_EVERY: Duration = Duration::from_secs(2);
+
+/// How often the current workspace's hub is asked what its speakers read (`speech.status`,
+/// [`speech`]): the status bar's note and the conversation's `▶` follow it.
+pub const SPEECH_EVERY: Duration = Duration::from_secs(2);
 
 /// How long quitting waits for the input history's last lines to be written.
 const HISTORY_FLUSH: Duration = Duration::from_secs(2);
 
 /// The entries of the history file at `path` (none when it cannot be read), oldest first.
-/// A line that is not a JSON string (torn by a crash, not UTF-8) costs only itself.
+/// A line that is neither (torn by a crash, not UTF-8) costs only itself.
 pub fn load_history(path: &Path) -> Vec<String> {
     std::fs::read(path)
         .unwrap_or_default()
         .split(|b| *b == b'\n')
-        .filter_map(|l| serde_json::from_slice::<String>(l).ok())
+        .filter_map(history_entry)
         .collect()
+}
+
+/// A history file line as the line to put back in the input box. A `!` command is stored as
+/// `{"shell": "!..."}` ([`history_line`]); a plain string that starts with `!` was a message
+/// sent before `!` ran commands, and comes back escaped (`\!...`), still a message.
+fn history_entry(line: &[u8]) -> Option<String> {
+    match serde_json::from_slice::<Value>(line).ok()? {
+        Value::String(s) if s.starts_with('!') => Some(format!("\\{s}")),
+        Value::String(s) => Some(s),
+        Value::Object(o) => o
+            .get("shell")
+            .and_then(Value::as_str)
+            .filter(|s| s.starts_with('!'))
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// History entry `e` as a history file line ([`history_entry`]): a `!` command tagged, so a
+/// TUI from before `!` commands skips it rather than sending it as a message.
+fn history_line(e: &str) -> serde_json::Result<String> {
+    if e.starts_with('!') {
+        serde_json::to_string(&json!({ "shell": e }))
+    } else {
+        serde_json::to_string(e)
+    }
 }
 
 /// Whether the file at `path` is not empty and its last byte is not a line break.
@@ -645,11 +852,7 @@ pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
         writeln!(f)?;
     }
     for e in entries.iter().filter(|e| e.len() <= HISTORY_ENTRY_MAX) {
-        writeln!(
-            f,
-            "{}",
-            serde_json::to_string(e).map_err(std::io::Error::other)?
-        )?;
+        writeln!(f, "{}", history_line(e).map_err(std::io::Error::other)?)?;
     }
     drop(f);
     let all = load_history(path);
@@ -660,11 +863,7 @@ pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
             let mut f = twr_core::paths::open_private_append(&tmp)?;
             f.set_len(0)?;
             for e in keep {
-                writeln!(
-                    f,
-                    "{}",
-                    serde_json::to_string(e).map_err(std::io::Error::other)?
-                )?;
+                writeln!(f, "{}", history_line(e).map_err(std::io::Error::other)?)?;
             }
             f.sync_all()?;
             std::fs::rename(&tmp, path)
@@ -762,6 +961,13 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long one fetch of a capped attention text may take before it counts as failed (and is
 /// tried again later).
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the control log replay's progress is drawn while it runs.
+const LOADING_EVERY: Duration = Duration::from_millis(100);
+
+/// Most items of a stream (control, transcript) applied in one pass of the TUI's loop,
+/// between draws.
+const CONTROL_BATCH: usize = 512;
 
 /// How many of the latest events of the main pane's thread the transcript replays.
 pub const TRANSCRIPT_TAIL: u64 = 2000;
@@ -894,7 +1100,12 @@ async fn subscribe_thread(
             .await?;
         let head = sub.ack()["head"].as_u64().unwrap_or(head);
         let blobs = connect(socket).await?;
-        let items = hydrating(Box::pin(sub.into_stream()), blobs, socket, HYDRATE_TIMEOUT);
+        let items = read_ahead(hydrating(
+            Box::pin(sub.into_stream()),
+            blobs,
+            socket,
+            HYDRATE_TIMEOUT,
+        ));
         Ok((items, since, head))
     })
     .await
@@ -908,6 +1119,11 @@ pub async fn hydrate_item<F: BlobFetch>(
     item: &StreamItem,
     fetch: &mut F,
 ) -> anyhow::Result<Option<StreamItem>> {
+    // Most items have nothing moved: told without building their `data` (a replay asks this
+    // of every item).
+    if !item.event.body.maybe_capped() {
+        return Ok(None);
+    }
     let mut data = item.event.body.data()?;
     if !has_capped(&data) {
         return Ok(None);
@@ -937,6 +1153,59 @@ fn hydrating(stream: ItemStream, blobs: Client, socket: &Path, limit: Duration) 
         },
     ))
 }
+
+/// `stream` read on a task of its own, ahead of the loop that takes it, in order, its error
+/// or end last: reading and decoding a replay of thousands takes longer than applying it, and
+/// runs meanwhile on another core, while the loop stays free to draw and read keys. What is
+/// ready goes over in batches of up to [`READ_AHEAD`] items (at most [`READ_AHEAD_BATCHES`]
+/// batches ahead), so the loop wakes once for many. Once the stream returned is dropped, the
+/// task ends at once, and the subscription with it (its connection closes), as it would
+/// without the task: it may wait for a live item that never comes.
+fn read_ahead(mut stream: ItemStream) -> ItemStream {
+    let (tx, rx) = mpsc::channel::<Vec<anyhow::Result<StreamItem>>>(READ_AHEAD_BATCHES);
+    tokio::spawn(async move {
+        loop {
+            let first = tokio::select! {
+                item = stream.next() => item,
+                () = tx.closed() => return,
+            };
+            let Some(first) = first else {
+                return;
+            };
+            let mut done = first.is_err();
+            let mut batch = vec![first];
+            while !done && batch.len() < READ_AHEAD {
+                match stream.next().now_or_never() {
+                    Some(Some(item)) => {
+                        done = item.is_err();
+                        batch.push(item);
+                    }
+                    Some(None) => done = true,
+                    None => break,
+                }
+            }
+            if tx.send(batch).await.is_err() || done {
+                return;
+            }
+        }
+    });
+    Box::pin(futures::stream::unfold(
+        (rx, std::collections::VecDeque::new()),
+        |(mut rx, mut ready)| async move {
+            if ready.is_empty() {
+                ready.extend(rx.recv().await?);
+            }
+            let item = ready.pop_front()?;
+            Some((item, (rx, ready)))
+        },
+    ))
+}
+
+/// Most items [`read_ahead`] hands over at once.
+const READ_AHEAD: usize = 512;
+
+/// How many batches [`read_ahead`] reads ahead.
+const READ_AHEAD_BATCHES: usize = 4;
 
 /// The blob connection of a stream being hydrated ([`hydrating`]). A fetch that failed or ran
 /// out of time may have left part of a reply unread on it, which the next one would read as
@@ -1277,28 +1546,40 @@ pub struct Switching {
     pub workspaces: std::sync::Arc<dyn Workspaces>,
 }
 
-/// How often the tab strip asks the other workspaces' hubs how they are.
-const TABS_EVERY: Duration = Duration::from_secs(5);
+/// How often the TUI looks for workspaces' hubs due to be asked how they are
+/// ([`workspace::PollClock`]).
+const TABS_EVERY: Duration = workspace::POLL_RUNNING;
+
+/// `TWR_TUI_HIDE_LOAD=1`: the TUI never reads this machine's load, so its status bar never
+/// says the machine is busy. Only `docs/tools/make-screenshots.sh` and `make-demo.sh` set it:
+/// the images must not depend on the load of the machine they are made on.
+pub const HIDE_LOAD_ENV: &str = "TWR_TUI_HIDE_LOAD";
 
 /// How often the TUI reads this machine's load for its status bar ([`twr_core::load`]).
 pub const LOAD_EVERY: Duration = Duration::from_secs(5);
 
-/// How often the TUI asks its hub (`hub.info`'s `disk`) whether a box is low on disk.
-const DISK_EVERY: Duration = Duration::from_secs(60);
+/// How often the TUI asks its hub (`hub.info`) whether a box is low on disk (`disk`) and how
+/// its remote boxes are (`boxes`: a thread's box token).
+pub const INFO_EVERY: Duration = Duration::from_secs(10);
 
 /// How long the tab strip waits for one hub's answer.
 const TAB_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info` and
-/// `orchestrator.show`, the connection for calls, and the control stream with the head its
-/// replay runs up to.
+/// A hub connected to and caught up with as far as the TUI starts on it: its `hub.info`,
+/// `orchestrator.show` and `account.list`, the connection for calls, and the control stream
+/// with the head its replay runs up to (and, compacted, how many items the replay has), or the
+/// state at that head (a snapshot) when the hub gave it: the stream then brings what comes
+/// after it.
 struct Session {
     socket: PathBuf,
     calls: Client,
     info: Value,
     show: Value,
+    accounts: Value,
     control: ItemStream,
     head: u64,
+    backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
 }
 
 impl Session {
@@ -1309,6 +1590,7 @@ impl Session {
             expect_workspace(socket, expected);
         }
         let mut calls = connect(socket).await?;
+        twr_core::trace::mark("tui: connected");
         // Identify the connected hub, even when the client used an explicit socket.
         let info = within(CONNECT_TIMEOUT, "asking for the instance", async {
             calls.call("hub.info", Value::Null).await
@@ -1318,40 +1600,187 @@ impl Session {
             check_hub_workspace(&info, expected, socket)?;
         }
         // The runtimes `/orch` completes, and whether the agent was ever chosen.
+        twr_core::trace::mark("tui: hub.info answered");
         let show = within(CONNECT_TIMEOUT, "asking for the orchestrator", async {
             calls.call("orchestrator.show", Value::Null).await
         })
         .await
         .unwrap_or(Value::Null);
-        let control = within(
+        let ControlStart {
+            sub: control,
+            backlog,
+            snapshot,
+        } = within(
             CONNECT_TIMEOUT,
             "subscribing to the control stream",
-            async {
-                connect(socket)
-                    .await?
-                    .subscribe("control.subscribe", json!({"since": 0}))
-                    .await
-                    .context("subscribing to the control stream")
-            },
+            subscribe_control(socket),
         )
         .await?;
-        // The replay up to the ack's head is the initial state; focus waits for it.
+        // The replay up to the ack's head (or the snapshot at it) is the initial state; focus
+        // waits for it.
         let head = control.ack()["head"].as_u64().unwrap_or(0);
+        twr_core::trace::mark_with(|| match (&snapshot, backlog) {
+            (Some(fold), _) => format!(
+                "tui: control subscribed (head {head}, a snapshot of {} threads)",
+                fold.registry.list().len() + fold.registry.deleted_views().count()
+            ),
+            (None, Some(n)) => {
+                format!("tui: control subscribed (head {head}, {n} items compacted)")
+            }
+            (None, None) => format!("tui: control subscribed (head {head})"),
+        });
+        // The accounts, asked for once subscribed: the answer is as new as the replay's end
+        // (or the snapshot's head) at least, and each `account.*` event after it asks again. A
+        // hub older than accounts has none (null): no labels. Another failure (no answer in
+        // time) is `{failed: true}`: asked for again soon (`AppState::accounts_answered`).
+        let accounts = within(CONNECT_TIMEOUT, "asking for the accounts", async {
+            calls.call("account.list", json!({})).await
+        })
+        .await
+        .unwrap_or_else(|e| accounts_failure(&e));
         let blobs = connect(socket).await?;
-        let control = hydrating(
+        let control = read_ahead(hydrating(
             Box::pin(control.into_stream()),
             blobs,
             socket,
             HYDRATE_TIMEOUT,
-        );
+        ));
         Ok(Session {
             socket: socket.to_path_buf(),
             calls,
             info,
             show,
+            accounts,
             control,
             head,
+            backlog,
+            snapshot,
         })
+    }
+}
+
+/// How the control stream starts ([`subscribe_control`]): the subscription, and either the
+/// state at its head (`snapshot`: the subscription brings what comes after it), or the
+/// backlog to replay, compacted (`backlog`: how many items it has) or not.
+struct ControlStart {
+    sub: twr_core::client::Subscription,
+    backlog: Option<u64>,
+    snapshot: Option<ClientFold>,
+}
+
+/// Subscribes to the control stream from its start, on a connection of its own, asking for
+/// the state at its head ([`ClientFold`], `snapshot`) instead of the items up to it. A hub
+/// may answer with its stored backlog instead, compacted ([`twr_core::compact`]: what the TUI
+/// folds of it, without the updates that change nothing of that; the ack's `backlog` says
+/// how many items it has). A hub from before snapshots refuses `snapshot` (`bad_request`): it
+/// is asked again for a compacted backlog; one from before compaction refuses `compact` too,
+/// and is asked again for the whole log.
+///
+/// A snapshot this TUI cannot read (malformed, or of another version: a hub of another
+/// build) is dropped with its subscription, and the stream is asked for again as from a hub
+/// without snapshots: the TUI then replays the log as before, rather than not starting.
+async fn subscribe_control(socket: &Path) -> anyhow::Result<ControlStart> {
+    let refused = |e: &anyhow::Error| {
+        e.downcast_ref::<twr_core::proto::RpcError>()
+            .is_some_and(|r| r.code == twr_core::proto::codes::BAD_REQUEST)
+    };
+    let asked = connect(socket)
+        .await?
+        .subscribe(
+            "control.subscribe",
+            json!({"since": 0, "compact": true, "snapshot": true}),
+        )
+        .await;
+    match asked {
+        Ok(sub) => match read_snapshot(sub.ack()) {
+            Ok(Some(fold)) => {
+                return Ok(ControlStart {
+                    sub,
+                    backlog: None,
+                    snapshot: Some(fold),
+                })
+            }
+            Ok(None) => {
+                let backlog = compacted_backlog(sub.ack());
+                return Ok(ControlStart {
+                    sub,
+                    backlog,
+                    snapshot: None,
+                });
+            }
+            Err(e) => {
+                twr_core::trace::mark_with(|| format!("tui: control snapshot unread: {e:#}"));
+            }
+        },
+        Err(e) if refused(&e) => {}
+        Err(e) => return Err(e).context("subscribing to the control stream"),
+    }
+    let compacted = connect(socket)
+        .await?
+        .subscribe("control.subscribe", json!({"since": 0, "compact": true}))
+        .await;
+    match compacted {
+        Ok(sub) => {
+            let backlog = compacted_backlog(sub.ack());
+            Ok(ControlStart {
+                sub,
+                backlog,
+                snapshot: None,
+            })
+        }
+        Err(e) if refused(&e) => {
+            let sub = connect(socket)
+                .await?
+                .subscribe("control.subscribe", json!({"since": 0}))
+                .await
+                .context("subscribing to the control stream")?;
+            Ok(ControlStart {
+                sub,
+                backlog: None,
+                snapshot: None,
+            })
+        }
+        Err(e) => Err(e).context("subscribing to the control stream"),
+    }
+}
+
+/// How many items the compacted backlog a `control.subscribe` `ack` announces has (`None`:
+/// it is not compacted).
+fn compacted_backlog(ack: &Value) -> Option<u64> {
+    (ack["compacted"] == true)
+        .then(|| ack["backlog"].as_u64())
+        .flatten()
+}
+
+/// The snapshot a `control.subscribe` `ack` carries (`None`: it has none, its backlog
+/// follows), or why it can't be read.
+fn read_snapshot(ack: &Value) -> anyhow::Result<Option<ClientFold>> {
+    let Some(snapshot) = ack.get("snapshot").filter(|s| !s.is_null()) else {
+        return Ok(None);
+    };
+    // Folded by this TUI's own code only ([`twr_core::client_state::FOLD`]): a hub of another
+    // build may fold the same items otherwise, and one that does not say its fold is unknown.
+    let fold = ack["snapshot_fold"].as_str();
+    anyhow::ensure!(
+        fold == Some(twr_core::client_state::FOLD),
+        "snapshot folded by {}, not this build's {}",
+        fold.unwrap_or("an unnamed fold"),
+        twr_core::client_state::FOLD
+    );
+    let fold = serde_json::from_value(snapshot.clone()).context("reading the snapshot")?;
+    Ok(Some(fold))
+}
+
+/// What a failed `account.list` call (`e`) tells the view (`AppState::accounts_answered`):
+/// `null` from a hub older than accounts (its unknown method: no accounts, never asked
+/// again), else `{failed: true}` (asked for again after a wait).
+fn accounts_failure(e: &anyhow::Error) -> Value {
+    match e
+        .downcast_ref::<twr_core::proto::RpcError>()
+        .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND)
+    {
+        true => Value::Null,
+        false => json!({"failed": true}),
     }
 }
 
@@ -1391,69 +1820,113 @@ fn check_hub_workspace(info: &Value, expected: &str, socket: &Path) -> anyhow::R
     }
 }
 
-/// What the tab strip shows of the workspaces other than `current`: each hub asked how it is
-/// ([`tab_hub`]), in the order [`Workspaces::names`] gives.
-async fn poll_tabs(ws: &dyn Workspaces, current: Option<&str>) -> Vec<workspace::Tab> {
-    let Ok(names) = ws.names() else {
-        return Vec::new();
-    };
-    let mut tabs = Vec::new();
-    for name in names {
-        let hub = if Some(name.as_str()) == current {
-            workspace::TabHub::Unknown
-        } else {
-            match ws.socket(&name) {
-                Ok(socket) => tab_hub(&socket, &name).await,
-                Err(_) => workspace::TabHub::Unknown,
-            }
-        };
-        tabs.push(workspace::Tab { name, hub });
-    }
-    tabs
+/// How many hubs one poll asks at once ([`poll_tabs`]).
+const POLL_AT_ONCE: usize = 4;
+
+/// One poll of the workspaces' hubs: how each hub of `due` is ([`glance_hub`]), asked a few
+/// at a time. A workspace whose socket can't be named is left as it was.
+async fn poll_tabs(ws: &dyn Workspaces, due: Vec<String>) -> Vec<workspace::Polled> {
+    use futures::StreamExt;
+    let asks: Vec<(String, PathBuf)> = due
+        .into_iter()
+        .filter_map(|name| Some((ws.socket(&name).ok()?, name)))
+        .map(|(socket, name)| (name, socket))
+        .collect();
+    futures::stream::iter(asks)
+        .map(|(name, socket)| async move {
+            let (hub, glance) = glance_hub(&socket, &name).await;
+            workspace::Polled { name, hub, glance }
+        })
+        .buffer_unordered(POLL_AT_ONCE)
+        .collect()
+        .await
 }
 
-/// How the hub of workspace `name` on `socket` is, for its tab: stopped when nothing listens,
-/// busy when it does not answer within [`TAB_TIMEOUT`] (or is another workspace's), else its
-/// worker threads, how many run and the permissions and questions waiting on the user.
-async fn tab_hub(socket: &Path, name: &str) -> workspace::TabHub {
-    use workspace::TabHub;
+/// How the hub of workspace `name` on `socket` is, for its tab and its sidebar card: stopped
+/// when nothing listens (it is never started to be asked), busy when it does not answer within
+/// [`TAB_TIMEOUT`] (or is another workspace's), else its counts and what it says of its
+/// orchestrator and its workers, in one `hub.glance` (and its `thread.list` from a hub whose
+/// glance does not list its workers yet). A hub older than that method answers `thread.list`
+/// and `attention.list` instead, as tabs asked before: the same counts, its orchestrator's
+/// status without its latest reply.
+async fn glance_hub(socket: &Path, name: &str) -> (workspace::TabHub, Option<workspace::Glance>) {
+    use workspace::{Glance, TabHub};
     let Ok(Ok(mut c)) = tokio::time::timeout(TAB_TIMEOUT, Client::connect(socket)).await else {
-        return TabHub::Stopped;
+        return (TabHub::Stopped, None);
     };
     let answer = tokio::time::timeout(TAB_TIMEOUT, async {
         let hello = c.hello(json!({ "client": CLIENT_NAME })).await?;
         check_hub_workspace(&hello, name, socket)?;
-        let threads = c.call("thread.list", Value::Null).await?;
-        let items = c.call("attention.list", json!({ "all": true })).await?;
-        anyhow::Ok((threads, items))
+        match c.call("hub.glance", Value::Null).await {
+            Ok(g) => anyhow::Ok(Ok(g)),
+            Err(e)
+                if e.downcast_ref::<twr_core::proto::RpcError>()
+                    .is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND) =>
+            {
+                let threads = c.call("thread.list", Value::Null).await?;
+                let items = c.call("attention.list", json!({ "all": true })).await?;
+                Ok(Err((threads, items)))
+            }
+            Err(e) => Err(e),
+        }
     })
     .await;
-    let Ok(Ok((threads, items))) = answer else {
-        return TabHub::Busy;
+    let Ok(Ok(mut answer)) = answer else {
+        return (TabHub::Busy, None);
     };
-    let workers: Vec<&Value> = threads
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|t| t["role"] != "orchestrator")
-        .collect();
-    let running = workers
-        .iter()
-        .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
-        .count();
-    let of = |reason: &str| {
-        items
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|i| i["reason"].as_str() == Some(reason))
-            .count()
+    // A hub that predates the glance's `workers` names them in `thread.list`, read-only too,
+    // asked on a clock of its own: its glance stands without them.
+    if let Ok(g) = &mut answer {
+        if g.is_object() && g["workers"].is_null() {
+            let list = tokio::time::timeout(TAB_TIMEOUT, c.call("thread.list", Value::Null)).await;
+            if let Ok(Ok(threads)) = list {
+                g["workers"] = threads;
+            }
+        }
+    }
+    let count = |v: &Value| {
+        v.as_u64()
+            .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
     };
-    TabHub::Running {
-        threads: workers.len(),
-        running,
-        permissions: of("permission"),
-        questions: of("question"),
+    match answer {
+        Ok(g) => (
+            TabHub::Running {
+                threads: count(&g["threads"]),
+                running: count(&g["running"]),
+                permissions: count(&g["permissions"]),
+                questions: count(&g["questions"]),
+            },
+            Some(Glance::from_json(&g)),
+        ),
+        Err((threads, items)) => {
+            let workers: Vec<&Value> = threads
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["role"] != "orchestrator")
+                .collect();
+            let running = workers
+                .iter()
+                .filter(|t| matches!(t["status"].as_str(), Some("running" | "background")))
+                .count();
+            let of = |reason: &str| {
+                items
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|i| i["reason"].as_str() == Some(reason))
+                    .count()
+            };
+            (
+                TabHub::Running {
+                    threads: workers.len(),
+                    running,
+                    permissions: of("permission"),
+                    questions: of("question"),
+                },
+                Some(Glance::from_threads(&threads)),
+            )
+        }
     }
 }
 
@@ -1474,6 +1947,58 @@ impl CallHub for Client {
         params: Value,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<Value>> {
         Box::pin(Client::call(self, method, params))
+    }
+}
+
+/// A view's calls connection to the hub on `socket`, opened again after the hub closed it (it
+/// stopped or restarted since: every later call failed with "Broken pipe" before). A call the
+/// hub closed the connection on before it reached it ([`HubClosed::resendable`]: nothing was
+/// done) is sent once more on the new connection, so a prompt is never sent twice; one the
+/// hub may have done is not, and says so.
+struct HubCalls {
+    socket: PathBuf,
+    client: Option<Client>,
+}
+
+impl CallHub for HubCalls {
+    fn call(
+        &mut self,
+        method: &'static str,
+        params: Value,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<Value>> {
+        Box::pin(async move {
+            let client = match &mut self.client {
+                Some(c) => c,
+                None => self.client.insert(
+                    connect(&self.socket)
+                        .await
+                        .context("connecting to the hub again")?,
+                ),
+            };
+            let e = match client.call(method, params.clone()).await {
+                Err(e) if e.downcast_ref::<HubClosed>().is_some() => e,
+                r => return r,
+            };
+            self.client = None;
+            if !e
+                .downcast_ref::<HubClosed>()
+                .is_some_and(HubClosed::resendable)
+            {
+                return Err(e);
+            }
+            let mut client = match connect(&self.socket).await {
+                Ok(c) => c,
+                Err(again) => return Err(anyhow::anyhow!("{e:#} (connecting again: {again:#})")),
+            };
+            let r = client.call(method, params).await;
+            if !r
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<HubClosed>().is_some())
+            {
+                self.client = Some(client);
+            }
+            r
+        })
     }
 }
 
@@ -1520,6 +2045,67 @@ fn spawn_history_writer(
     (tx, writer)
 }
 
+/// A setting to keep, or the settings to read, for the settings writer
+/// ([`spawn_settings_writer`]).
+enum Save {
+    /// The workspace sidebar shown or not, in `tui-state.json` at this path.
+    WsSidebar(PathBuf, bool),
+    /// A setting of the config file ([`save_setting`]); the file is read again after it.
+    Setting(settings::Change),
+    /// Read what the config file says of the TUI's settings ([`settings::read_file`]).
+    ReadFile,
+}
+
+/// What the settings writer did.
+enum Saved {
+    /// The workspace sidebar remembered shown (or hidden), or why not.
+    WsSidebar(bool, Result<(), String>),
+    /// A setting kept (where, as shown), or why not.
+    Setting(settings::Change, Result<String, String>),
+    /// What the config file says of the TUI's settings.
+    File(Vec<(settings::Key, Option<String>)>),
+}
+
+/// Starts the thread that keeps the settings changed in the TUI, one after another in the
+/// order they were changed: a later change never lands before an earlier one, and the IO loop
+/// never waits on a file or its lock (another TUI may hold it). Each outcome comes back on
+/// `done`. Its sender closed, the thread ends once it kept what it has.
+fn spawn_settings_writer(
+    done: mpsc::UnboundedSender<Saved>,
+) -> (
+    std::sync::mpsc::Sender<Save>,
+    Option<std::thread::JoinHandle<()>>,
+) {
+    let (tx, rx) = std::sync::mpsc::channel::<Save>();
+    let writer = std::thread::Builder::new()
+        .name("twr-settings".into())
+        .spawn(move || {
+            let file = || {
+                twr_core::paths::Paths::from_env()
+                    .ok()
+                    .map(|p| settings::read_file(&p.config_file))
+                    .unwrap_or_default()
+            };
+            for save in rx {
+                let saved = match save {
+                    Save::WsSidebar(path, on) => Saved::WsSidebar(
+                        on,
+                        firstrun::set_workspaces_sidebar(&path, on).map_err(|e| e.to_string()),
+                    ),
+                    Save::Setting(change) => {
+                        let r = save_setting(&change);
+                        let _ = done.send(Saved::Setting(change, r));
+                        Saved::File(file())
+                    }
+                    Save::ReadFile => Saved::File(file()),
+                };
+                let _ = done.send(saved);
+            }
+        })
+        .ok();
+    (tx, writer)
+}
+
 /// `msg` for the next view's status bar (`late`: its sender and the workspace `msg` came
 /// from), unless it is transient (news only for a moment) or empty.
 fn forward_late(
@@ -1550,19 +2136,28 @@ async fn forward_unread(
 /// view's (left by a switch and still sending what it had been asked), is done: one
 /// workspace's calls go out in the order they were asked, across switches.
 fn spawn_calls(
-    previous: Option<tokio::task::JoinHandle<()>>,
+    previous: Option<Calls>,
     calls: impl CallHub + 'static,
     rx: mpsc::UnboundedReceiver<(&'static str, Value)>,
     status: StatusOut,
     results: ResultsOut,
-) -> tokio::task::JoinHandle<()> {
+) -> Calls {
     tokio::spawn(async move {
-        if let Some(previous) = previous {
-            let _ = previous.await;
-        }
-        serve_calls(calls, rx, status, results).await;
+        // The earlier view's `!` commands too: a stop asked here may name one of them.
+        let launched = match previous {
+            Some(previous) => previous.await.unwrap_or_default(),
+            None => Launched::default(),
+        };
+        serve_calls(calls, rx, status, results, launched).await
     })
 }
+
+/// The jobs of a workspace's latest `!` commands, by the TUI's numbers for them
+/// ([`Action::ShellRun`]'s `launch`), at most [`SHELL_LAUNCHES_KEPT`].
+type Launched = std::collections::VecDeque<(Value, Value)>;
+
+/// A workspace view's calls ([`spawn_calls`]): what it ends with is its [`Launched`].
+type Calls = tokio::task::JoinHandle<Launched>;
 
 /// Stops every view's calls in `callers` (quitting): also those a later view of their
 /// workspace waits for, and those of workspaces in the background.
@@ -1577,9 +2172,9 @@ fn abort_all(callers: &mut Vec<tokio::task::AbortHandle>) {
 /// it (`callers`); quitting stops it.
 fn end_calls(
     switching: bool,
-    caller: tokio::task::JoinHandle<()>,
+    caller: Calls,
     workspace: Option<&str>,
-    callers: &mut std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    callers: &mut std::collections::HashMap<String, Calls>,
 ) {
     match (switching, workspace) {
         (true, Some(w)) => {
@@ -1589,10 +2184,26 @@ fn end_calls(
     }
 }
 
+/// The TUI's own call that stops a `!` command by its number once `shell.run` answered it
+/// ([`Action::ShellStopLaunch`]): `serve_calls` turns it into `job.cancel`.
+const SHELL_STOP_LAUNCH: &str = "tui.shell_stop_launch";
+
+/// How many `!` commands' jobs `serve_calls` keeps by number, for a stop that comes later.
+const SHELL_LAUNCHES_KEPT: usize = 64;
+
 /// The calls whose results the view follows a message with: what was sent and its ref, and
 /// taking it back ([`AppState::apply_result`]). A failed one comes as `{failed: true, ref}`
 /// (`ref`: the one it named, if any).
-const FOLLOWED: [&str; 3] = ["say", "thread.send", "message.withdraw"];
+const FOLLOWED: [&str; 6] = [
+    "say",
+    "thread.send",
+    "message.withdraw",
+    "shell.run",
+    "shell.cd",
+    // After the `shell.run` it stops, in order: a failed stop is never lost by a switch,
+    // nor read before the command it is about.
+    "job.cancel",
+];
 
 /// A results channel of a view ([`ResultsOut`]).
 type ResultTx = mpsc::UnboundedSender<(&'static str, Value)>;
@@ -1619,10 +2230,50 @@ async fn serve_calls(
     mut rx: mpsc::UnboundedReceiver<(&'static str, Value)>,
     status: StatusOut,
     results: ResultsOut,
-) {
-    while let Some((method, params)) = rx.recv().await {
+    mut launched: Launched,
+) -> Launched {
+    while let Some((method, mut params)) = rx.recv().await {
+        let launch = match method {
+            "shell.run" => params.as_object_mut().and_then(|p| p.remove("launch")),
+            _ => None,
+        };
+        // A stop asked before the run was answered: the run came first on these calls, so
+        // its job is known now (none: it failed, nothing to stop).
+        let (method, params) = if method == SHELL_STOP_LAUNCH {
+            let Some(i) = launched.iter().position(|(n, _)| *n == params["launch"]) else {
+                continue;
+            };
+            let (_, job) = launched.remove(i).unwrap_or_default();
+            ("job.cancel", json!({ "job": job }))
+        } else {
+            (method, params)
+        };
         let named = params["ref"].clone();
-        match calls.call(method, params).await {
+        let named_job = params["job"].clone();
+        // What a `speech.*` call asked goes with its answer: the words for what it did need
+        // it ([`speech::SpeechView::answered`]).
+        let asked = method.starts_with("speech.").then(|| params.clone());
+        let answer = calls.call(method, params).await;
+        if let (Some(n), Ok(r)) = (launch, &answer) {
+            if !r["job"].is_null() {
+                launched.push_back((n, r["job"].clone()));
+                if launched.len() > SHELL_LAUNCHES_KEPT {
+                    launched.pop_front();
+                }
+            }
+        }
+        if let Some(asked) = asked {
+            let said = results.view.send((method, speech::answer(asked, &answer)));
+            // The view that asked is gone (a switch): a failure is said where the TUI is now,
+            // naming the workspace, as other calls' are; a poll's says nothing.
+            if let (Err(_), Err(e)) = (said, &answer) {
+                if method != "speech.status" {
+                    status.send((error_status(method, &format!("{e:#}")), false));
+                }
+            }
+            continue;
+        }
+        match answer {
             // What a message did ("sent to the orchestrator") is news only for a moment.
             Ok(r) => {
                 if let Some(msg) = result_status(method, &r) {
@@ -1632,7 +2283,12 @@ async fn serve_calls(
                     let _ = results.followed.send((method, r));
                 } else if method == "orchestrator.reset"
                     || method == "thread.activity"
+                    || method == "thread.queue"
+                    || method == "message.send_now"
+                    || method == "job.log"
                     || method == "hub.info"
+                    || method == "account.list"
+                    || method == "orchestrator.show"
                     || method == "trash.list"
                     || (method == "trash.empty" && is_dry_run(&r))
                 {
@@ -1640,8 +2296,29 @@ async fn serve_calls(
                 }
             }
             // A failed poll says nothing: the next one tries again.
-            Err(_) if method == "thread.activity" || method == "hub.info" => {
+            Err(_)
+                if method == "thread.activity"
+                    || method == "hub.info"
+                    || method == "thread.queue"
+                    || method == "orchestrator.show" =>
+            {
                 let _ = results.view.send((method, Value::Null));
+            }
+            // A stop that failed: said, and no longer pending.
+            Err(e) if method == "job.cancel" => {
+                let failed = json!({"failed": true, "job": named_job, "error": format!("{e:#}")});
+                let _ = results.followed.send((method, failed));
+            }
+            // A command's log that can't be read: it shows what its end recorded.
+            Err(_) if method == "job.log" => {
+                let _ = results
+                    .view
+                    .send((method, json!({"failed": true, "job": named_job})));
+            }
+            // Nor a failed `account.list`, which is asked for again after a wait (none from a
+            // hub older than accounts).
+            Err(e) if method == "account.list" => {
+                let _ = results.view.send((method, accounts_failure(&e)));
             }
             Err(e) => {
                 status.send((error_status(method, &format!("{e:#}")), false));
@@ -1652,6 +2329,7 @@ async fn serve_calls(
             }
         }
     }
+    launched
 }
 
 /// Why [`drive`] returned.
@@ -1673,7 +2351,7 @@ enum End {
 /// working icon, and the workspaces with how many items each one had waiting when last seen.
 struct Shared {
     /// The calls each workspace left by a switch is still sending ([`end_calls`]).
-    callers: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+    callers: std::collections::HashMap<String, Calls>,
     /// Every view's calls ever started: quitting stops all that still run ([`abort_all`]).
     all_callers: Vec<tokio::task::AbortHandle>,
     /// Errors of calls a workspace left asked for, once another one shows ([`serve_calls`]).
@@ -1685,16 +2363,78 @@ struct Shared {
     epoch: std::time::Instant,
     workspaces: Option<std::sync::Arc<dyn Workspaces>>,
     waiting_seen: std::collections::HashMap<String, usize>,
+    /// When each workspace's hub is asked next how it is ([`workspace::PollClock`]).
+    poll_clock: workspace::PollClock,
     /// What the terminal tells apart ([`enhance_keyboard`]); its notice goes to the first
     /// workspace shown, and a Shift-Enter seen in one is known in every other.
     keys: keys::Keys,
     /// `/compact on|off`, for every workspace shown ([`crate::app::ViewState::compact`]).
     compact: Option<bool>,
+    /// `/suggest on|off`, for every workspace shown ([`crate::suggest`]).
+    suggest: Option<bool>,
+    /// The sidebar hidden ([`crate::sidebar`], Ctrl-B), for every workspace shown (and, in
+    /// `tui-state.json`, the next runs).
+    sidebar_hidden: bool,
+    /// The thread's agent this TUI runs for, if it does: it creates no workspace and changes
+    /// no setting.
+    agent: Option<String>,
+    /// The settings writer ([`spawn_settings_writer`]), and what it kept; taken (closed) as
+    /// the TUI quits.
+    saves: Option<std::sync::mpsc::Sender<Save>>,
+    saved_rx: mpsc::UnboundedReceiver<Saved>,
+    /// `/summaries on|off`, for every workspace shown ([`crate::summary`]).
+    summaries: Option<bool>,
+    /// What the TUI has told the user across runs, and where it keeps that
+    /// ([`crate::firstrun`]; `None`: nowhere, so the Shift-Enter offer is never made).
+    seen: firstrun::Seen,
+    seen_file: Option<PathBuf>,
+    /// The Shift-Enter offer, for the first workspace shown ([`firstrun::terminal_offer`]).
+    offer: Option<firstrun::TerminalOffer>,
+    /// The suggestion asks on their way, of every workspace shown ([`Asks`]).
+    asking: Asks,
+    /// The summary asks on their way, of every workspace shown ([`Asks`]).
+    summarizing: Asks,
+    /// The TUI's own speaker, once per process whichever workspace shows
+    /// ([`speaker::OwnSpeaker`]).
+    speaker: speaker::OwnSpeaker,
+}
+
+/// The suggestion asks on their way (`suggest.next`, each on a connection of its own), or the
+/// summary asks (`summary.thread`), of every workspace shown: once they are off, in whichever
+/// workspace, they are aborted,
+/// which closes their connections, and the hub drops them, before any model is asked or with
+/// the call it started.
+#[derive(Default)]
+struct Asks(Vec<tokio::task::AbortHandle>);
+
+impl Asks {
+    /// An ask on its way.
+    fn add(&mut self, ask: tokio::task::AbortHandle) {
+        self.0.push(ask);
+    }
+
+    /// Forgets the asks that ended; with suggestions off (`on` false), aborts the others.
+    fn settle(&mut self, on: bool) {
+        self.0.retain(|h| !h.is_finished());
+        if !on {
+            for h in self.0.drain(..) {
+                h.abort();
+            }
+        }
+    }
+}
+
+/// The TUI gone, however it ended (quit, an error, a panic unwinding): no ask of its outlives
+/// it.
+impl Drop for Asks {
+    fn drop(&mut self) {
+        self.settle(false);
+    }
 }
 
 /// Runs the TUI against the hub listening on `socket` until the user quits.
 pub async fn run(socket: PathBuf) -> anyhow::Result<()> {
-    run_with(socket, None, None).await
+    run_with(socket, None, None, None, None).await
 }
 
 /// The `[tui]` settings: `given` (what the CLI read from the config of the workspace it
@@ -1710,11 +2450,15 @@ pub fn tui_config(given: Option<twr_core::config::TuiConfig>) -> twr_core::confi
 
 /// Runs the TUI against the hub listening on `socket` until the user quits; with `switching`,
 /// on the workspace it names, with a tab per workspace to switch to ([`workspace`]). `tui`:
-/// the `[tui]` settings ([`tui_config`]).
+/// the `[tui]` settings ([`tui_config`]). `agent`: the thread's agent this TUI runs for, if
+/// it does (it then offers to change nothing of the user's terminal). `speech`: what the
+/// TUI's own speaker needs ([`speaker`]; `None`: it has none).
 pub async fn run_with(
     socket: PathBuf,
     switching: Option<Switching>,
     tui: Option<twr_core::config::TuiConfig>,
+    agent: Option<String>,
+    speech: Option<speaker::LocalSpeech>,
 ) -> anyhow::Result<()> {
     let tui = tui_config(tui);
     // Connect before touching the terminal so connection errors print normally.
@@ -1723,6 +2467,7 @@ pub async fn run_with(
         Session::connect(&socket, switching.as_ref().map(|s| s.current.as_str())).await?;
 
     let mut terminal = ratatui::try_init().context("initializing the terminal")?;
+    twr_core::trace::mark("tui: terminal initialized");
     let guard = TerminalGuard;
     // A terminal without an alternate screen (or one that keeps what was on it) still shows
     // the shell's lines: the first frame draws only what is not blank, so they would stay.
@@ -1738,7 +2483,38 @@ pub async fn run_with(
     // pasted digit would answer a card).
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)
         .context("enabling bracketed paste")?;
-    let keys = enhance_keyboard();
+    let mut keys = enhance_keyboard();
+    // (`keys.mosh` is not looked for where the terminal speaks the keyboard protocol, which
+    // mosh does not pass on.)
+    let remote = terminal_setup::place(keys.mosh).remote.is_some();
+    let agent_tui = is_agent_tui(agent.as_deref());
+    // What was told in earlier runs, and the Shift-Enter offer (only where it can be
+    // remembered: it must not come back every start).
+    let seen_file = firstrun::state_file();
+    let mut seen = seen_file.as_deref().map(firstrun::load).unwrap_or_default();
+    let mut offer = None;
+    if let Some(file) = &seen_file {
+        offer = if keys.notice == Some(keys::TMUX_NOTICE) {
+            // A tmux that loses Shift-Enter: how to fix tmux, instead of any offer.
+            let key = firstrun::TMUX_FORMAT_KEY;
+            (!seen.terminal.contains_key(key)).then(|| firstrun::TerminalOffer::Notice {
+                key: key.into(),
+                text: keys::TMUX_NOTICE.into(),
+            })
+        } else {
+            let place = terminal_setup::place(keys.mosh);
+            firstrun::terminal_offer(&keys, &place, agent_tui, &seen, terminal_setup::prepare)
+        };
+        // Remembered, the startup notices are told once (the mosh one among the offers).
+        keys.notice = None;
+        // A question takes one of the place's few offers, under the file's lock.
+        if let Some(firstrun::TerminalOffer::Edit { key, .. }) = &offer {
+            match firstrun::reserve_offer(file, key) {
+                Ok((true, now)) => seen = now,
+                _ => offer = None,
+            }
+        }
+    }
     if tui.mouse {
         set_mouse_capture(true).context("enabling the mouse")?;
     }
@@ -1749,6 +2525,14 @@ pub async fn run_with(
         .context("enabling focus reporting")?;
     let mut input = Input::terminal()?;
     let (late_tx, late_rx) = mpsc::unbounded_channel::<StatusMsg>();
+    let (saved_tx, saved_rx) = mpsc::unbounded_channel::<Saved>();
+    let (saves, settings_writer) = spawn_settings_writer(saved_tx);
+    let own = speaker::Place {
+        remote,
+        agent: agent_tui,
+        socket_only: switching.is_none(),
+    };
+    let speaker = speaker::OwnSpeaker::start(speech, own, late_tx.clone());
     let mut ctx = Shared {
         callers: std::collections::HashMap::new(),
         all_callers: Vec::new(),
@@ -1760,8 +2544,21 @@ pub async fn run_with(
         epoch: std::time::Instant::now(),
         workspaces: switching.as_ref().map(|s| s.workspaces.clone()),
         waiting_seen: std::collections::HashMap::new(),
+        poll_clock: workspace::PollClock::default(),
         keys,
         compact: None,
+        suggest: None,
+        sidebar_hidden: seen.workspaces_sidebar == Some(false),
+        agent,
+        saves: Some(saves),
+        saved_rx,
+        summaries: None,
+        seen,
+        seen_file,
+        offer,
+        asking: Asks::default(),
+        summarizing: Asks::default(),
+        speaker,
     };
     let mut current = switching.map(|s| s.current);
     // The views of the workspaces left, by name.
@@ -1775,10 +2572,7 @@ pub async fn run_with(
         .and_then(|ws| ws.names().ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|name| workspace::Tab {
-            name,
-            hub: workspace::TabHub::Unknown,
-        })
+        .map(workspace::Tab::new)
         .collect();
     let mut carried = Carried {
         mouse: ctx.tui.mouse,
@@ -1823,8 +2617,12 @@ pub async fn run_with(
             Err(e) => break (Err(e), writer),
         }
     };
-    // Nothing is sent once the user quit, from any workspace.
+    // Nothing is sent once the user quit, from any workspace: no suggestion asked either,
+    // and nothing more read aloud.
     abort_all(&mut ctx.all_callers);
+    ctx.asking.settle(false);
+    ctx.summarizing.settle(false);
+    ctx.speaker.stop();
 
     // Nothing reads the terminal once it is the user's again.
     drop(input);
@@ -1832,12 +2630,21 @@ pub async fn run_with(
     // The terminal is the user's again before anything else waits.
     drop(guard);
     // The lines sent last are written before the TUI exits, unless another TUI holds the
-    // file's lock past [`HISTORY_FLUSH`].
+    // file's lock past [`HISTORY_FLUSH`]; so are the settings changed last.
     flush_history(history_writer);
+    drop(ctx.saves.take());
+    flush_history(settings_writer);
     result
 }
 
-/// Waits for the history writer to finish, at most [`HISTORY_FLUSH`].
+/// Whether this is a thread's agent's TUI: `agent` given, or the process carries `TWR_AGENT`
+/// (a thread's processes do, `twr_runner::reap::AGENT_ENV`).
+fn is_agent_tui(agent: Option<&str>) -> bool {
+    agent.is_some() || std::env::var_os("TWR_AGENT").is_some_and(|v| !v.is_empty())
+}
+
+/// Waits for the history writer (or the settings writer) to finish, at most
+/// [`HISTORY_FLUSH`].
 fn flush_history(writer: Option<std::thread::JoinHandle<()>>) {
     if let Some(w) = writer {
         let until = std::time::Instant::now() + HISTORY_FLUSH;
@@ -1873,8 +2680,11 @@ async fn drive(
         calls,
         info,
         show,
+        accounts,
         control,
         head,
+        backlog,
+        snapshot,
     } = session;
     let epoch = ctx.epoch;
     let instance = info["instance"].as_str().map(str::to_string);
@@ -1927,22 +2737,40 @@ async fn drive(
         view: result_tx,
         followed: followed_tx.clone(),
     };
+    let calls = HubCalls {
+        socket: socket.clone(),
+        client: Some(calls),
+    };
     let caller = spawn_calls(previous, calls, call_rx, status.clone(), results);
     ctx.all_callers.push(caller.abort_handle());
 
     let current_name = current.clone();
     let mut state = AppState::new();
     state.instance_name = instance;
+    // The boxes as the hub said them on connecting: the first frame's box tokens.
+    state.apply_boxes(&info);
     state.attach_via = selection;
     state.view.orch_runtimes = orch_runtimes;
     state.view.orch_installed = orch_installed;
     state.view.orch_default = orch_default;
+    state.view.orch_default_account = show["account"].as_str().map(str::to_string);
+    state.view.default_runtime = crate::app::default_runtime(&show);
+    state.accounts_answered(&accounts, std::time::Instant::now());
     state.view.mouse = carried.mouse;
     state.view.animate = ctx.tui.animate;
+    state.view.color_mode = ctx.tui.colors;
+    state.view.colors = crate::color::resolve_env(ctx.tui.colors);
     state.view.card_order = ctx.tui.card_order;
     state.view.compact_width = ctx.tui.compact_width;
     state.view.compact = ctx.compact;
-    state.view.picker = Picker::from_show(&show);
+    state.view.suggest = ctx.suggest.unwrap_or(ctx.tui.suggest);
+    state.view.notify_terminal = ctx.tui.notify.terminal;
+    state.view.sidebar_hidden = ctx.sidebar_hidden;
+    state.agent = ctx.agent.clone();
+    state.view.suggest_model = ctx.tui.suggest_model.clone();
+    state.summary.on = ctx.summaries.unwrap_or(ctx.tui.summaries);
+    state.summary.every = ctx.tui.summary_every();
+    state.view.picker = Picker::from_show(&show, &state.accounts);
     state.workspace = current;
     state.set_tabs(carried.tabs);
     if let Some(view) = carried.view {
@@ -1952,9 +2780,28 @@ async fn drive(
     if let Some(notice) = ctx.keys.notice.take() {
         state.view.status = Some(notice.into());
     }
+    state.seen = ctx.seen.clone();
+    if let Some(offer) = ctx.offer.take() {
+        state.offer_terminal(offer);
+    }
+    state.suggest_turned_on = ctx.suggest == Some(true);
+    state.apply_suggest_info(&info);
     // Another workspace's frame may be on screen: the first one starts from a clear screen.
     state.view.repaint = true;
-    state.begin_catch_up(head);
+    match (snapshot, backlog) {
+        // The state at the head, at once: no replay, no loading frame. The notifier takes what
+        // a replay would have left it with.
+        (Some(fold), _) => {
+            notifier.adopt(&fold.policy);
+            let threads = fold.registry.list().len() + fold.registry.deleted_views().count();
+            state.install_snapshot(fold, head);
+            twr_core::trace::mark_with(|| {
+                format!("tui: control snapshot installed (head {head}, {threads} threads)")
+            });
+        }
+        (None, Some(items)) => state.begin_compacted_catch_up(head, items),
+        (None, None) => state.begin_catch_up(head),
+    }
     // The history file is written on a thread of its own, in order: a save waits for the
     // file's lock (another TUI may hold it), and the input loop never does.
     // (One JSON string per line, oldest first: [`load_history`].)
@@ -1967,11 +2814,17 @@ async fn drive(
     });
     let mut activity_poll = tokio::time::interval(ACTIVITY_EVERY);
     activity_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // What this hub's speakers read: asked now, then every [`SPEECH_EVERY`].
+    let mut speech_poll = tokio::time::interval(SPEECH_EVERY);
+    speech_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // The other workspaces' tabs: asked now, then every [`TABS_EVERY`].
     let mut tab_poll = tokio::time::interval(TABS_EVERY);
     tab_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tabs_pending = false;
     // This machine's load: read now, then every [`LOAD_EVERY`].
+    // Never read for the screenshots: they must not show the load of the machine they are
+    // made on ([`HIDE_LOAD_ENV`]).
+    let hide_load = std::env::var_os(HIDE_LOAD_ENV).is_some_and(|v| v == "1");
     let mut load_poll = tokio::time::interval(LOAD_EVERY);
     load_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut load_pending = false;
@@ -1987,11 +2840,21 @@ async fn drive(
             let _ = looking_tx.send(Some(looking));
         }
     }
-    // Whether a box is low on disk: asked now, then every [`DISK_EVERY`].
-    let mut disk_poll = tokio::time::interval(DISK_EVERY);
-    disk_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Whether a box is low on disk, and how the remote boxes are: asked now, then every
+    // [`INFO_EVERY`].
+    let mut info_poll = tokio::time::interval(INFO_EVERY);
+    info_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (load_tx, mut load_rx) = mpsc::unbounded_channel::<Option<twr_core::load::Load>>();
-    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<Vec<workspace::Tab>>();
+    // A poll's answers: the workspaces listed (`None`: they could not be), how the hubs
+    // asked were, and when they were asked.
+    let (tabs_tx, mut tabs_rx) = mpsc::unbounded_channel::<(
+        Option<Vec<String>>,
+        Vec<workspace::Polled>,
+        std::time::Instant,
+    )>();
+    // The workspaces as listed for a poll (`None`: they could not be), read off the loop: a
+    // directory on a slow mount never holds up the view.
+    let (names_tx, mut names_rx) = mpsc::unbounded_channel::<Option<Vec<String>>>();
     // A workspace switched to, once its hub is connected ([`open_workspace`]).
     type Opened = (String, anyhow::Result<Session>);
     let (open_tx, mut open_rx) = mpsc::unbounded_channel::<Opened>();
@@ -2010,11 +2873,26 @@ async fn drive(
     // off the input loop and tried again until they succeed (`AppState::hydration_due`).
     type Hydrated = (String, u64, Result<StreamItem, String>);
     let (hyd_tx, mut hyd_rx) = mpsc::unbounded_channel::<Hydrated>();
+    // Suggestion calls' answers: each call on a connection of its own, as it takes a second
+    // or more and nothing else waits for it.
+    let (sug_tx, mut sug_rx) = mpsc::unbounded_channel::<Value>();
+    // Summary calls' answers, by thread and ask, each call on a connection of its own too.
+    let (sum_tx, mut sum_rx) = mpsc::unbounded_channel::<(String, u64, summary::Answer)>();
+    // The decisions older than a snapshot's (`decisions.list`), read once on a connection of
+    // its own.
+    let (dec_tx, mut dec_rx) = mpsc::unbounded_channel::<Value>();
+
     // A replayed transcript event was the last thing applied: the next pass skips its draw.
     // The pane shows the transcript as the replay began until it is all applied
     // (`Transcript::visible`), so nothing on screen changed, and a draw per event would slow
     // a replay of thousands down.
     let mut replaying = false;
+    // `TWR_TRACE_STARTUP`: what the last frame traced showed, and how many control and
+    // transcript items were applied.
+    let mut traced: Option<(Option<String>, bool, bool)> = None;
+    let (mut control_items, mut transcript_items) = (0u64, 0u64);
+    // When the replay's progress was last drawn ([`ui::render_loading`]).
+    let mut loading_drawn: Option<std::time::Instant> = None;
 
     let end: anyhow::Result<End> = async {
         loop {
@@ -2042,6 +2920,17 @@ async fn drive(
                     state.transcript_stalled();
                 }
             }
+            // While the control log is replayed, how far it is, now and then: the view is
+            // not drawn until it is all applied, and no key acts until then.
+            if replaying_control
+                && loading_drawn.is_none_or(|at: std::time::Instant| at.elapsed() >= LOADING_EVERY)
+            {
+                terminal.draw(|f| ui::render_loading(f, &state))?;
+                if loading_drawn.is_none() {
+                    twr_core::trace::mark("tui: loading frame");
+                }
+                loading_drawn = Some(std::time::Instant::now());
+            }
             if !std::mem::take(&mut replaying) && !replaying_control {
                 // The grid's Shift-arrows need the column count the grid is drawn with, the
                 // input box the height it may grow in.
@@ -2056,11 +2945,34 @@ async fn drive(
                 {
                     repaint(terminal)?;
                 }
-                // The cards' order as of now: what waited may be due.
+                // The cards' order and heights as of now: what waited may be due.
                 state.settle_order(std::time::Instant::now());
                 state.view.frame = icon::frame_at(epoch.elapsed());
                 let mut panes = select::Panes::default();
+                let drawing = std::time::Instant::now();
                 let drawn = terminal.draw(|f| panes = ui::render(f, &state))?;
+                if twr_core::trace::enabled() {
+                    let drew = drawing.elapsed().as_micros();
+                    let now = (
+                        state.main_thread(),
+                        state.transcript.is_some(),
+                        state.transcript_catching_up(),
+                    );
+                    if traced.as_ref() != Some(&now) {
+                        twr_core::trace::mark(&format!(
+                            "tui: frame (main {}, transcript {}, {} control items, {} transcript items, drawn in {drew}us)",
+                            now.0.as_deref().unwrap_or("none"),
+                            match (now.1, now.2) {
+                                (false, _) => "none",
+                                (true, true) => "loading",
+                                (true, false) => "shown",
+                            },
+                            control_items,
+                            transcript_items,
+                        ));
+                        traced = Some(now);
+                    }
+                }
                 if state.view.selection.is_some() {
                     screen = drawn.buffer.clone();
                 }
@@ -2072,9 +2984,34 @@ async fn drive(
                 }
                 // What this frame drew in full is all an option key may answer.
                 state.note_drawn(std::time::Instant::now());
+                save_seen(&mut state, ctx.seen_file.as_deref());
                 if shown.replace(now_showing).is_none() {
                     typed_ahead.start(std::time::Instant::now());
                 }
+            }
+            // The decisions older than the snapshot's, once its first frame is drawn: they
+            // never hold that frame up. A hub without `decisions.list` (or a failed read)
+            // leaves the snapshot's rows, and nothing is said.
+            if let Some((before, limit)) = shown.is_some().then(|| state.older_decisions.take()).flatten() {
+                let (socket, tx) = (socket.clone(), dec_tx.clone());
+                tokio::spawn(async move {
+                    let params = json!({"before": before, "limit": limit});
+                    let r = async { connect(&socket).await?.call("decisions.list", params).await }.await;
+                    if let Ok(r) = r {
+                        let _ = tx.send(r);
+                    }
+                });
+            }
+            // An `account.*` event came, or a failed `account.list` is due again: the accounts
+            // again, one call at a time, and the orchestrator the hub would start while there
+            // is none.
+            state.accounts_retry_due(std::time::Instant::now());
+            for method in state.account_calls() {
+                let params = match method {
+                    "account.list" => json!({}),
+                    _ => Value::Null,
+                };
+                let _ = call_tx.send((method, params));
             }
             for (attn, revision, raise) in state.hydration_due(std::time::Instant::now()) {
                 let (socket, tx) = (socket.clone(), hyd_tx.clone());
@@ -2088,10 +3025,53 @@ async fn drive(
                     let _ = tx.send((attn, revision, r));
                 });
             }
+            // The main pane's thread's queue, read when it changed and while it moves.
+            if let Some(thread) = state.queue_due(std::time::Instant::now()) {
+                let _ = call_tx.send(("thread.queue", json!({ "thread": thread })));
+            }
+            // The output of `!` commands on the main pane's thread, and its folder.
+            for job in state.shell_reads_due(std::time::Instant::now()) {
+                let _ = call_tx.send((
+                    "job.log",
+                    json!({ "job": job, "lines": crate::shell::SHELL_READ_LINES }),
+                ));
+            }
+            if state.shell_cwd_due() {
+                let _ = call_tx.send(("shell.cd", json!({})));
+            }
+            ctx.asking.settle(state.view.suggest);
+            if let Some(ask) = state.take_suggest_due() {
+                let (socket, tx) = (socket.clone(), sug_tx.clone());
+                let task = tokio::spawn(async move {
+                    let params = json!({"thread": ask.thread, "turn": ask.turn, "models": ask.models, "retry": ask.retry});
+                    let r = async { connect(&socket).await?.call("suggest.next", params).await }.await;
+                    let _ = tx.send(r.unwrap_or_else(|e| json!({"failed": true, "error": format!("{e:#}")})));
+                });
+                ctx.asking.add(task.abort_handle());
+            }
+            // Summaries of the routine rows the last frame drew (the activity poll's tick, every
+            // [`ACTIVITY_EVERY`], comes back here: one due later waits no longer than that).
+            ctx.summarizing.settle(state.summary.running());
+            for ask in state.take_summaries_due(std::time::Instant::now()) {
+                let (socket, tx) = (socket.clone(), sum_tx.clone());
+                let task = tokio::spawn(async move {
+                    let r = async { connect(&socket).await?.summary_thread(&ask.params).await }.await;
+                    let answer = match r {
+                        Ok(r) => summary::Answer::Got(Box::new(r)),
+                        Err(e) if e.downcast_ref::<twr_core::proto::RpcError>().is_some_and(|r| r.code == twr_core::proto::codes::METHOD_NOT_FOUND) => summary::Answer::Unsupported,
+                        Err(e) => summary::Answer::Failed(format!("{e:#}")),
+                    };
+                    let _ = tx.send((ask.thread, ask.id, answer));
+                });
+                ctx.summarizing.add(task.abort_handle());
+            }
             // The next frame of a moving working icon; no timer when none was drawn.
             let tick = icon::next_tick(state.view.panes.animated, epoch, std::time::Instant::now());
             let retry = state
                 .next_hydration()
+                .into_iter()
+                .chain(state.accounts_retry)
+                .min()
                 .map(tokio::time::Instant::from_std)
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
 
@@ -2116,13 +3096,18 @@ async fn drive(
                             let _ = looking_tx.send(Some(looking));
                         }
                     }
+                    if let Some((_, Ok(TermEvent::Key(k)))) = &key {
+                        twr_core::trace::mark_with(|| format!("tui: key {:?}", k.code));
+                    }
                     let actions = match key {
                         Some((at, Ok(event))) => {
                             let (ahead, status) = typed_ahead.drops(&event, at);
                             if let Some(status) = status {
                                 state.view.status = Some(status.into());
                             }
+                            state.input_at = Some(at);
                             let actions = handle_terminal_event(&mut state, event, &screen, shown.is_some() && !ahead);
+                            state.input_at = None;
                             ctx.keys.shift_enter |= state.view.shift_enter;
                             actions
                         }
@@ -2143,6 +3128,46 @@ async fn drive(
                             Action::Mouse(on) => {
                                 if let Err(e) = set_mouse_capture(on) {
                                     state.view.status = Some(format!("/mouse: {e}"));
+                                }
+                                continue;
+                            }
+                            // The user's `y` to the Shift-Enter offer: the terminal's settings
+                            // file is edited here, by the user's own TUI ([`firstrun`]).
+                            Action::TerminalSetup { yes } => {
+                                if let Some(firstrun::TerminalOffer::Edit { place, terminal, .. }) =
+                                    state.answer_terminal_offer(yes)
+                                {
+                                    let outcome = terminal_setup::edit(&place, terminal);
+                                    state.view.status =
+                                        Some(firstrun::edit_status(terminal, &outcome, &place.home));
+                                }
+                                save_seen(&mut state, ctx.seen_file.as_deref());
+                                continue;
+                            }
+                            // Kept for the next runs (and the next workspaces shown).
+                            // Kept by the settings writer, in order.
+                            Action::WsSidebar(on) => {
+                                ctx.sidebar_hidden = !on;
+                                if let (Some(file), Some(saves)) = (&ctx.seen_file, &ctx.saves) {
+                                    let _ = saves.send(Save::WsSidebar(file.clone(), on));
+                                }
+                                continue;
+                            }
+                            // A setting changed in the settings overlay, applied to the view
+                            // already: the notifier takes it too, and the config file keeps
+                            // it when it can be changed safely ([`config_edit`]).
+                            Action::SettingsFile => {
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::ReadFile);
+                                }
+                                continue;
+                            }
+                            Action::Setting(change) => {
+                                if let settings::Change::Notify(alert) = change {
+                                    notifier.set_alert(alert);
+                                }
+                                if let Some(saves) = &ctx.saves {
+                                    let _ = saves.send(Save::Setting(change));
                                 }
                                 continue;
                             }
@@ -2188,39 +3213,74 @@ async fn drive(
                         }
                     }
                 }
-                item = next_opt(&mut control) => match item {
-                    Some(Ok(item)) => {
-                        apply_control(&mut state, notifier, &item, std::time::Instant::now());
-                    }
-                    Some(Err(e)) => {
-                        control_lost(&mut state, notifier, format!("control stream: {e:#}"));
-                        control = None;
-                        // What it can't show any more, the user doesn't see here.
-                        if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
-                            let _ = looking_tx.send(Some(looking));
+                item = next_opt(&mut control) => {
+                    // What else came already is applied in the same pass, before a draw: a
+                    // replay of thousands goes by in batches, not a pass of the loop each.
+                    let mut next = Some(item);
+                    let mut applied = 0;
+                    while let Some(item) = next.take() {
+                        match item {
+                            Some(Ok(item)) => {
+                                let replaying = state.catch_up.is_some();
+                                apply_control(&mut state, notifier, &item, std::time::Instant::now());
+                                control_items += 1;
+                                if replaying && state.catch_up.is_none() {
+                                    twr_core::trace::mark_with(|| {
+                                        format!("tui: control replay applied ({control_items} items)")
+                                    });
+                                }
+                            }
+                            Some(Err(e)) => {
+                                control_lost(&mut state, notifier, format!("control stream: {e:#}"));
+                                control = None;
+                                // What it can't show any more, the user doesn't see here.
+                                if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
+                                    let _ = looking_tx.send(Some(looking));
+                                }
+                            }
+                            None => {
+                                control_lost(&mut state, notifier, "hub closed the control stream".into());
+                                control = None;
+                                if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
+                                    let _ = looking_tx.send(Some(looking));
+                                }
+                            }
                         }
-                    }
-                    None => {
-                        control_lost(&mut state, notifier, "hub closed the control stream".into());
-                        control = None;
-                        if let Some(looking) = attendance.step(false, std::time::Instant::now()) {
-                            let _ = looking_tx.send(Some(looking));
+                        applied += 1;
+                        if applied < CONTROL_BATCH {
+                            next = control.as_mut().and_then(|c| c.next().now_or_never());
                         }
                     }
                 },
-                item = next_opt(&mut thread_sub) => match item {
-                    Some(Ok(item)) => {
-                        state.apply_event(&item);
-                        replaying = state.transcript_catching_up();
-                    }
-                    Some(Err(e)) => {
-                        state.view.status = Some(format!("transcript: {e:#}"));
-                        thread_sub = None;
-                        state.transcript_stalled();
-                    }
-                    None => {
-                        thread_sub = None;
-                        state.transcript_stalled();
+                item = next_opt(&mut thread_sub) => {
+                    // Like the control stream's: what came already in the same pass.
+                    let mut next = Some(item);
+                    let mut applied = 0;
+                    while let Some(item) = next.take() {
+                        match item {
+                            Some(Ok(item)) => {
+                                state.apply_event(&item);
+                                transcript_items += 1;
+                                replaying = state.transcript_catching_up();
+                            }
+                            Some(Err(e)) => {
+                                state.view.status = Some(format!("transcript: {e:#}"));
+                                thread_sub = None;
+                                state.transcript_stalled();
+                                // What it settled on is drawn, though an item of this batch
+                                // was still replayed.
+                                replaying = false;
+                            }
+                            None => {
+                                thread_sub = None;
+                                state.transcript_stalled();
+                                replaying = false;
+                            }
+                        }
+                        applied += 1;
+                        if applied < CONTROL_BATCH {
+                            next = thread_sub.as_mut().and_then(|s| s.next().now_or_never());
+                        }
                     }
                 },
                 Some((msg, transient)) = err_rx.recv() => {
@@ -2232,13 +3292,23 @@ async fn drive(
                 _ = sleep_opt(state.status_deadline()) => {
                     state.expire_status(std::time::Instant::now());
                 }
-                // A card move that waited is due, or the mouse's hold on the cards ended.
+                // A card move or a card's shrink that waited is due, or the mouse's hold on
+                // the cards ended.
                 _ = sleep_opt(state.order_deadline(std::time::Instant::now())) => {
                     state.settle_order(std::time::Instant::now());
                 }
+                // The queue is due to be read: loop to read it.
+                _ = sleep_opt(state.queue_deadline(std::time::Instant::now())) => {}
+                // A running command's output is due to be read: loop to read it.
+                _ = sleep_opt(state.shell_deadline(std::time::Instant::now())) => {}
                 // The double Esc's hint is due to go.
                 _ = sleep_opt(state.unsend_deadline()) => {
                     state.expire_unsend(std::time::Instant::now());
+                }
+                Some(r) = sug_rx.recv() => state.apply_result("suggest.next", &r),
+                Some(r) = dec_rx.recv() => state.older_decisions_came(&r),
+                Some((thread, ask, answer)) = sum_rx.recv() => {
+                    state.summary_result(&thread, ask, answer, std::time::Instant::now());
                 }
                 Some((attn, revision, r)) = hyd_rx.recv() => {
                     state.hydrated(&attn, revision, r, std::time::Instant::now());
@@ -2259,7 +3329,7 @@ async fn drive(
                         }
                     }
                 }
-                // A failed fetch is due again: loop to start it.
+                // A failed fetch (a capped text, the accounts) is due again: loop to start it.
                 _ = tokio::time::sleep_until(retry) => {}
                 // The user's attention to this lapsed, or it is time to say it lasts.
                 _ = sleep_opt(attendance.next_check(notifier)) => {
@@ -2276,8 +3346,16 @@ async fn drive(
                         let _ = call_tx.send(("thread.activity", Value::Null));
                     }
                 }
+                // Not asked of a hub from before reading aloud, until a `/read` it answers;
+                // never by a thread's agent's TUI, which the hub refuses `speech.*`.
+                _ = speech_poll.tick(), if !state.speech.unsupported && state.agent.is_none() => {
+                    if !state.speech.pending {
+                        state.speech.pending = true;
+                        let _ = call_tx.send(("speech.status", json!({})));
+                    }
+                }
                 // Read off the loop: a few small files, but a `sysctl` on macOS.
-                _ = load_poll.tick(), if !load_pending => {
+                _ = load_poll.tick(), if !load_pending && !hide_load => {
                     load_pending = true;
                     let tx = load_tx.clone();
                     tokio::task::spawn_blocking(move || {
@@ -2288,27 +3366,56 @@ async fn drive(
                     load_pending = false;
                     state.load = load;
                 }
-                _ = disk_poll.tick() => {
-                    if !state.disk_pending {
-                        state.disk_pending = true;
+                _ = info_poll.tick() => {
+                    // (Recorded as sent now: its answer is older than a runner event after.)
+                    if state.send_info() {
                         let _ = call_tx.send(("hub.info", Value::Null));
                     }
                 }
-                // The other workspaces' hubs, for their tabs.
+                // The workspaces' hubs due to be asked how they are, for their tabs and
+                // sidebar cards ([`workspace::PollClock`]); this one's too, for its
+                // orchestrator's latest reply while its conversation is not loaded.
                 _ = tab_poll.tick(), if ctx.workspaces.is_some() && !tabs_pending => {
                     if let Some(ws) = ctx.workspaces.clone() {
                         tabs_pending = true;
-                        let (current, tx) = (state.workspace.clone(), tabs_tx.clone());
+                        let tx = names_tx.clone();
                         tokio::spawn(async move {
-                            let _ = tx.send(poll_tabs(ws.as_ref(), current.as_deref()).await);
+                            let names = tokio::task::spawn_blocking(move || ws.names().ok())
+                                .await
+                                .ok()
+                                .flatten();
+                            let _ = tx.send(names);
                         });
                     }
                 }
-                Some(tabs) = tabs_rx.recv() => {
+                // Listed: the hubs due are asked.
+                Some(names) = names_rx.recv() => {
+                    match ctx.workspaces.clone() {
+                        Some(ws) => {
+                            let listed: Vec<String> = match &names {
+                                Some(n) => n.clone(),
+                                None => state.tabs.iter().map(|t| t.name.clone()).collect(),
+                            };
+                            let now = std::time::Instant::now();
+                            let due = ctx.poll_clock.take_due(&listed, now);
+                            let tx = tabs_tx.clone();
+                            tokio::spawn(async move {
+                                let polled = poll_tabs(ws.as_ref(), due).await;
+                                let _ = tx.send((names, polled, now));
+                            });
+                        }
+                        None => tabs_pending = false,
+                    }
+                }
+                Some((names, polled, asked)) = tabs_rx.recv() => {
                     tabs_pending = false;
+                    for p in &polled {
+                        ctx.poll_clock.answered(&p.name, &p.hub, asked);
+                    }
+                    state.merge_poll(names, polled);
                     let alerts = workspace::waiting_alerts(
                         &mut ctx.waiting_seen,
-                        &tabs,
+                        &state.tabs,
                         state.workspace.as_deref(),
                         notifier,
                         std::time::Instant::now(),
@@ -2320,8 +3427,19 @@ async fn drive(
                             state.view.status = Some(format!("notification: {e}"));
                         }
                     }
-                    state.set_tabs(tabs);
                 }
+                // What the settings writer kept, or why not, and what it read.
+                Some(saved) = ctx.saved_rx.recv() => match saved {
+                    Saved::WsSidebar(on, Err(e)) => {
+                        let how = if on { "shown" } else { "hidden" };
+                        state.view.status = Some(format!(
+                            "Threads sidebar {how}, but not remembered for the next runs: {e}"
+                        ));
+                    }
+                    Saved::WsSidebar(_, Ok(())) => {}
+                    Saved::Setting(change, r) => state.setting_saved(&change, r),
+                    Saved::File(file) => state.settings_file(file),
+                },
                 // An error of a call the workspace left had asked for.
                 Some((msg, transient)) = ctx.late_rx.recv() => {
                     state.set_status(msg, transient, std::time::Instant::now());
@@ -2331,15 +3449,16 @@ async fn drive(
                         // What the user saw of this workspace's waiting items: no alert for
                         // them once it is in the background.
                         if let Some(current) = &state.workspace {
-                            let hub = state.tab_hub(&workspace::Tab {
-                                name: current.clone(),
-                                hub: workspace::TabHub::Unknown,
-                            });
+                            let hub = state.tab_hub(&workspace::Tab::new(current.clone()));
                             if let workspace::TabHub::Running { permissions, questions, .. } = hub {
                                 let waiting = notifier.waiting_count(permissions, questions);
                                 ctx.waiting_seen.insert(current.clone(), waiting);
                             }
                         }
+                        // Its hub may just have been started: its card is asked at once.
+                        ctx.poll_clock.soon(&name);
+                        // What this workspace's card showed stays on it.
+                        state.keep_live_glance();
                         return Ok(End::Switch {
                             to: name,
                             next: Box::new(next),
@@ -2357,6 +3476,10 @@ async fn drive(
                     if follow.current(&t, generation) {
                         match r {
                             Ok((s, since, head)) => {
+                                twr_core::trace::mark_with(|| {
+                                    format!("tui: transcript subscribed ({t} after {since}, head {head})")
+                                });
+                                transcript_items = 0;
                                 if let Some(tr) = state.transcript.as_mut().filter(|tr| tr.thread == t) {
                                     tr.resume(since, head);
                                 }
@@ -2374,8 +3497,18 @@ async fn drive(
     }
     .await;
 
-    // `/compact on|off` holds in the next workspace shown too.
+    // `/compact on|off` holds in the next workspace shown too, and so do the settings
+    // changed here ([`crate::settings`]).
     ctx.compact = state.view.compact;
+    ctx.suggest = Some(state.view.suggest);
+    ctx.sidebar_hidden = state.view.sidebar_hidden;
+    ctx.tui.card_order = state.view.card_order;
+    ctx.tui.compact_width = state.view.compact_width;
+    ctx.tui.notify.terminal = state.view.notify_terminal;
+    ctx.tui.colors = state.view.color_mode;
+    ctx.summaries = Some(state.summary.on);
+    save_seen(&mut state, ctx.seen_file.as_deref());
+    ctx.seen = state.seen.clone();
     // Leaving this hub: its attendance connection closes, and the hub forgets it.
     drop(looking_tx);
     drop(call_tx);
@@ -2395,10 +3528,39 @@ async fn drive(
 }
 
 #[cfg(test)]
+mod asks_tests {
+    use super::*;
+
+    /// Asks on their way stay while suggestions are on, and all go, of every workspace, once
+    /// they are off.
+    #[tokio::test]
+    async fn asks_on_their_way_go_once_suggestions_are_off() {
+        let mut asks = Asks::default();
+        let one = tokio::spawn(std::future::pending::<()>());
+        let two = tokio::spawn(std::future::pending::<()>());
+        asks.add(one.abort_handle());
+        asks.add(two.abort_handle());
+        asks.settle(true);
+        tokio::task::yield_now().await;
+        assert!(!one.is_finished() && !two.is_finished());
+        asks.settle(false);
+        assert!(one.await.unwrap_err().is_cancelled());
+        assert!(two.await.unwrap_err().is_cancelled());
+        assert!(asks.0.is_empty());
+        // Dropped (the TUI quit, or failed): its asks go with it.
+        let three = tokio::spawn(std::future::pending::<()>());
+        asks.add(three.abort_handle());
+        drop(asks);
+        assert!(three.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` whose
-    /// params say `fail`), answers `slow` once its oneshot fires, and a `message.withdraw`
-    /// with its params.
+    /// A hub that records the calls it gets, fails `fail` (and a `message.withdraw` or an
+    /// `account.list` whose params say `fail`; an `account.list` whose params say `old` as a
+    /// hub older than accounts does), answers `slow` once its oneshot fires, and a
+    /// `message.withdraw` with its params.
     struct Recording(
         std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
         Option<tokio::sync::oneshot::Receiver<()>>,
@@ -2422,10 +3584,153 @@ mod tests {
                         Err(anyhow::anyhow!("connection lost"))
                     }
                     "message.withdraw" => Ok(params),
+                    "shell.cd" if params["dir"] == "/missing" => {
+                        Err(anyhow::anyhow!("/missing: No such file or directory"))
+                    }
+                    "account.list" if params["fail"] == true => {
+                        Err(anyhow::anyhow!("connection lost"))
+                    }
+                    "account.list" if params["old"] == true => {
+                        Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                            twr_core::proto::codes::METHOD_NOT_FOUND,
+                            "unknown method \"account.list\"",
+                        )))
+                    }
+                    "account.list" => Ok(serde_json::json!({"runtimes": {}})),
+                    // A hub from before reading aloud.
+                    "speech.status" => Err(anyhow::Error::new(twr_core::proto::RpcError::new(
+                        twr_core::proto::codes::METHOD_NOT_FOUND,
+                        "unknown method speech.status",
+                    ))),
+                    "speech.request" => Ok(serde_json::json!({"count": 2, "speakers": 1})),
                     _ => Ok(serde_json::Value::Null),
                 }
             })
         }
+    }
+
+    /// The view's calls connection after the hub stopped and another started (a restart, an
+    /// upgrade): the prompt goes to the new hub, once, instead of "Broken pipe".
+    #[tokio::test]
+    async fn calls_reconnect_after_the_hub_restarted() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Stop]);
+        let first = super::connect(&socket).await.unwrap();
+        hub.hung_up().await;
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(first),
+        };
+        let params = json!({"thread": "w1", "prompt": "hi"});
+        calls.call("thread.send", params.clone()).await.unwrap();
+        calls.call("hub.info", Value::Null).await.unwrap();
+        assert_eq!(
+            hub.got(),
+            [vec!["hello"], vec!["hello", "thread.send", "hub.info"]]
+        );
+    }
+
+    /// A prompt the hub had when it went away (it may have been sent) is not sent again: the
+    /// error says to check; the next call connects again.
+    #[tokio::test]
+    async fn a_call_the_hub_may_have_done_is_not_resent() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Crash]);
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(super::connect(&socket).await.unwrap()),
+        };
+        let params = json!({"thread": "w1", "prompt": "hi"});
+        let e = calls.call("thread.send", params).await.unwrap_err();
+        assert!(format!("{e:#}").contains("it may have been done"), "{e:#}");
+        assert_eq!(hub.got(), [vec!["hello", "thread.send"]]);
+        calls.call("hub.info", Value::Null).await.unwrap();
+        assert_eq!(
+            hub.got(),
+            [vec!["hello", "thread.send"], vec!["hello", "hub.info"]]
+        );
+    }
+
+    /// No hub to connect to again: the error says why the call failed and why connecting
+    /// again did.
+    #[tokio::test]
+    async fn a_hub_that_stopped_for_good_is_said_so() {
+        use super::CallHub;
+        use twr_core::testkit::{HubScript, ScriptedHub};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hub.sock");
+        let hub = ScriptedHub::start(&socket, vec![HubScript::Stop]);
+        let first = super::connect(&socket).await.unwrap();
+        hub.hung_up().await;
+        std::fs::remove_file(&socket).unwrap();
+        let mut calls = super::HubCalls {
+            socket: socket.clone(),
+            client: Some(first),
+        };
+        let e = calls
+            .call("thread.send", json!({"thread": "w1", "prompt": "hi"}))
+            .await
+            .unwrap_err();
+        let shown = format!("{e:#}");
+        assert!(
+            shown.starts_with(
+                "the hub closed the connection before thread.send reached it (nothing was \
+                 done): the hub is stopping; is it running? `twr info` (connecting again: "
+            ),
+            "{shown}"
+        );
+    }
+
+    /// A `speech.*` answer goes to the view with what was asked, for the words that say what
+    /// it did ([`speech::SpeechView::answered`]); a hub without the method is told apart, and
+    /// nothing of either goes to the status bar from here.
+    #[tokio::test]
+    async fn speech_answers_go_to_the_view_with_what_was_asked() {
+        use serde_json::json;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        tx.send(("speech.request", json!({"last": 2}))).unwrap();
+        tx.send(("speech.status", json!({}))).unwrap();
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        super::serve_calls(
+            Recording(seen.clone(), None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["speech.request", "speech.status"]);
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            (
+                "speech.request",
+                json!({"asked": {"last": 2}, "result": {"count": 2, "speakers": 1}})
+            )
+        );
+        assert_eq!(
+            view_rx.try_recv().unwrap(),
+            ("speech.status", json!({"asked": {}, "unsupported": true}))
+        );
+        assert!(status_rx.try_recv().is_err());
     }
 
     /// Calls asked for before a switch are still sent once the view that asked is gone, and
@@ -2451,7 +3756,14 @@ mod tests {
             late: Some((late_tx, "a".into())),
             selection: " -w a".into(),
         };
-        super::serve_calls(Recording(seen.clone(), None), rx, status, results).await;
+        super::serve_calls(
+            Recording(seen.clone(), None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         assert_eq!(*seen.lock().unwrap(), ["say", "fail"]);
         let (msg, transient) = late_rx.try_recv().unwrap();
         assert!(msg.starts_with("workspace a: "), "{msg}");
@@ -2492,11 +3804,314 @@ mod tests {
             view: view_tx,
             followed: followed_tx,
         };
-        super::serve_calls(Recording(seen, None), rx, status, results).await;
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
         let (method, r) = followed_rx.try_recv().unwrap();
         assert_eq!((method, r["ref"].as_i64()), ("message.withdraw", Some(7)));
         let (_, r) = followed_rx.try_recv().unwrap();
         assert_eq!(r, serde_json::json!({"failed": true, "ref": 8}));
+    }
+
+    /// A hub that records each call with its params, and answers `shell.run` with a job named
+    /// after its command (`fail` fails).
+    struct Params(std::sync::Arc<std::sync::Mutex<Vec<(&'static str, serde_json::Value)>>>);
+
+    impl super::CallHub for Params {
+        fn call(
+            &mut self,
+            method: &'static str,
+            params: serde_json::Value,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<serde_json::Value>> {
+            self.0.lock().unwrap().push((method, params.clone()));
+            Box::pin(async move {
+                match method {
+                    "shell.run" if params["command"] == "fail" => {
+                        Err(anyhow::anyhow!("no such folder"))
+                    }
+                    "shell.run" => Ok(serde_json::json!({ "job": params["command"] })),
+                    "job.cancel" if params["job"] == "unstoppable" => {
+                        Err(anyhow::anyhow!("connection lost"))
+                    }
+                    _ => Ok(serde_json::Value::Null),
+                }
+            })
+        }
+    }
+
+    /// Ctrl-C before `shell.run` answered stops the command it names once the answer is in,
+    /// whether or not the view that asked is still there: the TUI's number for it never
+    /// reaches the hub, and a run that failed has nothing to stop.
+    #[tokio::test]
+    async fn a_stop_before_the_answer_cancels_that_command() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let run = |command: &str, launch| {
+            super::action_request(&Action::ShellRun {
+                thread: None,
+                command: command.into(),
+                cwd: None,
+                share: false,
+                launch,
+            })
+            .unwrap()
+        };
+        let stop = |launch| super::action_request(&Action::ShellStopLaunch { launch }).unwrap();
+        for call in [
+            run("sleep 1", 1),
+            run("sleep 2", 2),
+            run("fail", 3),
+            stop(2),
+            stop(3),
+        ] {
+            tx.send(call).unwrap();
+        }
+        // The switch: the view is gone.
+        drop(tx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: mpsc::unbounded_channel().0,
+            followed: mpsc::unbounded_channel().0,
+        };
+        super::serve_calls(
+            Params(seen.clone()),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter().all(|(_, p)| p.get("launch").is_none()),
+            "{seen:?}"
+        );
+        let cancels: Vec<_> = seen.iter().filter(|(m, _)| *m == "job.cancel").collect();
+        assert_eq!(
+            cancels,
+            [&("job.cancel", serde_json::json!({"job": "sleep 2"}))]
+        );
+    }
+
+    /// A command run by a view left by a switch, stopped from the workspace's next view
+    /// before its answer was read there: the next view's calls know its job.
+    #[tokio::test]
+    async fn a_stop_from_the_next_view_cancels_the_earlier_views_command() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let out = || {
+            (
+                super::StatusOut {
+                    tx: mpsc::unbounded_channel().0,
+                    late: None,
+                    selection: String::new(),
+                },
+                super::ResultsOut {
+                    view: mpsc::unbounded_channel().0,
+                    followed: mpsc::unbounded_channel().0,
+                },
+            )
+        };
+        let (tx1, rx1) = mpsc::unbounded_channel();
+        let run = Action::ShellRun {
+            thread: None,
+            command: "sleep 9".into(),
+            cwd: None,
+            share: false,
+            launch: 4,
+        };
+        tx1.send(super::action_request(&run).unwrap()).unwrap();
+        drop(tx1);
+        let (status, results) = out();
+        let first = super::spawn_calls(None, Params(seen.clone()), rx1, status, results);
+        let (tx2, rx2) = mpsc::unbounded_channel();
+        tx2.send(super::action_request(&Action::ShellStopLaunch { launch: 4 }).unwrap())
+            .unwrap();
+        drop(tx2);
+        let (status, results) = out();
+        let second = super::spawn_calls(Some(first), Params(seen.clone()), rx2, status, results);
+        second.await.unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen.last(),
+            Some(&("job.cancel", serde_json::json!({"job": "sleep 9"})))
+        );
+    }
+
+    /// A stop that fails after a switch reaches the workspace, after the run it is about:
+    /// back on it, the command is no longer taken as stopping, and Ctrl-C stops it again.
+    #[tokio::test]
+    async fn a_failed_stop_after_a_switch_reaches_the_workspace_in_order() {
+        use crate::app::Action;
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (followed_tx, mut followed_rx) = mpsc::unbounded_channel();
+        let run = Action::ShellRun {
+            thread: None,
+            command: "unstoppable".into(),
+            cwd: None,
+            share: false,
+            launch: 1,
+        };
+        tx.send(super::action_request(&run).unwrap()).unwrap();
+        tx.send(super::action_request(&Action::ShellStopLaunch { launch: 1 }).unwrap())
+            .unwrap();
+        drop(tx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: mpsc::unbounded_channel().0,
+            followed: followed_tx,
+        };
+        super::serve_calls(Params(seen), rx, status, results, Default::default()).await;
+        let mut st = crate::app::tests::with_orch();
+        st.shell_launching.push_back(crate::shell::Launch {
+            id: 1,
+            thread: Some("t-orch".into()),
+            command: "unstoppable".into(),
+            cancel: true,
+        });
+        let mut methods = Vec::new();
+        while let Ok((method, mut r)) = followed_rx.try_recv() {
+            methods.push(method);
+            if method == "shell.run" {
+                r["thread"] = serde_json::json!("t-orch");
+                r["name"] = serde_json::json!("unstoppable");
+            }
+            st.apply_result(method, &r);
+        }
+        assert_eq!(methods, ["shell.run", "job.cancel"]);
+        assert!(st.shell_jobs.iter().all(|s| !s.stopping));
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("could not stop"));
+    }
+
+    /// A `!cd` that fails after the switch is answered to the workspace too: back on it, the
+    /// TUI knows the `!cd` is over, and commands run again.
+    #[tokio::test]
+    async fn a_failed_cd_after_a_switch_reaches_the_workspace() {
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, view_rx) = mpsc::unbounded_channel();
+        let (followed_tx, mut followed_rx) = mpsc::unbounded_channel();
+        tx.send((
+            "shell.cd",
+            serde_json::json!({"cwd": null, "dir": "/missing"}),
+        ))
+        .unwrap();
+        drop(tx);
+        drop(view_rx);
+        let status = super::StatusOut {
+            tx: mpsc::unbounded_channel().0,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: followed_tx,
+        };
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        let (method, r) = followed_rx.try_recv().unwrap();
+        assert_eq!(method, "shell.cd");
+        assert_eq!(r["failed"], true);
+        // The view back: the `!cd` is over.
+        let mut st = crate::app::AppState::new();
+        st.shell_cd_asked = true;
+        st.shell_cds.push_back(true);
+        st.apply_result(method, &r);
+        assert!(!st.shell_cd_asked);
+        assert!(st.shell_cds.is_empty());
+    }
+
+    /// A failed `account.list` reaches the view as `{failed: true}` (asked for again after a
+    /// wait, `AppState::accounts_answered`), an older hub's unknown method as null (never
+    /// asked again), with nothing in the status bar; an answer as it is.
+    #[tokio::test]
+    async fn a_failed_account_list_is_told_apart_from_an_older_hub() {
+        use tokio::sync::mpsc;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (view_tx, mut view_rx) = mpsc::unbounded_channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        for params in [
+            serde_json::json!({"fail": true}),
+            serde_json::json!({"old": true}),
+            serde_json::json!({}),
+        ] {
+            tx.send(("account.list", params)).unwrap();
+        }
+        drop(tx);
+        let status = super::StatusOut {
+            tx: status_tx,
+            late: None,
+            selection: String::new(),
+        };
+        let results = super::ResultsOut {
+            view: view_tx,
+            followed: mpsc::unbounded_channel().0,
+        };
+        super::serve_calls(
+            Recording(seen, None),
+            rx,
+            status,
+            results,
+            Default::default(),
+        )
+        .await;
+        let mut answers = Vec::new();
+        while let Ok((method, r)) = view_rx.try_recv() {
+            assert_eq!(method, "account.list");
+            answers.push(r);
+        }
+        assert_eq!(
+            answers,
+            [
+                serde_json::json!({"failed": true}),
+                serde_json::Value::Null,
+                serde_json::json!({"runtimes": {}}),
+            ]
+        );
+        assert!(status_rx.try_recv().is_err(), "nothing in the status bar");
+        // The one on connecting, as `Session::connect` maps it (no answer in time too).
+        let timed_out = super::within(
+            std::time::Duration::from_millis(1),
+            "asking for the accounts",
+            std::future::pending::<anyhow::Result<serde_json::Value>>(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            super::accounts_failure(&timed_out),
+            serde_json::json!({"failed": true})
+        );
     }
 
     /// A view left by a switch keeps sending its calls (it is not stopped), and the next view
@@ -2755,6 +4370,325 @@ mod tests {
         assert!(first_handle.is_finished(), "the predecessor too");
         assert!(second.is_finished() && background.is_finished());
         drop(tx1);
+    }
+
+    /// The settings writer keeps the changes in the order they were made, each outcome
+    /// coming back in that order; closed, it ends once it kept them all.
+    #[tokio::test]
+    async fn the_settings_writer_keeps_changes_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tui-state.json");
+        let (done, mut outcomes) = mpsc::unbounded_channel();
+        let (saves, writer) = super::spawn_settings_writer(done);
+        for i in 0..20 {
+            saves
+                .send(super::Save::WsSidebar(file.clone(), i % 2 == 0))
+                .unwrap();
+        }
+        saves
+            .send(super::Save::WsSidebar(file.clone(), false))
+            .unwrap();
+        drop(saves);
+        writer.unwrap().join().unwrap();
+        let mut n = 0;
+        while let Ok(saved) = outcomes.try_recv() {
+            let super::Saved::WsSidebar(on, r) = saved else {
+                panic!("only the sidebar was saved");
+            };
+            assert!(r.is_ok());
+            assert_eq!(on, n < 20 && n % 2 == 0, "{n}");
+            n += 1;
+        }
+        assert_eq!(n, 21);
+        assert_eq!(firstrun::load(&file).workspaces_sidebar, Some(false));
+    }
+
+    /// How a fake hub of [`fake_hub`] answers.
+    #[derive(Clone)]
+    enum Fake {
+        /// `hub.glance` with this.
+        Glance(Value),
+        /// `hub.glance` without its `workers`, and `thread.list` with these.
+        Mid(Value, Value),
+        /// An older hub: no `hub.glance`, `thread.list` and `attention.list` with these.
+        Old(Value, Value),
+        /// Takes the connection and never answers.
+        Silent,
+    }
+
+    /// A fake hub of workspace `name` on `<dir>/<name>.sock`, answering as `fake` says; the
+    /// methods it was asked, in order.
+    fn fake_hub(
+        dir: &std::path::Path,
+        name: &str,
+        fake: Fake,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let sock = dir.join(format!("{name}.sock"));
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (log, name) = (std::sync::Arc::clone(&asked), name.to_string());
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (log, fake, name) = (std::sync::Arc::clone(&log), fake.clone(), name.clone());
+                tokio::spawn(async move {
+                    let (r, mut w) = stream.into_split();
+                    let mut lines = BufReader::new(r).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let method = req["method"].as_str().unwrap_or_default().to_string();
+                        log.lock().unwrap().push(method.clone());
+                        if matches!(fake, Fake::Silent) {
+                            continue;
+                        }
+                        let answer = match (method.as_str(), &fake) {
+                            ("hello", _) => json!({"result": {"workspace": name}}),
+                            ("hub.glance", Fake::Glance(g) | Fake::Mid(g, _)) => {
+                                json!({"result": g})
+                            }
+                            ("thread.list", Fake::Mid(_, t)) => json!({"result": t}),
+                            ("thread.list", Fake::Old(t, _)) => json!({"result": t}),
+                            ("attention.list", Fake::Old(_, a)) => json!({"result": a}),
+                            _ => json!({"error": {"code": "method_not_found", "message": method}}),
+                        };
+                        let mut frame = answer;
+                        frame["id"] = req["id"].clone();
+                        let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                    }
+                });
+            }
+        });
+        (sock, asked)
+    }
+
+    /// The workspaces of a poll test: their sockets by name.
+    struct Fakes(std::collections::HashMap<String, std::path::PathBuf>);
+
+    impl super::Workspaces for Fakes {
+        fn names(&self) -> anyhow::Result<Vec<String>> {
+            let mut names: Vec<String> = self.0.keys().cloned().collect();
+            names.sort();
+            Ok(names)
+        }
+        fn socket(&self, name: &str) -> anyhow::Result<std::path::PathBuf> {
+            self.0
+                .get(name)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("no {name}"))
+        }
+        fn open(
+            &self,
+            _: &str,
+        ) -> futures::future::BoxFuture<'static, anyhow::Result<std::path::PathBuf>> {
+            unreachable!("a poll never opens a hub")
+        }
+        fn create(&self, _: &str) -> anyhow::Result<()> {
+            unreachable!()
+        }
+    }
+
+    /// A poll asks each running hub one `hub.glance` (after `hello`), an older hub
+    /// `thread.list` and `attention.list` instead; a stopped hub is not started (nothing is
+    /// opened: [`Fakes::open`] panics), and one that never answers is busy within the
+    /// timeout. The answers become the tabs' counts and the sidebar's cards.
+    #[tokio::test]
+    async fn a_poll_glances_at_each_hub_once_and_starts_none() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let glance = json!({
+            "workspace": "new", "threads": 3, "running": 1, "permissions": 2, "questions": 1,
+            "active": true,
+            "orchestrator": {"id": "o", "name": "orch", "status": "waiting",
+                             "preview": "Approve the deploy?", "preview_seq": 9},
+            "workers": [{"id": "w1", "name": "api", "status": "running", "color": 3,
+                         "parked": false}],
+        });
+        let (new_sock, new_asked) = fake_hub(dir.path(), "new", Fake::Glance(glance.clone()));
+        let mut bare = glance;
+        bare.as_object_mut().unwrap().remove("workers");
+        let listed = json!([
+            {"id": "o", "role": "orchestrator", "name": "orch", "status": "waiting"},
+            {"id": "w2", "name": "web", "status": "waiting", "parked": true},
+        ]);
+        let (mid_sock, mid_asked) = fake_hub(dir.path(), "mid", Fake::Mid(bare, listed));
+        let threads = json!([
+            {"role": "orchestrator", "status": "running"},
+            {"role": "orchestrator", "status": "idle", "retired": true},
+            {"status": "idle"},
+        ]);
+        let items = json!([{"reason": "question"}, {"reason": "error"}]);
+        let (old_sock, old_asked) = fake_hub(dir.path(), "old", Fake::Old(threads, items));
+        let (silent_sock, _) = fake_hub(dir.path(), "silent", Fake::Silent);
+        let ws = Fakes(
+            [
+                ("new", new_sock),
+                ("mid", mid_sock),
+                ("old", old_sock),
+                ("silent", silent_sock),
+                ("stopped", dir.path().join("stopped.sock")),
+            ]
+            .into_iter()
+            .map(|(n, p)| (n.to_string(), p))
+            .collect(),
+        );
+        let started = std::time::Instant::now();
+        let mut polled = poll_tabs(&ws, ws.names().unwrap()).await;
+        polled.sort_by(|a, b| a.name.cmp(&b.name));
+        // The silent hub held nobody up: they were asked together.
+        assert!(started.elapsed() < 2 * TAB_TIMEOUT + Duration::from_millis(500));
+        let by = |n: &str| polled.iter().find(|p| p.name == n).unwrap().clone();
+        let new = by("new");
+        assert_eq!(
+            new.hub,
+            TabHub::Running {
+                threads: 3,
+                running: 1,
+                permissions: 2,
+                questions: 1
+            }
+        );
+        let g = new.glance.unwrap();
+        assert!(g.active);
+        let o = g.orch.unwrap();
+        assert_eq!(o.status, twr_core::reduce::ThreadStatus::Waiting);
+        assert_eq!(o.preview.as_deref(), Some("Approve the deploy?"));
+        assert_eq!(
+            g.workers.unwrap(),
+            [workspace::WorkerGlance {
+                id: "w1".into(),
+                name: "api".into(),
+                status: twr_core::reduce::ThreadStatus::Running,
+                color: Some(3),
+                parked: false,
+            }]
+        );
+        assert_eq!(*new_asked.lock().unwrap(), ["hello", "hub.glance"]);
+        // A hub whose glance predates its workers names them in its thread list.
+        let mid = by("mid");
+        assert!(matches!(mid.hub, TabHub::Running { threads: 3, .. }));
+        let workers = mid.glance.unwrap().workers.unwrap();
+        assert_eq!(
+            workers
+                .iter()
+                .map(|w| (w.name.as_str(), w.status, w.parked))
+                .collect::<Vec<_>>(),
+            [("web", twr_core::reduce::ThreadStatus::Waiting, true)]
+        );
+        assert_eq!(
+            *mid_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list"]
+        );
+        let old = by("old");
+        assert_eq!(
+            old.hub,
+            TabHub::Running {
+                threads: 1,
+                running: 0,
+                permissions: 0,
+                questions: 1
+            }
+        );
+        let g = old.glance.unwrap();
+        assert!(g.active, "its orchestrator runs");
+        assert_eq!(
+            g.orch.unwrap().status,
+            twr_core::reduce::ThreadStatus::Running
+        );
+        assert_eq!(
+            *old_asked.lock().unwrap(),
+            ["hello", "hub.glance", "thread.list", "attention.list"]
+        );
+        assert_eq!(
+            by("silent"),
+            Polled {
+                name: "silent".into(),
+                hub: TabHub::Busy,
+                glance: None
+            }
+        );
+        assert_eq!(by("stopped").hub, TabHub::Stopped);
+        assert!(
+            !dir.path().join("stopped.sock").exists(),
+            "nothing started it"
+        );
+        // Only the hubs due are asked.
+        let polled = poll_tabs(&ws, vec!["new".into()]).await;
+        assert_eq!(polled.len(), 1);
+        assert_eq!(new_asked.lock().unwrap().len(), 4);
+    }
+
+    /// Polling preserves aggregate worker activity with an idle orchestrator, for both
+    /// glance-capable and older hubs. Fresh idle answers clear it; unavailable hubs keep
+    /// the useful reply without showing stale work. Fakes::open refuses hub startup.
+    #[tokio::test]
+    async fn polled_worker_activity_reaches_cards_and_clears() {
+        use workspace::{Polled, TabHub};
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new();
+        for (i, worker) in ["running", "background", "idle"].into_iter().enumerate() {
+            let active = worker != "idle";
+            let glance = json!({
+                "threads": 1, "running": usize::from(active), "active": active,
+                "orchestrator": {"id": "o", "status": "idle", "preview": "Latest reply."},
+            });
+            for (kind, fake) in [
+                ("new", Fake::Glance(glance)),
+                (
+                    "old",
+                    Fake::Old(
+                        json!([
+                            {"id": "o", "role": "orchestrator", "status": "idle"},
+                            {"id": "w", "status": worker},
+                        ]),
+                        json!([]),
+                    ),
+                ),
+            ] {
+                let name = format!("{kind}-{i}");
+                let (socket, _) = fake_hub(dir.path(), &name, fake);
+                let ws = Fakes([(name.clone(), socket)].into_iter().collect());
+                let polled = poll_tabs(&ws, vec![name.clone()]).await;
+                // Merge successive answers into the same card to exercise stale activity.
+                state.merge_poll(
+                    Some(vec!["work".into()]),
+                    polled
+                        .into_iter()
+                        .map(|p| Polled {
+                            name: "work".into(),
+                            ..p
+                        })
+                        .collect(),
+                );
+                let tab = &state.tabs[0];
+                assert_eq!(sidebar::tab_active(&state, "work"), active);
+                assert_eq!(
+                    sidebar::status_text(state.tab_hub(tab), state.tab_glance(tab).as_ref()).0,
+                    if active { "working" } else { "idle" }
+                );
+                if kind == "new" {
+                    assert!(sidebar::card_lines(&state, tab, 25, false)
+                        .iter()
+                        .any(|l| l.to_string().contains("Latest reply.")));
+                }
+                for unavailable in [TabHub::Busy, TabHub::Stopped] {
+                    state.merge_poll(
+                        None,
+                        vec![Polled {
+                            name: "work".into(),
+                            hub: unavailable,
+                            glance: None,
+                        }],
+                    );
+                    assert!(!sidebar::tab_active(&state, "work"));
+                }
+            }
+        }
     }
 
     /// Every connection to a workspace's socket checks the hub serves that workspace.
@@ -3521,6 +5455,22 @@ mod tests {
         );
     }
 
+    /// `!` commands are stored tagged; a plain `!...` line, from before `!` ran commands, was
+    /// a message and comes back as one.
+    #[test]
+    fn old_bang_lines_in_the_history_stay_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tui-history");
+        std::fs::write(&path, "\"!important: read this\"\n").unwrap();
+        save_history(&path, &["!ls -la".into(), "\\!not a command".into()]).unwrap();
+        assert_eq!(
+            load_history(&path),
+            ["\\!important: read this", "!ls -la", "\\!not a command"]
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains(r#"{"shell":"!ls -la"}"#), "{raw}");
+    }
+
     #[test]
     fn the_input_history_file_round_trips_and_stays_bounded() {
         let dir = tempfile::tempdir().unwrap();
@@ -3679,10 +5629,26 @@ mod tests {
             .as_deref(),
             Some("the orchestrator is now codex (a new session; handed over without a summary (the previous orchestrator was not running))")
         );
+        let on = |shown: bool| {
+            result_status(
+                "orchestrator.use",
+                &json!({"runtime": "claude-code", "account": "work", "account_shown": shown}),
+            )
+        };
+        assert_eq!(
+            on(true).as_deref(),
+            Some("the orchestrator is now claude-code:work (a new session)")
+        );
+        assert_eq!(
+            on(false).as_deref(),
+            Some("the orchestrator is now claude-code (a new session)")
+        );
         let (m, p) = action_request(&Action::NewThread {
             project: "api".into(),
             runtime: Some("codex".into()),
             name: Some("api2".into()),
+            account: None,
+            outside_pin: false,
         })
         .unwrap();
         assert_eq!(
@@ -3695,6 +5661,61 @@ mod tests {
         assert_eq!(
             result_status("thread.new", &json!({"name": "api2", "runtime": "codex"})).as_deref(),
             Some("created api2 (runtime codex)")
+        );
+        // The hub's advisory (the box reports the CLI missing) follows what was done.
+        let w = "box gpu reports no `codex` on its PATH; the thread may fail to start: run `twr \
+                 box doctor gpu`";
+        assert_eq!(
+            result_status(
+                "thread.new",
+                &json!({"name": "api2", "runtime": "codex", "warning": w})
+            ),
+            Some(format!("created api2 (runtime codex); warning: {w}"))
+        );
+        assert_eq!(
+            result_status(
+                "thread.set_model",
+                &json!({"thread_name": "api2", "model": "o3", "applies": "next_start",
+                        "warning": w})
+            ),
+            Some(format!(
+                "api2 now has model o3, effort default; from its next start; warning: {w}"
+            ))
+        );
+        // A mode change that restarts the runtime, and a send that starts it: also when the
+        // send itself says nothing (it started a turn).
+        assert_eq!(
+            result_status(
+                "thread.set_mode",
+                &json!({"thread_name": "api2", "mode": "auto", "previous": "manual",
+                        "changed": true, "applies": "now", "warning": w})
+            )
+            .unwrap(),
+            format!(
+                "{}; warning: {w}",
+                result_status(
+                    "thread.set_mode",
+                    &json!({"thread_name": "api2", "mode": "auto", "previous": "manual",
+                            "changed": true, "applies": "now"})
+                )
+                .unwrap()
+            )
+        );
+        assert_eq!(
+            result_status(
+                "thread.send",
+                &json!({"thread": "t1", "turn": 1, "warning": w})
+            ),
+            Some(format!("warning: {w}"))
+        );
+        assert_eq!(
+            result_status("thread.send", &json!({"thread": "t1", "turn": 1})),
+            None
+        );
+        // Only on those results.
+        assert_eq!(
+            result_status("thread.stop", &json!({"warning": w})).as_deref(),
+            Some("stopped")
         );
         let (m, p) = action_request(&Action::Stop {
             thread: "t1".into(),
@@ -3712,6 +5733,19 @@ mod tests {
         })
         .unwrap();
         assert_eq!((m, p), ("thread.trim", json!({"thread": "t1"})));
+        let (m, p) = action_request(&Action::CompactContext {
+            thread: "t1".into(),
+        })
+        .unwrap();
+        assert_eq!((m, p), ("thread.compact", json!({"thread": "t1"})));
+        assert_eq!(
+            result_status(
+                "thread.compact",
+                &json!({"thread_name": "api", "state": "queued"})
+            )
+            .as_deref(),
+            Some("api compacts its context after its running turn")
+        );
         assert_eq!(
             result_status(
                 "thread.trim",
@@ -4002,6 +6036,67 @@ mod tests {
             .starts_with("the delete card for web and api is"));
     }
 
+    /// [`read_ahead`] passes every item on, in order, its error last; and dropping what it
+    /// returns drops the stream it reads at once, though that one waits for an item that
+    /// never comes (an idle thread's transcript: its subscription must not outlive the view).
+    #[tokio::test]
+    async fn read_ahead_keeps_the_order_and_lets_go_of_its_stream() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use twr_core::testkit::ThreadScript;
+        let mut t = ThreadScript::new("t1");
+        let items: Vec<anyhow::Result<StreamItem>> = (0..2000)
+            .map(|i| {
+                Ok(StreamItem {
+                    stream: twr_core::proto::StreamKind::Thread,
+                    gseq: None,
+                    event: t.text(&format!("line {i}")),
+                })
+            })
+            .chain(std::iter::once(Err(anyhow::anyhow!("lost"))))
+            .collect();
+        let read: Vec<_> = read_ahead(Box::pin(futures::stream::iter(items)))
+            .collect()
+            .await;
+        assert_eq!(read.len(), 2001);
+        for (i, item) in read[..2000].iter().enumerate() {
+            assert_eq!(item.as_ref().unwrap().event.seq, i as u64 + 1);
+        }
+        assert!(read[2000].is_err());
+
+        /// Says when it is dropped.
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let gone = Arc::new(AtomicBool::new(false));
+        let guard = Dropped(gone.clone());
+        let first = Ok(StreamItem {
+            stream: twr_core::proto::StreamKind::Thread,
+            gseq: None,
+            event: t.text("only this"),
+        });
+        let idle = futures::stream::once(async move { first })
+            .chain(futures::stream::pending())
+            .map(move |item| {
+                let _held = &guard;
+                item
+            });
+        let mut s = read_ahead(Box::pin(idle));
+        assert!(s.next().await.unwrap().is_ok());
+        assert!(!gone.load(Ordering::SeqCst));
+        drop(s);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !gone.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream read is dropped with the one returned");
+    }
+
     #[tokio::test]
     async fn capped_control_items_are_hydrated_before_they_are_applied() {
         use std::sync::Arc;
@@ -4239,6 +6334,116 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(600)).await;
         let second = out.next().await.unwrap().unwrap();
         assert_eq!(second.event.body, finals[1].0);
+    }
+
+    /// The TUI asks for the control stream's snapshot; a hub may answer with its compacted
+    /// backlog instead (a snapshot too big), whose items it counts. A hub from before
+    /// snapshots refuses the key (`bad_request`, as `deny_unknown_fields` does) and is asked
+    /// for the compacted backlog; one from before compaction refuses that too and is asked for
+    /// the whole log. A snapshot the TUI can't read (malformed, another build's fold or one
+    /// that does not say its fold) is dropped: it asks as from a hub without snapshots.
+    #[tokio::test]
+    async fn the_control_stream_starts_from_a_snapshot_unless_the_hub_is_older() {
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let snapshot = serde_json::to_value(ClientFold::default()).unwrap();
+        let fold = twr_core::client_state::FOLD;
+        let both = json!({"since": 0, "compact": true, "snapshot": true});
+        let compact = json!({"since": 0, "compact": true});
+        let full = json!({"since": 0});
+        let dir = tempfile::tempdir().unwrap();
+        // The hub: how it answers a snapshot asked for; whether it knows `snapshot` and
+        // `compact`.
+        let hubs = [
+            (
+                "new",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": fold}),
+            ),
+            (
+                "unnamed",
+                json!({"since": 9, "head": 9, "snapshot": snapshot}),
+            ),
+            (
+                "too big",
+                json!({"since": 0, "head": 9, "backlog": 4, "compacted": true}),
+            ),
+            (
+                "malformed",
+                json!({"since": 9, "head": 9, "snapshot": {"registry": 5}, "snapshot_fold": fold}),
+            ),
+            (
+                "another build",
+                json!({"since": 9, "head": 9, "snapshot": snapshot, "snapshot_fold": "0123"}),
+            ),
+            ("compact only", Value::Null),
+            ("old", Value::Null),
+        ];
+        for (i, (hub, answer)) in hubs.into_iter().enumerate() {
+            let sock = dir.path().join(format!("hub-{i}.sock"));
+            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+            let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = Arc::clone(&asked);
+            tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (log, answer) = (Arc::clone(&log), answer.clone());
+                    tokio::spawn(async move {
+                        let (r, mut w) = stream.into_split();
+                        let mut lines = BufReader::new(r).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let req: Value = serde_json::from_str(&line).unwrap();
+                            let params = req["params"].clone();
+                            let unknown = |key: &str| {
+                                json!({"id": req["id"], "error": {"code": "bad_request",
+                                    "message": format!("unknown field `{key}`")}})
+                            };
+                            let frame = match req["method"].as_str() {
+                                Some("control.subscribe") => {
+                                    log.lock().unwrap().push(params.clone());
+                                    let (snap, compact) = (
+                                        params.get("snapshot").is_some(),
+                                        params.get("compact").is_some(),
+                                    );
+                                    match hub {
+                                        "old" if compact => unknown("compact"),
+                                        "old" | "compact only" if snap => unknown("snapshot"),
+                                        _ if snap => json!({"id": req["id"], "result": answer}),
+                                        _ if compact => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9,
+                                            "backlog": 4, "compacted": true}})
+                                        }
+                                        _ => {
+                                            json!({"id": req["id"], "result": {"since": 0, "head": 9}})
+                                        }
+                                    }
+                                }
+                                _ => json!({"id": req["id"], "result": {}}),
+                            };
+                            let _ = w.write_all(format!("{frame}\n").as_bytes()).await;
+                        }
+                    });
+                }
+            });
+            let start = subscribe_control(&sock).await.unwrap();
+            assert_eq!(start.sub.ack()["head"], 9, "{hub}");
+            let asked = asked.lock().unwrap().clone();
+            let (snap, backlog, chain) = match hub {
+                "new" => (true, None, vec![both.clone()]),
+                "too big" => (false, Some(4), vec![both.clone()]),
+                "unnamed" | "malformed" | "another build" | "compact only" => {
+                    (false, Some(4), vec![both.clone(), compact.clone()])
+                }
+                _ => (
+                    false,
+                    None,
+                    vec![both.clone(), compact.clone(), full.clone()],
+                ),
+            };
+            assert_eq!(start.snapshot.is_some(), snap, "{hub}");
+            assert_eq!(start.backlog, backlog, "{hub}");
+            assert_eq!(asked, chain, "{hub}");
+        }
     }
 
     /// Every connection the TUI opens starts with `hello {client: "tui"}`.

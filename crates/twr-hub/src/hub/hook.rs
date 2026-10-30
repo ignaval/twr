@@ -10,9 +10,10 @@
 //! a TUI says the user looks at it (`notify.looking`, sent while it has focus and a key in the
 //! last 30 s), what is due is dropped: they see it there.
 //!
-//! The command runs without a shell, in its own process group, with the hub's environment
-//! less twr's secrets, and is ended after `timeout_secs`. `{title}`, `{body}` and
-//! `{workspace}` in its arguments are filled in; its stdin is one JSON object:
+//! The command runs without a shell, in its own session and process group (no controlling
+//! terminal), with the hub's environment less twr's secrets, and is ended after
+//! `timeout_secs`. `{title}`, `{body}` and `{workspace}` in its arguments are filled in; its
+//! stdin is one JSON object:
 //! `{title, body, workspace, items: [{event, thread, name, turn, item, text?}]}`. Without
 //! `detail`, neither carries what was asked or reported, only who and what kind of thing.
 //! One runs at a time; what comes meanwhile waits for it, and the command's whole process
@@ -45,7 +46,8 @@ const STDERR_MAX: usize = 4096;
 
 /// What feeds the hook from the commit path: the policy and the dispatcher's channel.
 pub(super) struct HookFeed {
-    policy: Policy,
+    /// Folded on replay as the reducers are: in the hub's checkpoints (`hub::checkpoint`).
+    pub(super) policy: Policy,
     tx: mpsc::UnboundedSender<Candidate>,
 }
 
@@ -336,8 +338,8 @@ async fn run(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .process_group(0)
         .kill_on_drop(false);
+    twr_adapters::process::new_session(&mut cmd);
     twr_adapters::process::scrub(&mut cmd);
     cmd.env_remove(twr_runner::reap::RUNTIME_GEN_ENV);
     // Its processes, and a `twr` they run, are an agent of no thread: they read the hub, and

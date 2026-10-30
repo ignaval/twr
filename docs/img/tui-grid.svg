@@ -2,128 +2,118 @@
 <title>twr grid view: one tile per worker thread</title>
 <style>text{font-family:ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace;font-size:14px;white-space:pre}.b{font-weight:bold}.d{opacity:.55}.i{font-style:italic}.u{text-decoration:underline}</style>
 <rect width="100%" height="100%" rx="8" fill="#0d1117"/>
-<rect x="22.4" y="86" width="100.8" height="18" fill="#ff7b72"/>
-<rect x="358.4" y="86" width="84" height="18" fill="#d29922"/>
-<rect x="694.4" y="86" width="58.8" height="18" fill="#ffa198"/>
-<rect x="22.4" y="392" width="134.4" height="18" fill="#5fd7d7"/>
-<rect x="1030.4" y="56.8" width="8.4" height="11.2" fill="#d7875f"/>
-<path d="M18.2 401H22.4M266 401H1353.8M18.2 437H1353.8M18.2 401V437M1353.8 401V437" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M354.2 41H358.4M593.6 41H627.2M677.6 41H681.8M690.2 41H694.4M862.4 41H963.2M1013.6 41H1017.8M1026.2 41H1030.4M1190 41H1299.2M1349.6 41H1353.8M354.2 185H681.8M690.2 185H1017.8M1026.2 185H1353.8M18.2 203H22.4M173.6 203H291.2M341.6 203H345.8M354.2 203H358.4M509.6 203H627.2M677.6 203H681.8M690.2 203H694.4M854 203H963.2M1013.6 203H1017.8M18.2 347H345.8M354.2 347H681.8M690.2 347H1017.8M354.2 41V185M354.2 203V347M681.8 41V185M681.8 203V347M690.2 41V185M690.2 203V347M1017.8 41V185M1017.8 203V347M1026.2 41V185M1353.8 41V185M18.2 203V347M345.8 203V347" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
-<path d="M18.2 41H22.4M165.2 41H291.2M341.6 41H345.8M18.2 185H345.8M18.2 41V185M345.8 41V185" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
-<text x="22.4" y="27.5" fill="#c9d1d9" class="b" textLength="184.8">[twr] grid · 7 threads</text>
-<text x="215.6" y="27.5" fill="#6e7681" textLength="285.6">· 1 parked (hidden, /parked shows)</text>
-<text x="30.8" y="45.5" fill="#6e7681" textLength="42">api ·</text>
-<text x="81.2" y="45.5" fill="#d29922" class="b" textLength="75.6">ratelimit</text>
-<text x="299.6" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="366.8" y="45.5" fill="#6e7681" textLength="75.6">billing ·</text>
-<text x="450.8" y="45.5" fill="#6e7681" class="b" textLength="134.4">invoice-rounding</text>
-<text x="635.6" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="702.8" y="45.5" fill="#6e7681" textLength="58.8">infra ·</text>
-<text x="770" y="45.5" fill="#6e7681" class="b" textLength="84">deploy-fix</text>
-<text x="971.6" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="1038.8" y="45.5" fill="#6e7681" textLength="42">web ·</text>
-<text x="1089.2" y="45.5" fill="#6e7681" class="b" textLength="92.4">checkout-ui</text>
+<rect x="30.8" y="32" width="134.4" height="18" fill="#c9d1d9"/>
+<rect x="165.2" y="32" width="25.2" height="18" fill="#d29922"/>
+<rect x="190.4" y="32" width="33.6" height="18" fill="#c9d1d9"/>
+<rect x="240.8" y="68" width="100.8" height="18" fill="#ff7b72"/>
+<rect x="618.8" y="68" width="84" height="18" fill="#d29922"/>
+<rect x="988.4" y="68" width="58.8" height="18" fill="#ffa198"/>
+<rect x="240.8" y="392" width="134.4" height="18" fill="#5fd7d7"/>
+<rect x="22.4" y="38.8" width="8.4" height="11.2" fill="#d7875f"/>
+<rect x="240.8" y="200.8" width="8.4" height="11.2" fill="#d7875f"/>
+<path d="M236.6 401H240.8M484.4 401H1353.8M236.6 437H1353.8M236.6 401V437M1353.8 401V437" stroke="#39c5cf" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M228.2 14V464" stroke="#6e7681" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M984.2 41H988.4M1156.4 41H1164.8M1290.8 41H1299.2M1349.6 41H1353.8M984.2 167H1353.8M984.2 41V167M1353.8 41V167" stroke="#875fff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M984.2 185H988.4M1139.6 185H1164.8M1290.8 185H1299.2M1349.6 185H1353.8M984.2 311H1353.8M984.2 185V311M1353.8 185V311" stroke="#87af00" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M614.6 41H618.8M770 41H786.8M912.8 41H921.2M971.6 41H975.8M614.6 149H975.8M614.6 41V149M975.8 41V149" stroke="#87afff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M236.6 185H240.8M400.4 185H417.2M543.2 185H551.6M602 185H606.2M236.6 239H606.2M236.6 185V239M606.2 185V239" stroke="#af5f00" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<path d="M236.6 41H240.8M383.6 41H417.2M543.2 41H551.6M602 41H606.2M236.6 131H606.2M236.6 41V131M606.2 41V131" stroke="#d29922" stroke-width="2.4" fill="none" stroke-linecap="square"/>
+<path d="M614.6 185H618.8M770 185H786.8M912.8 185H921.2M971.6 185H975.8M614.6 293H975.8M614.6 185V293M975.8 185V293" stroke="#ff00ff" stroke-width="1.2" fill="none" stroke-linecap="square"/>
+<text x="22.4" y="27.5" fill="#6e7681" class="b" textLength="84">WORKSPACES</text>
+<text x="207.2" y="27.5" fill="#6e7681">‹</text>
+<text x="240.8" y="27.5" fill="#c9d1d9" class="b" textLength="58.8">‹ stack</text>
+<text x="308" y="27.5" fill="#6e7681">·</text>
+<text x="324.8" y="27.5" fill="#c9d1d9" class="b" textLength="134.4">grid · 7 threads</text>
+<text x="467.6" y="27.5" fill="#6e7681" textLength="420">· 1 parked (hidden, /parked shows) · ↓ 1 more rows</text>
+<text x="14" y="45.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="45.5" fill="#0d1117" class="b" textLength="58.8">default</text>
+<text x="173.6" y="45.5" fill="#0d1117" class="b" textLength="42">⚠2 ●1</text>
+<text x="249.2" y="45.5" fill="#6e7681" textLength="42">api ·</text>
+<text x="299.6" y="45.5" fill="#008700" class="b" textLength="75.6">ratelimit</text>
+<text x="425.6" y="45.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="560" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="627.2" y="45.5" fill="#87afff" class="b" textLength="134.4">invoice-rounding</text>
+<text x="795.2" y="45.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="929.6" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="996.8" y="45.5" fill="#6e7681" textLength="58.8">infra ·</text>
+<text x="1064" y="45.5" fill="#875fff" class="b" textLength="84">deploy-fix</text>
+<text x="1173.2" y="45.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
 <text x="1307.6" y="45.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="22.4" y="63.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
-<text x="89.6" y="63.5" fill="#6e7681">·</text>
-<text x="106.4" y="63.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="198.8" y="63.5" fill="#6e7681">·</text>
-<text x="215.6" y="63.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="358.4" y="63.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
-<text x="425.6" y="63.5" fill="#6e7681">·</text>
-<text x="442.4" y="63.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="534.8" y="63.5" fill="#6e7681">·</text>
-<text x="551.6" y="63.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="694.4" y="63.5" fill="#ff7b72" class="b" textLength="50.4">failed</text>
-<text x="753.2" y="63.5" fill="#6e7681">·</text>
-<text x="770" y="63.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="862.4" y="63.5" fill="#6e7681">·</text>
-<text x="879.2" y="63.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="1047.2" y="63.5" fill="#3fb950" class="b" textLength="58.8">running</text>
-<text x="1114.4" y="63.5" fill="#6e7681">·</text>
-<text x="1131.2" y="63.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="1223.6" y="63.5" fill="#6e7681">·</text>
-<text x="1240.4" y="63.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="22.4" y="81.5" fill="#d29922" textLength="235.2">twr/ff427ebd42c36be8/ratelim</text>
-<text x="257.6" y="81.5" fill="#c9d1d9">…</text>
-<text x="274.4" y="81.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="358.4" y="81.5" fill="#39c5cf" textLength="235.2">twr/ff427ebd42c36be8/invoice</text>
-<text x="593.6" y="81.5" fill="#c9d1d9">…</text>
-<text x="610.4" y="81.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="694.4" y="81.5" fill="#39c5cf" textLength="235.2">twr/ff427ebd42c36be8/deploy-</text>
-<text x="929.6" y="81.5" fill="#c9d1d9">…</text>
-<text x="946.4" y="81.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="1030.4" y="81.5" fill="#d29922" textLength="226.8">twr/ff427ebd42c36be8/checko</text>
-<text x="1257.2" y="81.5" fill="#c9d1d9">…</text>
-<text x="1274" y="81.5" fill="#6e7681" textLength="75.6">· 2 turns</text>
-<text x="30.8" y="99.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
-<text x="131.6" y="99.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
-<text x="366.8" y="99.5" fill="#1b1f24" class="b" textLength="67.2">QUESTION</text>
-<text x="450.8" y="99.5" fill="#c9d1d9" textLength="218.4">Round tax per line or once</text>
-<text x="702.8" y="99.5" fill="#1b1f24" class="b" textLength="42">ERROR</text>
-<text x="761.6" y="99.5" fill="#c9d1d9" textLength="218.4">deploy-fix: turn 1 failed:</text>
-<text x="1030.4" y="99.5" fill="#b1bac4" class="i" textLength="210">› writing CouponField.tsx</text>
-<text x="22.4" y="117.5" fill="#d29922" class="b">1</text>
-<text x="39.2" y="117.5" fill="#c9d1d9" textLength="42">allow</text>
-<text x="98" y="117.5" fill="#d29922" class="b">2</text>
-<text x="114.8" y="117.5" fill="#c9d1d9" textLength="33.6">deny</text>
-<text x="358.4" y="117.5" fill="#c9d1d9" textLength="176.4">on the invoice total?</text>
-<text x="694.4" y="117.5" fill="#c9d1d9" textLength="310.8">terraform plan failed: the state lock</text>
-<text x="358.4" y="135.5" fill="#d29922" class="b">1</text>
-<text x="375.2" y="135.5" fill="#c9d1d9" textLength="67.2">per line</text>
-<text x="459.2" y="135.5" fill="#d29922" class="b">2</text>
-<text x="476" y="135.5" fill="#c9d1d9" textLength="100.8">on the total</text>
-<text x="694.4" y="135.5" fill="#c9d1d9" textLength="168">is held by run 81719</text>
-<text x="694.4" y="153.5" fill="#d29922" class="b">1</text>
-<text x="711.2" y="153.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
-<text x="30.8" y="207.5" fill="#6e7681" textLength="50.4">docs ·</text>
-<text x="89.6" y="207.5" fill="#6e7681" class="b" textLength="75.6">changelog</text>
-<text x="299.6" y="207.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="366.8" y="207.5" fill="#6e7681" textLength="42">web ·</text>
-<text x="417.2" y="207.5" fill="#6e7681" class="b" textLength="84">a11y-audit</text>
-<text x="635.6" y="207.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="702.8" y="207.5" fill="#6e7681" textLength="50.4">docs ·</text>
-<text x="761.6" y="207.5" fill="#6e7681" class="b" textLength="84">quickstart</text>
-<text x="971.6" y="207.5" fill="#6e7681" textLength="33.6">auto</text>
-<text x="22.4" y="225.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
-<text x="81.2" y="225.5" fill="#6e7681">·</text>
-<text x="98" y="225.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="190.4" y="225.5" fill="#6e7681">·</text>
-<text x="207.2" y="225.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="358.4" y="225.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
-<text x="417.2" y="225.5" fill="#6e7681">·</text>
-<text x="434" y="225.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="526.4" y="225.5" fill="#6e7681">·</text>
-<text x="543.2" y="225.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="694.4" y="225.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
-<text x="753.2" y="225.5" fill="#6e7681">·</text>
-<text x="770" y="225.5" fill="#c9d1d9" textLength="84">fake@local</text>
-<text x="862.4" y="225.5" fill="#6e7681">·</text>
-<text x="879.2" y="225.5" fill="#c9d1d9" textLength="50.4">fake-1</text>
-<text x="22.4" y="243.5" fill="#39c5cf" textLength="235.2">twr/ff427ebd42c36be8/changel</text>
-<text x="257.6" y="243.5" fill="#c9d1d9">…</text>
-<text x="274.4" y="243.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="358.4" y="243.5" fill="#d29922" textLength="235.2">twr/ff427ebd42c36be8/a11y-au</text>
-<text x="593.6" y="243.5" fill="#c9d1d9">…</text>
-<text x="610.4" y="243.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="694.4" y="243.5" fill="#39c5cf" textLength="235.2">twr/ff427ebd42c36be8/quickst</text>
-<text x="929.6" y="243.5" fill="#c9d1d9">…</text>
-<text x="946.4" y="243.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
-<text x="22.4" y="261.5" fill="#6e7681" textLength="294">Drafted the 0.5.0 changelog from 37</text>
-<text x="358.4" y="261.5" fill="#6e7681" textLength="319.2">Found 6 problems on checkout: 4 inputs</text>
-<text x="694.4" y="261.5" fill="#6e7681" textLength="302.4">Rewrote the quick start around three</text>
-<text x="22.4" y="279.5" fill="#6e7681" textLength="268.8">commits: features, fixes and one</text>
-<text x="358.4" y="279.5" fill="#6e7681" textLength="294">without labels, low contrast on the</text>
-<text x="694.4" y="279.5" fill="#6e7681" textLength="243.6">commands and moved the config</text>
-<text x="22.4" y="297.5" fill="#6e7681" textLength="310.8">breaking change (the --json output of</text>
-<text x="358.4" y="297.5" fill="#6e7681" textLength="294">coupon hint and a focus trap in the</text>
-<text x="694.4" y="297.5" fill="#6e7681" textLength="277.2">reference to its own page. All 41</text>
-<text x="22.4" y="315.5" fill="#6e7681" textLength="109.2">thread list).</text>
-<text x="358.4" y="315.5" fill="#6e7681" textLength="294">address modal. Fixed the labels and</text>
-<text x="694.4" y="315.5" fill="#6e7681" textLength="117.6">links resolve.</text>
-<text x="358.4" y="333.5" fill="#6e7681" textLength="319.2">the trap. The contrast needs a design…</text>
-<text x="30.8" y="405.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
-<text x="165.2" y="405.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
-<text x="22.4" y="423.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
-<text x="14" y="459.5" fill="#6e7681" textLength="1285.2">Shift-arrows/Tab select · Enter on an empty line: actions · Enter send · Ctrl-J new line · Esc release · Ctrl-G stack · / commands · ? help · Ctrl-C quit</text>
+<text x="14" y="63.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="63.5" fill="#d29922" class="b" textLength="168">working · waiting on</text>
+<text x="240.8" y="63.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="618.8" y="63.5" fill="#d29922" class="b" textLength="58.8">waiting</text>
+<text x="988.4" y="63.5" fill="#ff7b72" class="b" textLength="50.4">failed</text>
+<text x="14" y="81.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="81.5" fill="#d29922" class="b" textLength="25.2">you</text>
+<text x="249.2" y="81.5" fill="#1b1f24" class="b" textLength="84">PERMISSION</text>
+<text x="350" y="81.5" fill="#c9d1d9" textLength="92.4">Allow Bash?</text>
+<text x="627.2" y="81.5" fill="#1b1f24" class="b" textLength="67.2">QUESTION</text>
+<text x="711.2" y="81.5" fill="#c9d1d9" textLength="243.6">Round tax per line or once on</text>
+<text x="996.8" y="81.5" fill="#1b1f24" class="b" textLength="42">ERROR</text>
+<text x="1055.6" y="81.5" fill="#c9d1d9" textLength="218.4">deploy-fix: turn 1 failed:</text>
+<text x="14" y="99.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="99.5" fill="#6e7681" textLength="109.2">Three things.</text>
+<text x="240.8" y="99.5" fill="#d29922" class="b">1</text>
+<text x="257.6" y="99.5" fill="#c9d1d9" textLength="42">allow</text>
+<text x="316.4" y="99.5" fill="#d29922" class="b">2</text>
+<text x="333.2" y="99.5" fill="#c9d1d9" textLength="33.6">deny</text>
+<text x="618.8" y="99.5" fill="#c9d1d9" textLength="151.2">the invoice total?</text>
+<text x="988.4" y="99.5" fill="#c9d1d9" textLength="336">terraform plan failed: the state lock is</text>
+<text x="14" y="117.5" fill="#39c5cf">▌</text>
+<text x="39.2" y="117.5" fill="#6e7681" textLength="176.4">ratelimit wants to r…</text>
+<text x="240.8" y="117.5" fill="#d29922" textLength="285.6">twr/d… · changes made · +1 vs main</text>
+<text x="534.8" y="117.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
+<text x="618.8" y="117.5" fill="#d29922" class="b">1</text>
+<text x="635.6" y="117.5" fill="#c9d1d9" textLength="67.2">per line</text>
+<text x="719.6" y="117.5" fill="#d29922" class="b">2</text>
+<text x="736.4" y="117.5" fill="#c9d1d9" textLength="100.8">on the total</text>
+<text x="988.4" y="117.5" fill="#c9d1d9" textLength="142.8">held by run 81719</text>
+<text x="618.8" y="135.5" fill="#39c5cf" textLength="277.2">twr/d42b16aa90a91be8/invoice-rou…</text>
+<text x="904.4" y="135.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
+<text x="988.4" y="135.5" fill="#d29922" class="b">1</text>
+<text x="1005.2" y="135.5" fill="#c9d1d9" textLength="58.8">dismiss</text>
+<text x="22.4" y="153.5" fill="#6e7681">○</text>
+<text x="39.2" y="153.5" fill="#c9d1d9" class="b" textLength="67.2">client-x</text>
+<text x="988.4" y="153.5" fill="#39c5cf" textLength="159.6">twr/d42b16aa90a91b…</text>
+<text x="1156.4" y="153.5" fill="#6e7681" textLength="193.2">· 1 turn · 22 tok $0.00</text>
+<text x="39.2" y="171.5" fill="#6e7681" textLength="126">hub not running</text>
+<text x="249.2" y="189.5" fill="#6e7681" textLength="42">web ·</text>
+<text x="299.6" y="189.5" fill="#af5f00" class="b" textLength="92.4">checkout-ui</text>
+<text x="425.6" y="189.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="560" y="189.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="627.2" y="189.5" fill="#6e7681" textLength="50.4">docs ·</text>
+<text x="686" y="189.5" fill="#ff00ff" class="b" textLength="75.6">changelog</text>
+<text x="795.2" y="189.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="929.6" y="189.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="996.8" y="189.5" fill="#6e7681" textLength="42">web ·</text>
+<text x="1047.2" y="189.5" fill="#87af00" class="b" textLength="84">a11y-audit</text>
+<text x="1173.2" y="189.5" fill="#6e7681" textLength="109.2">fake · fake-1</text>
+<text x="1307.6" y="189.5" fill="#6e7681" textLength="33.6">auto</text>
+<text x="257.6" y="207.5" fill="#3fb950" class="b" textLength="58.8">running</text>
+<text x="324.8" y="207.5" fill="#6e7681">·</text>
+<text x="341.6" y="207.5" fill="#b1bac4" class="i" textLength="193.2">writing CouponField.tsx</text>
+<text x="618.8" y="207.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
+<text x="677.6" y="207.5" fill="#6e7681" textLength="285.6">· Drafted the 0.5.0 changelog from</text>
+<text x="988.4" y="207.5" fill="#58a6ff" class="b" textLength="50.4">done ✓</text>
+<text x="1047.2" y="207.5" fill="#6e7681" textLength="277.2">· Found 6 problems on checkout: 4</text>
+<text x="240.8" y="225.5" fill="#d29922" textLength="235.2">changes made · +1/−1 vs main</text>
+<text x="484.4" y="225.5" fill="#6e7681" textLength="75.6">· 2 turns</text>
+<text x="618.8" y="225.5" fill="#6e7681" textLength="294">37 commits: features, fixes and one</text>
+<text x="988.4" y="225.5" fill="#6e7681" textLength="352.8">inputs without labels, low contrast on the</text>
+<text x="618.8" y="243.5" fill="#6e7681" textLength="310.8">breaking change (the --json output of</text>
+<text x="988.4" y="243.5" fill="#6e7681" textLength="361.2">coupon hint and a focus trap in the address</text>
+<text x="618.8" y="261.5" fill="#6e7681" textLength="109.2">thread list).</text>
+<text x="988.4" y="261.5" fill="#6e7681" textLength="344.4">modal. Fixed the labels and the trap. The</text>
+<text x="618.8" y="279.5" fill="#39c5cf" textLength="151.2">twr/… · +1 vs main</text>
+<text x="778.4" y="279.5" fill="#6e7681" textLength="193.2">· 1 turn · 44 tok $0.00</text>
+<text x="988.4" y="279.5" fill="#6e7681" textLength="243.6">contrast needs a design call.</text>
+<text x="988.4" y="297.5" fill="#d29922" textLength="285.6">twr/d… · changes made · −1 vs main</text>
+<text x="1282.4" y="297.5" fill="#6e7681" textLength="67.2">· 1 turn</text>
+<text x="249.2" y="405.5" fill="#000000" class="b" textLength="117.6">→ orchestrator</text>
+<text x="383.6" y="405.5" fill="#39c5cf" textLength="92.4">Enter sends</text>
+<text x="240.8" y="423.5" fill="#6e7681" textLength="210">message the orchestrator…</text>
+<text x="22.4" y="441.5" fill="#39c5cf" textLength="126">+ New workspace</text>
+<text x="22.4" y="459.5" fill="#39c5cf" textLength="84">⚙ Settings</text>
+<text x="232.4" y="459.5" fill="#6e7681" textLength="1125.6">Shift-arrows/Tab select · Enter on an empty line: actions · Enter send · Ctrl-J new line · Esc release · Ctrl-G stack · / commands · ?</text>
 </svg>

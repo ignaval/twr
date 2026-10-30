@@ -9,9 +9,10 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 use twr_core::event::*;
 
+use super::runners::Fence;
 use super::{
     twr_ext_map, AdapterScope, Batch, Core, Exit, Inner, Live, PendingExit, Planned,
-    RuntimeExiting, HUB_SHUTDOWN,
+    RuntimeExiting, TakenExit, HUB_SHUTDOWN,
 };
 use crate::store;
 
@@ -92,24 +93,20 @@ impl Core {
             // The log needs the stop (the process is gone); one the hub's shutdown asked for,
             // not the user, says so (`ext.twr.reason`), so viewers can fold those away, and so
             // does one the hub asked for to restart the runtime in new settings (`hub::restart`:
-            // `mode_change`, `model_change` or `runtime_change`; the thread does not count as
-            // stopped). A restart begun for a mode or model whose thread moved to another
-            // runtime meanwhile is that move's: the runtime is replaced, not restarted.
+            // `mode_change`, `model_change`, `runtime_change` or `account_change`; the thread
+            // does not count as stopped). A restart begun for a mode or model whose thread
+            // moved to another runtime or account meanwhile is that move's: the runtime is
+            // replaced, not restarted.
             Exit::Stopped => {
                 let rt = self.rt.get(thread);
                 let shutdown = self.shutting_down && !rt.is_some_and(|r| r.stop_requested);
                 let moved_away = rt
                     .and_then(|r| r.runtime_settings.as_ref())
-                    .is_some_and(|s| !s.is_runtime_of(view));
+                    .filter(|s| !s.is_runtime_of(view))
+                    .map(|s| s.restart_reason(&super::restart::RunSettings::of(view)));
                 let reason = rt
                     .and_then(|r| r.restart_reason)
-                    .map(|why| {
-                        if moved_away {
-                            RUNTIME_RESTART_REASON
-                        } else {
-                            why
-                        }
-                    })
+                    .map(|why| moved_away.unwrap_or(why))
                     .or(shutdown.then_some(HUB_SHUTDOWN));
                 plan.push_back(Planned {
                     turn: None,
@@ -141,19 +138,30 @@ impl Core {
                         ..Default::default()
                     }),
                 });
+                // A crash in the turn that carried a resume (one that is no retry itself): the
+                // resume failed, and the turn's automatic retry starts a new session
+                // (`hub::switch`), so no item; one that is not retried after all gets its item
+                // from the failure's reactions (`hub::retry`).
+                let resume_failed = view.handoff_pending
+                    && view.current_turn_retry_of.is_none()
+                    && view
+                        .resume_turn
+                        .is_some_and(|t| view.current_turn == Some(t));
                 // The item belongs to the turn the crash took down, if one was open (an
                 // automatic retry of that turn resolves it, `hub::retry`).
-                plan.push_back(Planned {
-                    turn: view.current_turn,
-                    source: Source::Hub,
-                    body: EventBody::AttentionRaised(AttentionRaised {
-                        attn_id: new_id(),
-                        reason: AttentionReason::Error,
-                        summary,
-                        options: vec!["dismiss".into()],
-                        ..Default::default()
-                    }),
-                });
+                if !resume_failed {
+                    plan.push_back(Planned {
+                        turn: view.current_turn,
+                        source: Source::Hub,
+                        body: EventBody::AttentionRaised(AttentionRaised {
+                            attn_id: new_id(),
+                            reason: AttentionReason::Error,
+                            summary,
+                            options: vec!["dismiss".into()],
+                            ..Default::default()
+                        }),
+                    });
+                }
             }
         }
         Ok(plan)
@@ -292,12 +300,64 @@ impl Core {
         exit_code: Option<i32>,
         stderr_tail: String,
     ) -> Option<PendingExit> {
-        let mut live = self.remove_live(thread, generation)?;
+        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, None)
+    }
+
+    /// [`Core::begin_exit`] of an exit a runner connection brought (its `exited` frame, or a
+    /// runtime the reconciliation at its `synced` found lost): the exit carries the
+    /// connection's `fence`, and the thread keeps the runtime it took, to be put back should
+    /// the box's token change before the closing sequence commits ([`ThreadRt::taken`]).
+    ///
+    /// [`ThreadRt::taken`]: super::ThreadRt::taken
+    pub(super) fn begin_exit_on(
+        &mut self,
+        thread: &str,
+        generation: u64,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        fence: &Fence,
+    ) -> Option<PendingExit> {
+        self.begin_exit_keeping(thread, generation, exit_code, stderr_tail, Some(fence))
+    }
+
+    /// Puts back the runtimes of the exits whose connection proved a token its box no longer
+    /// has ([`Fence::revoked`]), as they were before their exit began: live, not exiting.
+    /// Nothing else changed since (those exits recorded nothing, and record nothing now:
+    /// `supervisor::close_exited`). Called by `box.token` in the step under the core lock
+    /// that changes the token (`runners::set_box_token`), so the box's next connection
+    /// finds them back.
+    pub(super) fn put_back_revoked_exits(&mut self) {
+        for (thread, rt) in &mut self.rt {
+            if !rt.taken.as_ref().is_some_and(|t| t.fence.revoked()) {
+                continue;
+            }
+            if let Some(taken) = rt.taken.take() {
+                tracing::info!(
+                    thread,
+                    "an exit a connection brought whose token the box no longer has: the \
+                     runtime put back (the box's next connection reports it again)"
+                );
+                rt.live = Some(*taken.live);
+                rt.exiting = false;
+            }
+        }
+    }
+
+    fn begin_exit_keeping(
+        &mut self,
+        thread: &str,
+        generation: u64,
+        exit_code: Option<i32>,
+        stderr_tail: String,
+        fence: Option<&Fence>,
+    ) -> Option<PendingExit> {
+        let live = self.remove_live(thread, generation)?;
         let rt = self.rt(thread);
         rt.exiting = true;
         // A runtime the hub gave up on ([`give_up_runtime`]) crashed, whatever else asked it to
-        // stop meanwhile (a hub shutdown), unless the user did.
-        let given_up = live.given_up.take();
+        // stop meanwhile (a hub shutdown), unless the user did. (Left in the runtime, which an
+        // exit that is put back keeps as it was.)
+        let given_up = live.given_up.clone();
         // A durable `thread.stop` counts even when this runtime was taken over after a hub
         // restart (the in-memory flag is then gone).
         let stopped = rt.stop_requested || (live.stop_requested && given_up.is_none());
@@ -321,7 +381,7 @@ impl Core {
             },
         };
         let restart = stopped && given_up.is_none() && rt_restart(self, thread);
-        Some(PendingExit {
+        let exit = PendingExit {
             exit,
             log_runtime: live.log_runtime,
             attach_client,
@@ -331,9 +391,16 @@ impl Core {
             park: parking,
             crash,
             runner_ack: None,
-            fence: None,
+            fence: fence.cloned(),
             at: None,
-        })
+        };
+        if let Some(fence) = fence {
+            self.rt(thread).taken = Some(TakenExit {
+                live: Box::new(live),
+                fence: fence.clone(),
+            });
+        }
+        Some(exit)
     }
 
     /// The closing sequence of `exit`, planned from the state now (at each attempt to record
@@ -383,6 +450,7 @@ impl Core {
         release_live(hub);
         if let Some(rt) = self.rt.get_mut(thread) {
             rt.exiting = false;
+            rt.taken = None;
             if closed {
                 rt.restart_reason = None;
             }

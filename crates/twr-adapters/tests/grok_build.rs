@@ -14,6 +14,13 @@
 //!   with one tool, `ping`.
 //! - `real_noauth_v1041`: a REAL recording of grok 1.0.41 without credentials (`initialize`
 //!   works, `session/new` fails with `Authentication required`).
+//! - `real_compact_*_v1062`: REAL recordings of grok 1.0.62 (2026-10-21, model
+//!   `grok-4.7-build-fast`, effort low, no `--allow` / `--deny`), redacted like the others:
+//!   `manual` (a prompt, `/compact`, a prompt, `/context`; the probe's own
+//!   `_x.ai/session/usage` read at its end is left out here), `auto`
+//!   (`GROK_AUTO_COMPACT_THRESHOLD_PERCENT=11`: the second prompt auto-compacts first).
+//! - `synthetic_compaction`: written by hand for what the recordings do not show: another
+//!   session's compaction, a failed one (`auto_compact_failed`, not seen live).
 //! - `synthetic_*`: sessions written by hand from the ACP spec before grok could be signed in.
 //!   Kept for what a recording cannot provoke on demand (replaced requests, reported modes,
 //!   failed `session/set_mode`); where they differ from the real grok, the real one wins.
@@ -111,7 +118,11 @@ fn replay_lines(lines: Vec<(String, String)>, opts: TranslatorOptions) -> Replay
         if writes.is_empty() {
             let out = if rec["method"] == "session/prompt" {
                 let text = rec["params"]["prompt"][0]["text"].as_str().unwrap();
-                let out = tr.send(text, turn);
+                // The user's compaction (`thread.compact`) is the prompt `/compact`.
+                let out = match text {
+                    "/compact" => tr.compact(turn),
+                    _ => tr.send(text, turn),
+                };
                 turn += 1;
                 out
             } else if rec["method"] == "session/cancel" {
@@ -403,6 +414,173 @@ fn synthetic_stop_cancels_the_prompt_and_pending_requests_without_answering_the_
         grok_ext(&ended(&r.events)[0].ext)["stop_reason"],
         "cancelled"
     );
+}
+
+/// Compactions (not checked against the real CLI yet, see the module docs): grok's
+/// notifications become `context.compacting` / `context.compacted` in the running prompt's
+/// turn (`manual` in the user's `/compact`), another session's say nothing, and each turn's end
+/// says how full the context is (`_meta.totalTokens`) of the model's window (the catalog's
+/// `totalContextTokens`).
+#[test]
+fn synthetic_compaction_is_recorded() {
+    let r = replay(
+        "synthetic_compaction",
+        TranslatorOptions {
+            resume_session: Some("s-old".into()),
+            ..opts()
+        },
+    );
+    assert_eq!(
+        shape(&r.events),
+        [
+            "thread.started",
+            "delta@1",
+            "context.compacting@1",
+            "context.compacted@1",
+            "delta@1",
+            "text@1",
+            "turn.ended@1",
+            "context.compacting@2",
+            "context.compacted@2",
+            "turn.ended@2",
+        ]
+    );
+    let done: Vec<&ContextCompacted> = find(&r.events, |b| match b {
+        EventBody::ContextCompacted(c) => Some(c),
+        _ => None,
+    });
+    assert_eq!(done[0].trigger, "auto");
+    assert_eq!(
+        (done[0].pre_tokens, done[0].post_tokens),
+        (Some(230_000), Some(41_000))
+    );
+    assert_eq!(done[1].trigger, "manual");
+    assert_eq!(done[1].error.as_deref(), Some("conversation too short"));
+    let ends = ended(&r.events);
+    assert_eq!(
+        ends[0].context,
+        Some(ContextSize {
+            tokens: 42_100,
+            window: Some(256_000)
+        })
+    );
+    assert_eq!(ends[1].context.map(|c| c.tokens), Some(42_100));
+}
+
+/// The recordings' turns, the probe's lines after the last prompt left out.
+fn compaction_recording(name: &str) -> Vec<(String, String)> {
+    let mut lines = fixture(name);
+    if let Some(i) = lines
+        .iter()
+        .position(|(d, l)| d == ">>" && l.contains("_x.ai/session/usage"))
+    {
+        lines.truncate(i);
+    }
+    lines
+}
+
+fn compaction_opts() -> TranslatorOptions {
+    TranslatorOptions {
+        model: Some("grok-4.7-build-fast".into()),
+        effort: Some("low".into()),
+        ..opts()
+    }
+}
+
+/// grok 1.0.62's auto-compaction, at the start of a prompt: started, then completed with its
+/// sizes and time, in that prompt's turn; the turns' ends say how full the context is (the
+/// result's `_meta.totalTokens`) of the catalog's window.
+#[test]
+fn real_auto_compaction_is_recorded() {
+    let r = replay_lines(
+        compaction_recording("real_compact_auto_v1062"),
+        compaction_opts(),
+    );
+    assert!(r.fatal.is_empty(), "{:?}", r.fatal);
+    let at: Vec<String> = shape(&r.events)
+        .into_iter()
+        .filter(|s| s.starts_with("context.") || s.starts_with("turn.ended"))
+        .collect();
+    assert_eq!(
+        at,
+        [
+            "turn.ended@1",
+            "context.compacting@2",
+            "context.compacted@2",
+            "turn.ended@2"
+        ]
+    );
+    let done = find(&r.events, |b| match b {
+        EventBody::ContextCompacted(c) => Some(c),
+        _ => None,
+    });
+    assert_eq!(done[0].trigger, "auto");
+    assert_eq!(
+        (done[0].pre_tokens, done[0].post_tokens, done[0].duration_ms),
+        (Some(33_668), Some(20_123), Some(4_854))
+    );
+    let ends = ended(&r.events);
+    assert!(ends
+        .iter()
+        .all(|e| e.context.and_then(|c| c.window) == Some(256_000)));
+    assert!(ends.iter().all(|e| e.context.is_some_and(|c| c.tokens > 0)));
+}
+
+/// grok 1.0.62's `/compact`: a turn of its own, whose only sign is an
+/// `auto_compact_completed` with counters that do not hold (left unknown: the size before is
+/// the last one known), and a result with `_meta.totalTokens: 0` (no gauge: how full the
+/// context is after the compaction is unknown, not the size before it).
+#[test]
+fn real_manual_compaction_is_its_own_turn() {
+    let r = replay_lines(
+        compaction_recording("real_compact_manual_v1062"),
+        compaction_opts(),
+    );
+    assert!(r.fatal.is_empty(), "{:?}", r.fatal);
+    let at: Vec<String> = shape(&r.events)
+        .into_iter()
+        .filter(|s| s.starts_with("context.") || s.starts_with("turn.ended"))
+        .collect();
+    assert_eq!(
+        at,
+        [
+            "turn.ended@1",
+            "context.compacting@2",
+            "context.compacted@2",
+            "turn.ended@2",
+            "turn.ended@3",
+            "turn.ended@4"
+        ]
+    );
+    let done = find(&r.events, |b| match b {
+        EventBody::ContextCompacted(c) => Some(c),
+        _ => None,
+    });
+    assert_eq!(done[0].trigger, "manual");
+    // Grok's counters are left out; before it, the context was the last prompt's.
+    assert_eq!(
+        (done[0].pre_tokens, done[0].post_tokens),
+        (Some(25_072), None)
+    );
+    // Its start is said when the prompt goes out (grok says none), so the hub holds its stall
+    // checks for the ~5 s it compacts.
+    let starts = find(&r.events, |b| match b {
+        EventBody::ContextCompacting(c) => Some(c),
+        _ => None,
+    });
+    assert_eq!(starts[0].trigger.as_deref(), Some("manual"));
+    let ends = ended(&r.events);
+    assert!(ends.iter().all(|e| e.result == TurnResult::Completed));
+    assert!(ends[0].context.is_some());
+    assert_eq!(ends[1].context, None);
+    assert_eq!(ends[2].context.map(|c| c.tokens), Some(25_804));
+}
+
+/// The compaction prompt is grok's `/compact`; a generic ACP agent has none.
+#[test]
+fn grok_compacts_from_twr() {
+    assert!(GrokBuildAdapter::new().compacts());
+    assert!(!twr_adapters::acp::AcpAdapter::new().compacts());
 }
 
 #[test]
@@ -905,6 +1083,35 @@ fn prompt_errors_end_the_turn_with_an_error() {
     assert_eq!(e.result, TurnResult::Error);
     assert_eq!(grok_ext(&e.ext)["error"]["message"], "Rate limit exceeded");
     assert_eq!(grok_ext(&e.ext)["transient"], true);
+    assert!(e.ext.as_ref().unwrap()["twr"].get("limit").is_none());
+}
+
+/// A prompt error naming grok's usage limit or spending cap carries `ext.twr.limit` (no reset
+/// time) and is not transient; a rate limit stays transient.
+#[test]
+fn usage_limits_and_spending_caps_are_limits() {
+    for (message, kind) in [
+        ("You've reached your free Grok Build usage limit", "usage"),
+        ("UsagePoolExhausted: no credits left in the pool", "usage"),
+        ("Your team hit its monthly spending cap", "spend"),
+    ] {
+        let mut tr = ready();
+        tr.send("x", 1);
+        let out = tr.translate(
+            &json!({"jsonrpc": "2.0", "id": 3, "error": {"code": -32603, "message": message}})
+                .to_string(),
+        );
+        let e = ended(&out.events)[0];
+        assert_eq!(e.result, TurnResult::Error);
+        assert_eq!(
+            e.ext.as_ref().unwrap()["twr"]["limit"],
+            json!({"kind": kind, "message": message}),
+            "{message}"
+        );
+        assert_eq!(e.ext.as_ref().unwrap()["twr"]["error"], message);
+        assert_eq!(grok_ext(&e.ext)["transient"], false, "{message}");
+        assert!(grok_ext(&e.ext).get("transient_reason").is_none());
+    }
 }
 
 #[test]
@@ -1642,6 +1849,26 @@ fn env_disables_updates_and_sets_no_config_overlay() {
             ("GROK_DISABLE_AUTOUPDATER".to_string(), "1".to_string())
         ]
     );
+}
+
+/// The orchestrator's grok runs with grok's own memory off, whatever an inherited
+/// `GROK_MEMORY` says; other threads keep the user's setting.
+#[test]
+fn native_memory_off_sets_grok_memory_zero() {
+    let cfg = SpawnConfig {
+        env: vec![("GROK_MEMORY".into(), "1".into())],
+        native_memory_off: true,
+        ..Default::default()
+    };
+    let env = build_env(&cfg);
+    let memory: Vec<&str> = env
+        .iter()
+        .filter(|(k, _)| k == "GROK_MEMORY")
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert_eq!(memory, ["0"]);
+    let worker = SpawnConfig::default();
+    assert!(!build_env(&worker).iter().any(|(k, _)| k == "GROK_MEMORY"));
 }
 
 #[test]

@@ -21,6 +21,11 @@
 //! call it has not decided within [`DEADLINE`] ([`run`]): Claude Code lets a call through when
 //! its hook times out, so the guard denies well before the hook's [`HOOK_TIMEOUT_SECS`].
 //!
+//! An orchestrator on a named account keeps the native account's memory: the hub moves its
+//! memory directory there (`autoMemoryDirectory` in [`settings`], [`project_memory_dir`]) and
+//! names it to the guard (`--memory-dir <dir>`, [`check_with`]), which then allows exactly that
+//! directory instead of deriving one. A directory moved by anything else is still refused.
+//!
 //! The settings ([`settings`]) keep hooks on over the user's and the project's settings
 //! (`disableAllHooks: false`; `--settings` ranks above them). Managed settings rank above
 //! `--settings`: when a managed settings file turns hooks off, allows only managed hooks, keeps
@@ -65,26 +70,71 @@ const MAX_KEY: usize = 200;
 /// Most symbolic links [`resolve`] follows in one path (more is a loop, refused).
 const MAX_LINKS: usize = 40;
 
+/// The `twr claude-memory-guard` option that names the one memory directory the guard allows
+/// ([`check_with`]).
+pub const MEMORY_DIR_FLAG: &str = "--memory-dir";
+
 /// `--settings` for a Claude Code orchestrator: the guard (`<exe> claude-memory-guard`) as a
 /// `PreToolUse` hook on [`TOOLS`], with hooks kept on (a user's or project's
 /// `disableAllHooks: true` would drop it). Claude Code lets a call through when its hook exits
 /// with anything but 2 (a missing binary is 127) or times out, so the command exits 2 whenever
 /// the guard does not exit 0, and the guard decides within [`DEADLINE`], well inside the
 /// hook's [`HOOK_TIMEOUT_SECS`].
-pub fn settings(exe: &Path) -> Value {
-    json!({
+///
+/// With `memory_dir` (an orchestrator on a named account whose memory is the native account's,
+/// [`project_memory_dir`]), the settings move Claude Code's memory there
+/// (`autoMemoryDirectory`) and the hook command passes it to the guard
+/// (`--memory-dir '<dir>'`), which then allows exactly that directory.
+pub fn settings(exe: &Path, memory_dir: Option<&Path>) -> Value {
+    let mut command = format!("{} {COMMAND}", shell_quote(&exe.to_string_lossy()));
+    if let Some(dir) = memory_dir {
+        command.push_str(&format!(
+            " {MEMORY_DIR_FLAG} {}",
+            shell_quote(&dir.to_string_lossy())
+        ));
+    }
+    let mut out = json!({
         "disableAllHooks": false,
         "hooks": {
             "PreToolUse": [{
                 "matcher": TOOLS.join("|"),
                 "hooks": [{
                     "type": "command",
-                    "command": format!("{} {COMMAND} || exit 2", shell_quote(&exe.to_string_lossy())),
+                    "command": format!("{command} || exit 2"),
                     "timeout": HOOK_TIMEOUT_SECS,
                 }],
             }],
         },
-    })
+    });
+    if let Some(dir) = memory_dir {
+        out["autoMemoryDirectory"] = json!(dir.to_string_lossy());
+    }
+    out
+}
+
+/// The memory directory Claude Code keeps, in its configuration directory `config_dir`, for a
+/// session in `cwd`: `<config_dir>/projects/<key>/memory`, the key being [`sanitize`] of the
+/// main checkout of the git repository `cwd` is in ([`git_root`]), else of `cwd` (resolved
+/// when it can be). The directory is given as the file system resolves it ([`resolve`]): the
+/// symbolic links on the way (to `config_dir`, or in it to `projects` or the project's
+/// directory) are followed and a part that does not exist yet is kept as written, so
+/// `autoMemoryDirectory` and the guard's `--memory-dir` name the real directory (Claude Code's
+/// `dontAsk` refuses a memory write through a link). `Err` says why there is none twr can name:
+/// a key longer than Claude Code uses as is (it hashes those), or a path that cannot be
+/// resolved.
+pub fn project_memory_dir(config_dir: &Path, cwd: &Path) -> Result<PathBuf, String> {
+    let root = git_root(cwd)
+        .or_else(|| cwd.canonicalize().ok())
+        .unwrap_or_else(|| cwd.to_path_buf());
+    let key = sanitize(&root.to_string_lossy());
+    if key.len() > MAX_KEY {
+        return Err(format!(
+            "the project key of {} is longer than {MAX_KEY} characters (Claude Code hashes it)",
+            root.display()
+        ));
+    }
+    let dir = config_dir.join("projects").join(key).join("memory");
+    resolve(&dir).map_err(|e| format!("{} cannot be resolved: {e}", dir.display()))
 }
 
 /// `s` as one word for `sh`.
@@ -200,7 +250,9 @@ fn blocks_hooks(key: &str, v: &Value) -> bool {
 }
 
 /// [`policy_blocks_hooks`] for the managed settings in `dir`: `managed-settings.json` and the
-/// `*.json` files of `managed-settings.d` (not hidden ones), as Claude Code reads them.
+/// `*.json` files of `managed-settings.d` (not hidden ones), as Claude Code reads them. Each is
+/// read as [`twr_core::fsread::read_settings`] reads: one that is not a regular file, or is
+/// larger than [`twr_core::fsread::SETTINGS_MAX`], can't be read, so blocks.
 fn hooks_blocked_in(dir: &Path) -> Option<String> {
     let mut files = vec![dir.join("managed-settings.json")];
     let drop_ins = dir.join("managed-settings.d");
@@ -220,10 +272,12 @@ fn hooks_blocked_in(dir: &Path) -> Option<String> {
         Err(e) => return Some(format!("{}: {e}", drop_ins.display())),
     }
     for f in files {
-        let text = match std::fs::read_to_string(&f) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Some(format!("{}: {e}", f.display())),
+        // Read without blocking and within a cap: the hub reads these under its core lock
+        // (an orchestrator's spawn). One that can't be read so is a policy twr can't know.
+        let text = match twr_core::fsread::read_settings(&f) {
+            Ok(Some(t)) => t,
+            Ok(None) => continue,
+            Err(e) => return Some(format!("{} can't be read: {e}", f.display())),
         };
         let Ok(v) = serde_json::from_str::<Value>(&text) else {
             return Some(format!("{} is not JSON", f.display()));
@@ -262,10 +316,19 @@ pub fn run(
     read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
     deadline: Duration,
 ) -> Option<Value> {
+    run_with(read, deadline, None)
+}
+
+/// [`run`] allowing only `memory_dir` when given (`--memory-dir`, [`check_with`]).
+pub fn run_with(
+    read: impl FnOnce() -> std::io::Result<String> + Send + 'static,
+    deadline: Duration,
+    memory_dir: Option<PathBuf>,
+) -> Option<Value> {
     let (tx, rx) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new().spawn(move || {
         let out = match read() {
-            Ok(input) => answer(&input),
+            Ok(input) => answer_with(&input, memory_dir.as_deref()),
             Err(e) => Some(deny(&format!("its input could not be read: {e}"))),
         };
         let _ = tx.send(out);
@@ -286,8 +349,13 @@ pub fn run(
 /// The hook's answer for its input `input` (the `PreToolUse` JSON): `None` lets the call go on
 /// to Claude Code's own permission check, `Some(json)` (printed on stdout) denies it.
 pub fn answer(input: &str) -> Option<Value> {
+    answer_with(input, None)
+}
+
+/// [`answer`] allowing only `memory_dir` when given ([`check_with`]).
+pub fn answer_with(input: &str, memory_dir: Option<&Path>) -> Option<Value> {
     let reason = match serde_json::from_str::<Value>(input) {
-        Ok(v) => check(&v).err()?,
+        Ok(v) => check_with(&v, memory_dir).err()?,
         Err(e) => format!("unreadable hook input: {e}"),
     };
     Some(deny(&reason))
@@ -310,6 +378,15 @@ fn deny(reason: &str) -> Value {
 /// Whether the `PreToolUse` call `input` stays in the session's memory directory: `Err` says
 /// why not.
 pub fn check(input: &Value) -> Result<(), String> {
+    check_with(input, None)
+}
+
+/// [`check`], with `memory_dir` (`twr claude-memory-guard --memory-dir <dir>`, the
+/// `autoMemoryDirectory` the hub set) the one directory allowed when given, instead of those
+/// derived from the transcript and the working directory ([`memory_dirs`]); the transcript is
+/// then not needed. Resolved as the path is ([`resolve`]): one that cannot be resolved (a
+/// relative one included) allows nothing.
+pub fn check_with(input: &Value, memory_dir: Option<&Path>) -> Result<(), String> {
     let tool = input["tool_name"].as_str().unwrap_or_default();
     if !TOOLS.contains(&tool) {
         return Err(format!("{tool:?} is not a file tool the guard knows"));
@@ -322,10 +399,15 @@ pub fn check(input: &Value) -> Result<(), String> {
     if path.starts_with('~') {
         return Err(format!("{path} starts with ~"));
     }
-    let transcript = input["transcript_path"]
-        .as_str()
-        .filter(|p| !p.is_empty())
-        .ok_or("no transcript_path, so the memory directory is unknown")?;
+    let transcript = match memory_dir {
+        Some(_) => None,
+        None => Some(
+            input["transcript_path"]
+                .as_str()
+                .filter(|p| !p.is_empty())
+                .ok_or("no transcript_path, so the memory directory is unknown")?,
+        ),
+    };
     let cwd = input["cwd"]
         .as_str()
         .filter(|c| !c.is_empty())
@@ -338,7 +420,12 @@ pub fn check(input: &Value) -> Result<(), String> {
     };
     let resolved =
         resolve(&path).map_err(|e| format!("{} cannot be resolved: {e}", path.display()))?;
-    let inside = memory_dirs(Path::new(transcript), cwd)
+    let dirs = match (memory_dir, transcript) {
+        (Some(d), _) => vec![d.to_path_buf()],
+        (None, Some(t)) => memory_dirs(Path::new(t), cwd),
+        (None, None) => Vec::new(),
+    };
+    let inside = dirs
         .iter()
         .filter_map(|d| resolve(d).ok())
         .any(|d| resolved != d && resolved.starts_with(&d));
@@ -373,7 +460,12 @@ fn memory_dirs(transcript: &Path, cwd: Option<&Path>) -> Vec<PathBuf> {
 /// process, which could hang): the nearest `.git` at or above `dir`; a worktree's `.git` file
 /// names its git directory (`gitdir: <path>`), whose `commondir` names the repository's.
 /// `None`: not in one, or one whose git directory is no checkout's `.git` (bare, a submodule).
+/// The files are read without blocking and within a cap ([`twr_core::fsread::read_git_file`]):
+/// the hub asks under its core lock ([`project_memory_dir`], at an orchestrator's spawn and
+/// attach), so a `.git` or `commondir` that is a FIFO, a device or too large to be one makes
+/// `dir` no checkout (`None`) at once.
 fn git_root(dir: &Path) -> Option<PathBuf> {
+    use twr_core::fsread::read_git_file;
     let dir = dir.canonicalize().ok()?;
     let dot_git = dir
         .ancestors()
@@ -382,12 +474,12 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
     let common = if dot_git.is_dir() {
         dot_git
     } else {
-        let text = std::fs::read_to_string(&dot_git).ok()?;
+        let text = read_git_file(&dot_git).ok()??;
         let gitdir = text.lines().next()?.strip_prefix("gitdir:")?.trim();
         let gitdir = dot_git.parent()?.join(gitdir);
-        match std::fs::read_to_string(gitdir.join("commondir")) {
-            Ok(c) => gitdir.join(c.trim_end_matches(['\n', '\r'])),
-            Err(_) => gitdir,
+        match read_git_file(&gitdir.join("commondir")).ok()? {
+            Some(c) => gitdir.join(c.trim_end_matches(['\n', '\r'])),
+            None => gitdir,
         }
     };
     let common = common.canonicalize().ok()?;
@@ -720,7 +812,7 @@ mod tests {
     /// well past the guard's own deadline.
     #[test]
     fn settings_run_the_guard_on_the_file_tools() {
-        let s = settings(Path::new("/opt/it's/twr"));
+        let s = settings(Path::new("/opt/it's/twr"), None);
         assert_eq!(s["disableAllHooks"], false);
         let hook = &s["hooks"]["PreToolUse"][0];
         assert_eq!(hook["matcher"], "Read|Write|Edit");
@@ -731,6 +823,247 @@ mod tests {
         );
         assert_eq!(hook["hooks"][0]["timeout"], HOOK_TIMEOUT_SECS);
         assert!(DEADLINE * 2 <= Duration::from_secs(HOOK_TIMEOUT_SECS));
+        assert!(s.get("autoMemoryDirectory").is_none(), "{s}");
+    }
+
+    /// With a memory directory, the settings move Claude Code's memory there and the hook
+    /// command names it to the guard, quoted like the binary.
+    #[test]
+    fn settings_with_a_memory_directory_name_it_twice() {
+        let s = settings(
+            Path::new("/opt/twr"),
+            Some(Path::new("/h/.claude/projects/-it's/memory")),
+        );
+        assert_eq!(s["autoMemoryDirectory"], "/h/.claude/projects/-it's/memory");
+        let hook = &s["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(
+            hook["command"],
+            r"'/opt/twr' claude-memory-guard --memory-dir '/h/.claude/projects/-it'\''s/memory' || exit 2"
+        );
+        assert_eq!(s["disableAllHooks"], false);
+        assert_eq!(s["hooks"]["PreToolUse"][0]["matcher"], "Read|Write|Edit");
+    }
+
+    /// `--memory-dir`: exactly that directory is open (no transcript needed), and none of the
+    /// derived ones; the directory itself, a link out of it and a relative directory are not.
+    #[test]
+    fn a_given_memory_directory_replaces_the_derived_ones() {
+        let h = Home::new();
+        let shared = h.root().join("native/projects/-home-me/memory");
+        std::fs::create_dir_all(&shared).unwrap();
+        let call = |tool: &str, path: &Path, dir: &Path, transcript: bool| {
+            let mut input = json!({
+                "tool_name": tool,
+                "tool_input": {"file_path": path},
+                "cwd": h.root(),
+            });
+            if transcript {
+                input["transcript_path"] = json!(h.project().join("0f.jsonl"));
+            }
+            check_with(&input, Some(dir))
+        };
+        for tool in TOOLS {
+            for transcript in [true, false] {
+                for ok in [
+                    shared.join("MEMORY.md"),
+                    shared.join("new.md"),
+                    shared.join("sub/deeper.md"),
+                ] {
+                    assert_eq!(
+                        call(tool, &ok, &shared, transcript),
+                        Ok(()),
+                        "{tool} {}",
+                        ok.display()
+                    );
+                }
+                for bad in [
+                    // The derived one (the transcript's project) is no longer open.
+                    h.memory().join("MEMORY.md"),
+                    shared.clone(),
+                    h.root().join("secret.txt"),
+                    shared.join("../../../secret.txt"),
+                ] {
+                    assert!(
+                        call(tool, &bad, &shared, transcript).is_err(),
+                        "{tool} {}",
+                        bad.display()
+                    );
+                }
+            }
+        }
+        // A directory that does not exist yet is checked as written.
+        let unborn = h.root().join("native/projects/-new/memory");
+        assert_eq!(
+            call("Write", &unborn.join("MEMORY.md"), &unborn, false),
+            Ok(())
+        );
+        // A link out of it.
+        std::os::unix::fs::symlink(h.root().join("secret.txt"), shared.join("out.md")).unwrap();
+        assert!(call("Read", &shared.join("out.md"), &shared, false).is_err());
+        // A relative directory allows nothing.
+        assert!(call(
+            "Read",
+            &shared.join("MEMORY.md"),
+            Path::new("native/projects/-home-me/memory"),
+            false
+        )
+        .is_err());
+        // Without it, the transcript is needed and the derived directory is the one.
+        let derived = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": h.memory().join("MEMORY.md")},
+            "cwd": h.root(),
+            "transcript_path": h.project().join("0f.jsonl"),
+        });
+        assert_eq!(check_with(&derived, None), Ok(()));
+        let mut v = derived.clone();
+        v["tool_input"]["file_path"] = json!(shared.join("MEMORY.md"));
+        assert!(check_with(&v, None).is_err());
+        // Through the hook's answer and run as well.
+        assert_eq!(answer_with(&derived.to_string(), None), None);
+        assert!(answer_with(&derived.to_string(), Some(&shared)).is_some());
+        let input = v.to_string();
+        assert_eq!(run_with(move || Ok(input), DEADLINE, Some(shared)), None);
+    }
+
+    /// The memory directory of a session: the main checkout's key in a repository (worktrees
+    /// included), else the directory's own; none for a key Claude Code would hash.
+    #[test]
+    fn a_project_memory_directory_follows_the_main_checkout() {
+        let h = Home::new();
+        let config = Path::new("/n/.claude");
+        let plain = h.root().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            project_memory_dir(config, &plain),
+            Ok(config
+                .join("projects")
+                .join(sanitize(&plain.to_string_lossy()))
+                .join("memory"))
+        );
+        let repo = h.root().join("code/app");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ]);
+        let wt = h.root().join("wt");
+        git(&["worktree", "add", "-q", wt.to_str().unwrap()]);
+        let want = config
+            .join("projects")
+            .join(sanitize(&repo.to_string_lossy()))
+            .join("memory");
+        for cwd in [repo.clone(), repo.join("src"), wt] {
+            assert_eq!(
+                project_memory_dir(config, &cwd).as_ref(),
+                Ok(&want),
+                "{}",
+                cwd.display()
+            );
+        }
+        let long = h.root().join("x".repeat(MAX_KEY));
+        assert!(project_memory_dir(config, &long).is_err_and(|e| e.contains("longer than")));
+    }
+
+    /// A configuration directory reached through symbolic links (to it, or in it to
+    /// `projects` or the project's directory) gives the real memory directory, the parts that
+    /// do not exist yet kept as written; the guard allows a write in it.
+    #[test]
+    fn a_project_memory_directory_is_the_real_one() {
+        let h = Home::new();
+        let cwd = h.root().join("plain");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let key = sanitize(&cwd.to_string_lossy());
+        let real = h.root().join("dotfiles/claude");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = h.root().join("link-claude");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Nothing below the configuration directory exists yet.
+        let want = real.join("projects").join(&key).join("memory");
+        assert_eq!(project_memory_dir(&link, &cwd), Ok(want.clone()));
+        // `projects` a link elsewhere, the project's directory a relative link in it.
+        let projects = h.root().join("store/projects");
+        std::fs::create_dir_all(projects.join("real-key")).unwrap();
+        std::os::unix::fs::symlink(&projects, real.join("projects")).unwrap();
+        std::os::unix::fs::symlink("real-key", projects.join(&key)).unwrap();
+        let want = projects.join("real-key/memory");
+        let got = project_memory_dir(&link, &cwd).unwrap();
+        assert_eq!(got, want);
+        let write = json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": got.join("MEMORY.md")},
+            "cwd": cwd,
+        });
+        assert_eq!(check_with(&write, Some(&got)), Ok(()));
+    }
+
+    /// A `.git`, or a worktree's `commondir`, that is a FIFO (no writer: a blocking read
+    /// would wait forever) makes its directory no checkout, at once: the memory directory is
+    /// the directory's own. Run on a thread of its own, so a read that blocks fails the test
+    /// instead of hanging it.
+    #[test]
+    fn git_files_that_are_fifos_are_no_checkout() {
+        let h = Home::new();
+        let mkfifo = |p: &Path| {
+            let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        };
+        // `.git` itself a FIFO.
+        let fifo_git = h.root().join("fifo-git");
+        std::fs::create_dir_all(&fifo_git).unwrap();
+        mkfifo(&fifo_git.join(".git"));
+        // A worktree's `.git` file names a git directory whose `commondir` is a FIFO.
+        let fifo_common = h.root().join("fifo-commondir");
+        let gitdir = h.root().join("repo/.git/worktrees/w");
+        std::fs::create_dir_all(&fifo_common).unwrap();
+        std::fs::create_dir_all(&gitdir).unwrap();
+        std::fs::write(
+            fifo_common.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        mkfifo(&gitdir.join("commondir"));
+        let config = PathBuf::from("/n/.claude");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dirs = [fifo_git.clone(), fifo_common.clone()];
+        let c = config.clone();
+        std::thread::spawn(move || {
+            let got: Vec<_> = dirs
+                .iter()
+                .map(|d| (git_root(d), project_memory_dir(&c, d)))
+                .collect();
+            let _ = tx.send(got);
+        });
+        let got = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading a FIFO in git's files blocked");
+        for ((root, memory), dir) in got.into_iter().zip([fifo_git, fifo_common]) {
+            assert_eq!(root, None, "{}", dir.display());
+            let own = config
+                .join("projects")
+                .join(sanitize(&dir.to_string_lossy()))
+                .join("memory");
+            assert_eq!(memory, Ok(own), "{}", dir.display());
+        }
     }
 
     /// Managed settings files that turn hooks off, allow only managed hooks, or cannot be read
@@ -770,6 +1103,33 @@ mod tests {
         assert!(hooks_blocked_in(d).is_some_and(|r| r.contains("disableAllHooks")));
         std::fs::write(d.join("managed-settings.json"), "{").unwrap();
         assert!(hooks_blocked_in(d).is_some_and(|r| r.contains("not JSON")));
+        // A FIFO (no writer) or an oversized file is not read, at once: it blocks.
+        std::fs::remove_file(d.join("managed-settings.json")).unwrap();
+        let fifo = d.join("managed-settings.d/30-fifo.json");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            hooks_blocked_in(d),
+            Some(format!(
+                "{} can't be read: it is a FIFO, not a regular file",
+                fifo.display()
+            ))
+        );
+        std::fs::remove_file(&fifo).unwrap();
+        let big = d.join("managed-settings.json");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(twr_core::fsread::SETTINGS_MAX + 1)
+            .unwrap();
+        assert_eq!(
+            hooks_blocked_in(d),
+            Some(format!(
+                "{} can't be read: it is larger than 1024 KiB",
+                big.display()
+            ))
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     /// A managed policy key lets the hook run only when absent, `null`, a plain `false`, or

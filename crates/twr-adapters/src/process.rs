@@ -58,16 +58,27 @@ pub fn check_wrapped(
     } else {
         cwd.to_path_buf()
     };
-    let path = env
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| std::ffi::OsString::from(v))
-        .or_else(|| std::env::var_os("PATH"));
+    let path = search_path(env);
     match missing_program(program, path.as_deref(), &base) {
         Some(why) => Err(anyhow::anyhow!("{why} ({fix})")),
         None => Ok(()),
     }
+}
+
+/// The `PATH` `env` sets (its last entry, as the process started with it sees), if it sets one.
+pub fn env_path(env: &[(String, String)]) -> Option<&str> {
+    env.iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.as_str())
+}
+
+/// Where a program started with `env` added is looked up: `env`'s own `PATH`
+/// ([`env_path`]), else the runner's (this process's).
+pub fn search_path(env: &[(String, String)]) -> Option<std::ffi::OsString> {
+    env_path(env)
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
 }
 
 /// [`scrub`] for a `std` command (`attach`).
@@ -93,6 +104,58 @@ pub fn scrub_pty(cmd: &mut portable_pty::CommandBuilder) {
     for k in SCRUBBED_ENV {
         cmd.env_remove(k);
     }
+}
+
+/// A runtime command's environment: `env` added, then each of `remove`
+/// ([`twr_core::adapter::SpawnConfig::env_remove`]: a name in both is removed), then
+/// [`scrub`].
+pub fn apply_env<K, V>(
+    cmd: &mut tokio::process::Command,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    cmd.envs(env);
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub(cmd);
+}
+
+/// [`apply_env`] for a `std` command (`attach`).
+pub fn apply_env_std<K, V>(
+    cmd: &mut std::process::Command,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    cmd.envs(env);
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub_std(cmd);
+}
+
+/// [`apply_env`] for a PTY command.
+pub fn apply_env_pty<K, V>(
+    cmd: &mut portable_pty::CommandBuilder,
+    env: impl IntoIterator<Item = (K, V)>,
+    remove: &[String],
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    scrub_pty(cmd);
 }
 
 /// Why runtime program `program` (an argv[0]) cannot be run, when it cannot: a bare name
@@ -126,8 +189,10 @@ pub fn missing_program(
 }
 
 /// The executable file runtime program `program` (an argv[0]) names: a bare name looked up on
-/// the directories of `path` (a `PATH` value), a path taken from `cwd`. `None` when there is
-/// no such executable file, or `program` is empty.
+/// the directories of `path` (a `PATH` value), a path taken from `cwd`. A relative directory
+/// of `path` is taken from `cwd` too, and an empty one is `cwd` itself: where `execvp` in the
+/// program's working directory looks. `None` when there is no such executable file, or
+/// `program` is empty.
 pub fn find_program(
     program: &std::path::Path,
     path: Option<&std::ffi::OsStr>,
@@ -145,19 +210,20 @@ pub fn find_program(
         return runnable(&p).then_some(p);
     }
     std::env::split_paths(path?)
-        .filter(|d| !d.as_os_str().is_empty())
-        .map(|d| d.join(program))
+        .map(|d| cwd.join(d).join(program))
         .find(|p| runnable(p))
 }
 
-/// The error of starting runtime program `program` in `cwd` (`e`, from spawning it). A program
-/// that is not there ([`missing_program`] with the hub's `PATH`) leads with its name and `fix`,
+/// The error of starting runtime program `program` in `cwd` with `env` added (`e`, from
+/// spawning it). A program that is not there ([`missing_program`] on `env`'s `PATH`, else the
+/// hub's: [`search_path`]) leads with its name and `fix`,
 /// how to install it or point twr at another one: "`claude` not found on PATH (install Claude
 /// Code, or set TWR_CLAUDE_BIN)". Anything else, a missing working directory included, is
 /// "starting <program> in <cwd>: <e>".
 pub fn start_error(
     e: io::Error,
     program: &std::path::Path,
+    env: &[(String, String)],
     cwd: &std::path::Path,
     fix: &str,
 ) -> anyhow::Error {
@@ -167,7 +233,7 @@ pub fn start_error(
     } else {
         cwd.to_path_buf()
     };
-    let path = std::env::var_os("PATH");
+    let path = search_path(env);
     if let Some(why) = (e.kind() == io::ErrorKind::NotFound && cwd_ok)
         .then(|| missing_program(program, path.as_deref(), &base))
         .flatten()
@@ -180,6 +246,267 @@ pub fn start_error(
         cwd.display()
     ))
 }
+
+/// Starts `cmd` in a session of its own (`setsid`): without a controlling terminal, so a
+/// process that tries to use one (an interactive login shell, a CLI asking a question, a
+/// command reading `/dev/tty`) gets an error instead of being stopped by the terminal of
+/// whoever started twr (SIGTTIN, SIGTTOU), and in a process group of its own (its process id,
+/// as `process_group(0)` makes it), which [`kill_group`] ends with whatever it started. Not
+/// together with `process_group(0)`: a group leader cannot start a session (`EPERM`). A
+/// process it starts that makes a session of its own (`setsid`, a daemon) leaves that group.
+pub fn new_session(cmd: &mut tokio::process::Command) {
+    // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(setsid);
+    }
+}
+
+/// [`new_session`] for a `std` command.
+pub fn new_session_std(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid` is async-signal-safe, and nothing else runs between fork and exec.
+    unsafe {
+        cmd.pre_exec(setsid);
+    }
+}
+
+/// `setsid(2)`, between fork and exec ([`new_session`]): it allocates nothing (an `io::Error`
+/// of an OS error does not).
+fn setsid() -> io::Result<()> {
+    // SAFETY: setsid(2) takes nothing and touches no memory of this process.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Sends `SIGKILL` to process group `pgid`. Only while the group's leader is not reaped (it
+/// is this process's child): until then its id names no other process or group.
+pub fn kill_group(pgid: u32) {
+    // SAFETY: kill(2) with a negative pid signals that process group; no memory is passed.
+    let r = unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+    tracing::debug!(pgid, signalled = r == 0, "killed a process group");
+}
+
+/// Waits for `child`, spawned as the leader of a process group of its own (`process_group(0)`
+/// or [`new_session`]), to exit, kills what is left of that group (what it started in the
+/// background, which would otherwise outlive it), then reaps it: its exit status. The group
+/// is killed while the child is not reaped yet (it waits with `waitid(WEXITED | WNOWAIT)`,
+/// [`exited_unreaped`]): until then its pid, which is the group's id, cannot name another
+/// process or group. That wait only says the child has exited: what `waitid` reports of it is
+/// not read (macOS does not fill it in reliably); the status is the reap's. Should the wait
+/// fail:
+///
+/// - with `ECHILD`, the child is no longer this process's to wait for (something else reaped
+///   it): its id may name another process by now, so nothing is killed, and that error is
+///   returned at once (no reap is waited for), so the caller lets go of the id before anything
+///   of its own (a timeout that drops this, a guard) could signal it;
+/// - otherwise, the child is still this process's and not reaped (only the reap below reaps
+///   it), so its id still names its group: the group is killed, the child with it (whether it
+///   had exited or not), so that the reap that follows cannot wait forever.
+///
+/// An error for which [`ownership_lost`] holds says the child was reaped by something else:
+/// whoever holds its id (a group guard, a `Drop` that kills the group, the `Child`'s own
+/// `kill_on_drop`) must not signal it again.
+///
+/// Cancel safe as far as the group goes: a caller dropped while waiting leaves the child to
+/// its own kill (`kill_on_drop`, or the caller's group guard).
+pub async fn finish_group(
+    child: &mut tokio::process::Child,
+) -> io::Result<std::process::ExitStatus> {
+    finish_group_with(child, exited_unreaped).await
+}
+
+/// [`finish_group`], `wait` standing for [`exited_unreaped`] (tests make it fail).
+async fn finish_group_with(
+    child: &mut tokio::process::Child,
+    wait: fn(u32) -> io::Result<()>,
+) -> io::Result<std::process::ExitStatus> {
+    if let Some(pid) = child.id() {
+        match tokio::task::spawn_blocking(move || wait(pid)).await {
+            Ok(Ok(())) => kill_group(pid),
+            Ok(Err(e)) if e.raw_os_error() == Some(libc::ECHILD) => {
+                tracing::warn!(
+                    pid,
+                    "waitid: the process is not this one's child any more; its group is not killed"
+                );
+                // At once, not after a reap: the caller clears what holds the id (its group
+                // guard) before any timeout of its own can drop this and leave the id armed.
+                return Err(e);
+            }
+            // Not reaped (only the reap below reaps it): its id still names its group.
+            Ok(Err(e)) => {
+                tracing::warn!(pid, error = %e, "waitid failed: killing the process group before reaping its leader");
+                kill_group(pid);
+            }
+            Err(e) => {
+                tracing::warn!(pid, error = %e, "waiting with waitid failed: killing the process group before reaping its leader");
+                kill_group(pid);
+            }
+        }
+    }
+    child.wait().await
+}
+
+/// Whether `e`, from waiting for a child ([`finish_group`], `Child::wait`), says it is not
+/// this process's child any more (`ECHILD`: something else reaped it). Its id may name another
+/// process, or group, by then: nothing may signal it again, the `Child`'s `kill_on_drop`
+/// included (a holder of such a child spawns it without `kill_on_drop` and kills its group
+/// itself while it still owns it, as [`run_bounded`] and the hub's `Ssh` do).
+pub fn ownership_lost(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ECHILD)
+}
+
+/// Blocks until process `pid` (a child of this process) has exited, without reaping it
+/// (`waitid` with `WNOWAIT`; interrupted calls are made again). Only that it has exited: the
+/// `siginfo_t` it fills is not read.
+fn exited_unreaped(pid: u32) -> io::Result<()> {
+    loop {
+        // SAFETY: an all-zero `siginfo_t` is a valid value; waitid(2) writes into it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waitid(2) with a valid pointer to `info`; WNOWAIT leaves the child
+        // waitable (tokio reaps it).
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Kills process group `.0` when dropped, unless cleared first (its leader was reaped, by
+/// this process or, [`ownership_lost`], by something else: the id may be another process's by
+/// then).
+struct GroupGuard(Option<u32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            kill_group(p);
+        }
+    }
+}
+
+/// How a bounded run of a probe command went ([`run_bounded`]).
+#[derive(Debug)]
+pub enum Bounded {
+    /// It exited within the limit: its exit code (`None`: killed by a signal) and its stdout.
+    Exited(Option<i32>, Vec<u8>),
+    /// Its stdout so far satisfied the caller before it ended (the rest is not waited for).
+    Enough(Vec<u8>),
+    /// It could not be started (not there, not executable).
+    NotStarted,
+    /// It printed more than the cap.
+    TooLarge,
+    /// It did not finish within the limit.
+    TimedOut,
+    /// Reading its output or waiting for it failed.
+    Failed,
+}
+
+/// Runs `cmd` as a probe: stdin `/dev/null`, stderr discarded, twr's secrets removed
+/// ([`scrub`]), in a session of its own ([`new_session`]), for at most `limit`, reading at
+/// most `max` bytes of its stdout. `enough` is asked after every read: once it says the
+/// output so far suffices, the run stops there ([`Bounded::Enough`]). Whatever is left of its
+/// process group is killed unless it exited by itself in time (also when this is dropped
+/// first; once it exited, [`finish_group`] kills what it left in the background before it is
+/// reaped). When it is stopped early (enough, too large, timed out, a failed read), its group
+/// is killed and its leader reaped (waiting at most [`REAP_LIMIT`]) before this returns, so a
+/// caller that `exec`s next leaves no zombie child to what it runs. Should something else
+/// reap it ([`ownership_lost`]), nothing of it is signalled again ([`Bounded::Failed`]). The
+/// group, not the `Child`'s `kill_on_drop` (turned off: it would signal the leader's id
+/// whoever reaped it), is what is killed, the leader with it. What it printed is never logged.
+pub async fn run_bounded(
+    cmd: tokio::process::Command,
+    limit: std::time::Duration,
+    max: usize,
+    enough: impl Fn(&[u8]) -> bool,
+) -> Bounded {
+    run_bounded_with(cmd, limit, max, enough, exited_unreaped).await
+}
+
+/// [`run_bounded`], `wait` standing for [`exited_unreaped`] (tests reap the child elsewhere
+/// first).
+async fn run_bounded_with(
+    mut cmd: tokio::process::Command,
+    limit: std::time::Duration,
+    max: usize,
+    enough: impl Fn(&[u8]) -> bool,
+    wait: fn(u32) -> io::Result<()>,
+) -> Bounded {
+    use tokio::io::AsyncReadExt;
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(false);
+    scrub(&mut cmd);
+    new_session(&mut cmd);
+    let Ok(mut child) = cmd.spawn() else {
+        return Bounded::NotStarted;
+    };
+    // Dropped before `child`: the group is killed while its leader is not reaped yet.
+    let mut group = GroupGuard(child.id());
+    let Some(mut stdout) = child.stdout.take() else {
+        return Bounded::Failed;
+    };
+    let run = async {
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match stdout.read(&mut buf).await {
+                Ok(n) => n,
+                Err(_) => return Bounded::Failed,
+            };
+            if n == 0 {
+                break;
+            }
+            if out.len() + n > max {
+                return Bounded::TooLarge;
+            }
+            out.extend_from_slice(&buf[..n]);
+            if enough(&out) {
+                return Bounded::Enough(out);
+            }
+        }
+        match finish_group_with(&mut child, wait).await {
+            Ok(status) => {
+                group.0 = None;
+                Bounded::Exited(status.code(), out)
+            }
+            Err(e) => {
+                if ownership_lost(&e) {
+                    // Reaped by something else: its id is not this process's to signal.
+                    group.0 = None;
+                }
+                Bounded::Failed
+            }
+        }
+    };
+    let outcome = tokio::time::timeout(limit, run)
+        .await
+        .unwrap_or(Bounded::TimedOut);
+    // Not reaped yet (stopped early): kill the group while its leader is unreaped, then reap
+    // the leader, bounded (one stuck in the kernel is left to tokio's reaping of dropped
+    // children; it was sent SIGKILL with its group).
+    if let Some(pgid) = group.0.take() {
+        kill_group(pgid);
+        let _ = tokio::time::timeout(REAP_LIMIT, child.wait()).await;
+    }
+    outcome
+}
+
+/// How long [`run_bounded`] waits for a probe it killed to be reaped.
+pub const REAP_LIMIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether `key` is one of [`SCRUBBED_ENV`].
 pub fn is_scrubbed(key: &str) -> bool {
@@ -431,6 +758,7 @@ mod tests {
         let e = start_error(
             not_found(),
             Path::new("twr-test-no-such-cli"),
+            &[],
             dir.path(),
             fix,
         );
@@ -442,21 +770,38 @@ mod tests {
         let e = start_error(
             not_found(),
             Path::new("/nonexistent/claude"),
+            &[],
             dir.path(),
             fix,
         );
         assert!(format!("{e:#}").starts_with("`/nonexistent/claude` not found ("));
         // A missing working directory is not a missing program.
         let gone = dir.path().join("gone");
-        let e = start_error(not_found(), Path::new("twr-test-no-such-cli"), &gone, fix);
+        let e = start_error(
+            not_found(),
+            Path::new("twr-test-no-such-cli"),
+            &[],
+            &gone,
+            fix,
+        );
         let e = format!("{e:#}");
         assert!(e.starts_with("starting twr-test-no-such-cli in "), "{e}");
         assert!(!e.contains(fix), "{e}");
         // Nor is a program that is there (a missing interpreter, say), or another error.
-        let e = start_error(not_found(), Path::new("sh"), dir.path(), fix);
+        let e = start_error(not_found(), Path::new("sh"), &[], dir.path(), fix);
+        // `sh` on the runtime's own PATH (`[threads] env`) when that has none is missing.
+        let empty = [("PATH".to_string(), dir.path().display().to_string())];
+        let e2 = start_error(not_found(), Path::new("sh"), &empty, dir.path(), fix);
+        assert_eq!(format!("{e2:#}"), format!("`sh` not found on PATH ({fix})"));
         assert!(format!("{e:#}").starts_with("starting sh in "));
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
-        let e = start_error(denied, Path::new("twr-test-no-such-cli"), dir.path(), fix);
+        let e = start_error(
+            denied,
+            Path::new("twr-test-no-such-cli"),
+            &[],
+            dir.path(),
+            fix,
+        );
         assert!(format!("{e:#}").starts_with("starting twr-test-no-such-cli in "));
     }
 
@@ -562,6 +907,264 @@ mod tests {
         assert_eq!(head_response_id(r#"{"id":"s","result":1"#), None);
     }
 
+    /// Whether process `pid` still runs (a zombie does not).
+    fn alive(pid: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout);
+        let stat = stat.trim();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    /// A probe that exits successfully leaves nothing behind: what it started in the
+    /// background (its streams redirected, so its output ends with the probe) is killed with
+    /// its group before the probe is reaped.
+    #[tokio::test]
+    async fn a_successful_probe_leaves_no_background_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'; echo done",
+                pidfile.display()
+            ),
+        ]);
+        let out = run_bounded(cmd, std::time::Duration::from_secs(10), 1024, |_| false).await;
+        assert!(
+            matches!(&out, Bounded::Exited(Some(0), o) if o == b"done\n"),
+            "{out:?}"
+        );
+        let pid = std::fs::read_to_string(&pidfile).unwrap();
+        let pid = pid.trim();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the background sleeper {pid} outlived its probe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Whether process `pid` is there at all (a zombie, not reaped yet, still is).
+    fn present(pid: &str) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
+    /// A probe stopped early (enough output, too much, too slow) is killed and reaped before
+    /// `run_bounded` returns: a caller that `exec`s next inherits no zombie child.
+    #[tokio::test]
+    async fn a_probe_stopped_early_is_reaped_before_the_return() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, (body, enough, limit)) in [
+            ("echo ready; exec sleep 30", true, 10_000),
+            ("yes flood", false, 10_000),
+            ("exec sleep 30", false, 300),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let pidfile = dir.path().join(format!("pid{i}"));
+            let mut cmd = tokio::process::Command::new("/bin/sh");
+            cmd.args(["-c", &format!("echo $$ > '{}'; {body}", pidfile.display())]);
+            let out = run_bounded(
+                cmd,
+                std::time::Duration::from_millis(limit),
+                1024,
+                move |o| enough && o.ends_with(b"\n"),
+            )
+            .await;
+            match i {
+                0 => assert!(
+                    matches!(&out, Bounded::Enough(o) if o == b"ready\n"),
+                    "{out:?}"
+                ),
+                1 => assert!(matches!(out, Bounded::TooLarge), "{out:?}"),
+                _ => assert!(matches!(out, Bounded::TimedOut), "{out:?}"),
+            }
+            let pid = std::fs::read_to_string(&pidfile).unwrap();
+            let pid = pid.trim();
+            assert!(!present(pid), "probe {pid} ({body}) was left unreaped");
+        }
+    }
+
+    /// A process group leader (`sh`) that starts a sleeper in the background, writes its pid
+    /// into `pidfile`, then runs `then`.
+    fn leader_with_helper(pidfile: &Path, then: &str) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}.tmp' && mv '{0}.tmp' '{0}'; \
+                 {then}",
+                pidfile.display()
+            ),
+        ])
+        .stdin(std::process::Stdio::null())
+        .process_group(0);
+        cmd.spawn().unwrap()
+    }
+
+    /// [`exited_unreaped`] after something else (here) reaped child `pid` first: `waitid`
+    /// then fails with `ECHILD`, as when another waiter of this process got to it.
+    fn reaped_elsewhere(pid: u32) -> io::Result<()> {
+        let mut status = 0;
+        // SAFETY: waitpid(2) of this test's child, with a valid pointer to `status`.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        assert_eq!(r, pid as libc::pid_t, "{}", io::Error::last_os_error());
+        exited_unreaped(pid)
+    }
+
+    /// A child reaped by something else before [`finish_group`] waits for it: its group (a
+    /// helper it left running) is not killed, and the error says the ownership was lost; the
+    /// same through [`run_bounded`], whose group guard then signals nothing either.
+    #[tokio::test]
+    async fn a_child_reaped_elsewhere_is_not_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("finish");
+        let mut child = leader_with_helper(&pidfile, "exit 0");
+        let helper = written(&pidfile);
+        let e = finish_group_with(&mut child, reaped_elsewhere)
+            .await
+            .unwrap_err();
+        assert!(ownership_lost(&e), "{e}");
+        drop(child);
+        assert!(
+            alive(&helper),
+            "the group of a child reaped elsewhere was killed"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+
+        let pidfile = dir.path().join("bounded");
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            &format!(
+                "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}.tmp' && mv '{0}.tmp' '{0}'; \
+                 exit 0",
+                pidfile.display()
+            ),
+        ]);
+        let out = run_bounded_with(
+            cmd,
+            std::time::Duration::from_secs(20),
+            1 << 16,
+            |_| false,
+            reaped_elsewhere,
+        )
+        .await;
+        assert!(matches!(out, Bounded::Failed), "{out:?}");
+        let helper = written(&pidfile);
+        assert!(
+            alive(&helper),
+            "run_bounded signalled a group it no longer owned"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+    }
+
+    /// The pid written into `pidfile`, once it is.
+    fn written(pidfile: &Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Ok(p) = std::fs::read_to_string(pidfile) {
+                return p.trim().to_string();
+            }
+            assert!(std::time::Instant::now() < deadline, "no pid written");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// `waitid` failing with anything but `ECHILD` (injected): the leader is still this
+    /// process's, so its group is killed, a leader still running included, and the reap
+    /// returns at once with the status it reaped (killed). With `ECHILD` (the child is not
+    /// this process's any more) nothing is killed: what the leader left runs on, and the
+    /// error comes back at once, without waiting for a reap (the leader here still runs).
+    #[tokio::test]
+    async fn a_failed_waitid_kills_the_group_unless_the_child_is_gone() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let einval = |_| Err(io::Error::from_raw_os_error(libc::EINVAL));
+        let pidfile = dir.path().join("running");
+        let mut child = leader_with_helper(&pidfile, "exec sleep 30");
+        let helper = written(&pidfile);
+        let start = std::time::Instant::now();
+        let status = finish_group_with(&mut child, einval).await.unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive(&helper) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the helper outlived its group"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let echild = |_| Err(io::Error::from_raw_os_error(libc::ECHILD));
+        let pidfile = dir.path().join("gone");
+        let mut child = leader_with_helper(&pidfile, "exec sleep 30");
+        let helper = written(&pidfile);
+        let start = std::time::Instant::now();
+        let e = finish_group_with(&mut child, echild).await.unwrap_err();
+        assert!(ownership_lost(&e), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the leader was waited for after ECHILD"
+        );
+        assert!(
+            alive(&helper),
+            "a group no longer known to be this process's was killed"
+        );
+        // SAFETY: kill(2) of the helper this test started.
+        unsafe { libc::kill(helper.parse().unwrap(), libc::SIGKILL) };
+        // (Still this test's child, in truth: ended and reaped here.)
+        child.start_kill().unwrap();
+        child.wait().await.unwrap();
+    }
+
+    /// A relative `PATH` directory is taken from the program's working directory, an empty one
+    /// is that directory: as `execvp` there sees them, whatever this process's directory is.
+    #[test]
+    fn relative_path_directories_are_taken_from_the_programs_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        for p in [bin.join("agent"), dir.path().join("here")] {
+            std::fs::write(&p, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_ne!(std::env::current_dir().unwrap(), dir.path());
+        let find = |prog: &str, path: &str| {
+            find_program(
+                Path::new(prog),
+                Some(std::ffi::OsStr::new(path)),
+                dir.path(),
+            )
+        };
+        assert_eq!(
+            find("agent", "bin:/usr/bin"),
+            Some(dir.path().join("bin/agent"))
+        );
+        assert_eq!(find("agent", "./bin"), Some(dir.path().join("./bin/agent")));
+        assert_eq!(
+            find("here", "/nonexistent::/usr/bin"),
+            Some(dir.path().join("here"))
+        );
+        assert_eq!(find("here", "/nonexistent:/usr/bin"), None);
+        assert_eq!(find("agent", "nope"), None);
+    }
+
     #[test]
     fn scrubbing() {
         let mut cmd = tokio::process::Command::new("true");
@@ -576,5 +1179,32 @@ mod tests {
             Some(std::ffi::OsStr::new("1"))
         )));
         assert!(is_scrubbed("TWR_RUNNER_TOKEN") && !is_scrubbed("TWR_THREAD"));
+    }
+
+    /// `apply_env`: the variables set, then the removals (a name in both is removed), then
+    /// twr's secrets.
+    #[test]
+    fn apply_env_sets_then_removes() {
+        use std::ffi::OsStr;
+        let env = [("CLAUDE_CONFIG_DIR", "/a"), ("ANTHROPIC_API_KEY", "set")];
+        let remove = ["ANTHROPIC_API_KEY".to_string(), "OTHER".to_string()];
+        let want = |envs: &[(&OsStr, Option<&OsStr>)]| {
+            assert!(envs.contains(&(OsStr::new("CLAUDE_CONFIG_DIR"), Some(OsStr::new("/a")))));
+            for k in ["ANTHROPIC_API_KEY", "OTHER"].iter().chain(SCRUBBED_ENV) {
+                assert!(envs.contains(&(OsStr::new(k), None)), "{k}: {envs:?}");
+            }
+        };
+        let mut cmd = tokio::process::Command::new("true");
+        apply_env(&mut cmd, env, &remove);
+        want(&cmd.as_std().get_envs().collect::<Vec<_>>());
+        let mut cmd = std::process::Command::new("true");
+        apply_env_std(&mut cmd, env, &remove);
+        want(&cmd.get_envs().collect::<Vec<_>>());
+        let mut cmd = portable_pty::CommandBuilder::new("true");
+        apply_env_pty(&mut cmd, env, &remove);
+        assert_eq!(cmd.get_env("CLAUDE_CONFIG_DIR"), Some(OsStr::new("/a")));
+        for k in ["ANTHROPIC_API_KEY", "OTHER"].iter().chain(SCRUBBED_ENV) {
+            assert_eq!(cmd.get_env(k), None, "{k}");
+        }
     }
 }

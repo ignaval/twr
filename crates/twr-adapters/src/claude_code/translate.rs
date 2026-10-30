@@ -16,7 +16,9 @@
 //! - Assistant messages arrive one per content block; `stream_event` wraps the raw API
 //!   stream (`message_start` identifies an autonomous turn; `text_delta` streams text).
 //! - `result` ends a turn. `total_cost_usd` is cumulative per process (per-turn cost is the
-//!   delta); `usage`, `duration_ms` and `num_turns` are per turn. An interrupted turn's cost
+//!   delta); `usage`, `duration_ms` and `num_turns` are per turn (`usage` sums every model
+//!   call of the turn, `num_turns` of them: what it spent, not how full the context is). An
+//!   interrupted turn's cost
 //!   is not included (the total stays put, or reads 0), so it is reported as unknown. A
 //!   `result` with `origin.kind: task-notification` and `num_turns: 0` (Claude 2.1.291: a
 //!   resumed session consuming a notice of a task its previous process left, before the
@@ -39,7 +41,8 @@
 //!   request (one deny) and withdraws the still-open siblings as
 //!   `attention.resolved{by: timeout, answer: null}`.
 //! - A tool call says what it is for when the agent said: a Bash call's `description`
-//!   becomes `ext.twr.purpose` ([`PURPOSE_KEY`]). The step the agent's own plan has in
+//!   becomes `ext.twr.purpose` ([`PURPOSE_KEY`]); a blocking `TaskOutput` call names the task
+//!   it waits for as `ext.twr.waits_for` ([`WAITS_FOR_KEY`]). The step the agent's own plan has in
 //!   progress goes on the call that changes it as `ext.twr.step` ([`STEP_KEY`]; empty: none):
 //!   a `TodoWrite`'s `in_progress` todo (its `activeForm`, else its `content`), or the task a
 //!   `TaskUpdate` sets `in_progress` (its `activeForm`, else its `subject`, as the call or the
@@ -75,6 +78,61 @@
 //!   `errors` (`error_max_turns`, `error_max_budget_usd`, `error_during_execution`), else
 //!   `api_error_status` with the turn's API error message (an `assistant` message carrying
 //!   `error`), else `terminal_reason` / the subtype.
+//! - A failed turn that hit a usage or spending limit carries `ext.twr.limit`
+//!   ([`crate::usage::Limit`], [`limit_of`]) and is not transient: the latest
+//!   `rate_limit_event` since the last `result` was `rejected` for a window type (usage, with
+//!   its `resetsAt`) or for `overage` (spend), or said `errorCode: credits_required` (spend);
+//!   else an `assistant` `error: rate_limit` message whose text names a limit it hit ("You've
+//!   hit your weekly limit · resets 5am (UTC)": usage, no time). A plain 429 or overload
+//!   stays transient.
+//!
+//! Context compaction (Claude Code 2.1.304, see the recorded fixtures): `system/status`
+//! `status: "compacting"` starts one (`context.compacting`; Claude says nothing else until it
+//! ends, minutes on a large context); a later `status` with `compact_result: "failed"` (and
+//! `compact_error`) ends it unchanged (`context.compacted` with `error`); `system/compact_boundary`
+//! `compact_metadata {trigger, pre_tokens, post_tokens, duration_ms}` is the compaction done
+//! (`context.compacted`). The synthetic user message that follows (`isSynthetic`, the summary)
+//! and the replayed `<local-command-stdout>` are neither a prompt nor the agent's text: nothing.
+//! A manual compaction is the user message `/compact` ([`Translator::compact_message`]): its
+//! `compacting` comes before the `init` (it opens the queued turn), and its `result` ran no
+//! agent call (`num_turns: 0`, `local_command: compact`, usage all zero; the summary itself is
+//! a model call, billed: the total cost goes up) and ends that turn as any other.
+//!
+//! How full the context is (`turn.ended` `context`, [`twr_core::event::ContextSize`]): the
+//! input of the main agent's latest model call in the turn, its `message.usage`
+//! `input_tokens`, `cache_creation_input_tokens` and `cache_read_input_tokens` (what Claude's
+//! own `get_context_usage` counts as the context's `totalTokens`; the call's output is not in
+//! it), from its `stream_event` `message_start` or its `assistant` message (one per content
+//! block, the same input and message id in each). A subagent's calls (`parent_tool_use_id`
+//! set) are in their own context, and a `<synthetic>` message is no call. Not the `result`'s
+//! `usage`: that sums every call of the turn (a turn of 62 calls of about 110k tokens each
+//! reads 6.9M), except for a turn of one call (`num_turns: 1`), when the two are the same.
+//! After a compaction in the turn with no call since, the boundary's `post_tokens`. A turn
+//! whose latest call reported no size, whose compaction said none, or that called the model
+//! (`usage` input above 0) with none of these, has no `context` and says the size is unknown
+//! ([`CONTEXT_UNKNOWN`]); a turn that called none says nothing (the context is as it was). A
+//! turn ended for its missing `result` keeps what it saw of the context.
+//!
+//! The window is the `modelUsage[].contextWindow` of the model of that call (else of the
+//! session's latest call): the entries whose key or `canonicalModel` is that model, any `[1m]`
+//! suffix ignored, when they all say the same; with no model known, the one window every entry
+//! says. When the entries say nothing of it, the last window known of that model; when they
+//! disagree, unknown. A subagent's model may have another window, and so does a window smaller
+//! than the call (a call never exceeds its model's window): unknown too.
+//! `ext.claude.context_from` says where the tokens came from; a `turn.ended` written before twr
+//! read the last call has no such key, and its `context` is the `result`'s `usage`
+//! ([`twr_core::reduce::recorded_context`] tells which of those to trust).
+//!
+//! The prompt cache (`turn.ended` `prompt_cache`, [`twr_core::event::PromptCache`]): a turn
+//! whose context is its latest call's (`context_from: last_call`) also says when that call was
+//! made (the translator's clock when its first frame came) and how long the prompt cache lives:
+//! 3600 s when the call's `message.usage.cache_creation` wrote `ephemeral_1h_input_tokens`
+//! (a subscription), 300 s for `ephemeral_5m_input_tokens`, else what the latest main call of
+//! this process that wrote any said (a call that read its whole prompt from the cache writes
+//! none), else unknown (`ttl_s` absent). Subagent calls and `<synthetic>` messages are no
+//! calls here either. A turn without a call of its own (a manual `/compact`'s, one that asked
+//! the model nothing) has none: the thread keeps the expiry it knew
+//! ([`twr_core::reduce::ThreadView::cache_expires_at`]), and a compaction forgets it.
 //!
 //! Turn stamping: every user message written for turn `n` queues `n`; the first in-turn line
 //! after a `result` (normally the next `system/init`) opens the oldest queued turn, and the
@@ -85,6 +143,28 @@
 //! carry its id (`ext.twr.runtime_turn`). A `system/init` alone opens none: Claude also sends
 //! one before a run that never reaches the model. A user message written after that `init`
 //! or meanwhile stays queued until the run's `result`.
+//!
+//! Claude's own runs (2.1.304): the end of a task the main agent put in the background
+//! (`task_started` with `is_backgrounded: true`, or a later `task_updated` patch saying so; not
+//! `owned_by_subagent`) makes Claude start a run of its own for its notification, with no
+//! `init`, and its first output may come a minute later (time to first token). So that end,
+//! with no turn running or queued and the last turn not failed, opens the runtime's turn at
+//! once: the hub sees the thread busy and writes no prompt into that run. A prompt written
+//! into a run Claude started itself is folded into it, and since 2.1.295 such a run ends with
+//! no `result` at all, which left the turn open for hours. A turn so opened that sees no line
+//! of the main agent's run (output, a request, an `init`) within
+//! [`TranslatorOptions::notice_run_after`] is ended `completed` with `ext.twr.no_run` (Claude
+//! ran nothing), and so is one whose run's `result` asked the model nothing (`num_turns: 0`).
+//!
+//! A missing `result`: once the main agent's message stops for good (`message_delta` with a
+//! `stop_reason` other than `tool_use` / `pause_turn`) in a running turn, the `result` is
+//! due. When nothing else comes within [`TranslatorOptions::missing_result_after`] (no new
+//! model message, `init` or `result`; a request for the user holds it until answered, and the
+//! wait starts again then), [`Translator::expire`] ends the turn `completed` with
+//! `ext.twr.missing_result` (no usage), and so does each turn queued meanwhile (its prompt was
+//! folded into that run: Claude starts no run for it). A `result` that still comes before the
+//! next run shows (an `init` or model output), a prompt queued since or not, is absorbed (its
+//! total read, charged to no turn; no turn ended or opened).
 
 use std::collections::{HashMap, VecDeque};
 
@@ -95,14 +175,28 @@ use twr_core::usage::{UsageWindow, FIVE_HOUR, SEVEN_DAY};
 
 use crate::acp::translate::{mode_acceptable, mode_level, ModeLevel};
 use crate::attn::IssuedIds;
+use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
-    AttentionReason, AttentionResolved, EventBody, JsonMap, ResolvedBy, SessionPayload, TurnEnded,
-    TurnFrom, TurnResult, TurnStarted, Usage, PURPOSE_KEY, RUNTIME_TURN_KEY, STEP_KEY,
+    AttentionReason, AttentionResolved, EventBody, JsonMap, PromptCache, ResolvedBy,
+    SessionPayload, TaskUpdated, TurnEnded, TurnFrom, TurnResult, TurnStarted, Usage, DETACHED_KEY,
+    FOREGROUND_CALL_KEY, PURPOSE_KEY, RUNTIME_TURN_KEY, STEP_KEY, WAITS_FOR_KEY,
 };
 
 /// Key of this runtime's extras (`data.ext.claude`).
 pub const EXT: &str = "claude";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is the input of the main agent's
+/// latest model call in the turn.
+pub const CONTEXT_FROM_CALL: &str = "last_call";
+
+/// `ext.claude.context_from` of a `turn.ended` whose `context` is what a compaction left (no
+/// model call since it).
+pub const CONTEXT_FROM_COMPACTION: &str = "compaction";
+
+/// `ext.claude.context_from` of a `turn.ended` that called the model but reported no call's
+/// size: it has no `context`, and how full the context is is unknown from then.
+pub const CONTEXT_UNKNOWN: &str = "unknown";
 
 /// Tools whose calls always count as risky.
 pub const RISKY_TOOLS: &[&str] = &["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"];
@@ -139,6 +233,16 @@ pub const DEFAULT_DECLINE_MESSAGE: &str = "The user declined to answer via twr";
 /// `ext.twr.error` of a turn whose `result` line was too long to read.
 pub const OVERSIZED_ERROR: &str = "oversized runtime message";
 
+/// `turn.ended` `ext.twr` key: the turn was ended because its `result` never came.
+pub const MISSING_RESULT_KEY: &str = "missing_result";
+/// `turn.ended` `ext.twr` key: the turn opened for a notification saw no run.
+pub const NO_RUN_KEY: &str = "no_run";
+
+/// `d` as a chrono duration (the longest one when it does not fit).
+fn chrono_of(d: std::time::Duration) -> chrono::Duration {
+    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
+}
+
 /// Prefix of the `request_id` of twr's `get_usage` reads.
 pub const USAGE_REQUEST: &str = "twr_usage_";
 
@@ -159,6 +263,26 @@ pub struct TranslatorOptions {
     /// The `--permission-mode` the process was started with (empty: `default`): every
     /// `permissionMode` Claude reports is checked against it ([`Translator::translate`]).
     pub mode: String,
+    /// How long after the main agent's message stopped a missing `result` ends the turn
+    /// (`None`: [`MISSING_RESULT_AFTER`]).
+    pub missing_result_after: Option<std::time::Duration>,
+    /// How long a turn opened for a background task's notification waits for its run
+    /// (`None`: [`NOTICE_RUN_AFTER`]).
+    pub notice_run_after: Option<std::time::Duration>,
+}
+
+/// Default [`TranslatorOptions::missing_result_after`].
+pub const MISSING_RESULT_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+/// Default [`TranslatorOptions::notice_run_after`].
+pub const NOTICE_RUN_AFTER: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// What the translator waits for, with a deadline ([`Translator::deadline`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Watch {
+    /// The running turn's `result`, after the main agent's message stopped.
+    Result,
+    /// The run of a notification the runtime's turn was opened for.
+    NoticeRun,
 }
 
 /// One normalized event produced from a stdout line.
@@ -300,6 +424,11 @@ pub struct Translator {
     /// The running turn carried Claude's `[Request interrupted by user]` user text.
     interrupted_marker: bool,
     transient_hint: Option<String>,
+    /// The `rate_limit_info` of the latest `rate_limit_event` since the last `result`.
+    rate_limit_info: Option<Value>,
+    /// The running turn's `assistant` `error: rate_limit` text that names a limit it hit
+    /// ([`is_limit_text`]).
+    limit_text: Option<String>,
     /// The running turn reported an authentication failure (an `assistant` or `api_retry`
     /// message with `error: authentication_failed`).
     auth_failed: bool,
@@ -318,7 +447,49 @@ pub struct Translator {
     failed: bool,
     /// When to read the plan's usage again (`get_usage`).
     usage: crate::usage::Reads,
-    /// The clock usage reads are timed by.
+    /// Tasks the main agent put in the background: their end starts a run of Claude's own.
+    notifying: std::collections::HashSet<String>,
+    /// Tasks a subagent owns.
+    subagent_tasks: std::collections::HashSet<String>,
+    /// The main agent's tasks a tool call of its waits for in the foreground: task -> call
+    /// (`ext.twr.foreground_call` on each of their updates).
+    foreground_tasks: HashMap<String, String>,
+    /// Its tasks moved to the background while their call waited (`ext.twr.detached`).
+    detached_tasks: std::collections::HashSet<String>,
+    /// What is awaited, and until when.
+    watch: Option<(Watch, DateTime<Utc>)>,
+    /// A turn was ended for its missing `result`: a `result` before the next run shows (its
+    /// `init` or model output) is that run's, absorbed.
+    absorb_result: bool,
+    /// The runtime's turn was opened for a background task's notification and the main agent
+    /// has shown no output in it yet.
+    notice_quiet: bool,
+    /// The last turn ended `error`.
+    last_failed: bool,
+    /// Turns written as `/compact` ([`Translator::compact_message`]) not ended yet: a
+    /// compaction in them is `manual`.
+    compact_turns: std::collections::HashSet<u64>,
+    /// The trigger of the compaction under way (`system/status` `compacting` seen, no end yet).
+    compacting: Option<String>,
+    /// A compaction since the last `result` and the main agent's last model call, with the
+    /// context it left when it said: what a turn that ran no agent call (a manual
+    /// `/compact`'s) ends with.
+    compacted_to: Option<Option<u64>>,
+    /// The main agent's latest model call since the last `result` or compaction.
+    last_call: Option<Call>,
+    /// The main agent's model, as its latest model call said (none: it did not say).
+    main_model: Option<String>,
+    /// The prompt cache's lifetime in seconds, as the main agent's latest call that wrote the
+    /// cache in this process said ([`cache_ttl`]).
+    cache_ttl: Option<u64>,
+    /// The main agent's model and its context window, as the last `result` that said it did.
+    context_window: Option<(String, u64)>,
+    /// A compaction began in the runtime's turn opened for a notification while its run was
+    /// awaited ([`Watch::NoticeRun`]): the wait is held until the compaction ends (at most
+    /// [`twr_core::event::COMPACTING_HOLD_SECS`]), then starts again (a compaction can take
+    /// longer than the wait).
+    notice_held: bool,
+    /// The clock usage reads, waits and model calls are timed by.
     clock: fn() -> DateTime<Utc>,
 }
 
@@ -349,6 +520,8 @@ impl Translator {
             interrupts_sent: 0,
             interrupted_marker: false,
             transient_hint: None,
+            rate_limit_info: None,
+            limit_text: None,
             auth_failed: false,
             api_error: None,
             allowed_mode: match opts.mode.trim() {
@@ -359,13 +532,30 @@ impl Translator {
             mode_changed: None,
             failed: false,
             usage: crate::usage::Reads::default(),
+            notifying: Default::default(),
+            subagent_tasks: Default::default(),
+            foreground_tasks: Default::default(),
+            detached_tasks: Default::default(),
+            watch: None,
+            absorb_result: false,
+            notice_quiet: false,
+            last_failed: false,
+            compact_turns: Default::default(),
+            compacting: None,
+            compacted_to: None,
+            last_call: None,
+            main_model: None,
+            cache_ttl: None,
+            context_window: None,
+            notice_held: false,
             clock: Utc::now,
             opts,
             harness_metadata: Map::new(),
         }
     }
 
-    /// Times usage reads by `clock` instead of the system clock (tests).
+    /// Times usage reads, waits and model calls by `clock` instead of the system clock
+    /// (tests).
     pub fn set_clock(&mut self, clock: fn() -> DateTime<Utc>) {
         self.clock = clock;
     }
@@ -462,6 +652,13 @@ impl Translator {
         .to_string()
     }
 
+    /// The stdin line starting turn `turn` as a compaction of the context: the user message
+    /// `/compact`, as given (Claude runs it as its own command, not a prompt).
+    pub fn compact_message(&mut self, turn: u64) -> String {
+        self.compact_turns.insert(turn);
+        self.user_message("/compact", turn)
+    }
+
     /// The stdin line interrupting the running turn, if one is running or queued.
     pub fn interrupt(&mut self) -> Option<String> {
         if !self.busy() {
@@ -506,6 +703,13 @@ impl Translator {
     /// item of a request the runtime replaced since (see [`crate::attn`]) returns None, and
     /// the reply is built only from the content `attn_id` was raised with.
     pub fn respond(&mut self, attn_id: &str, answer: &Answer) -> Option<Translated> {
+        let out = self.answer(attn_id, answer);
+        self.requests_closed();
+        out
+    }
+
+    /// [`Translator::respond`] before the wait restarts.
+    fn answer(&mut self, attn_id: &str, answer: &Answer) -> Option<Translated> {
         if self.failed {
             return None;
         }
@@ -639,7 +843,26 @@ impl Translator {
                 return out;
             }
         };
-        match str_at(&v, "type") {
+        // A line of the main agent's run: the notification's run started. Not a subagent's
+        // line, a task's, a rate limit's, the answer to a request of twr's, a request for the
+        // user (a subagent's carries no mark of it; while one is open the wait is held, and it
+        // starts again when the last closes), nor a compaction's bookkeeping (its summary,
+        // `isSynthetic`, and a replayed command output, `isReplay`: a compaction's end starts
+        // the wait again), nor anything unknown (a `result` is [`Translator::on_result`]'s to
+        // judge).
+        let kind = str_at(&v, "type");
+        let main = v.get("parent_tool_use_id").is_none_or(Value::is_null);
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool) == Some(true);
+        let run_line = match kind {
+            "system" => matches!(str_at(&v, "subtype"), "init" | "api_retry"),
+            "user" => main && !flag("isSynthetic") && !flag("isReplay"),
+            "stream_event" | "assistant" => main,
+            _ => false,
+        };
+        if run_line && matches!(self.watch, Some((Watch::NoticeRun, _))) {
+            self.watch = None;
+        }
+        match kind {
             "system" => {
                 // Every system message carrying the mode (each turn's `init`, a status
                 // change) is checked: a session in a wider mode must not go on.
@@ -650,10 +873,16 @@ impl Translator {
                     }
                 }
                 if str_at(&v, "subtype") == "init" {
+                    if matches!(self.watch, Some((Watch::Result, _))) {
+                        self.watch = None;
+                    }
+                    // A new run: a `result` now is its own.
+                    self.absorb_result = false;
                     self.on_init(&v, line, &mut out);
                     self.read_usage(&mut out);
                 }
                 self.on_task(&v, line, &mut out);
+                self.on_compaction(&v, line, &mut out);
                 // Claude retries a request refused for authentication before giving up.
                 if str_at(&v, "subtype") == "api_retry" && str_at(&v, "error") == AUTH_FAILED {
                     self.in_turn();
@@ -663,6 +892,8 @@ impl Translator {
             "stream_event" => self.on_stream_event(&v, line, &mut out),
             "assistant" => self.on_assistant(&v, line, &mut out),
             "user" => self.on_user(&v, line, &mut out),
+            // (A request for the user only holds a missing `result`'s end while it is open:
+            // [`Translator::expire`].)
             "control_request" => self.on_control_request(&v, line, &mut out),
             "control_cancel_request" => self.on_cancel(&v, line, &mut out),
             "rate_limit_event" => {
@@ -673,6 +904,7 @@ impl Translator {
                 if status == "rejected" {
                     self.transient_hint = Some("rate_limit_event status rejected".into());
                 }
+                self.rate_limit_info = Some(v["rate_limit_info"].clone());
                 let windows = rate_limit_windows(&v["rate_limit_info"]);
                 if !windows.is_empty() {
                     self.usage.heard((self.clock)(), &windows);
@@ -831,6 +1063,7 @@ impl Translator {
             self.active = true;
             self.turn = self.queued.pop_front();
             self.transient_hint = None;
+            self.limit_text = None;
             self.auth_failed = false;
             self.api_error = None;
             self.interrupted_marker = false;
@@ -897,6 +1130,10 @@ impl Translator {
         ) {
             // The model works for the parent session, in a turn of twr's or its own.
             self.model_ran |= !child;
+            if !child {
+                self.absorb_result = false;
+                self.notice_quiet = false;
+            }
             self.start_runtime_turn(out, raw);
         }
         let turn = match &body {
@@ -927,7 +1164,18 @@ impl Translator {
         } else {
             self.tasks.update(id, running, description)
         };
-        if let Some(task) = event {
+        if let Some(mut task) = event {
+            // Where it runs, on each of its updates: the latest one recorded says it.
+            if let Some(call) = self.foreground_tasks.get(id) {
+                set_twr_ext(&mut task.ext, FOREGROUND_CALL_KEY, json!(call));
+            } else if self.detached_tasks.contains(id) {
+                set_twr_ext(&mut task.ext, DETACHED_KEY, json!(true));
+            }
+            // Its end, however it came: where it ran is forgotten.
+            if !task.running {
+                self.foreground_tasks.remove(id);
+                self.detached_tasks.remove(id);
+            }
             out.events.push(Emitted {
                 body: EventBody::TaskUpdated(task),
                 turn: None,
@@ -953,6 +1201,35 @@ impl Translator {
             .and_then(Value::as_str)
             .unwrap_or_else(|| str_at(v, "description"));
         let terminal = crate::background::terminal(status);
+        let id = str_at(v, "task_id");
+        // Whose task it is: one the main agent put in the background notifies it when it ends
+        // (a run of Claude's own); a subagent's, or one in the foreground of a turn, does not.
+        if subtype == "task_started" && !id.is_empty() {
+            // A launch says afresh where it runs (a reused id is another task).
+            self.foreground_tasks.remove(id);
+            self.detached_tasks.remove(id);
+            if v.get("owned_by_subagent").and_then(Value::as_bool) == Some(true) {
+                self.subagent_tasks.insert(id.to_string());
+            } else if v.get("is_backgrounded").and_then(Value::as_bool) == Some(true) {
+                self.notifying.insert(id.to_string());
+            } else if let Some(call) = opt_str(v, "tool_use_id")
+                .filter(|c| !c.is_empty())
+                .filter(|_| v.get("is_backgrounded").and_then(Value::as_bool) == Some(false))
+            {
+                // In the foreground of the call that started it: that call waits for it.
+                self.foreground_tasks.insert(id.to_string(), call);
+                self.detached_tasks.remove(id);
+            }
+        }
+        // Moved to the background while it runs (a finished task's late patch revives
+        // nothing).
+        if v.pointer("/patch/is_backgrounded").and_then(Value::as_bool) == Some(true)
+            && !self.subagent_tasks.contains(id)
+            && self.tasks.running.contains_key(id)
+        {
+            self.notifying.insert(id.to_string());
+            self.detach(id, line, out);
+        }
         // A resumed subagent can reuse its task id. An explicit new launch overrides the
         // terminal tombstone; late progress alone never does.
         if subtype == "task_started"
@@ -967,6 +1244,8 @@ impl Translator {
         {
             return;
         }
+        // Only a running task's end is one (a repeated completion is none).
+        let ended = terminal && self.tasks.running.contains_key(id);
         self.task(
             str_at(v, "task_id"),
             !terminal,
@@ -975,6 +1254,218 @@ impl Translator {
             line,
             out,
         );
+        if terminal {
+            self.subagent_tasks.remove(id);
+            self.foreground_tasks.remove(id);
+            self.detached_tasks.remove(id);
+            if self.notifying.remove(id) && ended {
+                self.open_notice_turn(out, line);
+            }
+        }
+    }
+
+    /// Foreground task `id` was moved to the background while it runs (its call returned, or
+    /// the user put it there): recorded at once, with [`DETACHED_KEY`].
+    fn detach(&mut self, id: &str, line: &str, out: &mut Translated) {
+        if self.foreground_tasks.remove(id).is_none() {
+            return;
+        }
+        self.detached_tasks.insert(id.to_string());
+        let Some((description, _)) = self.tasks.running.get(id) else {
+            return;
+        };
+        let mut task = TaskUpdated {
+            task_id: id.to_string(),
+            running: true,
+            description: description.clone(),
+            ..Default::default()
+        };
+        set_twr_ext(&mut task.ext, DETACHED_KEY, json!(true));
+        out.events.push(Emitted {
+            body: EventBody::TaskUpdated(task),
+            turn: None,
+            raw: Some(line.into()),
+        });
+    }
+
+    /// A compaction's start, failure or end (see the module docs).
+    fn on_compaction(&mut self, v: &Value, line: &str, out: &mut Translated) {
+        match str_at(v, "subtype") {
+            "status" if str_at(v, "status") == "compacting" => {
+                // A manual one comes before the `init` of the turn written for it: the oldest
+                // queued turn is the one it runs in.
+                let turn = if self.active {
+                    self.turn
+                } else {
+                    self.queued.front().copied()
+                };
+                let manual = turn.is_some_and(|t| self.compact_turns.contains(&t));
+                let trigger = if manual { "manual" } else { "auto" };
+                self.compacting = Some(trigger.to_string());
+                // The notification's run is compacting: its wait holds until that ends, for
+                // as long as the hub holds its stall checks for one at most.
+                if matches!(self.watch, Some((Watch::NoticeRun, _))) {
+                    let hold =
+                        std::time::Duration::from_secs(twr_core::event::COMPACTING_HOLD_SECS);
+                    self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(hold)));
+                    self.notice_held = true;
+                }
+                let body = EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                    trigger: Some(trigger.into()),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "status" if str_at(v, "compact_result") == "failed" => {
+                self.resume_notice_wait();
+                let trigger = self.compacting.take().unwrap_or_else(|| "auto".into());
+                let error = match str_at(v, "compact_error") {
+                    "" => "failed".to_string(),
+                    e => e.to_string(),
+                };
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    error: Some(error),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            "compact_boundary" => {
+                self.resume_notice_wait();
+                let m = &v["compact_metadata"];
+                let n = |k: &str| m.get(k).and_then(Value::as_u64);
+                let trigger = match str_at(m, "trigger") {
+                    "" => self.compacting.clone().unwrap_or_else(|| "auto".into()),
+                    t => t.to_string(),
+                };
+                self.compacting = None;
+                self.compacted_to = Some(n("post_tokens"));
+                // The call before it is not the context any more.
+                self.last_call = None;
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger,
+                    pre_tokens: n("pre_tokens"),
+                    post_tokens: n("post_tokens"),
+                    duration_ms: n("duration_ms"),
+                    ..Default::default()
+                });
+                self.push(out, body, Some(line));
+            }
+            _ => {}
+        }
+    }
+
+    /// A compaction that held a notification's wait ended: the wait starts again from now
+    /// (its run's output ends it as usual; none within it ends the turn `no_run`).
+    fn resume_notice_wait(&mut self) {
+        if std::mem::take(&mut self.notice_held)
+            && self.notice_quiet
+            && self.active
+            && self.turn.is_none()
+            && self.runtime_turn.is_some()
+        {
+            let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
+            self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
+        }
+    }
+
+    /// A background task of the main agent's ended: Claude starts a run of its own for its
+    /// notification. With no turn running or queued, the runtime's turn opens now, not at the
+    /// run's first output (see the module docs).
+    /// Not after a turn that failed: the run's first output opens its turn, and until then the
+    /// hub keeps that failure (its error card, its automatic retry).
+    fn open_notice_turn(&mut self, out: &mut Translated, line: &str) {
+        if !self.started || self.busy() || self.failed || self.last_failed {
+            return;
+        }
+        self.start_runtime_turn(out, Some(line));
+        if self.runtime_turn.is_some() {
+            self.notice_quiet = true;
+            let after = self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER);
+            self.watch = Some((Watch::NoticeRun, (self.clock)() + chrono_of(after)));
+        }
+    }
+
+    /// When [`Translator::expire`] has something to do (a turn's `result` or a notification's
+    /// run awaited), if anything is awaited.
+    pub fn deadline(&self) -> Option<DateTime<Utc>> {
+        self.watch.map(|(_, at)| at)
+    }
+
+    /// What is awaited did not come by `now` (see the module docs): a turn whose `result` is
+    /// missing ends `completed` with `ext.twr.missing_result`; one opened for a notification
+    /// whose run never started ends with `ext.twr.no_run`. Nothing while the user is asked
+    /// something.
+    pub fn expire(&mut self, now: DateTime<Utc>) -> Translated {
+        let mut out = Translated::default();
+        let Some((watch, at)) = self.watch else {
+            return out;
+        };
+        if now < at {
+            return out;
+        }
+        self.watch = None;
+        if !self.active || self.failed {
+            return out;
+        }
+        // The user is asked something (a subagent's permission, say): the end waits for the
+        // answer, and the wait starts again from it.
+        if !self.pending.is_empty() {
+            let after = match watch {
+                Watch::Result => self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER),
+                Watch::NoticeRun => self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER),
+            };
+            self.watch = Some((watch, now + chrono_of(after)));
+            return out;
+        }
+        match watch {
+            Watch::Result => {
+                tracing::warn!(turn = ?self.turn, runtime_turn = ?self.runtime_turn, queued = ?self.queued, "claude-code: no `result` came after the turn's last message; ending the turn");
+                self.end_without_result(MISSING_RESULT_KEY, &mut out);
+                // Prompts written during that run that Claude never started: it folded them
+                // into the run, which answered them. Their turns end with it.
+                while !self.queued.is_empty() {
+                    self.end_without_result(MISSING_RESULT_KEY, &mut out);
+                }
+                self.absorb_result = true;
+            }
+            Watch::NoticeRun if self.turn.is_none() && self.runtime_turn.is_some() => {
+                tracing::info!(runtime_turn = ?self.runtime_turn, "claude-code: no run followed a background task's notification; ending the runtime's turn");
+                self.end_without_result(NO_RUN_KEY, &mut out);
+            }
+            Watch::NoticeRun => {}
+        }
+        out
+    }
+
+    /// Ends the running turn without a `result` of Claude's: `completed`, no usage (its
+    /// context as its latest call said), and `ext.twr.<why> = true`.
+    fn end_without_result(&mut self, why: &str, out: &mut Translated) {
+        self.notice_quiet = false;
+        let model_ran = self.model_ran;
+        let synthetic = json!({"type": "result", "subtype": "success", "stop_reason": "end_turn"});
+        let mut ended = Translated::default();
+        self.end_turn_with(&synthetic, "", &mut ended);
+        self.model_ran = model_ran;
+        for mut e in ended.events {
+            e.raw = None;
+            if let EventBody::TurnEnded(t) = &mut e.body {
+                // What it spent is unknown; what it saw of the context (its latest call) holds.
+                t.usage = None;
+                if let Some(claude) = t.ext.as_mut().and_then(|x| x.get_mut(EXT)) {
+                    if let Some(c) = claude.as_object_mut() {
+                        c.retain(|k, _| {
+                            matches!(k.as_str(), "mode_changed" | "mode_note" | "context_from")
+                        });
+                    }
+                }
+                set_twr_ext(&mut t.ext, why, json!(true));
+            }
+            out.events.push(e);
+        }
     }
 
     fn on_init(&mut self, v: &Value, line: &str, out: &mut Translated) {
@@ -1022,8 +1513,27 @@ impl Translator {
         }
         let ev = &v["event"];
         if str_at(ev, "type") == "message_start" {
+            // A model call: what a compaction left is no longer the context.
+            self.compacted_to = None;
+            self.note_call(&ev["message"]);
             self.model_ran = true;
+            self.absorb_result = false;
+            self.notice_quiet = false;
+            if matches!(self.watch, Some((Watch::Result, _))) {
+                self.watch = None;
+            }
             self.start_runtime_turn(out, Some(line));
+        }
+        // The main agent's message stopped for good: the run's `result` is due.
+        if str_at(ev, "type") == "message_delta" && self.active {
+            let stop = ev.pointer("/delta/stop_reason").and_then(Value::as_str);
+            if stop.is_some_and(|r| !matches!(r, "tool_use" | "pause_turn")) {
+                let after = self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER);
+                self.watch = Some((Watch::Result, (self.clock)() + chrono_of(after)));
+            }
         }
         if str_at(ev, "type") != "content_block_delta" {
             return;
@@ -1044,6 +1554,9 @@ impl Translator {
 
     fn on_assistant(&mut self, v: &Value, line: &str, out: &mut Translated) {
         let parent = opt_str(v, "parent_tool_use_id");
+        if parent.is_none() {
+            self.note_call(&v["message"]);
+        }
         if let Some(e) = v.get("error").and_then(Value::as_str) {
             if matches!(e, "rate_limit" | "server_error" | "overloaded") {
                 self.transient_hint = Some(format!("assistant error {e}"));
@@ -1064,6 +1577,9 @@ impl Translator {
             // A subagent's own API error is not the turn's cause.
             if !text.is_empty() && parent.is_none() {
                 self.in_turn();
+                if e == "rate_limit" && is_limit_text(&text) {
+                    self.limit_text = Some(text.clone());
+                }
                 self.api_error = Some(text);
             }
         }
@@ -1114,6 +1630,14 @@ impl Translator {
                     {
                         set_twr_ext(&mut ext, PURPOSE_KEY, json!(one_line(&purpose, 200)));
                     }
+                    // A blocking wait on a task: that task is waited for while the call is open.
+                    if tool == "TaskOutput"
+                        && input.get("block").and_then(Value::as_bool) != Some(false)
+                    {
+                        if let Some(task) = opt_str(&input, "task_id").filter(|t| !t.is_empty()) {
+                            set_twr_ext(&mut ext, WAITS_FOR_KEY, json!(task));
+                        }
+                    }
                     if parent.is_none() {
                         if let Some(step) = self.steps.call(&id, &tool, &input) {
                             set_twr_ext(&mut ext, STEP_KEY, json!(one_line(&step, 200)));
@@ -1133,6 +1657,44 @@ impl Translator {
                 _ => {}
             }
         }
+    }
+
+    /// Records the main agent's model call `message` (an API message: `id`, `model`, `usage`)
+    /// as the latest. Frames of one call (its `message_start`, one `assistant` line per content
+    /// block) share its id; a new call without `usage` makes the size unknown, not the one
+    /// before. A new call is timed when its first frame comes. A `<synthetic>` message is no
+    /// call.
+    fn note_call(&mut self, message: &Value) {
+        let model = str_at(message, "model");
+        if !message.is_object() || model == "<synthetic>" {
+            return;
+        }
+        let id = str_at(message, "id");
+        let tokens = call_input(message);
+        let ttl = cache_ttl(message);
+        let model = Some(model.to_string()).filter(|m| !m.is_empty());
+        match &mut self.last_call {
+            Some(call) if !id.is_empty() && call.id == id => {
+                call.tokens = tokens.or(call.tokens);
+                call.model = model.clone().or(call.model.take());
+                call.ttl = ttl.or(call.ttl);
+            }
+            _ => {
+                self.last_call = Some(Call {
+                    id: id.to_string(),
+                    tokens,
+                    model: model.clone(),
+                    called_at: (self.clock)(),
+                    ttl,
+                })
+            }
+        }
+        if ttl.is_some() {
+            self.cache_ttl = ttl;
+        }
+        self.compacted_to = None;
+        // The session's model is the latest call's, unknown when it did not say.
+        self.main_model = self.last_call.as_ref().and_then(|c| c.model.clone());
     }
 
     fn on_user(&mut self, v: &Value, line: &str, out: &mut Translated) {
@@ -1173,14 +1735,19 @@ impl Translator {
             .find_map(|key| result.get(*key).and_then(Value::as_str))
         {
             let status = str_at(result, "status");
-            self.task(
-                id,
-                !crate::background::terminal(status),
-                "background task",
-                false,
-                line,
-                out,
-            );
+            let running = !crate::background::terminal(status);
+            // A foreground command whose call returned while it runs (its timeout ran out): it
+            // goes on in the background, unwaited.
+            if running && self.foreground_tasks.contains_key(id) {
+                self.detach(id, line, out);
+            }
+            // (A task known by now keeps what it said it does.)
+            let description = if self.tasks.running.contains_key(id) {
+                ""
+            } else {
+                "background task"
+            };
+            self.task(id, running, description, false, line, out);
         }
         if let Some(task) = result.get("task") {
             let status = str_at(task, "status");
@@ -1394,13 +1961,16 @@ impl Translator {
         if let Some(full) = &what.full {
             claude.insert(FULL_INPUT_KEY.into(), json!(full));
         }
-        let label = mark_visible(&tool);
+        // A name past [`FULL_INPUT_MAX`] marked is cut: the user can't see all of what an
+        // allow approves, so only `deny` is offered, as for an input that long.
+        let name = render_command(&tool, usize::MAX);
+        let label = name.full.unwrap_or(name.line);
         let mut summary = if what.line.is_empty() {
             format!("Allow {label}?")
         } else {
             format!("Allow {label}: {}", what.line)
         };
-        let allow = !what.too_long;
+        let allow = !what.too_long && !name.too_long;
         let options = if allow {
             vec!["allow".into(), "deny".into()]
         } else {
@@ -1501,25 +2071,77 @@ impl Translator {
             out.events
                 .push(self.withdrawal(attn_id, "runtime", Some(line)));
         }
+        self.requests_closed();
+    }
+
+    /// The last request for the user was answered or withdrawn: what is awaited by a deadline
+    /// (a missing `result`, a notification's run) gets its whole wait again from now.
+    fn requests_closed(&mut self) {
+        if !self.pending.is_empty() {
+            return;
+        }
+        // (A compaction holds a notification run's wait, whatever closed meanwhile.)
+        if matches!(self.watch, Some((Watch::NoticeRun, _))) && self.notice_held {
+            return;
+        }
+        if let Some((watch, _)) = self.watch {
+            let after = match watch {
+                Watch::Result => self
+                    .opts
+                    .missing_result_after
+                    .unwrap_or(MISSING_RESULT_AFTER),
+                Watch::NoticeRun => self.opts.notice_run_after.unwrap_or(NOTICE_RUN_AFTER),
+            };
+            self.watch = Some((watch, (self.clock)() + chrono_of(after)));
+        }
     }
 
     fn on_result(&mut self, v: &Value, line: &str, out: &mut Translated) {
         // Claude consumed a task notification without asking the model anything (a resumed
         // session hears of a task its previous process left behind before it reads the
         // prompt). That `result` answers no prompt and ends no turn: a twr turn running goes
-        // on with what it saw so far (an interruption, an error's cause), and so does a runtime
-        // turn, opened only by model output; only an `init` that opened neither is undone.
+        // on with what it saw so far (an interruption, an error's cause) and keeps waiting for
+        // its own `result`, and so does a runtime turn that showed output; only an `init` that
+        // opened neither is undone.
         if v.pointer("/origin/kind").and_then(Value::as_str) == Some("task-notification")
             && v.get("num_turns").and_then(Value::as_u64) == Some(0)
         {
             if self.active && self.turn.is_none() && self.runtime_turn.is_none() {
                 self.active = false;
             }
+            // The turn opened for a notification whose run never showed: nothing more comes
+            // for it.
+            if self.notice_quiet
+                && self.active
+                && self.turn.is_none()
+                && self.runtime_turn.is_some()
+            {
+                self.watch = None;
+                self.end_without_result(NO_RUN_KEY, out);
+            }
             if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
                 self.skip_cost(t);
             }
             return;
         }
+        // The run of a turn ended for its missing `result` ends after all: absorbed, whatever
+        // is open or queued now (no run showed since: no `init`, no model output; a turn opened
+        // since for another task's notification is still waiting for its run). A `result` that
+        // asked the model nothing (above) is never that run's. Its spend was that turn's
+        // (reported unknown): the total moves on, charged to no other turn.
+        if std::mem::take(&mut self.absorb_result) {
+            if let Some(t) = v.get("total_cost_usd").and_then(Value::as_f64) {
+                self.cost_since(t);
+            }
+            return;
+        }
+        self.watch = None;
+        self.notice_quiet = false;
+        self.end_turn_with(v, line, out);
+    }
+
+    /// Ends the running turn (or the queued one it opens) as `result` `v` says.
+    fn end_turn_with(&mut self, v: &Value, line: &str, out: &mut Translated) {
         // A run of the runtime's own that showed nothing before its `result` (an API error).
         self.start_runtime_turn(out, Some(line));
         let turn = self.in_turn();
@@ -1532,6 +2154,8 @@ impl Translator {
         let interrupted = std::mem::take(&mut self.interrupt_requested);
         let marker = std::mem::take(&mut self.interrupted_marker);
         let hint = self.transient_hint.take();
+        let rate_limit_info = self.rate_limit_info.take();
+        let limit_text = self.limit_text.take();
         let auth_failed = std::mem::take(&mut self.auth_failed);
         let api_error = self.api_error.take();
 
@@ -1549,6 +2173,7 @@ impl Translator {
         } else {
             TurnResult::Completed
         };
+        self.last_failed = result == TurnResult::Error;
 
         // Cost: cumulative per process. An interrupted turn's spend is not in the total (it
         // stays put, or reads 0 in a fresh process), and an errored turn reporting 0 did not
@@ -1572,6 +2197,77 @@ impl Translator {
             output: tok("output_tokens"),
             cost,
         };
+        // How full the context is (see the module docs): the main agent's latest call's input,
+        // else (no call since a compaction, a manual `/compact`'s turn) what the compaction
+        // left, else the `result`'s usage when it is one call's. Never the usage of a turn of
+        // several calls: their sum is what the turn spent, not what the context holds.
+        let one_call = v.get("num_turns").and_then(Value::as_u64) == Some(1) && usage.input > 0;
+        let call = self.last_call.take();
+        let (from, tokens) = match (&call, self.compacted_to.take()) {
+            (
+                Some(Call {
+                    tokens: Some(t), ..
+                }),
+                _,
+            ) => (CONTEXT_FROM_CALL, Some(*t)),
+            (Some(_), _) | (None, None) if one_call => (CONTEXT_FROM_CALL, Some(usage.input)),
+            (Some(_), _) => (CONTEXT_UNKNOWN, None),
+            (None, Some(Some(t))) => (CONTEXT_FROM_COMPACTION, Some(t)),
+            (None, Some(None)) => (CONTEXT_UNKNOWN, None),
+            (None, None) if usage.input > 0 => (CONTEXT_UNKNOWN, None),
+            (None, None) => ("", None),
+        };
+        // The prompt cache of that call, when the context is its: when it was made, and how
+        // long the cache lives (as it said, else as an earlier call of this process did).
+        let prompt_cache = call
+            .as_ref()
+            .filter(|_| from == CONTEXT_FROM_CALL)
+            .map(|c| PromptCache {
+                called_at: c.called_at,
+                ttl_s: c.ttl.or(self.cache_ttl),
+            });
+        // The model of the call (a call that did not say has none), else the session's.
+        let model = match call {
+            Some(c) => c.model,
+            None => self.main_model.clone(),
+        }
+        .or_else(|| {
+            // One model in the turn's `modelUsage`: the main agent's.
+            let models = v["modelUsage"].as_object()?;
+            (models.len() == 1).then(|| models.keys().next().cloned())?
+        });
+        let said = context_window(&v["modelUsage"], model.as_deref());
+        let window = match (said, &model) {
+            (Window::Said(w), _) => Some(w),
+            // A turn whose `modelUsage` lacks the window: the last one known of that model.
+            (Window::Unsaid, Some(m)) => self
+                .context_window
+                .as_ref()
+                .filter(|(known, _)| known == m)
+                .map(|(_, w)| *w),
+            (Window::Unsaid, None) | (Window::Conflicting, _) => None,
+        };
+        // A call fits its model's window: a smaller one is another model's, never kept.
+        let window = window.filter(|w| tokens.is_none_or(|t| t <= *w));
+        // Entries that disagree, or a window the call did not fit (said now, or the one known
+        // of its model): that model's window is not known any more.
+        let forget = match said {
+            Window::Said(_) => window.is_none(),
+            Window::Conflicting => true,
+            Window::Unsaid => model.is_some() && tokens.is_some() && window.is_none(),
+        };
+        let ours = |(known, _): &(String, u64)| model.as_ref().is_none_or(|m| m == known);
+        if forget && self.context_window.as_ref().is_some_and(ours) {
+            self.context_window = None;
+        }
+        if let (Window::Said(_), Some(w), Some(m)) = (said, window, &model) {
+            self.context_window = Some((m.clone(), w));
+        }
+        let context = tokens.map(|tokens| twr_core::event::ContextSize { tokens, window });
+        if let Some(t) = turn {
+            self.compact_turns.remove(&t);
+        }
+        self.compacting = None;
 
         let mut claude = Map::new();
         claude.insert("subtype".into(), json!(subtype));
@@ -1591,6 +2287,9 @@ impl Translator {
         for key in ["cache_read_input_tokens", "cache_creation_input_tokens"] {
             claude.insert(key.into(), json!(tok(key)));
         }
+        if !from.is_empty() {
+            claude.insert("context_from".into(), json!(from));
+        }
         if let Some(change) = self.mode_changed.take() {
             claude.insert("mode_changed".into(), change);
             claude.insert("mode_note".into(), json!(PLAN_EXIT_NOTE));
@@ -1599,6 +2298,7 @@ impl Translator {
         // the login expired): said with what to do, and never transient (retrying cannot help
         // until the user signs in).
         let mut twr_error = None;
+        let mut limit = None;
         if result == TurnResult::Error && (auth_failed || auth_failure(v)) {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code could not authenticate".into());
@@ -1609,16 +2309,25 @@ impl Translator {
             let text = error_text(v, api_error.as_deref())
                 .unwrap_or_else(|| "Claude Code reported an error without details".into());
             twr_error = Some(error_line(&text));
-            let reason = transient_reason(v).or(hint);
-            claude.insert("transient".into(), json!(reason.is_some()));
-            if let Some(r) = reason {
-                claude.insert("transient_reason".into(), json!(r));
+            limit = limit_of(rate_limit_info.as_ref(), limit_text.as_deref(), &text);
+            if limit.is_some() {
+                // Retrying before the reset cannot help.
+                claude.insert("transient".into(), json!(false));
+            } else {
+                let reason = transient_reason(v).or(hint);
+                claude.insert("transient".into(), json!(reason.is_some()));
+                if let Some(r) = reason {
+                    claude.insert("transient_reason".into(), json!(r));
+                }
             }
         }
         let mut ext = ext_of(claude);
         if let Some(e) = twr_error {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": e }));
+        }
+        if let Some(l) = limit {
+            set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
         }
         if let Some(id) = runtime_turn {
             set_twr_ext(&mut ext, RUNTIME_TURN_KEY, json!(id.to_string()));
@@ -1630,6 +2339,8 @@ impl Translator {
                 session_id,
                 usage: Some(usage),
                 duration_ms: v.get("duration_ms").and_then(Value::as_u64),
+                context,
+                prompt_cache,
                 ext,
                 ..Default::default()
             }),
@@ -1753,6 +2464,103 @@ impl Steps {
 /// Whether a control request subtype asks the user for input (MCP elicitations).
 fn is_elicitation(subtype: &str) -> bool {
     subtype.to_ascii_lowercase().contains("elicit")
+}
+
+/// The tokens of model call `message`'s input (`usage`: `input_tokens`,
+/// `cache_creation_input_tokens`, `cache_read_input_tokens`), how full the context was when it
+/// was made; none when it reports no input (no `usage`, a `<synthetic>` message's zeros).
+fn call_input(message: &Value) -> Option<u64> {
+    let u = message.get("usage")?;
+    let tokens = [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ]
+    .iter()
+    .filter_map(|k| u.get(*k).and_then(Value::as_u64))
+    .fold(0u64, u64::saturating_add);
+    (tokens > 0).then_some(tokens)
+}
+
+/// The prompt cache lifetime model call `message` reports, in seconds: its `usage`
+/// `cache_creation` wrote 1-hour entries (`ephemeral_1h_input_tokens` above 0: 3600), else
+/// 5-minute ones (`ephemeral_5m_input_tokens`: 300). `None` when it wrote none (all of its
+/// prompt was read from the cache, or the call did not say).
+fn cache_ttl(message: &Value) -> Option<u64> {
+    let written = |k: &str| {
+        message
+            .pointer("/usage/cache_creation")
+            .and_then(|c| c.get(k))
+            .and_then(Value::as_u64)
+            .is_some_and(|n| n > 0)
+    };
+    if written("ephemeral_1h_input_tokens") {
+        Some(3600)
+    } else if written("ephemeral_5m_input_tokens") {
+        Some(300)
+    } else {
+        None
+    }
+}
+
+/// The main agent's model call the translator saw last.
+#[derive(Debug, Clone)]
+struct Call {
+    /// Its API message id: frames of one call share it.
+    id: String,
+    /// The tokens of its input ([`call_input`]), how full the context was when it was made,
+    /// when it said.
+    tokens: Option<u64>,
+    /// Its model, when it said.
+    model: Option<String>,
+    /// When it was made: the translator's clock when its first frame came.
+    called_at: DateTime<Utc>,
+    /// The prompt cache lifetime it reported ([`cache_ttl`]), when it wrote the cache.
+    ttl: Option<u64>,
+}
+
+/// What a `result`'s `modelUsage` says of a model's context window ([`context_window`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// This window.
+    Said(u64),
+    /// Nothing: no entry of the model, or none with a window.
+    Unsaid,
+    /// Entries of the model disagree (`m` and `m[1m]`), or only some say one.
+    Conflicting,
+}
+
+/// The context window of `model` in a `result`'s `modelUsage`: the `contextWindow` of the
+/// entries whose key or `canonicalModel` is that model (a `[1m]`-like suffix ignored), when
+/// they all say the same (`m` and `m[1m]` may differ). With no model known, the window every
+/// entry says: another model's (a subagent's) is not the main agent's.
+fn context_window(model_usage: &Value, model: Option<&str>) -> Window {
+    let base = |m: &str| m.split('[').next().unwrap_or(m).trim().to_string();
+    let window = |m: &Value| {
+        m.get("contextWindow")
+            .and_then(Value::as_u64)
+            .filter(|w| *w > 0)
+    };
+    let is = |model: &str, k: &str, m: &Value| {
+        base(k) == model
+            || m.get("canonicalModel")
+                .and_then(Value::as_str)
+                .is_some_and(|c| base(c) == model)
+    };
+    let model = model.map(base);
+    let windows: Vec<Option<u64>> = model_usage
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, m)| model.as_deref().is_none_or(|model| is(model, k, m)))
+        .map(|(_, m)| window(m))
+        .collect();
+    match windows.first() {
+        None => Window::Unsaid,
+        _ if windows.iter().all(Option::is_none) => Window::Unsaid,
+        Some(Some(first)) if windows.iter().all(|w| *w == Some(*first)) => Window::Said(*first),
+        Some(_) => Window::Conflicting,
+    }
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> &'a str {
@@ -2269,6 +3077,58 @@ pub fn transient_reason(v: &Value) -> Option<String> {
     })
 }
 
+/// `rateLimitType`s of a `rejected` `rate_limit_event` that mean a usage window is used up.
+const USAGE_LIMIT_TYPES: &[&str] = &[
+    "five_hour",
+    "seven_day",
+    "seven_day_opus",
+    "seven_day_sonnet",
+    "seven_day_overage_included",
+];
+
+/// Whether an `assistant` `error: rate_limit` message's text says a limit was hit rather than
+/// the API throttling: it names a limit and says when it resets or that "you hit your" limit
+/// ("You've hit your weekly limit · resets 5am (UTC)").
+pub fn is_limit_text(text: &str) -> bool {
+    let t = text.to_lowercase();
+    t.contains("limit") && (t.contains("resets") || t.contains("hit your"))
+}
+
+/// The limit a failed turn hit, from the latest `rate_limit_event`'s `rate_limit_info` of
+/// the turn (`info`) and its limit-naming `rate_limit` error text (`text`, [`is_limit_text`]),
+/// in the runtime's words `message`: `rejected` with a [`USAGE_LIMIT_TYPES`] type is usage
+/// (that window, its `resetsAt`); `rejected` `overage` or `errorCode: credits_required` is
+/// spend; else such a text is usage with no window or time. None otherwise (a plain 429 or
+/// overload).
+pub fn limit_of(info: Option<&Value>, text: Option<&str>, message: &str) -> Option<Limit> {
+    if let Some(info) = info {
+        let rejected = str_at(info, "status") == "rejected";
+        let kind = str_at(info, "rateLimitType");
+        if str_at(info, "errorCode") == "credits_required" || (rejected && kind == "overage") {
+            return Some(Limit {
+                kind: LimitKind::Spend,
+                window: None,
+                resets_at: None,
+                message: message.to_string(),
+            });
+        }
+        if rejected && USAGE_LIMIT_TYPES.contains(&kind) {
+            return Some(Limit {
+                kind: LimitKind::Usage,
+                window: Some(kind.to_string()),
+                resets_at: crate::usage::epoch(&info["resetsAt"]),
+                message: message.to_string(),
+            });
+        }
+    }
+    text.map(|t| Limit {
+        kind: LimitKind::Usage,
+        window: None,
+        resets_at: None,
+        message: t.to_string(),
+    })
+}
+
 /// The windows of a `rate_limit_event`'s `rate_limit_info`: its `unifiedWindows` (fractions
 /// used), else the top-level `utilization` of a `five_hour` or `seven_day` `rateLimitType`.
 pub fn rate_limit_windows(info: &Value) -> Vec<UsageWindow> {
@@ -2561,6 +3421,57 @@ mod tests {
     /// changes the step the main agent's plan has in progress, that step: a `TodoWrite`'s
     /// item in progress, or the task a `TaskUpdate` starts (its id from its `TaskCreate`'s
     /// result), cleared once that task is completed. A subagent's plan is not the thread's.
+    /// A blocking `TaskOutput` call names the task it waits for; one that does not block, or
+    /// another tool, names none.
+    #[test]
+    fn a_blocking_task_output_call_names_the_task_it_waits_for() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("go", 1);
+        let waits = |t: &mut Translator, id: &str, name: &str, input: Value| {
+            let line = json!({
+                "type": "assistant",
+                "parent_tool_use_id": null,
+                "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]},
+            });
+            t.translate(&line.to_string())
+                .events
+                .iter()
+                .find_map(|e| match &e.body {
+                    EventBody::AgentToolCall(c) => Some(
+                        twr_core::event::twr_str(c.ext.as_ref(), WAITS_FOR_KEY).map(str::to_string),
+                    ),
+                    _ => None,
+                })
+                .expect("a tool call")
+        };
+        assert_eq!(
+            waits(&mut t, "t1", "TaskOutput", json!({"task_id": "b1"})),
+            Some("b1".into())
+        );
+        assert_eq!(
+            waits(
+                &mut t,
+                "t2",
+                "TaskOutput",
+                json!({"task_id": "b1", "block": true, "timeout": 600000})
+            ),
+            Some("b1".into())
+        );
+        assert_eq!(
+            waits(
+                &mut t,
+                "t3",
+                "TaskOutput",
+                json!({"task_id": "b1", "block": false})
+            ),
+            None
+        );
+        assert_eq!(
+            waits(&mut t, "t4", "BashOutput", json!({"bash_id": "b1"})),
+            None
+        );
+    }
+
     #[test]
     fn tool_calls_carry_their_purpose_and_the_plans_step() {
         let mut t = Translator::new(TranslatorOptions::default());
@@ -2968,6 +3879,781 @@ mod tests {
             .map(|e| e.turn)
             .collect::<Vec<_>>();
         assert_eq!(text, [Some(2)]);
+        assert!(!t.busy());
+    }
+
+    fn task_line(subtype: &str, id: &str, extra: Value) -> String {
+        let mut v = json!({"type": "system", "subtype": subtype, "task_id": id, "session_id": "s"});
+        if let (Some(o), Some(x)) = (v.as_object_mut(), extra.as_object()) {
+            o.extend(x.clone());
+        }
+        v.to_string()
+    }
+
+    fn stream(event: Value) -> String {
+        json!({"type": "stream_event", "event": event, "parent_tool_use_id": null}).to_string()
+    }
+
+    fn twr_key(e: &Emitted, key: &str) -> Option<Value> {
+        match &e.body {
+            EventBody::TurnEnded(p) => p.ext.as_ref()?.get("twr")?.get(key).cloned(),
+            _ => None,
+        }
+    }
+
+    const MESSAGE_START: &str =
+        r#"{"type":"stream_event","event":{"type":"message_start"},"parent_tool_use_id":null}"#;
+
+    /// A first turn that leaves a background task of the main agent's (`b1`) running.
+    fn with_background_task(t: &mut Translator) {
+        t.user_message("run the tests in the background", 1);
+        feed(
+            t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "task_type": "local_bash", "description": "cargo test"}),
+                ),
+                &reply("Tests are running."),
+                &result(1, Some(1.0), false),
+            ],
+        );
+        assert!(!t.busy());
+    }
+
+    /// The end of a task the main agent put in the background starts a run of Claude's own,
+    /// with no `init` and its first output much later: the runtime's turn opens at that end, so
+    /// the hub writes no prompt into the run. The run's output and `result` are that turn's.
+    #[test]
+    fn a_background_task_end_opens_the_runtime_turn_at_once() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_updated",
+                "b1",
+                json!({"patch": {"status": "completed"}}),
+            )],
+        );
+        assert!(matches!(
+            events[0].body,
+            EventBody::TaskUpdated(twr_core::event::TaskUpdated { running: false, .. })
+        ));
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+        assert!(t.busy() && t.deadline().is_some());
+        let events = feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("All tests passed."),
+                &result(2, Some(1.5), true),
+            ],
+        );
+        assert!(t.deadline().is_none(), "the run started");
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") Some(0.5)"]);
+        assert!(!t.busy());
+    }
+
+    /// Only the main agent's background tasks notify it: a foreground task's end, or a
+    /// subagent's task's (even one it put in the background), opens nothing; a task moved to
+    /// A task the main agent runs in the foreground of a call says that call on each of its
+    /// updates (`ext.twr.foreground_call`); once Claude moves it to the background (its call's
+    /// Bash timeout ran out, or a `task_updated` patch), it says it is detached, keeping what
+    /// it said it does, until its end. One started in the background, or a subagent's, says
+    /// neither.
+    #[test]
+    fn foreground_tasks_say_their_call_and_moved_ones_say_they_are_detached() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        let placed = |events: &[Emitted], id: &str| -> Vec<(bool, Option<Value>, bool, String)> {
+            events
+                .iter()
+                .filter_map(|e| match &e.body {
+                    EventBody::TaskUpdated(p) if p.task_id == id => Some((
+                        p.running,
+                        p.ext
+                            .as_ref()
+                            .and_then(|x| x.get("twr"))
+                            .and_then(|x| x.get(FOREGROUND_CALL_KEY))
+                            .cloned(),
+                        twr_core::event::is_detached(p),
+                        p.description.clone(),
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        let started = feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "w1",
+                    json!({"is_backgrounded": false, "tool_use_id": "toolu_w",
+                           "description": "Wait for tests"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "tool_use_id": "toolu_b",
+                           "description": "Run tests"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "s1",
+                    json!({"is_backgrounded": false, "owned_by_subagent": true,
+                           "tool_use_id": "toolu_s", "description": "Sub"}),
+                ),
+                &task_line(
+                    "task_started",
+                    "p1",
+                    json!({"is_backgrounded": false, "tool_use_id": "toolu_p",
+                           "description": "Build"}),
+                ),
+            ],
+        );
+        assert_eq!(
+            placed(&started, "w1"),
+            [(true, Some(json!("toolu_w")), false, "Wait for tests".into())]
+        );
+        assert_eq!(
+            placed(&started, "b1"),
+            [(true, None, false, "Run tests".into())]
+        );
+        assert_eq!(placed(&started, "s1"), [(true, None, false, "Sub".into())]);
+        // The call's Bash timeout ran out: moved to the background, its call returned.
+        let moved = feed(
+            &mut t,
+            &[&json!({"type": "user", "session_id": "s",
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_w",
+                    "content": "Command did not complete within its 600s timeout and was \
+                                moved to the background (ID: w1)."}]},
+                "tool_use_result": {"backgroundTaskId": "w1"}})
+            .to_string()],
+        );
+        assert_eq!(
+            placed(&moved, "w1"),
+            [(true, None, true, "Wait for tests".into())],
+            "{moved:?}"
+        );
+        // Put there by a patch.
+        let patched = feed(
+            &mut t,
+            &[&task_line(
+                "task_updated",
+                "p1",
+                json!({"patch": {"is_backgrounded": true}}),
+            )],
+        );
+        assert_eq!(placed(&patched, "p1"), [(true, None, true, "Build".into())]);
+        let ended = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "w1",
+                json!({"status": "killed"}),
+            )],
+        );
+        assert_eq!(
+            placed(&ended, "w1"),
+            [(false, None, true, "Wait for tests".into())]
+        );
+        // A launch that does not say where it runs is placed nowhere; an id reused for a
+        // launch in the background after its foreground task ended (through its tool
+        // result) is that new task's, placed afresh.
+        let unsaid = feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "u1",
+                json!({"tool_use_id": "toolu_u", "description": "Unsaid"}),
+            )],
+        );
+        assert_eq!(
+            placed(&unsaid, "u1"),
+            [(true, None, false, "Unsaid".into())]
+        );
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "r1",
+                json!({"is_backgrounded": false, "tool_use_id": "toolu_r",
+                       "description": "First"}),
+            )],
+        );
+        let done = feed(
+            &mut t,
+            &[&json!({"type": "user", "session_id": "s",
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": "toolu_r", "content": "ok"}]},
+                "tool_use_result": {"task": {"task_id": "r1", "status": "completed"}}})
+            .to_string()],
+        );
+        assert_eq!(placed(&done, "r1").len(), 1, "{done:?}");
+        assert!(!placed(&done, "r1")[0].0);
+        let again = feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "r1",
+                json!({"is_backgrounded": true, "tool_use_id": "toolu_r2",
+                       "description": "Second"}),
+            )],
+        );
+        assert_eq!(placed(&again, "r1"), [(true, None, false, "Second".into())]);
+    }
+
+    /// the background later (a `task_updated` patch) does.
+    #[test]
+    fn only_the_main_agents_background_tasks_open_a_turn_when_they_end() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line("task_started", "fg", json!({"is_backgrounded": false})),
+                &task_line(
+                    "task_started",
+                    "sub",
+                    json!({"is_backgrounded": true, "owned_by_subagent": true, "parent_task_id": "a1"}),
+                ),
+                &task_line("task_started", "later", json!({"is_backgrounded": false})),
+                &task_line(
+                    "task_updated",
+                    "later",
+                    json!({"patch": {"is_backgrounded": true}}),
+                ),
+                &reply("Working."),
+                &result(1, Some(1.0), false),
+            ],
+        );
+        for id in ["fg", "sub"] {
+            let events = feed(
+                &mut t,
+                &[&task_line(
+                    "task_notification",
+                    id,
+                    json!({"status": "completed"}),
+                )],
+            );
+            assert!(turn_marks(&events).is_empty(), "{id}: {events:?}");
+            assert!(!t.busy());
+        }
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "later",
+                json!({"status": "killed"}),
+            )],
+        );
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+    }
+
+    /// A task's end with a prompt queued opens nothing: the run is that prompt's.
+    #[test]
+    fn a_background_task_end_with_a_prompt_queued_opens_no_runtime_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        t.user_message("and now?", 2);
+        let events = feed(
+            &mut t,
+            &[
+                &task_line("task_notification", "b1", json!({"status": "completed"})),
+                INIT,
+                &reply("Done."),
+                &result(1, Some(1.5), false),
+            ],
+        );
+        assert_eq!(turn_marks(&events), ["end Some(2) None Some(0.5)"]);
+        assert!(t.deadline().is_none());
+    }
+
+    /// No run follows the notification: past its wait the turn ends `completed`, marked
+    /// `no_run`, with no usage; a `result` that asked the model nothing ends it at once.
+    #[test]
+    fn a_notification_turn_with_no_run_ends() {
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        let at = t.deadline().unwrap();
+        assert!(t
+            .expire(at - chrono::Duration::seconds(1))
+            .events
+            .is_empty());
+        // A task's line or a rate limit is no run.
+        feed(&mut t, &[&task_line("task_progress", "x", json!({}))]);
+        assert_eq!(t.deadline(), Some(at));
+        let events = t.expire(at).events;
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        assert!(!t.busy() && t.deadline().is_none());
+
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(&mut t, &[&end]);
+        let events = feed(&mut t, &[&result(0, Some(1.0), true)]);
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        assert!(!t.busy());
+    }
+
+    /// A notification's run that begins by compacting the context (minutes of silence, the
+    /// compaction's own lines aside) is no run that never came: the wait holds while it
+    /// compacts (for `COMPACTING_HOLD_SECS` at most) and starts again once it ended.
+    #[test]
+    fn a_compaction_holds_a_notification_runs_wait() {
+        let status = |s: &str| {
+            json!({"type": "system", "subtype": "status", "status": s, "session_id": "s"})
+                .to_string()
+        };
+        let boundary = json!({"type": "system", "subtype": "compact_boundary",
+            "session_id": "s", "compact_metadata": {"trigger": "auto", "pre_tokens": 900_000,
+            "post_tokens": 40_000}})
+        .to_string();
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        let wait = t.deadline().unwrap();
+        let events = feed(&mut t, &[&status("compacting")]);
+        assert!(matches!(events[0].body, EventBody::ContextCompacting(_)));
+        let held = t.deadline().unwrap();
+        assert!(
+            held - wait > chrono::Duration::minutes(20),
+            "held for the compaction"
+        );
+        assert!(t
+            .expire(wait + chrono::Duration::minutes(5))
+            .events
+            .is_empty());
+        assert!(t.busy(), "the turn still runs");
+        // Done compacting: the wait starts again, and ends the turn if still nothing runs;
+        // the summary Claude writes into the session (`isSynthetic`) and a replayed command
+        // output (`isReplay`) are no run.
+        let summary = json!({"type": "user", "isSynthetic": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text",
+            "text": "This session is being continued from a previous conversation."}]}})
+        .to_string();
+        let replayed = json!({"type": "user", "isReplay": true, "session_id": "s",
+            "parent_tool_use_id": null, "message": {"role": "user",
+            "content": "<local-command-stdout>Compacted </local-command-stdout>"}})
+        .to_string();
+        feed(&mut t, &[&boundary, &summary, &replayed]);
+        let again = t.deadline().unwrap();
+        assert!(again < held);
+        let events = t.expire(again).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+        // A request of the user's closed meanwhile (a subagent's permission answered or
+        // withdrawn) leaves the hold as it is.
+        let mut t = Translator::new(TranslatorOptions {
+            notice_run_after: Some(std::time::Duration::from_secs(60)),
+            ..Default::default()
+        });
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let held = t.deadline().unwrap();
+        t.translate(r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","message":"Name?"}}"#);
+        t.translate(r#"{"type":"control_cancel_request","request_id":"e1"}"#);
+        assert_eq!(t.deadline(), Some(held));
+        // Held no longer than the hub holds its stall checks.
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(&mut t, &[&end, &status("compacting")]);
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
+    /// Claude 2.1.295+ folds a prompt written into a run it started itself into that run, and
+    /// writes no `result` for it: once the main agent's message stopped (`end_turn`) and
+    /// nothing came for the wait, the turn ends `completed`, marked `missing_result`. A late
+    /// `result` of that run is absorbed; the next prompt's run is a turn as usual.
+    #[test]
+    fn a_missing_result_ends_the_turn_and_a_late_one_is_absorbed() {
+        let mut t = Translator::new(TranslatorOptions {
+            missing_result_after: Some(std::time::Duration::from_secs(90)),
+            ..Default::default()
+        });
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[INIT, &reply("Hello."), &result(1, Some(1.0), false)],
+        );
+        t.user_message("Checking in", 2);
+        let stop = |reason: &str| {
+            stream(json!({"type": "message_delta", "delta": {"stop_reason": reason}}))
+        };
+        // A tool call's stop awaits no `result`; a new model message ends the wait.
+        feed(&mut t, &[MESSAGE_START, &stop("tool_use")]);
+        assert!(t.deadline().is_none());
+        feed(&mut t, &[&reply("Read the findings."), &stop("end_turn")]);
+        assert!(t.deadline().is_some());
+        feed(&mut t, &[MESSAGE_START]);
+        assert!(t.deadline().is_none(), "the model went on");
+        // The folded prompt's answer, and no `result`.
+        feed(
+            &mut t,
+            &[&reply("Done: fixed both findings."), &stop("end_turn")],
+        );
+        let at = t.deadline().unwrap();
+        let events = t.expire(at);
+        assert_eq!(turn_marks(&events.events), ["end Some(2) None None"]);
+        assert_eq!(
+            twr_key(&events.events[0], MISSING_RESULT_KEY),
+            Some(json!(true))
+        );
+        assert!(!t.busy());
+        // The next prompt is written before the late `result` comes: that `result` is still
+        // the old run's, and the prompt's turn is not ended by it.
+        t.user_message("next", 3);
+        assert!(feed(&mut t, &[&result(3, Some(2.0), false)]).is_empty());
+        let events = feed(
+            &mut t,
+            &[INIT, &reply("Next done."), &result(1, Some(2.5), false)],
+        );
+        assert_eq!(turn_marks(&events), ["end Some(3) None Some(0.5)"]);
+    }
+
+    /// A turn ended for its missing `result` has no usage, but keeps what its latest call said
+    /// of the context, and where that came from.
+    #[test]
+    fn a_missing_result_keeps_the_context_its_call_said() {
+        let mut t = Translator::new(TranslatorOptions {
+            missing_result_after: Some(std::time::Duration::from_secs(90)),
+            ..Default::default()
+        });
+        t.user_message("hi", 1);
+        let call = json!({"type": "assistant", "parent_tool_use_id": null, "message": {
+            "id": "m1", "model": "claude-opus-5-5", "content": [{"type": "text", "text": "Done."}],
+            "usage": {"input_tokens": 3, "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 50_000, "output_tokens": 9}}});
+        let stop = stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}}));
+        feed(&mut t, &[INIT, MESSAGE_START, &call.to_string(), &stop]);
+        let at = t.deadline().unwrap();
+        let ended = t
+            .expire(at)
+            .events
+            .into_iter()
+            .find_map(|e| match e.body {
+                EventBody::TurnEnded(t) => Some(t),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            ended.ext.as_ref().unwrap()["twr"][MISSING_RESULT_KEY],
+            json!(true)
+        );
+        assert_eq!(ended.usage, None);
+        assert_eq!(
+            ended.context,
+            Some(twr_core::event::ContextSize {
+                tokens: 50_103,
+                window: None
+            })
+        );
+        let claude = &ended.ext.as_ref().unwrap()[EXT];
+        assert_eq!(claude["context_from"], json!(CONTEXT_FROM_CALL));
+    }
+
+    /// A subagent's line is no run of the main agent's: it neither ends the wait for the
+    /// notification's run nor keeps a `result` that asked the model nothing from ending it.
+    #[test]
+    fn a_subagents_line_is_no_run_of_the_notification() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        let at = t.deadline().unwrap();
+        let child = json!({"type": "stream_event", "parent_tool_use_id": "toolu_9",
+                           "event": {"type": "message_start"}})
+        .to_string();
+        let child_text = json!({"type": "assistant", "parent_tool_use_id": "toolu_9",
+                                "message": {"content": [{"type": "text", "text": "sub"}]}})
+        .to_string();
+        feed(
+            &mut t,
+            &[&child, &child_text, r#"{"type":"something_new"}"#],
+        );
+        assert_eq!(t.deadline(), Some(at));
+        let events = feed(&mut t, &[&result(0, Some(1.0), true)]);
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
+    /// After a turn ended for its missing `result`, another background task ends (its
+    /// notification's turn opens) and then the old run's `result` comes: it is absorbed, and
+    /// the new turn waits for its own run.
+    #[test]
+    fn a_late_result_does_not_end_a_notifications_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_started",
+                "b2",
+                json!({"is_backgrounded": true, "task_type": "local_bash"}),
+            )],
+        );
+        t.user_message("Checking in", 2);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("On it."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(turn_marks(&events), ["end Some(2) None None"]);
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b2",
+                json!({"status": "completed"}),
+            )],
+        );
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+        let at = t.deadline().unwrap();
+        assert!(feed(&mut t, &[&result(2, Some(2.0), false)]).is_empty());
+        assert_eq!(t.deadline(), Some(at), "still waiting for its run");
+        let events = feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("b2 done."),
+                &result(1, Some(2.5), true),
+            ],
+        );
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") Some(0.5)"]);
+    }
+
+    /// A `result` that asked the model nothing (another task's notice) while a turn waits for
+    /// its missing `result` leaves that wait as it was.
+    #[test]
+    fn a_notice_result_keeps_the_wait_for_a_missing_result() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("Done."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let at = t.deadline().unwrap();
+        assert!(turn_marks(&feed(&mut t, &[&result(0, Some(1.0), true)])).is_empty());
+        assert_eq!(t.deadline(), Some(at));
+        let events = t.expire(at).events;
+        assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
+    }
+
+    /// The hub's prompt raced the turn a background task's end opened: Claude folds it into its
+    /// own run and writes no `result`. Both the runtime's turn and the prompt's end.
+    #[test]
+    fn a_prompt_folded_into_a_runtime_run_ends_with_it() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        t.user_message("Checking in", 2);
+        feed(
+            &mut t,
+            &[
+                MESSAGE_START,
+                &reply("The tests passed."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        let events = t.expire(t.deadline().unwrap()).events;
+        assert_eq!(
+            turn_marks(&events),
+            ["end None Some(\"1\") None", "end Some(2) None None"]
+        );
+        assert!(events
+            .iter()
+            .all(|e| twr_key(e, MISSING_RESULT_KEY) == Some(json!(true))));
+        assert!(!t.busy());
+    }
+
+    /// A request for the user (a subagent's permission after the main agent's last message)
+    /// holds a missing `result`'s end while it is open; once answered, the wait starts again.
+    #[test]
+    fn a_request_for_the_user_holds_a_missing_result() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("Done."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+                r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu1"}}"#,
+            ],
+        );
+        let at = t.deadline().unwrap();
+        assert!(t.expire(at).events.is_empty());
+        let again = t.deadline().unwrap();
+        assert!(again > at && t.busy());
+        t.respond("r1", &Answer::new("allow")).unwrap();
+        // The whole wait again from the answer.
+        let fresh = t.deadline().unwrap();
+        assert!(
+            fresh >= Utc::now() + chrono::Duration::seconds(119),
+            "{fresh}"
+        );
+        assert!(t
+            .expire(fresh - chrono::Duration::seconds(1))
+            .events
+            .is_empty());
+        let events = t.expire(fresh).events;
+        assert_eq!(turn_marks(&events), ["end Some(1) None None"]);
+    }
+
+    /// A request for the user during a notification's turn (a subagent's: it carries no mark
+    /// of it) is no run of the main agent's: the wait for the run holds while it is open, and
+    /// starts again when it closes.
+    #[test]
+    fn a_request_during_a_notifications_turn_holds_its_wait() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        feed(
+            &mut t,
+            &[
+                &task_line("task_notification", "b1", json!({"status": "completed"})),
+                r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"ls"},"tool_use_id":"tu1"}}"#,
+            ],
+        );
+        let at = t.deadline().unwrap();
+        assert!(t.expire(at).events.is_empty());
+        t.respond("r1", &Answer::new("deny")).unwrap();
+        let fresh = t.deadline().unwrap();
+        let events = t.expire(fresh).events;
+        assert_eq!(turn_marks(&events), ["end None Some(\"1\") None"]);
+        assert_eq!(twr_key(&events[0], NO_RUN_KEY), Some(json!(true)));
+    }
+
+    /// After a turn ended for its missing `result`, a `result` that asked the model nothing
+    /// (another task's notice) leaves the late `result` of that run still to be absorbed: the
+    /// next prompt's turn is not ended by it.
+    #[test]
+    fn a_notice_result_does_not_use_up_the_late_results_absorption() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("hi", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                MESSAGE_START,
+                &reply("Done."),
+                &stream(json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})),
+            ],
+        );
+        t.expire(t.deadline().unwrap());
+        t.user_message("next", 2);
+        assert!(turn_marks(&feed(&mut t, &[&result(0, Some(1.0), true)])).is_empty());
+        assert!(feed(&mut t, &[&result(2, Some(1.5), false)]).is_empty());
+        let events = feed(
+            &mut t,
+            &[INIT, &reply("Next."), &result(1, Some(2.0), false)],
+        );
+        // (What the notice's `result` added goes to the next charged turn, as ever.)
+        assert_eq!(turn_marks(&events), ["end Some(2) None Some(1.5)"]);
+    }
+
+    /// After a failed turn a background task's end opens no turn (the hub keeps the failure and
+    /// its retry); the run's first output does, as before.
+    #[test]
+    fn no_turn_opens_early_after_a_failed_turn() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        t.user_message("run it", 1);
+        feed(
+            &mut t,
+            &[
+                INIT,
+                &task_line(
+                    "task_started",
+                    "b1",
+                    json!({"is_backgrounded": true, "task_type": "local_bash"}),
+                ),
+                r#"{"type":"result","subtype":"error_during_execution","is_error":true,"stop_reason":"end_turn","session_id":"s"}"#,
+            ],
+        );
+        let events = feed(
+            &mut t,
+            &[&task_line(
+                "task_notification",
+                "b1",
+                json!({"status": "completed"}),
+            )],
+        );
+        assert!(turn_marks(&events).is_empty(), "{events:?}");
+        assert!(!t.busy());
+        let events = feed(&mut t, &[MESSAGE_START, &reply("Retrying.")]);
+        assert_eq!(turn_marks(&events), ["start None Some(\"1\")"]);
+    }
+
+    /// A finished task's late patch revives nothing, and its completion said again opens no
+    /// turn.
+    #[test]
+    fn a_finished_task_opens_no_turn_again() {
+        let mut t = Translator::new(TranslatorOptions::default());
+        with_background_task(&mut t);
+        let end = task_line("task_notification", "b1", json!({"status": "completed"}));
+        feed(&mut t, &[&end]);
+        feed(
+            &mut t,
+            &[MESSAGE_START, &reply("Done."), &result(1, Some(1.5), true)],
+        );
+        assert!(!t.busy());
+        let events = feed(
+            &mut t,
+            &[
+                &task_line(
+                    "task_updated",
+                    "b1",
+                    json!({"patch": {"is_backgrounded": true}}),
+                ),
+                &end,
+                &task_line(
+                    "task_updated",
+                    "b1",
+                    json!({"patch": {"status": "completed"}}),
+                ),
+            ],
+        );
+        assert!(turn_marks(&events).is_empty(), "{events:?}");
         assert!(!t.busy());
     }
 

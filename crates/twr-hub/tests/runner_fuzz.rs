@@ -458,6 +458,7 @@ impl Sess {
 
     fn on_cmd(&mut self, cmd: Option<AdapterCmd>, waiting: Option<&str>) -> Flow<Option<Answer>> {
         match cmd {
+            Some(AdapterCmd::Compact { .. }) => Ok(None),
             Some(AdapterCmd::Send { text, turn }) => {
                 self.queue.push_back((text, turn));
                 Ok(None)
@@ -1287,6 +1288,7 @@ impl RunnerProc {
         let mut o = RunnerOptions::new(url, Secret::new(token(box_name)), box_name, dir);
         o.backoff_min = Duration::from_millis(20);
         o.backoff_max = Duration::from_millis(200);
+        o.refused_retry = Duration::from_millis(200);
         o.ping_interval = Duration::from_millis(500);
         o.idle_timeout = Duration::from_secs(10);
         o.welcome_timeout = Duration::from_secs(5);
@@ -2791,6 +2793,10 @@ impl World {
         for t in &self.threads {
             let mut j = h.get_thread(&t.id).unwrap();
             j.as_object_mut().unwrap().remove("live");
+            // (When its `work` was read is the clock's, not the log's.)
+            if let Some(w) = j.get_mut("work").and_then(Value::as_object_mut) {
+                w.remove("as_of");
+            }
             threads.insert(t.id.clone(), j);
         }
         let attention: Vec<Value> = h.attention_list(true);

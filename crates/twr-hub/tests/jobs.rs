@@ -214,6 +214,67 @@ async fn jobs_wait_for_slots_in_turn_and_count_as_background_work() {
     hub.request_shutdown();
 }
 
+/// What the hub shows of a job it runs (`thread.get`, the activity line) is what the job does
+/// now, not its last renewal (every 5 min): a queued job moves up when one before it goes.
+#[tokio::test]
+async fn a_jobs_shown_state_is_what_it_does_now() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(opts(dir.path(), 1)).await.unwrap();
+    let t = thread(&hub, &dir.path().join("proj"), "api").await;
+    let job = |name: &str| {
+        start(
+            &hub,
+            &t,
+            &["sleep", "30"],
+            json!({"wake": false, "name": name}),
+        )["job"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let a = job("a");
+    until(&hub, &t, |evs| {
+        evs.iter().any(|e| {
+            matches!(&e.body, EventBody::TaskUpdated(p)
+            if p.task_id == format!("job:{a}") && p.description == "job a: running")
+        })
+    })
+    .await;
+    let (b, c) = (job("b"), job("c"));
+    let shown = |job: &str| {
+        hub.get_thread(&t).unwrap()["background_tasks"][format!("job:{job}")]["description"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(shown(&a), "job a: running");
+    assert_eq!(shown(&c), "job c: queued (1 ahead)");
+    hub.cancel_job(&b, None).unwrap();
+    until(&hub, &t, |evs| job_end(evs, &b).is_some()).await;
+    assert_eq!(shown(&c), "job c: queued (0 ahead)");
+    let activity = hub.thread_activity()[&t]["activity"].clone();
+    assert!(
+        activity
+            .as_str()
+            .unwrap()
+            .contains("job c: queued (0 ahead)"),
+        "{activity}"
+    );
+    // The log still says what its start said: nothing was recorded for the move.
+    let recorded = hub.thread_view(&t).unwrap().background_tasks[&format!("job:{c}")]
+        .description
+        .clone();
+    assert_eq!(recorded, "job c: queued (1 ahead)");
+    for j in [&a, &c] {
+        hub.cancel_job(j, None).unwrap();
+    }
+    until(&hub, &t, |evs| {
+        job_end(evs, &a).is_some() && job_end(evs, &c).is_some()
+    })
+    .await;
+    hub.request_shutdown();
+}
+
 #[tokio::test]
 async fn a_cancel_or_a_timeout_ends_its_process_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -1255,12 +1316,30 @@ async fn ran(hub: &Hub, t: &str, argv: &[&str]) -> (Value, String, String) {
     (end, end_description(&evs, &job), log)
 }
 
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path`, and the side file is removed. A child another test thread forks while this process
+/// writes the file would inherit the descriptor, and exec'ing the file would fail with
+/// ETXTBSY until that child execs or exits.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// Writes an executable script `body` (with `#!/bin/sh`) at `p`, its directories made.
 fn script(p: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-    std::fs::write(p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install(p, format!("#!/bin/sh\n{body}\n"));
 }
 
 /// Through its gate a job's program is found as `execvp` finds it and run exactly as named:
@@ -1282,12 +1361,7 @@ async fn a_jobs_program_is_found_and_run_as_named() {
     script(&proj.join("node_modules/.bin/jesty"), "echo jesty ran");
     script(&proj.join("-a/x"), "echo \"x ran $*\"");
     std::fs::write(proj.join("plain"), "echo plain").unwrap();
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let headless = proj.join("headless");
-        std::fs::write(&headless, [0u8, 1, 2, 3]).unwrap();
-        std::fs::set_permissions(&headless, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    install(&proj.join("headless"), [0u8, 1, 2, 3]);
     let (end, why, _) = ran(&hub, &t, &["no-such-program-twr"]).await;
     assert_eq!(end["outcome"], "failed_to_start", "{end}");
     assert!(
@@ -1446,4 +1520,141 @@ async fn a_slow_member_snapshot_does_not_hold_up_a_cancel() {
     released.store(true, Ordering::SeqCst);
     ended.expect("the cancel waited for the snapshot");
     hub.request_shutdown();
+}
+
+/// The controlling terminal (`tty_nr`, 0 for none) and state of process `pid`, from
+/// `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn tty_and_state(pid: u32) -> Option<(i64, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // After the command name, which may hold spaces: state, ppid, pgrp, session, tty_nr.
+    let rest: Vec<&str> = stat[stat.rfind(')')? + 1..].split_whitespace().collect();
+    Some((rest.get(4)?.parse().ok()?, rest.first()?.to_string()))
+}
+
+/// Not a test of its own: a hub process for [`a_job_that_reads_the_terminal_ends_with_an_error`]
+/// (this binary with `TWR_TEST_TTY_HUB=<dir>`, run with a terminal as its controlling one):
+/// writes its own `tty_nr` to `<dir>/tty`, opens a hub on `<dir>` and runs a job that reads
+/// the terminal (`cat /dev/tty`). Writes `<dir>/ended`: the job's end (JSON) once it ended, or
+/// `stuck <state>` (the state of its process) when it did not end within 15 s, in which case
+/// it kills the job's group.
+#[cfg(target_os = "linux")]
+#[test]
+fn tty_hub() {
+    let Some(dir) = std::env::var_os("TWR_TEST_TTY_HUB") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let (tty, _) = tty_and_state(std::process::id()).unwrap();
+    std::fs::write(dir.join("tty"), tty.to_string()).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let hub = Hub::open(opts(&dir, 2)).await.unwrap();
+        let t = thread(&hub, &dir.join("proj"), "api").await;
+        let r = start(&hub, &t, &["cat", "/dev/tty"], json!({"wake": false}));
+        let job = r["job"].as_str().unwrap().to_string();
+        let ended = timeout(Duration::from_secs(15), async {
+            loop {
+                let (_, evs) = hub.thread_events(&t, 0, 10_000).unwrap();
+                if let Some(end) = job_end(&evs, &job) {
+                    return end.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let said = match ended {
+            Ok(end) => end.to_string(),
+            Err(_) => {
+                let (_, evs) = hub.thread_events(&t, 0, 10_000).unwrap();
+                let pgid = evs.iter().find_map(|e| match &e.body {
+                    EventBody::TaskUpdated(p) if p.running => p
+                        .ext
+                        .as_ref()?
+                        .get("twr")?
+                        .get("job")?
+                        .get("pgid")?
+                        .as_u64(),
+                    _ => None,
+                });
+                let state = pgid.and_then(|p| tty_and_state(p as u32)).map(|(_, s)| s);
+                if let Some(p) = pgid {
+                    // SAFETY: kill(2) of the job's process group; no memory is passed.
+                    unsafe { libc::kill(-(p as libc::pid_t), libc::SIGKILL) };
+                }
+                format!("stuck {state:?}")
+            }
+        };
+        // Whole or not at all: the parent reads it as soon as it exists.
+        std::fs::write(dir.join("ended.tmp"), said).unwrap();
+        std::fs::rename(dir.join("ended.tmp"), dir.join("ended")).unwrap();
+        hub.shutdown().await;
+    });
+}
+
+/// A job whose command reads the terminal, run by a hub that has one (a pseudo-terminal, its
+/// controlling terminal, as when `twr hub` runs in your terminal): the job runs in a session
+/// of its own, so opening `/dev/tty` fails and the job ends with that error. (In the hub's
+/// session, it was a background process group of that terminal: job control stopped it with
+/// SIGTTIN, forever.)
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_job_that_reads_the_terminal_ends_with_an_error() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let dir = tempfile::tempdir().unwrap();
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty(3) writes the two descriptors; no name, termios or size is passed.
+    let r = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert_eq!(r, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: both are open descriptors of this process's, owned from here on.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let out = std::fs::File::create(dir.path().join("hub.out")).unwrap();
+    let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "tty_hub", "--test-threads=1", "--nocapture"])
+        .env("TWR_TEST_TTY_HUB", dir.path())
+        .stdin(slave)
+        .stdout(out.try_clone().unwrap())
+        .stderr(out);
+    // SAFETY: setsid(2) and ioctl(2) are async-signal-safe; nothing is allocated. The new
+    // session's controlling terminal becomes the pseudo-terminal on stdin.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut hub = cmd.spawn().unwrap();
+    let ended = dir.path().join("ended");
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !ended.exists() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let said = std::fs::read_to_string(&ended);
+    let _ = hub.kill();
+    let _ = hub.wait();
+    // Held until the hub is gone: closing it hangs the terminal up.
+    drop(master);
+    let log = std::fs::read_to_string(dir.path().join("hub.out")).unwrap_or_default();
+    let tty = std::fs::read_to_string(dir.path().join("tty")).unwrap_or_default();
+    assert!(
+        tty.parse::<i64>().is_ok_and(|t| t != 0),
+        "the hub had the terminal as its controlling one ({tty:?}): {log}"
+    );
+    let said = said.unwrap_or_else(|_| panic!("the hub never said how the job went: {log}"));
+    let end: Value = serde_json::from_str(&said).unwrap_or_else(|_| panic!("{said}: {log}"));
+    assert_eq!(end["outcome"], "exited", "{end}");
+    assert_eq!(end["exit"], 1, "{end}");
 }

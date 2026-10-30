@@ -2154,3 +2154,27 @@ async fn a_restore_waiting_for_its_repository_sees_threads_made_meanwhile() {
     assert_eq!(run(&wt, &["symbolic-ref", "HEAD"]), "refs/heads/twr/sw");
     hub.shutdown().await;
 }
+
+/// A deleted thread's id names that thread for its events, also when a later thread is named
+/// like it: `thread.events` reads the deleted thread's, and
+/// `thread.subscribe` answers `not_found` rather than following the new one.
+#[tokio::test]
+async fn a_deleted_threads_id_never_reads_a_thread_named_like_it() {
+    let r = Repo::new();
+    let hub = Hub::open(opts(&r.root)).await.unwrap();
+    let id = create(&hub, &r.repo, "api", true).await;
+    let card = ask(&hub, &["api"]).await;
+    answer(&hub, &card, "Delete", &user()).unwrap();
+    gone(&hub, &id).await;
+    let other = create(&hub, &r.repo, &id, true).await;
+    assert_ne!(other, id);
+    let (read, events) = hub.thread_events(&id, 0, 10_000).unwrap();
+    assert_eq!(read, id);
+    assert!(events.iter().all(|e| e.thread == id), "{events:?}");
+    assert!(events.iter().any(|e| e.kind() == "thread.deleted"));
+    let err = hub.subscribe_thread(&id, 0).err().expect("refused");
+    assert_eq!(err.code, codes::NOT_FOUND);
+    // The new thread is still there, by its own id.
+    assert_eq!(hub.thread_events(&other, 0, 10).unwrap().0, other);
+    hub.shutdown().await;
+}

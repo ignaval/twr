@@ -79,10 +79,12 @@ pub const NOT_NOW: &str = "Not now";
 /// Whether the hub's own box trims: only where it can list the mount points in a worktree.
 const TRIMS_HERE: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 
-/// The hub's disk bookkeeping (memory only; the cards come back from the log).
-#[derive(Default)]
+/// The hub's disk bookkeeping (memory only; the cards come back from the log, and go into the
+/// hub's checkpoints with the rest, `hub::checkpoint`).
+#[derive(PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct DiskState {
     /// When each thread's worktree was last measured, and its turn count and last trim then.
+    #[serde(skip)]
     measured: HashMap<String, Measured>,
     /// Each box's free space, as last read.
     pub(super) boxes: HashMap<String, BoxDisk>,
@@ -90,9 +92,11 @@ pub(super) struct DiskState {
     pub(super) cards: HashMap<String, DiskCard>,
     /// Boxes whose card the user answered: no new one until their free space is back over the
     /// threshold.
+    #[serde(serialize_with = "twr_core::sorted::set")]
     quiet: HashSet<String>,
 }
 
+#[derive(PartialEq)]
 struct Measured {
     /// When the measurement was asked for.
     at: Instant,
@@ -100,8 +104,25 @@ struct Measured {
     at_wall: DateTime<Utc>,
 }
 
+impl DiskState {
+    /// The fields checkpoints skip that are set (tests, `hub::checkpoint`).
+    #[cfg(test)]
+    pub(super) fn skipped_set(&self) -> Vec<&'static str> {
+        let DiskState {
+            measured,
+            boxes: _,
+            cards: _,
+            quiet: _,
+        } = self;
+        match measured.is_empty() {
+            true => Vec::new(),
+            false => vec!["disk.measured"],
+        }
+    }
+}
+
 /// A box's free space, as last read.
-#[derive(Debug, Clone)]
+#[derive(PartialEq, Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct BoxDisk {
     pub(super) free: Option<u64>,
     pub(super) total: Option<u64>,
@@ -110,7 +131,7 @@ pub(super) struct BoxDisk {
 
 /// An open disk card: its box and the threads Trim trims, each with the life of it the card
 /// named (`lifecycle_seq`: one deleted and restored since is another life, and is left alone).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(super) struct DiskCard {
     pub(super) box_name: String,
     pub(super) threads: Vec<(String, u64)>,
@@ -286,8 +307,7 @@ impl Core {
             ));
         }
         let git = hub
-            .hosts
-            .get(&box_name)
+            .host(&box_name)
             .map(|h| h.git())
             .ok_or_else(|| rpc(codes::CONFLICT, format!("box {box_name} is not configured")))?;
         let stopping = self.rt.get(id).is_some_and(|r| r.live.is_some());
@@ -301,7 +321,7 @@ impl Core {
             };
             self.append_batch(hub, batch).map_err(super::append_err)?;
             if let Some(c) = &remote_stop {
-                if let Some(rbox) = hub.remotes.get(&c.box_name) {
+                if let Some(rbox) = hub.remote(&c.box_name) {
                     rbox.expect_stop(id, &c.cmd_id);
                 }
             }
@@ -672,7 +692,7 @@ impl Core {
             })
             .filter_map(|v| {
                 let (b, wt) = self.managed_worktree(&v.id)?;
-                let git = hub.hosts.get(b)?.git();
+                let git = hub.host(b)?.git();
                 Some((
                     self.disk.measured.get(&v.id).map(|m| m.at),
                     Due {
@@ -913,11 +933,12 @@ async fn trim(
 /// a time, then the cards.
 pub(super) async fn disk_round(hub: &Arc<Inner>) {
     let boxes: Vec<(String, Arc<dyn GitOps>)> = {
+        let hosts = hub.hosts_list();
         let core = hub.core();
-        hub.hosts
-            .iter()
+        hosts
+            .into_iter()
             .filter(|(b, _)| core.box_online(b))
-            .map(|(b, h)| (b.clone(), h.git()))
+            .map(|(b, h)| (b, h.git()))
             .collect()
     };
     // The free space first, each box bounded: a box that recovered closes its card whatever

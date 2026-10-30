@@ -22,15 +22,34 @@
 //! refresh is per window: a record is due once any window's report is that much newer than
 //! the one recorded.
 //!
-//! Accounts: a thread runs on its runtime's own login (`account` absent) until a runtime can
-//! have several accounts; the entry is keyed by both.
+//! Accounts: the entry is keyed by runtime and account, the account the reporting session was
+//! started on (`RunSettings::account`; absent: the runtime's native account), not the thread's
+//! now: a thread moved to another account keeps its previous session running until its turn
+//! ends. A report of a session whose account's name leads to another directory now (removed and
+//! added again elsewhere: `RunSettings::account_dir`), or was removed, is dropped: it is not
+//! the account's now. `usage.get`'s labels name the account by the accounts' rule ([`usage_json`]): while
+//! the runtime shows account labels (`AccountsView::shows_labels`), the native account under
+//! its current name.
+//!
+//! Directories: a named account's record says the directory its session ran in
+//! (`AccountUsage::dir`, links followed), and a report merges into the known windows only when
+//! they were read in the reporting session's directory (else it starts afresh: a sparse report
+//! of the account's new login never keeps the old login's windows). When a named account's
+//! directory changes (removed, added again elsewhere, or config names another one at a start)
+//! the hub records an `account.usage` with no windows for it ([`Core::usage_clears`], in the
+//! batch of the `account.added` / `account.removed` that changed it; [`Core::clear_moved_usage`]
+//! at a start), so every client's [`UsageView`] drops what it showed. `usage.get` also leaves
+//! out an entry read in another directory than the account's now ([`moved`]), whatever the
+//! log says. An entry without a directory (the native account's, an older hub's) is kept.
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
+use twr_core::account::AccountsView;
 use twr_core::event::{AccountUsage, EventBody, RuntimeLimits, Source, Usage, HUB_THREAD};
-use twr_core::usage::{changed, merge_windows, Spent, UsageView, REFRESH_AFTER};
+use twr_core::usage::{changed, merge_windows, Spent, UsageEntry, UsageView, REFRESH_AFTER};
 
-use super::{store, Batch, Core, EndedTurn, Hub, Inner};
+use super::accounts::same_dir;
+use super::{store, Batch, BatchEvent, Core, EndedTurn, Hub, Inner};
 
 impl Core {
     /// Folds `thread`'s runtime's usage report `limits` (see the module docs), committing the
@@ -47,9 +66,10 @@ impl Core {
             .rt
             .get(thread)
             .and_then(|r| r.runtime_settings.as_ref())
-            .map(|s| s.runtime.clone());
+            .map(|s| (s.runtime.clone(), s.account.clone(), s.account_dir.clone()));
         let known = self.registry.get(thread).is_some();
-        let Some(runtime) = started_as.filter(|r| known && !r.is_empty()) else {
+        let Some((runtime, account, dir)) = started_as.filter(|(r, _, _)| known && !r.is_empty())
+        else {
             tracing::debug!(
                 thread,
                 "a usage report of a session whose runtime is not known yet; dropped"
@@ -57,10 +77,30 @@ impl Core {
             self.commit_ack(hub, ack)?;
             return Ok(None);
         };
+        // A session on an account its name no longer leads to (removed, or added again
+        // elsewhere): its usage is not the account's now.
+        if let Some(why) = self.session_account_gone(&runtime, account.as_deref(), dir.as_deref()) {
+            tracing::debug!(
+                thread,
+                why,
+                "a usage report of an account's previous directory; dropped"
+            );
+            self.commit_ack(hub, ack)?;
+            return Ok(None);
+        }
         let now = Utc::now();
         let when = at.unwrap_or(now).min(now);
-        let account: Option<String> = None;
-        let prev = self.usage.get(&runtime, account.as_deref());
+        // The session's directory, as recorded with the windows: a named account's only.
+        let dir = account
+            .as_ref()
+            .and(dir)
+            .map(|d| d.to_string_lossy().into_owned());
+        // What is known of the account, if it was read in this directory: another directory's
+        // windows are another login's.
+        let prev = self
+            .usage
+            .get(&runtime, account.as_deref())
+            .filter(|p| same_entry_dir(p.dir.as_deref(), dir.as_deref()));
         let reported: Vec<_> = limits
             .windows
             .into_iter()
@@ -108,6 +148,7 @@ impl Core {
             plan,
             thread: Some(thread.to_string()),
             observed_at: Some(observed_at),
+            dir,
             ..Default::default()
         });
         let mut batch = Batch {
@@ -119,13 +160,129 @@ impl Core {
         self.append_batch(hub, batch)?;
         Ok(None)
     }
+
+    /// The `account.usage` records with no windows that `events` (a batch about to be
+    /// committed) call for: one per named account whose known usage was read in another
+    /// directory than the one the accounts' registry gives it once the batch's
+    /// `account.added` / `account.removed` are folded (see the module docs). Nothing for a
+    /// batch without either.
+    pub(super) fn usage_clears(&self, events: &[BatchEvent]) -> Vec<BatchEvent> {
+        let changes = |e: &&BatchEvent| {
+            e.thread == HUB_THREAD
+                && matches!(
+                    e.body,
+                    EventBody::AccountAdded(_) | EventBody::AccountRemoved(_)
+                )
+        };
+        if !events.iter().any(|e| changes(&e)) {
+            return Vec::new();
+        }
+        let mut after = self.accounts.clone();
+        for (i, e) in events.iter().filter(changes).enumerate() {
+            after.apply(&twr_core::event::Event::new(
+                HUB_THREAD,
+                i as u64 + 1,
+                None,
+                e.source.clone(),
+                e.body.clone(),
+            ));
+        }
+        // An entry this batch clears already (or that a record of the batch replaces) is left
+        // to it.
+        let recorded = |runtime: &str, account: Option<&str>| {
+            events.iter().any(|e| {
+                matches!(&e.body, EventBody::AccountUsage(p)
+                    if e.thread == HUB_THREAD
+                        && p.runtime == runtime
+                        && p.account.as_deref() == account)
+            })
+        };
+        self.usage
+            .entries()
+            .filter(|e| moved(e, &after) && !recorded(&e.runtime, e.account.as_deref()))
+            .map(|e| BatchEvent {
+                thread: HUB_THREAD.to_string(),
+                turn: None,
+                source: Source::Hub,
+                body: cleared(e),
+                raw: None,
+            })
+            .collect()
+    }
+
+    /// Startup: clears the known usage of each named account whose directory is another than
+    /// the one it was read in (config names another directory now, or a log from before the
+    /// clearing was part of the account's change). One append.
+    pub(super) fn clear_moved_usage(&mut self, hub: &Inner) -> anyhow::Result<()> {
+        let mut batch = Batch::default();
+        for e in self.usage.entries().filter(|e| moved(e, &self.accounts)) {
+            batch.push(HUB_THREAD, None, Source::Hub, cleared(e));
+        }
+        if batch.events.is_empty() {
+            return Ok(());
+        }
+        self.append_batch(hub, batch).map(drop)
+    }
+}
+
+/// Whether windows read in directory `known` (`None`: the native account's, or an older hub's
+/// record) may take a report of a session in `dir`: the same directory, or neither has one.
+fn same_entry_dir(known: Option<&str>, dir: Option<&str>) -> bool {
+    match (known, dir) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a == b || same_dir(std::path::Path::new(a), std::path::Path::new(b)),
+        _ => false,
+    }
+}
+
+/// Whether entry `e` was read in another directory than the one `accounts` gives its named
+/// account now (or the account is removed, or its name is the native account's now). An entry
+/// without a directory, or with no windows left to show, is not.
+pub(super) fn moved(e: &UsageEntry, accounts: &AccountsView) -> bool {
+    let (Some(name), Some(dir)) = (e.account.as_deref(), e.dir.as_deref()) else {
+        return false;
+    };
+    if e.windows.is_empty() {
+        return false;
+    }
+    let now = match accounts.resolve(&e.runtime, name) {
+        Some(Some(_)) => accounts
+            .info(&e.runtime, Some(name))
+            .filter(|a| !a.native && !a.removed)
+            .and_then(|a| a.dir),
+        _ => None,
+    };
+    now.is_none_or(|now| {
+        now.as_os_str() != std::ffi::OsStr::new(dir) && !same_dir(&now, std::path::Path::new(dir))
+    })
+}
+
+/// The `account.usage` that clears entry `e`: no windows, no directory.
+fn cleared(e: &UsageEntry) -> EventBody {
+    EventBody::AccountUsage(AccountUsage {
+        runtime: e.runtime.clone(),
+        account: e.account.clone(),
+        source: e.source.clone(),
+        ..Default::default()
+    })
 }
 
 /// What `usage.get` answers for `view` at `now`: per runtime and account, the windows that
-/// have not reset, with their labels, and the data's age (`twr_core::usage::UsageView::shown`).
-pub fn usage_json(view: &UsageView, now: DateTime<Utc>) -> Value {
-    let runtimes: Vec<Value> = view
-        .shown(now)
+/// have not reset, with their labels, and the data's age. The labels name the account as the
+/// accounts' registry `accounts` says threads' do (`UsageView::shown_for`: while the runtime
+/// shows labels, the native account under its current name); without one, as an older hub's
+/// did (`UsageView::shown`).
+pub fn usage_json(view: &UsageView, accounts: Option<&AccountsView>, now: DateTime<Utc>) -> Value {
+    let shown = match accounts {
+        // Not an entry read in another directory than its account's now ([`moved`]).
+        Some(a) => {
+            let mut view = view.clone();
+            view.retain(|e| !moved(e, a));
+            view.shown_for(now, a)
+        }
+        None => view.shown(now),
+    };
+    let runtimes: Vec<Value> = shown
         .into_iter()
         .map(|s| {
             let windows: Vec<Value> = s
@@ -161,7 +318,8 @@ pub fn usage_json(view: &UsageView, now: DateTime<Utc>) -> Value {
 impl Hub {
     /// `usage.get`: the latest known usage of each runtime's account ([`usage_json`]).
     pub fn usage(&self) -> Value {
-        usage_json(&self.inner.core().usage, Utc::now())
+        let core = self.inner.core();
+        usage_json(&core.usage, Some(&core.accounts), Utc::now())
     }
 
     /// `usage.threads {since?, by?}`: what the turns spent ([`Spent`]), summed from the log's
@@ -343,7 +501,7 @@ mod tests {
         );
         ev.ts = now;
         view.apply(&ev);
-        let u = usage_json(&view, now);
+        let u = usage_json(&view, None, now);
         let windows = u["runtimes"][0]["windows"].as_array().unwrap();
         for (w, (used, left)) in
             windows
@@ -353,6 +511,135 @@ mod tests {
             assert_eq!(w["used_pct"], used);
             assert_eq!(w["remaining_pct"], left);
         }
+    }
+
+    /// `usage.get` leaves out an entry read in another directory than its account's now (a
+    /// log without the record that cleared it), and keeps one read in the account's directory,
+    /// the native account's, and an older hub's that names no directory.
+    #[test]
+    fn usage_json_leaves_out_another_directorys_usage() {
+        let now = Utc::now();
+        let entry = |account: Option<&str>, dir: Option<&str>| {
+            let mut ev = Event::new(
+                twr_core::HUB_THREAD,
+                1,
+                None,
+                Source::Hub,
+                EventBody::AccountUsage(AccountUsage {
+                    runtime: "claude-code".into(),
+                    account: account.map(str::to_string),
+                    windows: vec![UsageWindow {
+                        window: "seven_day".into(),
+                        used_pct: 40.0,
+                        ..Default::default()
+                    }],
+                    dir: dir.map(str::to_string),
+                    ..Default::default()
+                }),
+            );
+            ev.ts = now;
+            ev
+        };
+        let mut view = UsageView::default();
+        view.apply(&entry(None, None));
+        view.apply(&entry(Some("work"), Some("/acc/a")));
+        view.apply(&entry(Some("old"), None));
+        let accounts = |work: &str| {
+            let mut c = Config::default();
+            for (name, dir) in [("work", work), ("old", "/acc/old")] {
+                c.accounts.entry("claude-code".into()).or_default().insert(
+                    name.into(),
+                    twr_core::config::AccountConfig {
+                        dir: Some(dir.into()),
+                        ..Default::default()
+                    },
+                );
+            }
+            AccountsView::new(&c)
+        };
+        let shown = |accounts: &AccountsView| -> Vec<Value> {
+            usage_json(&view, Some(accounts), now)["runtimes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["account"].clone())
+                .collect()
+        };
+        assert_eq!(
+            shown(&accounts("/acc/a")),
+            [Value::Null, json!("old"), json!("work")]
+        );
+        assert_eq!(shown(&accounts("/acc/b")), [Value::Null, json!("old")]);
+    }
+
+    /// A report merges only into windows read in its session's directory: known windows of
+    /// another directory (a log without the record that cleared them) are another login's, so a
+    /// sparse report starts afresh, and the record says the session's directory.
+    #[tokio::test]
+    async fn a_report_keeps_no_windows_of_another_directory() {
+        use twr_core::event::AccountAdded;
+        let dir = tempfile::tempdir().unwrap();
+        let hub = hub_with_thread(dir.path()).await;
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        {
+            let mut core = hub.inner.core();
+            core.accounts.apply(&Event::new(
+                twr_core::HUB_THREAD,
+                1,
+                None,
+                Source::Hub,
+                EventBody::AccountAdded(AccountAdded {
+                    runtime: "claude-code".into(),
+                    account: "work".into(),
+                    dir: Some(b.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+            ));
+            core.usage.apply(&Event::new(
+                twr_core::HUB_THREAD,
+                1,
+                None,
+                Source::Hub,
+                EventBody::AccountUsage(AccountUsage {
+                    runtime: "claude-code".into(),
+                    account: Some("work".into()),
+                    windows: vec![window("five_hour", 30.0), window("seven_day", 44.0)],
+                    dir: Some(a.to_string_lossy().into_owned()),
+                    ..Default::default()
+                }),
+            ));
+            let view = core.registry.get("t1").unwrap().clone();
+            core.rt("t1").runtime_settings = Some(super::super::restart::RunSettings {
+                account: Some("work".into()),
+                account_dir: Some(b.clone()),
+                ..super::super::restart::RunSettings::of(&view)
+            });
+        }
+        let known = |hub: &Hub| {
+            let core = hub.inner.core();
+            let e = core.usage.get("claude-code", Some("work")).unwrap();
+            let pcts: Vec<(String, f64)> = e
+                .windows
+                .iter()
+                .map(|w| (w.window.clone(), w.used_pct))
+                .collect();
+            (pcts, e.dir.clone())
+        };
+        let b_dir = b.to_str().map(str::to_string);
+        record(&hub, of(vec![window("seven_day", 50.0)]), None);
+        assert_eq!(
+            known(&hub),
+            (vec![("seven_day".into(), 50.0)], b_dir.clone())
+        );
+        // The next report of `b` merges into `b`'s.
+        record(&hub, of(vec![window("five_hour", 5.0)]), None);
+        assert_eq!(
+            known(&hub),
+            (
+                vec![("five_hour".into(), 5.0), ("seven_day".into(), 50.0)],
+                b_dir
+            )
+        );
     }
 
     async fn hub_with_thread(dir: &std::path::Path) -> Hub {

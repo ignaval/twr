@@ -6,6 +6,10 @@
 //!
 //! A subscription request is answered with a normal response, after which the server writes
 //! stream items on the same connection until it closes.
+//!
+//! An error with id 0 is about the connection, which the hub closes next: a line it could not
+//! read (`bad_request`), or the hub stopping ([`codes::STOPPING`]). The request a client waits
+//! for then was not done ([`crate::client::HubClosed`]).
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -55,6 +59,9 @@ pub mod codes {
     /// The orchestrator tried to answer a permission or question the user did not explicitly
     /// answer in its current turn, or to resolve an item it may only annotate (relay rule).
     pub const RELAY_FORBIDDEN: &str = "relay_forbidden";
+    /// The hub is stopping: what it says to a connection it closes as it stops (as the reply
+    /// to request 0), so a client that writes to it later knows why it is gone.
+    pub const STOPPING: &str = "stopping";
     /// Anything else.
     pub const INTERNAL: &str = "internal";
 }
@@ -210,6 +217,151 @@ impl<'de> Deserialize<'de> for ServerMessage {
     }
 }
 
+impl ServerMessage {
+    /// One line the hub wrote (without its newline), read as its `Deserialize` reads it, but
+    /// from the text straight into its types, a stream item's payload too: a subscription's
+    /// replay is thousands of items, and a `Value` of each costs more than reading it. What
+    /// does not parse that way is read the `Value` way, so what that accepts is built the same
+    /// ([`crate::event::EventBody::from_kind_json`] says what else it takes).
+    pub fn from_line(line: &[u8]) -> serde_json::Result<ServerMessage> {
+        /// Whether the key is there, whatever its value (`null` too).
+        fn present<'de, D: Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+            serde::de::IgnoredAny::deserialize(d).map(|_| true)
+        }
+        #[derive(Deserialize)]
+        struct Keys {
+            #[serde(default, deserialize_with = "present")]
+            stream: bool,
+        }
+        #[derive(Deserialize)]
+        struct Item<'a> {
+            stream: StreamKind,
+            #[serde(default)]
+            gseq: Option<u64>,
+            #[serde(borrow)]
+            event: crate::event::WireEventText<'a>,
+        }
+        let direct = serde_json::from_slice::<Keys>(line).and_then(|k| {
+            if k.stream {
+                let i: Item = serde_json::from_slice(line)?;
+                Ok(ServerMessage::Stream(Box::new(StreamItem {
+                    stream: i.stream,
+                    gseq: i.gseq,
+                    event: i.event.into_event()?,
+                })))
+            } else {
+                serde_json::from_slice(line).map(ServerMessage::Response)
+            }
+        });
+        direct.or_else(|_| serde_json::from_slice(line))
+    }
+}
+
+/// [`read_frame`] of what the hub writes, read with [`ServerMessage::from_line`].
+pub async fn read_message<R>(r: &mut R) -> std::io::Result<Option<ServerMessage>>
+where
+    R: AsyncBufRead + Unpin + ?Sized,
+{
+    read_line_max(r, MAX_FRAME, ServerMessage::from_line).await
+}
+
+/// `summary.thread`'s parameters (users only; `twr-hub` `hub::summary`): a one-line summary of
+/// where worker `thread` stands, from the small model `models` names for the runtime that
+/// answers (each runtime's default when left out), at most one per `every_secs` (60 at least,
+/// ten years at most: more is `bad_request`); `retry` after the user turned summaries on again.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryThreadParams {
+    /// The thread, by id, name or alias.
+    pub thread: String,
+    /// The model for each runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<crate::config::SuggestModels>,
+    /// The shortest time between two summaries of the thread, in seconds (`[tui]
+    /// summary_every`).
+    pub every_secs: u64,
+    /// The user turned summaries on again (`/summaries on`): the hub probes the agents' CLIs
+    /// afresh and tries again what calls (of summaries or suggestions) found unable to run,
+    /// as `suggest.next`'s `retry` does.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry: bool,
+}
+
+/// `summary.thread`'s result. `summary` is the thread's summary (`None`: none, `reason` says
+/// why); `basis` names what this ask read of the thread (a hash: the same basis gets the same
+/// summary); `covers` is the routine update the summary is of (the newest it read: `seq`
+/// `covers` of the orchestrator's thread `covers_in`; an unchanged basis, this ask's newest);
+/// `runtime` and `model` answered it; `cached`: no model was asked for this one; `next_after_secs`: ask
+/// again no sooner than this.
+///
+/// `reason` (absent with a fresh or cached summary): `none` (the model had nothing to say),
+/// `interval` (the last summary is younger than `every_secs`: `summary` is that one, made
+/// from an earlier basis, of the updates up to `covers`; also the answer to an ask that waited
+/// on a call made of another basis),
+/// `not_worker` (the orchestrator), `limit` (the hub's hourly cap), `backoff` (a call failed a
+/// moment ago), `failed: ...`, `unavailable: ...` (no runtime can run it here: no CLI, or none
+/// signed in; [`SummaryThreadResult::unavailable`]), `retry: ...` (this runtime can't run, another
+/// may for the next ask).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummaryThreadResult {
+    /// The thread's id.
+    pub thread: String,
+    /// The summary: one plain line.
+    pub summary: Option<String>,
+    /// What this ask read of the thread, as a hash (with `interval`, the summary was made from
+    /// an earlier one).
+    pub basis: String,
+    /// The `seq` (in the orchestrator's thread, `covers_in`) of the newest routine update the
+    /// summary read: the run of updates it is of. `None`: it read none, or there is no summary
+    /// (and from a hub before it was given).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covers: Option<u64>,
+    /// The orchestrator's conversation (its thread's id) the summary read the updates in:
+    /// `covers` is a `seq` of that thread's. A reset or a switch of the orchestrator is a new
+    /// thread whose seqs start again, so an update is told by both. `None`: there was no
+    /// conversation to read, or no summary was made or kept to answer with (the hub held off,
+    /// a call failed), and from a hub before it was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covers_in: Option<String>,
+    /// The runtime that answered (`claude-code`, `codex`).
+    pub runtime: Option<String>,
+    /// The model that answered.
+    pub model: Option<String>,
+    /// Kept from before: no model was asked.
+    pub cached: bool,
+    /// Why there is no fresh summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Asking again sooner gets the same answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after_secs: Option<u64>,
+    /// The hub's summary calls since it started.
+    pub stats: SummaryStats,
+}
+
+impl SummaryThreadResult {
+    /// Whether no runtime can run summaries here (no CLI, or none signed in): asking again
+    /// gets the same.
+    pub fn unavailable(&self) -> bool {
+        self.reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("unavailable: "))
+    }
+}
+
+/// The hub's summary calls since it started (`summary.thread` `stats`).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SummaryStats {
+    /// Calls made.
+    pub calls: u64,
+    /// Calls that failed.
+    pub failures: u64,
+    /// What they cost at list price, in US dollars.
+    pub cost_usd: f64,
+}
+
 /// Serializes `msg` as one NDJSON line (with the trailing newline).
 pub fn encode_line<T: Serialize>(msg: &T) -> serde_json::Result<String> {
     let mut s = serde_json::to_string(msg)?;
@@ -245,6 +397,18 @@ where
     R: AsyncBufRead + Unpin + ?Sized,
     T: DeserializeOwned,
 {
+    read_line_max(r, max, |line| serde_json::from_slice(line)).await
+}
+
+/// [`read_frame_max`] with each line parsed by `parse`.
+async fn read_line_max<R, T>(
+    r: &mut R,
+    max: usize,
+    parse: impl Fn(&[u8]) -> serde_json::Result<T>,
+) -> std::io::Result<Option<T>>
+where
+    R: AsyncBufRead + Unpin + ?Sized,
+{
     let mut buf = Vec::new();
     loop {
         buf.clear();
@@ -268,7 +432,7 @@ where
         if buf.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        return serde_json::from_slice(&buf)
+        return parse(&buf)
             .map(Some)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e));
     }
@@ -344,6 +508,28 @@ mod tests {
         assert_eq!(serde_json::from_str::<Response>(&s).unwrap(), err);
     }
 
+    /// `covers_in` is new: an older hub's answer (no `covers_in`) reads as `None`, an answer
+    /// without it is written without it, and one with it goes both ways.
+    #[test]
+    fn a_summary_result_carries_the_conversation_its_covers_is_in() {
+        let old: SummaryThreadResult =
+            serde_json::from_str(r#"{"thread":"api","summary":"ok","basis":"b","covers":7}"#)
+                .unwrap();
+        assert_eq!((old.covers, old.covers_in.as_deref()), (Some(7), None));
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("covers_in").is_none(), "{v}");
+        let new = SummaryThreadResult {
+            covers_in: Some("o2".into()),
+            ..old
+        };
+        let v = serde_json::to_value(&new).unwrap();
+        assert_eq!((&v["covers"], &v["covers_in"]), (&json!(7), &json!("o2")));
+        assert_eq!(
+            serde_json::from_value::<SummaryThreadResult>(v).unwrap(),
+            new
+        );
+    }
+
     #[test]
     fn stream_item_shape_and_server_message_dispatch() {
         let ev = crate::event::Event::new(
@@ -377,6 +563,96 @@ mod tests {
 
         let m: ServerMessage = serde_json::from_str(r#"{"id":1,"result":true}"#).unwrap();
         assert_eq!(m, ServerMessage::Response(Response::ok(1, json!(true))));
+    }
+
+    /// A message parsed from its text straight into its type ([`ServerMessage::from_line`])
+    /// is the one a `Value` gives, and what one way refuses the other refuses: `stream`
+    /// decides even when `null`, a key given twice keeps its last value. The `Deserialize`
+    /// impls stay the `Value` way, for any deserializer: inside an untagged enum (which
+    /// buffers what it reads), and through `from_value` without touching a number.
+    #[test]
+    fn server_messages_parse_as_through_a_value() {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Message(ServerMessage),
+            #[allow(dead_code)]
+            Other(u8),
+        }
+        let ev = crate::event::Event::new(
+            "t1",
+            1,
+            None,
+            Source::Hub,
+            EventBody::TurnEnded(crate::event::TurnEnded::default()),
+        );
+        let line = serde_json::to_string(&StreamItem {
+            stream: StreamKind::Thread,
+            gseq: None,
+            event: ev.clone(),
+        })
+        .unwrap();
+        let Either::Message(ServerMessage::Stream(item)) =
+            serde_json::from_str::<Either>(&line).unwrap()
+        else {
+            panic!("not a stream item");
+        };
+        assert_eq!(item.event, ev);
+        let m: ServerMessage =
+            serde_json::from_value(json!({"id": 1, "result": 51.248178375505404})).unwrap();
+        assert_eq!(
+            m,
+            ServerMessage::Response(Response::ok(1, json!(51.248178375505404)))
+        );
+
+        let value_way = |json: &str| -> Result<ServerMessage, String> {
+            let v: Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            if v.get("stream").is_some() {
+                serde_json::from_value(v)
+                    .map(|i| ServerMessage::Stream(Box::new(i)))
+                    .map_err(|e| e.to_string())
+            } else {
+                serde_json::from_value(v)
+                    .map(ServerMessage::Response)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let ev = crate::event::Event::new(
+            "t1",
+            7,
+            Some(2),
+            Source::Adapter("codex".into()),
+            EventBody::AgentText(crate::event::AgentText {
+                text: "hi \u{1F600} \"quoted\"\n".into(),
+                ..Default::default()
+            }),
+        );
+        let item = serde_json::to_string(&StreamItem {
+            stream: StreamKind::Control,
+            gseq: Some(9),
+            event: ev,
+        })
+        .unwrap();
+        let cases = [
+            item.clone(),
+            item.replacen("{", r#"{"gseq":1,"#, 1),
+            item.replacen(r#""stream":"control""#, r#""stream":null"#, 1),
+            r#"{"id":1,"result":true}"#.to_string(),
+            r#"{"id":1,"result":{"a":[1,2]},"id":2}"#.to_string(),
+            r#"{"id":3,"error":{"code":-32601,"message":"no such method"}}"#.to_string(),
+            r#"{"id":1,"result":true,"stream":null}"#.to_string(),
+            r#"{"stream":"thread"}"#.to_string(),
+            "[1,2]".to_string(),
+            "{".to_string(),
+        ];
+        for json in &cases {
+            let direct = ServerMessage::from_line(json.as_bytes()).map_err(|e| e.to_string());
+            match (direct, value_way(json)) {
+                (Ok(d), Ok(v)) => assert_eq!(d, v, "{json}"),
+                (Err(_), Err(_)) => {}
+                (d, v) => panic!("{json}: {d:?} but {v:?}"),
+            }
+        }
     }
 
     #[tokio::test]

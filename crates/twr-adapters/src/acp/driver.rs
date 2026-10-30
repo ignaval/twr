@@ -4,10 +4,11 @@
 //! carries out hub commands, and reports the exit with the last [`STDERR_TAIL`] bytes of
 //! stderr.
 //!
-//! The process runs in its own process group, kill-on-drop, with twr's secrets removed from
-//! its environment ([`crate::process::scrub`]); the rest of its group is killed whenever it
-//! exits. `stop` cancels what runs, answers pending requests `cancelled`, closes stdin and,
-//! after the grace period, kills the process group.
+//! The process runs in a session and process group of its own (no controlling terminal),
+//! kill-on-drop, with twr's secrets removed from its environment
+//! ([`crate::process::scrub`]); the rest of its group is killed whenever it exits. `stop`
+//! cancels what runs, answers pending requests `cancelled`, closes stdin and, after the grace
+//! period, kills the process group.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -42,30 +43,31 @@ pub fn absolute_cwd(cwd: &Path) -> anyhow::Result<PathBuf> {
     }
 }
 
-/// Starts `program args` (under `wrap`, [`process::wrapped`]) in `cwd` with `env` added
-/// (twr's secrets removed), stdio piped, in its own process group, killed on drop. `fix`: what
+/// Starts `program args` (under `wrap`, [`process::wrapped`]) in `cwd` with `env` added and
+/// `remove` removed (and twr's secrets: [`process::apply_env`]), stdio piped, in a session of its own ([`process::new_session`]:
+/// no controlling terminal, its own process group), killed on drop. `fix`: what
 /// to do when the program is not there ([`process::start_error`]).
 pub fn launch(
     wrap: &[String],
     program: &Path,
     args: &[String],
     env: &[(String, String)],
+    remove: &[String],
     cwd: &Path,
     fix: &str,
 ) -> anyhow::Result<Child> {
     let mut cmd = process::wrapped(wrap, program);
     cmd.args(args)
-        .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
-    process::scrub(&mut cmd);
+        .kill_on_drop(true);
+    process::new_session(&mut cmd);
+    process::apply_env(&mut cmd, env.iter().cloned(), remove);
     process::check_wrapped(wrap, program, env, cwd, fix)?;
     cmd.spawn()
-        .map_err(|e| process::start_error(e, program, cwd, fix))
+        .map_err(|e| process::start_error(e, program, env, cwd, fix))
 }
 
 /// Last [`STDERR_TAIL`] bytes of a stream.
@@ -137,10 +139,13 @@ fn queue_line(stdin: &mut Stdin, line: String, log: &'static str) {
 
 /// Sends `SIGKILL` to process group `pgid` with the `kill` command (no libc in this crate).
 fn kill_group(pgid: u32, log: &'static str) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, ?status, "{log}: killed process group");
 }
 
@@ -315,6 +320,11 @@ pub async fn drive<D: Dialect>(
                 Some(AdapterCmd::Interrupt) => {
                     for line in tr.interrupt().writes { queue_line(&mut stdin, line, log); }
                 },
+                Some(AdapterCmd::Compact { turn }) => {
+                    if apply(&mut stdin, &end, &tail, tr.compact(turn), log) {
+                        stop_deadline = Some(begin_stop(&mut tr, &mut stdin, grace, log));
+                    }
+                }
             },
             _ = sleep_until_opt(stop_deadline) => {
                 tracing::warn!(?pid, "{log}: runtime did not exit after stop; killing its process group");

@@ -10,7 +10,7 @@ use twr_core::event::*;
 use twr_decisions::{DecisionContext, GradeContext, LadderRun};
 
 use super::append::hydrated_from_store;
-use super::{retry, twr_ext_map, Batch, Core, EndedTurn, Inner};
+use super::{retry, twr_ext, twr_ext_map, Batch, Core, EndedTurn, Inner};
 use crate::report;
 use crate::store;
 
@@ -114,14 +114,63 @@ impl Core {
         if result == TurnResult::Interrupted {
             return Ok(());
         }
+        // A turn its runtime opened for a background task's notification that saw no run
+        // (`ext.twr.no_run`) handled nothing: its report is the interim one it followed, again
+        // (`hub::wake`), so the worker still counts as yielded with that work unhandled.
+        if let Some(Event {
+            body: EventBody::TurnEnded(p),
+            ..
+        }) = self.stored_event(thread, Some(turn), "turn.ended")?
+        {
+            if twr_ext(&p.ext).is_some_and(|t| t.get(super::wake::NO_RUN_KEY) == Some(&json!(true)))
+            {
+                if self.logged_report(thread, turn)?.is_some() {
+                    return Ok(());
+                }
+                // Only a completed turn's interim report: a failed turn keeps its failure.
+                let report_turn = self
+                    .view(thread)
+                    .map_err(anyhow::Error::new)?
+                    .last_report
+                    .as_ref()
+                    .and_then(|r| r.turn);
+                let completed = match report_turn {
+                    Some(t) => matches!(
+                        self.stored_event(thread, Some(t), "turn.ended")?,
+                        Some(Event { body: EventBody::TurnEnded(e), .. })
+                            if e.result == TurnResult::Completed
+                    ),
+                    None => false,
+                };
+                let view = self.view(thread).map_err(anyhow::Error::new)?;
+                if let Some(report) = super::wake::no_run_report(view, turn).filter(|_| completed) {
+                    let mut batch = Batch::default();
+                    batch.push(
+                        thread,
+                        Some(turn),
+                        Source::Hub,
+                        EventBody::ReportReady(report),
+                    );
+                    self.append_batch(hub, batch)?;
+                    return Ok(());
+                }
+            }
+        }
+        // A compaction is maintenance (`hub::compact`): no grade, report or review.
+        if self.is_compaction(thread, turn)? {
+            return self.react_to_compaction_end(hub, thread, turn, result);
+        }
         let done = store::turn_reactions(self.store.conn(), thread, turn)?;
         let view = self.view(thread).map_err(anyhow::Error::new)?;
         if view.is_orchestrator() {
             return self.react_to_orchestrator_turn_end(hub, thread, turn, result, &done);
         }
+        // The thread's own work only: a `!` command of the user's is no task its turn waits
+        // for, and its end starts no turn that would report again.
         let background_starts: serde_json::Map<String, Value> = view
             .background_tasks
             .iter()
+            .filter(|(_, t)| !t.shell)
             .map(|(id, t)| (id.clone(), json!(t.started_seq)))
             .collect();
         let background_count = background_starts.len();
@@ -207,12 +256,14 @@ impl Core {
     /// turns get no grade, report or review (its replies go to the user, who talks to it
     /// directly; a report would only point back at it). A failed one raises an `error` item
     /// quoting the failure (`turn.ended` `ext.twr.error`, e.g. a runtime that cannot start),
-    /// unless the log has one for the turn. The item replaces the open hub `error` items of the
-    /// thread's earlier turns (resolved `by: timeout`, `ext.twr.superseded_by`, in the same
-    /// batch), so an orchestrator failing again (the next notice, each hub restart) leaves one
-    /// item, its latest failure. Derived from the log only: startup recovery runs it for every
-    /// failed orchestrator turn without its item, oldest first
-    /// ([`Core::recover_turn_reactions`]), and ends the same way.
+    /// unless the log has one for the turn; account-aware as a worker's
+    /// ([`Core::failure_words`]: a limit card with `ext.twr.limit` and `ext.twr.account`, a
+    /// named account's sign-in hint, its login checked), and never retried. The item replaces
+    /// the open hub `error` items of the thread's earlier turns (resolved `by: timeout`,
+    /// `ext.twr.superseded_by`, in the same batch), so an orchestrator failing again (the next
+    /// notice, each hub restart) leaves one item, its latest failure. Derived from the log
+    /// only: startup recovery runs it for every failed orchestrator turn without its item,
+    /// oldest first ([`Core::recover_turn_reactions`]), and ends the same way.
     fn react_to_orchestrator_turn_end(
         &mut self,
         hub: &Inner,
@@ -224,17 +275,32 @@ impl Core {
         if result != TurnResult::Error || done.errored {
             return Ok(());
         }
-        let name = self.view(thread).map_err(anyhow::Error::new)?.name.clone();
-        let detail = match self.stored_event(thread, Some(turn), "turn.ended")? {
+        let view = self.view(thread).map_err(anyhow::Error::new)?.clone();
+        let name = view.name.clone();
+        let ended = match self.stored_event(thread, Some(turn), "turn.ended")? {
             Some(Event {
                 body: EventBody::TurnEnded(p),
                 ..
-            }) => retry::failure_detail(&p),
+            }) => Some(p),
             _ => None,
         };
-        let summary = match detail {
-            Some(d) => format!("{name}: turn {turn} failed: {d}"),
-            None => format!("{name}: turn {turn} failed"),
+        // As a worker's card says it (`hub::retry`): a limit names the account and its reset,
+        // a sign-in failure on a named account how to sign that one in (and its login is
+        // checked); never retried.
+        let limited = ended.as_ref().is_some_and(retry::limit_failure);
+        let mut twr = json!({});
+        let summary = match self.failure_words(hub, &view, turn, ended.as_ref(), limited, &mut twr)
+        {
+            retry::FailureWords::Limit(summary) => summary,
+            retry::FailureWords::Detail(detail) => match detail {
+                Some(d) => format!("{name}: turn {turn} failed: {d}"),
+                None => format!("{name}: turn {turn} failed"),
+            },
+        };
+        let ext = if twr.as_object().is_some_and(|o| o.is_empty()) {
+            None
+        } else {
+            twr_ext_map(twr)
         };
         let attn_id = new_id();
         let mut older: Vec<String> = self
@@ -268,6 +334,7 @@ impl Core {
                 reason: AttentionReason::Error,
                 summary,
                 options: vec!["dismiss".into()],
+                ext,
                 ..Default::default()
             }),
         );
@@ -375,7 +442,8 @@ impl Core {
     /// Startup recovery: completes the reactions of every ended (`completed` / `error`) worker
     /// turn that has no report (a hub crash between `turn.ended` and its reactions would
     /// otherwise skip them forever), oldest first, of every failed orchestrator turn without
-    /// its `error` item (orchestrator turns get no report,
+    /// its `error` item (a compaction whose `context.compacted` says it failed included,
+    /// whatever its end said; orchestrator turns get no report,
     /// [`Core::react_to_orchestrator_turn_end`]), and of every thread's last
     /// ended turn (a log written before reactions were one batch can also hold a report
     /// without its review). Uses the turn's final text from the log, hydrated, and the turn's
@@ -394,7 +462,16 @@ impl Core {
                 todo.push((thread.clone(), turn, TurnResult::Error));
             }
         }
-        for ev in store::unreported_turn_ends(self.store.conn(), &orchestrators)? {
+        // Only the live workers' ends: those of a thread the registry does not have (deleted)
+        // are never completed, and reading every thread's would read all history.
+        let workers: Vec<String> = self
+            .registry
+            .list()
+            .into_iter()
+            .filter(|v| !v.is_orchestrator())
+            .map(|v| v.id.clone())
+            .collect();
+        for ev in store::unreported_turn_ends(self.store.conn(), &workers)? {
             let (EventBody::TurnEnded(p), Some(turn)) = (&ev.body, ev.turn) else {
                 continue;
             };
@@ -556,6 +633,7 @@ pub(super) fn interim_tasks_running(
         .and_then(Value::as_object);
     running
         .iter()
+        .filter(|(_, t)| !t.shell)
         .filter(|(id, t)| match starts {
             Some(starts) => starts
                 .get(id.as_str())

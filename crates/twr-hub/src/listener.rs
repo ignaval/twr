@@ -154,8 +154,10 @@ impl RunnerListener {
     /// every connection).
     pub fn serve(self, hub: Hub) -> RunnerServer {
         tracing::info!(addr = %self.addr, tls = self.is_tls(), "listening for runners");
+        hub.set_listening(true);
         RunnerServer {
             addr: self.addr,
+            hub: hub.clone(),
             task: tokio::spawn(accept_loop(self, hub)),
         }
     }
@@ -164,6 +166,8 @@ impl RunnerListener {
 /// The serving runner listener. Dropping it stops accepting and closes every connection.
 pub struct RunnerServer {
     addr: SocketAddr,
+    /// Told when the listener stops serving it.
+    hub: Hub,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -176,6 +180,7 @@ impl RunnerServer {
 
 impl Drop for RunnerServer {
     fn drop(&mut self) {
+        self.hub.set_listening(false);
         self.task.abort();
     }
 }

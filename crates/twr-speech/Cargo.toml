@@ -1,0 +1,30 @@
+[package]
+name = "twr-speech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+description = "twr's speaker: reads the orchestrator's messages aloud on the machine you listen on (`twr speak`, the TUI's own)"
+
+[dependencies]
+twr-core.workspace = true
+twr-avspeech.workspace = true
+anyhow.workspace = true
+# The speaker's keys (s, p, n, q) in its own terminal, in raw mode.
+crossterm.workspace = true
+futures.workspace = true
+# Process groups of the engines' programs, the state file's lock (`flock`), `isatty`.
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The speaker's device id, made once.
+uuid.workspace = true
+
+[dev-dependencies]
+# `tokio::time::pause`: the player's timing in virtual time.
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

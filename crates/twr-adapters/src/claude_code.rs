@@ -28,13 +28,15 @@
 //! (code 0). A `--help` that could not be read is not cached ([`cli`]). A process that exits
 //! refusing its command line gets the same update hint as the last line of its stderr tail,
 //! after why `--help` was not read when it was not. The binary is `claude` on `PATH` unless
-//! [`BIN_ENV`] (or [`ClaudeCodeAdapter::with_bin`]) names another one.
+//! [`BIN_ENV`] (or [`ClaudeCodeAdapter::with_bin`]) names another one; the `PATH` is the
+//! runtime's ([`crate::resolve::resolve`]: its thread's `env`, which a runner fills with the
+//! login shell's), and the probe reads the binary found there.
 //!
 //! The process runs in `SpawnConfig::cwd` with `SpawnConfig::env` added and twr's secrets
 //! removed ([`crate::process::SCRUBBED_ENV`], inherited or configured; `attach` too), and, with
 //! `--settings` (the orchestrator's file guard), the variables that would keep Claude Code from
 //! running its hook ([`guard::HOOK_ENV`], inherited or configured; `attach` too), in its
-//! own process group, with stdin/stdout piped and the last 4 KB of stderr kept for `Exited`.
+//! own session and process group (no controlling terminal), with stdin/stdout piped and the last 4 KB of stderr kept for `Exited`.
 //! Stdout lines (at most [`crate::process::MAX_LINE`] bytes each: a longer one is skipped, and
 //! a skipped `result` still ends its turn as an error with `ext.twr.error`) go through the
 //! pure [`translate::Translator`]; see there for the mapping:
@@ -132,6 +134,9 @@ pub struct ClaudeCodeAdapter {
     stop_grace: Duration,
     max_line: usize,
     probe_timeout: Duration,
+    /// [`TranslatorOptions::missing_result_after`] and
+    /// [`TranslatorOptions::notice_run_after`] (`None`: the defaults).
+    waits: (Option<Duration>, Option<Duration>),
 }
 
 impl Default for ClaudeCodeAdapter {
@@ -148,6 +153,7 @@ impl ClaudeCodeAdapter {
             stop_grace: STOP_GRACE,
             max_line: process::MAX_LINE,
             probe_timeout: cli::PROBE_TIMEOUT,
+            waits: (None, None),
         }
     }
 
@@ -158,12 +164,21 @@ impl ClaudeCodeAdapter {
             stop_grace: STOP_GRACE,
             max_line: process::MAX_LINE,
             probe_timeout: cli::PROBE_TIMEOUT,
+            waits: (None, None),
         }
     }
 
     /// Changes how long `stop` waits before killing the process group.
     pub fn stop_grace(mut self, grace: Duration) -> Self {
         self.stop_grace = grace;
+        self
+    }
+
+    /// Changes how long after the main agent's message stopped a missing `result` ends the
+    /// turn ([`translate::MISSING_RESULT_AFTER`] by default), and how long a turn opened for a
+    /// background task's notification waits for its run ([`translate::NOTICE_RUN_AFTER`]).
+    pub fn turn_waits(mut self, missing_result: Duration, notice_run: Duration) -> Self {
+        self.waits = (Some(missing_result), Some(notice_run));
         self
     }
 
@@ -180,11 +195,10 @@ impl ClaudeCodeAdapter {
         self
     }
 
-    /// The binary this adapter runs.
+    /// The binary this adapter runs ([`crate::resolve::select_program`]: this adapter's own,
+    /// else [`BIN_ENV`], else `claude`; an empty one counts as unset).
     pub fn bin(&self) -> PathBuf {
-        self.bin
-            .clone()
-            .or_else(|| std::env::var_os(BIN_ENV).map(PathBuf::from))
+        crate::resolve::select_program(NAME, self.bin.as_deref(), |k| std::env::var_os(k))
             .unwrap_or_else(|| PathBuf::from("claude"))
     }
 }
@@ -200,13 +214,15 @@ fn missing_fix() -> String {
 /// front.
 pub const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
-/// Why this box's `claude` (the adapter's binary: [`BIN_ENV`], else `claude` on `PATH`) cannot
-/// take a reasoning effort, when an earlier spawn probed it and its `--help` does not list
-/// `--effort` ([`cli::effort_refusal`]). Never probes: `None` when nothing is known yet (a
-/// spawn then refuses the effort itself, with the same hint).
-pub fn effort_refusal() -> Option<String> {
+/// Why the `claude` a thread with environment `env` and working directory `cwd` would run (the
+/// adapter's binary: [`BIN_ENV`], else `claude` on the `PATH` `env` gives, resolved in `cwd`, as
+/// a spawn resolves it) cannot take a reasoning effort, when an earlier spawn probed it and its
+/// `--help` does not list `--effort` ([`cli::effort_refusal`]). Never probes: `None` when
+/// nothing is known yet (a spawn then refuses the effort itself, with the same hint).
+pub fn effort_refusal(env: &[(String, String)], cwd: &std::path::Path) -> Option<String> {
     let bin = ClaudeCodeAdapter::new().bin();
-    let support = cli::cached(&bin, std::path::Path::new(""))?;
+    let resolved = crate::resolve::resolve(&bin, env, None, cwd);
+    let support = cli::cached(&resolved, cwd)?;
     cli::effort_refusal(&bin, &support)
 }
 
@@ -355,6 +371,11 @@ impl Adapter for ClaudeCodeAdapter {
         Some((self.bin(), missing_fix()))
     }
 
+    /// `/compact` as the turn's message ([`Translator::compact_message`]).
+    fn compacts(&self) -> bool {
+        true
+    }
+
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let bin = self.bin();
         let mode = permission_mode(&cfg)?;
@@ -365,9 +386,12 @@ impl Adapter for ClaudeCodeAdapter {
             cfg,
             grace: self.stop_grace,
             max_line: self.max_line,
+            waits: self.waits,
         };
         let (handle, end) = AdapterHandle::pair();
-        match cli::lookup(&start.bin, &start.cfg.cwd, self.probe_timeout) {
+        // The binary the process will run, on the `PATH` it gets: what the probe reads.
+        let resolved = crate::resolve::resolve(&start.bin, &start.cfg.env, None, &start.cfg.cwd);
+        match cli::lookup(&resolved, &start.cfg.cwd, self.probe_timeout) {
             cli::Lookup::Known(help) => {
                 let started = start.launch(&help)?;
                 started.report_pid(&end);
@@ -384,7 +408,10 @@ impl Adapter for ClaudeCodeAdapter {
 
     fn attach_command(&self, cfg: &SpawnConfig, session_id: &str) -> Option<std::process::Command> {
         // Only what is already known of this box's binary (no probe here).
-        let known = cli::cached(&self.bin(), &cfg.cwd);
+        let known = cli::cached(
+            &crate::resolve::resolve(&self.bin(), &cfg.env, None, &cfg.cwd),
+            &cfg.cwd,
+        );
         self.interactive(cfg, session_id, known.as_ref())
     }
 
@@ -450,8 +477,8 @@ impl ClaudeCodeAdapter {
         if let Some(e) = effort {
             cmd.args([cli::EFFORT, e]);
         }
-        cmd.args(tool_args(cfg)).envs(process::attach_env(cfg));
-        process::scrub_std(&mut cmd);
+        cmd.args(tool_args(cfg));
+        process::apply_env_std(&mut cmd, process::attach_env(cfg), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }
@@ -470,6 +497,7 @@ struct Start {
     first: Option<(String, u64)>,
     grace: Duration,
     max_line: usize,
+    waits: (Option<Duration>, Option<Duration>),
 }
 
 /// A started process with what its driver needs.
@@ -550,13 +578,12 @@ impl Start {
         let plan = cli::plan(bin, help.support(), self.mode, &full).map_err(anyhow::Error::msg)?;
         let mut cmd = process::wrapped(&cfg.wrap, bin);
         cmd.args(build_args_with(cfg, &session_id, plan))
-            .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
-        process::scrub(&mut cmd);
+            .kill_on_drop(true);
+        process::new_session(&mut cmd);
+        process::apply_env(&mut cmd, cfg.env.iter().cloned(), &cfg.env_remove);
         for k in guard_env(cfg) {
             cmd.env_remove(k);
         }
@@ -566,13 +593,15 @@ impl Start {
         process::check_wrapped(&cfg.wrap, bin, &cfg.env, &cfg.cwd, &missing_fix())?;
         let child = cmd
             .spawn()
-            .map_err(|e| process::start_error(e, bin, &cfg.cwd, &missing_fix()))?;
+            .map_err(|e| process::start_error(e, bin, &cfg.env, &cfg.cwd, &missing_fix()))?;
         let mut translator = Translator::new(TranslatorOptions {
             thinking: cfg.thinking,
             pid: child.id(),
             exe: Some(bin.to_string_lossy().into_owned()),
             resumed,
             mode: plan.mode.to_string(),
+            missing_result_after: self.waits.0,
+            notice_run_after: self.waits.1,
         });
         if cfg.refresh_system_prompt {
             let mut metadata = serde_json::Map::new();
@@ -685,10 +714,13 @@ fn queue_line(stdin: &mut Stdin, line: String) {
 
 /// Sends `SIGKILL` to process group `pgid` with the `kill` command (no libc in this crate).
 fn kill_group(pgid: u32) {
-    let status = std::process::Command::new("kill")
-        .args(["-KILL", "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args(["-KILL", "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, ?status, "claude-code: killed process group");
 }
 
@@ -758,7 +790,17 @@ async fn drive(started: Started, mut end: AdapterEnd, early: VecDeque<AdapterCmd
     // Whether the process wrote anything to stdout (one refusing its command line does not).
     let mut heard = false;
     loop {
+        // What the translator awaits by a deadline (a missing `result`, a notification's run).
+        let awaited = tr.deadline().map(|at| {
+            tokio::time::Instant::now() + (at - chrono::Utc::now()).to_std().unwrap_or_default()
+        });
         tokio::select! {
+            _ = sleep_until_opt(awaited), if awaited.is_some() && stop_deadline.is_none() => {
+                let out = tr.expire(chrono::Utc::now());
+                if emit(&mut stdin, &end, &tail, out) {
+                    stop_deadline = Some(begin_stop(&mut tr, &mut stdin, grace));
+                }
+            }
             line = lines.next_line(), if stdout_open => match line {
                 Ok(Some(l)) => {
                     heard = true;
@@ -836,6 +878,11 @@ fn on_cmd(
             if let Some(line) = tr.interrupt() {
                 queue_line(stdin, line);
             }
+            false
+        }
+        Some(AdapterCmd::Compact { turn }) => {
+            let line = tr.compact_message(turn);
+            queue_line(stdin, line);
             false
         }
         Some(AdapterCmd::Stop) | None => true,

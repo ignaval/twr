@@ -2,11 +2,16 @@
 
 #[macro_use]
 mod term;
+mod accounts;
+mod boxes;
+mod dial_in;
 mod pretty;
+mod speech;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
 use std::time::Duration;
@@ -16,7 +21,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use twr_core::blob::hydrate_deep;
 use twr_core::client::Client;
-use twr_core::config::Config;
+use twr_core::config::{BoxesFile, Config};
 use twr_core::event::{Event, DELETE_KEY, HUB_THREAD};
 use twr_core::git::human_bytes;
 use twr_core::paths::{check_socket_path, sh_word, Paths, DEFAULT_WORKSPACE, WORKSPACE_ENV};
@@ -106,6 +111,8 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+// Parsed once per process: `twr runner`'s many hidden flags make its variant the largest.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Run the hub in the foreground (logs to stderr). `twr hub stop` stops a running hub.
@@ -178,7 +185,12 @@ enum Cmd {
     /// directory, and whatever it cannot decide within its deadline (a deny decision on stdout
     /// and exit 2).
     #[command(name = "claude-memory-guard", hide = true)]
-    ClaudeMemoryGuard,
+    ClaudeMemoryGuard {
+        /// The one memory directory to allow (the `autoMemoryDirectory` the hub set), instead
+        /// of the ones derived from the session's transcript and working directory.
+        #[arg(long)]
+        memory_dir: Option<PathBuf>,
+    },
     /// Serve the twr MCP tools on stdin/stdout for the orchestrator's runtime (logs go to
     /// stderr; stdout is the MCP channel). The hub starts it for the orchestrator with
     /// `TWR_ORCH_TOKEN`; it refuses to start without that token.
@@ -277,8 +289,10 @@ enum Cmd {
     /// next time. With `--runtime`, the thread moves to that runtime: its current runtime stops
     /// (after the turn it runs), and its next turn starts a new session of the new one, given a
     /// handoff of what the previous session did; a model or effort left out is the new
-    /// runtime's default. Not for the orchestrator (switch it with `twr orchestrator use`); a
-    /// pty thread can only move to another runtime.
+    /// runtime's default. Moving back to a runtime it left a session of resumes that session
+    /// instead, told what the thread did since, with the settings it had (`default` starts a new
+    /// one). Not for the orchestrator (switch it with `twr orchestrator use`); a pty thread can
+    /// only move to another runtime.
     Model {
         /// Thread id, name, alias or unique prefix.
         thread: String,
@@ -290,9 +304,20 @@ enum Cmd {
         effort: Option<String>,
         /// Move the thread to this runtime (`claude-code`, `codex`, `grok-build`, a configured
         /// `[runtimes.<name>]` preset, or `acp:<command>`; not `pty`): the same thread,
-        /// worktree and branch, on a new session.
+        /// worktree and branch, on a new session (or, back on a runtime and account it left, on
+        /// the session it left there). `<runtime>:<account>` (`codex:team`) picks the account too.
         #[arg(long)]
         runtime: Option<String>,
+        /// Move the thread to this account of its runtime (`twr account list`; a glob or a
+        /// comma-separated list takes the first usable one): a new session there, given a
+        /// handoff, keeping the model and effort.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        /// Move it although the thread's or its project's pin keeps it off that account
+        /// (`--account`, or `--runtime <runtime>:<account>`; on a terminal, a refused move asks
+        /// instead).
+        #[arg(long)]
+        outside_pin: bool,
     },
     /// Rename a worker thread. The name must be free and work as a git branch name, like
     /// `--name`. Its worktree path and branch keep the name they were made with, and its
@@ -337,6 +362,18 @@ enum Cmd {
         /// Thread id, name, alias or unique prefix.
         thread: String,
     },
+    /// Compact a thread's context, as its agent's own /compact does: a turn of its own, now or
+    /// after its running turn and the messages queued before. Claude Code, Codex and Grok
+    /// Build threads on this machine; refused for other runtimes and remote boxes.
+    Compact {
+        /// Thread id, name, alias or unique prefix.
+        thread: String,
+        /// Instead of compacting: turn the hub's offers to compact this thread's context once
+        /// its prompt cache expired on or off (`[threads] idle_compaction`; a card's "Don't
+        /// ask for <thread>" turns them off).
+        #[arg(long, value_parser = ["on", "off"])]
+        offers: Option<String>,
+    },
     /// Delete threads: stop each one's runtime and move its worktree (uncommitted changes too,
     /// or only its record when a park removed it) and its recorded branch (`twr/<its name when
     /// the worktree was made>`: a rename does not change it) to the trash of its box (`twr trash`: purged after `[trash] keep_days`, 7 by default; `twr trash
@@ -358,6 +395,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TrashCmd,
     },
+    /// The hub's log: its size, and moving old agent events out of it (`[log]`).
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
+    },
     /// Run a command for a thread as a job of the hub: it waits for the machine's job slots,
     /// shows as the thread's background work, and its end (exit code and the end of its
     /// output) comes back to the thread as a prompt. A thread's agent runs jobs for its own
@@ -365,6 +407,58 @@ enum Cmd {
     Job {
         #[command(subcommand)]
         cmd: JobCmd,
+    },
+    /// Reading aloud, the hub machine's end (docs/read-aloud.md).
+    Speech {
+        #[command(subcommand)]
+        cmd: SpeechCmd,
+    },
+    /// A speaker on this machine: reads aloud the orchestrator's messages that this machine's
+    /// hubs send, or with `--ssh HOST` those of HOST's hubs, over `ssh HOST twr speech feed`:
+    /// every workspace unless `-w` names one. Keys in its terminal: `s` stop, `p` pause or
+    /// resume, `n` skip, `q` quit. What it reads is turned on with `/read on` in the TUI
+    /// (docs/read-aloud.md).
+    Speak {
+        /// Read aloud what HOST's hubs send, over ssh (your ssh config and keys).
+        #[arg(long, value_name = "HOST")]
+        ssh: Option<String>,
+        /// Every workspace (of this machine, or of HOST): the default; refused with `-w`.
+        #[arg(long)]
+        all_workspaces: bool,
+        /// The speaker's name in `/read status` and for `/read N --on` (default: this
+        /// machine's name).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The engine, over `[speech] engine`: say, avspeech, spd or command.
+        #[arg(long, value_name = "ENGINE", value_parser = ["say", "avspeech", "spd", "command"])]
+        engine: Option<String>,
+        /// The engine's voice, over the one kept by `/read voice` and `[speech] voice`.
+        #[arg(long, value_name = "VOICE")]
+        voice: Option<String>,
+        /// Words per minute (80 to 500), over the rate kept by `/read rate` and `[speech]
+        /// rate`.
+        #[arg(long, value_name = "WPM", value_parser = clap::value_parser!(u32).range(80..=500))]
+        rate: Option<u32>,
+        /// Print a LaunchAgent (macOS) or systemd user unit (Linux) that runs this `twr speak`,
+        /// and the commands to install it; installs nothing.
+        #[arg(long)]
+        print_service: bool,
+    },
+    /// `mosh HOST -- twr ARGS...` (with `--ssh`: `ssh -t HOST -- twr ARGS...`) with `twr speak
+    /// --ssh HOST` running beside it, in the background (its output in `speak.log` in twr's
+    /// data directory), stopped when the session ends.
+    Remote {
+        /// The host, as mosh and ssh take it (`me@box`, a `Host` of your ssh config).
+        host: String,
+        /// Run the session over `ssh -t` rather than mosh.
+        #[arg(long)]
+        ssh: bool,
+        /// The speaker's name (`twr speak --name`).
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+        /// The arguments of the remote `twr`, after `--`.
+        #[arg(last = true, value_name = "ARGS")]
+        args: Vec<String>,
     },
     /// Print a thread's events as NDJSON.
     Events {
@@ -389,6 +483,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ContextCmd,
     },
+    /// Show, edit or forget the orchestrator's memory: the notes it keeps across sessions,
+    /// restarts and runtimes, one memory per workspace.
+    Memory {
+        #[command(subcommand)]
+        cmd: MemoryCmd,
+    },
     /// Print the hub control stream as NDJSON.
     Control {
         /// Keep streaming new items.
@@ -401,6 +501,20 @@ enum Cmd {
         #[arg(long)]
         pretty: bool,
     },
+    /// Make your terminal send Shift-Enter as Alt-Enter (ESC CR), which the TUI reads as a new
+    /// line everywhere, over mosh and SSH too, as Claude Code's /terminal-setup does. It edits
+    /// the terminal's settings file when it can do so safely (backing it up), leaves a
+    /// Shift-Enter binding already there alone, and otherwise prints the steps. Over SSH or
+    /// mosh it changes nothing: it prints what to change on the machine the terminal runs on.
+    TerminalSetup {
+        /// The terminal: terminal.app, iterm2, ghostty, kitty, wezterm, alacritty, vscode,
+        /// vscode-insiders, cursor, windsurf, vscodium or zed. Default: the one this runs in.
+        #[arg(long, value_name = "NAME")]
+        terminal: Option<String>,
+        /// Print the steps and change nothing (every terminal's when none is named or found).
+        #[arg(long)]
+        print: bool,
+    },
     /// List, create or remove workspaces: separate hubs on this machine, each with its own
     /// orchestrator, threads, worktrees and trash, sharing the config file. `twr -w <name>
     /// <command>` (or `TWR_WORKSPACE=<name>`) runs a command in one; `default` is the usual
@@ -410,9 +524,29 @@ enum Cmd {
         #[command(subcommand)]
         cmd: Option<WsCmd>,
     },
+    /// Add, list, inspect, install twr on and remove remote boxes. `twr box add <name>
+    /// <ssh destination>` sets up a box the hub reaches over SSH (no token, listener or
+    /// tunnel), and `twr box add <name> --command docker exec -i <container>` one it reaches
+    /// through that command (a container): the hub installs twr there, keeps it connected,
+    /// and runs the box's threads in a daemon on the box that outlives the connection. `twr box doctor <name>` checks a box,
+    /// and `twr box login <name> <agent>` logs an agent CLI in there, in this terminal.
+    #[command(name = "box")]
+    Boxes {
+        #[command(subcommand)]
+        cmd: boxes::BoxCmd,
+    },
+    /// List, add, log in, check and remove a runtime's accounts: several logins of Claude
+    /// Code, Codex or Grok Build, each a config directory of its own. `twr account add
+    /// claude-code work` makes one and runs the runtime's login in this terminal; a thread
+    /// picks one with `twr thread new --account` and moves with `twr model --account`.
+    Account {
+        #[command(subcommand)]
+        cmd: accounts::AccountCmd,
+    },
     /// Run this box as a runner: connect to a hub over WebSocket and run its threads here.
-    /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner token` prints a new
-    /// token for `[boxes.<name>] token`.
+    /// Stops the runtimes gracefully on SIGINT / SIGTERM. `twr runner install-token <box>`
+    /// stores a dial-in box's token here; `twr runner token` prints a new token for
+    /// `[boxes.<name>] token`.
     #[command(subcommand_negates_reqs = true, args_conflicts_with_subcommands = true)]
     Runner {
         #[command(subcommand)]
@@ -421,15 +555,27 @@ enum Cmd {
         /// in 127.0.0.0/8, `[::1]` or an IPv4-mapped one such as `[::ffff:127.0.0.1]`: an SSH
         /// tunnel's end). Plain `ws://` to any other host is refused unless --allow-insecure is
         /// given.
-        #[arg(long, value_name = "URL", required = true)]
+        #[arg(
+            long,
+            value_name = "URL",
+            required_unless_present_any = [
+                "stdio", "daemon", "agents", "login", "exec", "find_repo", "clone_repo"
+            ]
+        )]
         hub: Option<String>,
         /// File holding the box's token (`[boxes.<name>] token` on the hub, at least 16
         /// characters); it must not be accessible by other users (`chmod 600`). Default:
-        /// `$TWR_RUNNER_TOKEN`.
+        /// `$TWR_RUNNER_TOKEN`, else the file `twr runner install-token` writes
+        /// (`~/.config/twr/runner-tokens/<box>.token`). A token from a file is read again
+        /// after the hub refuses the runner, so a new one there is used without a restart.
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
         /// Box name (as configured on the hub).
-        #[arg(long = "box", value_name = "NAME", required = true)]
+        #[arg(
+            long = "box",
+            value_name = "NAME",
+            required_unless_present_any = ["agents", "login", "exec", "find_repo", "clone_repo"]
+        )]
         box_name: Option<String>,
         /// Data directory for the spool and worktrees (default: the twr data directory).
         #[arg(long, value_name = "DIR")]
@@ -442,6 +588,245 @@ enum Cmd {
         /// the network in clear text (the token never does). Only on a network you trust.
         #[arg(long)]
         allow_insecure: bool,
+        /// An SSH box's relay, which the hub's ssh runs: starts the box daemon of --hub-key
+        /// and --box when none runs, then relays stdin/stdout to it.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = ["daemon", "hub", "token_file", "ca", "allow_insecure"],
+            requires_all = ["box_name", "hub_key"]
+        )]
+        stdio: bool,
+        /// An SSH box's daemon, which the relay starts: serves the hub's sealed connections on
+        /// --daemon-socket, logging to --log.
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = [
+                "hub", "token_file", "ca", "allow_insecure", "replace", "stop", "restart"
+            ],
+            requires_all = ["box_name", "hub_key", "daemon_socket", "data_dir", "lock", "log"]
+        )]
+        daemon: bool,
+        /// The hub's box key (64 hex digits: its Ed25519 public key).
+        #[arg(long, hide = true, value_name = "HEX")]
+        hub_key: Option<String>,
+        /// With --stdio: replace a box daemon of another build with this one.
+        #[arg(long, hide = true, requires = "stdio")]
+        replace: bool,
+        /// With --stdio: stop the box daemon of --hub-key and --box instead of relaying to it,
+        /// and wait until it has stopped (at most 60 s). Its data and worktrees stay. Nothing
+        /// to do when none runs.
+        #[arg(long, hide = true, requires = "stdio", conflicts_with = "replace")]
+        stop: bool,
+        /// With --stdio: stop the box daemon of --hub-key and --box, whatever its build, start a
+        /// new one, and relay to it (`twr box restart`; a Mac's daemon then starts in the GUI
+        /// session when there is one). One relay at a time starts a daemon.
+        #[arg(long, hide = true, requires = "stdio", conflicts_with = "stop")]
+        restart: bool,
+        /// With --stdio: the build id the hub launched (this executable's, as the hub knows
+        /// it), taken as this relay's own when it cannot read its executable.
+        #[arg(long, hide = true, value_name = "ID", requires = "stdio")]
+        build: Option<String>,
+        /// With --stdio: print the status line of the box daemon of --hub-key and --box, or
+        /// `no daemon`, and nothing else (`twr box doctor`).
+        #[arg(
+            long,
+            hide = true,
+            requires = "stdio",
+            conflicts_with_all = ["replace", "stop", "build", "restart"]
+        )]
+        status: bool,
+        /// Print this box's agent CLIs as its runner finds them, as JSON: the login shell's
+        /// PATH, then each agent's path, version and login state (`twr box doctor`).
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login"
+            ]
+        )]
+        agents: bool,
+        /// Start AGENT's login in this terminal, on the program this box's runner would run
+        /// (its TWR_*_BIN, else on the login shell's PATH): `claude auth login`, `codex login
+        /// --device-auth`, `grok login --device-auth` (`twr box login`). Needs a terminal.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "AGENT",
+            value_parser = ["claude", "claude-code", "codex", "grok", "grok-build"],
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key"
+            ]
+        )]
+        login: Option<String>,
+        /// Run RUNTIME's CLI with the arguments after `--`, its program resolved as a spawn
+        /// of a thread on this box resolves it (its TWR_*_BIN, else on --path, else on the
+        /// login shell's PATH before this one): what `twr attach` runs on an SSH box, with
+        /// the arguments the hub built.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "RUNTIME",
+            value_parser = ["claude-code", "codex", "grok-build"],
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec: Option<String>,
+        /// With --exec: the thread's PATH, when it configures one (it wins over the login
+        /// shell's, as for a spawn). (The conflicts repeat --exec's: clap does not check
+        /// `requires` against an argument that conflicts with one given.)
+        #[arg(
+            long = "path",
+            hide = true,
+            value_name = "PATH",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_path: Option<String>,
+        /// With --exec: a variable of the thread's environment (NAME=VALUE, repeated), set on
+        /// the runtime's command only: the program is resolved, and the login shell asked,
+        /// with this process's environment, as a spawn's are.
+        #[arg(
+            long = "env",
+            hide = true,
+            value_name = "NAME=VALUE",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_env: Vec<String>,
+        /// With --exec: a variable the runtime's command does not get (repeated).
+        #[arg(
+            long = "unset",
+            hide = true,
+            value_name = "NAME",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_unset: Vec<String>,
+        /// With --exec: the runtime's arguments.
+        #[arg(
+            last = true,
+            hide = true,
+            value_name = "ARGS",
+            requires = "exec",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents"
+            ]
+        )]
+        exec_args: Vec<String>,
+        /// Print, as JSON, the git repositories on this box that could be the hub's repository
+        /// of folder name --name (`twr box project`): the --hint path, then those under the
+        /// default project roots in this home, each with its `origin` and whether that names
+        /// --origin's repository ([`twr_runner::repos::find_repo`]). Reads only, no network.
+        #[arg(
+            long,
+            hide = true,
+            requires = "repo_name",
+            group = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec"
+            ]
+        )]
+        find_repo: bool,
+        /// With --find-repo: the hub repository's `origin` URL (without credentials).
+        #[arg(
+            long,
+            hide = true,
+            value_name = "URL",
+            requires = "find_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "clone_repo"
+            ]
+        )]
+        origin: Option<String>,
+        /// With --find-repo: the path on this box to look at first.
+        #[arg(
+            long,
+            hide = true,
+            value_name = "PATH",
+            requires = "find_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "clone_repo"
+            ]
+        )]
+        hint: Option<PathBuf>,
+        /// Clone --url into a new directory --parent/--name in this terminal, then print
+        /// `twr-clone-path <path>` (`twr box project --clone`; checks:
+        /// [`twr_runner::repos::clone_repo`]). Needs a terminal.
+        #[arg(
+            long,
+            hide = true,
+            requires_all = ["repo_name", "clone_url", "clone_parent"],
+            group = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_repo: bool,
+        /// With --clone-repo: the URL (https://, ssh:// or user@host:path, no credentials).
+        #[arg(
+            long = "url",
+            hide = true,
+            value_name = "URL",
+            requires = "clone_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_url: Option<String>,
+        /// With --clone-repo: the directory the clone goes in.
+        #[arg(
+            long = "parent",
+            hide = true,
+            value_name = "DIR",
+            requires = "clone_repo",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec", "find_repo"
+            ]
+        )]
+        clone_parent: Option<PathBuf>,
+        /// With --find-repo or --clone-repo: the repository's folder name.
+        #[arg(
+            long = "name",
+            hide = true,
+            value_name = "NAME",
+            requires = "repo_op",
+            conflicts_with_all = [
+                "hub", "token_file", "box_name", "data_dir", "ca", "allow_insecure", "stdio",
+                "daemon", "hub_key", "login", "agents", "exec"
+            ]
+        )]
+        repo_name: Option<String>,
+        /// With --daemon: the socket to listen on (`--socket` is the hub socket's).
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        daemon_socket: Option<PathBuf>,
+        /// With --daemon: its machine lock.
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        lock: Option<PathBuf>,
+        /// With --daemon: the file it logs to.
+        #[arg(long, hide = true, value_name = "PATH", requires = "daemon")]
+        log: Option<PathBuf>,
     },
 }
 
@@ -450,6 +835,29 @@ enum RunnerCmd {
     /// Print a new random token (32 bytes from the OS, hex): put it in the hub's
     /// `[boxes.<name>] token` and in the runner's `--token-file` (`chmod 600`).
     Token,
+    /// On a dial-in box: store the box's token (`twr box add --dial-in` or `twr box token` on
+    /// the hub prints it) in `~/.config/twr/runner-tokens/<box>.token` (mode 0600), where `twr
+    /// runner` finds it. Asks for it at a prompt that does not show it, or reads it from a
+    /// pipe. With --hub, prints the command that runs the runner and a service to paste that
+    /// keeps it running (a systemd user unit, or a LaunchAgent on a Mac).
+    InstallToken {
+        /// The box's name on the hub.
+        #[arg(value_name = "BOX")]
+        box_name: String,
+        /// The hub's runner URL: `wss://host:port`, or `ws://` to a loopback host (an SSH
+        /// tunnel's end).
+        #[arg(long, value_name = "URL")]
+        hub: Option<String>,
+        /// For `wss://`: trust only this CA certificate (PEM), as `twr runner --ca`.
+        #[arg(long, value_name = "PEM")]
+        ca: Option<PathBuf>,
+        /// Store the token in this file instead (its directory must exist).
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        /// Replace another token stored for the box without asking.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -547,6 +955,67 @@ enum JobCmd {
     Cancel {
         /// The job's id, or a unique start of it.
         job: String,
+    },
+}
+
+/// `twr speech`.
+#[derive(Subcommand, Debug)]
+enum SpeechCmd {
+    /// Stream the orchestrator's new messages: with `--text`, their sentences one per line
+    /// (for a reader of your own); without it, the line protocol `twr speak --ssh` reads.
+    Feed {
+        /// Print each message's sentences, one per line, and nothing else.
+        #[arg(long)]
+        text: bool,
+        /// The line protocol (the default); for `twr speak --ssh`.
+        #[arg(long, conflicts_with = "text")]
+        proto: bool,
+        /// Every workspace of this machine, not only the current one (`-w`).
+        #[arg(long)]
+        all_workspaces: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LogCmd {
+    /// Move the agent events `[log]` lets go (of turns older than `retention_days` whose
+    /// reactions are done, and of deleted threads whose trash item is purged) and the blobs
+    /// only they reach out of twr.db into archive.db now (or delete them, with `archive =
+    /// false`). The hub does this every hour by itself when 2 000 rows or more can go.
+    Compact {
+        /// Then rewrite twr.db whole (`VACUUM`), which gives the freed space back to the
+        /// file system and turns on incremental vacuum for the next runs. The hub waits for
+        /// it, doing nothing else meanwhile: 3 to 18 seconds for a 475 MB twr.db.
+        #[arg(long)]
+        vacuum: bool,
+        /// Drop the hub's checkpoints of its state first (its next start folds the whole log).
+        #[arg(long)]
+        drop_checkpoints: bool,
+        /// Print the raw `log.compact` JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Write a checkpoint of the hub's folded state for this build of twr, so that its hub's
+    /// next start folds only what comes after it instead of the whole log. Run it after
+    /// installing a new build while a hub of the old one still runs (`docs/tools/
+    /// dev-install.sh` does): checkpoints are kept per build, and a build uses only its own.
+    /// Works whether or not the hub runs, never starts one, and leaves a database of another
+    /// schema alone (the hub's start migrates it).
+    Checkpoint {
+        /// Every workspace of this home, not only this one.
+        #[arg(long)]
+        all: bool,
+        /// Print one JSON object per workspace.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sizes of twr.db, its write-ahead log and archive.db, rows and bytes per kind, blobs,
+    /// checkpoints, the control backlog (whole and compacted), and what the next compaction
+    /// would move.
+    Stats {
+        /// Print the raw `log.stats` JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -662,6 +1131,38 @@ enum ContextCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum MemoryCmd {
+    /// List the notes: name, type, when saved, description; `!` marks a note the orchestrator
+    /// saved in a turn you did not start (it may come from a worker's text).
+    List {
+        /// As JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a note.
+    Show {
+        /// The note's name.
+        name: String,
+    },
+    /// Edit a note (or write a new one) in `$VISUAL` / `$EDITOR` (else `vi`): its
+    /// `description:` and `type:` lines, then its text. Saved when the editor exits
+    /// successfully and the text changed; a note changed meanwhile is a conflict, never
+    /// overwritten.
+    Edit {
+        /// The note's name (lowercase words joined by -).
+        name: String,
+    },
+    /// Forget notes: their files are removed.
+    Rm {
+        /// The notes' names.
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
+    /// Print the memory's directory (one Markdown file per note).
+    Path,
+}
+
 // Parsed once per run: the size of `New` next to the small `List` costs nothing.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
@@ -677,6 +1178,16 @@ enum ThreadCmd {
         /// shell would, without expansion.
         #[arg(long)]
         runtime: Option<String>,
+        /// The runtime's account to run on (`twr account list`): a name, a glob (`max-*`) or
+        /// a comma-separated list, the first usable one taken (default: the project's pin,
+        /// else `[account_policy.<runtime>] default`, else the runtime's own login).
+        /// `--runtime claude-code:work` picks one too.
+        #[arg(long, value_name = "NAME")]
+        account: Option<String>,
+        /// Open it on its account (`--account`, or `--runtime <runtime>:<account>`) although
+        /// the project's pin keeps it off that account.
+        #[arg(long)]
+        outside_pin: bool,
         /// Box to run on: `local`, or a remote box from `[boxes.<name>]` whose runner is
         /// connected (default: the project's `box`, else `local`).
         #[arg(long = "box", value_name = "BOX")]
@@ -714,6 +1225,18 @@ enum ThreadCmd {
         #[arg(long, short)]
         all: bool,
     },
+    /// Show what a thread has in flight now, as the hub reads it (`work` of `thread.get`): its
+    /// reading (working, waiting on its background work, on a tool call, nothing in flight,
+    /// unknown), the open turn's tool calls, its tasks (background, foreground, detached:
+    /// moved to the background after its call returned, nothing waits for them) and jobs,
+    /// prompts queued behind it, its last progress apart from heartbeats, and its open items.
+    Show {
+        /// Thread id, name, alias or unique prefix.
+        thread: String,
+        /// Print the `work` object as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -723,16 +1246,43 @@ fn main() -> ExitCode {
         twr_hub::job_gate_main(std::env::args_os().skip(1).collect());
     }
     let cli = Cli::parse();
+    twr_core::trace::mark_with(|| {
+        let role = match &cli.cmd {
+            None => "tui",
+            Some(Cmd::Hub { cmd: None }) => "hub",
+            Some(_) => "cli",
+        };
+        format!("{role}: process started")
+    });
     let stopping_hub = matches!(
         cli.cmd,
         Some(Cmd::Hub {
             cmd: Some(HubCmd::Stop { .. })
         })
     );
+    // The relay's read of stdin is a blocking task, which a runtime's graceful shutdown would
+    // wait on after the daemon's side ended: it leaves without it. So does `--find-repo`, past
+    // its deadline, without a walk of the box's folders that hangs (a dead network mount). And
+    // so does `twr speech feed`, whose proxy reads stdin the same way: once its output is gone
+    // (or its speaker went quiet) it ends with stdin still open. Every line it wrote was
+    // flushed as it was written.
+    let relaying = matches!(
+        cli.cmd,
+        Some(
+            Cmd::Runner { stdio: true, .. }
+                | Cmd::Runner {
+                    find_repo: true,
+                    ..
+                }
+                | Cmd::Speech {
+                    cmd: SpeechCmd::Feed { .. }
+                }
+        )
+    );
     // Before anything else that could fail: a hook that exits with anything but 2 lets the
     // tool call through.
-    if matches!(cli.cmd, Some(Cmd::ClaudeMemoryGuard)) {
-        return memory_guard();
+    if let Some(Cmd::ClaudeMemoryGuard { memory_dir }) = &cli.cmd {
+        return memory_guard(memory_dir.clone());
     }
     // The hub sets the agent marker only on what it starts for a thread:
     // a hub started from an agent's shell must not pass that shell's marker on to the rest
@@ -780,14 +1330,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     };
-    shutdown_cli_runtime(runtime, stopping_hub);
+    shutdown_cli_runtime(runtime, stopping_hub || relaying);
     code
 }
 
 /// A timed-out process-table read is a blocking task, which Tokio cannot cancel. Short
-/// stop commands must exit without waiting on it; the foreground hub keeps graceful drop.
-fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, stopping_hub: bool) {
-    if stopping_hub {
+/// stop commands must exit without waiting on it, as must an SSH box's relay (its read of
+/// stdin); the foreground hub keeps graceful drop.
+fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, background: bool) {
+    if background {
         runtime.shutdown_background();
     }
 }
@@ -795,8 +1346,9 @@ fn shutdown_cli_runtime(runtime: tokio::runtime::Runtime, stopping_hub: bool) {
 /// `twr claude-memory-guard`: answers the `PreToolUse` hook input on stdin
 /// (`twr_adapters::claude_code::guard`) within the guard's deadline. A denial (outside the
 /// memory directory, stdin unreadable, a panic, no decision by the deadline) is a JSON decision
-/// on stdout and exit 2, which Claude Code blocks on either way.
-fn memory_guard() -> ExitCode {
+/// on stdout and exit 2, which Claude Code blocks on either way. With `memory_dir`
+/// (`--memory-dir`), exactly that directory is allowed (`guard::check_with`).
+fn memory_guard(memory_dir: Option<PathBuf>) -> ExitCode {
     use std::io::Read;
     use twr_adapters::claude_code::guard;
     let read = || {
@@ -806,7 +1358,7 @@ fn memory_guard() -> ExitCode {
             .read_to_string(&mut input)
             .map(|_| input)
     };
-    match guard::run(read, guard::deadline()) {
+    match guard::run_with(read, guard::deadline(), memory_dir) {
         Some(deny) => {
             outln!("{deny}");
             ExitCode::from(2)
@@ -930,6 +1482,143 @@ fn workspace_hint() -> &'static str {
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     refuse_runner_socket(&cli)?;
     refuse_bulk_stop_socket(&cli)?;
+    // An SSH box's relay and daemon need no twr home: every path comes from the box's
+    // environment (the relay) or the relay (the daemon).
+    let cli = match cli.cmd {
+        Some(Cmd::Runner {
+            cmd: None,
+            agents: true,
+            ..
+        }) => {
+            let report = twr_runner::agents::agents_report(&twr_runner::BoxEnv::user()).await;
+            outln!("{}", serde_json::to_string(&report)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            login: Some(agent),
+            ..
+        }) => return runner_login(&agent).await,
+        Some(Cmd::Runner {
+            cmd: None,
+            find_repo: true,
+            repo_name: Some(name),
+            origin,
+            hint,
+            ..
+        }) => {
+            let home = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|h| h.is_absolute());
+            let report = twr_runner::repos::find_repo(
+                &twr_runner::local::LocalGit::default(),
+                home.as_deref(),
+                &name,
+                origin.as_deref(),
+                hint.as_deref(),
+                tokio::time::Instant::now() + twr_runner::repos::FIND_DEADLINE,
+            )
+            .await?;
+            outln!("{}", serde_json::to_string(&report)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            clone_repo: true,
+            repo_name: Some(name),
+            clone_url: Some(url),
+            clone_parent: Some(parent),
+            ..
+        }) => return runner_clone(&url, &parent, &name).await,
+        Some(Cmd::Runner {
+            cmd: None,
+            exec: Some(runtime),
+            exec_path,
+            exec_env,
+            exec_unset,
+            exec_args,
+            ..
+        }) => {
+            return runner_exec(
+                &runtime,
+                exec_path.as_deref(),
+                &exec_env,
+                &exec_unset,
+                &exec_args,
+            )
+            .await
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            stdio: true,
+            status: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let opts = twr_runner::relay::RelayOptions::new(&box_name, hub_key, false)?;
+            match twr_runner::relay::status(&opts).await? {
+                Some(status) => outln!("{}", status.line().trim_end()),
+                None => outln!("no daemon"),
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            stdio: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            replace,
+            stop,
+            restart,
+            build,
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let mut opts = twr_runner::relay::RelayOptions::new(&box_name, hub_key, replace)?;
+            opts.restart = restart;
+            if let Some(b) = build {
+                if !twr_core::valid_build_id(&b) {
+                    bail!("--build {b:?} is not a build id");
+                }
+                opts.build = Some(b);
+            }
+            if stop {
+                twr_runner::relay::stop(&opts, &mut |line: &str| note(line)).await?;
+            } else {
+                twr_runner::relay::relay(opts).await?;
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
+            cmd: None,
+            daemon: true,
+            box_name: Some(box_name),
+            hub_key: Some(hub_key),
+            daemon_socket: Some(socket),
+            data_dir: Some(data_dir),
+            lock: Some(lock),
+            log: Some(log),
+            ..
+        }) => {
+            let hub_key = twr_core::sealed::parse_hub_public(&hub_key)?;
+            let opts = twr_runner::RunnerOptions::for_daemon(
+                box_name,
+                data_dir,
+                twr_runner::DaemonOptions {
+                    socket,
+                    hub_key,
+                    lock,
+                    build: twr_core::build_id().map(str::to_string),
+                    launch: Some(twr_runner::daemon::own_launch()),
+                },
+            );
+            run_box_daemon(opts, &log).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        cmd => Cli { cmd, ..cli },
+    };
     // A bulk stop selects a home, not one workspace; even a stale workspace selection
     // must not keep it from reaching the others. Refuse locally before discovering them,
     // including when no hub is there to enforce the RPC's agent guard.
@@ -965,6 +1654,26 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Some(Cmd::Runner {
+            cmd:
+                Some(RunnerCmd::InstallToken {
+                    box_name,
+                    hub,
+                    ca,
+                    token_file,
+                    yes,
+                }),
+            ..
+        }) => {
+            dial_in::install_token(dial_in::InstallToken {
+                box_name,
+                hub,
+                ca,
+                token_file,
+                yes,
+            })?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Runner {
             cmd: None,
             hub,
             token_file,
@@ -972,12 +1681,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             data_dir,
             ca,
             allow_insecure,
+            ..
         }) => {
             // clap requires both without a subcommand.
             let (Some(hub), Some(box_name)) = (hub, box_name) else {
                 bail!("twr runner needs --hub and --box");
             };
             let data_dir = data_dir.unwrap_or_else(|| paths.data_dir.clone());
+            let default_token = paths.runner_token_file(&box_name);
             let mut opts = twr_runner::RunnerOptions::new(
                 hub,
                 twr_core::runner::Secret::default(),
@@ -986,7 +1697,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             );
             opts.ca_file = ca;
             opts.allow_insecure = allow_insecure;
-            run_runner(opts, token_file).await?;
+            run_runner(opts, token_file, default_token).await?;
             return Ok(ExitCode::SUCCESS);
         }
         // Before the config is loaded: a config this twr cannot read must not stop an update
@@ -995,9 +1706,108 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             update(version, cli.socket, &paths).await?;
             return Ok(ExitCode::SUCCESS);
         }
+        // About the terminal, not a hub: no config needed.
+        Some(Cmd::TerminalSetup { terminal, print }) => {
+            let terminal = match terminal.as_deref() {
+                None => None,
+                Some(name) => Some(twr_tui::terminal_setup::Terminal::parse(name).ok_or_else(
+                    || {
+                        anyhow!(
+                            "no terminal {name:?}: name one of {}",
+                            twr_tui::terminal_setup::ALL
+                                .iter()
+                                .map(|t| t.name())
+                                .chain(["vscode-insiders", "cursor", "windsurf", "vscodium"])
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                )?),
+            };
+            let place = twr_tui::terminal_setup::place(twr_tui::keys::under_mosh());
+            let agent = calling_agent();
+            let (lines, failed) =
+                twr_tui::terminal_setup::run(&place, terminal, print, agent.as_deref());
+            for line in lines {
+                outln!("{line}");
+            }
+            return Ok(if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
         // Workspaces are the root's: these work from any workspace, existing or not.
         Some(Cmd::Ws { cmd }) => {
             ws(cmd, &paths).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        // A speaker is the root's (its state and `[speech]`), and with `--ssh` (or `twr
+        // remote`) `-w` names a workspace of the other machine, which this one need not have.
+        Some(Cmd::Speak {
+            ssh,
+            all_workspaces,
+            name,
+            engine,
+            voice,
+            rate,
+            print_service,
+        }) => {
+            refuse_agent_action("start a speaker")?;
+            if cli.socket.is_some() {
+                bail!("--socket does not apply to `twr speak`: it reads the workspaces' own hubs");
+            }
+            speech::speak(
+                speech::Speak {
+                    ssh,
+                    workspace: cli.workspace.clone(),
+                    all_workspaces,
+                    name,
+                    engine,
+                    voice,
+                    rate,
+                    print_service,
+                },
+                &paths,
+            )
+            .await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Some(Cmd::Remote {
+            host,
+            ssh,
+            name,
+            args,
+        }) => {
+            refuse_agent_action("start a remote session with a speaker")?;
+            if cli.socket.is_some() {
+                bail!("--socket does not apply to `twr remote`");
+            }
+            return speech::remote(
+                speech::Remote {
+                    host,
+                    ssh,
+                    name,
+                    workspace: cli.workspace.clone(),
+                    args,
+                },
+                &paths,
+            )
+            .await;
+        }
+        // Before the config is loaded: it repairs config files that do not load (a box in
+        // both, or one whose settings twr refuses, comes out of boxes.toml). The hub's socket
+        // as config.toml alone says, else the default.
+        Some(Cmd::Boxes {
+            cmd: boxes::BoxCmd::Remove { name },
+        }) => {
+            let socket = cli.socket.clone().unwrap_or_else(|| {
+                Config::load(&paths.config_file)
+                    .unwrap_or_default()
+                    .in_workspace(&paths)
+                    .socket_path(&paths)
+            });
+            boxes::remove(&paths, &socket, &name).await?;
             return Ok(ExitCode::SUCCESS);
         }
         cmd => Cli { cmd, ..cli },
@@ -1012,6 +1822,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         bail!("there is no workspace {name}{from}: create it with `twr ws new {name}` (`twr ws` lists them)");
     }
     let config = Config::load_from(&paths)?;
+    twr_core::trace::mark("cli: config loaded");
     if cli.socket.is_none() {
         let _ = EXPECTED_WORKSPACE.set(paths.workspace_name().to_string());
         // `hub.socket` is the default workspace's alone.
@@ -1034,7 +1845,14 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 config: Config::load_from(&paths.root()).unwrap_or_else(|_| config.clone()),
             }),
         });
-        open_tui(&socket, &paths, switching, config.tui.clone()).await?;
+        open_tui(
+            &socket,
+            &paths,
+            switching,
+            config.tui.clone(),
+            config.speech.clone(),
+        )
+        .await?;
         return Ok(ExitCode::SUCCESS);
     };
     match cmd {
@@ -1047,6 +1865,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         } => wait_cmd(&socket, &threads, all, timeout, json).await,
         Cmd::Mcp => {
             run_mcp(socket).await?;
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Boxes { cmd } => boxes::run(cmd, &config, &paths, &socket).await,
+        Cmd::Account { cmd } => accounts::run(cmd, &paths, &socket)
+            .await
+            .map(|()| ExitCode::SUCCESS),
+        Cmd::Speech {
+            cmd:
+                SpeechCmd::Feed {
+                    text,
+                    proto: _,
+                    all_workspaces,
+                },
+        } => {
+            if text {
+                speech::text(speech::workspace_sockets(&paths, &[], all_workspaces)?).await?;
+            } else {
+                speech::proxy(&paths, all_workspaces, speech::proxy_idle()).await?;
+            }
             Ok(ExitCode::SUCCESS)
         }
         cmd => run_simple(cmd, &config, paths, socket)
@@ -1065,9 +1902,15 @@ async fn run_simple(
         Cmd::Attach { .. }
         | Cmd::Wait { .. }
         | Cmd::Mcp
-        | Cmd::ClaudeMemoryGuard
+        | Cmd::ClaudeMemoryGuard { .. }
         | Cmd::Runner { .. }
         | Cmd::Update { .. }
+        | Cmd::Boxes { .. }
+        | Cmd::Speech { .. }
+        | Cmd::Speak { .. }
+        | Cmd::Remote { .. }
+        | Cmd::TerminalSetup { .. }
+        | Cmd::Account { .. }
         | Cmd::Ws { .. } => {
             unreachable!("handled by run")
         }
@@ -1136,7 +1979,7 @@ async fn run_simple(
             by,
         } => usage_threads(&socket, json, since.as_deref(), by.as_deref()).await,
         Cmd::Usage { json, .. } => usage(&socket, json).await,
-        Cmd::Hub { cmd: None } => run_hub(paths, config.clone(), socket).await,
+        Cmd::Hub { cmd: None } => run_hub(paths, socket).await,
         Cmd::Hub {
             cmd:
                 Some(HubCmd::Stop {
@@ -1151,10 +1994,15 @@ async fn run_simple(
             cmd: ThreadCmd::List { all },
         } => thread_list(&socket, all).await,
         Cmd::Thread {
+            cmd: ThreadCmd::Show { thread, json },
+        } => thread_show(&socket, &thread, json).await,
+        Cmd::Thread {
             cmd:
                 ThreadCmd::New {
                     project,
                     runtime,
+                    account,
+                    outside_pin,
                     box_name,
                     name,
                     mode,
@@ -1166,7 +2014,8 @@ async fn run_simple(
                     base,
                 },
         } => {
-            let project = project_param(config, &project)?;
+            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
+            let project = project_param(config, &project, box_name.as_deref())?;
             let mut c = connect(&socket).await?;
             let mut params = json!({ "project": project, "aliases": aliases });
             if no_worktree {
@@ -1175,8 +2024,12 @@ async fn run_simple(
             if worktree {
                 params["worktree"] = json!(true);
             }
+            if outside_pin {
+                params["outside_pin"] = json!(true);
+            }
             for (k, v) in [
                 ("runtime", runtime),
+                ("account", account),
                 ("box", box_name),
                 ("name", name),
                 ("mode", mode),
@@ -1204,11 +2057,14 @@ async fn run_simple(
                 "created {} ({}) runtime={}{command}{model} worktree={}",
                 str_of(&t["name"]),
                 str_of(&t["id"]),
-                str_of(&t["runtime"]),
+                accounts::runtime_label(&t),
                 str_of(&t["worktree"])
             );
             if let Some(repo) = t["project_found"]["repo"].as_str() {
                 outln!("found {} at {repo}", str_of(&t["project_found"]["name"]));
+            }
+            if let Some(w) = result_warning(&t) {
+                errln!("{w}");
             }
             Ok(())
         }
@@ -1271,6 +2127,9 @@ async fn run_simple(
                 ),
                 None => outln!("queued on {thread} ({} pending)", r["pending"]),
             }
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
+            }
             if let Some(e) = r["dispatch_error"].as_str() {
                 errln!("twr: the prompt is queued, but dispatching it failed: {e}");
             }
@@ -1314,6 +2173,16 @@ async fn run_simple(
             outln!("{}", resume_outcome(&thread, &r));
             Ok(())
         }
+        Cmd::Compact { thread, offers } => {
+            let mut c = connect(&socket).await?;
+            let mut params = json!({ "thread": thread });
+            if let Some(o) = &offers {
+                params["offers"] = json!(o);
+            }
+            let r = c.call("thread.compact", params).await?;
+            outln!("{}", compact_outcome(&thread, &r));
+            Ok(())
+        }
         Cmd::Delete { threads, yes } => {
             // As for `twr respond`: only a terminal can confirm, else --yes.
             let mut ask = ask_on_stderr;
@@ -1323,6 +2192,10 @@ async fn run_simple(
             cmd: TrashCmd::List { json },
         } => trash_list(&socket, json).await,
         Cmd::Job { cmd } => job_cmd(&socket, cmd).await,
+        Cmd::Log {
+            cmd: LogCmd::Checkpoint { all, json },
+        } => log_checkpoint(&paths, all, json).await,
+        Cmd::Log { cmd } => log_cmd(&socket, cmd).await,
         Cmd::Trash {
             cmd: TrashCmd::Empty { items, all, yes },
         } => {
@@ -1356,6 +2229,9 @@ async fn run_simple(
                 .call("thread.set_mode", json!({ "thread": thread, "mode": mode }))
                 .await?;
             outln!("{}", mode_outcome(&thread, &r));
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
+            }
             if let Some(e) = r["dispatch_error"].as_str() {
                 errln!("twr: the mode is set, but restarting the runtime failed: {e}");
             }
@@ -1366,21 +2242,65 @@ async fn run_simple(
             model,
             effort,
             runtime,
+            account,
+            outside_pin,
         } => {
+            check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref())?;
             let mut c = connect(&socket).await?;
-            if model.is_none() && effort.is_none() && runtime.is_none() {
-                let t = c.call("thread.get", json!({ "thread": thread })).await?;
+            let t = c.call("thread.get", json!({ "thread": thread })).await?;
+            if model.is_none() && effort.is_none() && runtime.is_none() && account.is_none() {
                 outln!("{}", model_show(&t));
                 return Ok(());
             }
-            let mut params = json!({ "thread": thread });
-            for (k, v) in [("model", model), ("effort", effort), ("runtime", runtime)] {
+            // The thread by its id, not the query: the pin question below is about this
+            // thread, and the retry must move it whatever names change while it is open.
+            let Some(id) = t["id"]
+                .as_str()
+                .filter(|i| !i.is_empty())
+                .map(str::to_string)
+            else {
+                bail!("the hub did not say which thread {thread} is");
+            };
+            let mut params = json!({ "thread": id });
+            for (k, v) in [
+                ("model", model),
+                ("effort", effort),
+                ("runtime", runtime),
+                ("account", account),
+            ] {
                 if let Some(v) = v {
                     params[k] = json!(v);
                 }
             }
-            let r = c.call("thread.set_model", params).await?;
+            if outside_pin {
+                params["outside_pin"] = json!(true);
+            }
+            let r = match c.call("thread.set_model", params.clone()).await {
+                Ok(r) => r,
+                // A pin keeps the thread off that account: a terminal is asked whether to
+                // leave it this once.
+                Err(e)
+                    if !outside_pin
+                        && pin_refusal(&e)
+                        && std::io::IsTerminal::is_terminal(&std::io::stdin()) =>
+                {
+                    errln!("twr: {}", localize(&format!("{e:#}")));
+                    let answer = ask_on_stderr(&format!(
+                        "move {} ({id}) anyway? [y/N] ",
+                        str_of(&t["name"])
+                    ))?;
+                    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                        bail!("not moved");
+                    }
+                    params["outside_pin"] = json!(true);
+                    c.call("thread.set_model", params).await?
+                }
+                Err(e) => return Err(e),
+            };
             outln!("{}", model_outcome(&thread, &r));
+            if let Some(w) = result_warning(&r) {
+                errln!("{w}");
+            }
             if let Some(e) = r["dispatch_error"].as_str() {
                 if r["runtime_changed"].as_bool() == Some(true) {
                     errln!("twr: the runtime is set, but stopping the previous one failed: {e}");
@@ -1447,6 +2367,203 @@ async fn run_simple(
         Cmd::Context {
             cmd: ContextCmd::Edit { project },
         } => context_edit(&socket, &project).await,
+        Cmd::Memory { cmd } => memory(&socket, cmd).await,
+    }
+}
+
+// --- memory ------------------------------------------------------------------------------------
+
+/// `twr memory`.
+async fn memory(socket: &Path, cmd: MemoryCmd) -> anyhow::Result<()> {
+    match cmd {
+        MemoryCmd::List { json } => {
+            let r = connect(socket)
+                .await?
+                .call("memory.list", json!({}))
+                .await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            let notes = r["notes"].as_array().cloned().unwrap_or_default();
+            if r["enabled"] == false {
+                errln!("memory is off ([orchestrator] memory = false): the orchestrator neither gets nor changes these notes");
+            }
+            if notes.is_empty() {
+                errln!("no notes ({})", str_of(&r["dir"]));
+            }
+            for n in &notes {
+                let mark = if n["unconfirmed"] == true { "!" } else { " " };
+                outln!(
+                    "{mark} {:<28} {:<9} {:<10} {}",
+                    str_of(&n["name"]),
+                    str_of(&n["type"]),
+                    str_of(&n["updated"]).get(..10).unwrap_or(""),
+                    str_of(&n["description"])
+                );
+            }
+            for u in r["unreadable"].as_array().into_iter().flatten() {
+                errln!(
+                    "{}.md cannot be read: {}",
+                    str_of(&u["name"]),
+                    str_of(&u["why"])
+                );
+            }
+            if notes.iter().any(|n| n["unconfirmed"] == true) {
+                errln!("! saved by the orchestrator in a turn you did not start");
+            }
+            Ok(())
+        }
+        MemoryCmd::Show { name } => {
+            let n = connect(socket)
+                .await?
+                .call("memory.read", json!({ "name": name }))
+                .await?;
+            out!("{}", note_text(&n));
+            outln!(
+                "\n(rev {}, saved {} by {}{})",
+                str_of(&n["rev"]),
+                str_of(&n["updated"]),
+                match str_of(&n["by"]) {
+                    "" => "hand",
+                    b => b,
+                },
+                match str_of(&n["origin"]) {
+                    "" | "user" => String::new(),
+                    o => format!(" in a {o} turn"),
+                }
+            );
+            Ok(())
+        }
+        MemoryCmd::Edit { name } => memory_edit(socket, &name).await,
+        MemoryCmd::Rm { names } => {
+            let mut c = connect(socket).await?;
+            for name in names {
+                c.call("memory.forget", json!({ "name": name })).await?;
+                outln!("forgot {name}");
+            }
+            Ok(())
+        }
+        MemoryCmd::Path => {
+            let r = connect(socket)
+                .await?
+                .call("memory.list", json!({}))
+                .await?;
+            outln!("{}", str_of(&r["dir"]));
+            Ok(())
+        }
+    }
+}
+
+/// A note as `twr memory show` prints it and `twr memory edit` edits it.
+fn note_text(n: &Value) -> String {
+    format!(
+        "description: {}\ntype: {}\n---\n{}\n",
+        str_of(&n["description"]),
+        str_of(&n["type"]),
+        str_of(&n["body"]).trim_end()
+    )
+}
+
+/// The description, type and text of a note as [`note_text`] lays it out.
+fn parse_note_text(text: &str) -> anyhow::Result<(String, String, String)> {
+    let Some((head, body)) = text.split_once("\n---\n") else {
+        bail!("keep the `---` line between the note's description and type and its text");
+    };
+    let (mut description, mut kind) = (String::new(), String::new());
+    for line in head.lines() {
+        match line.split_once(':') {
+            Some(("description", v)) => description = v.trim().to_string(),
+            Some(("type", v)) => kind = v.trim().to_string(),
+            _ if line.trim().is_empty() => {}
+            _ => bail!("only `description:` and `type:` lines go above the `---` line"),
+        }
+    }
+    Ok((description, kind, body.trim().to_string()))
+}
+
+/// `twr memory edit`: edits a temporary copy of the note (a new one from a template) with
+/// `$VISUAL` / `$EDITOR` and saves it with `memory.save` and the rev that was read, so a note
+/// changed meanwhile is a conflict. On any failure after the editor wrote something, the
+/// temporary file is kept and its path printed.
+async fn memory_edit(socket: &Path, name: &str) -> anyhow::Result<()> {
+    let read = connect(socket)
+        .await?
+        .call("memory.read", json!({ "name": name }))
+        .await;
+    let (before, rev) = match read {
+        Ok(n) => (note_text(&n), n["rev"].as_str().map(str::to_string)),
+        Err(e)
+            if e.downcast_ref::<RpcError>()
+                .is_some_and(|r| r.code == codes::NOT_FOUND) =>
+        {
+            ("description: \ntype: user\n---\n".to_string(), None)
+        }
+        Err(e) => return Err(e),
+    };
+    let tmp = TempFile::create("twr-memory", ".md", before.as_bytes())?;
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("{editor} \"$1\""))
+        .arg("twr-memory-edit")
+        .arg(tmp.path())
+        .status();
+    let after = std::fs::read(tmp.path());
+    let edited = after.as_ref().map_or(true, |a| a != before.as_bytes());
+    let keep = |tmp: TempFile, why: String| -> anyhow::Error {
+        if edited {
+            anyhow!(
+                "{why}; the note is unchanged (your edit is kept in {})",
+                tmp.keep().display()
+            )
+        } else {
+            anyhow!("{why}; the note is unchanged")
+        }
+    };
+    match status {
+        Ok(s) if s.success() => {}
+        Ok(s) => return Err(keep(tmp, format!("the editor `{editor}` exited with {s}"))),
+        Err(e) => {
+            return Err(keep(
+                tmp,
+                format!("running the editor `{editor}` failed ({e})"),
+            ))
+        }
+    }
+    let after = match after.map(String::from_utf8) {
+        Ok(Ok(a)) => a,
+        Ok(Err(_)) => return Err(keep(tmp, "the edited note is not UTF-8".into())),
+        Err(e) => return Err(keep(tmp, format!("reading the edited note failed ({e})"))),
+    };
+    if after == before {
+        outln!("{name}: no changes");
+        return Ok(());
+    }
+    let (description, kind, body) = match parse_note_text(&after) {
+        Ok(p) => p,
+        Err(e) => return Err(keep(tmp, e.to_string())),
+    };
+    let saved = async {
+        connect(socket)
+            .await?
+            .call(
+                "memory.save",
+                json!({ "name": name, "type": kind, "description": description,
+                        "body": body, "rev": rev }),
+            )
+            .await
+    }
+    .await;
+    match saved {
+        Ok(r) => {
+            outln!("{name}: {} (rev {})", str_of(&r["op"]), str_of(&r["rev"]));
+            Ok(())
+        }
+        Err(e) => Err(keep(tmp, format!("saving the note failed: {e:#}"))),
     }
 }
 
@@ -1643,8 +2760,16 @@ fn str_of(v: &Value) -> &str {
 
 /// A configured project name is sent as is; an existing directory becomes an absolute path
 /// (the hub resolves paths in its own working directory).
-fn project_param(config: &Config, project: &str) -> anyhow::Result<String> {
+/// The `project` of a `thread.new` for what was typed: a configured project's name as is, a
+/// directory of this machine as its absolute path, anything else as is (the hub looks it up).
+/// For a remote box (`box_name` other than `local`), only the hub resolves it: a project
+/// configured for that box (`[boxes.<box>.projects.<name>]`) is a name, and a path means a
+/// path on the box, never a directory here.
+fn project_param(config: &Config, project: &str, box_name: Option<&str>) -> anyhow::Result<String> {
     if config.projects.contains_key(project) {
+        return Ok(project.to_string());
+    }
+    if box_name.is_some_and(|b| b != "local") {
         return Ok(project.to_string());
     }
     let p = Path::new(project);
@@ -1702,8 +2827,16 @@ fn model_effort(model: &Value, effort: &Value) -> String {
 /// completes (`handoff_pending`).
 fn model_show(t: &Value) -> String {
     let runtime = str_of(&t["runtime"]);
+    // The account while its runtime shows account labels, or when it was removed.
+    let account = match t["account"].as_str() {
+        Some(a) if t["account_removed"].as_bool() == Some(true) => {
+            format!(", account {a} (removed)")
+        }
+        Some(a) if t["account_shown"].as_bool() == Some(true) => format!(", account {a}"),
+        _ => String::new(),
+    };
     let mut out = format!(
-        "{}: runtime {runtime}, {}",
+        "{}: runtime {runtime}{account}, {}",
         str_of(&t["name"]),
         model_effort(&t["model"], &t["effort"])
     );
@@ -1715,9 +2848,16 @@ fn model_show(t: &Value) -> String {
         if t["live"].as_bool() == Some(true) {
             out.push_str("; its previous runtime stops once the current turn ends");
         }
-        out.push_str(&format!(
-            "; its next turn starts a new {runtime} session, given a handoff of the previous one"
-        ));
+        match t["resume_session"].as_str() {
+            Some(s) => out.push_str(&format!(
+                "; its next turn resumes its earlier {runtime} session {s}, told what the thread \
+                 did since"
+            )),
+            None => out.push_str(&format!(
+                "; its next turn starts a new {runtime} session, given a handoff of the previous \
+                 one"
+            )),
+        }
         return out;
     }
     let pending = |k: &str| t.as_object().is_some_and(|o| o.contains_key(k));
@@ -1740,7 +2880,41 @@ fn model_show(t: &Value) -> String {
     out
 }
 
+/// Refuses `--outside-pin` without an account to leave the pin for: `--account <name>`, or
+/// the account part of `--runtime <runtime>:<account>`.
+fn check_outside_pin(
+    outside_pin: bool,
+    account: Option<&str>,
+    runtime: Option<&str>,
+) -> anyhow::Result<()> {
+    let in_runtime = runtime.is_some_and(|r| twr_core::account::split_runtime(r).1.is_some());
+    if outside_pin && account.is_none() && !in_runtime {
+        bail!(
+            "--outside-pin needs the account it is for: --account <name>, or --runtime \
+             <runtime>:<account>"
+        );
+    }
+    Ok(())
+}
+
+/// Whether `e` is the hub refusing a move because a pin keeps the thread off the account
+/// (`thread.set_model` without `outside_pin`), which the user may override.
+fn pin_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<RpcError>()
+        .is_some_and(|r| r.message.contains("pass outside_pin"))
+}
+
 /// What `twr model` prints for a `thread.set_model` result.
+/// The advisory of a `thread.new` / `thread.set_model` / `thread.set_mode` / `thread.send`
+/// result `r` (its `warning`: the box reports the CLI of the runtime the call starts or
+/// restarts missing; the thread was made, changed or sent to all the same), as the
+/// line printed to stderr: `warning: <it>`, its commands run in this workspace ([`localize`]).
+/// `errln!` cleans it for the terminal.
+fn result_warning(r: &Value) -> Option<String> {
+    let w = r["warning"].as_str().filter(|w| !w.trim().is_empty())?;
+    Some(format!("warning: {}", localize(w)))
+}
+
 fn model_outcome(thread: &str, r: &Value) -> String {
     let name = r["thread_name"].as_str().unwrap_or(thread);
     let now = model_effort(&r["model"], &r["effort"]);
@@ -1748,6 +2922,28 @@ fn model_outcome(thread: &str, r: &Value) -> String {
         return format!("{name} already runs with {now}");
     }
     let before = model_effort(&r["previous_model"], &r["previous_effort"]);
+    // A move to another account (and maybe runtime): the hub's message names both accounts.
+    if r["account_changed"].as_bool() == Some(true) {
+        let from = format!(
+            "{}:{}",
+            str_of(&r["previous_runtime"]),
+            str_of(&r["previous_account"])
+        );
+        let old = match r["applies"].as_str() {
+            Some("now") => format!("its {from} runtime stops now"),
+            Some("after_turn") => format!("its {from} runtime stops once the current turn ends"),
+            _ => format!("no {from} runtime is running"),
+        };
+        let message = match r["message"].as_str() {
+            Some(m) => localize(m),
+            None => format!(
+                "{name} moves to {}:{}",
+                str_of(&r["runtime"]),
+                str_of(&r["account"])
+            ),
+        };
+        return format!("{message} ({before} -> {now}; {old}{})", tasks_end(r));
+    }
     if r["runtime_changed"].as_bool() == Some(true) {
         let (from, to) = (str_of(&r["previous_runtime"]), str_of(&r["runtime"]));
         let old = match r["applies"].as_str() {
@@ -1803,6 +2999,20 @@ fn park_outcome(thread: &str, r: &Value) -> String {
     out
 }
 
+/// What `twr compact` prints for a `thread.compact` result.
+fn compact_outcome(thread: &str, r: &Value) -> String {
+    let name = r["thread_name"].as_str().unwrap_or(thread);
+    if let Some(offers) = r["offers"].as_str() {
+        return format!(
+            "{name}: offers to compact its context once its prompt cache expired are {offers}"
+        );
+    }
+    match (r["state"].as_str(), r["turn"].as_u64()) {
+        (Some("started"), Some(turn)) => format!("{name}: compacting its context (turn {turn})"),
+        _ => format!("{name}: compacts its context after its running turn"),
+    }
+}
+
 /// What `twr resume` prints for a `thread.resume` result.
 fn resume_outcome(thread: &str, r: &Value) -> String {
     let mut out = format!("resumed {thread}");
@@ -1815,7 +3025,9 @@ fn resume_outcome(thread: &str, r: &Value) -> String {
     out
 }
 
-async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Result<()> {
+/// `twr hub`: the hub of `paths` on `socket`, in the foreground. Its config is read again
+/// under boxes.toml's lock ([`read_config_locked`]), held until the socket is bound.
+async fn run_hub(paths: Paths, socket: PathBuf) -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
@@ -1829,7 +3041,13 @@ async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Resul
     if let Some(dir) = paths.orchestrator_dir() {
         twr_core::paths::ensure_private_dir(&dir)?;
     }
+    let (config, boxes_lock) = {
+        let paths = paths.clone();
+        tokio::task::spawn_blocking(move || read_config_locked(&paths)).await??
+    };
+    twr_core::trace::mark("hub: config read");
     let mut opts = HubOptions::new(paths.db_file(), config);
+    opts.boxes_lock = boxes_lock;
     opts.config_file = Some(paths.config_file.clone());
     opts.instance_name = paths.instance_name();
     opts.workspace = paths.workspace.clone();
@@ -1839,11 +3057,94 @@ async fn run_hub(paths: Paths, config: Config, socket: PathBuf) -> anyhow::Resul
     // A test's throwaway hub (under `TWR_HOME` only) trusts the test's clients: in a debug
     // build only, which the tests run and no installed twr is ([`test_token_trusted`]), and
     // only from a private file of the hub's user ([`hub_test_token`]).
-    if test_token_trusted() {
+    let trusted = test_token_trusted();
+    if trusted {
         opts.test_user_token = hub_test_token();
     }
+    // The hub's own agent CLIs (`hub.info` `agents`), probed in the background; never under
+    // a test's throwaway hub, nor with `TWR_AGENT_PROBE=off`, so tests run none of the user's
+    // real agent CLIs.
+    if probes_own_agents(trusted, std::env::var_os(AGENT_PROBE_ENV).as_deref()) {
+        opts.agent_probe = Some(twr_hub::hub::own_agent_probe());
+        // The accounts' logins too (`account.status`), on the same terms.
+        opts.account_probe = Some(twr_hub::hub::own_account_probe());
+    }
+    // Named accounts without a `dir` of their own: the home's root's, every workspace's.
+    opts.accounts_root = Some(paths.accounts_dir());
     opts.worktree_namespace = paths.worktree_namespace();
+    if trusted && std::env::var_os(HUB_STOP_GATE_ENV).is_some() {
+        opts.socket_removed_hook = Some(std::sync::Arc::new(|| {
+            Box::pin(async {
+                let _ = tokio::task::spawn_blocking(|| hub_test_gate(HUB_STOP_GATE_ENV)).await;
+            })
+        }));
+    }
     twr_hub::run(opts, socket).await
+}
+
+/// The config of `paths` as a starting hub reads it: under the lock of boxes.toml
+/// ([`BoxesFile::lock`]), which the hub keeps until its socket is bound
+/// ([`HubOptions::boxes_lock`]). `twr box remove` and `twr box token --rotate` edit boxes.toml
+/// under that lock, then ask the hub on the socket to take the change (`box.token`); one that
+/// finds no socket made its edit before this read, never between this read and the bind,
+/// where the hub would start with the old token and nobody would tell it. The lock is waited
+/// for: those commands hold it only while they read, check and save the file, never while
+/// they wait for a hub or for the user. A lock file that can't be opened (a read-only config
+/// directory) is logged and the hub starts without it: no twr command can edit boxes.toml
+/// there either, since each takes the lock first.
+fn read_config_locked(
+    paths: &Paths,
+) -> anyhow::Result<(Config, Option<twr_core::config::BoxesLock>)> {
+    let file = paths.boxes_file();
+    let lock = BoxesFile::lock(&file)
+        .inspect_err(|e| {
+            let file = file.display();
+            tracing::warn!(error = %format!("{e:#}"), "starting without the lock of {file}");
+        })
+        .ok();
+    let config = Config::load_from(paths)?;
+    hub_test_gate(HUB_START_GATE_ENV);
+    Ok((config, lock))
+}
+
+/// `TWR_TEST_HUB_START_GATE=<file>`, for tests of a starting hub: right after it read its
+/// config ([`read_config_locked`]), the hub waits at the gate ([`hub_test_gate`]).
+const HUB_START_GATE_ENV: &str = "TWR_TEST_HUB_START_GATE";
+
+/// `TWR_TEST_HUB_STOP_GATE=<file>`, for tests of a hub shutting down: right after it removed
+/// its socket ([`twr_hub::HubOptions::socket_removed_hook`]), the hub waits at the gate
+/// ([`hub_test_gate`]).
+const HUB_STOP_GATE_ENV: &str = "TWR_TEST_HUB_STOP_GATE";
+
+/// The test gate `<file>` that `env` names: the hub creates `<file>.reached` and waits while
+/// `<file>` exists (at most a minute). Only in a test's throwaway hub
+/// ([`test_token_trusted`]): ignored by an installed twr.
+fn hub_test_gate(env: &str) {
+    let Some(gate) = std::env::var_os(env).filter(|_| test_token_trusted()) else {
+        return;
+    };
+    let gate = PathBuf::from(gate);
+    let mut reached = gate.clone().into_os_string();
+    reached.push(".reached");
+    if let Err(e) = std::fs::write(&reached, b"") {
+        tracing::warn!(error = %e, "{env}: cannot create {}", Path::new(&reached).display());
+        return;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while gate.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `TWR_AGENT_PROBE`: `off` keeps the hub from probing its own box's agent CLIs (no
+/// `claude`, `codex` or `grok` runs; `hub.info` reports no local agents). Any other value, or
+/// none: it probes them. For tests and troubleshooting.
+const AGENT_PROBE_ENV: &str = "TWR_AGENT_PROBE";
+
+/// Whether the hub probes its own agent CLIs: not for a test's throwaway hub (`test`,
+/// [`test_token_trusted`]), nor when [`AGENT_PROBE_ENV`] is `off` (`value`).
+fn probes_own_agents(test: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    !test && value.is_none_or(|v| v != "off")
 }
 
 /// The test user token a test's throwaway hub trusts ([`twr_core::client::TEST_USER_TOKEN_ENV`]),
@@ -1997,7 +3298,9 @@ fn hub_stop_timeout(socket: &Path, paths: &Paths, timeout: Duration) -> anyhow::
 
 /// Shared shutdown, with an explicit workspace identity for bulk stops (the global
 /// EXPECTED_WORKSPACE belongs to single-workspace commands). One deadline bounds every
-/// phase, including connecting and process-table reads, with the phase's own diagnostics.
+/// phase, including connecting and process-table reads, with the phase's own diagnostics;
+/// it moves on by as long as writing this build's checkpoint took, unless the hub runs this
+/// very build ([`prewarm_for_stop`], between `hub.info` and `hub.shutdown` on one connection).
 async fn hub_stop_result(
     socket: &Path,
     paths: &Paths,
@@ -2005,10 +3308,11 @@ async fn hub_stop_result(
     expected: Option<&str>,
     wait_start: bool,
 ) -> anyhow::Result<Option<String>> {
-    let deadline = tokio::time::Instant::now()
+    let mut deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .context("hub stop timeout is too large")?;
     let mut connection_losses = 0;
+    let mut prewarmed = false;
     let proc = loop {
         let connected = tokio::time::timeout_at(deadline, async {
             loop {
@@ -2055,29 +3359,52 @@ async fn hub_stop_result(
         };
         let mut shutdown_sent = false;
         let mut known_proc = None;
-        let asked = tokio::time::timeout_at(deadline, async {
+        let info = tokio::time::timeout_at(deadline, async {
             let hello = c.hello(json!({ "client": "cli" })).await?;
             if let Some(expected) = expected {
                 check_workspace_name(&hello, socket, expected)?;
             }
-            let info = c.call("hub.info", Value::Null).await?;
-            let pid = info["pid"].as_u64().and_then(|p| u32::try_from(p).ok());
-            // Read while the hub surely runs: once it is gone, the pid may name another process.
-            let start = match pid {
-                Some(pid) => {
-                    tokio::task::spawn_blocking(move || twr_runner::reap::process_start_time(pid))
-                        .await
-                        .ok()
-                        .flatten()
-                }
-                None => None,
-            };
-            known_proc = pid.map(|pid| (pid, start));
-            shutdown_sent = true;
-            c.call("hub.shutdown", Value::Null).await?;
-            anyhow::Ok(known_proc)
+            c.call("hub.info", Value::Null).await
         })
         .await;
+        // The hub's process, read while it surely runs (as it just answered): once it is gone,
+        // the pid may name another process. Before the prewarm below, which may take seconds.
+        let pid = match &info {
+            Ok(Ok(info)) => info["pid"].as_u64().and_then(|p| u32::try_from(p).ok()),
+            _ => None,
+        };
+        let start = match pid {
+            Some(pid) => tokio::time::timeout_at(
+                deadline,
+                tokio::task::spawn_blocking(move || twr_runner::reap::process_start_time(pid)),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten(),
+            None => None,
+        };
+        if let (Ok(Ok(info)), false) = (&info, prewarmed) {
+            prewarmed = true;
+            let started = tokio::time::Instant::now();
+            if let Some(line) = prewarm_for_stop(info, paths).await {
+                outln!("{line}");
+            }
+            deadline += started.elapsed();
+        }
+        let asked = match info {
+            Ok(Ok(_)) => {
+                tokio::time::timeout_at(deadline, async {
+                    known_proc = pid.map(|pid| (pid, start));
+                    shutdown_sent = true;
+                    c.call("hub.shutdown", Value::Null).await?;
+                    anyhow::Ok(known_proc)
+                })
+                .await
+            }
+            Ok(Err(e)) => Ok(Err(e)),
+            Err(elapsed) => Err(elapsed),
+        };
         let proc = match asked {
             Ok(Err(e))
                 if wait_start
@@ -2136,6 +3463,49 @@ async fn hub_stop_result(
     .map(Some)
 }
 
+/// Whether `twr hub stop` writes this build's checkpoint of the log at `db` before stopping a
+/// hub that answers `hub.info` with `info` ([`prewarm_for_stop`]): unless that hub runs this
+/// very build (its `checkpoint_build`, the build its checkpoints are for, is `this`), as the
+/// start that follows is likely this build's, which uses only its own checkpoints; on that log.
+/// A hub from before `checkpoint_build` may be another build of the same version (a dirty
+/// checkout's): it gets one too. (A build that has one up to date writes nothing.)
+fn prewarm_wanted(info: &Value, this: &str, db: &Path) -> bool {
+    info.is_object()
+        && info["checkpoint_build"].as_str() != Some(this)
+        && info["db"].as_str().is_none_or(|d| Path::new(d) == db)
+}
+
+/// Before `twr hub stop` asks the hub of workspace `paths` that answered `hub.info` with `info`
+/// to stop: when it runs another version of twr ([`prewarm_wanted`]), writes this build's
+/// checkpoint of its log, as `twr log checkpoint` does ([`twr_hub::prewarm_checkpoint`]), so
+/// that the start that follows on this build folds only what came after it. (A running older
+/// hub keeps only its own newest checkpoints, and may have dropped one written at install.)
+/// Best effort: the line saying what it did, or `None` when it did nothing (the same version,
+/// another log, an agent asking).
+async fn prewarm_for_stop(info: &Value, paths: &Paths) -> Option<String> {
+    // An agent may not stop the hub (the hub refuses it): it writes nothing either.
+    if caller_is_agent() {
+        return None;
+    }
+    let db = paths.db_file();
+    if !prewarm_wanted(info, &twr_hub::checkpoint_build(), &db) {
+        return None;
+    }
+    let name = paths.workspace_name().to_string();
+    let notify = Config::load_from(paths)
+        .map(|c| c.notify)
+        .unwrap_or_default();
+    let done = tokio::task::spawn_blocking(move || twr_hub::prewarm_checkpoint(&db, &notify)).await;
+    Some(match done {
+        Ok(Ok(p)) => prewarm_text(&prewarm_json(&name, &p)),
+        Ok(Err(e)) => format!(
+            "{name}: no checkpoint written for twr {} ({e:#}): its next start folds the whole log",
+            twr_core::version()
+        ),
+        Err(e) => format!("{name}: no checkpoint written ({e})"),
+    })
+}
+
 fn hub_stop_failure(name: &str, e: &anyhow::Error) -> String {
     let reason = twr_core::paths::localize_commands(&format!("{e:#}"), &format!(" -w {name}"));
     format!("{name}: failed: {reason}")
@@ -2185,6 +3555,9 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
     if e.downcast_ref::<RpcError>().is_some() {
         return false;
     }
+    if e.downcast_ref::<twr_core::client::HubClosed>().is_some() {
+        return true;
+    }
     e.chain().any(|c| {
         c.downcast_ref::<std::io::Error>().is_some_and(|e| {
             matches!(
@@ -2195,12 +3568,7 @@ fn stop_connection_lost(e: &anyhow::Error) -> bool {
                     | std::io::ErrorKind::UnexpectedEof
             )
         })
-    }) || matches!(
-        e.to_string().as_str(),
-        "hub closed the connection during hello"
-            | "hub closed the connection during hub.info"
-            | "hub closed the connection during hub.shutdown"
-    )
+    })
 }
 
 /// Default plus the same named directories as `twr ws`. Each stop has its own deadline
@@ -2323,6 +3691,7 @@ async fn update(
     if !status.success() {
         bail!("the installer failed ({status}); twr was not updated");
     }
+    prewarm_installed(&dir.join("twr")).await;
     hub_version_note(&dir.join("twr"), socket, paths).await;
     Ok(())
 }
@@ -2539,6 +3908,24 @@ const RELEASE_LINE: &str = "# twr release ";
 /// refused.
 fn release_of(source: &UpdateSource, script: &[u8], sums: &[u8]) -> anyhow::Result<String> {
     let url = format!("{}/sha256sums.txt", source.base);
+    let tag = sums_release(source, sums)?;
+    let listed = listed_sha256(sums, "install.sh");
+    let actual = sha256_hex(script);
+    match listed {
+        None => bail!("{url} lists no install.sh; nothing was run"),
+        Some(hash) if !hash.eq_ignore_ascii_case(&actual) => bail!(
+            "the installer from {} is not the install.sh of {tag} (its SHA-256 is not the one \
+             in sha256sums.txt); nothing was run",
+            source.script
+        ),
+        Some(_) => Ok(tag),
+    }
+}
+
+/// The release `sums` (a sha256sums.txt whose signature verified, from `source`) names on its
+/// [`RELEASE_LINE`], which must be the one `source` asked for, if it named one.
+fn sums_release(source: &UpdateSource, sums: &[u8]) -> anyhow::Result<String> {
+    let url = format!("{}/sha256sums.txt", source.base);
     let text =
         std::str::from_utf8(sums).map_err(|_| anyhow!("{url} is not text; nothing was run"))?;
     let mut tags = text
@@ -2555,21 +3942,61 @@ fn release_of(source: &UpdateSource, script: &[u8], sums: &[u8]) -> anyhow::Resu
     if let Some(asked) = source.tag.as_deref().filter(|asked| *asked != tag) {
         bail!("{url} is the checksums of {tag}, not of {asked}; nothing was run");
     }
-    let listed = text.lines().find_map(|l| {
-        let (hash, name) = l.split_once("  ")?;
-        (name.trim_end() == "install.sh").then_some(hash)
-    });
-    let digest = ring::digest::digest(&ring::digest::SHA256, script);
-    let actual: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-    match listed {
-        None => bail!("{url} lists no install.sh; nothing was run"),
-        Some(hash) if !hash.eq_ignore_ascii_case(&actual) => bail!(
-            "the installer from {} is not the install.sh of {tag} (its SHA-256 is not the one \
-             in sha256sums.txt); nothing was run",
-            source.script
-        ),
-        Some(_) => Ok(tag),
+    Ok(tag)
+}
+
+/// The SHA-256 `sums` (sha256sums.txt) lists for file `name`, as written there.
+fn listed_sha256<'a>(sums: &'a [u8], name: &str) -> Option<&'a str> {
+    std::str::from_utf8(sums).ok()?.lines().find_map(|l| {
+        let (hash, file) = l.split_once("  ")?;
+        (file.trim_end() == name).then_some(hash)
+    })
+}
+
+/// The SHA-256 of `bytes`, lowercase hex.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Largest release archive `twr box install` downloads ([`fetch_release_archive`]).
+const RELEASE_ARCHIVE_MAX: usize = 256 << 20;
+
+/// How long `twr box install` waits for a release archive.
+const RELEASE_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Downloads release `tag`'s archive for `target` (`twr-<target>.tar.gz`), checked the way
+/// `twr update` checks a release: sha256sums.txt and its signature are downloaded from the
+/// release (or the mirror of [`INSTALL_SCRIPT_URL_ENV`]), the signature must verify with the
+/// release key, the checksums must name release `tag` and list the archive, and the archive
+/// must have the SHA-256 they list. Returns the archive and its SHA-256 (lowercase hex).
+async fn fetch_release_archive(tag: &str, target: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    let key = release_key(test_token_trusted(), std::env::var_os(TEST_RELEASE_KEY_ENV))?;
+    let mirror = std::env::var(INSTALL_SCRIPT_URL_ENV)
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+    let source = update_source(Some(tag), mirror).await?;
+    let sums_url = format!("{}/sha256sums.txt", source.base);
+    let sig_url = format!("{sums_url}.sig");
+    let sums = fetch_release_file(&sums_url).await?;
+    let signature = fetch_signature(&sig_url).await?;
+    check_signature(&key, &sums, &signature, &sums_url, &sig_url)?;
+    sums_release(&source, &sums)?;
+    let asset = format!("twr-{target}.tar.gz");
+    let Some(want) = listed_sha256(&sums, &asset).map(str::to_ascii_lowercase) else {
+        bail!("{sums_url} lists no {asset}: release {tag} has no build for {target}");
+    };
+    let base = source.archives.as_deref().unwrap_or(&source.base);
+    let url = format!("{base}/{asset}");
+    let archive = fetch_limited(&url, RELEASE_ARCHIVE_MAX, RELEASE_ARCHIVE_TIMEOUT).await?;
+    let actual = sha256_hex(&archive);
+    if actual != want {
+        bail!(
+            "{url} is not the {asset} of {tag} (its SHA-256 is not the one in sha256sums.txt); \
+             nothing was installed"
+        );
     }
+    Ok((archive, actual))
 }
 
 /// A release file a server answered with a status other than 2xx.
@@ -2715,28 +4142,34 @@ fn cargo_bin_dirs(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<PathB
 /// 2xx is an error), or `file:///<path>` read from disk ([`read_release_file`]). At most
 /// [`RELEASE_FILE_MAX`] bytes, within [`RELEASE_FILE_TIMEOUT`].
 async fn fetch_release_file(url: &str) -> anyhow::Result<Vec<u8>> {
-    let too_large = || anyhow!("{url} is over {RELEASE_FILE_MAX} bytes; nothing was run");
+    fetch_limited(url, RELEASE_FILE_MAX, RELEASE_FILE_TIMEOUT).await
+}
+
+/// [`fetch_release_file`] with another size limit `max` and time limit `timeout` (a release
+/// archive, [`fetch_release_archive`]).
+async fn fetch_limited(url: &str, max: usize, timeout: Duration) -> anyhow::Result<Vec<u8>> {
+    let too_large = || anyhow!("{url} is over {max} bytes; nothing was run");
     if let Some(rest) = url.strip_prefix("file://") {
         let path = rest.strip_prefix("localhost").unwrap_or(rest);
         if !path.starts_with('/') {
             bail!("{url} is not a local file:// URL (use file:///absolute/path)");
         }
         let owned = PathBuf::from(path);
-        let bytes = read_detached(RELEASE_FILE_TIMEOUT, move || read_release_file(&owned))
+        let bytes = read_detached(timeout, move || read_release_file(&owned, max))
             .await
             .map_err(|_| anyhow!("reading {path} timed out; nothing was run"))?
             .with_context(|| format!("reading {path}"))?;
-        if bytes.len() > RELEASE_FILE_MAX {
+        if bytes.len() > max {
             return Err(too_large());
         }
         return Ok(bytes);
     }
     if !url.starts_with("https://") {
-        bail!("{url}: twr update only downloads over https:// (or reads file:///)");
+        bail!("{url}: twr only downloads over https:// (or reads file:///)");
     }
     let client = reqwest::Client::builder()
         .https_only(true)
-        .timeout(RELEASE_FILE_TIMEOUT)
+        .timeout(timeout)
         .build()
         .context("setting up the HTTP client")?;
     let what = || format!("downloading {url}");
@@ -2749,15 +4182,12 @@ async fn fetch_release_file(url: &str) -> anyhow::Result<Vec<u8>> {
         }
         .into());
     }
-    if resp
-        .content_length()
-        .is_some_and(|n| n > RELEASE_FILE_MAX as u64)
-    {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
         return Err(too_large());
     }
     let mut body = Vec::new();
     while let Some(chunk) = resp.chunk().await.with_context(what)? {
-        if body.len() + chunk.len() > RELEASE_FILE_MAX {
+        if body.len() + chunk.len() > max {
             return Err(too_large());
         }
         body.extend_from_slice(&chunk);
@@ -2794,9 +4224,9 @@ where
 
 /// The release file at local `path`, read only when it is a regular file, as its opened
 /// descriptor says (a symbolic link to one will do): opened without blocking, so a FIFO there
-/// cannot hang the update, and read up to one byte past [`RELEASE_FILE_MAX`], so a device
-/// such as `/dev/zero` or a huge file cannot fill memory (the caller refuses what is longer).
-fn read_release_file(path: &Path) -> std::io::Result<Vec<u8>> {
+/// cannot hang the update, and read up to one byte past `max`, so a device such as
+/// `/dev/zero` or a huge file cannot fill memory (the caller refuses what is longer).
+fn read_release_file(path: &Path, max: usize) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
@@ -2807,8 +4237,7 @@ fn read_release_file(path: &Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other("not a regular file"));
     }
     let mut bytes = Vec::new();
-    file.take(RELEASE_FILE_MAX as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -2828,12 +4257,13 @@ fn check_script(url: &str, script: &[u8]) -> anyhow::Result<()> {
 
 /// The version `exe --version` prints (`twr <version>`), if it runs.
 fn installed_version(exe: &Path) -> Option<String> {
-    let out = std::process::Command::new(exe)
-        .arg("--version")
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--version")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    // No terminal: `twr --version` needs none.
+    twr_adapters::process::new_session_std(&mut cmd);
+    let out = cmd.output().ok()?;
     let text = String::from_utf8(out.stdout).ok()?;
     let v = text.trim().strip_prefix("twr ")?.trim();
     (out.status.success() && !v.is_empty()).then(|| v.to_string())
@@ -2877,15 +4307,37 @@ async fn hub_version_note(new_exe: &Path, socket: Option<PathBuf>, paths: &Paths
     }
 }
 
+/// After `twr update` installed `new_exe`: its checkpoint of each workspace's log (`twr log
+/// checkpoint --all`, run by it: checkpoints are per build), so that the next start of a hub
+/// on it folds only what comes after it. Best effort: a release from before `log checkpoint`
+/// refuses it, and the hub's start then folds the whole log, as before.
+async fn prewarm_installed(new_exe: &Path) {
+    outln!();
+    let prewarm = tokio::process::Command::new(new_exe)
+        .args(["log", "checkpoint", "--all"])
+        .env_remove(twr_core::paths::WORKSPACE_ENV)
+        .status()
+        .await;
+    if !prewarm.is_ok_and(|s| s.success()) {
+        outln!(
+            "(no checkpoint was written for the new build: a hub's first start on it folds the whole log)"
+        );
+    }
+}
+
 /// `twr runner`: serves the hub from this box until SIGINT / SIGTERM, with `opts` but their
-/// token, which comes from `--token-file` (mode 0600) or `$TWR_RUNNER_TOKEN` and is never
-/// logged; the variable is removed from the environment first thing, so nothing the runner
-/// starts inherits it. A token shorter than [`twr_core::runner::TOKEN_GOOD_LEN`] is warned
-/// about (one too short to use is refused).
+/// token, which comes from `--token-file` (mode 0600), `$TWR_RUNNER_TOKEN` or the box's
+/// default file `default_token` ([`dial_in::runner_token`]) and is never logged; the variable
+/// is removed from the environment first thing, so nothing the runner starts inherits it. A
+/// token shorter than [`twr_core::runner::TOKEN_GOOD_LEN`] is warned about (one too short to
+/// use is refused). A SIGINT or SIGTERM is listened for from the start: one that comes while
+/// it starts stops it before it connects ([`twr_runner::run`]).
 async fn run_runner(
     mut opts: twr_runner::RunnerOptions,
     token_file: Option<PathBuf>,
+    default_token: PathBuf,
 ) -> anyhow::Result<()> {
+    let shutdown = twr_runner::Shutdown::install();
     let env_token = twr_runner::client::take_token_env();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -2895,22 +4347,161 @@ async fn run_runner(
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let token = match token_file {
-        Some(p) => twr_runner::client::read_token_file(&p)?,
-        None => env_token.ok_or_else(|| {
-            anyhow!(
-                "no runner token: pass --token-file or set {}",
-                twr_runner::client::TOKEN_ENV
-            )
-        })?,
-    };
+    let (token, file) =
+        dial_in::runner_token(token_file, env_token, default_token, &opts.box_name)?;
     // Too short a token is refused (`RunnerOptions::validate`); a short one only warned about.
     if let Ok(Some(warning)) = twr_core::runner::check_token_len(token.expose(), "the runner token")
     {
         tracing::warn!("{warning}");
     }
     opts.token = token;
-    twr_runner::run(opts).await
+    opts.token_file = file;
+    twr_runner::run(opts, shutdown).await
+}
+
+/// `twr runner --daemon`: an SSH box's daemon ([`twr_runner::daemon`]), started by its relay
+/// with every path as an argument, its stdout and stderr `/dev/null`: it logs to `log`
+/// (appended, 0600, in its private data directory), its failure included, and runs until a
+/// `stop` request, SIGINT or SIGTERM. Those signals are listened for from the start: one that
+/// comes while it starts (its relay stopped meanwhile, say) stops it before it binds its socket
+/// ([`twr_runner::run`]).
+async fn run_box_daemon(opts: twr_runner::RunnerOptions, log: &Path) -> anyhow::Result<()> {
+    let shutdown = twr_runner::Shutdown::install();
+    if let Some(dir) = log.parent() {
+        twr_core::paths::ensure_private_dir(dir)?;
+    }
+    let file = twr_core::paths::open_private_append(log)
+        .with_context(|| format!("opening the box daemon's log {}", log.display()))?;
+    tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_ansi(false)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    tracing::info!(
+        version = twr_core::version(),
+        build = twr_core::build_id().unwrap_or("-"),
+        box_name = %opts.box_name,
+        "the box daemon starts"
+    );
+    let r = twr_runner::run(opts, shutdown).await;
+    if let Err(e) = &r {
+        tracing::error!(error = %format!("{e:#}"), "the box daemon failed");
+    }
+    r
+}
+
+/// `twr runner --login <agent>` (`twr box login` runs it over ssh with a terminal): resolves
+/// the agent as this box's runner would (its `TWR_*_BIN`, else on the box's baseline login
+/// `PATH` merged before this one, none with `TWR_BOX_PROBE=off`:
+/// [`twr_runner::agents::login_command`] with [`twr_runner::BoxEnv::user`], the daemon's) and
+/// replaces this process with its login command, so the login talks to the user's terminal
+/// directly. Refused without a terminal on stdin and stdout.
+async fn runner_login(agent: &str) -> anyhow::Result<ExitCode> {
+    use std::io::IsTerminal;
+    use std::os::unix::process::CommandExt;
+    let Some(runtime) = twr_adapters::agents::agent_runtime(agent) else {
+        bail!("{agent:?} is not an agent twr logs in (claude, codex or grok)");
+    };
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "`twr runner --login` needs a terminal on stdin and stdout: the login asks you \
+             things (`twr box login <box> {agent}` runs it with one)"
+        );
+    }
+    let mut cmd = twr_runner::agents::login_command(
+        &twr_runner::BoxEnv::user(),
+        runtime,
+        |k| std::env::var_os(k),
+        |why| {
+            note(&format!(
+                "twr: the login shell gave no PATH ({why}): looking for {agent} on this one"
+            ))
+        },
+    )
+    .await?;
+    let shown = format!(
+        "{} {}",
+        cmd.get_program().to_string_lossy(),
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // Only returns when it could not run it.
+    let e = cmd.exec();
+    bail!("running `{shown}`: {e}")
+}
+
+/// `twr runner --clone-repo --url <url> --parent <dir> --name <name>` (`twr box project
+/// --clone` runs it over ssh with a terminal): [`twr_runner::repos::clone_repo`], git talking
+/// to the user's terminal, then a newline and `twr-clone-path <path>` as the last line
+/// ([`twr_runner::repos::CLONE_PATH_MARK`]). Refused without a terminal on stdin and stdout,
+/// after a URL twr does not clone (which needs no terminal to be told so).
+async fn runner_clone(url: &str, parent: &Path, name: &str) -> anyhow::Result<ExitCode> {
+    use std::io::IsTerminal;
+    twr_core::gitremote::RemoteUrl::parse(url).map_err(|e| anyhow!("{e}"))?;
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        bail!(
+            "`twr runner --clone-repo` needs a terminal on stdin and stdout: git may ask you \
+             things (`twr box project <box> <project> --clone` runs it with one)"
+        );
+    }
+    let path = twr_runner::repos::clone_repo(url, parent, name).await?;
+    // On a line of its own, whatever git's output (a hook's) left unfinished.
+    outln!(
+        "\n{} {}",
+        twr_runner::repos::CLONE_PATH_MARK,
+        path.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `twr runner --exec <runtime> [--path <PATH>] [--env NAME=VALUE]... [--unset NAME]... --
+/// <args>` (a remote attach to a thread on an SSH box runs it over ssh): resolves the runtime's
+/// program as a spawn of the thread on this box resolves it
+/// ([`twr_runner::agents::exec_command`] with [`twr_runner::BoxEnv::user`], the daemon's: its
+/// `TWR_*_BIN`, else on the thread's `PATH` when given, else on the box's baseline login `PATH`
+/// merged before this one, the shell asked with this process's environment, the box's as ssh
+/// gives it, as the daemon asks it with its own, and not asked with `TWR_BOX_PROBE=off`) and
+/// replaces this process with it, with `args` (the hub's) as they are and the thread's other
+/// variables (`set`, `unset`) on it alone.
+async fn runner_exec(
+    runtime: &str,
+    path: Option<&str>,
+    set: &[String],
+    unset: &[String],
+    args: &[String],
+) -> anyhow::Result<ExitCode> {
+    use std::os::unix::process::CommandExt;
+    let mut env = Vec::new();
+    for e in set {
+        let Some((k, v)) = e.split_once('=') else {
+            bail!("--env {e:?}: expected NAME=VALUE");
+        };
+        env.push((k.to_string(), Some(v.to_string())));
+    }
+    env.extend(unset.iter().map(|k| (k.clone(), None)));
+    let mut cmd = twr_runner::agents::exec_command(
+        &twr_runner::BoxEnv::user(),
+        runtime,
+        args,
+        path,
+        &env,
+        |k| std::env::var_os(k),
+        |why| {
+            note(&format!(
+                "twr: the login shell gave no PATH ({why}): looking for {runtime}'s program \
+                 on this one"
+            ))
+        },
+    )
+    .await?;
+    // Only returns when it could not run it.
+    let e = cmd.exec();
+    bail!("running {}: {e}", cmd.get_program().to_string_lossy())
 }
 
 /// `twr mcp`: the MCP server on stdio. Tracing goes to stderr only: stdout carries MCP.
@@ -3073,6 +4664,15 @@ async fn connect(socket: &Path) -> anyhow::Result<Client> {
 /// the thread's queued prompts run. Exits with the CLI's exit code.
 async fn attach(socket: &Path, thread: &str, force: bool) -> anyhow::Result<ExitCode> {
     let mut lease = connect(socket).await?;
+    // Said before `attach.begin` pauses the runtime. (A thread this cannot read is
+    // `attach.begin`'s to refuse.)
+    if let Ok(t) = lease.call("thread.get", json!({ "thread": thread })).await {
+        if let Ok(info) = lease.call("hub.info", Value::Null).await {
+            if let Some(w) = attach_mac_warning(&t, &info) {
+                note(&w);
+            }
+        }
+    }
     let grant = match lease
         .call("attach.begin", json!({ "thread": thread, "force": force }))
         .await
@@ -3123,6 +4723,31 @@ async fn attach(socket: &Path, thread: &str, force: bool) -> anyhow::Result<Exit
         note(&format!("twr: detached from {thread}"));
     }
     Ok(code)
+}
+
+/// What `twr attach` says before it pauses the runtime of `thread` (its `thread.get`), with the
+/// hub's boxes in `info` (`hub.info`): a Claude Code thread on a Mac box (`os` `Darwin`, from
+/// the hub's probe of an SSH box; a token box's is not known) then runs over ssh, where Claude
+/// Code may not read its keychain login. Nothing for a command box: the hub refuses attach
+/// there (`attach.begin`), and nothing runs over ssh.
+fn attach_mac_warning(thread: &Value, info: &Value) -> Option<String> {
+    if thread["runtime"] != twr_adapters::claude_code::NAME {
+        return None;
+    }
+    let name = thread["box_name"]
+        .as_str()
+        .filter(|b| *b != twr_hub::hub::LOCAL_BOX)?;
+    let b = info["boxes"]
+        .as_array()?
+        .iter()
+        .find(|b| b["name"].as_str() == Some(name))?;
+    (b["os"] == "Darwin" && b["transport"] != "command").then(|| {
+        format!(
+            "twr: box {name} is a Mac: attached, Claude Code runs there over ssh, where it may \
+             not read its keychain login. If it asks you to log in, end the attach (exit it) \
+             and continue the thread from the TUI: the box daemon's Claude Code keeps its login"
+        )
+    })
 }
 
 /// What `twr attach` says before running the command, if anything: on the first attach to a
@@ -3317,7 +4942,7 @@ async fn info(socket: &Path, raw: bool) -> anyhow::Result<()> {
     let o = &i["orchestrator"];
     outln!(
         "orchestrator: runtime {}{}{}",
-        str_of(&o["runtime"]),
+        orchestrator_runtime(o),
         models_text(&o["model"], &o["model_actual"]),
         if o["available"].as_bool() == Some(true) {
             ""
@@ -3325,13 +4950,11 @@ async fn info(socket: &Path, raw: bool) -> anyhow::Result<()> {
             " (not available)"
         }
     );
+    for line in accounts::info_lines(&i["accounts"]) {
+        outln!("accounts:     {line}");
+    }
     for b in i["boxes"].as_array().into_iter().flatten() {
-        let state = if b["online"].as_bool() == Some(true) {
-            "online"
-        } else {
-            "offline"
-        };
-        outln!("box:          {} {state}", str_of(&b["name"]));
+        outln!("box:          {}", box_info_line(b));
     }
     for w in i["warnings"].as_array().into_iter().flatten() {
         outln!("warning:      {}", str_of(w));
@@ -4161,6 +5784,290 @@ async fn delete(socket: &Path, threads: &[String], consent: Consent<'_>) -> anyh
 // --- trash -------------------------------------------------------------------------------------
 
 /// `twr trash list`: the trash of every box, as a table (or the raw JSON with `raw`).
+/// `twr log compact` and `twr log stats`.
+async fn log_cmd(socket: &Path, cmd: LogCmd) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    match cmd {
+        LogCmd::Compact {
+            vacuum,
+            drop_checkpoints,
+            json,
+        } => {
+            if vacuum && !json {
+                errln!(
+                    "compacting the log, then VACUUM: the hub does nothing else until it is \
+                     done (3 to 18 s for a 475 MB twr.db)…"
+                );
+            }
+            let r = c
+                .call(
+                    "log.compact",
+                    json!({ "vacuum": vacuum, "drop_checkpoints": drop_checkpoints }),
+                )
+                .await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                out!("{}", log_compact_text(&r));
+            }
+        }
+        LogCmd::Checkpoint { .. } => unreachable!("`twr log checkpoint` needs no hub"),
+        LogCmd::Stats { json } => {
+            let r = c.call("log.stats", Value::Null).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&r)?);
+            } else {
+                out!("{}", log_stats_text(&r));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `twr log checkpoint`: a checkpoint for this build in this workspace's log, or in every
+/// workspace's with `all` ([`twr_hub::prewarm_checkpoint`]). A workspace without a log yet is
+/// skipped; one that fails is reported, and the command fails once all were tried.
+async fn log_checkpoint(paths: &Paths, all: bool, json: bool) -> anyhow::Result<()> {
+    let root = paths.root();
+    let names = if all {
+        let mut names = vec![DEFAULT_WORKSPACE.to_string()];
+        names.extend(
+            root.named_workspaces()
+                .with_context(|| format!("listing {}", root.workspaces_dir().display()))?,
+        );
+        names
+    } else {
+        vec![paths.workspace_name().to_string()]
+    };
+    let mut failed = 0;
+    for name in names {
+        let ws = root.workspace(&name)?;
+        let db = ws.db_file();
+        let r = if !db.exists() {
+            Ok(json!({ "workspace": name, "skipped": "no log yet" }))
+        } else {
+            // The `[notify]` the hub would fold with: part of what a checkpoint is for.
+            let notify = Config::load_from(&ws).map(|c| c.notify).unwrap_or_default();
+            tokio::task::spawn_blocking(move || twr_hub::prewarm_checkpoint(&db, &notify))
+                .await?
+                .map(|p| prewarm_json(&name, &p))
+                .map_err(|e| (name, e))
+        };
+        match r {
+            Ok(v) if json => outln!("{v}"),
+            Ok(v) => outln!("{}", prewarm_text(&v)),
+            Err((name, e)) => {
+                failed += 1;
+                errln!("{name}: {e:#}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} workspace(s) got no checkpoint");
+    }
+    Ok(())
+}
+
+/// What [`log_checkpoint`] did in workspace `name`, as JSON.
+fn prewarm_json(name: &str, p: &twr_hub::Prewarm) -> Value {
+    match p {
+        twr_hub::Prewarm::Written {
+            id,
+            from,
+            gseq,
+            events,
+            bytes,
+            ms,
+        } => json!({ "workspace": name, "written": id, "from": from, "gseq": gseq,
+                     "events": events, "bytes": bytes, "ms": ms }),
+        twr_hub::Prewarm::UpToDate => json!({ "workspace": name, "up_to_date": true }),
+        twr_hub::Prewarm::SchemaDiffers { found, this } if found > this => {
+            json!({ "workspace": name,
+            "skipped": format!("its schema is {found}, newer than this build's {this}: this build's hub cannot open it") })
+        }
+        twr_hub::Prewarm::SchemaDiffers { found, this } => json!({ "workspace": name,
+            "skipped": format!("its schema is {found}, this build's {this}: the hub's next start migrates it") }),
+    }
+}
+
+/// [`prewarm_json`] as a line.
+fn prewarm_text(v: &Value) -> String {
+    let name = str_of(&v["workspace"]);
+    if let Some(why) = v["skipped"].as_str() {
+        return format!("{name}: skipped ({why})");
+    }
+    if v["up_to_date"] == true {
+        return format!("{name}: up to date (this build has a checkpoint at the log's end)");
+    }
+    format!(
+        "{name}: checkpoint {} written at control position {} ({} events folded, {}, {} ms)",
+        v["written"],
+        v["gseq"],
+        v["events"],
+        twr_core::git::human_bytes(v["bytes"].as_u64().unwrap_or(0)),
+        v["ms"]
+    )
+}
+
+/// Bytes as `twr trash list` shows them.
+fn bytes_text(v: &Value) -> String {
+    twr_core::git::human_bytes(v.as_u64().unwrap_or(0))
+}
+
+/// `twr log compact` for a `log.compact` result.
+fn log_compact_text(r: &Value) -> String {
+    let n = |k: &str| r[k].as_u64().unwrap_or(0);
+    let mut out = String::new();
+    if n("checkpoints_dropped") > 0 {
+        out.push_str(&format!(
+            "dropped {} checkpoint(s)\n",
+            n("checkpoints_dropped")
+        ));
+    }
+    match r["skipped"].as_str() {
+        Some(why) => {
+            out.push_str(&format!("moved nothing: {why}\n"));
+            if n("blobs") > 0 {
+                out.push_str(&format!(
+                    "{} blob(s), {} no row left in twr.db reaches\n",
+                    n("blobs"),
+                    bytes_text(&r["blob_bytes"])
+                ));
+            }
+        }
+        None => {
+            let whither = if r["archived"] == true {
+                "into archive.db"
+            } else {
+                "deleted (archive = false)"
+            };
+            out.push_str(&format!(
+                "{} agent event(s), {} ({} purged thread(s), {} turn(s)), {whither}\n",
+                n("rows"),
+                bytes_text(&r["bytes"]),
+                n("purged_threads"),
+                n("turns"),
+            ));
+            out.push_str(&format!(
+                "{} blob(s), {} no row left in twr.db reaches\n",
+                n("blobs"),
+                bytes_text(&r["blob_bytes"])
+            ));
+            out.push_str(&format!(
+                "{} transaction(s), the longest {} ms; {} ms in all\n",
+                n("batches"),
+                n("longest_batch_ms"),
+                n("total_ms")
+            ));
+        }
+    }
+    if n("freed_pages") > 0 {
+        out.push_str(&format!("{} free page(s) given back\n", n("freed_pages")));
+    }
+    if let Some(v) = r["vacuum"].as_object() {
+        let b = |k: &str| bytes_text(&v[k]);
+        out.push_str(&format!(
+            "VACUUM: twr.db {} → {} in {} ms{}\n",
+            b("before"),
+            b("after"),
+            v["ms"].as_u64().unwrap_or(0),
+            if v["incremental_set"] == true {
+                " (incremental vacuum on from now)"
+            } else {
+                ""
+            }
+        ));
+    }
+    out
+}
+
+/// `twr log stats` for a `log.stats` result.
+fn log_stats_text(r: &Value) -> String {
+    let mut out = String::new();
+    let db = &r["db"];
+    out.push_str(&format!(
+        "twr.db       {} (write-ahead log {}; {} free page(s) of {}, auto_vacuum {})\n",
+        bytes_text(&db["bytes"]),
+        bytes_text(&db["wal"]),
+        db["free_pages"].as_u64().unwrap_or(0),
+        db["pages"].as_u64().unwrap_or(0),
+        db["auto_vacuum"].as_str().unwrap_or("?"),
+    ));
+    let a = &r["archive"];
+    if a.is_object() {
+        out.push_str(&format!(
+            "archive.db   {} (write-ahead log {})\n",
+            bytes_text(&a["bytes"]),
+            bytes_text(&a["wal"])
+        ));
+    } else {
+        out.push_str("archive.db   none yet\n");
+    }
+    let kinds = |label: &str, v: &Value, out: &mut String| {
+        let Some(k) = v["kinds"].as_object() else {
+            return;
+        };
+        let rows: Vec<[String; 3]> = k
+            .iter()
+            .map(|(kind, e)| {
+                [
+                    kind.clone(),
+                    e["rows"].as_u64().unwrap_or(0).to_string(),
+                    bytes_text(&e["bytes"]),
+                ]
+            })
+            .collect();
+        out.push_str(&format!("\n{label}\n"));
+        out.push_str(&table(&["KIND", "ROWS", "BYTES"], &rows));
+        out.push_str(&format!(
+            "blobs: {}, {}\n",
+            v["blobs"]["count"].as_u64().unwrap_or(0),
+            bytes_text(&v["blobs"]["bytes"])
+        ));
+    };
+    kinds("twr.db", db, &mut out);
+    if a.is_object() {
+        kinds("archive.db", a, &mut out);
+    }
+    let b = &r["backlog"];
+    out.push_str(&format!(
+        "\ncontrol backlog: {} item(s), {} compacted\n",
+        b["full"].as_u64().unwrap_or(0),
+        b["compacted"].as_u64().unwrap_or(0)
+    ));
+    let cps = r["checkpoints"].as_array().cloned().unwrap_or_default();
+    if cps.is_empty() {
+        out.push_str("checkpoints: none\n");
+    }
+    for c in &cps {
+        let age = c["age_secs"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "checkpoint {}: {} min old, {}, {} event(s) after it\n",
+            c["id"],
+            age / 60,
+            bytes_text(&c["bytes"]),
+            c["events_after"].as_u64().unwrap_or(0)
+        ));
+    }
+    let next = &r["next"];
+    out.push_str(&format!(
+        "\nnext compaction ([log] retention_days = {}, archive = {}): {} agent event(s), {} \
+         ({} purged thread(s), {} turn(s)){}\n",
+        r["retention_days"].as_u64().unwrap_or(0),
+        r["archive_on"].as_bool().unwrap_or(true),
+        next["rows"].as_u64().unwrap_or(0),
+        bytes_text(&next["bytes"]),
+        next["purged_threads"].as_u64().unwrap_or(0),
+        next["turns"].as_u64().unwrap_or(0),
+        if next["automatic"] == true {
+            ", within the hour"
+        } else {
+            "; the hub waits for 2 000 (`twr log compact` moves them now)"
+        }
+    ));
+    out
+}
+
 async fn trash_list(socket: &Path, raw: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let r = c.call("trash.list", Value::Null).await?;
@@ -4173,6 +6080,28 @@ async fn trash_list(socket: &Path, raw: bool) -> anyhow::Result<()> {
 }
 
 /// An RFC 3339 time as `trash.list` gives it, shorter: `2026-10-04 12:30 UTC`.
+/// A box of `hub.info` for `twr info`: its name, whether it's online, the twr version its
+/// runner last reported, and while it's offline the latest refused connection that named it.
+fn box_info_line(b: &Value) -> String {
+    let state = if b["online"].as_bool() == Some(true) {
+        "online"
+    } else {
+        "offline"
+    };
+    let mut line = format!("{} {state}", str_of(&b["name"]));
+    if let Some(v) = b["version"].as_str() {
+        line.push_str(&format!(" (twr {v})"));
+    }
+    if let Some(r) = b["refused"].as_object() {
+        line.push_str(&format!(
+            "; last refused {}: {}",
+            trash_time(&r["at"]),
+            str_of(&r["reason"])
+        ));
+    }
+    line
+}
+
 fn trash_time(t: &Value) -> String {
     let t = str_of(t);
     match t.get(..16) {
@@ -4363,11 +6292,27 @@ async fn orchestrator_show(socket: &Path, raw: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The orchestrator's runtime as `twr orchestrator show`, `twr info` and `twr orchestrator
+/// use` write it (`o`: an `orchestrator.show` object, `hub.info`'s `orchestrator`, an
+/// `orchestrator.use` answer), as a thread's
+/// ([`accounts::runtime_label`]): `claude-code:work` while its runtime shows account labels,
+/// else the runtime alone; a removed account always shows, `claude-code:work (removed)`. (An
+/// older hub's `runtime` may carry the configured account.)
+fn orchestrator_runtime(o: &Value) -> String {
+    let base = twr_core::account::split_runtime(str_of(&o["runtime"])).0;
+    accounts::runtime_label(&json!({
+        "runtime": base,
+        "account": o["account"],
+        "account_shown": o["account_shown"],
+        "account_removed": o["account_removed"],
+    }))
+}
+
 /// `twr orchestrator show` for an `orchestrator.show` result.
 fn orchestrator_text(o: &Value) -> String {
+    let runtime = orchestrator_runtime(o);
     let mut out = format!(
-        "orchestrator: {}{}{}\n",
-        str_of(&o["runtime"]),
+        "orchestrator: {runtime}{}{}\n",
         models_text(&o["model"], &o["model_actual"]),
         if o["available"].as_bool() == Some(true) {
             ""
@@ -4389,9 +6334,17 @@ fn orchestrator_text(o: &Value) -> String {
         None => out.push_str("thread:       none yet (created with the first message you say)\n"),
     }
     let conf = &o["configured"];
+    // `[orchestrator] account`, or the account part of its runtime (written apart).
+    let (conf_runtime, account) = match conf["account"].as_str() {
+        Some(a) => (
+            twr_core::account::split_runtime(str_of(&conf["runtime"])).0,
+            format!(", account {a}"),
+        ),
+        None => (str_of(&conf["runtime"]), String::new()),
+    };
     out.push_str(&format!(
-        "configured:   {}{} (the first orchestrator's; `twr orchestrator use` switches)\n",
-        str_of(&conf["runtime"]),
+        "configured:   {conf_runtime}{}{account} (the first orchestrator's; `twr orchestrator \
+         use` switches)\n",
         model_text(&conf["model"])
     ));
     let runtimes: Vec<&str> = o["runtimes"]
@@ -4474,7 +6427,7 @@ fn orchestrator_use_text(r: &Value) -> String {
 fn orchestrator_session_text(r: &Value, reset: bool) -> String {
     let mut out = format!(
         "orchestrator is now {}{}: thread {} ({})",
-        str_of(&r["runtime"]),
+        orchestrator_runtime(r),
         model_text(&r["model"]),
         str_of(&r["name"]),
         str_of(&r["thread"])
@@ -4565,6 +6518,54 @@ fn parked_footer(hidden: &[String]) -> String {
     )
 }
 
+/// How many of thread `t`'s tasks are background work: not one a tool call of its open turn
+/// waits for (`foreground_call`), which its turn stands for.
+fn bg_count(t: &Value) -> usize {
+    match t["background_tasks"].as_object() {
+        Some(tasks) => tasks
+            .values()
+            .filter(|task| task["foreground_call"].is_null())
+            .count(),
+        None => usize::try_from(t["background_task_count"].as_u64().unwrap_or(0)).unwrap_or(0),
+    }
+}
+
+/// `twr thread show`: what thread `thread` has in flight ([`twr_core::work::Work::lines`]),
+/// and its open items.
+async fn thread_show(socket: &Path, thread: &str, json: bool) -> anyhow::Result<()> {
+    let mut c = connect(socket).await?;
+    let t = c.call("thread.get", json!({ "thread": thread })).await?;
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&t["work"])?);
+        return Ok(());
+    }
+    outln!("{}", show_text(&t));
+    Ok(())
+}
+
+/// What `twr thread show` prints of thread object `t`.
+fn show_text(t: &Value) -> String {
+    let mut out = vec![format!(
+        "{} ({}){}",
+        str_of(&t["name"]),
+        str_of(&t["status"]),
+        match t["activity"].as_str().unwrap_or_default() {
+            "" => String::new(),
+            a => format!(": {a}"),
+        }
+    )];
+    match serde_json::from_value::<twr_core::work::Work>(t["work"].clone()) {
+        Ok(w) => out.extend(w.lines().into_iter().map(|l| format!("  {l}"))),
+        Err(_) => out.push("  (this hub does not say what the thread has in flight)".into()),
+    }
+    if let Some(items) = t["open_attention"].as_object().filter(|m| !m.is_empty()) {
+        for (id, reason) in items {
+            out.push(format!("  open item: {id} ({})", str_of(reason)));
+        }
+    }
+    out.join("\n")
+}
+
 async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
     let mut c = connect(socket).await?;
     let threads = c.call("thread.list", Value::Null).await?;
@@ -4594,14 +6595,14 @@ async fn thread_list(socket: &Path, all: bool) -> anyhow::Result<()> {
                 if t["retired"].as_bool() == Some(true) {
                     "retired".to_string()
                 } else {
-                    let count = t["background_task_count"].as_u64().unwrap_or(0);
+                    let count = bg_count(t);
                     if count == 0 {
                         str_of(&t["status"]).to_string()
                     } else {
                         format!("{} ({count} bg)", str_of(&t["status"]))
                     }
                 },
-                str_of(&t["runtime"]).to_string(),
+                accounts::runtime_label(t),
                 mode_cell(t),
                 model_cell(t),
                 str_of(&t["project"]).to_string(),
@@ -5290,45 +7291,86 @@ async fn events(
         p.names
             .insert(str_of(&t["id"]).to_string(), str_of(&t["name"]).to_string());
     }
-    if follow {
-        let sub_conn = connect(socket).await?;
-        let sub = sub_conn
-            .subscribe(
-                "thread.subscribe",
-                json!({ "thread": thread, "since_seq": since }),
-            )
-            .await?;
-        let mut sub = items(sub);
-        while let Some(item) = next_item(&mut sub, &mut p).await? {
-            print_item(&mut c, &mut p, &item, hydrate).await?;
-        }
+    // The stored events page by page through `thread.events`, which reads the archive too
+    // (`[log]`); then, with `--follow`, what comes after them, from the subscription, with
+    // no gap or repeat: it delivers what has a seq above the last one printed. After the
+    // first page, the thread is named by the id that page answered with: a name or alias
+    // that comes to mean another thread meanwhile (an orchestrator switch, a new thread
+    // taking the name) does not change which one is read.
+    let (id, since) = print_stored(&mut c, &mut p, thread, since, hydrate).await?;
+    if !follow {
         return p.flush();
     }
+    hub_test_gate(EVENTS_FOLLOW_GATE_ENV);
+    let sub_conn = connect(socket).await?;
+    let sub = match sub_conn
+        .subscribe(
+            "thread.subscribe",
+            json!({ "thread": id, "since_seq": since }),
+        )
+        .await
+    {
+        Ok(sub) => sub,
+        // It cannot be followed: deleted (now or before; read by its id), it records nothing
+        // more. What it recorded since the last page (its deletion) is printed first.
+        Err(e) if is_not_found(&e) => {
+            print_stored(&mut c, &mut p, &id, since, hydrate).await?;
+            p.flush()?;
+            errln!("{thread} is deleted: nothing more comes");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    let mut sub = items(sub);
+    while let Some(item) = next_item(&mut sub, &mut p).await? {
+        print_item(&mut c, &mut p, &item, hydrate).await?;
+    }
+    p.flush()
+}
+
+/// `TWR_TEST_EVENTS_FOLLOW_GATE=<file>`, for tests of `twr events --follow`: once the stored
+/// events are printed, before it subscribes, it waits at the gate ([`hub_test_gate`]).
+const EVENTS_FOLLOW_GATE_ENV: &str = "TWR_TEST_EVENTS_FOLLOW_GATE";
+
+/// Prints the stored events of thread `thread` with seq above `since`, page by page
+/// (`thread.events`, archived ones too): the thread's id, as the hub resolved it, and the
+/// last seq printed (`since` when none was). Later pages name the thread by that id.
+async fn print_stored(
+    c: &mut Client,
+    p: &mut Printer,
+    thread: &str,
+    since: u64,
+    hydrate: bool,
+) -> anyhow::Result<(String, u64)> {
     let mut since = since;
+    let mut id = thread.to_string();
     loop {
         let r = c
             .call(
                 "thread.events",
-                json!({ "thread": thread, "since_seq": since, "limit": PAGE }),
+                json!({ "thread": id, "since_seq": since, "limit": PAGE }),
             )
             .await?;
+        if let Some(t) = r["thread"].as_str() {
+            id = t.to_string();
+        }
         let evs: Vec<Event> = serde_json::from_value(r["events"].clone())?;
         for ev in &evs {
             let j = if hydrate {
-                Some(hydrate_event(&mut c, ev).await?)
+                Some(hydrate_event(c, ev).await?)
             } else {
                 None
             };
             p.event(None, ev, j)?;
         }
-        // Pages are bounded by size too: `more` says whether to continue from `next`.
-        if evs.is_empty() || r["more"] != true {
-            return p.flush();
-        }
         since = r["next"]
             .as_u64()
             .or(evs.last().map(|e| e.seq))
             .unwrap_or(since);
+        // Pages are bounded by size too: `more` says whether to continue from `next`.
+        if evs.is_empty() || r["more"] != true {
+            return Ok((id, since));
+        }
     }
 }
 
@@ -5517,6 +7559,24 @@ fn refuse_agent() -> anyhow::Result<()> {
 }
 
 fn refuse_agent_action(action: &str) -> anyhow::Result<()> {
+    match calling_agent() {
+        Some(agent) => bail!(
+            "this request comes from {agent}: agents cannot {action}; only you \
+             can, from your own terminal"
+        ),
+        None => Ok(()),
+    }
+}
+
+/// Whether this process runs for a thread's agent ([`calling_agent`]): what it prints is then
+/// read by that agent (`twr box doctor` never shows it a command box's words).
+fn caller_is_agent() -> bool {
+    calling_agent().is_some()
+}
+
+/// The thread's agent this process runs for, as said ([`twr_hub::local_agent`]); none for a
+/// test's own processes ([`test_user_waived`]).
+fn calling_agent() -> Option<String> {
     // A test's own processes, on its throwaway home only (`TWR_HOME`), with the token its
     // hubs share (`TWR_TEST_USER_TOKEN_FILE`): run from inside a thread, they would count as
     // that thread's agent.
@@ -5525,16 +7585,9 @@ fn refuse_agent_action(action: &str) -> anyhow::Result<()> {
         std::env::var_os(twr_core::client::TEST_USER_TOKEN_ENV).as_deref(),
         twr_core::paths::effective_uid(),
     ) {
-        return Ok(());
+        return None;
     }
-    match twr_hub::local_agent(std::process::id()) {
-        Some(agent) => bail!(
-            "this request comes from {}: agents cannot {action}; only you \
-             can, from your own terminal",
-            agent.detail()
-        ),
-        None => Ok(()),
-    }
+    twr_hub::local_agent(std::process::id()).map(|agent| agent.detail())
 }
 
 /// Whether [`refuse_agent_action`] lets this process act as the user: it honours the test
@@ -5624,6 +7677,18 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
             if items == 1 { "" } else { "s" }
         );
     }
+    // The orchestrator's memory goes with the data: said, since it is the user's notes.
+    let notes = std::fs::read_dir(ws.data_dir.join(twr_hub::MEMORY_DIR))
+        .map(|d| {
+            d.flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.ends_with(".md") && !n.starts_with('.')
+                })
+                .count()
+        })
+        .unwrap_or(0);
     // Moved aside first (a name no workspace can have), so a half-removed directory is never
     // taken for the workspace.
     let doomed = ws
@@ -5634,7 +7699,13 @@ async fn ws_rm(paths: &Paths, name: &str) -> anyhow::Result<()> {
     std::fs::remove_dir_all(&doomed).with_context(|| format!("removing {}", doomed.display()))?;
     // A socket file a hub that died left is left too: the next hub there replaces it, and
     // removing it here could remove a new hub's.
-    outln!("removed workspace {name}");
+    match notes {
+        0 => outln!("removed workspace {name}"),
+        n => outln!(
+            "removed workspace {name}, with its orchestrator's {n} memory note{}",
+            if n == 1 { "" } else { "s" }
+        ),
+    }
     Ok(())
 }
 
@@ -5728,14 +7799,18 @@ async fn probe_hub(socket: &Path) -> anyhow::Result<Probe> {
     )
 }
 
-/// Starts `twr hub` detached (own process group, output to the hub log).
+/// Starts `twr hub` detached (a session of its own, without a controlling terminal: neither
+/// it nor what it starts, a runtime or a job, can be stopped or hung up by the terminal `twr`
+/// ran in; output to the hub log).
 fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     twr_core::paths::ensure_private_dir(&paths.data_dir)?;
     let log_path = paths.hub_log();
     let log = twr_core::paths::open_private_append(&log_path)
         .with_context(|| format!("opening {}", log_path.display()))?;
-    let exe = std::env::current_exe().context("locating the twr executable")?;
-    let mut cmd = std::process::Command::new(exe);
+    // Not `std::env::current_exe`: the TUI starts hubs as it switches workspaces, maybe after
+    // an upgrade replaced the file it runs ([`twr_core::current_exe`]).
+    let exe = twr_core::current_exe().context("starting the hub")?;
+    let mut cmd = std::process::Command::new(&exe);
     cmd.arg("--socket")
         .arg(socket)
         .arg("--workspace")
@@ -5744,13 +7819,13 @@ fn spawn_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
-        .process_group(0)
         // Started from an agent's shell, this process carries its marker; the hub never does.
         .env_remove(twr_hub::host::AGENT_ENV)
         // Nor a test's user token: a hub started for whoever runs the TUI trusts no token
         // file named in their environment.
         .env_remove(twr_core::client::TEST_USER_TOKEN_ENV);
-    spawn_reaped(&mut cmd).context("starting the hub")?;
+    twr_adapters::process::new_session_std(&mut cmd);
+    spawn_reaped(&mut cmd).with_context(|| format!("starting the hub ({})", exe.display()))?;
     Ok(())
 }
 
@@ -5774,9 +7849,23 @@ async fn open_tui(
     paths: &Paths,
     switching: Option<twr_tui::Switching>,
     tui: twr_core::config::TuiConfig,
+    speech: twr_core::config::SpeechConfig,
 ) -> anyhow::Result<()> {
     wait_for_hub(socket, paths).await?;
-    twr_tui::run_with(socket.to_path_buf(), switching, Some(tui)).await
+    // The TUI's own speaker reads this root aloud (`[speech] local`).
+    let speech = twr_tui::speaker::LocalSpeech {
+        paths: paths.clone(),
+        config: speech,
+    };
+    let agent = calling_agent();
+    twr_tui::run_with(
+        socket.to_path_buf(),
+        switching,
+        Some(tui),
+        agent,
+        Some(speech),
+    )
+    .await
 }
 
 /// The workspaces of a root, as the TUI switches between them: their hubs are started like
@@ -5832,7 +7921,9 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
     let mut spawned: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        match probe_hub(socket).await? {
+        let probe = probe_hub(socket).await?;
+        twr_core::trace::mark_with(|| format!("cli: hub probe: {probe:?}"));
+        match probe {
             Probe::Answers => return Ok(()),
             Probe::Absent => match spawned {
                 None => {
@@ -5863,6 +7954,64 @@ async fn wait_for_hub(socket: &Path, paths: &Paths) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// `twr info`'s box line: online with the runner's version, offline with the latest
+    /// refusal, and a box that never connected.
+    #[test]
+    fn box_info_lines() {
+        let line = |b: serde_json::Value| super::box_info_line(&b);
+        assert_eq!(
+            line(serde_json::json!({"name": "gpu", "online": true,
+                "version": "0.2.0+dev.abc1234", "refused": null})),
+            "gpu online (twr 0.2.0+dev.abc1234)"
+        );
+        assert_eq!(
+            line(
+                serde_json::json!({"name": "gpu", "online": false, "version": "0.2.0",
+                "refused": {"at": "2026-10-16T09:30:12.345Z", "reason": "a bad proof"}})
+            ),
+            "gpu offline (twr 0.2.0); last refused 2026-10-16 09:30 UTC: a bad proof"
+        );
+        assert_eq!(
+            line(
+                serde_json::json!({"name": "mac", "online": false, "version": null,
+                "refused": null})
+            ),
+            "mac offline"
+        );
+    }
+
+    /// `thread new`'s project: a directory here becomes its path for the local box only; for a
+    /// remote box what was typed goes to the hub as is.
+    #[test]
+    fn project_params_for_remote_boxes_stay_as_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("api");
+        std::fs::create_dir(&sub).unwrap();
+        let typed = sub.to_string_lossy().into_owned();
+        let config = super::Config::from_toml_str(
+            "[boxes.gpu]\ntoken = \"0123456789abcdef0123456789abcdef\"\n\
+             [boxes.gpu.projects.api]\nrepo = \"/srv/api\"\n",
+        )
+        .unwrap();
+        let abs = std::fs::canonicalize(&sub).unwrap();
+        assert_eq!(
+            super::project_param(&config, &typed, None).unwrap(),
+            abs.to_string_lossy()
+        );
+        assert_eq!(
+            super::project_param(&config, &typed, Some("local")).unwrap(),
+            abs.to_string_lossy()
+        );
+        assert_eq!(
+            super::project_param(&config, &typed, Some("gpu")).unwrap(),
+            typed
+        );
+        assert_eq!(
+            super::project_param(&config, "api", Some("gpu")).unwrap(),
+            "api"
+        );
+    }
+
     /// `twr usage`: per runtime its label, plan and age, then each window's remaining share and
     /// reset; a note when nothing is known.
     #[test]
@@ -6207,6 +8356,41 @@ mod tests {
         assert_eq!(attach_hint(&json!({"runtime": "claude-code"})), None);
     }
 
+    /// Attaching a Claude Code thread on a Mac box warns about the keychain over ssh; another
+    /// runtime, another OS, a token box (no OS known), a command box (attach refused there, no
+    /// ssh) or the hub's own box does not.
+    #[test]
+    fn attaching_claude_on_a_mac_warns_about_the_keychain() {
+        let info = json!({"boxes": [
+            {"name": "mac", "transport": "ssh", "os": "Darwin"},
+            {"name": "gpu", "transport": "ssh", "os": "Linux"},
+            {"name": "lab", "transport": "token", "os": null},
+            {"name": "sb", "transport": "command", "os": "Darwin"},
+        ]});
+        let thread = |runtime: &str, b: &str| json!({"runtime": runtime, "box_name": b});
+        let w = attach_mac_warning(&thread("claude-code", "mac"), &info).unwrap();
+        assert!(
+            w.contains("box mac is a Mac")
+                && w.contains("keychain login")
+                && w.contains("continue the thread from the TUI"),
+            "{w}"
+        );
+        for (runtime, b) in [
+            ("codex", "mac"),
+            ("claude-code", "gpu"),
+            ("claude-code", "lab"),
+            ("claude-code", "sb"),
+            ("claude-code", "local"),
+            ("claude-code", "gone"),
+        ] {
+            assert_eq!(
+                attach_mac_warning(&thread(runtime, b), &info),
+                None,
+                "{runtime} on {b}"
+            );
+        }
+    }
+
     #[test]
     fn say_and_mcp_parse_and_say_outcomes_read_well() {
         let c = Cli::try_parse_from(["twr", "say", "on", "api,", "-v", "fix"]).unwrap();
@@ -6351,6 +8535,427 @@ mod tests {
         ));
     }
 
+    /// `twr runner install-token <box>` takes its own --hub, --ca, --token-file and --yes,
+    /// and none of the runner's other flags.
+    #[test]
+    fn the_install_token_subcommand_parses() {
+        let c = Cli::try_parse_from([
+            "twr",
+            "runner",
+            "install-token",
+            "gpu",
+            "--hub",
+            "wss://hub:7878",
+            "--ca",
+            "ca.pem",
+            "--token-file",
+            "t",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(Cmd::Runner {
+            cmd:
+                Some(RunnerCmd::InstallToken {
+                    box_name,
+                    hub,
+                    ca,
+                    token_file,
+                    yes: true,
+                }),
+            hub: None,
+            box_name: None,
+            ..
+        }) = c.cmd
+        else {
+            panic!("{:?}", c.cmd)
+        };
+        assert_eq!(box_name, "gpu");
+        assert_eq!(hub.as_deref(), Some("wss://hub:7878"));
+        assert_eq!(ca, Some(PathBuf::from("ca.pem")));
+        assert_eq!(token_file, Some(PathBuf::from("t")));
+        let c = Cli::try_parse_from(["twr", "runner", "install-token", "gpu"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                cmd: Some(RunnerCmd::InstallToken {
+                    hub: None,
+                    yes: false,
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["twr", "runner", "install-token"]).is_err());
+        for extra in [
+            &["--allow-insecure"][..],
+            &["--box", "b"],
+            &["--data-dir", "d"],
+        ] {
+            let args = [&["twr", "runner", "install-token", "gpu"][..], extra].concat();
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?}");
+        }
+        assert!(Cli::try_parse_from([
+            "twr",
+            "runner",
+            "--hub",
+            "ws://h:1",
+            "install-token",
+            "gpu"
+        ])
+        .is_err());
+    }
+
+    /// The SSH box's relay (`--stdio`) and daemon (`--daemon`) take a box and a hub key, none
+    /// of the token runner's flags, and not each other; the daemon every path. Hidden from
+    /// help.
+    #[test]
+    fn the_box_relay_and_daemon_flags_parse() {
+        let key = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let args: Vec<&str> = ["twr", "runner"].iter().chain(extra).copied().collect();
+            Cli::try_parse_from(args)
+        };
+        let relay = ["--stdio", "--box", "b", "--hub-key", key.as_str()];
+        let c = parse(&[&relay[..], &["--build=0123456789abcdef"]].concat()).unwrap();
+        assert!(
+            matches!(&c.cmd, Some(Cmd::Runner { build: Some(b), .. }) if b == "0123456789abcdef")
+        );
+        let c = parse(&relay).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stdio: true,
+                daemon: false,
+                replace: false,
+                hub: None,
+                ..
+            })
+        ));
+        let c = parse(&[&relay[..], &["--replace"]].concat()).unwrap();
+        assert!(matches!(c.cmd, Some(Cmd::Runner { replace: true, .. })));
+        let c = parse(&[&relay[..], &["--stop"]].concat()).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stop: true,
+                replace: false,
+                restart: false,
+                ..
+            })
+        ));
+        for extra in [&["--restart"][..], &["--restart", "--replace"]] {
+            let c = parse(&[&relay[..], extra].concat()).unwrap();
+            assert!(matches!(
+                c.cmd,
+                Some(Cmd::Runner {
+                    restart: true,
+                    stop: false,
+                    ..
+                })
+            ));
+        }
+        let daemon = [
+            "--daemon",
+            "--box",
+            "b",
+            "--hub-key",
+            key.as_str(),
+            "--daemon-socket",
+            "/s/x.sock",
+            "--data-dir",
+            "/d",
+            "--lock",
+            "/l",
+            "--log",
+            "/d/daemon.log",
+        ];
+        let c = parse(&daemon).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                daemon: true,
+                daemon_socket: Some(_),
+                lock: Some(_),
+                log: Some(_),
+                ..
+            })
+        ));
+        // The names the hub passes joined to their flag (`--box=<name>`), as the relay and the
+        // daemon get them.
+        for args in [
+            vec!["--stdio", "--box=b", "--hub-key", key.as_str()],
+            [&["--daemon", "--box=b"][..], &daemon[3..]].concat(),
+        ] {
+            let c = parse(&args).unwrap();
+            assert!(
+                matches!(&c.cmd, Some(Cmd::Runner { box_name: Some(b), .. }) if b == "b"),
+                "{args:?}"
+            );
+        }
+        // What each refuses.
+        for bad in [
+            vec!["--stdio", "--box", "b"],
+            vec!["--stdio", "--hub-key", key.as_str()],
+            [&relay[..], &["--daemon"]].concat(),
+            [&relay[..], &["--hub", "ws://h:1"]].concat(),
+            [&relay[..], &["--token-file", "/t"]].concat(),
+            [&relay[..], &["--ca", "/c"]].concat(),
+            [&relay[..], &["--allow-insecure"]].concat(),
+            [&relay[..], &["--lock", "/l"]].concat(),
+            [&daemon[..], &["--replace"]].concat(),
+            [&daemon[..], &["--stop"]].concat(),
+            [&daemon[..], &["--restart"]].concat(),
+            [&relay[..], &["--stop", "--replace"]].concat(),
+            [&relay[..], &["--stop", "--restart"]].concat(),
+            vec!["--hub", "ws://h:1", "--box", "b", "--restart"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--stop"],
+            [&daemon[..], &["--hub", "ws://h:1"]].concat(),
+            daemon[..daemon.len() - 2].to_vec(),
+            daemon[..daemon.len() - 4].to_vec(),
+            vec!["--hub", "ws://h:1", "--box", "b", "--replace"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--daemon-socket", "/s"],
+            vec!["--box", "b", "--hub-key", key.as_str()],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        // Hidden: the help shows none of them (as whole flags: `twr account remove --logout`
+        // is not `--log`).
+        let help = cli_help_page().1;
+        let shows = |flag: &str| {
+            help.match_indices(flag).any(|(i, _)| {
+                !help[i + flag.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-')
+            })
+        };
+        for flag in [
+            "--stdio",
+            "--daemon",
+            "--hub-key",
+            "--replace",
+            "--stop",
+            "--restart",
+            "--lock",
+            "--log",
+        ] {
+            assert!(!shows(flag), "{flag}");
+        }
+    }
+
+    /// The hub probes its own agent CLIs unless it is a test's, or `TWR_AGENT_PROBE=off`;
+    /// any other value leaves it on.
+    #[test]
+    fn the_hubs_own_agent_probe_can_be_turned_off() {
+        use std::ffi::OsStr;
+        assert!(probes_own_agents(false, None));
+        assert!(probes_own_agents(false, Some(OsStr::new("on"))));
+        assert!(probes_own_agents(false, Some(OsStr::new("OFF"))));
+        assert!(probes_own_agents(false, Some(OsStr::new(""))));
+        assert!(!probes_own_agents(false, Some(OsStr::new("off"))));
+        assert!(!probes_own_agents(true, None));
+    }
+
+    /// The box-side probes of `twr box doctor` / `twr box login` / `twr box project`:
+    /// `--agents`, `--login <agent>`, `--find-repo` and `--clone-repo` take no other runner
+    /// flag and not each other; `--status` goes with the relay's box and hub key only. Hidden
+    /// from help.
+    #[test]
+    fn the_box_probe_flags_parse() {
+        let key = "ab".repeat(32);
+        let parse = |extra: &[&str]| {
+            let args: Vec<&str> = ["twr", "runner"].iter().chain(extra).copied().collect();
+            Cli::try_parse_from(args)
+        };
+        let c = parse(&["--agents"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                agents: true,
+                hub: None,
+                box_name: None,
+                login: None,
+                ..
+            })
+        ));
+        for agent in ["claude", "claude-code", "codex", "grok", "grok-build"] {
+            let c = parse(&["--login", agent]).unwrap();
+            assert!(
+                matches!(&c.cmd, Some(Cmd::Runner { login: Some(a), agents: false, .. }) if a == agent),
+                "{agent}"
+            );
+        }
+        let relay = ["--stdio", "--box=b", "--hub-key", key.as_str()];
+        let c = parse(&[&relay[..], &["--status"]].concat()).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Runner {
+                stdio: true,
+                status: true,
+                stop: false,
+                ..
+            })
+        ));
+        for bad in [
+            vec!["--login", "acp"],
+            vec!["--login"],
+            vec!["--agents", "--login", "codex"],
+            vec!["--agents", "--box", "b"],
+            vec!["--agents", "--hub", "ws://h:1"],
+            vec!["--agents", "--hub", "ws://h:1", "--box", "b"],
+            vec!["--agents", "--data-dir", "/d"],
+            vec!["--agents", "--token-file", "/t"],
+            vec!["--agents", "--hub-key", key.as_str()],
+            [&relay[..], &["--agents"]].concat(),
+            vec!["--login", "claude", "--box", "b"],
+            vec!["--login", "claude", "--hub", "ws://h:1", "--box", "b"],
+            vec!["--login", "claude", "--allow-insecure"],
+            [&relay[..], &["--login", "codex"]].concat(),
+            vec!["--login", "claude", "--daemon"],
+            vec!["--status"],
+            vec!["--status", "--box", "b", "--hub-key", key.as_str()],
+            vec!["--hub", "ws://h:1", "--box", "b", "--status"],
+            [&relay[..], &["--status", "--stop"]].concat(),
+            [&relay[..], &["--status", "--replace"]].concat(),
+            [&relay[..], &["--status", "--restart"]].concat(),
+            [&relay[..], &["--status", "--build=0123456789abcdef"]].concat(),
+            vec!["--agents", "token"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        // `--exec` takes a built-in runtime, `--path` and the arguments after `--`, and no
+        // other runner flag.
+        let c = parse(&[
+            "--exec",
+            "claude-code",
+            "--path=bin:/usr/bin",
+            "--",
+            "--resume",
+            "s",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec: Some(r), exec_path: Some(p), exec_args, box_name: None, .. })
+                if r == "claude-code" && p == "bin:/usr/bin" && exec_args == &["--resume", "s"]
+        ));
+        let c = parse(&["--exec=codex", "--", "resume", "--model", "x"]).unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec: Some(r), exec_path: None, exec_args, exec_env, .. })
+                if r == "codex" && exec_args == &["resume", "--model", "x"] && exec_env.is_empty()
+        ));
+        // The thread's other variables, each in an argument of its own.
+        let c = parse(&[
+            "--exec=codex",
+            "--env=HOME=/x y",
+            "--env=A=b=c",
+            "--unset=CLAUDE_CODE_SIMPLE",
+            "--",
+            "resume",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { exec_env, exec_unset, exec_args, .. })
+                if exec_env == &["HOME=/x y", "A=b=c"]
+                    && exec_unset == &["CLAUDE_CODE_SIMPLE"]
+                    && exec_args == &["resume"]
+        ));
+        for bad in [
+            vec!["--exec", "acp", "--", "x"],
+            vec!["--exec", "codex", "--box", "b"],
+            vec!["--exec", "codex", "--agents"],
+            vec!["--exec", "codex", "--login", "codex"],
+            vec!["--exec", "codex", "--hub", "ws://h:1"],
+            [&relay[..], &["--exec", "codex"]].concat(),
+            vec!["--path", "/x"],
+            vec!["--env=A=b"],
+            vec!["--unset=A"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--env=A=b"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--", "x"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--path", "/x"],
+            vec!["--agents", "--", "x"],
+            vec!["--login", "codex", "--path", "/x"],
+            [&relay[..], &["--", "x"]].concat(),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        // `--find-repo` and `--clone-repo` take their own operands and no other runner flag.
+        let c = parse(&[
+            "--find-repo",
+            "--name=api",
+            "--origin=git@github.com:o/api.git",
+            "--hint=/home/me/code/api",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { find_repo: true, clone_repo: false, repo_name: Some(n), origin: Some(o), hint: Some(h), box_name: None, hub: None, .. })
+                if n == "api" && o == "git@github.com:o/api.git" && h == Path::new("/home/me/code/api")
+        ));
+        let c = parse(&["--find-repo", "--name", "api"]).unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner {
+                find_repo: true,
+                origin: None,
+                hint: None,
+                ..
+            })
+        ));
+        let c = parse(&[
+            "--clone-repo",
+            "--url",
+            "https://h/o/api",
+            "--parent",
+            "/home/me/code",
+            "--name",
+            "api",
+        ])
+        .unwrap();
+        assert!(matches!(
+            &c.cmd,
+            Some(Cmd::Runner { clone_repo: true, find_repo: false, clone_url: Some(u), clone_parent: Some(p), repo_name: Some(n), .. })
+                if u == "https://h/o/api" && p == Path::new("/home/me/code") && n == "api"
+        ));
+        let clone = ["--clone-repo", "--url=u", "--parent=/p", "--name=n"];
+        for bad in [
+            vec!["--find-repo"],
+            vec!["--name", "api"],
+            vec!["--find-repo", "--name=a", "--url=u"],
+            vec!["--find-repo", "--name=a", "--parent=/p"],
+            vec!["--find-repo", "--name=a", "--box", "b"],
+            vec!["--find-repo", "--name=a", "--hub", "ws://h:1"],
+            vec!["--find-repo", "--name=a", "--agents"],
+            vec!["--find-repo", "--name=a", "--exec=codex"],
+            vec!["--origin=u"],
+            vec!["--hint=/p"],
+            vec!["--hub", "ws://h:1", "--box", "b", "--name=a"],
+            vec!["--clone-repo", "--url=u", "--name=n"],
+            vec!["--clone-repo", "--parent=/p", "--name=n"],
+            vec!["--clone-repo", "--url=u", "--parent=/p"],
+            vec!["--url=u", "--parent=/p", "--name=n"],
+            [&clone[..], &["--find-repo"]].concat(),
+            [&clone[..], &["--origin=o"]].concat(),
+            [&clone[..], &["--login", "codex"]].concat(),
+            [&clone[..], &["--box", "b"]].concat(),
+            [&relay[..], &["--find-repo", "--name=a"]].concat(),
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        let help = cli_help_page().1;
+        for flag in [
+            "--agents",
+            "--login",
+            "--status",
+            "--exec",
+            "--find-repo",
+            "--clone-repo",
+            "--hint",
+            "--origin",
+        ] {
+            assert!(!help.contains(flag), "{flag}");
+        }
+    }
+
     #[test]
     fn new_subcommands_parse() {
         let c = Cli::try_parse_from(["twr", "attach", "api", "--force"]).unwrap();
@@ -6414,7 +9019,8 @@ mod tests {
         .unwrap();
         assert!(matches!(
             c.cmd,
-            Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None })
+            Some(Cmd::Model { ref thread, ref model, ref effort, runtime: None, account: None,
+                outside_pin: false })
                 if thread == "web" && model.as_deref() == Some("claude-fable-5-1")
                     && effort.as_deref() == Some("high")
         ));
@@ -6427,6 +9033,85 @@ mod tests {
                 ..
             })
         ));
+        // `--outside-pin` with either account syntax; with neither, refused after parsing.
+        for args in [
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--runtime",
+                "claude-code:personal",
+                "--outside-pin",
+            ][..],
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--account",
+                "personal",
+                "--outside-pin",
+            ],
+            &["twr", "thread", "new", ".", "--outside-pin"],
+            &[
+                "twr",
+                "thread",
+                "new",
+                ".",
+                "--runtime",
+                "acp:x:y",
+                "--outside-pin",
+            ],
+            &[
+                "twr",
+                "model",
+                "web",
+                "--runtime",
+                "codex:team",
+                "--outside-pin",
+            ],
+            &["twr", "model", "web", "--account", "team", "--outside-pin"],
+            &["twr", "model", "web", "--outside-pin"],
+            &["twr", "model", "web", "--runtime", "codex", "--outside-pin"],
+        ] {
+            let c = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+            let (account, runtime, outside_pin) = match c.cmd {
+                Some(Cmd::Thread {
+                    cmd:
+                        ThreadCmd::New {
+                            account,
+                            runtime,
+                            outside_pin,
+                            ..
+                        },
+                })
+                | Some(Cmd::Model {
+                    account,
+                    runtime,
+                    outside_pin,
+                    ..
+                }) => (account, runtime, outside_pin),
+                other => panic!("{args:?}: {other:?}"),
+            };
+            assert!(outside_pin, "{args:?}");
+            let named = args.contains(&"--account")
+                || args
+                    .iter()
+                    .any(|a| *a == "claude-code:personal" || *a == "codex:team");
+            let checked = check_outside_pin(outside_pin, account.as_deref(), runtime.as_deref());
+            match named {
+                true => checked.unwrap_or_else(|e| panic!("{args:?}: {e}")),
+                false => assert!(
+                    checked
+                        .unwrap_err()
+                        .to_string()
+                        .starts_with("--outside-pin needs the account it is for"),
+                    "{args:?}"
+                ),
+            }
+        }
+        check_outside_pin(false, None, None).unwrap();
         assert!(Cli::try_parse_from(["twr", "respond", "api"]).is_err());
         let c = Cli::try_parse_from(["twr", "park", "api", "--keep", "--force"]).unwrap();
         assert!(matches!(
@@ -6444,6 +9129,27 @@ mod tests {
         ));
         let c = Cli::try_parse_from(["twr", "resume", "api"]).unwrap();
         assert!(matches!(c.cmd, Some(Cmd::Resume { ref thread }) if thread == "api"));
+        let c = Cli::try_parse_from(["twr", "compact", "api"]).unwrap();
+        assert!(
+            matches!(c.cmd, Some(Cmd::Compact { ref thread, offers: None }) if thread == "api")
+        );
+        let c = Cli::try_parse_from(["twr", "compact", "api", "--offers", "off"]).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Some(Cmd::Compact { ref thread, offers: Some(ref o) }) if thread == "api" && o == "off"
+        ));
+        assert!(Cli::try_parse_from(["twr", "compact", "api", "--offers", "maybe"]).is_err());
+        assert_eq!(
+            compact_outcome("api", &json!({"thread_name": "api", "offers": "on"})),
+            "api: offers to compact its context once its prompt cache expired are on"
+        );
+        assert_eq!(
+            compact_outcome(
+                "api",
+                &json!({"thread_name": "api", "state": "started", "turn": 4})
+            ),
+            "api: compacting its context (turn 4)"
+        );
         let c = Cli::try_parse_from(["twr", "thread", "new", ".", "--base", "v1.2"]).unwrap();
         assert!(matches!(
             c.cmd,
@@ -6630,6 +9336,86 @@ mod tests {
         assert!(shown.contains("retired:      1 earlier"), "{shown}");
     }
 
+    /// The orchestrator's runtime is labelled with its account only while `account_shown`:
+    /// a configured `claude-code:work` (an older hub's `runtime`) is the runtime alone
+    /// otherwise; the configured line writes the account apart.
+    #[test]
+    fn the_orchestrators_account_is_labelled_only_while_shown() {
+        let o = |runtime: &str, shown: bool| {
+            orchestrator_text(&json!({
+                "available": true, "runtime": runtime, "model": null, "account": "work",
+                "account_shown": shown, "thread": null,
+                "configured": {"runtime": "claude-code:work", "model": null, "account": "work"},
+                "runtimes": [],
+            }))
+        };
+        for runtime in ["claude-code", "claude-code:work"] {
+            let hidden = o(runtime, false);
+            assert!(
+                hidden.starts_with(
+                    "orchestrator: claude-code (the runtime's default model)
+"
+                ),
+                "{hidden}"
+            );
+            assert!(
+                hidden.contains(
+                    "configured:   claude-code (the runtime's default model), account work"
+                ),
+                "{hidden}"
+            );
+            let shown = o(runtime, true);
+            assert!(
+                shown.starts_with(
+                    "orchestrator: claude-code:work (the runtime's default model)
+"
+                ),
+                "{shown}"
+            );
+        }
+        // A removed account always shows, whatever `account_shown` says.
+        for shown in [false, true] {
+            let removed = orchestrator_text(&json!({
+                "available": true, "runtime": "claude-code", "model": null, "account": "work",
+                "account_shown": shown, "account_removed": true, "thread": null,
+                "configured": {"runtime": "claude-code", "model": null}, "runtimes": [],
+            }));
+            assert!(
+                removed.starts_with(
+                    "orchestrator: claude-code:work (removed) (the runtime's default model)\n"
+                ),
+                "{removed}"
+            );
+        }
+        // `twr info`'s and `twr orchestrator use`'s runtime: the same label.
+        let o = |extra: Value| {
+            let mut o = json!({"runtime": "claude-code", "account": "work"});
+            o.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            orchestrator_runtime(&o)
+        };
+        assert_eq!(o(json!({})), "claude-code");
+        assert_eq!(o(json!({"account_shown": false})), "claude-code");
+        assert_eq!(o(json!({"account_shown": true})), "claude-code:work");
+        assert_eq!(
+            o(json!({"account_shown": false, "account_removed": true})),
+            "claude-code:work (removed)"
+        );
+        assert_eq!(
+            orchestrator_runtime(&json!({"runtime": "claude-code:work", "account_shown": false})),
+            "claude-code"
+        );
+        let switched = orchestrator_use_text(&json!({
+            "thread": "01NEW", "name": "orchestrator", "runtime": "claude-code", "model": null,
+            "account": "work", "account_shown": true, "started": false, "previous": null,
+        }));
+        assert!(
+            switched.starts_with("orchestrator is now claude-code:work (the runtime's default"),
+            "{switched}"
+        );
+    }
+
     /// The orchestrator lines and `thread list` say the model the runtime reports next to the
     /// requested one.
     #[test]
@@ -6728,6 +9514,21 @@ mod tests {
 
     /// `twr model` says what changed and when the runtime takes it, and shows the model and
     /// effort (and what a live runtime still runs with) with only the thread.
+    /// `twr thread new` and `twr model` print the hub's advisory (`warning`) to stderr; a
+    /// result without one prints nothing more.
+    #[test]
+    fn results_with_a_warning_say_it() {
+        let w = "box gpu reports no `codex` on its PATH; the thread may fail to start: run `twr \
+                 box doctor gpu`";
+        let made = json!({"id": "t1", "name": "api", "runtime": "codex", "warning": w});
+        assert_eq!(result_warning(&made), Some(format!("warning: {w}")));
+        let set = json!({"thread_name": "api", "changed": true, "model": "o3", "warning": w});
+        assert_eq!(result_warning(&set), Some(format!("warning: {w}")));
+        assert_eq!(result_warning(&json!({"id": "t1", "name": "api"})), None);
+        assert_eq!(result_warning(&json!({"warning": " "})), None);
+        assert_eq!(result_warning(&json!({"warning": 3})), None);
+    }
+
     #[test]
     fn model_outcomes_and_show() {
         let r = |applies: &str| {
@@ -6766,6 +9567,47 @@ mod tests {
             "api: runtime claude-code, model fable, effort high; its runtime runs model \
              fable, effort (runtime default) until it restarts"
         );
+        let moving = |resume: Value| {
+            model_show(&json!({"name": "api", "runtime": "codex", "model": null,
+                               "effort": null, "handoff_pending": true,
+                               "resume_session": resume}))
+        };
+        assert!(moving(Value::Null).ends_with(
+            "its next turn starts a new codex session, given a handoff of the previous one"
+        ));
+        assert!(moving(json!("th-1")).ends_with(
+            "its next turn resumes its earlier codex session th-1, told what the thread did since"
+        ));
+    }
+
+    /// `twr hub stop` writes this build's checkpoint first only for a hub of another version
+    /// on the workspace's own log: not for one of this version, one that does not say its
+    /// version, or one on another database.
+    #[test]
+    fn hub_stop_prewarms_only_a_hub_of_another_build_on_this_log() {
+        let db = Path::new("/h/twr.db");
+        let info = |version: Value, at: Option<&str>| {
+            let mut v = json!({ "version": version, "pid": 7 });
+            if let Some(at) = at {
+                v["db"] = json!(at);
+            }
+            v
+        };
+        let (this, build) = ("0.3.0+dev.abc", "0.3.0+dev.abc src 1");
+        let wanted = |info: &Value| prewarm_wanted(info, build, db);
+        // An older hub says its version only: it may be another build of this version (a
+        // dirty checkout's), so it gets one too.
+        assert!(wanted(&info(json!("0.3.0+dev.123"), Some("/h/twr.db"))));
+        assert!(wanted(&info(json!("0.2.9"), None)));
+        assert!(wanted(&info(json!(this), Some("/h/twr.db"))));
+        assert!(!wanted(&Value::Null), "no answer, nothing known");
+        assert!(!wanted(&info(json!("0.2.9"), Some("/other/twr.db"))));
+        // Two builds of one version differ in their checkpoint build.
+        let mut same_version = info(json!(this), Some("/h/twr.db"));
+        same_version["checkpoint_build"] = json!("0.3.0+dev.abc src 2");
+        assert!(wanted(&same_version));
+        same_version["checkpoint_build"] = json!(build);
+        assert!(!wanted(&same_version), "this very build");
     }
 
     /// `twr hub stop` says "stopped" only once the hub's process is seen gone: an unreadable
@@ -6863,9 +9705,8 @@ mod tests {
     fn hub_stop_connection_retries_preserve_rpc_refusals() {
         let reset = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
         assert!(stop_connection_lost(&reset));
-        assert!(stop_connection_lost(&anyhow!(
-            "hub closed the connection during hello"
-        )));
+        let closed = twr_core::client::HubClosed::new("hub.info", true, None, None);
+        assert!(stop_connection_lost(&closed.into()));
         let refusal = anyhow::Error::from(RpcError::new(
             codes::UNAUTHORIZED,
             "hub closed the connection during hello",
@@ -7561,6 +10402,54 @@ mod tests {
         );
     }
 
+    /// `twr thread show` says what the hub's `work` says, a line each, and the open items; an
+    /// older hub without `work` is said so. `twr thread list` counts as `bg` only the tasks no
+    /// call of the turn waits for.
+    #[test]
+    fn thread_show_says_the_work_and_bg_counts_background_only() {
+        let t = json!({
+            "name": "api", "status": "running", "activity": "re-reviewing · waiting",
+            "work": {
+                "as_of": "2026-10-28T22:12:53Z", "state": "waiting_on_work", "sight": "full",
+                "turn": 15, "turn_started_at": "2026-10-28T21:28:00Z",
+                "calls": [{"id": "c2", "tool": "Bash", "what": "Wait for round 3 answer",
+                           "since": "2026-10-28T22:07:46Z", "task": "bsv"}],
+                "tasks": [
+                    {"id": "bu3", "what": "Re-review (round 3)", "kind": "background",
+                     "since": "2026-10-28T22:07:44Z", "progress_at": "2026-10-28T22:07:44Z",
+                     "alive_at": "2026-10-28T22:07:44Z"},
+                    {"id": "bsv", "what": "Wait for round 3 answer", "kind": "foreground",
+                     "since": "2026-10-28T22:07:50Z", "alive_at": "2026-10-28T22:07:50Z"}],
+                "queued": {"count": 1, "oldest_at": "2026-10-28T21:58:00Z",
+                           "from": "orchestrator"},
+                "progress_at": "2026-10-28T22:07:50Z"
+            },
+            "background_tasks": {"bu3": {}, "bsv": {"foreground_call": "c2"}},
+            "background_task_count": 2,
+            "open_attention": {"h1": "stalled"}
+        });
+        assert_eq!(
+            show_text(&t),
+            "api (running): re-reviewing · waiting
+  state: waiting_on_work
+  turn 15, started 44m ago
+  call: Bash \"Wait for round 3 answer\" open 5m (task bsv)
+  background: Re-review (round 3) [bu3], running 5m, last update 5m ago
+  foreground: Wait for round 3 answer [bsv], running 5m, last update 5m ago
+  queued: 1 prompt(s), the oldest (orchestrator) waiting 14m
+  last progress: 5m ago
+  as of 22:12:53 UTC
+  open item: h1 (stalled)"
+        );
+        assert_eq!(bg_count(&t), 1);
+        assert_eq!(bg_count(&json!({"background_task_count": 3})), 3);
+        let old = show_text(&json!({"name": "api", "status": "idle"}));
+        assert_eq!(
+            old,
+            "api (idle)\n  (this hub does not say what the thread has in flight)"
+        );
+    }
+
     /// `twr thread list`'s last column is the thread's activity line, cut with `…`.
     #[test]
     fn thread_list_ends_with_the_activity() {
@@ -7680,6 +10569,59 @@ mod tests {
             ],
         );
         assert_eq!(t, "A    BB\nxxx  y\nz\n");
+    }
+
+    /// `twr log compact` says what moved, where to, how long the write lock was held at most,
+    /// and what the `VACUUM` did; `twr log stats` the sizes, kinds, checkpoints, backlog and
+    /// what the next run moves.
+    #[test]
+    fn log_texts() {
+        let r = json!({
+            "rows": 1200, "bytes": 5_000_000, "purged_threads": 2, "turns": 7, "blobs": 30,
+            "blob_bytes": 9_000_000, "archived": true, "batches": 2, "longest_batch_ms": 14,
+            "total_ms": 900, "freed_pages": 0, "checkpoints_dropped": 2,
+            "vacuum": {"ms": 3100, "before": 400_000_000, "after": 90_000_000,
+                       "incremental_set": true},
+        });
+        let t = log_compact_text(&r);
+        assert!(t.contains("dropped 2 checkpoint(s)"), "{t}");
+        assert!(
+            t.contains(
+                "1200 agent event(s), 5 MB (2 purged thread(s), 7 turn(s)), into archive.db"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("the longest 14 ms"), "{t}");
+        assert!(
+            t.contains("VACUUM: twr.db 381 MB → 86 MB in 3100 ms"),
+            "{t}"
+        );
+        let t = log_compact_text(&json!({"skipped": "no agent events to move", "archived": false}));
+        assert_eq!(t, "moved nothing: no agent events to move\n");
+        let st = json!({
+            "db": {"bytes": 1000, "wal": 0, "free_pages": 3, "pages": 10,
+                   "auto_vacuum": "none",
+                   "kinds": {"agent.text": {"rows": 5, "bytes": 500}},
+                   "blobs": {"count": 1, "bytes": 10}},
+            "archive": null,
+            "backlog": {"full": 40, "compacted": 9},
+            "checkpoints": [{"id": 3, "age_secs": 600, "bytes": 2048, "events_after": 12}],
+            "retention_days": 30, "archive_on": true,
+            "next": {"rows": 5, "bytes": 500, "purged_threads": 0, "turns": 1,
+                     "automatic": false},
+        });
+        let t = log_stats_text(&st);
+        for want in [
+            "auto_vacuum none",
+            "archive.db   none yet",
+            "agent.text",
+            "control backlog: 40 item(s), 9 compacted",
+            "checkpoint 3: 10 min old, 2 KB, 12 event(s) after it",
+            "5 agent event(s), 500 bytes",
+            "the hub waits for 2 000",
+        ] {
+            assert!(t.contains(want), "{want}: {t}");
+        }
     }
 
     /// A socket that accepts connections but only answers after `quiet` has passed.

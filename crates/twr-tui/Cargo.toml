@@ -10,6 +10,8 @@ description = "twr terminal UI: stack and grid views, attention cards, transcrip
 
 [dependencies]
 twr-core.workspace = true
+# The TUI's own speaker ([speech] local): reads aloud on the machine you listen on.
+twr-speech.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 crossterm = { workspace = true, features = ["event-stream"] }
@@ -18,6 +20,10 @@ pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# `terminal_setup`: settings files opened without following links (`O_NOFOLLOW`).
+libc.workspace = true
+# `terminal_setup`: alacritty.toml, read and checked before it is written.
+toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

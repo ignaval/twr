@@ -16,8 +16,8 @@ use twr_core::reduce::ThreadView;
 use twr_runner::workdirs::WorkdirUse;
 
 use super::{
-    append_err, git, internal, rpc, runtime_spec, spawn_config, twr_ext_map, AttachLease, Core,
-    Exit, Hub, HubState, Inner, Live, RuntimeExiting, ThreadRt, ATTACH_QUIESCE_TIMEOUT, LOCAL_BOX,
+    append_err, git, internal, rpc, runtime_spec, twr_ext_map, AttachLease, Core, Exit, Hub,
+    HubState, Inner, Live, RuntimeExiting, ThreadRt, ATTACH_QUIESCE_TIMEOUT, LOCAL_BOX,
 };
 use crate::host::{ThreadHost, AGENT_ENV, ATTACH_ENV};
 use crate::store;
@@ -52,8 +52,9 @@ pub struct AttachGrant {
     pub session_id: String,
     /// Runtime name.
     pub runtime: String,
-    /// The thread's box when it is a remote one: `argv` is then `ssh -t <boxes.NAME.ssh> --
-    /// <command>` (the runtime's own command runs on that box, in its directory there), `cwd`
+    /// The thread's box when it is a remote one: `argv` is then `ssh -t <no forwarding>
+    /// <boxes.NAME.ssh> -a -x -k -- <command>` (`crate::remote::ssh_command`; the runtime's
+    /// own command runs on that box, in its directory there), `cwd`
     /// is empty and `env` has only [`ATTACH_ENV`] and [`AGENT_ENV`] (for the local `ssh`).
     #[serde(rename = "box", skip_serializing_if = "Option::is_none")]
     pub box_name: Option<String>,
@@ -128,9 +129,9 @@ struct RemoteAttach {
 }
 
 /// A thread's interactive command, as [`Hub::interactive_command`] made it.
-struct AttachCommand<'a> {
+struct AttachCommand {
     /// The thread's box.
-    host: &'a Arc<dyn ThreadHost>,
+    host: Arc<dyn ThreadHost>,
     /// The session the command resumes.
     session: String,
     /// The runtime configuration it was made from.
@@ -203,16 +204,18 @@ impl Core {
     }
 
     /// The runtime configuration thread `id`'s (`view`) interactive command is made from: its
-    /// start configuration ([`spawn_config`]: mode, model, effort, directory), an `acp`
-    /// thread's preset attach command (`TWR_ACP_ATTACH`), and the current orchestrator's
-    /// restrictions (or the attach is refused).
+    /// start configuration ([`Core::spawn_config`]: mode, model, effort, directory, its
+    /// account's environment), an `acp` thread's preset attach command (`TWR_ACP_ATTACH`), and
+    /// the current orchestrator's restrictions (or the attach is refused). Refused too on an
+    /// account that cannot run its session ([`Core::refuse_account`]).
     fn attach_config(
         &self,
         hub: &Inner,
         id: &str,
         view: &ThreadView,
     ) -> Result<SpawnConfig, RpcError> {
-        let mut cfg = spawn_config(hub, view);
+        self.refuse_account(view)?;
+        let mut cfg = self.spawn_config(hub, view);
         if let Some(r) = self.rt.get(id) {
             cfg.env.extend(r.acp_env.iter().cloned());
         }
@@ -449,8 +452,8 @@ impl Core {
         let client = view.attached.clone().unwrap_or_default();
         let box_name = view.box_name.clone();
         let dir = child.dir.as_ref().map(PathBuf::from);
-        let workdir = match (&dir, hub.remotes.contains_key(&box_name)) {
-            (Some(d), false) => hub.hosts.get(&box_name).and_then(|h| {
+        let workdir = match (&dir, hub.has_remote(&box_name)) {
+            (Some(d), false) => hub.host(&box_name).and_then(|h| {
                 h.use_workdir(d, &format!("{thread} (attached by {client})"))
                     .unwrap_or_else(|e| {
                         tracing::warn!(thread, error = %format!("{e:#}"), "cannot hold the directory of an attach the hub took over");
@@ -700,7 +703,7 @@ impl Hub {
         remote_cmd: &mut Option<RemoteAttach>,
     ) -> Result<(AttachGrant, SpawnConfig, oneshot::Receiver<()>), RpcError> {
         let (id, view) = core.attachable(query)?;
-        let remote = self.inner.remotes.contains_key(&view.box_name);
+        let remote = self.inner.has_remote(&view.box_name);
         let AttachCommand {
             host,
             session,
@@ -737,7 +740,7 @@ impl Hub {
                 ));
             }
         }
-        let workdir = core.attach_workdir(host, &id, &view, dir.as_deref(), remote, client)?;
+        let workdir = core.attach_workdir(&host, &id, &view, dir.as_deref(), remote, client)?;
         let (lease, rx) =
             core.take_attach_lease(&self.inner, &id, client, &mut grant, dir, workdir)?;
         Ok((AttachGrant { lease, ..grant }, cfg, rx))
@@ -754,17 +757,20 @@ impl Hub {
         view: &ThreadView,
         remote: bool,
         remote_cmd: &mut Option<RemoteAttach>,
-    ) -> Result<AttachCommand<'_>, RpcError> {
+    ) -> Result<AttachCommand, RpcError> {
         if remote {
             core.require_box(view)?;
         }
-        let Some(host) = self.inner.hosts.get(&view.box_name) else {
+        let Some(host) = self.inner.host(&view.box_name) else {
             return Err(rpc(
                 codes::BOX_OFFLINE,
                 format!("box {:?} is not available", view.box_name),
             ));
         };
-        let Some(session) = view.session_id.clone() else {
+        // While a move to another runtime is pending, the thread has no session of it yet,
+        // even one the move resumes: its next turn tells that one what happened since
+        // (`hub::switch`).
+        let Some(session) = view.confirmed_session().map(str::to_string) else {
             return Err(rpc(
                 codes::UNSUPPORTED,
                 format!(
@@ -838,8 +844,7 @@ impl Hub {
         };
         let applies = self
             .inner
-            .hosts
-            .get(maker)
+            .host(maker)
             .map(|h| h.attach_applies(&view.runtime, cfg))
             .unwrap_or_default();
         match core.attach_settings_refusal(id, view, cfg, applies) {
@@ -905,21 +910,25 @@ impl Hub {
     ///
     /// [`RemoteBox::attach_command`]: crate::remote::RemoteBox::attach_command
     async fn remote_attach_command(&self, query: &str) -> Result<Option<RemoteAttach>, RpcError> {
-        let (rbox, view, cfg, session, local) =
+        // `_op`: the box's operation, begun with its gate check and held while the runner is
+        // asked, so the box is not switched meanwhile (`Core::reserve_box`; the attach lease
+        // that follows is checked against the gate again).
+        let (rbox, view, cfg, session, local, _op) =
             {
                 let core = self.inner.core();
                 let id = core.resolve(query)?;
                 let view = core.view(&id)?.clone();
-                let Some(rbox) = self.inner.remotes.get(&view.box_name).cloned() else {
+                let Some(rbox) = self.inner.remote(&view.box_name) else {
                     return Ok(None);
                 };
                 core.require_box(&view)?;
+                let op = core.reserve_box(&self.inner, &view.box_name)?;
                 if let Some(why) = core.rt.get(&id).and_then(|r| {
                     runtime_spec::acp_attach_refusal(&view.name, &view.mode, &r.acp_env)
                 }) {
                     return Err(rpc(codes::CONFLICT, why));
                 }
-                let Some(session) = view.session_id.clone() else {
+                let Some(session) = view.confirmed_session().map(str::to_string) else {
                     return Ok(None);
                 };
                 refuse_session_id(&view, &session)?;
@@ -936,8 +945,7 @@ impl Hub {
                 };
                 let mut local = self
                     .inner
-                    .hosts
-                    .get(LOCAL_BOX)
+                    .host(LOCAL_BOX)
                     .ok_or_else(unknown)?
                     // Built for the box: nothing the hub knows of its own binaries applies.
                     .remote_attach_command(&view.runtime, &cfg, &session)
@@ -945,7 +953,7 @@ impl Hub {
                     .ok_or_else(unknown)?;
                 // None of twr's secrets goes along (on the box: `env -u`).
                 twr_adapters::process::scrub_std(&mut local);
-                (rbox, view, cfg, session, local)
+                (rbox, view, cfg, session, local, op)
             };
         let repo = view.repo.as_deref().map(Path::new);
         match rbox

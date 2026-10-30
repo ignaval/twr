@@ -1,8 +1,10 @@
 //! `thread.set_model` with a `runtime`: a worker thread moves to another runtime (`hub::switch`).
 //! The old runtime stops (`runtime_change`, no stop of the thread), nothing restarts it, and the
 //! thread's next turn starts a new session of the new runtime whose prompt carries the handoff.
-//! The `rec` runtime records what each of its sessions was started with and sent.
+//! The `rec` runtime records what each of its sessions was started with and sent. A move back to
+//! a runtime the thread left a session of resumes that session, told what happened since.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,21 +31,66 @@ struct Session {
     sent: Vec<String>,
 }
 
-/// Runtime `rec`: reports session `rec-<n>` (or the one it resumes), ends every turn at once
-/// with the reply `done`, and records its sessions.
-#[derive(Clone, Default)]
-struct Recorder(Arc<Mutex<Vec<Session>>>);
+/// How a resume of a session `rec` does not know fails.
+#[derive(Debug, Clone, Copy)]
+enum ResumeFails {
+    /// Like Claude Code's `No conversation found`: its turn ends `error`, then the process
+    /// exits, never having reported a session.
+    EndsTurn,
+    /// Like Codex's `thread not found`: the process exits with the turn it was sent still
+    /// open, never having reported a session.
+    Exits,
+    /// As `EndsTurn`, but the process stays until it is told to stop, and then exits only once
+    /// the test lets it ([`Recorder::release_stop`]): a replacement still under way.
+    Lingers,
+}
+
+/// Runtime `rec` (or another name): reports session `<name>-<n>` (or the one it resumes), ends
+/// every turn at once with the reply `done`, and records its sessions. A resume of a session
+/// marked to fail ([`Recorder::fail_resume`]) fails.
+#[derive(Clone)]
+struct Recorder {
+    name: &'static str,
+    sessions: Arc<Mutex<Vec<Session>>>,
+    fails: Arc<Mutex<HashMap<String, ResumeFails>>>,
+    stop_gate: Arc<tokio::sync::Notify>,
+}
+
+impl Default for Recorder {
+    fn default() -> Self {
+        Recorder::named("rec")
+    }
+}
 
 impl Recorder {
+    fn named(name: &'static str) -> Self {
+        Recorder {
+            name,
+            sessions: Arc::default(),
+            fails: Arc::default(),
+            stop_gate: Arc::default(),
+        }
+    }
+
     fn sessions(&self) -> Vec<Session> {
-        self.0.lock().unwrap().clone()
+        self.sessions.lock().unwrap().clone()
+    }
+
+    /// Every resume of `session` fails, `how`.
+    fn fail_resume(&self, session: &str, how: ResumeFails) {
+        self.fails.lock().unwrap().insert(session.to_string(), how);
+    }
+
+    /// A [`ResumeFails::Lingers`] process told to stop exits now.
+    fn release_stop(&self) {
+        self.stop_gate.notify_one();
     }
 }
 
 impl Adapter for Recorder {
     fn info(&self) -> AdapterInfo {
         AdapterInfo {
-            name: "rec",
+            name: self.name,
             tier: Tier::Headless,
             description: "records its sessions",
         }
@@ -52,7 +99,7 @@ impl Adapter for Recorder {
     fn spawn(&self, cfg: SpawnConfig, prompt: Option<String>) -> anyhow::Result<AdapterHandle> {
         let (h, mut end) = AdapterHandle::pair();
         let index = {
-            let mut s = self.0.lock().unwrap();
+            let mut s = self.sessions.lock().unwrap();
             s.push(Session {
                 resumed: cfg.resume_session.clone(),
                 first: prompt.clone(),
@@ -62,12 +109,51 @@ impl Adapter for Recorder {
             });
             s.len() - 1
         };
-        let sessions = Arc::clone(&self.0);
+        let sessions = Arc::clone(&self.sessions);
+        let fails = cfg
+            .resume_session
+            .as_ref()
+            .and_then(|s| self.fails.lock().unwrap().get(s).copied());
+        let name = self.name;
+        let stop_gate = Arc::clone(&self.stop_gate);
         tokio::spawn(async move {
+            if let Some(how) = fails {
+                while let Some(cmd) = end.cmds.recv().await {
+                    match cmd {
+                        AdapterCmd::Send { text, turn } => {
+                            sessions.lock().unwrap()[index].sent.push(text);
+                            if let ResumeFails::EndsTurn | ResumeFails::Lingers = how {
+                                end.emit(
+                                    EventBody::TurnEnded(TurnEnded {
+                                        result: TurnResult::Error,
+                                        ext: json!({name: {"error": "No conversation found"}})
+                                            .as_object()
+                                            .cloned(),
+                                        ..Default::default()
+                                    }),
+                                    Some(turn),
+                                );
+                            }
+                            if let ResumeFails::Lingers = how {
+                                continue;
+                            }
+                            break;
+                        }
+                        AdapterCmd::Stop if matches!(how, ResumeFails::Lingers) => {
+                            stop_gate.notified().await;
+                            break;
+                        }
+                        AdapterCmd::Stop | AdapterCmd::Interrupt => break,
+                        _ => {}
+                    }
+                }
+                end.exited(Some(1), "no such session\n");
+                return;
+            }
             let session = cfg
                 .resume_session
                 .clone()
-                .unwrap_or(format!("rec-{}", index + 1));
+                .unwrap_or(format!("{name}-{}", index + 1));
             end.emit(
                 EventBody::ThreadStarted(SessionPayload {
                     session_id: Some(session.clone()),
@@ -113,16 +199,25 @@ impl Adapter for Recorder {
 }
 
 fn opts(dir: &Path, rec: &Recorder) -> HubOptions {
+    opts_with(dir, &[rec])
+}
+
+/// [`opts`] with several recording runtimes, each under its name (before the built-in one of
+/// that name, if any).
+fn opts_with(dir: &Path, recs: &[&Recorder]) -> HubOptions {
     let mut o = HubOptions::new(dir.join("data").join("twr.db"), Config::default());
-    let rec = rec.clone();
+    let recs: Vec<Recorder> = recs.iter().map(|r| (*r).clone()).collect();
     o.adapters = Arc::new(move |name: &str| -> Option<Arc<dyn Adapter>> {
+        if let Some(r) = recs.iter().find(|r| r.name == name) {
+            return Some(Arc::new(r.clone()));
+        }
         match name {
             "fake" => Some(Arc::new(FakeAdapter::new()) as Arc<dyn Adapter>),
-            "rec" => Some(Arc::new(rec.clone())),
             // Never spawned here: threads of these only check what they take.
             "codex" => Some(Arc::new(twr_adapters::codex::CodexAdapter::new())),
             "claude-code" => Some(Arc::new(twr_adapters::ClaudeCodeAdapter::new())),
             "pty" => Some(Arc::new(twr_adapters::PtyAdapter::new())),
+            "acp" => Some(Arc::new(twr_adapters::AcpAdapter::new())),
             _ => None,
         }
     });
@@ -723,5 +818,621 @@ async fn the_handoff_of_a_long_thread_is_built_quickly() {
     let older = first.find(&format!("### turn {} (", TURNS - 1)).unwrap();
     let newest = first.find(&format!("### turn {TURNS} (")).unwrap();
     assert!(older < newest, "{first}");
+    hub.shutdown().await;
+}
+
+/// The `thread.model_changed` events of the thread, oldest first.
+fn moves(hub: &Hub, thread: &str) -> Vec<ThreadModelChanged> {
+    let evs = hub.thread_events(thread, 0, 10_000).unwrap().1;
+    evs.into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::ThreadModelChanged(p) => Some(p),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The `turn.started` of turn `turn` in `evs`.
+fn started_turn(evs: &[Event], turn: u64) -> TurnStarted {
+    evs.iter()
+        .find_map(|e| match &e.body {
+            EventBody::TurnStarted(p) if e.turn == Some(turn) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no turn.started of turn {turn}"))
+}
+
+/// Moves the thread to `runtime` as the user, then waits until its live runtime (if any) has
+/// been stopped for the move.
+async fn move_to(hub: &Hub, sub: &mut ThreadSubscription, thread: &str, runtime: &str) -> Value {
+    let live = hub.live_runtimes() > 0;
+    let r = hub
+        .set_runtime_model(thread, Some(runtime), None, None, &user())
+        .unwrap();
+    assert_eq!(r["runtime_changed"], json!(true), "{r}");
+    if live {
+        until(sub, |e| restart_reason(e).is_some()).await;
+    }
+    r
+}
+
+/// A -> B -> A, with work on B: the move back records the session the thread left A with, and
+/// nothing starts until the next turn (B's exit starts nothing, not even the resume). That
+/// turn resumes the session (records `ext.twr.resumes`), given only what happened since it
+/// left: B's turns, the reports of those, the workspace. Then the thread runs on it as before.
+#[tokio::test]
+async fn moving_back_resumes_the_earlier_session_told_what_happened_since() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Recorder::named("rec"), Recorder::named("rec2"));
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b])).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "build the login page");
+    until(&mut sub, report_of(1)).await;
+    let s = hub.thread_view(&t).unwrap().session_id.expect("a session");
+    assert_eq!(s, "rec-1");
+
+    let r = move_to(&hub, &mut sub, &t, "rec2").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    send(&hub, &t, "add a logout button");
+    until(&mut sub, report_of(2)).await;
+    assert_eq!(b.sessions()[0].resumed, None);
+
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!(s), "{r}");
+    let message = r["message"].as_str().unwrap();
+    assert!(
+        message.contains("moves from rec2 back to rec: its earlier rec session (rec-1) resumes"),
+        "{message}"
+    );
+    let m = moves(&hub, &t).pop().unwrap();
+    assert_eq!(twr_ext(&m.ext)["resume_session"], json!(s));
+    assert_eq!(twr_ext(&m.ext)["previous_session"], json!("rec2-1"));
+    // Nothing starts without a turn: neither B again nor A's session (that start would end the
+    // move before the session was told what happened since).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(hub.live_runtimes(), 0);
+    assert_eq!((a.sessions().len(), b.sessions().len()), (1, 1));
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (
+            v.session_id.as_deref(),
+            v.handoff_pending,
+            v.resume_session.as_deref()
+        ),
+        (Some(s.as_str()), true, Some(s.as_str()))
+    );
+
+    send(&hub, &t, "now a test");
+    let evs = until(&mut sub, report_of(3)).await;
+    let sessions = a.sessions();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(sessions[1].resumed.as_deref(), Some(s.as_str()));
+    assert_eq!(
+        sessions[1].first, None,
+        "a resumed session gets its turn sent"
+    );
+    let delivered = sessions[1].sent[0].clone();
+    assert!(
+        delivered.starts_with(
+            "[twr handoff] This thread (web) comes back to you: you are its earlier rec \
+             session, resumed. Since you left it, it ran on rec2 for 1 turn,"
+        ),
+        "{delivered}"
+    );
+    assert!(
+        delivered.ends_with("</twr-handoff>\n\nnow a test"),
+        "{delivered}"
+    );
+    for part in [
+        "## Workspace\n- directory: ",
+        "## Reports since (newest first)\n- turn 2 ",
+        "## Turns since (oldest first)\n### turn 2 (user, completed,",
+        "prompt: add a logout button\nreply: done\n",
+    ] {
+        assert!(
+            delivered.contains(part),
+            "{part:?} missing from:\n{delivered}"
+        );
+    }
+    for gone in [
+        "### turn 1 (",
+        "- turn 1 ",
+        "build the login page",
+        "## Task",
+    ] {
+        assert!(!delivered.contains(gone), "{gone:?} in:\n{delivered}");
+    }
+    let started = started_turn(&evs, 3);
+    assert_eq!(started.prompt, "now a test");
+    assert_eq!(twr_ext(&started.ext)["resumes"], json!(s));
+    assert_eq!(
+        format!(
+            "{}now a test",
+            twr_ext(&started.ext)["runtime_handoff"].as_str().unwrap()
+        ),
+        delivered
+    );
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (
+            v.session_id.as_deref(),
+            v.handoff_pending,
+            v.resume_session.as_deref()
+        ),
+        (Some(s.as_str()), false, None)
+    );
+
+    // Then the session goes on as usual.
+    send(&hub, &t, "and the docs");
+    until(&mut sub, report_of(4)).await;
+    assert_eq!(a.sessions()[1].sent[1], "and the docs");
+    assert_eq!(a.sessions().len(), 2);
+    hub.shutdown().await;
+}
+
+/// A -> B -> A with no turn on B: the session resumes with no handoff at all.
+#[tokio::test]
+async fn moving_back_with_nothing_done_since_resumes_without_a_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Recorder::named("rec"), Recorder::named("rec2"));
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b])).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "build the login page");
+    until(&mut sub, report_of(1)).await;
+    move_to(&hub, &mut sub, &t, "rec2").await;
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!("rec-1"), "{r}");
+    send(&hub, &t, "go on");
+    let evs = until(&mut sub, report_of(2)).await;
+    let sessions = a.sessions();
+    assert_eq!(sessions[1].resumed.as_deref(), Some("rec-1"));
+    assert_eq!(sessions[1].sent, ["go on"]);
+    assert!(b.sessions().is_empty());
+    let started = started_turn(&evs, 2);
+    assert_eq!(twr_ext(&started.ext)["resumes"], json!("rec-1"));
+    assert_eq!(twr_ext(&started.ext).get("runtime_handoff"), None);
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (v.session_id.as_deref(), v.handoff_pending),
+        (Some("rec-1"), false)
+    );
+    hub.shutdown().await;
+}
+
+/// A(S) -> B (work) -> A (no turn) -> C (work) -> A: the move away from the pending resume
+/// records no session (none was confirmed), so the session the thread resumes is still S, and
+/// what it is told covers B's and C's turns.
+#[tokio::test]
+async fn a_resume_is_told_of_every_runtime_since_the_session_was_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b, c) = (
+        Recorder::named("rec"),
+        Recorder::named("rec2"),
+        Recorder::named("rec3"),
+    );
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b, &c]))
+        .await
+        .unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "first on a");
+    until(&mut sub, report_of(1)).await;
+    move_to(&hub, &mut sub, &t, "rec2").await;
+    send(&hub, &t, "work on b");
+    until(&mut sub, report_of(2)).await;
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!("rec-1"), "{r}");
+    let r = move_to(&hub, &mut sub, &t, "rec3").await;
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    let m = moves(&hub, &t).pop().unwrap();
+    assert_eq!(
+        twr_ext(&m.ext)["previous_session"],
+        Value::Null,
+        "a pending resume is no session of the thread"
+    );
+    send(&hub, &t, "work on c");
+    until(&mut sub, report_of(3)).await;
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!("rec-1"), "{r}");
+    send(&hub, &t, "back on a");
+    until(&mut sub, report_of(4)).await;
+    let sessions = a.sessions();
+    assert_eq!(sessions.len(), 2, "{sessions:?}");
+    assert_eq!(sessions[1].resumed.as_deref(), Some("rec-1"));
+    let delivered = &sessions[1].sent[0];
+    assert!(
+        delivered.contains("Since you left it, it ran on rec2 and rec3 for 2 turns,"),
+        "{delivered}"
+    );
+    for part in [
+        "### turn 2 (user, completed,",
+        "### turn 3 (user, completed,",
+    ] {
+        assert!(
+            delivered.contains(part),
+            "{part:?} missing from:\n{delivered}"
+        );
+    }
+    assert!(!delivered.contains("### turn 1 ("), "{delivered}");
+    hub.shutdown().await;
+}
+
+/// The settings of a move back: left out, the model and effort are the ones the thread had when
+/// it left the session (not the runtime's defaults); given, they replace them; a `default` the
+/// runtime would not take on resume (Codex keeps a session's model) starts a new session with
+/// the full handoff instead of being refused.
+#[tokio::test]
+async fn a_move_back_resumes_with_the_settings_the_session_had() {
+    let dir = tempfile::tempdir().unwrap();
+    // A recording runtime under Codex's name: Codex keeps a session's model and effort.
+    let (a, b) = (Recorder::named("codex"), Recorder::named("rec"));
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b])).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("api", "codex")).await;
+    hub.set_model(&t, Some("gpt-x"), Some("high"), &user())
+        .unwrap();
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "first");
+    until(&mut sub, report_of(1)).await;
+    let s = hub.thread_view(&t).unwrap().session_id.unwrap();
+
+    // Left out: the session's.
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!((&r["model"], &r["effort"]), (&Value::Null, &Value::Null));
+    let r = move_to(&hub, &mut sub, &t, "codex").await;
+    assert_eq!(
+        (&r["model"], &r["effort"], &r["resumes"]),
+        (&json!("gpt-x"), &json!("high"), &json!(s)),
+        "{r}"
+    );
+    send(&hub, &t, "second");
+    until(&mut sub, report_of(2)).await;
+    let last = a.sessions().pop().unwrap();
+    assert_eq!(
+        (
+            last.resumed.as_deref(),
+            last.model.as_deref(),
+            last.effort.as_deref()
+        ),
+        (Some(s.as_str()), Some("gpt-x"), Some("high"))
+    );
+
+    // Given: it replaces the session's.
+    move_to(&hub, &mut sub, &t, "rec").await;
+    let r = hub
+        .set_runtime_model(&t, Some("codex"), Some("gpt-y"), None, &user())
+        .unwrap();
+    assert_eq!(
+        (&r["model"], &r["effort"], &r["resumes"]),
+        (&json!("gpt-y"), &json!("high"), &json!(s)),
+        "{r}"
+    );
+    send(&hub, &t, "third");
+    until(&mut sub, report_of(3)).await;
+    let last = a.sessions().pop().unwrap();
+    assert_eq!(
+        (last.resumed.as_deref(), last.model.as_deref()),
+        (Some(s.as_str()), Some("gpt-y"))
+    );
+
+    // `default` for the model Codex keeps on resume: a new session, not a refusal.
+    move_to(&hub, &mut sub, &t, "rec").await;
+    let r = hub
+        .set_runtime_model(&t, Some("codex"), Some("default"), None, &user())
+        .unwrap();
+    assert_eq!(
+        (&r["model"], &r["effort"], &r["resumes"]),
+        (&Value::Null, &Value::Null, &Value::Null),
+        "{r}"
+    );
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .contains("a new codex session starts"),
+        "{r}"
+    );
+    assert_eq!(
+        twr_ext(&moves(&hub, &t).pop().unwrap().ext).get("resume_session"),
+        None
+    );
+    send(&hub, &t, "fourth");
+    until(&mut sub, report_of(4)).await;
+    let last = a.sessions().pop().unwrap();
+    assert_eq!((last.resumed, last.model), (None, None));
+    let first = last
+        .first
+        .expect("a new session gets its turn with the start");
+    assert!(
+        first.starts_with("[twr handoff] This thread (api) moved to another runtime"),
+        "{first}"
+    );
+    hub.shutdown().await;
+}
+
+/// A request of over 4 KB (the handoff quotes a turn's prompt cut at 4 KB) whose last line is
+/// [`TAIL`].
+fn long_request() -> String {
+    format!("now a test\n{}\n{TAIL}", "spec line\n".repeat(600))
+}
+
+const TAIL: &str = "and finally: TAIL-MARKER-7f3a";
+
+/// A resume that fails (the runtime does not know the session any more), either way a runtime
+/// fails it: the resume is dropped, and the failed turn is retried once at once, on a new
+/// session given the full handoff, whose newest turn is the failed one and which says the
+/// resume failed, then the failed turn's request whole (over 4 KB here: no session got it).
+/// No `error` item is raised.
+async fn a_failed_resume_falls_back_to_a_new_session(how: ResumeFails) {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Recorder::named("rec"), Recorder::named("rec2"));
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b])).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "build the login page");
+    until(&mut sub, report_of(1)).await;
+    move_to(&hub, &mut sub, &t, "rec2").await;
+    send(&hub, &t, "add a logout button");
+    until(&mut sub, report_of(2)).await;
+    a.fail_resume("rec-1", how);
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!("rec-1"), "{r}");
+
+    let request = long_request();
+    send(&hub, &t, &request);
+    let evs = until(&mut sub, report_of(4)).await;
+    let started = started_turn(&evs, 3);
+    assert_eq!(twr_ext(&started.ext)["resumes"], json!("rec-1"));
+    let retry = started_turn(&evs, 4);
+    assert_eq!(twr_ext(&retry.ext)["retry_of"], json!(3), "{how:?}");
+    assert_eq!(twr_ext(&retry.ext).get("resumes"), None);
+    assert_eq!(retry.from, TurnFrom::User);
+    let sessions = a.sessions();
+    assert_eq!(sessions.len(), 3, "{how:?}: {sessions:?}");
+    assert_eq!(sessions[1].resumed.as_deref(), Some("rec-1"));
+    assert_eq!(sessions[2].resumed, None, "{how:?}: a new session");
+    let first = sessions[2]
+        .first
+        .clone()
+        .expect("the retry came with the start");
+    assert!(
+        first.starts_with(
+            "[twr handoff] twr could not resume the earlier rec session of this thread (web), \
+             so you are a new rec session taking over its work"
+        ),
+        "{how:?}: {first}"
+    );
+    // The request follows the handoff whole, its last line too (the handoff's copy is cut).
+    assert!(
+        first.ends_with(&format!("</twr-handoff>\n\n{request}")),
+        "{first}"
+    );
+    assert_eq!(first.matches(TAIL).count(), 1, "{first}");
+    // The failed turn is the newest one the handoff lists.
+    let newest = first.rfind("### turn ").unwrap();
+    assert!(
+        first[newest..].starts_with("### turn 3 (user, "),
+        "{how:?}: {first}"
+    );
+    assert!(first[newest..].contains("prompt: now a test\n"), "{first}");
+    let block_kind = evs.iter().find_map(|e| match &e.body {
+        EventBody::DecisionMade(d) if d.site == DecisionSite::BlockKind => {
+            Some((e.turn, d.chosen.clone()))
+        }
+        _ => None,
+    });
+    assert_eq!(block_kind, Some((Some(3), "transient".to_string())));
+    let all = hub.thread_events(&t, 0, 10_000).unwrap().1;
+    assert!(
+        !all.iter().any(|e| matches!(
+            &e.body,
+            EventBody::AttentionRaised(p) if p.reason == AttentionReason::Error
+        )),
+        "{how:?}: an error item was raised: {:?}",
+        kinds(&all)
+    );
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (
+            v.session_id.as_deref(),
+            v.handoff_pending,
+            v.resume_failed_turn
+        ),
+        (Some("rec-3"), false, None),
+        "{how:?}"
+    );
+    hub.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resume_whose_turn_fails_falls_back_to_a_new_session() {
+    a_failed_resume_falls_back_to_a_new_session(ResumeFails::EndsTurn).await;
+}
+
+#[tokio::test]
+async fn a_resume_whose_runtime_exits_falls_back_to_a_new_session() {
+    a_failed_resume_falls_back_to_a_new_session(ResumeFails::Exits).await;
+}
+
+/// A job's wake (the hub's prompt, `from: runtime`) is the turn that carries a move back's
+/// resume when it comes first: it records `ext.twr.resumes`, and when the resume fails, the
+/// wake is retried once on a new session given the full handoff, then the wake's prompt whole,
+/// with no `error` item.
+#[tokio::test]
+async fn a_job_wake_that_carries_a_failed_resume_falls_back_to_a_new_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Recorder::named("rec"), Recorder::named("rec2"));
+    let mut o = opts_with(dir.path(), &[&a, &b]);
+    o.job_gate_exe = Some(env!("CARGO_BIN_EXE_twr-job-gate").into());
+    let hub = Hub::open(o).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "build the login page");
+    until(&mut sub, report_of(1)).await;
+    move_to(&hub, &mut sub, &t, "rec2").await;
+    send(&hub, &t, "add a logout button");
+    until(&mut sub, report_of(2)).await;
+    a.fail_resume("rec-1", ResumeFails::EndsTurn);
+    let r = move_to(&hub, &mut sub, &t, "rec").await;
+    assert_eq!(r["resumes"], json!("rec-1"), "{r}");
+
+    let req: twr_hub::JobStart =
+        serde_json::from_value(json!({"argv": ["echo", "job output"], "name": "check"})).unwrap();
+    hub.start_job(&t, req, Source::User("test".into())).unwrap();
+    let evs = until(&mut sub, report_of(4)).await;
+    let wake = started_turn(&evs, 3);
+    assert_eq!(wake.from, TurnFrom::Runtime);
+    assert!(wake.prompt.contains("[twr job "), "{}", wake.prompt);
+    assert_eq!(twr_ext(&wake.ext)["resumes"], json!("rec-1"));
+    let retry = started_turn(&evs, 4);
+    assert_eq!(twr_ext(&retry.ext)["retry_of"], json!(3));
+    assert_eq!(retry.from, TurnFrom::Runtime);
+    let sessions = a.sessions();
+    assert_eq!(sessions.len(), 3, "{sessions:?}");
+    assert_eq!(sessions[1].resumed.as_deref(), Some("rec-1"));
+    assert_eq!(sessions[2].resumed, None, "a new session");
+    let first = sessions[2]
+        .first
+        .clone()
+        .expect("the retry came with the start");
+    assert!(
+        first.starts_with("[twr handoff] twr could not resume the earlier rec session"),
+        "{first}"
+    );
+    assert!(
+        first.ends_with(&format!("</twr-handoff>\n\n{}", wake.prompt)),
+        "{first}"
+    );
+    let all = hub.thread_events(&t, 0, 10_000).unwrap().1;
+    assert!(
+        !all.iter().any(|e| matches!(
+            &e.body,
+            EventBody::AttentionRaised(p) if p.reason == AttentionReason::Error
+        )),
+        "an error item was raised: {:?}",
+        kinds(&all)
+    );
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (v.session_id.as_deref(), v.handoff_pending),
+        (Some("rec-3"), false)
+    );
+    hub.shutdown().await;
+}
+
+/// A failed resume whose runtime is still being replaced when the user stops the thread: the
+/// stop forestalls the automatic retry (a stopped thread gets none), so the failed turn gets
+/// its `error` item, saying it was not retried, once (a hub restart raises no second one).
+#[tokio::test]
+async fn a_stop_that_forestalls_a_failed_resumes_retry_raises_its_error_item() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (Recorder::named("rec"), Recorder::named("rec2"));
+    let hub = Hub::open(opts_with(dir.path(), &[&a, &b])).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("web", "rec")).await;
+    let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+    send(&hub, &t, "build the login page");
+    until(&mut sub, report_of(1)).await;
+    move_to(&hub, &mut sub, &t, "rec2").await;
+    send(&hub, &t, "add a logout button");
+    until(&mut sub, report_of(2)).await;
+    a.fail_resume("rec-1", ResumeFails::Lingers);
+    move_to(&hub, &mut sub, &t, "rec").await;
+    send(&hub, &t, "now a test");
+    // Turn 3 failed and is due a retry; the runtime that failed it is being replaced first,
+    // and does not exit yet.
+    until(&mut sub, |e| {
+        matches!(&e.body, EventBody::DecisionMade(d)
+            if d.site == DecisionSite::BlockKind && e.turn == Some(3) && d.chosen == "transient")
+    })
+    .await;
+    let r = hub.stop_thread_by(&t, &user()).unwrap();
+    assert_eq!(r["stopping"], json!(true), "{r}");
+    a.release_stop();
+    let error = |e: &Event| matches!(&e.body, EventBody::AttentionRaised(p) if p.reason == AttentionReason::Error);
+    let evs = until(&mut sub, error).await;
+    let EventBody::AttentionRaised(item) = &evs.last().unwrap().body else {
+        panic!()
+    };
+    assert_eq!(evs.last().unwrap().turn, Some(3));
+    assert!(
+        item.summary.starts_with(
+            "web: turn 3 failed, and was not retried: the thread was stopped: No conversation \
+             found"
+        ),
+        "{}",
+        item.summary
+    );
+    let v = hub.thread_view(&t).unwrap();
+    assert!(v.stopped && v.turns == 3, "no retry: {v:?}");
+    hub.shutdown().await;
+    drop((sub, hub));
+    let hub = timeout(WAIT, async {
+        loop {
+            match Hub::open(opts_with(dir.path(), &[&a, &b])).await {
+                Ok(h) => return h,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    })
+    .await
+    .expect("reopening the hub");
+    let all = hub.thread_events(&t, 0, 10_000).unwrap().1;
+    assert_eq!(
+        all.iter().filter(|e| error(e)).count(),
+        1,
+        "{:?}",
+        kinds(&all)
+    );
+    assert_eq!(hub.thread_view(&t).unwrap().turns, 3);
+    hub.shutdown().await;
+}
+
+/// An `acp` thread (its agent is a command line) moving back to its agent resumes nothing: a
+/// new session with the full handoff, as before.
+#[tokio::test]
+async fn an_acp_thread_moving_back_resumes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = Recorder::default();
+    let hub = Hub::open(opts(dir.path(), &rec)).await.unwrap();
+    let t = new_thread(&hub, dir.path(), named("agent", "acp:sh -c x")).await;
+    // As if its agent had run: a session of the thread.
+    hub.append(
+        &t,
+        None,
+        Source::Adapter("acp".into()),
+        EventBody::ThreadStarted(SessionPayload {
+            session_id: Some("acp-1".into()),
+            ..Default::default()
+        }),
+        None,
+    )
+    .unwrap();
+    hub.set_runtime_model(&t, Some("rec"), None, None, &user())
+        .unwrap();
+    assert_eq!(
+        twr_ext(&moves(&hub, &t).pop().unwrap().ext)["previous_session"],
+        json!("acp-1")
+    );
+    let r = hub
+        .set_runtime_model(&t, Some("acp:sh -c x"), None, None, &user())
+        .unwrap();
+    assert_eq!(r["resumes"], Value::Null, "{r}");
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap()
+            .contains("a new acp session starts"),
+        "{r}"
+    );
+    let v = hub.thread_view(&t).unwrap();
+    assert_eq!(
+        (
+            v.session_id.as_deref(),
+            v.resume_session.as_deref(),
+            v.handoff_pending
+        ),
+        (None, None, true)
+    );
     hub.shutdown().await;
 }

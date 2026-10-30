@@ -28,6 +28,10 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 ulid.workspace = true
 
+# `build.rs`: the hash of the fold's sources that names a checkpoint's build.
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 rmcp = { workspace = true, features = ["client"] }
 rusqlite.workspace = true

@@ -110,6 +110,10 @@ pub struct LastTurn {
     /// turn (no error item, no retry of a message taken back).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub withdrawn: bool,
+    /// The user interrupted it to send the next queued message now (`turn.interrupted`): no
+    /// crash after it makes it a failed turn either (its message is not run again).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupted: bool,
 }
 
 /// One task still owned by the current runtime process.
@@ -130,11 +134,36 @@ pub struct BackgroundTask {
     /// A job started not to tell its thread when it ends (`ext.twr.job.wake: false`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub quiet: bool,
+    /// A `!` command the user ran from the TUI (`ext.twr.job.shell`): the user's own work, not
+    /// the thread's (the orchestrator is told nothing of it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell: bool,
     /// A job's process group as the hub recorded it before the job's command ran
     /// (`ext.twr.job.pgid`, the group's leader's pid, and `ext.twr.job.start_time`, its start
     /// time): what a later hub kills of it when the hub that ran it stopped first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<JobGroup>,
+    /// When it started: the time of the update that started it (`None` in snapshots from
+    /// before it was kept).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime<Utc>>,
+    /// The tool call it runs in the foreground of, as its latest update says
+    /// ([`crate::event::FOREGROUND_CALL_KEY`]): part of the open turn's work, waited for, not
+    /// background work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreground_call: Option<String>,
+    /// Started in the foreground of a call and moved to the background while it ran, as its
+    /// latest update says ([`crate::event::DETACHED_KEY`]): nothing waits for it any longer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detached: bool,
+}
+
+impl BackgroundTask {
+    /// Whether it is background work: not a task a tool call of the open turn waits for in
+    /// the foreground ([`BackgroundTask::foreground_call`]).
+    pub fn in_background(&self) -> bool {
+        self.foreground_call.is_none()
+    }
 }
 
 /// A job's process group ([`BackgroundTask::group`]).
@@ -209,6 +238,22 @@ pub struct ThreadView {
     /// `acp_command`, as the hub reports a thread's agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_command: Option<serde_json::Value>,
+    /// The account it runs on: `thread.created`'s `ext.twr.account` ([`ACCOUNT_KEY`]), then
+    /// that of the latest account move (`thread.model_changed` with `account_changed`);
+    /// `None` = the runtime's native account, whatever it is named now (and every log from
+    /// before accounts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Its own account pin, as it was created with it (`ext.twr.account_pin`,
+    /// [`ACCOUNT_PIN_KEY`]: items comma-separated); `None`: the thread has none of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_pin: Option<String>,
+    /// The configured project of the repository it was made for by path
+    /// (`ext.twr.account_project`, [`ACCOUNT_PROJECT_KEY`]); `None` for one made for a
+    /// project by name, or for a repository no configured project has.
+    /// [`ThreadView::pins_project`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_project: Option<String>,
     /// Permission mode: `thread.created`'s, then the latest `thread.mode_changed`'s (what the
     /// thread's next runtime starts with).
     pub mode: String,
@@ -262,6 +307,29 @@ pub struct ThreadView {
     /// only a `thread.started` of the new runtime ends this.
     #[serde(default)]
     pub handoff_pending: bool,
+    /// The session of the new runtime that a pending move resumes instead of starting a new
+    /// one: the move back to a runtime the thread left earlier recorded the session it left
+    /// then (`thread.model_changed` `ext.twr.resume_session`, [`RESUME_SESSION_KEY`]), and
+    /// [`ThreadView::session_id`] is that session meanwhile (still
+    /// [`ThreadView::handoff_pending`]). Every move clears it before it sets its own; the new
+    /// runtime's start ends it, and so does the failure of the turn that carried it
+    /// ([`ThreadView::resume_failed_turn`]), or a turn that drops it because the session no
+    /// longer holds when the turn starts ([`RESUME_DROPPED_KEY`]: no session, still pending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session: Option<String>,
+    /// The turn that carries [`ThreadView::resume_session`]: the work turn whose
+    /// `turn.started` says it resumes that session (`ext.twr.resumes`, [`RESUMES_KEY`]), one
+    /// the hub recorded (whoever it is from: a job's wake is `from: runtime`), never one a
+    /// runtime reported. Cleared with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_turn: Option<u64>,
+    /// The turn whose resume failed: [`ThreadView::resume_turn`] ended `error` or
+    /// `interrupted`, or a crash took it down, before the new runtime started a session. The
+    /// resume is dropped then ([`ThreadView::session_id`] and
+    /// [`ThreadView::resume_session`] `None`, still [`ThreadView::handoff_pending`]): the
+    /// next start is a new session. Cleared by the new runtime's start and by the next move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_failed_turn: Option<u64>,
     /// Highest turn number started.
     pub turns: u64,
     /// Currently open turn.
@@ -292,6 +360,17 @@ pub struct ThreadView {
     /// no authority and is being interrupted.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current_turn_withdrawn: bool,
+    /// The user interrupted the currently open turn to send the next queued message now
+    /// (`turn.interrupted`): it is being interrupted, and ends `interrupted`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_turn_interrupted: bool,
+    /// The currently open turn is a compaction of the context the user asked for
+    /// ([`is_compact_turn`]): maintenance, no work. Its end leaves [`ThreadView::last_turn`],
+    /// the report and what the last work turn left (its interim report, its failure) as they
+    /// were, so nothing that waits on the thread's work (a wake, a watch, `send --after`, a
+    /// retry) counts it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub current_turn_compact: bool,
     /// Every automatic retry seen: retry turn -> the turn it retried (`ext.twr.retry_of`).
     /// Kept per turn number so a `turn.ended` that arrives after `thread.crashed` (which closes
     /// the open turn) still knows its turn was a retry.
@@ -320,6 +399,37 @@ pub struct ThreadView {
     /// ([`crate::usage::Spent`]).
     #[serde(default, skip_serializing_if = "crate::usage::Spent::is_empty")]
     pub spent: crate::usage::Spent,
+    /// How full its session's context is: the latest `turn.ended` `context`, then what a
+    /// compaction since left (`context.compacted` `post_tokens`, the window kept; unknown when
+    /// it did not say). A new
+    /// session (a `thread.started` with another session id, a move to another runtime) has
+    /// none until its first turn ends, and a turn end whose size cannot be trusted
+    /// ([`recorded_context`]) leaves it unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextSize>,
+    /// When its runtime began compacting its context (`context.compacting`), while it does:
+    /// until the `context.compacted`, the end of the turn or of the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compacting: Option<DateTime<Utc>>,
+    /// How long its session's prompt cache lives, in seconds: the latest `turn.ended`
+    /// `prompt_cache` `ttl_s` of the session ([`PromptCache`]), kept when a later one does not
+    /// say (a new process of the same session that has not written the cache yet). Cleared
+    /// with [`ThreadView::context`] by a new session (a `thread.started` with another session
+    /// id, a move to another runtime) and by a compaction that worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_ttl_s: Option<u64>,
+    /// When its session's prompt cache expires: the latest `turn.ended` `prompt_cache`
+    /// `called_at` plus [`ThreadView::cache_ttl_s`], `None` when no TTL is known. A turn end
+    /// without `prompt_cache` (one that called no model, a compaction's) leaves it; it is
+    /// cleared when [`ThreadView::cache_ttl_s`] is. Claude Code only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_expires_at: Option<DateTime<Utc>>,
+    /// The user turned the hub's offers to compact its context once the prompt cache expired
+    /// off for this thread: the latest `conversation.update` on it with
+    /// `ext.twr.idle_compaction` ([`IDLE_COMPACTION_KEY`]) said `"off"` (`"on"` turns them
+    /// back on).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub idle_compaction_off: bool,
     /// Client currently attached.
     pub attached: Option<String>,
     /// Parked.
@@ -350,6 +460,14 @@ pub struct ThreadView {
     /// new one. Derived from the log (clients get it as `lifecycle_seq`).
     #[serde(default)]
     pub lifecycle_seq: u64,
+    /// Its color, a place in [`crate::palette::THREAD_PALETTE`]: given by [`Registry::apply`]
+    /// when it folds the thread's first control event (its `thread.created`, as a rule: what a
+    /// client that folds only the control stream sees first too; none for an
+    /// orchestrator, which has a color of its own), and again by a `thread.restored` if a
+    /// thread alive took it meanwhile. Derived from the log, the same on every client; `None`
+    /// for an orchestrator and for a view no registry folded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u8>,
 }
 
 impl ThreadView {
@@ -357,6 +475,12 @@ impl ThreadView {
     /// runs whatever the runtime does).
     pub fn runtime_tasks(&self) -> bool {
         self.background_tasks.values().any(|t| !t.job)
+    }
+
+    /// Whether the thread has background work of its own: a task of its runtime's or a job,
+    /// not a `!` command the user runs ([`BackgroundTask::shell`]).
+    pub fn own_background(&self) -> bool {
+        self.background_tasks.values().any(|t| !t.shell)
     }
 
     /// An empty view for `id`.
@@ -430,6 +554,9 @@ impl ThreadView {
                 self.base = twr("base_ref");
                 self.model = twr("model");
                 self.effort = twr("effort");
+                self.account = twr(ACCOUNT_KEY);
+                self.account_pin = twr(ACCOUNT_PIN_KEY);
+                self.account_project = twr(ACCOUNT_PROJECT_KEY);
                 self.configured_project = p
                     .ext
                     .as_ref()
@@ -442,17 +569,30 @@ impl ThreadView {
             EventBody::ThreadStarted(p) => {
                 // A start of the previous runtime (one that was starting when the thread moved)
                 // is not the new runtime's session: another adapter's, one the hub stamped as
-                // moved away from, or one stamped as another runtime or agent than the
-                // thread's (a start the hub had not seen before the move, say after a hub
+                // moved away from, or one stamped as another runtime, agent or account than
+                // the thread's (a start the hub had not seen before the move, say after a hub
                 // restart).
                 if self.handoff_pending
-                    && (!self.is_own_runtime(&ev.source) || moved_away(p) || self.is_other_agent(p))
+                    && (!self.is_own_runtime(&ev.source)
+                        || moved_away(p)
+                        || self.is_other_agent(p)
+                        || self.is_other_account(p))
                 {
                     return;
                 }
                 self.handoff_pending = false;
+                // The resume, if any, is over: it worked, or its fallback started anew.
+                self.resume_session = None;
+                self.resume_turn = None;
+                self.resume_failed_turn = None;
                 self.cut_tasks();
                 self.task_tracking_closed = false;
+                // Another session starts with a context (and a prompt cache) of its own.
+                if p.session_id.is_some() && p.session_id != self.session_id {
+                    self.context = None;
+                    self.forget_cache();
+                }
+                self.compacting = None;
                 self.set_session(&p.session_id);
                 self.stopped = false;
                 self.actual_model = reported_model(p.ext.as_ref()).map(str::to_string);
@@ -507,25 +647,52 @@ impl ThreadView {
             EventBody::ThreadModelChanged(p) => {
                 self.model = p.model.clone();
                 self.effort = p.effort.clone();
-                // Sessions do not move between runtimes: the next start is a new session.
+                if p.account_changed {
+                    self.account = p.account.clone();
+                }
+                // Sessions do not move between runtimes (or accounts): the next start is a new
+                // session, or the session the thread left this runtime and account with earlier,
+                // resumed. A move between accounts of one runtime keeps its agent.
                 if let Some(r) = &p.runtime {
+                    let same_runtime = p.previous_runtime.as_deref() == Some(r.as_str());
+                    if !(p.account_changed && same_runtime) {
+                        self.acp_command = acp_command(p.ext.as_ref()).cloned();
+                    }
                     self.runtime = r.clone();
-                    self.acp_command = acp_command(p.ext.as_ref()).cloned();
                     self.session_id = None;
                     self.actual_model = None;
+                    self.context = None;
+                    self.forget_cache();
                     self.handoff_pending = true;
+                    self.resume_session = None;
+                    self.resume_turn = None;
+                    self.resume_failed_turn = None;
+                    if let Some(s) = twr_str(p.ext.as_ref(), RESUME_SESSION_KEY) {
+                        self.session_id = Some(s.to_string());
+                        self.resume_session = Some(s.to_string());
+                    }
                 }
             }
             // A turn whose message the user took back is never the crashed one: retrying it
             // would deliver that message again.
             EventBody::ThreadCrashed(_) => {
+                // A crash in the turn that carried a resume: the resume failed.
+                if let Some(t) = self.resume_turn.filter(|t| self.current_turn == Some(*t)) {
+                    self.fail_resume(t);
+                }
                 self.crashed = true;
                 self.crashed_turn = match self.current_turn {
-                    Some(t) => (!self.current_turn_withdrawn).then_some(t),
+                    // (A compaction is no work to retry.)
+                    Some(t) => (!self.current_turn_withdrawn
+                        && !self.current_turn_interrupted
+                        && !self.current_turn_compact)
+                        .then_some(t),
                     None => self
                         .last_turn
                         .as_ref()
-                        .filter(|t| t.result != TurnResult::Completed && !t.withdrawn)
+                        .filter(|t| {
+                            t.result != TurnResult::Completed && !t.withdrawn && !t.interrupted
+                        })
                         .map(|t| t.turn),
                 };
                 self.close_for_exit();
@@ -536,6 +703,23 @@ impl ThreadView {
                 self.task_tracking_closed = true;
             }
             EventBody::ThreadDetached(_) => self.attached = None,
+            // A compaction (maintenance) keeps what the last work turn left.
+            EventBody::TurnStarted(p) if is_compact_turn(p) => {
+                let n = ev.turn.unwrap_or(self.turns + 1);
+                self.turns = self.turns.max(n);
+                self.current_turn = Some(n);
+                self.task_tracking_closed = false;
+                self.current_turn_retry_of = None;
+                self.current_runtime_turn = None;
+                self.current_turn_ref = None;
+                self.current_turn_acted = false;
+                self.current_turn_withdrawn = false;
+                self.current_turn_interrupted = false;
+                self.current_turn_compact = true;
+                // (A crash before it stays the thread's failure: `crashed`, `crashed_turn`.)
+                self.stopped = false;
+                self.parked = false;
+            }
             EventBody::TurnStarted(p) => {
                 let n = ev.turn.unwrap_or(self.turns + 1);
                 self.turns = self.turns.max(n);
@@ -549,8 +733,30 @@ impl ThreadView {
                 self.current_turn_ref = message_ref(p);
                 self.current_turn_acted = false;
                 self.current_turn_withdrawn = false;
+                self.current_turn_interrupted = false;
                 if let Some(r) = self.current_turn_retry_of {
                     self.turn_retry_of.insert(n, r);
+                }
+                // A turn the hub recorded that drops the pending resume (its session no longer
+                // holds, [`RESUME_DROPPED_KEY`]): it starts a new session, the move still
+                // pending.
+                if self.handoff_pending
+                    && !matches!(ev.source, Source::Adapter(_))
+                    && self.resume_session.is_some()
+                    && twr_str(p.ext.as_ref(), RESUME_DROPPED_KEY) == self.resume_session.as_deref()
+                {
+                    self.session_id = None;
+                    self.resume_session = None;
+                    self.resume_turn = None;
+                }
+                // The turn that carries the pending resume: one the hub recorded, whoever it is
+                // from (a job's wake is `from: runtime`), never one a runtime reported.
+                if self.handoff_pending
+                    && !matches!(ev.source, Source::Adapter(_))
+                    && self.resume_session.is_some()
+                    && twr_str(p.ext.as_ref(), RESUMES_KEY) == self.resume_session.as_deref()
+                {
+                    self.resume_turn = Some(n);
                 }
                 self.crashed = false;
                 self.crashed_turn = None;
@@ -564,13 +770,37 @@ impl ThreadView {
                 if let Some(u) = &p.usage {
                     self.spent.add(u);
                 }
+                if let Some(c) = recorded_context(p).filter(|_| !self.handoff_pending) {
+                    self.context = c;
+                }
+                if let Some(cache) = p.prompt_cache.filter(|_| !self.handoff_pending) {
+                    let ttl = cache.ttl_s.or(self.cache_ttl_s);
+                    self.cache_ttl_s = ttl;
+                    self.cache_expires_at = ttl.and_then(|t| {
+                        let t = chrono::Duration::try_seconds(i64::try_from(t).ok()?)?;
+                        cache.called_at.checked_add_signed(t)
+                    });
+                }
+                self.compacting = None;
                 let n = ev.turn.or(self.current_turn).unwrap_or(self.turns);
+                // The turn that carried a resume failed: the next start is a new session.
+                if matches!(p.result, TurnResult::Error | TurnResult::Interrupted)
+                    && self.resume_turn == Some(n)
+                {
+                    self.fail_resume(n);
+                }
+                // The end of a compaction: maintenance, what the last work turn left stays.
+                if self.current_turn == Some(n) && self.current_turn_compact {
+                    self.close_turn();
+                    return;
+                }
                 let retry = self.turn_retry_of.get(&n).copied();
                 self.last_turn = Some(LastTurn {
                     turn: n,
                     result: p.result,
                     retry_of: retry,
                     withdrawn: self.current_turn == Some(n) && self.current_turn_withdrawn,
+                    interrupted: self.current_turn == Some(n) && self.current_turn_interrupted,
                 });
                 self.last_turn_retry_of = retry;
                 if self.current_turn == Some(n) || ev.turn.is_none() {
@@ -602,7 +832,21 @@ impl ThreadView {
                                     .and_then(|j| j.get("wake"))
                                     .and_then(serde_json::Value::as_bool)
                                     == Some(false),
+                            shell: job
+                                && p.ext
+                                    .as_ref()
+                                    .and_then(|e| e.get("twr"))
+                                    .and_then(|t| t.get("job"))
+                                    .is_some_and(|j| j.get("shell").is_some()),
+                            started_at: Some(ev.ts),
+                            foreground_call: None,
+                            detached: false,
                         });
+                    // Where it runs, as its latest update says (each says it).
+                    task.foreground_call = twr_str(p.ext.as_ref(), FOREGROUND_CALL_KEY)
+                        .filter(|c| !c.is_empty())
+                        .map(str::to_string);
+                    task.detached = is_detached(p);
                     if !p.description.is_empty() {
                         task.description.clone_from(&p.description);
                     }
@@ -624,7 +868,9 @@ impl ThreadView {
             EventBody::ReportReady(p) => {
                 self.set_session(&p.session_id);
                 let covers = p.turn.or(ev.turn);
-                if self.current_turn.is_none() {
+                // (A report of the last work turn that comes while a compaction runs, its
+                // reaction late, covers it as well: the compaction's end keeps it.)
+                if self.current_turn.is_none() || self.current_turn_compact {
                     if let Some(last) = &self.last_turn {
                         if covers.is_none_or(|t| t == last.turn) {
                             self.reported = true;
@@ -650,11 +896,16 @@ impl ThreadView {
                     self.current_turn_acted = true;
                 }
             }
-            EventBody::AgentToolCall(_) if self.in_open_turn(ev) => {
+            // A call of the orchestrator's memory tools changes no thread: its message can
+            // still be taken back.
+            EventBody::AgentToolCall(p) if self.in_open_turn(ev) && !is_memory_call(&p.ext) => {
                 self.current_turn_acted = true;
             }
             EventBody::TurnWithdrawn(_) if self.in_open_turn(ev) => {
                 self.current_turn_withdrawn = true;
+            }
+            EventBody::TurnInterrupted(_) if self.in_open_turn(ev) => {
+                self.current_turn_interrupted = true;
             }
             EventBody::AttentionResolved(p) => {
                 self.open_attention.remove(&p.attn_id);
@@ -675,8 +926,59 @@ impl ThreadView {
                 }
                 self.trimmed = Some((ev.ts, p.freed));
             }
+            EventBody::ContextCompacting(_) => self.compacting = Some(ev.ts),
+            EventBody::ContextCompacted(p) => {
+                self.compacting = None;
+                // A compaction that worked replaced the context: what it left, unknown when it
+                // did not say.
+                if p.error.is_none() && !self.handoff_pending {
+                    let window = self.context.and_then(|c| c.window);
+                    self.context = p.post_tokens.map(|tokens| ContextSize { tokens, window });
+                    // Its next call writes the prompt cache anew.
+                    self.forget_cache();
+                }
+            }
+            EventBody::ConversationUpdate(p) => {
+                match twr_str(p.ext.as_ref(), IDLE_COMPACTION_KEY) {
+                    Some("off") => self.idle_compaction_off = true,
+                    Some("on") => self.idle_compaction_off = false,
+                    _ => {}
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Its session's prompt cache is not known any more ([`ThreadView::cache_ttl_s`],
+    /// [`ThreadView::cache_expires_at`]).
+    fn forget_cache(&mut self) {
+        self.cache_ttl_s = None;
+        self.cache_expires_at = None;
+    }
+
+    /// The turn `n` that carried a pending resume failed before the new runtime started a
+    /// session: the resume is dropped, and the next start is a new session
+    /// ([`ThreadView::resume_failed_turn`]). The failed process may still report the session
+    /// it was asked to resume; `set_session` ignores it while the move is pending.
+    fn fail_resume(&mut self, n: u64) {
+        if !self.handoff_pending || self.resume_session.is_none() {
+            return;
+        }
+        self.session_id = None;
+        self.resume_session = None;
+        self.resume_turn = None;
+        self.resume_failed_turn = Some(n);
+    }
+
+    /// Its session, unless the thread waits for its new runtime's first session
+    /// ([`ThreadView::handoff_pending`]): then [`ThreadView::session_id`] is none, or the
+    /// session a pending resume asks for ([`ThreadView::resume_session`]), which no runtime
+    /// confirmed yet.
+    pub fn confirmed_session(&self) -> Option<&str> {
+        if self.handoff_pending {
+            return None;
+        }
+        self.session_id.as_deref()
     }
 
     /// Records session id `s`, if given, unless the thread waits for its new runtime's first
@@ -733,6 +1035,21 @@ impl ThreadView {
         }
     }
 
+    /// Whether start `p` is stamped as another account than the thread's: it carries the
+    /// hub's `ext.twr.runtime` stamp, and its `ext.twr.account` ([`ACCOUNT_KEY`]; absent = the
+    /// native account) is not [`ThreadView::account`]. A start without a runtime stamp (a
+    /// runner from before stamps) says nothing.
+    fn is_other_account(&self, p: &SessionPayload) -> bool {
+        let twr = p.ext.as_ref().and_then(|e| e.get("twr"));
+        let stamped = twr
+            .and_then(|t| t.get("runtime"))
+            .is_some_and(serde_json::Value::is_string);
+        let account = twr
+            .and_then(|t| t.get(ACCOUNT_KEY))
+            .and_then(serde_json::Value::as_str);
+        stamped && account != self.account.as_deref()
+    }
+
     /// The runtime's background tasks go, unfinished, with its process (a stop, crash, park,
     /// attach or a new runtime start); its jobs stay. The turn they were left running by did
     /// not finish its work: [`ThreadView::cut_short`].
@@ -747,6 +1064,7 @@ impl ThreadView {
     /// nothing can still be waiting on the agent side. Retry links survive in
     /// [`ThreadView::turn_retry_of`].
     fn close_for_exit(&mut self) {
+        self.compacting = None;
         self.cut_tasks();
         self.task_tracking_closed = true;
         self.close_turn();
@@ -761,6 +1079,8 @@ impl ThreadView {
         self.current_turn_ref = None;
         self.current_turn_acted = false;
         self.current_turn_withdrawn = false;
+        self.current_turn_interrupted = false;
+        self.current_turn_compact = false;
     }
 
     /// Whether `ev` was recorded in the currently open turn (not a request of the runtime's
@@ -864,6 +1184,16 @@ impl ThreadView {
         self.actual_model.as_deref().or(self.model.as_deref())
     }
 
+    /// The configured project whose account pins and exclusions apply to the thread (on its
+    /// box, `hub::thread_account`): [`ThreadView::account_project`] for one made by a
+    /// repository path, else its project when it was made for that configured project
+    /// ([`ThreadView::configured_project`]); `None`: a repository no configured project has.
+    pub fn pins_project(&self) -> Option<&str> {
+        self.account_project
+            .as_deref()
+            .or_else(|| self.project.as_deref().filter(|_| self.configured_project))
+    }
+
     /// Whether this is an orchestrator thread: the current one, or a retired one
     /// ([`ThreadView::retired`]).
     pub fn is_orchestrator(&self) -> bool {
@@ -896,6 +1226,33 @@ pub fn reported_model(ext: Option<&JsonMap>) -> Option<&str> {
         .find_map(|(_, v)| v.get("model")?.as_str().filter(|m| !m.trim().is_empty()))
 }
 
+/// What turn end `p` says of its session's context: `None` nothing (the context stays as it
+/// was); `Some(None)` that its size is unknown from then (a Claude Code turn that called the
+/// model without reporting a call's size, `ext.claude.context_from: "unknown"`, or a size that
+/// cannot be trusted, below); `Some(Some(c))` the size.
+///
+/// A Claude Code `turn.ended` (`ext.claude`) recorded before twr read the main agent's last
+/// model call has no `ext.claude.context_from`, and its tokens are the `result`'s `usage`: the
+/// sum of every model call of the turn. That is how full the context was for a turn of one call
+/// (`num_turns: 1`) or of none (`usage` input 0: what a compaction left). For a turn of several
+/// it counts the context once per call (a research turn of 62 calls recorded 6.9M tokens, 693%
+/// of a 1M window, when its last call held 184k), and the event does not have the last call's
+/// size: unknown. Such events stay in the log as they were.
+pub fn recorded_context(p: &TurnEnded) -> Option<Option<ContextSize>> {
+    // `twr_adapters::claude_code::EXT`.
+    let claude = p.ext.as_ref().and_then(|e| e.get("claude"));
+    let from = claude.and_then(|c| c.get("context_from"));
+    let Some(c) = p.context else {
+        return (from.and_then(serde_json::Value::as_str) == Some("unknown")).then_some(None);
+    };
+    let Some(claude) = claude.filter(|_| from.is_none()) else {
+        return Some(Some(c));
+    };
+    let input = p.usage.as_ref().map_or(0, |u| u.input);
+    let calls = claude.get("num_turns").and_then(serde_json::Value::as_u64);
+    Some((input == 0 || calls == Some(1)).then_some(c))
+}
+
 fn retry_of(p: &TurnStarted) -> Option<u64> {
     p.ext.as_ref()?.get("twr")?.get("retry_of")?.as_u64()
 }
@@ -923,7 +1280,9 @@ pub enum ResolveError {
 /// All thread views, keyed by thread id. The reserved [`HUB_THREAD`] is never listed, nor is
 /// a deleted thread (`thread.deleted`): its view is set aside, and every later event of it is
 /// dropped until a `thread.restored` brings it back as it was.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// Serialized whole in the hub's checkpoints of its folded state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Registry {
     threads: BTreeMap<String, ThreadView>,
     /// Deleted threads, by id, with their views as they were when deleted.
@@ -954,6 +1313,11 @@ impl Registry {
     /// A `thread.deleted` sets the thread's view aside ([`Registry::deleted_view`]); a later
     /// `thread.restored` of it puts that view back (and applies itself), every other event of
     /// it is dropped.
+    ///
+    /// A thread's first control event (its `thread.created`, as a rule) gives it a color
+    /// ([`ThreadView::color`], [`crate::palette::allocate`]) from those of the threads alive
+    /// then, which an orchestrator's `thread.created` takes back; a restored thread keeps its
+    /// own unless a thread alive took it meanwhile ([`crate::palette::keeps`]).
     pub fn apply(&mut self, ev: &Event) {
         if ev.thread == HUB_THREAD {
             return;
@@ -963,6 +1327,15 @@ impl Registry {
                 let mut view = view.clone();
                 self.deleted.remove(&ev.thread);
                 view.apply(ev);
+                if !view.is_orchestrator() {
+                    let held = self.held_colors(&ev.thread);
+                    if !view
+                        .color
+                        .is_some_and(|c| crate::palette::keeps(c, held.clone()))
+                    {
+                        view.color = Some(crate::palette::allocate(held));
+                    }
+                }
                 self.threads.insert(ev.thread.clone(), view);
             }
             return;
@@ -975,13 +1348,22 @@ impl Registry {
             self.deleted.insert(ev.thread.clone(), view);
             return;
         }
+        let created = matches!(ev.body, EventBody::ThreadCreated(_));
+        // Only a control event gives a color: a client folds the control stream alone.
+        let colorless = |t: &ThreadView| t.color.is_none() && !t.is_orchestrator();
+        let held = (ev.is_control() && self.threads.get(&ev.thread).is_none_or(colorless))
+            .then(|| self.held_colors(&ev.thread));
         let view = self
             .threads
             .entry(ev.thread.clone())
             .or_insert_with(|| ThreadView::new(ev.thread.clone()));
         view.apply(ev);
-        let new_orchestrator =
-            matches!(ev.body, EventBody::ThreadCreated(_)) && view.is_orchestrator();
+        if view.is_orchestrator() {
+            view.color = None;
+        } else if let Some(held) = held.filter(|_| view.color.is_none()) {
+            view.color = Some(crate::palette::allocate(held));
+        }
+        let new_orchestrator = created && view.is_orchestrator();
         if new_orchestrator {
             for (id, t) in self.threads.iter_mut() {
                 if *id != ev.thread && t.is_orchestrator() {
@@ -989,6 +1371,16 @@ impl Registry {
                 }
             }
         }
+    }
+
+    /// The colors ([`ThreadView::color`]) the threads alive other than `id` hold, one entry
+    /// per thread.
+    fn held_colors(&self, id: &str) -> Vec<u8> {
+        self.threads
+            .values()
+            .filter(|t| t.id != id)
+            .filter_map(|t| t.color)
+            .collect()
     }
 
     /// The current orchestrator thread (the latest one created), if any.
@@ -1009,6 +1401,11 @@ impl Registry {
     /// The view of deleted thread `id` as it was when it was deleted.
     pub fn deleted_view(&self, id: &str) -> Option<&ThreadView> {
         self.deleted.get(id)
+    }
+
+    /// The views of the deleted threads ([`Registry::deleted_view`]), in no order.
+    pub fn deleted_views(&self) -> impl Iterator<Item = &ThreadView> {
+        self.deleted.values()
     }
 
     /// Number of threads.
@@ -1256,8 +1653,9 @@ pub fn compare_attention(a: &AttentionItem, b: &AttentionItem, pins: &HashSet<St
         .then(a.event_id.cmp(&b.event_id))
 }
 
-/// Open attention items across all threads (including [`HUB_THREAD`]).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Open attention items across all threads (including [`HUB_THREAD`]). Serialized whole in the
+/// hub's checkpoints of its folded state.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AttentionStack {
     items: BTreeMap<String, AttentionItem>,
 }
@@ -1539,6 +1937,56 @@ mod tests {
         assert!(v.background_tasks.is_empty());
     }
 
+    /// A compaction (maintenance) leaves what the last work turn left: its last turn, its
+    /// report, and a crash that took it down (no `turn.ended`) as the thread's failure.
+    #[test]
+    fn a_compaction_keeps_the_last_work_turns_outcome() {
+        let mut t = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.created("a"));
+        v.apply(&t.event(EventBody::ThreadStarted(SessionPayload::default())));
+        v.apply(&t.turn_started("build it"));
+        v.apply(&t.event(EventBody::ThreadCrashed(Default::default())));
+        assert_eq!(
+            (v.crashed, v.crashed_turn, v.failed_turn()),
+            (true, Some(1), Some(1))
+        );
+        let compact_of = |t: &mut ThreadScript| {
+            let mut compact = t.turn_started("/compact");
+            if let EventBody::TurnStarted(p) = &mut compact.body {
+                set_twr_ext(&mut p.ext, COMPACT_TURN_KEY, serde_json::json!(true));
+            }
+            compact
+        };
+        v.apply(&compact_of(&mut t));
+        assert!(v.current_turn_compact);
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert!(v.current_turn.is_none() && !v.current_turn_compact);
+        assert_eq!(
+            (v.crashed, v.crashed_turn, v.failed_turn()),
+            (true, Some(1), Some(1))
+        );
+        assert_eq!(v.status(), ThreadStatus::Error);
+        assert_eq!(v.turns, 2);
+        // The work turn's report, late, while a compaction runs, covers it all the same.
+        let mut v = ThreadView::new("t1");
+        let mut t = ThreadScript::new("t1");
+        v.apply(&t.created("a"));
+        v.apply(&t.turn_started("build it"));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        v.apply(&compact_of(&mut t));
+        v.apply(&t.report(Some(1), Grade::Success));
+        assert!(v.reported, "covers the work turn");
+        assert_eq!(v.last_report.as_ref().and_then(|r| r.turn), Some(1));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert!(v.reported && v.current_turn.is_none());
+        // A work turn after it is the thread's again.
+        v.apply(&t.turn_started("again"));
+        v.apply(&t.turn_ended(TurnResult::Completed));
+        assert_eq!(v.last_turn.as_ref().map(|l| l.turn), Some(3));
+        assert!(!v.crashed);
+    }
+
     /// A thread's view sums what its turns spent; a turn without usage adds nothing.
     #[test]
     fn spent_sums_the_turns_usage() {
@@ -1579,6 +2027,575 @@ mod tests {
         // Nothing spent is left out of the JSON.
         let fresh = serde_json::to_value(ThreadView::new("t2")).unwrap();
         assert!(fresh.get("spent").is_none());
+    }
+
+    /// How full the context is folds from the turns' ends. A Claude Code turn end recorded
+    /// before twr read the last call (no `ext.claude.context_from`) holds the turn's summed
+    /// usage: trusted for a turn of one call or none (a compaction's), unknown for a turn of
+    /// several (the 693% card: 62 calls, 6.9M of a 1M window), whatever the earlier size was. A
+    /// turn end that says its size is unknown makes it so; one that says nothing keeps it.
+    /// Other runtimes' sizes are taken as they are. A compaction that worked sets what it left,
+    /// unknown when it does not say.
+    #[test]
+    fn a_claude_turns_recorded_sum_is_no_context_size() {
+        use serde_json::json;
+        let mut t = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&t.created("a"));
+        let size = |tokens| ContextSize {
+            tokens,
+            window: Some(1_000_000),
+        };
+        let mut ended = |input: u64, tokens: Option<u64>, claude: Option<serde_json::Value>| {
+            let mut ev = t.turn_ended(TurnResult::Completed);
+            if let EventBody::TurnEnded(p) = &mut ev.body {
+                p.usage = Some(crate::event::Usage {
+                    input,
+                    output: 1,
+                    cost: None,
+                });
+                p.context = tokens.map(size);
+                p.ext = claude.map(|c| {
+                    let mut m = JsonMap::new();
+                    m.insert("claude".into(), c);
+                    m
+                });
+            }
+            ev
+        };
+        let legacy = |n: u64| json!({"num_turns": n, "subtype": "success"});
+        // One call: its sum is its size.
+        v.apply(&ended(150_000, Some(150_000), Some(legacy(1))));
+        assert_eq!(v.context, Some(size(150_000)));
+        // Several: unknown, not the previous size.
+        v.apply(&ended(6_932_444, Some(6_932_444), Some(legacy(64))));
+        assert_eq!(v.context, None);
+        assert!(serde_json::to_value(&v).unwrap().get("context").is_none());
+        // What a compaction left (no call, usage 0) holds.
+        v.apply(&ended(0, Some(40_000), Some(legacy(0))));
+        assert_eq!(v.context, Some(size(40_000)));
+        // Several calls under the window are no better.
+        v.apply(&ended(300_000, Some(300_000), Some(legacy(3))));
+        assert_eq!(v.context, None);
+        // A turn end of this twr: the last call's size, trusted.
+        let read = |from: &str| json!({"num_turns": 64, "context_from": from});
+        v.apply(&ended(6_932_444, Some(183_861), Some(read("last_call"))));
+        assert_eq!(v.context, Some(size(183_861)));
+        assert_eq!(v.context.unwrap().percent(), Some(18));
+        // Nothing said (no call): kept.
+        v.apply(&ended(0, None, Some(json!({"num_turns": 0}))));
+        assert_eq!(v.context, Some(size(183_861)));
+        // Calls without a size: unknown.
+        v.apply(&ended(90_000, None, Some(read("unknown"))));
+        assert_eq!(v.context, None);
+        // Another runtime's size is its own.
+        v.apply(&ended(500_000, Some(120_000), None));
+        assert_eq!(v.context, Some(size(120_000)));
+        // A compaction replaces it with what it left, the window kept; one that failed leaves
+        // it; one that worked without saying makes it unknown.
+        let compacted = |post: Option<u64>, error: Option<&str>| {
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                post_tokens: post,
+                error: error.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        v.apply(&t.event(compacted(Some(30_000), None)));
+        assert_eq!(v.context, Some(size(30_000)));
+        v.apply(&t.event(compacted(None, Some("too_few_groups"))));
+        assert_eq!(v.context, Some(size(30_000)));
+        v.apply(&t.event(compacted(None, None)));
+        assert_eq!(v.context, None);
+    }
+
+    /// `turn.ended` with a prompt cache called `secs` after the test clock's base, of `ttl_s`.
+    fn cache_ended(s: &mut ThreadScript, secs: i64, ttl_s: Option<u64>) -> Event {
+        let mut ev = s.turn_ended(TurnResult::Completed);
+        if let EventBody::TurnEnded(p) = &mut ev.body {
+            p.prompt_cache = Some(PromptCache {
+                called_at: crate::testkit::base_time() + chrono::Duration::seconds(secs),
+                ttl_s,
+            });
+        }
+        ev
+    }
+
+    fn at_secs(secs: i64) -> Option<DateTime<Utc>> {
+        Some(crate::testkit::base_time() + chrono::Duration::seconds(secs))
+    }
+
+    /// `thread.model_changed` moving the thread to `runtime`, resuming `resume` if given.
+    fn moved_to(s: &mut ThreadScript, runtime: &str, resume: Option<&str>) -> Event {
+        let mut p = ThreadModelChanged {
+            runtime: Some(runtime.into()),
+            previous_runtime: Some("fake".into()),
+            ..Default::default()
+        };
+        if let Some(r) = resume {
+            set_twr_ext(&mut p.ext, RESUME_SESSION_KEY, serde_json::json!(r));
+        }
+        s.event(EventBody::ThreadModelChanged(p))
+    }
+
+    /// A move to another account of the thread's runtime is a new session there (or its own
+    /// earlier session on that account, resumed): the prompt cache's expiry is forgotten as on
+    /// a runtime move, and the old account's late turn end sets nothing.
+    #[test]
+    fn an_account_move_forgets_the_prompt_cache() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        for (session, resume) in [("s1", None), ("s2", Some("s0"))] {
+            // (Each move's session reported: the cache folds again.)
+            v.apply(&s.started(session));
+            v.apply(&s.turn_started("go"));
+            v.apply(&cache_ended(&mut s, 800, Some(3600)));
+            assert_eq!(v.cache_expires_at, at_secs(4400));
+            let mut p = ThreadModelChanged {
+                runtime: Some("fake".into()),
+                previous_runtime: Some("fake".into()),
+                account_changed: true,
+                account: Some("work".into()),
+                ..Default::default()
+            };
+            if let Some(r) = resume {
+                set_twr_ext(&mut p.ext, RESUME_SESSION_KEY, serde_json::json!(r));
+            }
+            v.apply(&s.event(EventBody::ThreadModelChanged(p)));
+            assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+            assert_eq!(v.account.as_deref(), Some("work"));
+            assert_eq!(v.resume_session.as_deref(), resume);
+            v.apply(&s.turn_started("go"));
+            v.apply(&cache_ended(&mut s, 900, Some(3600)));
+            assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        }
+    }
+
+    /// The prompt cache's expiry folds from the turns' ends: the call's time plus its TTL, the
+    /// TTL known when the end does not say, unknown when neither does. A turn end without a
+    /// prompt cache (no call, a compaction's) keeps it. A compaction that worked, another
+    /// session and a move to another runtime clear both; a failed compaction and a start of the
+    /// same session keep them; the previous runtime's late turn end during a move sets nothing.
+    #[test]
+    fn a_turns_prompt_cache_sets_when_it_expires() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("s1"));
+        // Nothing known: no TTL, no expiry.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 100, None));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 200, Some(3600)));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(3800))
+        );
+        // A turn end without one keeps it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        assert_eq!(v.cache_expires_at, at_secs(3800));
+        // A later call without a TTL of its own: the TTL known.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 500, None));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(4100))
+        );
+        // A 5-minute cache replaces it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 600, Some(300)));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(300), at_secs(900))
+        );
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json["cache_ttl_s"], 300);
+        assert_eq!(
+            serde_json::from_value::<ThreadView>(json).unwrap(),
+            v,
+            "round trip"
+        );
+        // A failed compaction keeps it; one that worked clears it.
+        let compacted = |error: Option<&str>| {
+            EventBody::ContextCompacted(ContextCompacted {
+                trigger: "manual".into(),
+                post_tokens: Some(500),
+                error: error.map(str::to_string),
+                ..Default::default()
+            })
+        };
+        v.apply(&s.event(compacted(Some("too_few_groups"))));
+        assert_eq!(v.cache_expires_at, at_secs(900));
+        v.apply(&s.event(compacted(None)));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        let json = serde_json::to_value(&v).unwrap();
+        assert!(json.get("cache_ttl_s").is_none() && json.get("cache_expires_at").is_none());
+        // A start of the same session keeps it; one of another session clears it.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 700, Some(3600)));
+        v.apply(&s.started("s1"));
+        assert_eq!(v.cache_expires_at, at_secs(4300));
+        v.apply(&s.started("s2"));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        // A move to another runtime clears it, and the previous runtime's turn end that comes
+        // after the move sets nothing.
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 800, Some(3600)));
+        assert_eq!(v.cache_expires_at, at_secs(4400));
+        v.apply(&s.turn_started("go"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        v.apply(&cache_ended(&mut s, 900, Some(3600)));
+        assert_eq!((v.cache_ttl_s, v.cache_expires_at), (None, None));
+        // A thread view from before prompt caches reads as none known.
+        let mut old = serde_json::to_value(&v).unwrap();
+        old.as_object_mut().unwrap().retain(|k, _| {
+            !matches!(
+                k.as_str(),
+                "cache_ttl_s"
+                    | "cache_expires_at"
+                    | "idle_compaction_off"
+                    | "resume_session"
+                    | "resume_turn"
+                    | "resume_failed_turn"
+            )
+        });
+        let back: ThreadView = serde_json::from_value(old).unwrap();
+        assert_eq!(back, v);
+    }
+
+    /// The TTL is the session's: a new process of the same session whose first call wrote no
+    /// cache (its prompt read whole from the cache) does not know it, says none, and the
+    /// thread's expiry still counts the 1 h the session's earlier process said.
+    #[test]
+    fn the_cache_ttl_outlives_a_process_of_its_session() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("s1"));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 100, Some(3600)));
+        v.apply(&s.stopped());
+        v.apply(&s.started("s1"));
+        v.apply(&s.turn_started("go"));
+        v.apply(&cache_ended(&mut s, 2_000, None));
+        assert_eq!(
+            (v.cache_ttl_s, v.cache_expires_at),
+            (Some(3600), at_secs(5_600))
+        );
+        let events = [
+            s.created("api"),
+            s.started("s1"),
+            s.turn_started("go"),
+            cache_ended(&mut s, 100, Some(3600)),
+            s.parked(),
+            s.resumed("s1"),
+            s.turn_started("go"),
+            cache_ended(&mut s, 2_000, None),
+        ];
+        let v = view(&events);
+        assert_eq!(v.cache_expires_at, at_secs(5_600));
+        assert_eq!(replayed(&events, "t1"), v);
+    }
+
+    /// The user's choice of offers to compact a thread whose cache expired: a
+    /// `conversation.update` on it with `ext.twr.idle_compaction` `off` turns them off, `on`
+    /// back on; any other update leaves the choice.
+    #[test]
+    fn idle_compaction_offers_follow_the_latest_choice() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        let update = |s: &mut ThreadScript, value: Option<&str>| {
+            let mut p = ConversationUpdate {
+                text: "x".into(),
+                ..Default::default()
+            };
+            if let Some(value) = value {
+                set_twr_ext(&mut p.ext, IDLE_COMPACTION_KEY, serde_json::json!(value));
+            }
+            s.event(EventBody::ConversationUpdate(p))
+        };
+        assert!(!v.idle_compaction_off);
+        v.apply(&update(&mut s, Some("off")));
+        assert!(v.idle_compaction_off);
+        assert_eq!(
+            serde_json::to_value(&v).unwrap()["idle_compaction_off"],
+            true
+        );
+        v.apply(&update(&mut s, None));
+        v.apply(&update(&mut s, Some("sometimes")));
+        assert!(v.idle_compaction_off);
+        v.apply(&update(&mut s, Some("on")));
+        assert!(!v.idle_compaction_off);
+        assert!(serde_json::to_value(&v)
+            .unwrap()
+            .get("idle_compaction_off")
+            .is_none());
+    }
+
+    /// `turn.started` of a turn that carries the resume of `session` (the hub's).
+    fn resuming(s: &mut ThreadScript, session: &str) -> Event {
+        let mut ev = s.turn_started("go");
+        ev.source = Source::Hub;
+        if let EventBody::TurnStarted(p) = &mut ev.body {
+            set_twr_ext(&mut p.ext, RESUMES_KEY, serde_json::json!(session));
+        }
+        ev
+    }
+
+    /// `ev`, a `turn.started`, from the runtime (a job's wake, or a runtime's own turn).
+    fn runtime_turn(mut ev: Event) -> Event {
+        if let EventBody::TurnStarted(p) = &mut ev.body {
+            p.from = TurnFrom::Runtime;
+        }
+        ev
+    }
+
+    fn from(mut ev: Event, runtime: &str) -> Event {
+        ev.source = Source::Adapter(runtime.into());
+        ev
+    }
+
+    /// Resume state: (session, resume session, resume turn, resume failed turn, pending).
+    type ResumeState<'a> = (
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<u64>,
+        Option<u64>,
+        bool,
+    );
+
+    fn resume_state(v: &ThreadView) -> ResumeState<'_> {
+        (
+            v.session_id.as_deref(),
+            v.resume_session.as_deref(),
+            v.resume_turn,
+            v.resume_failed_turn,
+            v.handoff_pending,
+        )
+    }
+
+    /// A move back to a runtime the thread left points its session at the session it left
+    /// (still pending: no runtime confirmed it, [`ThreadView::confirmed_session`] says none),
+    /// the turn that carries the resume is noted, and the runtime's start ends it all. Every
+    /// move clears what a pending resume left before it sets its own: A → B → A (pending) → C
+    /// leaves no resume.
+    #[test]
+    fn a_move_back_resumes_the_session_it_left() {
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("a1"));
+        assert_eq!(v.confirmed_session(), Some("a1"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        assert_eq!(v.confirmed_session(), None);
+        v.apply(&from(s.started("b1"), "codex"));
+        v.apply(&s.turn_started("work on b"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        assert_eq!(resume_state(&v), (Some("b1"), None, None, None, false));
+        // Back to A, resuming a1.
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        assert_eq!(
+            v.confirmed_session(),
+            None,
+            "a pending resume is no session yet"
+        );
+        // A turn that resumes another session is not the resume's; one a runtime reported (its
+        // own turn) never is, whatever it says.
+        v.apply(&resuming(&mut s, "zz"));
+        assert_eq!(v.resume_turn, None);
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&from(runtime_turn(resuming(&mut s, "a1")), "fake"));
+        assert_eq!(v.resume_turn, None);
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        // The hub's turn is, whoever it is from: here a job's wake (`from: runtime`).
+        v.apply(&runtime_turn(resuming(&mut s, "a1")));
+        assert_eq!(v.resume_turn, Some(4));
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            (&json["resume_session"], &json["resume_turn"]),
+            (&serde_json::json!("a1"), &serde_json::json!(4))
+        );
+        assert_eq!(serde_json::from_value::<ThreadView>(json).unwrap(), v);
+        // The resumed start: the session confirmed, the resume over.
+        v.apply(&s.started("a1"));
+        assert_eq!(resume_state(&v), (Some("a1"), None, None, None, false));
+        assert_eq!(v.confirmed_session(), Some("a1"));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+
+        // A → B → A (pending) → C: nothing of the resume is left.
+        v.apply(&moved_to(&mut s, "codex", None));
+        v.apply(&from(s.started("b2"), "codex"));
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        v.apply(&resuming(&mut s, "a1"));
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(5), None, true)
+        );
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&moved_to(&mut s, "grok-build", None));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        // A start of the runtime the resume was for, late, is not the new runtime's.
+        v.apply(&s.started("a1"));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        v.apply(&from(s.started("g1"), "grok-build"));
+        assert_eq!(resume_state(&v), (Some("g1"), None, None, None, false));
+    }
+
+    /// A hub turn that drops the pending resume (`ext.twr.resume_dropped`, the session no
+    /// longer holding when the turn starts) leaves no session and no resume, the move still
+    /// pending; one that names another session, or a runtime's own turn, drops nothing. The
+    /// new runtime's start then ends the move.
+    #[test]
+    fn a_turn_that_drops_the_resume_starts_a_new_session() {
+        let dropping = |s: &mut ThreadScript, session: &str| {
+            let mut ev = s.turn_started("go");
+            ev.source = Source::Hub;
+            if let EventBody::TurnStarted(p) = &mut ev.body {
+                set_twr_ext(&mut p.ext, RESUME_DROPPED_KEY, serde_json::json!(session));
+            }
+            ev
+        };
+        let mut s = ThreadScript::new("t1");
+        let mut v = ThreadView::new("t1");
+        v.apply(&s.created("api"));
+        v.apply(&s.started("a1"));
+        v.apply(&moved_to(&mut s, "codex", None));
+        v.apply(&from(s.started("b1"), "codex"));
+        v.apply(&moved_to(&mut s, "fake", Some("a1")));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&dropping(&mut s, "zz"));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&s.turn_ended(TurnResult::Error));
+        v.apply(&from(runtime_turn(dropping(&mut s, "a1")), "fake"));
+        assert_eq!(resume_state(&v), (Some("a1"), Some("a1"), None, None, true));
+        v.apply(&s.turn_ended(TurnResult::Completed));
+        v.apply(&dropping(&mut s, "a1"));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        // Its failure is no failed resume.
+        v.apply(&s.turn_ended(TurnResult::Error));
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
+        v.apply(&s.started("a2"));
+        assert_eq!(resume_state(&v), (Some("a2"), None, None, None, false));
+    }
+
+    /// The turn that carried a resume fails (ends `error` or `interrupted`, or a crash takes
+    /// it down) before the runtime started a session: the resume is dropped (no session, still
+    /// pending) and the failed turn noted, whatever session the failed process reports. A
+    /// crash after that turn's failed end changes nothing more, nor does a failed end of
+    /// another turn (the previous runtime's, late) or a completed end of the resume's turn. The
+    /// next start (a new session) clears the failure, and so does the next move.
+    #[test]
+    fn a_failed_resume_falls_back_to_a_new_session() {
+        // Thread on A (session a1), moved to B, then back to A resuming a1.
+        let setup = |s: &mut ThreadScript| {
+            vec![
+                s.created("api"),
+                s.started("a1"),
+                moved_to(s, "codex", None),
+                from(s.started("b1"), "codex"),
+                s.turn_started("work on b"),
+                s.turn_ended(TurnResult::Completed),
+                moved_to(s, "fake", Some("a1")),
+            ]
+        };
+        let failed = |result: TurnResult| {
+            let mut s = ThreadScript::new("t1");
+            let mut evs = setup(&mut s);
+            evs.push(resuming(&mut s, "a1"));
+            let mut end = s.turn_ended(result);
+            if let EventBody::TurnEnded(p) = &mut end.body {
+                p.session_id = Some("a1".into());
+            }
+            evs.push(end);
+            (s, evs)
+        };
+        for result in [TurnResult::Error, TurnResult::Interrupted] {
+            let (_, evs) = failed(result);
+            let v = view(&evs);
+            assert_eq!(
+                resume_state(&v),
+                (None, None, None, Some(2), true),
+                "{result:?}"
+            );
+            assert_eq!(replayed(&evs, "t1"), v);
+        }
+        // A job's wake (the hub's, `from: runtime`) that carried the resume and failed drops it
+        // the same way; a runtime's own turn that says it resumes the session is not the
+        // resume's, and its failure drops nothing.
+        for reported in [false, true] {
+            let mut s = ThreadScript::new("t1");
+            let mut evs = setup(&mut s);
+            let wake = runtime_turn(resuming(&mut s, "a1"));
+            evs.push(if reported { from(wake, "fake") } else { wake });
+            evs.push(s.turn_ended(TurnResult::Error));
+            let v = view(&evs);
+            let want: ResumeState = if reported {
+                (Some("a1"), Some("a1"), None, None, true)
+            } else {
+                (None, None, None, Some(2), true)
+            };
+            assert_eq!(
+                resume_state(&v),
+                want,
+                "reported by the runtime: {reported}"
+            );
+            assert_eq!(replayed(&evs, "t1"), v);
+        }
+        // A completed end of the resume's turn is no failure.
+        let v = view(&failed(TurnResult::Completed).1);
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(2), None, true)
+        );
+
+        // A crash in the resume's turn (no end before it).
+        let mut s = ThreadScript::new("t1");
+        let mut evs = setup(&mut s);
+        evs.push(resuming(&mut s, "a1"));
+        evs.push(s.crashed(1));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, Some(2), true));
+        assert_eq!(v.crashed_turn, Some(2));
+        // A crash after its failed end (the hub's closing sequence): the end already counted.
+        let (mut s, mut evs) = failed(TurnResult::Interrupted);
+        evs.push(s.crashed(1));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, Some(2), true));
+
+        // A failed end of another turn (the previous runtime's, late) is not the resume's.
+        let mut s = ThreadScript::new("t1");
+        let mut evs = setup(&mut s);
+        evs.push(resuming(&mut s, "a1"));
+        let mut late = s.event(EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Error,
+            session_id: Some("b1".into()),
+            ..Default::default()
+        }));
+        late.turn = Some(1);
+        evs.push(late);
+        let v = view(&evs);
+        assert_eq!(
+            resume_state(&v),
+            (Some("a1"), Some("a1"), Some(2), None, true)
+        );
+
+        // After the failure: the retry starts a new session, which clears it.
+        let (mut s, mut evs) = failed(TurnResult::Error);
+        evs.push(s.retry_turn_started(2));
+        evs.push(s.started("a2"));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (Some("a2"), None, None, None, false));
+        // ... and so does the next move.
+        let (mut s, mut evs) = failed(TurnResult::Error);
+        evs.push(moved_to(&mut s, "codex", None));
+        let v = view(&evs);
+        assert_eq!(resume_state(&v), (None, None, None, None, true));
     }
 
     /// A permission's context comes from its runtime's section (`reason`, else
@@ -1630,6 +2647,14 @@ mod tests {
         for e in events {
             v.apply(e);
         }
+        v
+    }
+
+    /// Thread `id`'s view in a registry folded from `events`, without the color the registry
+    /// gives it ([`ThreadView::color`]): what folding its events into a view alone gives.
+    fn replayed(events: &[Event], id: &str) -> ThreadView {
+        let mut v = Registry::from_events(events).get(id).unwrap().clone();
+        v.color = None;
         v
     }
 
@@ -2148,8 +3173,39 @@ mod tests {
         let v = view(&evs);
         assert_eq!(v.mode, "plan");
         assert!(v.stopped, "a plain stop still stops");
-        let replayed = Registry::from_events(&evs);
-        assert_eq!(replayed.get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
+    }
+
+    /// The `thread.stopped` of a box switch (`box_upgrade`) folds like a mode restart's: the
+    /// thread keeps its session and is not stopped, live and on replay; a plain stop after it
+    /// still stops.
+    #[test]
+    fn a_box_upgrade_is_no_stop() {
+        let mut s = ThreadScript::new("t1");
+        let upgrade = SessionPayload {
+            session_id: Some("sess-1".into()),
+            ext: serde_json::json!({"twr": {"reason": BOX_UPGRADE_REASON}})
+                .as_object()
+                .cloned(),
+            ..Default::default()
+        };
+        let mut evs = vec![
+            s.created("api"),
+            s.started("sess-1"),
+            s.turn_started("go"),
+            s.turn_ended(TurnResult::Completed),
+            s.event(EventBody::ThreadStopped(upgrade)),
+        ];
+        let v = view(&evs);
+        assert!(!v.stopped, "a box upgrade is no stop");
+        assert_eq!(v.status(), S::Idle);
+        assert_eq!(v.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(replayed(&evs, "t1"), v);
+        evs.push(s.started("sess-1"));
+        evs.push(s.stopped());
+        let v = view(&evs);
+        assert!(v.stopped, "a plain stop still stops");
+        assert_eq!(replayed(&evs, "t1"), v);
     }
 
     /// The model and effort start as `thread.created`'s `ext.twr.model` / `ext.twr.effort`
@@ -2204,7 +3260,7 @@ mod tests {
                 "after event {n}"
             );
             assert!(!v.stopped, "a model restart is no stop (event {n})");
-            assert_eq!(Registry::from_events(&evs[..=n]).get("t1"), Some(&v));
+            assert_eq!(replayed(&evs[..=n], "t1"), v);
         }
         // A thread object from before efforts reads as the runtime's default.
         let mut j = serde_json::to_value(view(&evs[..1])).unwrap();
@@ -2272,7 +3328,7 @@ mod tests {
         let v = at(8);
         assert_eq!(v.session_id.as_deref(), Some("new"));
         assert!(!v.handoff_pending);
-        assert_eq!(Registry::from_events(&evs).get("t1"), Some(&v));
+        assert_eq!(replayed(&evs, "t1"), v);
         // A thread object from before runtime changes has none pending.
         let mut j = serde_json::to_value(at(1)).unwrap();
         j.as_object_mut().unwrap().remove("handoff_pending");
@@ -2419,6 +3475,139 @@ mod tests {
         );
     }
 
+    /// A thread's account: `thread.created`'s, then an account move's. The move sets what the
+    /// event says (model and effort included), drops the session and waits for the new
+    /// account's first start: a start stamped with the old account is ignored, one of the new
+    /// account ends the handoff, and an unstamped one (an older runner) says nothing. A log
+    /// from before accounts reads as the native account.
+    #[test]
+    fn an_account_move_waits_for_the_new_accounts_session() {
+        let mut s = ThreadScript::new("t1");
+        let mut created = s.created("api");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.ext = serde_json::json!({"twr": {
+                "model": "opus", "effort": "high",
+                ACCOUNT_KEY: "work", ACCOUNT_PIN_KEY: "work,max-*",
+            }})
+            .as_object()
+            .cloned();
+        }
+        let start = |s: &mut ThreadScript, session: &str, account: Option<&str>| {
+            let mut e = s.started(session);
+            if let EventBody::ThreadStarted(p) = &mut e.body {
+                let mut twr = serde_json::json!({"runtime": "fake"});
+                if let Some(a) = account {
+                    twr[ACCOUNT_KEY] = a.into();
+                }
+                p.ext = serde_json::json!({ "twr": twr }).as_object().cloned();
+            }
+            e
+        };
+        let mv = |s: &mut ThreadScript, to: Option<&str>, from: Option<&str>| {
+            s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+                previous_model: Some("opus".into()),
+                previous_effort: Some("high".into()),
+                runtime: Some("fake".into()),
+                previous_runtime: Some("fake".into()),
+                account_changed: true,
+                account: to.map(str::to_string),
+                previous_account: from.map(str::to_string),
+                ..Default::default()
+            }))
+        };
+        let evs = [
+            created,
+            start(&mut s, "w-1", Some("work")),
+            mv(&mut s, Some("personal"), Some("work")),
+            start(&mut s, "w-2", Some("work")),
+            start(&mut s, "p-1", Some("personal")),
+            mv(&mut s, None, Some("personal")),
+            start(&mut s, "p-2", Some("personal")),
+            start(&mut s, "n-1", None),
+        ];
+        let at = |n: usize| view(&evs[..=n]);
+        let v = at(0);
+        assert_eq!(
+            (v.account.as_deref(), v.account_pin.as_deref()),
+            (Some("work"), Some("work,max-*"))
+        );
+        assert_eq!(at(1).session_id.as_deref(), Some("w-1"));
+        let v = at(2);
+        assert_eq!(v.account.as_deref(), Some("personal"));
+        assert_eq!((v.session_id, v.handoff_pending), (None, true));
+        assert_eq!(
+            (v.model.as_deref(), v.effort.as_deref(), v.runtime.as_str()),
+            (Some("opus"), Some("high"), "fake")
+        );
+        assert_eq!(v.account_pin.as_deref(), Some("work,max-*"));
+        let v = at(3);
+        assert_eq!(
+            (v.session_id, v.handoff_pending),
+            (None, true),
+            "the old account's start"
+        );
+        let v = at(4);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("p-1"), false)
+        );
+        // Back to the native account.
+        let v = at(5);
+        assert_eq!((v.account, v.handoff_pending), (None, true));
+        assert!(at(6).handoff_pending, "a start of the named account");
+        let v = at(7);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("n-1"), false)
+        );
+        assert_eq!(replayed(&evs, "t1"), v);
+        // An unstamped start says nothing.
+        let unstamped = s.started("u-1");
+        let v = view(&[evs[0].clone(), evs[1].clone(), evs[2].clone(), unstamped]);
+        assert_eq!(
+            (v.session_id.as_deref(), v.handoff_pending),
+            (Some("u-1"), false)
+        );
+        // The account goes over the wire; a thread from before accounts has none.
+        let j = serde_json::to_value(at(4)).unwrap();
+        assert_eq!(j["account"], serde_json::json!("personal"));
+        assert_eq!(serde_json::from_value::<ThreadView>(j).unwrap(), at(4));
+        let mut old = ThreadScript::new("t2");
+        let v = view(&[old.created("web")]);
+        assert_eq!((v.account.as_ref(), v.account_pin.as_ref()), (None, None));
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(
+            j.get("account").is_none() && j.get("account_pin").is_none(),
+            "{j}"
+        );
+    }
+
+    /// A move between accounts of one `acp` runtime keeps its agent; a move to another
+    /// runtime takes the event's.
+    #[test]
+    fn an_account_move_keeps_the_agent() {
+        let mut s = ThreadScript::new("t1");
+        let mut created = s.created("api");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.runtime = "acp".into();
+            p.ext = serde_json::json!({"twr": {ACP_COMMAND_KEY: ["agent-a", "acp"]}})
+                .as_object()
+                .cloned();
+        }
+        let moved = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+            runtime: Some("acp".into()),
+            previous_runtime: Some("acp".into()),
+            account_changed: true,
+            account: Some("team".into()),
+            ..Default::default()
+        }));
+        let v = view(&[created, moved]);
+        assert_eq!(v.acp_command, Some(serde_json::json!(["agent-a", "acp"])));
+        assert_eq!(v.account.as_deref(), Some("team"));
+    }
+
     /// A deleted thread leaves the registry and the attention stack, and nothing of it comes
     /// back with a later event; its name resolves to another thread again.
     #[test]
@@ -2450,6 +3639,196 @@ mod tests {
         assert_eq!(r.resolve("api").unwrap().id, "t2");
         assert_eq!(r.list().len(), 1);
         assert_eq!(r.deleted_view("t1").unwrap().name, "api");
+    }
+
+    /// Each thread gets a color of its own when its `thread.created` is folded, from those
+    /// of the threads alive then: in the palette's order while none is freed, none for an
+    /// orchestrator. It keeps it through renames, other threads' deletions and creations, and
+    /// a replay; a deleted thread's view keeps it, and the next thread may take it.
+    #[test]
+    fn a_thread_gets_a_color_of_its_own_and_keeps_it() {
+        let (mut a, mut b, mut c, mut o) = (
+            ThreadScript::new("t-a"),
+            ThreadScript::new("t-b"),
+            ThreadScript::new("t-c"),
+            ThreadScript::new("t-o"),
+        );
+        let mut orch = o.created("orchestrator");
+        if let EventBody::ThreadCreated(p) = &mut orch.body {
+            p.ext = serde_json::json!({"twr": {"role": "orchestrator"}})
+                .as_object()
+                .cloned();
+        }
+        let mut evs = vec![orch, a.created("api"), b.created("web"), c.created("docs")];
+        let colors = |evs: &[Event]| {
+            let r = Registry::from_events(evs);
+            ["t-o", "t-a", "t-b", "t-c"].map(|id| r.get(id).and_then(|t| t.color))
+        };
+        assert_eq!(colors(&evs), [None, Some(0), Some(1), Some(2)]);
+        evs.push(b.event(EventBody::ThreadRenamed(ThreadRenamed {
+            name: "frontend".into(),
+            previous: "web".into(),
+            ..Default::default()
+        })));
+        evs.push(a.event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: "api".into(),
+            ..Default::default()
+        })));
+        assert_eq!(colors(&evs), [None, None, Some(1), Some(2)]);
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.deleted_view("t-a").unwrap().color, Some(0));
+        // The next thread takes a color no thread alive has, the farthest from theirs.
+        let mut d = ThreadScript::new("t-d");
+        evs.push(d.created("api"));
+        let r = Registry::from_events(&evs);
+        let dc = r.get("t-d").unwrap().color.unwrap();
+        assert_eq!(dc, crate::palette::allocate([1, 2]));
+        assert!(dc != 1 && dc != 2);
+        assert_eq!(colors(&evs), [None, None, Some(1), Some(2)]);
+        // Live and on replay alike.
+        let mut live = Registry::new();
+        for e in &evs {
+            live.apply(e);
+        }
+        assert_eq!(live, r);
+    }
+
+    /// A restored thread keeps its color unless a thread alive took it meanwhile; then it gets
+    /// one no thread alive has.
+    #[test]
+    fn a_restored_thread_keeps_its_color_unless_it_was_taken() {
+        let restored = |name: &str| {
+            EventBody::ThreadRestored(ThreadRestored {
+                item: "01J00000000000000000000000".into(),
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        let deleted = |name: &str| {
+            EventBody::ThreadDeleted(ThreadDeleted {
+                name: name.into(),
+                ..Default::default()
+            })
+        };
+        let (mut a, mut b) = (ThreadScript::new("t-a"), ThreadScript::new("t-b"));
+        // Nobody took it: kept.
+        let evs = vec![
+            a.created("api"),
+            b.created("web"),
+            a.event(deleted("api")),
+            a.event(restored("api")),
+        ];
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-a").unwrap().color, Some(0));
+        // Threads created meanwhile took it: another one, that no thread alive has.
+        let mut evs = vec![a.created("api"), b.created("web"), a.event(deleted("api"))];
+        for i in 0.. {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+            let r = Registry::from_events(&evs);
+            if r.get(&format!("t-{i}")).unwrap().color == Some(0) {
+                break;
+            }
+            assert!(i < 28);
+        }
+        evs.push(a.event(restored("api")));
+        let r = Registry::from_events(&evs);
+        let ac = r.get("t-a").unwrap().color.unwrap();
+        let others: Vec<u8> = r
+            .list()
+            .iter()
+            .filter(|t| t.id != "t-a")
+            .filter_map(|t| t.color)
+            .collect();
+        assert!(!others.contains(&ac), "{ac} {others:?}");
+        assert_eq!(ac, crate::palette::allocate(others));
+    }
+
+    /// A thread whose `thread.created` the log lacks holds a color from its first control
+    /// event, so later threads don't take it, and the same as a fold of the control stream
+    /// alone gives it (an agent event before it counts for nothing); an orchestrator seen
+    /// before its `thread.created` gives its color back.
+    #[test]
+    fn a_thread_without_its_creation_holds_a_color_too() {
+        let (mut x, mut o, mut y) = (
+            ThreadScript::new("t-x"),
+            ThreadScript::new("t-o"),
+            ThreadScript::new("t-y"),
+        );
+        let mut evs = vec![y.text("hello"), x.turn_started("go"), o.turn_started("hi")];
+        let mut orch = o.created("orchestrator");
+        if let EventBody::ThreadCreated(p) = &mut orch.body {
+            p.ext = serde_json::json!({"twr": {"role": "orchestrator"}})
+                .as_object()
+                .cloned();
+        }
+        evs.push(orch);
+        for i in 0..28 {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+        }
+        evs.push(y.turn_started("go"));
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-x").unwrap().color, Some(0));
+        assert_eq!(r.get("t-o").unwrap().color, None);
+        let held: std::collections::HashSet<u8> = r.list().iter().filter_map(|t| t.color).collect();
+        assert_eq!(held.len(), 30);
+        let control = Registry::from_events(evs.iter().filter(|e| e.is_control()));
+        assert_eq!(control.len(), r.len());
+        for t in r.list() {
+            assert_eq!(control.get(&t.id).unwrap().color, t.color, "{}", t.id);
+        }
+    }
+
+    /// Past 30, deleting threads changes no survivor's color, and the next thread takes a
+    /// freed color, not a shared one; two threads that came to share a color keep it until
+    /// one goes.
+    #[test]
+    fn after_more_than_thirty_deletions_recolor_nobody() {
+        let mut scripts: Vec<ThreadScript> = (0..31)
+            .map(|i| ThreadScript::new(format!("t-{i}")))
+            .collect();
+        let mut evs: Vec<Event> = scripts
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| s.created(&format!("n{i}")))
+            .collect();
+        let before = Registry::from_events(&evs);
+        let shared = before.get("t-30").unwrap().color.unwrap();
+        assert_eq!(shared, 0);
+        // t-5 had a color of its own.
+        evs.push(scripts[5].event(EventBody::ThreadDeleted(ThreadDeleted {
+            name: "n5".into(),
+            ..Default::default()
+        })));
+        let after = Registry::from_events(&evs);
+        for t in after.list() {
+            assert_eq!(t.color, before.get(&t.id).unwrap().color, "{}", t.id);
+        }
+        let mut n = ThreadScript::new("t-new");
+        evs.push(n.created("new"));
+        let r = Registry::from_events(&evs);
+        assert_eq!(r.get("t-new").unwrap().color, Some(5));
+        assert_eq!(r.get("t-0").unwrap().color, r.get("t-30").unwrap().color);
+    }
+
+    /// Up to 30 threads alive never share a color; past that, colors are shared evenly.
+    #[test]
+    fn thirty_threads_have_thirty_colors_and_more_share_them_evenly() {
+        let mut evs = Vec::new();
+        for i in 0..45 {
+            let mut s = ThreadScript::new(format!("t-{i}"));
+            evs.push(s.created(&format!("n{i}")));
+        }
+        let r = Registry::from_events(&evs[..30]);
+        let held: std::collections::HashSet<u8> = r.list().iter().filter_map(|t| t.color).collect();
+        assert_eq!(held.len(), 30);
+        let r = Registry::from_events(&evs);
+        let mut count = [0usize; 30];
+        for t in r.list() {
+            count[usize::from(t.color.unwrap())] += 1;
+        }
+        assert!(count.iter().all(|&n| n == 1 || n == 2), "{count:?}");
     }
 
     /// A restored thread comes back as it was when deleted, parked, under its new name and
@@ -2688,8 +4067,7 @@ mod tests {
             live.apply(e);
             assert_eq!(live.actual_model.as_deref(), want[i], "after step {i}");
             assert_eq!(live.model.as_deref(), Some("sonnet"));
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(live.shown_model(), Some("sonnet"));
         live.actual_model = Some("claude-sonnet-4-5".into());
@@ -2756,8 +4134,7 @@ mod tests {
         for (i, e) in evs.iter().enumerate() {
             live.apply(e);
             assert_eq!(live.actual_model.as_deref(), want[i], "after step {i}");
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         let pending = view(&evs[..=5]);
         assert_eq!(
@@ -2786,8 +4163,7 @@ mod tests {
             live.apply(e);
             eligibility.push(live.retry_eligible());
             // A hub restarting at any point rebuilds the same view by replay.
-            let replayed = Registry::from_events(&evs[..=i]);
-            assert_eq!(replayed.get("t1").unwrap(), &live, "after step {i}");
+            assert_eq!(replayed(&evs[..=i], "t1"), live, "after step {i}");
         }
         assert_eq!(
             eligibility,

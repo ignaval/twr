@@ -88,6 +88,27 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path`, and the side file is removed. A child another test thread forks while this process
+/// writes the file would inherit the descriptor, and exec'ing the file would fail with
+/// ETXTBSY until that child execs or exits.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn write(dir: &Path, path: &str, data: &[u8]) {
     let p = dir.join(path);
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -848,13 +869,10 @@ async fn git_output_never_reaches_a_refusal() {
     // can): the refusal and its event carry none of what it printed.
     let bin_dir = tempfile::tempdir().unwrap();
     let bin = bin_dir.path().join("git");
-    std::fs::write(
+    install(
         &bin,
         "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = grep ]; then\n    printf 'x:.env\\0001\\0API_KEY=hunter2\\n'\n    exit 2\n  fi\ndone\nexec git \"$@\"\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut th = start_git(|_, _| {}, Some(bin)).await;
     let mut o = th.orchestrator().await;
     let e = refused(
@@ -939,16 +957,13 @@ fn logging_git(dir: &Path, log: &Path, fail_toplevel: bool) -> PathBuf {
     } else {
         ""
     };
-    std::fs::write(
+    install(
         &bin,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n{fail}exec git \"$@\"\n",
             log.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     bin
 }
 
@@ -1068,13 +1083,10 @@ async fn git_never_finds_another_repository_from_the_git_directory() {
     // only runs bare repositories it is told about.
     let bin_dir = tempfile::tempdir().unwrap();
     let bin = bin_dir.path().join("git");
-    std::fs::write(
+    install(
         &bin,
         "#!/bin/sh\nexec git -c safe.bareRepository=explicit \"$@\"\n",
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut th = start_git(
         |_, home| {
             let other = home.join("other");
@@ -1421,7 +1433,7 @@ async fn alternates_added_while_a_read_runs_fail_it() {
     // every check before the read.
     let alternates = late.join(".git/objects/info/alternates");
     let bin = bin_dir.path().join("git");
-    std::fs::write(
+    install(
         &bin,
         format!(
             "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = --verify ]; then\n    \
@@ -1429,10 +1441,7 @@ async fn alternates_added_while_a_read_runs_fail_it() {
             other.join(".git/objects").display(),
             alternates.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut th = start_git(|c, _| project(c, "late", &late), Some(bin)).await;
     let mut o = th.orchestrator().await;
     let e = refused(
@@ -1545,17 +1554,14 @@ async fn search_ignores_git_config_that_changes_what_it_reads() {
     let bin_dir = tempfile::tempdir().unwrap();
     let bin = bin_dir.path().join("git");
     let log = bin_dir.path().join("log");
-    std::fs::write(
+    install(
         &bin,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec git -c submodule.recurse=true -c \
              grep.column=true \"$@\"\n",
             log.display()
         ),
-    )
-    .unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let mut th = start_git(
         |c, home| {
             let sub = home.join("sub");

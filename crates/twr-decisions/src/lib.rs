@@ -43,7 +43,7 @@ pub const GRADE_DEFAULT: Grade = Grade::Success;
 /// Confidence of [`GRADE_DEFAULT`].
 pub const GRADE_DEFAULT_CONFIDENCE: f64 = 0.6;
 /// Every block kind, as offered to the block_kind decision.
-pub const BLOCK_KIND_OPTIONS: [&str; 2] = ["user_blocked", "transient"];
+pub const BLOCK_KIND_OPTIONS: [&str; 3] = ["user_blocked", "transient", "limited"];
 
 /// One rung's answer.
 #[derive(Debug, Clone, PartialEq)]
@@ -127,14 +127,17 @@ pub enum BlockKind {
     UserBlocked,
     /// Rate limit / overload / network: eligible for one automatic retry.
     Transient,
+    /// The account hit a usage or spending limit (`ext.twr.limit`): never retried at once.
+    Limited,
 }
 
 impl BlockKind {
-    /// Wire name (`user_blocked` / `transient`).
+    /// Wire name (`user_blocked` / `transient` / `limited`).
     pub fn as_str(self) -> &'static str {
         match self {
             BlockKind::UserBlocked => "user_blocked",
             BlockKind::Transient => "transient",
+            BlockKind::Limited => "limited",
         }
     }
 
@@ -143,6 +146,7 @@ impl BlockKind {
         match s {
             "user_blocked" => Some(BlockKind::UserBlocked),
             "transient" => Some(BlockKind::Transient),
+            "limited" => Some(BlockKind::Limited),
             _ => None,
         }
     }
@@ -193,7 +197,11 @@ mod tests {
 
     #[test]
     fn block_kind_names_round_trip() {
-        for k in [BlockKind::UserBlocked, BlockKind::Transient] {
+        for k in [
+            BlockKind::UserBlocked,
+            BlockKind::Transient,
+            BlockKind::Limited,
+        ] {
             assert_eq!(BlockKind::parse(k.as_str()), Some(k));
             assert!(BLOCK_KIND_OPTIONS.contains(&k.as_str()));
             assert_eq!(

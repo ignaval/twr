@@ -930,3 +930,141 @@ async fn an_item_being_made_is_never_purged() {
     assert!(items(&hub).await[0].get("incomplete").is_none());
     hub.shutdown().await;
 }
+
+/// The `trash.purged` events so far: `(item, thread, gone)`.
+fn purges(hub: &Hub) -> Vec<(String, String, bool)> {
+    control(hub)
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::TrashPurged(p) if e.thread == HUB_THREAD && e.source == Source::Hub => {
+                Some((p.item, p.thread, p.gone))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every purge is recorded (`trash.purged` on the hub's thread): by `trash.empty`, by the
+/// purge after `keep_days`, and an item past its purge time that its box no longer has
+/// (removed by hand, or purged before purges were recorded) as `gone`; one not past it is
+/// left alone. A restarted hub has none of them back, and reads a purged thread's events by
+/// its id.
+#[tokio::test]
+async fn purges_are_recorded_and_stay_after_a_restart() {
+    let r = Repo::new();
+    let hub = Hub::open(opts(&r.root, 2)).await.unwrap();
+    let mut ids = Vec::new();
+    for name in ["a", "b", "c", "d"] {
+        ids.push(create(&hub, &r.repo, name).await);
+        delete(&hub, name).await;
+    }
+    let item = |i: usize| deleted(&hub, &ids[i]).trash.unwrap();
+    let (a, b, c, d) = (item(0), item(1), item(2), item(3));
+    hub.trash_empty(std::slice::from_ref(&a), false, &user())
+        .await
+        .unwrap();
+    assert_eq!(purges(&hub), [(a.clone(), ids[0].clone(), false)]);
+    // c and d gone by hand: not recorded before their purge time, recorded after it.
+    for i in [&c, &d] {
+        std::fs::remove_dir_all(r.trash().join(i)).unwrap();
+    }
+    let deleted_at = items(&hub).await[0]["deleted_at_ms"].as_u64().unwrap();
+    let out = hub.purge_trash(deleted_at + DAY_MS).await;
+    assert_eq!(out["gone"], serde_json::json!([]), "{out}");
+    assert_eq!(purges(&hub).len(), 1);
+    let out = hub.purge_trash(deleted_at + 2 * DAY_MS + 60_000).await;
+    assert_eq!(out["purged"], serde_json::json!([b.clone()]), "{out}");
+    let mut gone: Vec<String> = serde_json::from_value(out["gone"].clone()).unwrap();
+    gone.sort();
+    let mut want = vec![c.clone(), d.clone()];
+    want.sort();
+    assert_eq!(gone, want, "{out}");
+    let mut got = purges(&hub);
+    got.sort();
+    let mut expected = vec![
+        (a.clone(), ids[0].clone(), false),
+        (b.clone(), ids[1].clone(), false),
+        (c.clone(), ids[2].clone(), true),
+        (d.clone(), ids[3].clone(), true),
+    ];
+    expected.sort();
+    assert_eq!(got, expected);
+    // Once each.
+    hub.purge_trash(deleted_at + 3 * DAY_MS).await;
+    assert_eq!(purges(&hub).len(), 4);
+    hub.shutdown().await;
+    drop(hub);
+    let hub = Hub::open(opts(&r.root, 2)).await.unwrap();
+    assert!(items(&hub).await.is_empty());
+    hub.purge_trash(deleted_at + 3 * DAY_MS).await;
+    assert_eq!(purges(&hub).len(), 4);
+    let (id, events) = hub.thread_events(&ids[0], 0, 10_000).unwrap();
+    assert_eq!(id, ids[0]);
+    assert!(events.iter().any(|e| e.kind() == "thread.deleted"));
+    hub.shutdown().await;
+}
+
+/// Copies directory `from` to `to` (files, directories and symlinks as they are).
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for e in std::fs::read_dir(from).unwrap() {
+        let e = e.unwrap();
+        let (src, dst) = (e.path(), to.join(e.file_name()));
+        let t = e.file_type().unwrap();
+        if t.is_symlink() {
+            std::os::unix::fs::symlink(std::fs::read_link(&src).unwrap(), &dst).unwrap();
+        } else if t.is_dir() {
+            copy_dir(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
+/// Only an item the box's trash lacks for certain is recorded as gone: one whose manifest it
+/// cannot read stays an item. A thread comes back only from the item of its latest deletion,
+/// and never once that item is purged: another item naming it (a copy here) is refused.
+#[tokio::test]
+async fn gone_needs_the_item_gone_and_a_purged_thread_never_comes_back() {
+    let r = Repo::new();
+    let hub = Hub::open(opts(&r.root, 2)).await.unwrap();
+    let mut ids = Vec::new();
+    for name in ["a", "b"] {
+        ids.push(create(&hub, &r.repo, name).await);
+        delete(&hub, name).await;
+    }
+    let (a, b) = (
+        deleted(&hub, &ids[0]).trash.unwrap(),
+        deleted(&hub, &ids[1]).trash.unwrap(),
+    );
+    // b: a copy of its item under another id names b too.
+    let copy = "01ZZZZZZZZZZZZZZZZZZZZZZZZ";
+    copy_dir(&r.trash().join(&b), &r.trash().join(copy));
+    let m = r.trash().join(copy).join("manifest.json");
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&m).unwrap()).unwrap();
+    v["item"] = Value::from(copy);
+    std::fs::write(&m, serde_json::to_vec(&v).unwrap()).unwrap();
+    let e = hub.trash_restore(copy, None, &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+    assert!(e.message.contains("last deleted into"), "{}", e.message);
+    hub.trash_empty(std::slice::from_ref(&b), false, &user())
+        .await
+        .unwrap();
+    let e = hub.trash_restore(copy, None, &user()).await.unwrap_err();
+    assert_eq!(e.code, codes::CONFLICT, "{e:?}");
+    assert!(e.message.contains("purged"), "{}", e.message);
+    assert!(hub.thread_view("b").is_err());
+    // a: its manifest unreadable for a while (the listing skips it), long past its time.
+    let manifest = r.trash().join(&a).join("manifest.json");
+    let saved = std::fs::read(&manifest).unwrap();
+    std::fs::write(&manifest, b"{not json").unwrap();
+    let deleted_at = items(&hub).await[0]["deleted_at_ms"].as_u64().unwrap();
+    let out = hub.purge_trash(deleted_at + 30 * DAY_MS).await;
+    assert_eq!(out["gone"], serde_json::json!([]), "{out}");
+    assert!(purges(&hub).iter().all(|(i, ..)| *i != a));
+    std::fs::write(&manifest, saved).unwrap();
+    // Readable again: a comes back.
+    hub.trash_restore(&a, None, &user()).await.unwrap();
+    assert!(hub.thread_view("a").is_ok());
+    hub.shutdown().await;
+}

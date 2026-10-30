@@ -1,5 +1,9 @@
 //! The runner process: connects outbound to the hub over WebSocket (`ws://` or `wss://` via
-//! rustls with the webpki root certificates) and serves the hub from a [`LocalBox`].
+//! rustls with the webpki root certificates) and serves the hub from a [`LocalBox`]. Or, as an
+//! SSH box's daemon ([`RunnerOptions::daemon`], `twr runner --daemon`), takes its connections
+//! from the hub on a Unix socket instead of dialing ([`crate::daemon`]): the same session runs
+//! over either transport (the code below is generic over the WebSocket's byte stream), and
+//! only how a connection is made and how the hub is authenticated differ.
 //!
 //! Connection loop: connect; authenticate ([`twr_core::runner`]: `hello` with a fresh nonce,
 //! check the hub's proof in its `challenge` before sending anything else, send this runner's
@@ -30,28 +34,57 @@
 //! logged ([`twr_core::runner::Secret`] redacts itself). A hub that cannot prove it knows the
 //! token (a wrong URL, a different token, or another process listening on the port, such as
 //! another user's on a loopback port an SSH tunnel did not get) gets nothing but the hello,
-//! and the runner tries again later.
+//! and the runner tries again later. A token from a file is read again after such a refusal,
+//! and the file watched while the runner waits: a new token installed there (`twr runner
+//! install-token`, after the hub's `twr box token --rotate`) is used at once, without a
+//! restart.
+//!
+//! A daemon has no token: its connections are sealed channels the hub's key opened
+//! ([`twr_core::sealed`]), so the hub is proven before the WebSocket starts, and the
+//! handshake inside skips the proofs (sealed connections, [`twr_core::runner`]: the runner
+//! does not check the challenge's proof and answers
+//! [`twr_core::runner::SEALED_AUTH_PROOF`]). A daemon never backs off: it accepts.
 
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context};
 use futures::{SinkExt, StreamExt};
-use tokio::sync::{mpsc, watch};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::WebSocketStream;
 use twr_core::runner::{
     auth_proof, check_auth_proof, hub_errors, new_nonce, valid_nonce, Hello, HubMsg, Inventory,
-    Prover, RunnerMsg, Secret, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    Prover, RunnerMsg, Secret, MAX_FRAME_BYTES, PROTOCOL_VERSION, SEALED_AUTH_PROOF,
 };
 
 use crate::lbox::{LocalBox, LocalBoxOptions};
 use crate::spool::DEFAULT_MAX_BYTES;
 
-/// Runner version reported in the inventory.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Runner version reported in the inventory: twr's whole version, with the build of a
+/// development install (`0.2.0+dev.<commit>`, [`twr_core::version`]).
+pub fn version() -> &'static str {
+    twr_core::version()
+}
+
+/// A connection the hub refused (`error{unauthorized}` or `error{protocol}`), or whose hub
+/// could not prove that it knows the box's token.
+#[derive(Debug)]
+struct Refused(String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 /// Environment variable the CLI reads the token from (removed from the process environment
 /// once read, see [`take_token_env`]).
@@ -107,13 +140,48 @@ pub const O_NONBLOCK: i32 = 0x0004;
 pub const O_NONBLOCK: i32 = 0;
 
 /// Reads the token from `path` (`twr runner --token-file`), trimmed of surrounding whitespace.
-/// Refused when the file is not a regular file, is readable or writable by group or others
-/// (it must be `chmod 600` or stricter), is empty, or is larger than 64 KiB. It is opened
-/// without blocking (`O_NONBLOCK`: a FIFO or a device at the path cannot hold the runner up)
-/// and checked on the opened descriptor, so what is read is what was checked.
+/// Refused when the file is not a regular file, belongs to another user, is readable or
+/// writable by group or others (it must be `chmod 600` or stricter), is empty, or is larger
+/// than 64 KiB. It is opened without blocking (`O_NONBLOCK`: a FIFO or a device at the path
+/// cannot hold the runner up) and checked on the opened descriptor, so what is read is what
+/// was checked.
 pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
+    read_token_file_stamped(path).map(|(token, _)| token)
+}
+
+/// What says that a token file changed ([`dial_loop`] watches it): its device, inode, size,
+/// and modification and change times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(meta: &std::fs::Metadata) -> FileStamp {
+        use std::os::unix::fs::MetadataExt;
+        FileStamp {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            size: meta.size(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// The stamp of the file at `path` now (`None` when it can't be read: missing, say).
+    fn at(path: &std::path::Path) -> Option<FileStamp> {
+        std::fs::metadata(path).ok().map(|m| FileStamp::of(&m))
+    }
+}
+
+/// [`read_token_file`], with the stamp of the file it read (taken on the opened descriptor).
+fn read_token_file_stamped(path: &std::path::Path) -> anyhow::Result<(Secret, FileStamp)> {
     use std::io::Read;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(O_NONBLOCK)
@@ -124,6 +192,14 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
         .with_context(|| format!("reading the token file {}", path.display()))?;
     if !meta.is_file() {
         bail!("the token file {} is not a regular file", path.display());
+    }
+    let me = twr_core::paths::effective_uid();
+    if meta.uid() != me {
+        bail!(
+            "the token file {} belongs to another user (uid {}; the runner runs as uid {me})",
+            path.display(),
+            meta.uid()
+        );
     }
     let mode = meta.permissions().mode() & 0o777;
     if mode & 0o077 != 0 {
@@ -144,18 +220,187 @@ pub fn read_token_file(path: &std::path::Path) -> anyhow::Result<Secret> {
     if token.is_empty() {
         bail!("the token file {} is empty", path.display());
     }
-    Ok(Secret::new(token))
+    Ok((Secret::new(token), FileStamp::of(&meta)))
 }
+
+/// What [`write_token_file`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stored {
+    /// There was no token file: it holds the token now.
+    New,
+    /// The file held this token already: left as it was.
+    Same,
+    /// The file held something else (another token, or a file the runner can't use): it holds
+    /// the token now.
+    Replaced,
+    /// The file held something else, and replacing it was declined: left as it was.
+    Kept,
+}
+
+/// Writes `token` to the token file `path` (`twr runner install-token`), private to this user
+/// (mode 0600). With `make_dir` (the default path, [`twr_core::paths::Paths::runner_token_file`]),
+/// its directory is made private first ([`twr_core::paths::ensure_private_dir`]: 0700, its
+/// owner and the directories above it checked); otherwise the directory must exist. A file
+/// that holds the same token is left as it is ([`Stored::Same`]); one that holds anything else
+/// is replaced only when `replace` says yes (it asks the user), else left ([`Stored::Kept`]).
+///
+/// The check, the question and the write happen under an exclusive `flock` of
+/// `.<file name>.lock` in the same directory, so two of them never interleave: the file
+/// `replace` agreed to replace is the one replaced, and of two that find no file, the second
+/// finds the first's. The token is written to a new file in the same directory (created
+/// exclusively, 0600) and synced; it then takes `path`'s place: linked there when there was no
+/// file (which fails if one appeared, written by hand meanwhile), renamed over it otherwise.
+/// The directory is synced: a runner reading the file sees the old token or the new one, never
+/// part of one. Nothing is left behind on an error. No message holds the token.
+pub fn write_token_file(
+    path: &std::path::Path,
+    token: &Secret,
+    make_dir: bool,
+    replace: &mut dyn FnMut() -> anyhow::Result<bool>,
+) -> anyhow::Result<Stored> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        bail!("{} is not a file path", path.display());
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    };
+    if make_dir {
+        twr_core::paths::ensure_private_dir(dir)?;
+    }
+    let _lock = lock_beside(dir, name)?;
+    let stored = match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Stored::New,
+        Err(e) => return Err(anyhow!("reading {}: {e}", path.display())),
+        Ok(_) => match read_token_file(path) {
+            Ok(old) if old.ct_eq(token.expose()) => return Ok(Stored::Same),
+            _ if replace()? => Stored::Replaced,
+            _ => return Ok(Stored::Kept),
+        },
+    };
+    let nonce = twr_core::runner::new_nonce()?;
+    let tmp = dir.join(format!(".{}.{}.tmp", name.to_string_lossy(), &nonce[..16]));
+    // Removes the temporary file unless it was renamed into place.
+    struct Tmp<'a>(&'a std::path::Path, bool);
+    impl Drop for Tmp<'_> {
+        fn drop(&mut self) {
+            if !self.1 {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
+    let mut guard = Tmp(&tmp, false);
+    f.write_all(token.expose().as_bytes())
+        .and_then(|()| f.write_all(b"\n"))
+        .and_then(|()| f.sync_all())
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    drop(f);
+    if stored == Stored::New {
+        // Never over a file that appeared since it was looked for: linked, not renamed.
+        std::fs::hard_link(&tmp, path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => anyhow!(
+                "{} appeared while the token was written: nothing was stored; run the command \
+                 again",
+                path.display()
+            ),
+            _ => anyhow!("creating {}: {e}", path.display()),
+        })?;
+    } else {
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("replacing {} with {}", path.display(), tmp.display()))?;
+        guard.1 = true;
+    }
+    drop(guard);
+    std::fs::File::open(dir)
+        .and_then(|d| d.sync_all())
+        .with_context(|| format!("syncing {}", dir.display()))?;
+    Ok(stored)
+}
+
+/// An exclusive `flock` of `.<name>.lock` in `dir` (made 0600 when missing), held until it
+/// drops: [`write_token_file`]'s.
+fn lock_beside(dir: &std::path::Path, name: &std::ffi::OsStr) -> anyhow::Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut lock = std::ffi::OsString::from(".");
+    lock.push(name);
+    lock.push(".lock");
+    let lock = dir.join(lock);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock)
+        .with_context(|| format!("opening {}", lock.display()))?;
+    loop {
+        // SAFETY: flock on a descriptor this function owns; no memory is passed.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            return Ok(file);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::EINTR) {
+            return Err(e).with_context(|| format!("locking {}", lock.display()));
+        }
+    }
+}
+
+/// How long a runner's shutdown waits for its runtimes by default
+/// ([`RunnerOptions::shutdown_grace`]).
+pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The longest a runner (an SSH box's daemon) takes to shut down once asked, with the default
+/// grace: its runtimes' grace ([`DEFAULT_SHUTDOWN_GRACE`]), then a repository change still
+/// running (at most [`twr_core::git::GIT_CHANGE_TIMEOUT`]), and a margin: 330 s. A launchd
+/// job's `ExitTimeOut`, the systemd unit's `TimeoutStopSec` in `docs/runners.md`, and how long
+/// a relay waits for a daemon it asked to stop ([`crate::relay::STOP_TIMEOUT`]).
+pub const SHUTDOWN_BUDGET: Duration = Duration::from_secs(
+    DEFAULT_SHUTDOWN_GRACE.as_secs() + twr_core::git::GIT_CHANGE_TIMEOUT.as_secs() + 20,
+);
 
 /// Spooled frames sent per batch between checks for other work.
 const BATCH: usize = 128;
 
+/// What makes a runner an SSH box's daemon (`twr runner --daemon`): where it takes the hub's
+/// connections and whose key opens them. Every path comes from the relay that started it
+/// ([`crate::relay::DaemonPaths`]), as an argument: a daemon started by `systemd-run` has
+/// another environment, so it derives no path from its own.
+#[derive(Debug, Clone)]
+pub struct DaemonOptions {
+    /// The Unix socket it listens on (its directory private, [`crate::daemon`]).
+    pub socket: PathBuf,
+    /// The hub's public key ([`twr_core::sealed::HubKey::public`]): only a connection this
+    /// key opened ([`twr_core::sealed::daemon_side`]) reaches the runner protocol.
+    pub hub_key: [u8; 32],
+    /// The box's machine lock ([`LocalBoxOptions::machine_lock`]): one daemon per hub key and
+    /// box on the machine.
+    pub lock: PathBuf,
+    /// The build the daemon says it runs (its status line, the channel's hello, the
+    /// inventory): its own, [`twr_core::build_id`]. Tests make a daemon "of another build".
+    pub build: Option<String>,
+    /// How it was started, as it tells from its own environment
+    /// ([`crate::daemon::own_launch`]): its inventory's [`Inventory::launch`].
+    pub launch: Option<String>,
+}
+
 /// Everything `twr runner` needs.
 #[derive(Debug, Clone)]
 pub struct RunnerOptions {
-    /// `ws://host:port[/path]` or `wss://...`.
+    /// `ws://host:port[/path]` or `wss://...`. A daemon's ([`RunnerOptions::for_daemon`]) is
+    /// `ssh://<hub id>`, which only names the hub in its logs.
     pub hub_url: String,
-    /// The box's token (`[boxes.<name>] token` on the hub).
+    /// The box's token (`[boxes.<name>] token` on the hub). Empty for a daemon.
     pub token: Secret,
     /// Box name.
     pub box_name: String,
@@ -169,6 +414,10 @@ pub struct RunnerOptions {
     pub backoff_min: Duration,
     /// Largest reconnect delay.
     pub backoff_max: Duration,
+    /// The shortest wait before connecting again after the hub refused the runner, or could
+    /// not prove that it knows the token (default a minute): retrying sooner can't help, since
+    /// one side's twr or token has to change first.
+    pub refused_retry: Duration,
     /// How often to ping the hub.
     pub ping_interval: Duration,
     /// Reconnect when the hub has been silent this long.
@@ -184,6 +433,20 @@ pub struct RunnerOptions {
     /// every event cross the network in clear text. Off: such a URL is refused
     /// ([`RunnerOptions::validate`]).
     pub allow_insecure: bool,
+    /// Run as an SSH box's daemon: accept the hub's sealed connections on a Unix socket
+    /// instead of dialing `hub_url` with the token.
+    pub daemon: Option<DaemonOptions>,
+    /// The file `token` was read from (`--token-file`, or the default one `twr runner
+    /// install-token` writes), when it came from one: after the hub refuses the runner, it is
+    /// read again, and watched while the runner waits, so a new token installed there is used
+    /// at once ([`dial_loop`]).
+    pub token_file: Option<PathBuf>,
+    /// The runner protocol its hello names: [`PROTOCOL_VERSION`]. Tests only: a hub test
+    /// makes a running runner say it speaks an older protocol from its next connection on (a
+    /// hub then drains it, `twr_hub::hub`). A runner that names an older protocol only gets
+    /// less from the hub.
+    #[doc(hidden)]
+    pub hello_protocol: Arc<AtomicU32>,
 }
 
 impl RunnerOptions {
@@ -203,54 +466,100 @@ impl RunnerOptions {
             spool_max_bytes: DEFAULT_MAX_BYTES,
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
+            refused_retry: Duration::from_secs(60),
             ping_interval: Duration::from_secs(20),
             idle_timeout: Duration::from_secs(60),
             welcome_timeout: Duration::from_secs(30),
-            shutdown_grace: Duration::from_secs(10),
+            shutdown_grace: DEFAULT_SHUTDOWN_GRACE,
             ca_file: None,
             allow_insecure: false,
+            daemon: None,
+            token_file: None,
+            hello_protocol: Arc::new(AtomicU32::new(PROTOCOL_VERSION)),
         }
     }
 
-    /// The box options these runner options imply (built-in adapters, and the box's machine
-    /// lock, [`machine_lock_path`]).
+    /// The options of an SSH box's daemon (`twr runner --daemon`) with the defaults: no token,
+    /// `hub_url` `ssh://<hub id>` ([`twr_core::sealed::hub_id`]), for its logs only.
+    pub fn for_daemon(
+        box_name: impl Into<String>,
+        data_dir: impl Into<PathBuf>,
+        daemon: DaemonOptions,
+    ) -> Self {
+        let url = format!("ssh://{}", twr_core::sealed::hub_id(&daemon.hub_key));
+        let mut o = RunnerOptions::new(url, Secret::default(), box_name, data_dir);
+        o.daemon = Some(daemon);
+        o
+    }
+
+    /// The box options these runner options imply (built-in adapters, the box's machine
+    /// lock: [`machine_lock_path`], or a daemon's [`DaemonOptions::lock`], which its relay
+    /// resolved; the user's login shell asked for its `PATH` and the agents probed:
+    /// [`crate::BoxEnv::user`]).
     pub fn box_options(&self) -> LocalBoxOptions {
         let mut o = LocalBoxOptions::new(&self.data_dir, &self.box_name);
-        o.machine_lock = machine_lock_path(&self.hub_url, &self.box_name);
+        o.machine_lock = match &self.daemon {
+            Some(d) => Some(d.lock.clone()),
+            None => machine_lock_path(&self.hub_url, &self.box_name),
+        };
         o.spool_max_bytes = self.spool_max_bytes;
         if let Some(w) = &self.worktrees_dir {
             o.worktrees = w.clone();
         }
+        o.env = crate::BoxEnv::user();
         o
     }
 
     /// Checks the options: the box name, a token of at least
     /// [`twr_core::runner::TOKEN_MIN_LEN`] characters, and a `wss://` hub URL or a `ws://` one
     /// to a loopback host ([`is_loopback_host`]; any host with
-    /// [`RunnerOptions::allow_insecure`]).
+    /// [`RunnerOptions::allow_insecure`]). A daemon has neither token nor URL: only its box
+    /// name is checked.
     pub fn validate(&self) -> anyhow::Result<()> {
         validate_box_name(&self.box_name)?;
+        if self.daemon.is_some() {
+            return Ok(());
+        }
         if self.token.is_empty() {
             bail!("the runner token is empty");
         }
         twr_core::runner::check_token_len(self.token.expose(), "the runner token")
             .map_err(anyhow::Error::msg)?;
-        let lower = self.hub_url.to_ascii_lowercase();
-        if lower.starts_with("ws://") {
-            let host = url_host(&self.hub_url)?;
-            if !self.allow_insecure && !is_loopback_host(&host) {
-                bail!(
-                    "refusing plain ws:// to {host}: the box token and every event would cross the \
-                     network in clear text. Use wss:// (with --ca <pem> for a private CA), an SSH \
-                     tunnel to a loopback port (--hub ws://127.0.0.1:<port>), or --allow-insecure \
-                     on a network you trust"
-                );
-            }
-        } else if !lower.starts_with("wss://") {
-            bail!("the hub URL must start with ws:// or wss://");
-        }
-        Ok(())
+        check_hub_url(&self.hub_url, self.allow_insecure)
     }
+}
+
+/// Checks a runner's hub URL: `wss://`, or `ws://` to a loopback host ([`is_loopback_host`];
+/// any host when `allow_insecure`, `--allow-insecure`).
+pub fn check_hub_url(url: &str, allow_insecure: bool) -> anyhow::Result<()> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("ws://") {
+        let host = url_host(url)?;
+        if !allow_insecure && !is_loopback_host(&host) {
+            bail!(
+                "refusing plain ws:// to {host}: the box token and every event would cross the \
+                 network in clear text. Use wss:// (with --ca <pem> for a private CA), an SSH \
+                 tunnel to a loopback port (--hub ws://127.0.0.1:<port>), or --allow-insecure \
+                 on a network you trust"
+            );
+        }
+    } else if !lower.starts_with("wss://") {
+        bail!("the hub URL must start with ws:// or wss://");
+    }
+    Ok(())
+}
+
+/// Checks a hub URL that twr writes into commands and services for you (`twr runner
+/// install-token --hub`, `twr box add --dial-in --hub`): [`check_hub_url`] without
+/// `--allow-insecure`, and a URL that parses, has a host, and holds no space or control
+/// character.
+pub fn check_guided_hub_url(url: &str) -> anyhow::Result<()> {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("the hub URL {url:?} holds a space or a control character");
+    }
+    check_hub_url(url, false)?;
+    url_host(url)?;
+    Ok(())
 }
 
 /// The lock file of box `box_name` of the hub at `hub_url` on this machine
@@ -269,7 +578,7 @@ pub fn machine_lock_path(hub_url: &str, box_name: &str) -> Option<PathBuf> {
 }
 
 /// [`machine_lock_path`] with the environment read through `env`.
-fn machine_lock_path_in(
+pub(crate) fn machine_lock_path_in(
     hub_url: &str,
     box_name: &str,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
@@ -323,23 +632,9 @@ pub fn is_loopback_host(host: &str) -> bool {
         .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// Box names become file names (`runner-<box>.db`): `[A-Za-z0-9._-]`, not starting with `.`,
-/// at most 64 bytes.
-pub fn validate_box_name(name: &str) -> anyhow::Result<()> {
-    let ok = !name.is_empty()
-        && name.len() <= 64
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "invalid box name {name:?}: use letters, digits, '.', '_' or '-' (not starting with '.')"
-        ))
-    }
-}
+/// Box names become file names (`runner-<box>.db`): [`twr_core::runner::validate_box_name`],
+/// which the hub's config checks share.
+pub use twr_core::runner::validate_box_name;
 
 /// The TLS configuration for a hub whose certificate chains to the CA(s) in `ca_file` (and
 /// nothing else).
@@ -374,45 +669,213 @@ pub fn open_box(opts: &RunnerOptions) -> anyhow::Result<LocalBox> {
     LocalBox::open(opts.box_options())
 }
 
-/// Runs the runner until SIGINT or SIGTERM.
-pub async fn run(opts: RunnerOptions) -> anyhow::Result<()> {
-    let lbox = open_box(&opts)?;
-    run_with(opts, lbox, shutdown_signal()).await
-}
-
-/// Resolves on SIGINT or SIGTERM.
-pub async fn shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
-    let mut term = match signal(SignalKind::terminate()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "cannot listen for SIGTERM");
-            let _ = tokio::signal::ctrl_c().await;
-            return;
-        }
-    };
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = term.recv() => {}
+/// Runs the runner until SIGINT or SIGTERM, which `shutdown` has listened for since it was
+/// made, first thing in the process ([`Shutdown::install`]): one that came before the box
+/// opens, or while it opens (which can take seconds: it waits for the box's lock and ends what
+/// a predecessor left running), stops the runner before it binds, probes or connects anything,
+/// exit 0 ([`run_with`]), even when the opening failed meanwhile (its error is not reported:
+/// the runner was asked to stop).
+pub async fn run(opts: RunnerOptions, mut shutdown: Shutdown) -> anyhow::Result<()> {
+    if shutdown.fired() {
+        stopped_before_start();
+        return Ok(());
     }
-    tracing::info!("shutting down");
+    test_start_hold(&mut shutdown);
+    let opened = open_box(&opts);
+    if shutdown.fired() {
+        stopped_before_start();
+        return Ok(());
+    }
+    run_with(opts, opened?, shutdown.wait()).await
 }
 
-/// Runs the runner on `lbox` until `shutdown` resolves, then shuts down gracefully.
+/// Test only (debug builds only, ignored by a release build): a file path. [`run`] writes it
+/// as the box starts opening, then holds the opening (blocking the thread, as a slow opening
+/// does) until a signal came (at most [`TEST_START_HOLD`]), so a test can send SIGTERM while
+/// the runner starts and nothing in the runtime delivers it meanwhile.
+pub const TEST_START_HOLD_ENV: &str = "TWR_TEST_RUNNER_START_HOLD";
+
+/// The longest [`TEST_START_HOLD_ENV`] holds the box's opening.
+const TEST_START_HOLD: Duration = Duration::from_secs(10);
+
+/// [`TEST_START_HOLD_ENV`]'s hold, in a debug build where it is set: blocks the thread.
+fn test_start_hold(shutdown: &mut Shutdown) {
+    let Some(marker) = std::env::var_os(TEST_START_HOLD_ENV).filter(|_| cfg!(debug_assertions))
+    else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&marker, b"") {
+        tracing::warn!(error = %e, "cannot write the start hold's marker");
+        return;
+    }
+    let until = Instant::now() + TEST_START_HOLD;
+    while !shutdown.fired() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Says the runner stopped on a signal that came while it started.
+fn stopped_before_start() {
+    tracing::info!("stopped before it started: asked to stop while starting");
+}
+
+/// SIGTERM and SIGINT, listened for from the moment it is made ([`Shutdown::install`]): one
+/// that comes before anything waits for it is kept, not lost, and does not kill the process
+/// (the default action) either. Make it first thing, before anything slow.
+///
+/// Each signal is listened for twice: by a Tokio stream (what [`Shutdown::wait`] awaits), and
+/// by a latch set in the signal handler itself (`signal_hook_registry`, which Tokio's own
+/// handler goes through too). The stream only yields once the runtime has delivered the
+/// signal, which it does not while this thread is busy with something synchronous (opening
+/// the box) on a current-thread runtime, or before its driver next runs on another; the latch
+/// is set when the signal arrives, whatever the runtime does, so [`Shutdown::fired`] sees it
+/// then.
+pub struct Shutdown {
+    term: Option<tokio::signal::unix::Signal>,
+    int: Option<tokio::signal::unix::Signal>,
+    /// Set by the signal handler (SIGTERM or SIGINT came), or by [`Shutdown::fired`] when a
+    /// stream already yielded.
+    latch: Arc<AtomicBool>,
+    /// The latch's handler actions, removed when this is dropped.
+    actions: Vec<signal_hook_registry::SigId>,
+}
+
+impl Shutdown {
+    /// Listens for SIGTERM and SIGINT from now on (both at once). In a Tokio runtime. A
+    /// signal it cannot listen for is logged and keeps its default action.
+    pub fn install() -> Shutdown {
+        use tokio::signal::unix::{signal, SignalKind};
+        let latch = Arc::new(AtomicBool::new(false));
+        let mut actions = Vec::new();
+        let mut listen = |kind: SignalKind, signo: libc::c_int, name: &str| {
+            let stream = match signal(kind) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot listen for {name}");
+                    return None;
+                }
+            };
+            // Only alongside a stream: Tokio's handler already replaced the default action,
+            // and `wait` can await the signal. Should the latch fail, `fired` asks the stream.
+            let set = Arc::clone(&latch);
+            // SAFETY: the action runs in the signal handler, where only async-signal-safe
+            // operations are allowed: it only stores `true` to an `AtomicBool` (lock-free on
+            // every target twr builds for), allocating, locking and dropping nothing (the
+            // `Arc` it holds is dropped when the action is unregistered, outside the handler).
+            // SIGTERM and SIGINT are not among the signals the registry refuses.
+            match unsafe { signal_hook_registry::register(signo, move || set.store(true, SeqCst)) }
+            {
+                Ok(id) => actions.push(id),
+                Err(e) => tracing::warn!(error = %e, "cannot latch {name} in its handler"),
+            }
+            Some(stream)
+        };
+        let term = listen(SignalKind::terminate(), libc::SIGTERM, "SIGTERM");
+        let int = listen(SignalKind::interrupt(), libc::SIGINT, "SIGINT");
+        Shutdown {
+            term,
+            int,
+            latch,
+            actions,
+        }
+    }
+
+    /// Whether SIGTERM or SIGINT came since [`Shutdown::install`], without waiting: the
+    /// latch, which the signal handler set (or, should the latch not be registered, a stream
+    /// that already yielded).
+    pub fn fired(&mut self) -> bool {
+        use futures::FutureExt;
+        if !self.latch.load(SeqCst)
+            && [&mut self.term, &mut self.int]
+                .into_iter()
+                .flatten()
+                .any(|s| s.recv().now_or_never().is_some())
+        {
+            self.latch.store(true, SeqCst);
+        }
+        self.latch.load(SeqCst)
+    }
+
+    /// Resolves once SIGTERM or SIGINT came since [`Shutdown::install`]: at once when the
+    /// latch is set ([`Shutdown::fired`]), else when a stream yields (a signal after the
+    /// check: Tokio's handler saw it too).
+    pub async fn wait(mut self) {
+        async fn recv(s: &mut Option<tokio::signal::unix::Signal>) {
+            match s {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending().await,
+            }
+        }
+        if !self.fired() {
+            tokio::select! {
+                () = recv(&mut self.term) => {}
+                () = recv(&mut self.int) => {}
+            }
+        }
+        tracing::info!("shutting down");
+    }
+}
+
+impl Drop for Shutdown {
+    fn drop(&mut self) {
+        for id in self.actions.drain(..) {
+            signal_hook_registry::unregister(id);
+        }
+    }
+}
+
+/// Resolves on SIGINT or SIGTERM: [`Shutdown::install`], then [`Shutdown::wait`], when first
+/// polled (a signal before that has its default action: make a [`Shutdown`] first thing
+/// instead where that matters).
+pub async fn shutdown_signal() {
+    Shutdown::install().wait().await
+}
+
+/// Runs the runner on `lbox` until `shutdown` resolves, then shuts down gracefully. A daemon
+/// binds its socket first (an error if it cannot: [`crate::daemon`]), and also shuts down so
+/// when a `stop` request comes on it. When `shutdown` has already resolved (a signal while the
+/// runner started: [`Shutdown::wait`]), it stops at once, exit 0, having bound, probed and
+/// connected nothing.
 pub async fn run_with(
     opts: RunnerOptions,
     lbox: LocalBox,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
+    use futures::FutureExt;
+    let mut shutdown = std::pin::pin!(shutdown);
+    if shutdown.as_mut().now_or_never().is_some() {
+        stopped_before_start();
+        return Ok(());
+    }
     opts.validate()?;
     // wss: rustls with ring (no system OpenSSL). Fails only when already installed.
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let socket = match &opts.daemon {
+        Some(d) => Some(crate::daemon::DaemonSocket::bind(&d.socket).await?),
+        None => None,
+    };
+    // The login shell's PATH and the agents, in the background: never before the connection.
+    let environment = tokio::spawn({
+        let lbox = lbox.clone();
+        async move { lbox.environment_loop().await }
+    });
+    let _environment = AbortOnDrop(environment);
     let (stop_tx, stop_rx) = watch::channel(false);
-    let conn = connect_loop(&opts, &lbox, stop_rx);
+    // A daemon's `stop` request (it stores its wakeup: none is lost).
+    let asked = Notify::new();
+    let conn = connect_loop(&opts, &lbox, socket, stop_rx, &asked);
     tokio::pin!(conn);
+    let requested = async {
+        tokio::select! {
+            _ = shutdown => {}
+            () = asked.notified() => tracing::info!("asked to stop: shutting down"),
+        }
+    };
     let mut shutdown_at = None;
     tokio::select! {
-        _ = shutdown => {
+        () = requested => {
             shutdown_at = Some(Instant::now());
             let _ = stop_tx.send(true);
             conn.as_mut().await;
@@ -424,14 +887,19 @@ pub async fn run_with(
         opts.shutdown_grace.saturating_sub(t.elapsed())
     });
     lbox.shutdown(left.max(Duration::from_millis(100))).await;
-    // A repository change still running (its connection is gone) runs on to its end first,
-    // at most for as long as a git change may run before it is killed.
-    if !lbox.git_changes_done(Duration::ZERO).await {
+    // A repository change still running (its connection is gone; the connection's reader has
+    // ended, so none begins any more) runs on to its end first, received but not started yet
+    // included, at most for as long as a git change may run before it is killed.
+    if lbox.changes_running() > 0 || !lbox.git_changes_done(Duration::ZERO).await {
         tracing::info!("waiting for the repository changes in progress before stopping");
-        if !lbox
-            .git_changes_done(twr_core::git::GIT_CHANGE_TIMEOUT)
-            .await
-        {
+        let limit = twr_core::git::GIT_CHANGE_TIMEOUT;
+        let done = tokio::time::timeout(limit, async {
+            lbox.changes_done().await;
+            lbox.git_changes_done(limit).await
+        })
+        .await
+        .unwrap_or(false);
+        if !done {
             tracing::warn!("stopping with a repository change still running; what it was changing is left part way");
         }
     }
@@ -440,6 +908,15 @@ pub async fn run_with(
     }
     tracing::info!("runner stopped");
     Ok(())
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// While an outage is younger than this, reconnects are at most [`SHORT_OUTAGE_CAP`] apart.
@@ -525,7 +1002,7 @@ impl Backoff {
 }
 
 /// Resolves once `stop` is set (never, if its sender is gone without setting it).
-async fn stopped(stop: &mut watch::Receiver<bool>) {
+pub(crate) async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
         if *stop.borrow_and_update() {
             return;
@@ -536,7 +1013,44 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Receiver<bool>) {
+/// The WebSocket limits of a connection to the hub, either transport. What this side buffers
+/// to send is bounded too: a peer that pings without reading (one that is not the hub, before
+/// the handshake failed) cannot grow it.
+pub(crate) fn ws_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME_BYTES))
+        .max_frame_size(Some(MAX_FRAME_BYTES))
+        .max_write_buffer_size(MAX_FRAME_BYTES + (1 << 20))
+}
+
+/// Serves the hub until `stop` is set or the box fails: a daemon's connections come from its
+/// `socket` ([`crate::daemon::accept_loop`], which tells `asked` of a `stop` request), a
+/// runner's from dialing the hub ([`dial_loop`]).
+async fn connect_loop(
+    opts: &RunnerOptions,
+    lbox: &LocalBox,
+    socket: Option<crate::daemon::DaemonSocket>,
+    stop: watch::Receiver<bool>,
+    asked: &Notify,
+) {
+    match (socket, &opts.daemon) {
+        (Some(socket), Some(daemon)) => {
+            crate::daemon::accept_loop(opts, daemon, socket, lbox, stop, asked).await
+        }
+        _ => dial_loop(opts, lbox, stop).await,
+    }
+}
+
+/// How often a refused runner looks at its token file while it waits ([`wait_for_token`]).
+const TOKEN_POLL: Duration = Duration::from_secs(2);
+
+/// The runner's connection loop: dials the hub, serves it, and dials again with backoff (see
+/// the module docs). After a refusal, a token from a file ([`RunnerOptions::token_file`]) is
+/// read again, and the file watched while the runner waits ([`wait_for_token`]): a new token
+/// there is used at once.
+async fn dial_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Receiver<bool>) {
+    // The options with the token in use, which a new token file replaces.
+    let mut live = opts.clone();
     let mut backoff = Backoff::new(opts.backoff_min, opts.backoff_max);
     let connector = match opts.ca_file.as_deref().map(tls_connector).transpose() {
         Ok(c) => c,
@@ -545,7 +1059,7 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
             return;
         }
     };
-    let mut epoch_hint = None;
+    let epoch_hint = std::sync::Mutex::new(None);
     let mut fatal = lbox.fatal_watch();
     loop {
         if *stop.borrow() || lbox.fatal_error().is_some() {
@@ -563,27 +1077,30 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
                 () = stopped(&mut stop) => return,
             }
         }
-        // What this side buffers to send is bounded too: a peer that pings without reading
-        // (one that is not the hub, before the handshake failed) cannot grow it.
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_FRAME_BYTES))
-            .max_frame_size(Some(MAX_FRAME_BYTES))
-            .max_write_buffer_size(MAX_FRAME_BYTES + (1 << 20));
         let attempt = tokio::select! {
             r = tokio::time::timeout(
                 opts.welcome_timeout,
                 tokio_tungstenite::connect_async_tls_with_config(
                     opts.hub_url.as_str(),
-                    Some(config),
+                    Some(ws_config()),
                     true,
                     connector.clone(),
                 ),
             ) => r,
             () = stopped(&mut stop) => return,
         };
+        let mut refused = false;
         match attempt {
             Ok(Ok((ws, _resp))) => {
-                let out = serve(ws, lbox, opts, &mut epoch_hint, stop.clone()).await;
+                let out = serve(
+                    ws,
+                    lbox,
+                    &live,
+                    &epoch_hint,
+                    stop.clone(),
+                    std::future::pending(),
+                )
+                .await;
                 if out.welcomed {
                     backoff.reset();
                 }
@@ -593,7 +1110,10 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
                 match out.result {
                     Ok(true) => return,
                     Ok(false) => tracing::warn!("hub connection closed"),
-                    Err(e) => tracing::warn!(error = %format!("{e:#}"), "hub connection lost"),
+                    Err(e) => {
+                        refused = e.downcast_ref::<Refused>().is_some();
+                        tracing::warn!(error = %format!("{e:#}"), "hub connection lost")
+                    }
                 }
             }
             Ok(Err(e)) => {
@@ -601,31 +1121,126 @@ async fn connect_loop(opts: &RunnerOptions, lbox: &LocalBox, mut stop: watch::Re
             }
             Err(_) => tracing::warn!(hub = %opts.hub_url, "connecting to the hub timed out"),
         }
-        let delay = backoff.next();
+        let delay = if refused {
+            backoff.next().max(opts.refused_retry)
+        } else {
+            backoff.next()
+        };
         tracing::info!(retry_in_ms = delay.as_millis() as u64, "reconnecting");
+        let wait = async {
+            match opts.token_file.as_deref().filter(|_| refused) {
+                Some(path) => wait_for_token(path, &mut live.token, delay).await,
+                None => tokio::time::sleep(delay).await,
+            }
+        };
         tokio::select! {
-            () = tokio::time::sleep(delay) => {}
+            () = wait => {}
             () = stopped(&mut stop) => return,
             _ = fatal.wait_for(Option::is_some) => return,
         }
     }
 }
 
-type Ws =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
-
-struct Served {
-    welcomed: bool,
-    /// `Ok(true)`: shut down; `Ok(false)`: the hub closed the connection.
-    result: anyhow::Result<bool>,
+/// A refused runner's wait of `delay` before it connects again, cut short when its token file
+/// `path` holds a new token: the file is read at once (it may have changed while the runner
+/// was connected), then again whenever its [`FileStamp`] changes, looked at every
+/// [`TOKEN_POLL`]. A new token that passes [`read_token_file`]'s checks and is long enough
+/// replaces `token`, and the wait ends. A file that fails them is logged (once per change) and
+/// the old token kept. Neither token is ever logged.
+async fn wait_for_token(path: &std::path::Path, token: &mut Secret, delay: Duration) {
+    let until = tokio::time::Instant::now() + delay;
+    // The stamp of the file as last read (`None`: read it now).
+    let mut seen: Option<Option<FileStamp>> = None;
+    loop {
+        let now = FileStamp::at(path);
+        if seen != Some(now) {
+            seen = Some(now);
+            match read_token_file_stamped(path) {
+                Ok((new, stamp)) => {
+                    seen = Some(Some(stamp));
+                    if !new.ct_eq(token.expose()) {
+                        match twr_core::runner::check_token_len(new.expose(), "the runner token") {
+                            Err(e) => tracing::warn!(
+                                file = %path.display(),
+                                "the token file changed, but its token can't be used: {e}"
+                            ),
+                            Ok(warning) => {
+                                if let Some(w) = warning {
+                                    tracing::warn!("{w}");
+                                }
+                                tracing::info!(
+                                    file = %path.display(),
+                                    "the token file changed: connecting with the new token"
+                                );
+                                *token = new;
+                                return;
+                            }
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "cannot read the token file again: keeping the token in use"
+                ),
+            }
+        }
+        let left = until.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        tokio::time::sleep(left.min(TOKEN_POLL)).await;
+    }
 }
 
-/// Aborts the reader task when the connection ends.
-struct AbortOnDrop(tokio::task::JoinHandle<anyhow::Result<()>>);
+/// What a connection's WebSocket runs over: TCP (and TLS) when the runner dials, a sealed
+/// stream over the daemon's socket ([`twr_core::sealed::SealedStream`]).
+pub(crate) trait HubStream: AsyncRead + AsyncWrite + Unpin + Send + 'static {}
 
-impl Drop for AbortOnDrop {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HubStream for S {}
+
+/// The outcome of one connection ([`serve`]).
+pub(crate) struct Served {
+    /// The hub welcomed it.
+    pub(crate) welcomed: bool,
+    /// `Ok(true)`: shut down; `Ok(false)`: the hub closed the connection.
+    pub(crate) result: anyhow::Result<bool>,
+}
+
+/// A connection's reader task ([`read_loop`]). [`serve`] joins it before it returns
+/// ([`Reader::join`]): aborting a task only asks it to stop at its next await, and a reader in
+/// the middle of taking a command (on another worker thread) would otherwise count or start
+/// it after the connection is over, where the next connection's wait for repository changes
+/// in progress cannot see it.
+struct Reader {
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Its outcome was taken ([`Reader::outcome`]): the task is over.
+    done: bool,
+}
+
+impl Reader {
+    /// Waits for the reader to end by itself: the connection's outcome. Cancel safe.
+    async fn outcome(&mut self) -> anyhow::Result<bool> {
+        let r = (&mut self.task).await;
+        self.done = true;
+        reader_result(r)
+    }
+
+    /// Stops the reader and waits until it no longer runs.
+    async fn join(mut self) {
+        if !self.done {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for Reader {
+    /// A connection dropped part way (the runner going away) at least asks its reader to stop.
     fn drop(&mut self) {
-        self.0.abort();
+        if !self.done {
+            self.task.abort();
+        }
     }
 }
 
@@ -633,39 +1248,56 @@ fn text(msg: &RunnerMsg) -> anyhow::Result<Message> {
     Ok(Message::Text(serde_json::to_string(msg)?.into()))
 }
 
-async fn serve(
-    ws: Ws,
+/// Serves one connection to the hub: the handshake, the replay of the spool, then live
+/// frames and commands, until it ends, `stop` has drained it, the box failed, or `replaced`
+/// completes (a daemon's newer connection replaces this one: an error). Whichever way it
+/// ends, its reader task has ended when this returns ([`Reader::join`]), so no command of
+/// this connection begins afterwards. `epoch_hint` is the epoch of the last welcome, which
+/// the inventory reports (shared, not borrowed mutably: a daemon ends a session it replaces
+/// part way).
+pub(crate) async fn serve<S: HubStream>(
+    ws: WebSocketStream<S>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
-    epoch_hint: &mut Option<u64>,
+    epoch_hint: &std::sync::Mutex<Option<u64>>,
     stop: watch::Receiver<bool>,
+    replaced: impl std::future::Future<Output = ()> + Send,
 ) -> Served {
     let mut welcomed = false;
-    let result = serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed).await;
+    let mut reader = None;
+    let result = tokio::select! {
+        r = serve_inner(ws, lbox, opts, epoch_hint, stop, &mut welcomed, &mut reader) => r,
+        () = replaced => Err(anyhow!("a newer connection from the hub replaced this one")),
+    };
+    if let Some(r) = reader {
+        r.join().await;
+    }
     Served { welcomed, result }
 }
 
-async fn serve_inner(
-    ws: Ws,
+async fn serve_inner<S: HubStream>(
+    ws: WebSocketStream<S>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
-    epoch_hint: &mut Option<u64>,
+    epoch_hint: &std::sync::Mutex<Option<u64>>,
     mut stop: watch::Receiver<bool>,
     welcomed: &mut bool,
+    reader_slot: &mut Option<Reader>,
 ) -> anyhow::Result<bool> {
     let (mut sink, mut stream) = ws.split();
     let spool = lbox.spool().clone();
     let io_timeout = opts.idle_timeout;
 
+    let hint = *epoch_hint.lock().unwrap_or_else(|e| e.into_inner());
     let (epoch, watermarks) = tokio::time::timeout(
         opts.welcome_timeout,
-        handshake(&mut sink, &mut stream, lbox, opts, *epoch_hint),
+        handshake(&mut sink, &mut stream, lbox, opts, hint),
     )
     .await
     .map_err(|_| anyhow!("no welcome from the hub within {:?}", opts.welcome_timeout))??;
     spool.apply_watermarks(&watermarks)?;
     *welcomed = true;
-    *epoch_hint = Some(epoch);
+    *epoch_hint.lock().unwrap_or_else(|e| e.into_inner()) = Some(epoch);
     tracing::info!(
         epoch,
         box_name = %opts.box_name,
@@ -675,12 +1307,15 @@ async fn serve_inner(
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<RunnerMsg>();
     let last_rx = Arc::new(Mutex::new(Instant::now()));
-    let mut reader = AbortOnDrop(tokio::spawn(read_loop(
-        stream,
-        lbox.clone(),
-        out_tx.clone(),
-        last_rx.clone(),
-    )));
+    let reader = reader_slot.insert(Reader {
+        task: tokio::spawn(read_loop(
+            stream,
+            lbox.clone(),
+            out_tx.clone(),
+            last_rx.clone(),
+        )),
+        done: false,
+    });
 
     let mut cursor = 0i64;
     let mut synced = false;
@@ -719,8 +1354,8 @@ async fn serve_inner(
             while let Ok(m) = out_rx.try_recv() {
                 send!(text(&m)?);
             }
-            if reader.0.is_finished() {
-                return reader_end(&mut reader).await;
+            if reader.task.is_finished() {
+                return reader.outcome().await;
             }
             continue;
         }
@@ -752,7 +1387,7 @@ async fn serve_inner(
                     draining = Some(tokio::time::Instant::now() + opts.shutdown_grace);
                 }
             }
-            r = &mut reader.0 => return reader_result(r),
+            r = reader.outcome() => return r,
             _ = tick.tick() => {
                 let silent = last_rx.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
                 if silent > opts.idle_timeout {
@@ -767,7 +1402,9 @@ async fn serve_inner(
 }
 
 /// The next text message from the hub before the welcome (other frames skipped).
-async fn next_hub_msg(stream: &mut futures::stream::SplitStream<Ws>) -> anyhow::Result<HubMsg> {
+async fn next_hub_msg<S: HubStream>(
+    stream: &mut futures::stream::SplitStream<WebSocketStream<S>>,
+) -> anyhow::Result<HubMsg> {
     loop {
         let msg = match stream.next().await {
             Some(m) => m.context("reading from the hub")?,
@@ -786,21 +1423,38 @@ async fn next_hub_msg(stream: &mut futures::stream::SplitStream<Ws>) -> anyhow::
 /// The error for a refusal `code` / `message` from the hub during the handshake (logged too
 /// when it is about the box or token, the one thing the user has to fix here).
 fn refused(opts: &RunnerOptions, code: &str, message: &str) -> anyhow::Error {
-    if code == hub_errors::UNAUTHORIZED {
+    if code == hub_errors::UNAUTHORIZED && opts.daemon.is_some() {
+        tracing::error!(
+            box_name = %opts.box_name,
+            "the hub rejected this box daemon's box name: is the box an SSH box of that hub \
+             (`transport = \"ssh\"`)?"
+        );
+    } else if code == hub_errors::UNAUTHORIZED {
         tracing::error!(
             box_name = %opts.box_name,
             "the hub rejected this runner's box name or token (a hub older than this runner \
              answers so too: both must run the same twr version)"
         );
+    } else if code == hub_errors::PROTOCOL {
+        tracing::error!(
+            box_name = %opts.box_name,
+            version = version(),
+            "the hub refused this runner's protocol ({message}): run the same twr version on \
+             the hub and here, then restart this runner"
+        );
     }
-    anyhow!("the hub refused the runner: {code}: {message}")
+    anyhow::Error::new(Refused(format!(
+        "the hub refused the runner: {code}: {message}"
+    )))
 }
 
 /// The handshake (see the module docs) up to the welcome: `(epoch, watermarks)`. Nothing but
-/// the hello goes out before the hub has proved that it knows the box's token.
-async fn handshake(
-    sink: &mut futures::stream::SplitSink<Ws, Message>,
-    stream: &mut futures::stream::SplitStream<Ws>,
+/// the hello goes out before the hub has proved that it knows the box's token. On a daemon's
+/// sealed connection the channel already proved the hub: the challenge's proof is not
+/// checked, and the runner's is [`SEALED_AUTH_PROOF`].
+async fn handshake<S: HubStream>(
+    sink: &mut futures::stream::SplitSink<WebSocketStream<S>, Message>,
+    stream: &mut futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: &LocalBox,
     opts: &RunnerOptions,
     epoch_hint: Option<u64>,
@@ -808,7 +1462,7 @@ async fn handshake(
     let nonce = new_nonce()?;
     let hello = RunnerMsg::Hello(Hello {
         box_name: opts.box_name.clone(),
-        protocol: PROTOCOL_VERSION,
+        protocol: opts.hello_protocol.load(SeqCst),
         nonce: nonce.clone(),
     });
     sink.send(text(&hello)?).await.context("sending hello")?;
@@ -820,16 +1474,18 @@ async fn handshake(
             hub_msg_type(&other)
         ),
     };
-    let proven = valid_nonce(&hub_nonce)
-        && hub_nonce != nonce
-        && check_auth_proof(
-            &opts.token,
-            Prover::Hub,
-            &opts.box_name,
-            &nonce,
-            &hub_nonce,
-            &proof,
-        );
+    let sealed = opts.daemon.is_some();
+    let proven = sealed
+        || (valid_nonce(&hub_nonce)
+            && hub_nonce != nonce
+            && check_auth_proof(
+                &opts.token,
+                Prover::Hub,
+                &opts.box_name,
+                &nonce,
+                &hub_nonce,
+                &proof,
+            ));
     if !proven {
         tracing::error!(
             box_name = %opts.box_name,
@@ -840,15 +1496,21 @@ async fn handshake(
              leaves it to anyone: use -o ExitOnForwardFailure=yes). Nothing was sent to it",
             opts.box_name
         );
-        bail!("the hub did not prove that it knows the box's token");
+        return Err(anyhow::Error::new(Refused(
+            "the hub did not prove that it knows the box's token".into(),
+        )));
     }
-    let mine = auth_proof(
-        &opts.token,
-        Prover::Runner,
-        &opts.box_name,
-        &nonce,
-        &hub_nonce,
-    );
+    let mine = if sealed {
+        SEALED_AUTH_PROOF.to_string()
+    } else {
+        auth_proof(
+            &opts.token,
+            Prover::Runner,
+            &opts.box_name,
+            &nonce,
+            &hub_nonce,
+        )
+    };
     sink.send(text(&RunnerMsg::Auth { proof: mine })?)
         .await
         .context("sending the proof")?;
@@ -861,13 +1523,20 @@ async fn handshake(
         ),
     }
     let inventory = RunnerMsg::Inventory(Inventory {
-        version: VERSION.to_string(),
+        version: version().to_string(),
         epoch_hint,
         running: lbox.running(),
         in_flight: lbox.in_flight(),
         acks_needed: lbox.spool().pending()?,
         runtimes: lbox.runtimes().to_vec(),
         worktrees: lbox.worktrees().to_path_buf(),
+        build: match &opts.daemon {
+            Some(d) => d.build.clone(),
+            None => twr_core::build_id().map(str::to_string),
+        },
+        // What is known: none before the first probe ended (`Op::Agents` asks later).
+        agents: lbox.agents(),
+        launch: opts.daemon.as_ref().and_then(|d| d.launch.clone()),
     });
     sink.send(text(&inventory)?)
         .await
@@ -890,11 +1559,6 @@ fn hub_msg_type(m: &HubMsg) -> String {
         .unwrap_or_else(|| "a message".to_string())
 }
 
-/// The outcome of a connection whose reader has finished.
-async fn reader_end(reader: &mut AbortOnDrop) -> anyhow::Result<bool> {
-    reader_result((&mut reader.0).await)
-}
-
 fn reader_result(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyhow::Result<bool> {
     match r {
         Ok(Ok(())) => Ok(false),
@@ -905,8 +1569,8 @@ fn reader_result(r: Result<anyhow::Result<()>, tokio::task::JoinError>) -> anyho
 
 /// Reads hub messages: applies acks, answers pings and runs commands (session commands in
 /// arrival order, the others concurrently).
-async fn read_loop(
-    mut stream: futures::stream::SplitStream<Ws>,
+async fn read_loop<S: HubStream>(
+    mut stream: futures::stream::SplitStream<WebSocketStream<S>>,
     lbox: LocalBox,
     out: mpsc::UnboundedSender<RunnerMsg>,
     last_rx: Arc<Mutex<Instant>>,
@@ -938,7 +1602,11 @@ async fn read_loop(
                     let r = lbox.handle_cmd(&cmd_id, op).await;
                     let _ = out.send(RunnerMsg::CmdResult(r));
                 } else {
-                    // Counted from its arrival: the next hello waits for it.
+                    // Counted from its arrival: the next hello waits for it (the next
+                    // connection's, once this reader has ended: `Reader::join`).
+                    if op.changes_repository() {
+                        lbox.change_received();
+                    }
                     let change = op.changes_repository().then(|| lbox.begin_change());
                     let lbox = lbox.clone();
                     let out = out.clone();
@@ -1140,6 +1808,41 @@ mod tests {
         }
     }
 
+    /// The URL rule on its own (`twr runner install-token`, `twr box add --dial-in`), and its
+    /// stricter guided form: no `--allow-insecure`, nothing that doesn't parse, no space or
+    /// control character.
+    #[test]
+    fn guided_hub_urls_are_checked() {
+        check_hub_url("ws://127.0.0.1:7878", false).unwrap();
+        check_hub_url("ws://10.0.0.5:7878", true).unwrap();
+        let e = check_hub_url("ws://10.0.0.5:7878", false).unwrap_err();
+        assert!(
+            e.to_string()
+                .starts_with("refusing plain ws:// to 10.0.0.5: "),
+            "{e}"
+        );
+        assert!(check_hub_url("http://hub", true).is_err());
+        for url in [
+            "ws://127.0.0.1:7878",
+            "ws://[::1]:7878/x",
+            "wss://hub.tail1234.ts.net:7878",
+        ] {
+            check_guided_hub_url(url).unwrap_or_else(|e| panic!("{url}: {e:#}"));
+        }
+        for url in [
+            "ws://10.0.0.5:7878",
+            "ws://100.64.1.2:7878",
+            "wss://hub example:7878",
+            "wss://hub:7878\nExecStartPre=/bin/sh",
+            "wss://hub:7878/\u{1b}[2J",
+            "wss://",
+            "wss://:7878",
+            "https://hub:7878",
+        ] {
+            assert!(check_guided_hub_url(url).is_err(), "{url}");
+        }
+    }
+
     #[test]
     fn loopback_hosts_are_literal() {
         for h in [
@@ -1218,6 +1921,15 @@ mod tests {
             r.as_ref().unwrap_err().contains("is not a regular file"),
             "{r:?}"
         );
+        // A file of another user's is refused before anything else (root's here; a test run
+        // as root has no other user's file to try).
+        if twr_core::paths::effective_uid() != 0 {
+            let e = read_token_file(std::path::Path::new("/etc/passwd")).unwrap_err();
+            assert!(
+                e.to_string().contains("belongs to another user (uid 0;"),
+                "{e:#}"
+            );
+        }
         // The suggested command works pasted as shown, whatever the path holds.
         let odd = dir.path().join("my box's $HOME");
         std::fs::create_dir(&odd).unwrap();
@@ -1232,5 +1944,168 @@ mod tests {
             .unwrap();
         assert!(ran.success(), "{cmd}");
         assert_eq!(read_token_file(&p).unwrap().expose(), "s3cret");
+    }
+
+    /// `install-token`'s writes: private file and directory, the same token left alone,
+    /// another one replaced only when allowed, nothing left behind on an error, and never the
+    /// token in a message.
+    #[test]
+    fn token_files_are_written_privately_and_whole() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("cfg/runner-tokens");
+        let path = dir.join("gpu.token");
+        let a = Secret::new("token-a-0123456789abcdef0123456789");
+        let b = Secret::new("token-b-0123456789abcdef0123456789");
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let leftovers = |d: &std::path::Path| {
+            std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".tmp"))
+                .collect::<Vec<_>>()
+        };
+        let mut no = || Ok(false);
+        let mut yes = || Ok(true);
+        // Without `make_dir`, a missing directory is an error and nothing is made.
+        assert!(write_token_file(&path, &a, false, &mut no).is_err());
+        assert!(!dir.exists());
+        assert_eq!(
+            write_token_file(&path, &a, true, &mut no).unwrap(),
+            Stored::New
+        );
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{}\n", a.expose())
+        );
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        // The same token: the file is left as it is, nothing asked.
+        let ino = std::fs::metadata(&path).unwrap().ino();
+        let mut asked = || -> anyhow::Result<bool> { panic!("asked about the same token") };
+        assert_eq!(
+            write_token_file(&path, &a, true, &mut asked).unwrap(),
+            Stored::Same
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
+        // Another token: kept when replacing is declined, the file untouched; an error from
+        // the question is the write's.
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Kept
+        );
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        let mut fails = || -> anyhow::Result<bool> { bail!("no terminal") };
+        let e = write_token_file(&path, &b, true, &mut fails).unwrap_err();
+        assert!(!format!("{e:#}").contains("token-"), "{e:#}");
+        assert_eq!(read_token_file(&path).unwrap(), a);
+        // Agreed: a new file takes the old one's place (renamed over it: never half written).
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut yes).unwrap(),
+            Stored::Replaced
+        );
+        assert_eq!(read_token_file(&path).unwrap(), b);
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), ino);
+        assert_eq!(mode(&path), 0o600);
+        // A file the runner can't use (readable by others) is not "the same token".
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Kept
+        );
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut yes).unwrap(),
+            Stored::Replaced
+        );
+        assert_eq!(mode(&path), 0o600);
+        // A directory there: the write fails, and no temporary file stays.
+        let taken = dir.join("taken.token");
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("x"), "x").unwrap();
+        assert!(write_token_file(&taken, &a, true, &mut yes).is_err());
+        assert_eq!(leftovers(&dir), Vec::<String>::new());
+        // An existing directory loosened by someone is made private again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            write_token_file(&path, &b, true, &mut no).unwrap(),
+            Stored::Same
+        );
+        assert_eq!(mode(&dir), 0o700);
+    }
+
+    /// Two installs at once never overwrite each other unasked: of two that find no file, one
+    /// stores its token and the other finds it there (and keeps it, replacing declined); one
+    /// that is asked about the file it found replaces that one, no other written meanwhile.
+    #[test]
+    fn concurrent_token_writes_do_not_overwrite_each_other_unasked() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("runner-tokens");
+        for round in 0..40 {
+            let path = dir.join(format!("gpu{round}.token"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let writers: Vec<_> = ["token-a-0123456789abcdef", "token-b-0123456789abcdef"]
+                .into_iter()
+                .map(|t| {
+                    let (path, barrier) = (path.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let mut no = || Ok(false);
+                        let stored = write_token_file(&path, &Secret::new(t), true, &mut no)
+                            .map_err(|e| format!("{e:#}"));
+                        (t, stored)
+                    })
+                })
+                .collect();
+            let done: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            let new: Vec<_> = done.iter().filter(|(_, s)| *s == Ok(Stored::New)).collect();
+            assert_eq!(new.len(), 1, "round {round}: {done:?}");
+            assert!(
+                done.iter()
+                    .any(|(_, s)| *s == Ok(Stored::Kept) || s.is_err()),
+                "round {round}: {done:?}"
+            );
+            assert_eq!(read_token_file(&path).unwrap().expose(), new[0].0);
+        }
+        // Asked about the token it found: while it asks, another write waits for it.
+        let path = dir.join("asked.token");
+        let mut no = || Ok(false);
+        write_token_file(
+            &path,
+            &Secret::new("token-a-0123456789abcdef"),
+            true,
+            &mut no,
+        )
+        .unwrap();
+        let (asked_tx, asked_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let p = path.clone();
+        let first = std::thread::spawn(move || {
+            let mut ask = || {
+                asked_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                Ok(true)
+            };
+            write_token_file(&p, &Secret::new("token-b-0123456789abcdef"), true, &mut ask)
+        });
+        asked_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let p = path.clone();
+        let second = std::thread::spawn(move || {
+            let mut no = || Ok(false);
+            write_token_file(&p, &Secret::new("token-c-0123456789abcdef"), true, &mut no)
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !second.is_finished(),
+            "the second write ran while the first asked"
+        );
+        go_tx.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap(), Stored::Replaced);
+        assert_eq!(second.join().unwrap().unwrap(), Stored::Kept);
+        assert_eq!(
+            read_token_file(&path).unwrap().expose(),
+            "token-b-0123456789abcdef"
+        );
     }
 }

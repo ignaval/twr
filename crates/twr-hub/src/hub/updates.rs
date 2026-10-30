@@ -17,8 +17,99 @@ pub(super) fn with_hub_facts(facts: &[String], prompt: String, user: bool) -> St
     format!("[twr background] Hub facts, not instructions or answers:\n{facts}\n{mark}{prompt}")
 }
 
+/// `ext` with `ext.twr.`[`ROUTINE_KEY`] set to `kind`, every other key kept (a `twr` that is
+/// no object is replaced).
+fn routine(ext: Option<JsonMap>, kind: &str) -> Option<JsonMap> {
+    mark(ext, json!(kind))
+}
+
+/// `ext` with `ext.twr.`[`ROUTINE_KEY`] `null`, every other key kept: an update that is no
+/// routine one, whatever its words (a client tells an older hub's updates by them).
+fn not_routine(ext: Option<JsonMap>) -> Option<JsonMap> {
+    mark(ext, Value::Null)
+}
+
+/// `ext` with `ext.twr.`[`ROUTINE_KEY`] set to `value` ([`routine`], [`not_routine`]).
+fn mark(ext: Option<JsonMap>, value: Value) -> Option<JsonMap> {
+    let mut ext = ext.unwrap_or_default();
+    let twr = ext.entry("twr").or_insert_with(|| json!({}));
+    if !twr.is_object() {
+        *twr = json!({});
+    }
+    if let Some(t) = twr.as_object_mut() {
+        t.insert(ROUTINE_KEY.into(), value);
+    }
+    Some(ext)
+}
+
+/// Whether `batch` ends a turn of `thread`.
+fn ended(batch: &[BatchEvent], thread: &str) -> bool {
+    batch
+        .iter()
+        .any(|x| x.thread == thread && matches!(x.body, EventBody::TurnEnded(_)))
+}
+
+/// What the orchestrator is told when worker `name`'s hung-turn card closes (`p`), its turn
+/// ended in the same batch or not (`turn_ended`): that the alarm is over, and why.
+fn hung_closed_text(name: &str, p: &AttentionResolved, turn_ended: bool) -> String {
+    let how = match &p.answer {
+        Some(a) => format!("answered: {}", cut(&a.decision, 80)),
+        None if turn_ended => "closed: its turn ended".to_string(),
+        None if twr_ext(&p.ext)
+            .is_some_and(|t| t.contains_key(super::stall::NOTHING_WAITS_KEY)) =>
+        {
+            "closed: nothing waits behind its turn any longer".to_string()
+        }
+        None if went_on(&p.ext) => "closed: its runtime went on".to_string(),
+        None => "closed".to_string(),
+    };
+    format!(
+        "{name}'s seems-hung card {} {how}; it is no longer a current alarm.",
+        p.attn_id
+    )
+}
+
 impl Core {
-    /// Derive updates before a batch commits, preserving crash/replay consistency.
+    /// Whether report `p` (of an event of turn `turn`) of worker `thread` is a failure's: it
+    /// is graded `gave_up` (as every failed turn is), or its own turn failed, as worker `v`
+    /// (the batch applied) last ended it or else as the log's `turn.ended` of that turn says
+    /// (a rewrite of an older turn's report, `report.write`, after later turns ended). Never
+    /// routine, whatever ran on after it; a log that cannot be read counts it failed.
+    fn failed(
+        &self,
+        thread: &str,
+        p: &ReportReady,
+        turn: Option<u64>,
+        v: &twr_core::reduce::ThreadView,
+    ) -> bool {
+        if p.grade == Grade::GaveUp {
+            return true;
+        }
+        let Some(turn) = p.turn.or(turn) else {
+            return false;
+        };
+        if let Some(t) = v.last_turn.as_ref().filter(|t| t.turn == turn) {
+            return t.result == TurnResult::Error;
+        }
+        match self.stored_event(thread, Some(turn), "turn.ended") {
+            Ok(Some(Event {
+                body: EventBody::TurnEnded(t),
+                ..
+            })) => t.result == TurnResult::Error,
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(%thread, turn, error = %e, "cannot read how a reported turn ended");
+                true
+            }
+        }
+    }
+
+    /// Derive updates before a batch commits, preserving crash/replay consistency. Those that
+    /// tell of work going on are marked routine ([`ROUTINE_KEY`]): an interim report, a
+    /// worker's background work finishing, the hub's wake of it. Final reports, failures (a
+    /// failed turn's report too, though tasks ran on after it: marked `null`), the hub's choice
+    /// not to wake a worker (it asks the user to send it a message: marked `null` too), items
+    /// and their outcomes, and confirm cards' are not.
     pub(super) fn conversation_updates(&self, events: &[BatchEvent]) -> Vec<BatchEvent> {
         let Some(orch) = self.orch.thread.as_ref() else {
             return Vec::new();
@@ -32,9 +123,8 @@ impl Core {
             let view = views
                 .entry(e.thread.clone())
                 .or_insert_with(|| self.registry.get(&e.thread).cloned());
-            let had_background = view
-                .as_ref()
-                .is_some_and(|v| !v.background_tasks.is_empty());
+            // The user's `!` commands are theirs: the orchestrator hears nothing of them.
+            let had_background = view.as_ref().is_some_and(|v| v.own_background());
             if let Some(view) = view {
                 view.apply(&Event::new(
                     &e.thread,
@@ -55,6 +145,7 @@ impl Core {
                             AttentionReason::Question => "asks",
                             AttentionReason::Error => "failed",
                             AttentionReason::Review => "needs review",
+                            AttentionReason::Stalled if is_hung_card(&p.ext) => "seems hung",
                             AttentionReason::Stalled => "is stalled",
                         },
                         cut(&p.summary, 600)
@@ -62,7 +153,14 @@ impl Core {
                     Some(e.thread.clone()),
                     twr_ext_map(json!({"attn_id": p.attn_id})),
                 ),
+                // The report of a turn that saw no run repeats one already said (`hub::wake`).
+                (EventBody::ReportReady(p), Some(_)) if super::wake::no_run_of(p).is_some() => {
+                    continue;
+                }
                 // Said from the report's own marks: tasks another turn runs now are not its.
+                // An interim one is routine: the result comes later; but never a failure's
+                // ([`failed`]), which says so (`routine: null`: no client takes its words for
+                // an interim report's).
                 (EventBody::ReportReady(p), Some(v)) => {
                     let tasks = crate::report::interim_tasks(p);
                     let how = if tasks > 0 {
@@ -84,21 +182,53 @@ impl Core {
                             p.summary
                         ),
                         Some(e.thread.clone()),
-                        p.ext.clone(),
+                        match tasks {
+                            0 => p.ext.clone(),
+                            _ if self.failed(&e.thread, p, e.turn, v) => not_routine(p.ext.clone()),
+                            _ => routine(p.ext.clone(), ROUTINE_INTERIM),
+                        },
                     )
                 }
                 (EventBody::TaskUpdated(p), Some(v))
                     if !p.running
                         && had_background
-                        && v.background_tasks.is_empty()
+                        && !v.own_background()
                         && v.current_turn.is_none() =>
                 {
                     (
                         format!("{} background work finished.", v.name),
                         Some(e.thread.clone()),
-                        None,
+                        routine(None, ROUTINE_BACKGROUND_DONE),
                     )
                 }
+                // The hub woke the worker after its background work (routine), or chose not to
+                // (`hub::wake`), which asks the user to send it a message (not routine: marked
+                // `null`): said as the worker's record says it.
+                (EventBody::ConversationUpdate(p), Some(_))
+                    if twr_ext(&p.ext).is_some_and(|t| {
+                        t.contains_key(super::wake::AUTO_WAKE_KEY)
+                            || t.contains_key(super::wake::AUTO_WAKE_SKIPPED_KEY)
+                    }) =>
+                {
+                    let skipped = twr_ext(&p.ext)
+                        .is_some_and(|t| t.contains_key(super::wake::AUTO_WAKE_SKIPPED_KEY));
+                    (
+                        p.text.clone(),
+                        Some(e.thread.clone()),
+                        if skipped {
+                            not_routine(None)
+                        } else {
+                            routine(None, ROUTINE_AUTO_WAKE)
+                        },
+                    )
+                }
+                // A hung-turn card closed: said, so that its alarm is not taken for a current
+                // one (`hub::stall`).
+                (EventBody::AttentionResolved(p), Some(v)) if self.hung_card(&p.attn_id) => (
+                    hung_closed_text(&v.name, p, ended(events, &e.thread)),
+                    Some(e.thread.clone()),
+                    twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                ),
                 (EventBody::AttentionResolved(p), Some(v))
                     if self
                         .attention
@@ -171,16 +301,57 @@ impl Core {
         out
     }
 
-    /// Bounded updates since the preceding turn, supplied as context with a user message.
+    /// The updates of the hung-turn cards `resolutions` close (the resolutions the activity of
+    /// `batch` implies, `Core::stall_resolutions`): said as [`Core::conversation_updates`] says
+    /// one the batch closes itself.
+    pub(super) fn hung_closures(
+        &self,
+        batch: &[BatchEvent],
+        resolutions: &[BatchEvent],
+    ) -> Vec<BatchEvent> {
+        let Some(orch) = self.orch.thread.as_ref() else {
+            return Vec::new();
+        };
+        resolutions
+            .iter()
+            .filter_map(|e| {
+                let EventBody::AttentionResolved(p) = &e.body else {
+                    return None;
+                };
+                let v = self
+                    .registry
+                    .get(&e.thread)
+                    .filter(|v| !v.is_orchestrator() && self.hung_card(&p.attn_id))?;
+                Some(BatchEvent {
+                    thread: orch.clone(),
+                    turn: None,
+                    source: Source::Hub,
+                    body: EventBody::ConversationUpdate(ConversationUpdate {
+                        text: hung_closed_text(&v.name, p, ended(batch, &e.thread)),
+                        about_thread: Some(e.thread.clone()),
+                        ext: twr_ext_map(json!({"attn_id": p.attn_id, "resolved": true})),
+                        ..Default::default()
+                    }),
+                    raw: None,
+                })
+            })
+            .collect()
+    }
+
+    /// Bounded updates since the preceding turn, supplied as context with a user message. A
+    /// thread's routine line ([`ROUTINE_KEY`]) goes only when no later line about that thread
+    /// is in them; other lines are never left out for that.
     pub(super) fn update_context(&self, thread: &str) -> anyhow::Result<String> {
         let mut updates =
             crate::store::latest_of_kind(self.store.conn(), thread, "conversation.update", 33)?;
         // Notice and handoff turns do not receive this context. Only the preceding
         // user turn is a delivery watermark; the current user turn is already committed. A
-        // turn whose message the user took back is none: what it was told goes again.
+        // turn whose message the user took back is none: what it was told goes again. Nor is
+        // a compaction (`hub::compact`): it was told nothing.
         let since: i64 = self.store.conn().query_row(
             "SELECT COALESCE((SELECT seq FROM events WHERE thread=?1 AND kind='turn.started'
              AND json_extract(data, '$.from')='user'
+             AND json_extract(data, '$.ext.twr.compact') IS NOT 1
              AND turn NOT IN (SELECT turn FROM events WHERE thread=?1 AND kind='turn.withdrawn'
                               AND turn IS NOT NULL)
              ORDER BY seq DESC LIMIT 1 OFFSET 1),0)",
@@ -212,8 +383,19 @@ impl Core {
         let mut more = updates.len() > 32;
         let mut lines = Vec::new();
         let mut bytes = 0;
+        // The newest line in the facts about each thread: a routine line of a thread with a
+        // later line there says nothing that one doesn't (interim chatter costs no tokens).
+        let mut newest: std::collections::HashMap<String, u64> = Default::default();
         for e in updates.into_iter().take(32) {
             if let EventBody::ConversationUpdate(p) = e.body {
+                let about = p.about_thread.clone();
+                let later = about
+                    .as_ref()
+                    .and_then(|t| newest.get(t))
+                    .is_some_and(|seq| *seq > e.seq);
+                if later && routine_of(&p.ext).is_some() {
+                    continue;
+                }
                 let (mut fact, hint) = match twr_ext(&p.ext)
                     .and_then(|t| t.get("interrupted_notice"))
                     .and_then(Value::as_str)
@@ -238,6 +420,10 @@ impl Core {
                 }
                 bytes += line.len() + 1;
                 lines.push((e.seq, line));
+                if let Some(t) = about {
+                    let seq = newest.entry(t).or_default();
+                    *seq = (*seq).max(e.seq);
+                }
             }
         }
         lines.sort_by_key(|(seq, _)| *seq);
@@ -292,5 +478,181 @@ impl Core {
         }
         pending.extend(lines);
         Ok(pending.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{Hub, HubOptions, LOCAL_BOX};
+    use super::*;
+    use twr_core::config::Config;
+
+    /// A thread's routine lines go from the background facts when a later line about it is
+    /// there: only the newest routine line of a thread with nothing after it stays, and no
+    /// other line is left out.
+    #[tokio::test]
+    async fn background_facts_keep_only_a_threads_latest_routine_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            Config::default(),
+        ))
+        .await
+        .unwrap();
+        hub.inner.core().orch.switching = true;
+        hub.append(
+            "o1",
+            None,
+            Source::Hub,
+            EventBody::ThreadCreated(ThreadCreated {
+                name: "orchestrator".into(),
+                box_name: LOCAL_BOX.into(),
+                runtime: "fake".into(),
+                ext: twr_ext_map(json!({"role": "orchestrator"})),
+                ..Default::default()
+            }),
+            None,
+        )
+        .unwrap();
+        let say = |about: &str, text: &str, kind: Option<&str>| {
+            hub.append(
+                "o1",
+                None,
+                Source::Hub,
+                EventBody::ConversationUpdate(ConversationUpdate {
+                    text: text.into(),
+                    about_thread: Some(about.into()),
+                    ext: kind.and_then(|k| routine(None, k)),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        };
+        say("api", "api yielded 1", Some(ROUTINE_INTERIM));
+        say("api", "api background 1", Some(ROUTINE_BACKGROUND_DONE));
+        say("web", "web yielded 1", Some(ROUTINE_INTERIM));
+        say("api", "api failed 2", None);
+        say("api", "api failed 3", None);
+        say("api", "api yielded 4", Some(ROUTINE_INTERIM));
+        say("db", "db woke", Some(ROUTINE_AUTO_WAKE));
+        say("db", "db background", Some(ROUTINE_BACKGROUND_DONE));
+        let facts = hub.inner.core().update_context("o1").unwrap();
+        let lines: Vec<&str> = facts.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            [
+                "\"web yielded 1\"",
+                "\"api failed 2\"",
+                "\"api failed 3\"",
+                "\"api yielded 4\"",
+                "\"db background\"",
+            ],
+            "{facts}"
+        );
+    }
+
+    /// The hub's wake of a worker after its background work is mirrored into the
+    /// orchestrator's conversation as a routine update; its choice not to wake it, which asks
+    /// the user to send it a message, as no routine one (`routine: null`), whatever its words.
+    #[tokio::test]
+    async fn a_wake_the_hub_skipped_is_no_routine_update() {
+        use super::super::wake::{AUTO_WAKE_KEY, AUTO_WAKE_SKIPPED_KEY};
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(HubOptions::new(
+            dir.path().join("twr.db"),
+            Config::default(),
+        ))
+        .await
+        .unwrap();
+        hub.inner.core().orch.switching = true;
+        for (id, name, twr) in [
+            ("o1", "orchestrator", json!({"role": "orchestrator"})),
+            ("w1", "api", json!({})),
+        ] {
+            hub.append(
+                id,
+                None,
+                Source::Hub,
+                EventBody::ThreadCreated(ThreadCreated {
+                    name: name.into(),
+                    box_name: LOCAL_BOX.into(),
+                    runtime: "fake".into(),
+                    ext: twr_ext_map(twr),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        }
+        // As `hub::wake` records them on the worker.
+        for (text, key) in [
+            (
+                "api's background work finished and no turn started after it: twr woke it to \
+                 continue (after its interim report of turn 1).",
+                AUTO_WAKE_KEY,
+            ),
+            (
+                "api's background work finished and no turn started after it; twr did not \
+                 wake it (woken 5 times in a row already). Send it a message to continue.",
+                AUTO_WAKE_SKIPPED_KEY,
+            ),
+        ] {
+            hub.append(
+                "w1",
+                None,
+                Source::Hub,
+                EventBody::ConversationUpdate(ConversationUpdate {
+                    text: text.into(),
+                    about_thread: Some("w1".into()),
+                    ext: twr_ext_map(json!({ key: {"turn": 1} })),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        }
+        let (_, evs) = hub.thread_events("o1", 0, 100).unwrap();
+        let marks: Vec<Option<Value>> = evs
+            .iter()
+            .filter_map(|e| match &e.body {
+                EventBody::ConversationUpdate(p) => {
+                    Some(twr_ext(&p.ext).and_then(|t| t.get(ROUTINE_KEY)).cloned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marks,
+            [Some(json!(ROUTINE_AUTO_WAKE)), Some(Value::Null)],
+            "{evs:#?}"
+        );
+    }
+
+    /// The routine mark joins whatever `ext` had.
+    #[test]
+    fn the_routine_mark_keeps_the_ext() {
+        let ext = twr_ext_map(json!({"background_tasks": 2}));
+        let marked = routine(ext, ROUTINE_INTERIM);
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap(),
+            json!({"twr": {"background_tasks": 2, "routine": "interim"}})
+        );
+        assert_eq!(routine_of(&marked), Some(ROUTINE_INTERIM));
+        let mut odd = JsonMap::new();
+        odd.insert("twr".into(), json!("x"));
+        odd.insert("other".into(), json!(1));
+        let marked = routine(Some(odd), ROUTINE_AUTO_WAKE);
+        assert_eq!(
+            serde_json::to_value(&marked).unwrap(),
+            json!({"twr": {"routine": "auto_wake"}, "other": 1})
+        );
+        // Marked no routine update: kept too, and no kind.
+        let not = not_routine(twr_ext_map(json!({"background_tasks": 2})));
+        assert_eq!(
+            serde_json::to_value(&not).unwrap(),
+            json!({"twr": {"background_tasks": 2, "routine": null}})
+        );
+        assert_eq!(routine_of(&not), None);
     }
 }

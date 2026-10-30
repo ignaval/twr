@@ -10,11 +10,13 @@
 //! whether it is set. Every struct is destructured without `..`, so a field added to the
 //! configuration fails to compile here until someone decides whether it may be shown.
 
+use std::collections::BTreeMap;
+
 use serde_json::{json, Map, Value};
 use twr_core::config::{
-    BoxConfig, BoxProjectConfig, Config, HubConfig, NotifyConfig, OrchestratorConfig,
-    ProjectConfig, RuntimePreset, ThreadsConfig, TrashConfig, TuiConfig, TuiNotifyConfig,
-    DEFAULT_PROJECT_ROOTS,
+    AccountConfig, AccountPolicy, BoxConfig, BoxProjectConfig, CodexConfig, Config, HubConfig,
+    LogConfig, NotifyConfig, OrchestratorConfig, ProjectConfig, RuntimePreset, ThreadsConfig,
+    TrashConfig, TuiConfig, TuiNotifyConfig, DEFAULT_PROJECT_ROOTS,
 };
 
 /// A runtime as `config.show` shows it: a name as it is, a command line (`acp:<command>`,
@@ -26,23 +28,33 @@ fn runtime_shown(runtime: &str) -> String {
     }
 }
 
-/// What `config.show` returns for `config`.
-pub fn config_view(config: &Config) -> Value {
+/// What `config.show` returns for `config`, its boxes those of `boxes` (the hub's, which
+/// includes those added since it started; `None`: `config`'s own).
+pub fn config_view(config: &Config, boxes: Option<&BTreeMap<String, BoxConfig>>) -> Value {
     let Config {
         default_runtime,
         orchestrator,
         hub,
-        boxes,
+        boxes: configured,
         projects,
         threads,
         trash,
+        log,
         stall_after_secs,
         background_timeout_secs,
+        wake_after_secs,
         runtimes,
+        codex,
         notify: hook,
         tui,
         project_roots,
+        accounts,
+        account_policy,
+        // The speaker's (`twr speak`, the TUI's), not the hub's: not shown (its `command` can
+        // carry a hosted voice's key in its arguments).
+        speech: _,
     } = config;
+    let CodexConfig { auto: codex_auto } = codex;
     // The command often holds a secret (an ntfy topic, a webhook's URL): whether it is set.
     let NotifyConfig {
         command: hook_command,
@@ -58,6 +70,8 @@ pub fn config_view(config: &Config) -> Value {
         effort: orch_effort,
         project_reads,
         read_deny,
+        memory,
+        account: orch_account,
     } = orchestrator;
     let HubConfig {
         socket,
@@ -77,14 +91,24 @@ pub fn config_view(config: &Config) -> Value {
         job_slots,
         cpu_weight,
         memory_high,
+        idle_compaction,
     } = threads;
     let TrashConfig { keep_days } = trash;
+    let LogConfig {
+        retention_days,
+        archive,
+    } = log;
     let TuiConfig {
         mouse,
         animate,
         card_order,
         compact_width,
         notify,
+        suggest,
+        suggest_model,
+        summaries,
+        summary_every_span,
+        colors,
     } = tui;
     let TuiNotifyConfig {
         terminal,
@@ -107,6 +131,10 @@ pub fn config_view(config: &Config) -> Value {
                 base,
                 trim_idle_after,
                 idle_trim_disposable,
+                codex_auto,
+                account,
+                accounts,
+                exclude_accounts,
             } = p;
             (
                 name.clone(),
@@ -118,31 +146,89 @@ pub fn config_view(config: &Config) -> Value {
                     "base": base,
                     "trim_idle_after": trim_idle_after,
                     "idle_trim_disposable": idle_trim_disposable,
+                    "codex_auto": codex_auto.map(|a| a.as_str()),
                     "env_names": env.keys().collect::<Vec<_>>(),
+                    "account": account,
+                    "accounts": accounts,
+                    "exclude_accounts": exclude_accounts,
                 }),
             )
         })
         .collect();
     let boxes: Map<String, Value> = boxes
+        .unwrap_or(configured)
         .iter()
         .map(|(name, b)| {
+            // Never its `ssh` or its `command` (one may hold a secret).
             let BoxConfig {
                 token,
                 ssh: _,
+                command: _,
+                terminal_command: _,
+                transport,
+                build: _,
                 projects,
             } = b;
+            let transport = super::boxes::transport_name(transport.unwrap_or_default());
             let projects: Map<String, Value> = projects
                 .iter()
                 .map(|(name, p)| {
-                    let BoxProjectConfig { repo, runtime } = p;
+                    let BoxProjectConfig {
+                        repo,
+                        runtime,
+                        account,
+                        accounts,
+                        exclude_accounts,
+                    } = p;
                     let runtime = runtime.as_deref().map(runtime_shown);
-                    (name.clone(), json!({ "repo": repo, "runtime": runtime }))
+                    let mut shown = json!({ "repo": repo, "runtime": runtime });
+                    // A box project's account keys only when set: most have none.
+                    if let Some(o) = shown.as_object_mut() {
+                        if let Some(a) = account {
+                            o.insert("account".into(), json!(a));
+                        }
+                        if !accounts.is_empty() {
+                            o.insert("accounts".into(), json!(accounts));
+                        }
+                        if let Some(x) = exclude_accounts {
+                            o.insert("exclude_accounts".into(), json!(x));
+                        }
+                    }
+                    (name.clone(), shown)
                 })
                 .collect();
             (
                 name.clone(),
-                json!({ "has_token": token.is_some(), "projects": projects }),
+                json!({
+                    "transport": transport,
+                    "has_token": token.is_some(),
+                    "projects": projects,
+                }),
             )
+        })
+        .collect();
+    // Accounts and their directories (not secrets: no credential is in config.toml).
+    let accounts: Map<String, Value> = accounts
+        .iter()
+        .map(|(rt, names)| {
+            let names: Map<String, Value> = names
+                .iter()
+                .map(|(name, a)| {
+                    let AccountConfig { dir, share, native } = a;
+                    (
+                        name.clone(),
+                        json!({ "dir": dir, "share": share, "native": native }),
+                    )
+                })
+                .collect();
+            (rt.clone(), Value::Object(names))
+        })
+        .collect();
+    let account_policy: Map<String, Value> = account_policy
+        .iter()
+        .map(|(rt, p)| {
+            let AccountPolicy { default } = p;
+            (rt.clone(), json!({ "default": default }))
         })
         .collect();
     let presets: Vec<&String> = runtimes
@@ -155,12 +241,14 @@ pub fn config_view(config: &Config) -> Value {
     json!({
         "note": "the configuration this hub loaded when it started (a change to the file \
                  applies after a hub restart); tokens, env values, preset command lines, \
-                 the notify command, ssh destinations and TLS files are never shown",
+                 the notify command, ssh destinations, box commands and TLS files are never \
+                 shown",
         "default_runtime": runtime_shown(default_runtime),
         "project_roots": roots,
         "project_roots_default": roots_default,
         "stall_after_secs": stall_after_secs,
         "background_timeout_secs": background_timeout_secs,
+        "wake_after_secs": wake_after_secs,
         "orchestrator": {
             "runtime": orch_runtime.as_deref().map(runtime_shown),
             "model": orch_model,
@@ -169,6 +257,8 @@ pub fn config_view(config: &Config) -> Value {
             "autostart": autostart,
             "project_reads": project_reads,
             "read_deny": read_deny,
+            "memory": memory,
+            "account": orch_account,
         },
         "threads": {
             "default_mode": default_mode,
@@ -182,8 +272,11 @@ pub fn config_view(config: &Config) -> Value {
             "job_slots": job_slots,
             "cpu_weight": cpu_weight,
             "memory_high": memory_high,
+            "idle_compaction": idle_compaction.as_str(),
         },
         "trash": { "keep_days": keep_days },
+        "log": { "retention_days": retention_days, "archive": archive },
+        "codex": { "auto": codex_auto.as_str() },
         "notify": {
             "command_set": !hook_command.is_empty(),
             "events": hook_events,
@@ -191,6 +284,8 @@ pub fn config_view(config: &Config) -> Value {
             "timeout_secs": hook_timeout,
         },
         "projects": projects,
+        "accounts": accounts,
+        "account_policy": account_policy,
         "runtimes": presets,
         "boxes": boxes,
         "hub": {
@@ -205,6 +300,11 @@ pub fn config_view(config: &Config) -> Value {
             "card_order": card_order,
             "compact_width": compact_width,
             "notify": { "terminal": terminal, "when": when, "events": events },
+            "suggest": suggest,
+            "suggest_model": suggest_model,
+            "summaries": summaries,
+            "summary_every": summary_every_span,
+            "colors": colors,
         },
     })
 }
@@ -258,7 +358,7 @@ runtime = "acp:remote --key s3cret-box"
 "#,
         )
         .unwrap();
-        let v = config_view(&config);
+        let v = config_view(&config, None);
         let text = v.to_string();
         assert!(!text.contains("s3cret"), "{text}");
         assert_eq!(v["default_runtime"], "acp:<command>");
@@ -278,11 +378,52 @@ runtime = "acp:remote --key s3cret-box"
         assert_eq!(v["projects"]["api"]["repo"], "/home/me/code/api");
         assert_eq!(v["runtimes"], json!(["gem"]));
         assert_eq!(v["boxes"]["gpu"]["has_token"], true);
+        assert_eq!(v["boxes"]["gpu"]["transport"], "token");
+        // The hub's own list of boxes, when given: an SSH or a command box shows its
+        // transport, never its destination or its command.
+        let ssh: BTreeMap<String, BoxConfig> = BTreeMap::from([
+            (
+                "far".to_string(),
+                BoxConfig {
+                    transport: Some(twr_core::config::BoxTransport::Ssh),
+                    ssh: Some("-i /home/me/.ssh/s3cret_id me@far".into()),
+                    build: Some("0123456789abcdef".into()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "sb".to_string(),
+                BoxConfig {
+                    transport: Some(twr_core::config::BoxTransport::Command),
+                    command: Some(
+                        ["docker", "exec", "-i", "-e", "KEY=s3cret", "ctr"]
+                            .map(String::from)
+                            .to_vec(),
+                    ),
+                    terminal_command: Some(
+                        ["docker", "exec", "-i", "-t", "ctr"]
+                            .map(String::from)
+                            .to_vec(),
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let w = config_view(&config, Some(&ssh));
+        assert!(
+            !w.to_string().contains("s3cret") && !w.to_string().contains("docker"),
+            "{w}"
+        );
+        assert_eq!(w["boxes"]["far"]["transport"], "ssh");
+        assert_eq!(w["boxes"]["far"]["has_token"], false);
+        assert_eq!(w["boxes"]["sb"]["transport"], "command");
+        assert_eq!(w["boxes"]["sb"]["has_token"], false);
+        assert!(w["boxes"].get("gpu").is_none(), "{w}");
         assert_eq!(v["boxes"]["gpu"]["projects"]["api"]["repo"], "/srv/api");
         assert_eq!(v["hub"]["tls"], true);
         assert_eq!(v["notify"]["command_set"], true);
         assert_eq!(v["project_roots_default"], false);
-        let defaults = config_view(&Config::default());
+        let defaults = config_view(&Config::default(), None);
         assert_eq!(defaults["project_roots_default"], true);
         assert_eq!(defaults["project_roots"], json!(DEFAULT_PROJECT_ROOTS));
         // What idle trims delete: the threads' list, and a project's own.
@@ -295,5 +436,73 @@ runtime = "acp:remote --key s3cret-box"
             json!(["target/"])
         );
         assert_eq!(v["projects"]["api"]["idle_trim_disposable"], Value::Null);
+        // What the hub does about an expired prompt cache: `ask` unless set.
+        assert_eq!(defaults["threads"]["idle_compaction"], "ask");
+        let mut idle = Config::default();
+        idle.threads.idle_compaction = twr_core::config::IdleCompaction::BeforeExpiry;
+        assert_eq!(
+            config_view(&idle, None)["threads"]["idle_compaction"],
+            "before_expiry"
+        );
+    }
+
+    #[test]
+    fn accounts_and_pins_show() {
+        let config = Config::from_toml_str(
+            r#"
+[orchestrator]
+account = "work"
+
+[accounts.claude-code.work]
+dir = "/home/me/.claude-work"
+share = "none"
+
+[accounts.claude-code.me]
+native = true
+
+[account_policy.claude-code]
+default = "me"
+
+[projects.api]
+repo = "/r/api"
+account = "work"
+accounts = { codex = ["team", "max-*"] }
+exclude_accounts = "old"
+
+[boxes.gpu]
+ssh = "me@gpu"
+transport = "ssh"
+
+[boxes.gpu.projects.api]
+repo = "/srv/api"
+account = "gpu-*"
+"#,
+        )
+        .unwrap();
+        let v = config_view(&config, None);
+        assert_eq!(v["orchestrator"]["account"], "work");
+        assert_eq!(
+            v["accounts"]["claude-code"]["work"],
+            json!({"dir": "/home/me/.claude-work", "share": "none", "native": false})
+        );
+        assert_eq!(
+            v["accounts"]["claude-code"]["me"],
+            json!({"dir": null, "share": "config", "native": true})
+        );
+        assert_eq!(v["account_policy"]["claude-code"]["default"], "me");
+        assert_eq!(v["projects"]["api"]["account"], "work");
+        assert_eq!(
+            v["projects"]["api"]["accounts"],
+            json!({"codex": ["team", "max-*"]})
+        );
+        assert_eq!(v["projects"]["api"]["exclude_accounts"], "old");
+        assert_eq!(v["boxes"]["gpu"]["projects"]["api"]["account"], "gpu-*");
+        assert_eq!(
+            v["boxes"]["gpu"]["projects"]["api"]["exclude_accounts"],
+            Value::Null
+        );
+        let defaults = config_view(&Config::default(), None);
+        assert_eq!(defaults["accounts"], json!({}));
+        assert_eq!(defaults["orchestrator"]["account"], Value::Null);
     }
 }

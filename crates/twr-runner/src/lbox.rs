@@ -105,6 +105,7 @@ use twr_core::runner::{
     WireWorktreeCreated, MAX_FRAME_BYTES,
 };
 
+use crate::agents::{BoxAgents, BoxEnv};
 use crate::local::LocalGit;
 use crate::reap::{self, StaleProcess};
 use crate::spool::{
@@ -169,6 +170,10 @@ pub struct LocalBoxOptions {
     /// ([`crate::client::machine_lock_path`]: keyed by the hub and the box); `None` (tests, and
     /// a box opened without a hub) takes none.
     pub machine_lock: Option<PathBuf>,
+    /// What the box asks of its environment for its agents (the login shell's `PATH`, its
+    /// agent CLIs: [`crate::agents`]); none by default, a runner's asks both
+    /// ([`crate::RunnerOptions::box_options`]).
+    pub env: BoxEnv,
 }
 
 impl std::fmt::Debug for LocalBoxOptions {
@@ -178,6 +183,7 @@ impl std::fmt::Debug for LocalBoxOptions {
             .field("spool_max_bytes", &self.spool_max_bytes)
             .field("worktrees", &self.worktrees)
             .field("runtimes", &self.runtimes)
+            .field("env", &self.env)
             .finish()
     }
 }
@@ -203,6 +209,7 @@ impl LocalBoxOptions {
                 .collect(),
             git: LocalGit::default(),
             machine_lock: None,
+            env: BoxEnv::none(),
         }
     }
 }
@@ -304,6 +311,61 @@ struct Inner {
     op_permits: tokio::sync::Semaphore,
     /// Repository changes received from the hub and not finished ([`LocalBox::begin_change`]).
     changes: watch::Sender<usize>,
+    /// [`LocalBox::hold_change_receipts`] (tests).
+    receipt_hold: Mutex<Option<std::sync::mpsc::Sender<ChangeReceiptPause>>>,
+    /// The login shell's `PATH` and the agents ([`crate::agents`]).
+    agents: BoxAgents,
+}
+
+/// A repository change paused by [`LocalBox::hold_change_receipts`] (tests) as the
+/// connection's reader takes it, before it is counted: the reader's thread is blocked until
+/// `go` is sent (or dropped).
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ChangeReceiptPause {
+    /// Lets the reader go on.
+    pub go: std::sync::mpsc::Sender<()>,
+}
+
+/// Settles a command whose execution ([`LocalBox::handle_cmd`]) is dropped part way, its task
+/// cancelled (a connection's reader aborted, the runtime shutting down): it is no longer in
+/// flight, and its row in the spool is forgotten when it had not begun (a repeat of its id
+/// runs it), else finished as `interrupted` (its effect is unknown, so it never runs again).
+/// Disarmed once the result is recorded.
+struct Settle<'a> {
+    lbox: &'a LocalBox,
+    cmd_id: &'a str,
+    /// The op's execution has begun.
+    begun: bool,
+    armed: bool,
+}
+
+impl Drop for Settle<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let cmd_id = self.cmd_id;
+        let spool = self.lbox.spool();
+        let settled = if self.begun {
+            spool.cmd_finish(&interrupted_result(
+                cmd_id,
+                "the command's execution was cancelled; its effect is unknown",
+            ))
+        } else {
+            spool.cmd_forget(cmd_id)
+        };
+        match settled {
+            Ok(()) => tracing::info!(cmd_id, begun = self.begun, "a command was cancelled"),
+            // Its row stays unfinished: it answers `interrupted`, as a crash's does.
+            Err(e) => tracing::warn!(
+                cmd_id,
+                error = %format!("{e:#}"),
+                "a command was cancelled and could not be settled in the spool"
+            ),
+        }
+        self.lbox.forget_inflight(cmd_id);
+    }
 }
 
 impl Drop for Inner {
@@ -392,8 +454,33 @@ impl LocalBox {
                 inflight: Mutex::new(HashMap::new()),
                 op_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_OPS),
                 changes: watch::Sender::new(0),
+                receipt_hold: Mutex::new(None),
+                agents: BoxAgents::new(opts.env),
             }),
         })
+    }
+
+    /// The login shell's `PATH` ([`crate::agents`]): asked the first time, then the same
+    /// answer; `None` when the box asks none or the shell gave none.
+    pub async fn login_path(&self) -> Option<Arc<twr_adapters::resolve::LoginPath>> {
+        self.inner.agents.login_path().await
+    }
+
+    /// The box's agents as last probed (none before the first probe ended, or when the box
+    /// probes none): what the inventory carries.
+    pub fn agents(&self) -> Vec<twr_core::runner::AgentInfo> {
+        self.inner.agents.known()
+    }
+
+    /// Probes the box's agents now (see [`crate::agents`]) and returns them.
+    pub async fn probe_agents(&self) -> Vec<twr_core::runner::AgentInfo> {
+        self.inner.agents.probe().await
+    }
+
+    /// The box's background work while it runs ([`crate::run_with`]): the login `PATH`, then
+    /// the agents probed every [`crate::agents::AGENTS_EVERY`]. Runs until dropped.
+    pub async fn environment_loop(&self) {
+        self.inner.agents.run().await
     }
 
     /// A repository change ([`Op::changes_repository`]) received from the hub begins: counted
@@ -403,6 +490,37 @@ impl LocalBox {
         self.inner.changes.send_modify(|n| *n += 1);
         ChangeInProgress {
             changes: self.inner.changes.clone(),
+        }
+    }
+
+    /// Test hook: from now on the connection's reader, as it takes a repository change from
+    /// the hub and before it counts it ([`LocalBox::begin_change`]), sends a
+    /// [`ChangeReceiptPause`] on the returned channel and blocks its thread until the pause's
+    /// `go`: a reader in the middle of being polled, which aborting its task does not stop.
+    #[doc(hidden)]
+    pub fn hold_change_receipts(&self) -> std::sync::mpsc::Receiver<ChangeReceiptPause> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self
+            .inner
+            .receipt_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        rx
+    }
+
+    /// The connection's reader takes a repository change ([`LocalBox::hold_change_receipts`]).
+    pub(crate) fn change_received(&self) {
+        let hold = self
+            .inner
+            .receipt_hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hold) = hold {
+            let (go, wait) = std::sync::mpsc::channel();
+            if hold.send(ChangeReceiptPause { go }).is_ok() {
+                let _ = wait.recv();
+            }
         }
     }
 
@@ -517,12 +635,19 @@ impl LocalBox {
     }
 
     /// Runs command `cmd_id` once: a repeated id returns the first execution's result.
+    ///
+    /// What the command waits for before it runs (the login shell's `PATH`, asked once) is
+    /// waited for before the command is recorded as running: a connection replaced meanwhile
+    /// (its reader aborted at that wait) leaves nothing of the command behind, and the hub's
+    /// repeat of the id runs it. A command dropped later, part way ([`Settle`]), is settled
+    /// all the same: not in flight any more, and run again when repeated if it had not begun.
     pub async fn handle_cmd(&self, cmd_id: &str, op: Op) -> CmdResult {
         enum Plan {
             Wait(watch::Receiver<Option<CmdResult>>),
             Done(CmdResult),
             Run(watch::Sender<Option<CmdResult>>),
         }
+        let login = self.login_path_for(&op).await;
         let plan = {
             let mut inflight = self
                 .inner
@@ -570,13 +695,23 @@ impl LocalBox {
                 }
             },
             Plan::Run(tx) => {
+                // Declared after `tx`, so dropped before it: a waiter woken by `tx` going
+                // away finds the command settled.
+                let mut settle = Settle {
+                    lbox: self,
+                    cmd_id,
+                    begun: false,
+                    armed: true,
+                };
                 tracing::debug!(cmd_id, op = op.name(), thread = ?op.thread(), "running command");
                 let outcome = if op.is_session_op() {
-                    self.execute(op).await
+                    settle.begun = true;
+                    self.execute_with(op, login.as_deref()).await
                 } else {
                     // The semaphore is never closed.
                     let _permit = self.inner.op_permits.acquire().await.ok();
-                    self.execute(op).await
+                    settle.begun = true;
+                    self.execute_with(op, login.as_deref()).await
                 };
                 let mut result = CmdResult::new(cmd_id, outcome);
                 // Published only once stored: a result the hub saw but the spool lacks would
@@ -601,19 +736,51 @@ impl LocalBox {
                     tracing::warn!(cmd_id, error = %format!("{e:#}"), ?d, "storing a command result failed; retrying");
                     tokio::time::sleep(*d).await;
                 }
+                settle.armed = false;
                 let _ = tx.send(Some(result.clone()));
-                self.inner
-                    .inflight
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(cmd_id);
+                self.forget_inflight(cmd_id);
                 result
             }
         }
     }
 
+    fn forget_inflight(&self, cmd_id: &str) {
+        self.inner
+            .inflight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(cmd_id);
+    }
+
     /// Runs `op` (no dedup).
     pub async fn execute(&self, op: Op) -> Result<Value, CmdError> {
+        let login = self.login_path_for(&op).await;
+        self.execute_with(op, login.as_deref()).await
+    }
+
+    /// The login shell's `PATH` `op` starts or resolves a runtime's program on (a spawn's, a
+    /// resume's, an attach command's), when its thread configures no `PATH` of its own: it
+    /// goes before the runner's ([`twr_adapters::resolve::with_login_path`]), so the adapter
+    /// resolves its program on it, as the agent probe does. Waited for the first time
+    /// ([`LocalBox::login_path`]). `None` for every other op.
+    async fn login_path_for(&self, op: &Op) -> Option<Arc<twr_adapters::resolve::LoginPath>> {
+        let cfg = match op {
+            Op::Spawn { cfg, .. } | Op::Resume { cfg, .. } | Op::AttachInfo { cfg, .. } => cfg,
+            _ => return None,
+        };
+        if twr_adapters::process::env_path(&cfg.env).is_some() {
+            return None;
+        }
+        self.login_path().await
+    }
+
+    /// [`LocalBox::execute`] with the login shell's `PATH` already asked (`login`,
+    /// [`LocalBox::login_path_for`]): a session op runs without waiting for anything.
+    async fn execute_with(
+        &self,
+        op: Op,
+        login: Option<&twr_adapters::resolve::LoginPath>,
+    ) -> Result<Value, CmdError> {
         let failed = |e: anyhow::Error| CmdError::new(cmd_errors::FAILED, format!("{e:#}"));
         let git = &self.inner.git;
         match op {
@@ -626,6 +793,7 @@ impl LocalBox {
             } => {
                 let mut cfg: SpawnConfig = cfg.into();
                 cfg.thread = thread.clone();
+                twr_adapters::resolve::with_login_path(&mut cfg.env, login);
                 self.start(&thread, &runtime, cfg, run, |a, cfg| a.spawn(cfg, prompt))
             }
             Op::Resume {
@@ -637,6 +805,7 @@ impl LocalBox {
             } => {
                 let mut cfg: SpawnConfig = cfg.into();
                 cfg.thread = thread.clone();
+                twr_adapters::resolve::with_login_path(&mut cfg.env, login);
                 self.start(&thread, &runtime, cfg, run, |a, cfg| {
                     a.resume(cfg, session_id)
                 })
@@ -719,8 +888,15 @@ impl LocalBox {
                 let mut cfg: SpawnConfig = cfg.into();
                 cfg.thread = thread;
                 // Only the runtime spec's attach template (an `acp` preset's): without it the
-                // adapter has no attach command. Nothing else the hub sent is kept.
+                // adapter has no attach command. Nothing else the hub sent is kept but the
+                // thread's `PATH`, when it configures one: the program is resolved as for a
+                // spawn, on that `PATH`, else on the login shell's before the runner's.
+                let path = twr_adapters::process::env_path(&cfg.env).map(str::to_string);
                 twr_adapters::retain_attach_env(&mut cfg.env);
+                match path {
+                    Some(p) => cfg.env.push(("PATH".into(), p)),
+                    None => twr_adapters::resolve::with_login_path(&mut cfg.env, login),
+                }
                 Ok(match adapter.attach_command(&cfg, &session_id) {
                     Some(c) => json!(AttachInfo::from_command(&c)),
                     None => Value::Null,
@@ -836,6 +1012,15 @@ impl LocalBox {
             .await
             .map(|o| json!(o))
             .map_err(failed),
+            // As last probed, unless asked for a fresh look (or none was made yet).
+            Op::Agents { refresh } => {
+                let agents = if refresh || !self.inner.agents.probed() {
+                    self.probe_agents().await
+                } else {
+                    self.agents()
+                };
+                Ok(json!(agents))
+            }
         }
     }
 

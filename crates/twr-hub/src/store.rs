@@ -4,7 +4,9 @@
 //! Tables (schema version [`SCHEMA_VERSION`], kept in `PRAGMA user_version`):
 //!
 //! - `events(thread, seq, id, v, ts, turn, source, kind, data, raw)`: one logical append-only
-//!   log per thread, primary key `(thread, seq)`. Triggers abort any UPDATE or DELETE.
+//!   log per thread, primary key `(thread, seq)`. Triggers abort any UPDATE, and any DELETE
+//!   but that of an agent event ([`AGENT_KINDS`], never a control one) the hub archives or
+//!   prunes (`hub::prune`, schema 9).
 //! - `control(gseq, thread, seq)`: the hub control stream, a materialized index over `events`
 //!   with its own global sequence. Also append-only (triggers).
 //! - `blobs(hash, bytes)`: content-addressed payload overflow and raw runtime messages.
@@ -55,9 +57,33 @@
 //!   restart (`hub`, Attach). Deleted in the transaction that records `thread.detached` (and
 //!   `thread.attached`: a new attach has no process yet).
 //!
+//! - `checkpoints(id, format, build, config, gseq, last_event, created, checksum, state)`
+//!   (schema 9): the
+//!   hub's folded state as of control event `last_event` (at control position `gseq`), so that
+//!   a hub start folds only the events after it (`hub::checkpoint`). A cache: written from a
+//!   replay of the log alone, used only by the same build (`build`) with the same settings the
+//!   fold reads (`config`), whose `checksum` (SHA-256 of the row) still holds, and dropped
+//!   without loss. The newest [`CHECKPOINTS_KEPT`] of each of the [`CHECKPOINT_BUILDS_KEPT`]
+//!   builds with the newest checkpoints are kept.
+//!
 //! Schema 7 changes no table: from it, `events` may hold `turn.started` `from: runtime`, which
 //! a twr before it cannot decode. Such a twr refuses the database as newer than itself rather
-//! than failing on those rows. Schema 8 adds `pending_prompts.user_sent`.
+//! than failing on those rows. Schema 8 adds `pending_prompts.user_sent`, schema 9
+//! `checkpoints` and lets agent events be deleted (`events_no_delete` becomes
+//! `events_delete_agent_only`).
+//!
+//! Schema 10 ([`ACCOUNTS_SCHEMA_VERSION`]) changes no table either: it marks a database that
+//! holds account data. A twr before accounts would ignore `account.*` events and a thread's
+//! account (`ext.twr.account`), and start a named account's threads on the native login. The
+//! first transaction that records account data ([`account_dependent`]: an `account.added`,
+//! `account.removed` or `account.status`, a `thread.created` with an account, a
+//! `thread.model_changed` that moves a thread between accounts) raises the version to 10 in
+//! that same transaction, so such a twr refuses the database as newer than itself. A database
+//! without account data stays at 9 (one that has some from before this fence is raised when
+//! the hub replays it, [`Store::fence_accounts`]): until an account is added, an older twr can
+//! still open it. This twr opens both, and so do its checkpoints ([`is_own_schema`]). (A
+//! development build of accounts made before schema 9 marked account data with 9: such a
+//! database has no `checkpoints`, and gets them when it is opened.)
 //!
 //! Every append (event row, control row, blobs, dequeued prompt) is one transaction, and so is
 //! every [`AppendBatch`]: several events plus queued prompts that make up one logical operation.
@@ -75,8 +101,100 @@ use twr_core::blob::{blob_ref, BlobStore};
 use twr_core::event::{AttentionReason, DecisionSite, EventBody, Grade, TurnFrom};
 use twr_core::{Event, Source};
 
-/// Current schema version (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i32 = 8;
+/// Current schema version (`PRAGMA user_version`) of a database without account data.
+pub const SCHEMA_VERSION: i32 = 9;
+
+/// Schema 9: checkpoints of the hub's folded state (`hub::checkpoint`).
+const SCHEMA_9: &str = r#"
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    format     INTEGER NOT NULL,
+    build      TEXT NOT NULL,
+    config     TEXT NOT NULL,
+    gseq       INTEGER NOT NULL,
+    last_event TEXT NOT NULL,
+    created    TEXT NOT NULL,
+    checksum   TEXT NOT NULL,
+    state      BLOB NOT NULL
+);
+"#;
+
+/// Schema 9 too: the agent events (and only those) may be deleted, once archived or pruned
+/// (`hub::prune`). Control events, and every other kind, stay append-only.
+const SCHEMA_9_PRUNE: &str = r#"
+DROP TRIGGER IF EXISTS events_no_delete;
+CREATE TRIGGER IF NOT EXISTS events_delete_agent_only BEFORE DELETE ON events
+WHEN OLD.kind NOT IN ('agent.text', 'agent.thinking', 'agent.tool_call', 'agent.tool_result')
+  OR EXISTS (SELECT 1 FROM control c WHERE c.thread = OLD.thread AND c.seq = OLD.seq)
+BEGIN SELECT RAISE(ABORT, 'events are append-only (but archived agent events)'); END;
+"#;
+
+/// The kinds of the events `twr.db` may delete (once archived, `hub::prune`): what agents said,
+/// thought and did. Never on the control stream.
+pub const AGENT_KINDS: [&str; 4] = [
+    "agent.text",
+    "agent.thinking",
+    "agent.tool_call",
+    "agent.tool_result",
+];
+
+/// How many checkpoints of one build are kept (its newest).
+pub const CHECKPOINTS_KEPT: usize = 2;
+
+/// Of how many builds checkpoints are kept (those whose newest checkpoint is newest): a build
+/// installed next to a running hub writes one for itself before the hub restarts (`twr log
+/// checkpoint`), and the running hub's next one must not drop it.
+pub const CHECKPOINT_BUILDS_KEPT: usize = 3;
+
+/// Schema version of a database that holds account data (see the module docs): the newest
+/// this twr knows. Same tables as [`SCHEMA_VERSION`].
+pub const ACCOUNTS_SCHEMA_VERSION: i32 = 10;
+
+/// Whether schema `version` is one this twr writes ([`SCHEMA_VERSION`], or
+/// [`ACCOUNTS_SCHEMA_VERSION`] once the database holds account data): a database at it needs
+/// no migration (`hub::checkpoint`'s prewarm writes a checkpoint for it).
+pub fn is_own_schema(version: i32) -> bool {
+    version == SCHEMA_VERSION || version == ACCOUNTS_SCHEMA_VERSION
+}
+
+/// Whether recording `ev` makes the database one a twr before accounts must refuse
+/// ([`ACCOUNTS_SCHEMA_VERSION`]): an `account.added` / `account.removed` / `account.status`,
+/// a `thread.created` with an account (`ext.twr.account`), or a `thread.model_changed` that
+/// moves the thread between accounts (`account_changed`).
+pub fn account_dependent(ev: &Event) -> bool {
+    match &ev.body {
+        EventBody::AccountAdded(_) | EventBody::AccountRemoved(_) | EventBody::AccountStatus(_) => {
+            true
+        }
+        EventBody::ThreadCreated(c) => c
+            .ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get(twr_core::event::ACCOUNT_KEY))
+            .is_some_and(|a| !a.is_null()),
+        EventBody::ThreadModelChanged(m) => m.account_changed,
+        _ => false,
+    }
+}
+
+/// Refuses a database whose schema `version` is newer than `known` (the newest version this
+/// twr knows).
+fn check_version(version: i32, known: i32) -> anyhow::Result<()> {
+    if version > known {
+        bail!("database schema version {version} is newer than this twr ({known})");
+    }
+    Ok(())
+}
+
+/// Raises the schema version to [`ACCOUNTS_SCHEMA_VERSION`] within `conn`'s transaction
+/// (once: a no-op when it is there already).
+fn fence_accounts(conn: &Connection) -> anyhow::Result<()> {
+    let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if version < ACCOUNTS_SCHEMA_VERSION {
+        conn.pragma_update(None, "user_version", ACCOUNTS_SCHEMA_VERSION)?;
+    }
+    Ok(())
+}
 
 const SCHEMA_6: &str = r#"
 CREATE TABLE IF NOT EXISTS spawn_operations (
@@ -200,10 +318,27 @@ pub fn connect(path: &Path) -> anyhow::Result<Connection> {
 /// Creates or checks the schema.
 fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     let version: i32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-    if version > SCHEMA_VERSION {
-        bail!("database schema version {version} is newer than this twr ({SCHEMA_VERSION})");
-    }
-    if version == SCHEMA_VERSION {
+    check_version(version, ACCOUNTS_SCHEMA_VERSION)?;
+    // (10 has 9's tables: only its account data is new.)
+    if version >= SCHEMA_VERSION {
+        // A database a development build of schema 9 made before agent events could be
+        // deleted: its trigger is replaced. One a development build of accounts raised from 8
+        // to 9 when 9 marked account data has no `checkpoints`: it gets 9's tables.
+        let old: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'trigger'
+             AND name = 'events_no_delete')",
+            [],
+            |r| r.get(0),
+        )?;
+        let checkpoints: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table'
+             AND name = 'checkpoints')",
+            [],
+            |r| r.get(0),
+        )?;
+        if old || !checkpoints {
+            conn.execute_batch(&format!("BEGIN; {SCHEMA_9} {SCHEMA_9_PRUNE} COMMIT;"))?;
+        }
         return Ok(());
     }
     let tx = conn.transaction()?;
@@ -227,8 +362,13 @@ fn migrate(conn: &mut Connection) -> anyhow::Result<()> {
     // → 7: no table; events a twr before it cannot decode (see the module docs).
     // → 8: `pending_prompts.user_sent`. Rows queued before it stay NULL: none of them
     // releases a crash's hold at the next start (the user sends again).
-    if version != 0 {
+    if version != 0 && version < 8 {
         tx.execute_batch("ALTER TABLE pending_prompts ADD COLUMN user_sent INTEGER;")?;
+    }
+    // → 9: `checkpoints`; agent events may be deleted.
+    if version < 9 {
+        tx.execute_batch(SCHEMA_9)?;
+        tx.execute_batch(SCHEMA_9_PRUNE)?;
     }
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()?;
@@ -277,6 +417,23 @@ pub struct PendingPrompt {
     pub source: Source,
     /// The control head when it was queued (`None` for rows from schema 1).
     pub said_after: Option<u64>,
+}
+
+/// A queued prompt as `thread.queue` lists it ([`Store::pending_list`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedPrompt {
+    /// Its row id: the message's ref, and its place in the queue.
+    pub id: i64,
+    /// The prompt.
+    pub prompt: String,
+    /// Who sent it.
+    pub from: TurnFrom,
+    /// Who queued it.
+    pub source: Source,
+    /// When (RFC 3339).
+    pub queued_at: String,
+    /// Marked as a send of the user's (`user_sent`).
+    pub user_sent: bool,
 }
 
 /// The writer side of the database. The hub owns exactly one.
@@ -409,6 +566,33 @@ impl Store {
         })
     }
 
+    /// Another connection to the database at `path`, which a [`Store::open`] created and
+    /// migrated already: for a replay in the background that writes nothing but a checkpoint
+    /// (`hub::checkpoint`).
+    pub fn open_existing(path: &Path) -> anyhow::Result<Store> {
+        Ok(Store {
+            conn: connect(path)?,
+            syncs: Default::default(),
+        })
+    }
+
+    /// Raises the schema version to [`ACCOUNTS_SCHEMA_VERSION`] if it is not there: for a
+    /// database whose account data was recorded before the fence (the hub's replay finds it,
+    /// [`account_dependent`]). Appends raise it themselves.
+    pub fn fence_accounts(&mut self) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        fence_accounts(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The schema version recorded in the database (`PRAGMA user_version`).
+    pub fn schema_version(&self) -> anyhow::Result<i32> {
+        Ok(self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?)
+    }
+
     /// The underlying connection (reads).
     pub fn conn(&self) -> &Connection {
         &self.conn
@@ -479,6 +663,11 @@ impl Store {
             if n != 1 {
                 bail!("pending prompt {id} is gone");
             }
+        }
+        // Account data raises the schema version before it is written, in the same
+        // transaction (the module docs).
+        if batch.events.iter().any(|(ev, _)| account_dependent(ev)) {
+            fence_accounts(&tx)?;
         }
         let mut out = BatchCommit::default();
         for thread in batch.drop_queues {
@@ -818,25 +1007,7 @@ impl Store {
 
     /// Every event in append order with its control gseq (`None` for non-control events).
     pub fn load_all_with_gseq(&self) -> anyhow::Result<Vec<(Event, Option<u64>)>> {
-        let cols = EVENT_COLS
-            .split(", ")
-            .map(|c| format!("e.{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut st = self.conn.prepare(&format!(
-            "SELECT {cols}, c.gseq FROM events e
-             LEFT JOIN control c ON c.thread = e.thread AND c.seq = e.seq
-             ORDER BY e.rowid"
-        ))?;
-        let rows = st.query_map([], |r| {
-            let gseq: Option<i64> = r.get(10)?;
-            Ok((row_to_raw(r)?, gseq))
-        })?;
-        rows.map(|r| {
-            let (raw, gseq) = r?;
-            Ok((raw.into_event()?, gseq.map(|g| g as u64)))
-        })
-        .collect()
+        load_with_gseq(&self.conn, None)
     }
 
     /// Highest control gseq (0 when empty).
@@ -922,6 +1093,67 @@ impl Store {
             .transpose()
     }
 
+    /// The first `limit` queued prompts of `thread`, in the order they run (`thread.queue`).
+    pub fn pending_list(&self, thread: &str, limit: usize) -> anyhow::Result<Vec<QueuedPrompt>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, prompt, from_, source, queued_at, user_sent IS NOT NULL
+             FROM pending_prompts WHERE thread = ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![thread, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, bool>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, prompt, from, source, queued_at, user_sent) = row?;
+            out.push(QueuedPrompt {
+                id,
+                prompt,
+                from: turn_from_parse(&from)?,
+                source: Source::from_str(&source)?,
+                queued_at,
+                user_sent,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The newest queued prompt of `thread` that a user sent (a client of theirs, the row
+    /// marked as their send: a gated send let go later holds reports agents wrote), wherever
+    /// it is in the queue: what the TUI's `↑` takes back to edit.
+    pub fn newest_user_pending(&self, thread: &str) -> anyhow::Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM pending_prompts WHERE thread = ?1 AND from_ = 'user'
+                 AND source LIKE 'user:%' AND user_sent IS NOT NULL ORDER BY id DESC LIMIT 1",
+                params![thread],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Records that the user asked for queued prompt `id` to run (`message.send_now` on a held
+    /// queue), at control head `head`, as a send of theirs records it (`user_sent`): a hub
+    /// started after a crash finds the hold released ([`Store::user_sent_since`]). The row's
+    /// sender and authority (`from_`, `source`, `said_after`) stay as they were; a mark from
+    /// an earlier send of the user's (before the crash that holds the queue) moves to `head`.
+    /// Whether a row changed.
+    pub fn mark_user_sent(&mut self, id: i64, head: u64) -> anyhow::Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE pending_prompts SET user_sent = ?2
+             WHERE id = ?1 AND (user_sent IS NULL OR user_sent < ?2)",
+            params![id, to_i64(head)?],
+        )? > 0)
+    }
+
     /// Number of queued prompts of `thread`.
     pub fn pending_count(&self, thread: &str) -> anyhow::Result<u64> {
         let n: i64 = self.conn.query_row(
@@ -981,7 +1213,7 @@ fn insert_prompt(
 }
 
 /// Creates `path` empty with mode 0600 if it does not exist (SQLite then initializes it).
-fn create_private(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn create_private(path: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     match std::fs::OpenOptions::new()
         .write(true)
@@ -996,7 +1228,7 @@ fn create_private(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Restricts the database and its `-wal` / `-shm` files to their owner (mode 0600).
-fn restrict_db_files(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn restrict_db_files(path: &Path) -> anyhow::Result<()> {
     for suffix in ["", "-wal", "-shm"] {
         let mut f = path.as_os_str().to_owned();
         f.push(suffix);
@@ -1041,15 +1273,20 @@ fn row_to_pending(r: &Row<'_>) -> rusqlite::Result<PendingRow> {
     ))
 }
 
-fn pending_from_row(
-    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
-) -> anyhow::Result<PendingPrompt> {
-    let from = match from.as_str() {
+/// A `pending_prompts.from_` value.
+fn turn_from_parse(from: &str) -> anyhow::Result<TurnFrom> {
+    Ok(match from {
         "user" => TurnFrom::User,
         "orchestrator" => TurnFrom::Orchestrator,
         "runtime" => TurnFrom::Runtime,
         other => bail!("bad pending prompt sender {other:?}"),
-    };
+    })
+}
+
+fn pending_from_row(
+    (id, thread, prompt, from, routed_by, source, said_after): PendingRow,
+) -> anyhow::Result<PendingPrompt> {
+    let from = turn_from_parse(&from)?;
     Ok(PendingPrompt {
         id,
         thread,
@@ -1101,8 +1338,8 @@ fn row_to_raw(r: &Row<'_>) -> rusqlite::Result<RawRow> {
 
 impl RawRow {
     fn into_event(self) -> anyhow::Result<Event> {
-        let data: serde_json::Value =
-            serde_json::from_str(&self.data).with_context(|| format!("event {} data", self.id))?;
+        let body = EventBody::from_kind_json(&self.kind, Some(&self.data))
+            .with_context(|| format!("event {} ({}) data", self.id, self.kind))?;
         Ok(Event {
             v: self.v,
             seq: self.seq as u64,
@@ -1110,8 +1347,7 @@ impl RawRow {
             thread: self.thread,
             turn: self.turn.map(|t| t as u64),
             source: Source::from_str(&self.source)?,
-            body: EventBody::from_kind_data(&self.kind, data)
-                .with_context(|| format!("event {} ({})", self.id, self.kind))?,
+            body,
             raw: self.raw,
             id: self.id,
         })
@@ -1135,6 +1371,102 @@ pub fn read_thread_events(
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// [`read_thread_events`] as the lines a thread subscription writes ([`stream_line`]), each
+/// with its seq.
+pub fn read_thread_lines(
+    conn: &Connection,
+    thread: &str,
+    since_seq: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3"
+    ))?;
+    let rows = st.query_map(
+        params![thread, to_i64(since_seq)?, limit as i64],
+        row_to_raw,
+    )?;
+    rows.map(|r| {
+        let row = r?;
+        let seq = row.seq as u64;
+        let mut line = Vec::new();
+        stream_line(row, None, &mut line)?;
+        Ok((seq, line))
+    })
+    .collect()
+}
+
+/// The line a subscription writes for event row `row` (with its newline), a control item
+/// when it has a `gseq`: what serializing its [`twr_core::proto::StreamItem`] writes, read
+/// back the same. The row's `data` goes in as stored, without parsing it into its type and
+/// writing that back out, which costs a replay of thousands most of its time. Only a row
+/// whose `data` is not one JSON value on one line, or whose `ts` or `source` does not read,
+/// goes through its type ([`RawRow::into_event`]), which then also fails as it would.
+fn stream_line(row: RawRow, gseq: Option<u64>, out: &mut Vec<u8>) -> anyhow::Result<()> {
+    use serde_json::value::RawValue;
+    let data = serde_json::from_str::<&RawValue>(&row.data)
+        .ok()
+        .filter(|d| !d.get().contains(['\n', '\r']));
+    // The envelope as `Event` writes it: the time to the millisecond in UTC, the source
+    // spelled its way.
+    let ts = DateTime::parse_from_rfc3339(&row.ts).ok().map(|t| {
+        t.with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
+    let source = Source::from_str(&row.source).ok().map(|s| s.to_string());
+    let readable = row.seq >= 0 && row.turn.is_none_or(|t| t >= 0);
+    let (Some(data), Some(ts), Some(source), true) = (data, ts, source, readable) else {
+        let item = twr_core::proto::StreamItem {
+            stream: if gseq.is_some() {
+                twr_core::proto::StreamKind::Control
+            } else {
+                twr_core::proto::StreamKind::Thread
+            },
+            gseq,
+            event: row.into_event()?,
+        };
+        serde_json::to_writer(&mut *out, &item)?;
+        out.push(b'\n');
+        return Ok(());
+    };
+    let text = |out: &mut Vec<u8>, s: &str| serde_json::to_writer(&mut *out, s);
+    match gseq {
+        Some(g) => {
+            out.extend_from_slice(br#"{"stream":"control","gseq":"#);
+            out.extend_from_slice(g.to_string().as_bytes());
+        }
+        None => out.extend_from_slice(br#"{"stream":"thread""#),
+    }
+    out.extend_from_slice(br#","event":{"v":"#);
+    out.extend_from_slice(row.v.to_string().as_bytes());
+    out.extend_from_slice(br#","id":"#);
+    text(out, &row.id)?;
+    out.extend_from_slice(br#","seq":"#);
+    out.extend_from_slice(row.seq.to_string().as_bytes());
+    out.extend_from_slice(br#","ts":"#);
+    text(out, &ts)?;
+    out.extend_from_slice(br#","thread":"#);
+    text(out, &row.thread)?;
+    out.extend_from_slice(br#","turn":"#);
+    match row.turn {
+        Some(t) => out.extend_from_slice(t.to_string().as_bytes()),
+        None => out.extend_from_slice(b"null"),
+    }
+    out.extend_from_slice(br#","source":"#);
+    text(out, &source)?;
+    out.extend_from_slice(br#","kind":"#);
+    text(out, &row.kind)?;
+    out.extend_from_slice(br#","data":"#);
+    out.extend_from_slice(data.get().as_bytes());
+    out.extend_from_slice(br#","raw":"#);
+    match &row.raw {
+        Some(r) => text(out, r)?,
+        None => out.extend_from_slice(b"null"),
+    }
+    out.extend_from_slice(b"}}\n");
+    Ok(())
+}
+
 /// Semantic transcript rows. Hidden streaming text never consumes a page slot.
 pub fn read_transcript_events(
     conn: &Connection,
@@ -1149,7 +1481,7 @@ pub fn read_transcript_events(
               'attention.raised', 'attention.resolved', 'attention.annotated', 'report.ready',
               'thread.stopped', 'thread.crashed', 'thread.mode_changed', 'thread.model_changed',
               'thread.renamed', 'conversation.update', 'thread.deleted', 'thread.restored',
-              'project.read')
+              'project.read', 'memory.changed', 'context.compacted')
               OR (kind = 'task.updated' AND COALESCE(json_extract(data, '$.heartbeat'), 0) = 0)
               OR (kind = 'agent.text' AND json_extract(data, '$.final') = 1))
          ORDER BY seq LIMIT ?4"
@@ -1161,6 +1493,22 @@ pub fn read_transcript_events(
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// [`transcript_bounds`]'s start: the seq of `thread`'s latest `turn.started` (of turn `?2`,
+/// when given), read off `events_kind_turn` (the thread's turn starts alone; SQLite would
+/// walk every row of the thread otherwise).
+const TURN_START: &str = "SELECT MAX(seq) FROM events INDEXED BY events_kind_turn
+     WHERE kind = 'turn.started' AND thread = ?1 AND (?2 IS NULL OR turn = ?2)";
+
+/// [`turn_reactions`]: off `events_kind_turn`, three short lookups. SQLite otherwise walks
+/// every row of the thread (`(thread, seq)`), which start-up recovery does for each thread's
+/// last turn: seconds for a long-lived thread whose pages are not in the cache.
+const TURN_REACTIONS: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events INDEXED BY events_kind_turn WHERE thread = ?1 AND turn = ?2
+     AND kind IN ('decision.made', 'report.ready', 'attention.raised') ORDER BY seq"
+);
+
 /// The sequence bounds of a turn, including lifecycle events after its end.
 pub fn transcript_bounds(
     conn: &Connection,
@@ -1168,8 +1516,7 @@ pub fn transcript_bounds(
     turn: Option<u64>,
 ) -> anyhow::Result<(u64, u64, Option<u64>)> {
     let start: Option<i64> = conn.query_row(
-        "SELECT MAX(seq) FROM events WHERE thread = ?1 AND kind = 'turn.started'
-         AND (?2 IS NULL OR turn = ?2)",
+        TURN_START,
         params![thread, turn.map(to_i64).transpose()?],
         |r| r.get(0),
     )?;
@@ -1238,6 +1585,377 @@ pub fn read_control(
         Ok((g, raw.into_event()?))
     })
     .collect()
+}
+
+/// [`read_decisions`]'s query, selecting the events' columns `cols`. (`CROSS JOIN`: the events
+/// of the kind first, whatever the planner would make of the order.)
+fn decisions_sql(cols: &str) -> String {
+    format!(
+        "SELECT c.gseq, {cols} FROM events e CROSS JOIN control c
+         ON c.thread = e.thread AND c.seq = e.seq
+         WHERE e.kind = 'decision.made' AND c.gseq < ?1
+         ORDER BY c.gseq DESC LIMIT ?2"
+    )
+}
+
+/// The newest `limit` `decision.made` control items with `gseq < before`, newest first (as
+/// stored: a capped payload is not hydrated). Read from the kind's rows (`events_kind_turn`),
+/// not the whole control stream: a decision is one item in hundreds.
+pub fn read_decisions(
+    conn: &Connection,
+    before: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Event)>> {
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare_cached(&decisions_sql(&cols))?;
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let rows = st.query_map(params![before, limit as i64], |r| {
+        let gseq: i64 = r.get(0)?;
+        Ok((
+            gseq as u64,
+            RawRow {
+                thread: r.get(1)?,
+                seq: r.get(2)?,
+                id: r.get(3)?,
+                v: r.get(4)?,
+                ts: r.get(5)?,
+                turn: r.get(6)?,
+                source: r.get(7)?,
+                kind: r.get(8)?,
+                data: r.get(9)?,
+                raw: r.get(10)?,
+            },
+        ))
+    })?;
+    rows.map(|r| {
+        let (g, raw) = r?;
+        Ok((g, raw.into_event()?))
+    })
+    .collect()
+}
+
+/// [`read_control`] as the lines a control subscription writes ([`stream_line`]).
+pub fn read_control_lines(
+    conn: &Connection,
+    since: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT c.gseq, {cols} FROM control c JOIN events e ON e.thread = c.thread AND e.seq = c.seq
+         WHERE c.gseq > ?1 ORDER BY c.gseq LIMIT ?2"
+    ))?;
+    let rows = st.query_map(params![to_i64(since)?, limit as i64], |r| {
+        let gseq: i64 = r.get(0)?;
+        Ok((
+            gseq as u64,
+            RawRow {
+                thread: r.get(1)?,
+                seq: r.get(2)?,
+                id: r.get(3)?,
+                v: r.get(4)?,
+                ts: r.get(5)?,
+                turn: r.get(6)?,
+                source: r.get(7)?,
+                kind: r.get(8)?,
+                data: r.get(9)?,
+                raw: r.get(10)?,
+            },
+        ))
+    })?;
+    rows.map(|r| {
+        let (g, row) = r?;
+        let mut line = Vec::new();
+        stream_line(row, Some(g), &mut line)?;
+        Ok((g, line))
+    })
+    .collect()
+}
+
+/// The events after row `after` (every event for `None`) in append order, each with its control
+/// gseq (`None` for non-control events).
+pub fn load_with_gseq(
+    conn: &Connection,
+    after: Option<i64>,
+) -> anyhow::Result<Vec<(Event, Option<u64>)>> {
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare(&format!(
+        "SELECT {cols}, c.gseq FROM events e
+         LEFT JOIN control c ON c.thread = e.thread AND c.seq = e.seq
+         WHERE e.rowid > ?1
+         ORDER BY e.rowid"
+    ))?;
+    let rows = st.query_map([after.unwrap_or(i64::MIN)], |r| {
+        let gseq: Option<i64> = r.get(10)?;
+        Ok((row_to_raw(r)?, gseq))
+    })?;
+    rows.map(|r| {
+        let (raw, gseq) = r?;
+        Ok((raw.into_event()?, gseq.map(|g| g as u64)))
+    })
+    .collect()
+}
+
+/// How many events come after row `after` (every event for `None`).
+pub fn events_after(conn: &Connection, after: Option<i64>) -> anyhow::Result<u64> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE rowid > ?1",
+        [after.unwrap_or(i64::MIN)],
+        |r| r.get(0),
+    )?;
+    Ok(n as u64)
+}
+
+/// Where event `id` is in the log now: its row id (rows keep their order, but a `VACUUM` may
+/// renumber them: never kept across one) and its control gseq (`None` for a non-control event).
+/// `None` when the log has no such event.
+pub fn event_position(conn: &Connection, id: &str) -> anyhow::Result<Option<(i64, Option<u64>)>> {
+    Ok(conn
+        .query_row(
+            "SELECT e.rowid, c.gseq FROM events e
+             LEFT JOIN control c ON c.thread = e.thread AND c.seq = e.seq
+             WHERE e.id = ?1",
+            [id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
+        .map(|(row, g)| (row, g.map(|g| g as u64))))
+}
+
+/// A checkpoint of the hub's folded state (`checkpoints`), without the state itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointMeta {
+    /// Row id: the newest has the highest.
+    pub id: i64,
+    /// The state's format version.
+    pub format: i64,
+    /// The build that wrote it.
+    pub build: String,
+    /// What the fold read of the hub's settings then.
+    pub config: String,
+    /// The control position of `last_event`.
+    pub gseq: u64,
+    /// The id of the last event it covers: a control event.
+    pub last_event: String,
+    /// When it was written (RFC 3339).
+    pub created: String,
+    /// What the writer computed of the row (`hub::checkpoint`): a state or a field changed
+    /// since does not match it.
+    pub checksum: String,
+    /// The size of the state, in bytes.
+    pub bytes: u64,
+}
+
+/// A checkpoint to record ([`insert_checkpoint`]).
+#[derive(Debug, Clone)]
+pub struct NewCheckpoint<'a> {
+    /// The state's format version.
+    pub format: i64,
+    /// The build that writes it.
+    pub build: &'a str,
+    /// What the fold read of the hub's settings.
+    pub config: &'a str,
+    /// The control position of `last_event`.
+    pub gseq: u64,
+    /// The last event it covers: a control event.
+    pub last_event: &'a str,
+    /// What the writer computed of the row.
+    pub checksum: &'a str,
+    /// The state.
+    pub state: &'a [u8],
+}
+
+/// Every checkpoint, newest first.
+pub fn checkpoints(conn: &Connection) -> anyhow::Result<Vec<CheckpointMeta>> {
+    let mut st = conn.prepare(
+        "SELECT id, format, build, config, gseq, last_event, created, checksum, length(state)
+         FROM checkpoints ORDER BY id DESC",
+    )?;
+    let rows = st.query_map([], |r| {
+        Ok(CheckpointMeta {
+            id: r.get(0)?,
+            format: r.get(1)?,
+            build: r.get(2)?,
+            config: r.get(3)?,
+            gseq: r.get::<_, i64>(4)? as u64,
+            last_event: r.get(5)?,
+            created: r.get(6)?,
+            checksum: r.get(7)?,
+            bytes: r.get::<_, i64>(8)? as u64,
+        })
+    })?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// The state of checkpoint `id` (`None`: no such checkpoint).
+pub fn checkpoint_state(conn: &Connection, id: i64) -> anyhow::Result<Option<Vec<u8>>> {
+    Ok(conn
+        .query_row("SELECT state FROM checkpoints WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?)
+}
+
+/// Records checkpoint `c` and drops all but the newest [`CHECKPOINTS_KEPT`] of each of the
+/// [`CHECKPOINT_BUILDS_KEPT`] builds whose newest checkpoint is newest, in one transaction.
+/// Returns its id.
+pub fn insert_checkpoint(conn: &Connection, c: &NewCheckpoint<'_>) -> anyhow::Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT INTO checkpoints
+             (format, build, config, gseq, last_event, created, checksum, state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            c.format,
+            c.build,
+            c.config,
+            to_i64(c.gseq)?,
+            c.last_event,
+            Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            c.checksum,
+            c.state
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.execute(
+        "DELETE FROM checkpoints WHERE id NOT IN
+         (SELECT id FROM
+            (SELECT id, build,
+                    ROW_NUMBER() OVER (PARTITION BY build ORDER BY id DESC) AS nth
+             FROM checkpoints)
+          WHERE nth <= ?1
+            AND build IN (SELECT build FROM checkpoints GROUP BY build
+                          ORDER BY MAX(id) DESC LIMIT ?2))",
+        params![CHECKPOINTS_KEPT as i64, CHECKPOINT_BUILDS_KEPT as i64],
+    )?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Drops every checkpoint (the next hub start replays the whole log). Returns how many.
+pub fn drop_checkpoints(conn: &Connection) -> anyhow::Result<usize> {
+    Ok(conn.execute("DELETE FROM checkpoints", [])?)
+}
+
+/// The control items with `gseq` in `(since, until]`, oldest first, at most `limit`, as the
+/// compacted backlog's selection reads them ([`twr_core::compact::Row::stored`]): no event is
+/// decoded, and only the `data` of the kinds it reads is fetched.
+pub fn read_control_rows(
+    conn: &Connection,
+    since: u64,
+    until: u64,
+    limit: usize,
+) -> anyhow::Result<Vec<twr_core::compact::Row>> {
+    let kinds = twr_core::compact::DATA_KINDS
+        .iter()
+        .map(|k| format!("'{k}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut st = conn.prepare_cached(&format!(
+        "SELECT c.gseq, c.thread, c.seq, e.kind, e.source,
+                CASE WHEN e.kind IN ({kinds}) THEN e.data END
+         FROM control c JOIN events e ON e.thread = c.thread AND e.seq = c.seq
+         WHERE c.gseq > ?1 AND c.gseq <= ?2 ORDER BY c.gseq LIMIT ?3"
+    ))?;
+    let mut rows = st.query(params![to_i64(since)?, to_i64(until)?, limit as i64])?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let gseq: i64 = r.get(0)?;
+        let seq: i64 = r.get(2)?;
+        out.push(twr_core::compact::Row::stored(
+            gseq as u64,
+            r.get(1)?,
+            seq as u64,
+            r.get_ref(3)?.as_str()?,
+            r.get_ref(4)?.as_str()?,
+            r.get_ref(5)?.as_str_or_null()?,
+        ));
+    }
+    Ok(out)
+}
+
+/// The control items at `gseqs` (ascending), as the lines a control subscription writes
+/// ([`stream_line`]), oldest first. A gseq with no item is skipped.
+pub fn read_control_lines_at(
+    conn: &Connection,
+    gseqs: &[u64],
+) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+    read_control_at(conn, gseqs, |g, row| {
+        let mut line = Vec::new();
+        stream_line(row, Some(g), &mut line)?;
+        Ok(line)
+    })
+}
+
+/// The control items at `gseqs` (ascending), oldest first ([`read_control_lines_at`] as
+/// events).
+pub fn read_control_events_at(
+    conn: &Connection,
+    gseqs: &[u64],
+) -> anyhow::Result<Vec<(u64, Event)>> {
+    read_control_at(conn, gseqs, |_, row| row.into_event())
+}
+
+/// The rows of the control items at `gseqs`, each made into what `f` makes of it.
+fn read_control_at<T>(
+    conn: &Connection,
+    gseqs: &[u64],
+    mut f: impl FnMut(u64, RawRow) -> anyhow::Result<T>,
+) -> anyhow::Result<Vec<(u64, T)>> {
+    /// Gseqs asked per statement.
+    const CHUNK: usize = 256;
+    let cols = EVENT_COLS
+        .split(", ")
+        .map(|c| format!("e.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = Vec::with_capacity(gseqs.len());
+    for chunk in gseqs.chunks(CHUNK) {
+        let marks = vec!["?"; chunk.len()].join(", ");
+        let mut st = conn.prepare_cached(&format!(
+            "SELECT c.gseq, {cols} FROM control c JOIN events e ON e.thread = c.thread AND e.seq = c.seq
+             WHERE c.gseq IN ({marks}) ORDER BY c.gseq"
+        ))?;
+        let args = chunk
+            .iter()
+            .map(|g| to_i64(*g))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let rows = st.query_map(rusqlite::params_from_iter(args), |r| {
+            let gseq: i64 = r.get(0)?;
+            Ok((
+                gseq as u64,
+                RawRow {
+                    thread: r.get(1)?,
+                    seq: r.get(2)?,
+                    id: r.get(3)?,
+                    v: r.get(4)?,
+                    ts: r.get(5)?,
+                    turn: r.get(6)?,
+                    source: r.get(7)?,
+                    kind: r.get(8)?,
+                    data: r.get(9)?,
+                    raw: r.get(10)?,
+                },
+            ))
+        })?;
+        for r in rows {
+            let (g, row) = r?;
+            out.push((g, f(g, row)?));
+        }
+    }
+    Ok(out)
 }
 
 /// Highest control gseq (0 when empty).
@@ -1309,10 +2027,7 @@ pub struct TurnReactions {
 
 /// Reads the [`TurnReactions`] of a turn from the log.
 pub fn turn_reactions(conn: &Connection, thread: &str, turn: u64) -> anyhow::Result<TurnReactions> {
-    let mut st = conn.prepare_cached(&format!(
-        "SELECT {EVENT_COLS} FROM events WHERE thread = ?1 AND turn = ?2
-         AND kind IN ('decision.made', 'report.ready', 'attention.raised') ORDER BY seq"
-    ))?;
+    let mut st = conn.prepare_cached(TURN_REACTIONS)?;
     let rows = st.query_map(params![thread, to_i64(turn)?], row_to_raw)?;
     let mut out = TurnReactions::default();
     for r in rows {
@@ -1345,31 +2060,44 @@ pub fn turn_reactions(conn: &Connection, thread: &str, turn: u64) -> anyhow::Res
     Ok(out)
 }
 
-/// Every `turn.ended` (as stored) of a turn that has no `report.ready`, oldest first, except
-/// on the threads in `skip` (the orchestrators: their turns get no report): the turns whose
-/// reactions startup recovery completes (`Core::recover_turn_reactions`).
-pub fn unreported_turn_ends(conn: &Connection, skip: &[String]) -> anyhow::Result<Vec<Event>> {
+/// Every `turn.ended` (as stored) of a turn that has no `report.ready`, oldest first, of the
+/// threads in `threads` (the live workers: the orchestrators' turns get no report, and a deleted
+/// thread's are never completed): the turns whose reactions startup recovery completes
+/// (`Core::recover_turn_reactions`). Reads only those threads' ends (`events_kind_turn`), not
+/// every thread's history.
+pub fn unreported_turn_ends(conn: &Connection, threads: &[String]) -> anyhow::Result<Vec<Event>> {
     let mut st = conn.prepare(&format!(
-        "SELECT {EVENT_COLS} FROM events e WHERE e.kind = 'turn.ended' AND e.turn IS NOT NULL
+        "SELECT {EVENT_COLS} FROM events e WHERE e.kind = 'turn.ended'
+         AND e.thread IN (SELECT value FROM json_each(?1)) AND e.turn IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM events r WHERE r.kind = 'report.ready'
                          AND r.thread = e.thread AND r.turn = e.turn)
-         AND e.thread NOT IN (SELECT value FROM json_each(?1))
          ORDER BY e.rowid"
     ))?;
-    let rows = st.query_map(params![serde_json::to_string(skip)?], row_to_raw)?;
+    let rows = st.query_map(params![serde_json::to_string(threads)?], row_to_raw)?;
     rows.map(|r| r?.into_event()).collect()
 }
 
-/// The turns of `thread` that ended `error` (as recorded) and have no hub-raised
-/// `attention.raised{reason: error}`, oldest first: the failed orchestrator turns whose item
-/// startup recovery raises (`Core::recover_turn_reactions`).
+/// The turns of `thread` that ended `error` (as recorded), or are a compaction the user asked
+/// for (`ext.twr.compact`) whose `context.compacted` says it failed though the turn ended
+/// `completed` (not `interrupted`: a cancelled one is no failure, as live), and have no
+/// hub-raised `attention.raised{reason: error}`, oldest first: the
+/// failed orchestrator turns whose item startup recovery raises
+/// (`Core::recover_turn_reactions`).
 pub fn failed_turns_without_error_item(
     conn: &Connection,
     thread: &str,
 ) -> anyhow::Result<Vec<u64>> {
     let mut st = conn.prepare_cached(
         "SELECT e.turn FROM events e WHERE e.kind = 'turn.ended' AND e.thread = ?1
-         AND e.turn IS NOT NULL AND json_extract(e.data, '$.result') = 'error'
+         AND e.turn IS NOT NULL
+         AND (json_extract(e.data, '$.result') = 'error'
+              OR (json_extract(e.data, '$.result') != 'interrupted'
+                  AND EXISTS (SELECT 1 FROM events s WHERE s.kind = 'turn.started'
+                          AND s.thread = e.thread AND s.turn = e.turn
+                          AND json_extract(s.data, '$.ext.twr.compact') = 1)
+                  AND EXISTS (SELECT 1 FROM events c WHERE c.kind = 'context.compacted'
+                              AND c.thread = e.thread AND c.turn = e.turn
+                              AND json_extract(c.data, '$.error') IS NOT NULL)))
          AND NOT EXISTS (SELECT 1 FROM events a WHERE a.kind = 'attention.raised'
                          AND a.thread = e.thread AND a.turn = e.turn AND a.source = ?2
                          AND json_extract(a.data, '$.reason') = 'error')
@@ -1442,6 +2170,46 @@ const LAST_FINAL_TEXT: &str = concat!(
      AND json_extract(data, '$.final') = 1 ORDER BY +seq DESC LIMIT 1"
 );
 
+/// [`latest_final_text`]. Ordered by `turn` first, which `events_kind_turn` gives walking
+/// backwards: SQLite reads the texts of the newest turns until a turn has a final one (and
+/// sorts only that turn's by `seq`), where `ORDER BY +seq` would read and sort every text of
+/// the thread.
+const LATEST_FINAL_TEXT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'agent.text' AND thread = ?1
+     AND json_extract(data, '$.final') = 1 ORDER BY turn DESC, seq DESC LIMIT 1"
+);
+
+/// [`speakable_finals`]: the thread's events walked backwards by `seq` from `?2` (the
+/// primary key; `+kind` keeps SQLite off `events_kind_turn`, which would read and sort every
+/// text of the thread), its final texts only. By `seq`, not by turn: a late text of an older
+/// turn (a runtime's notice in a turn it reopened) comes where it was said, and the page's
+/// cursor is a `seq`.
+const FINALS_BEFORE: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE thread = ?1 AND seq < ?2 AND +kind = 'agent.text' AND turn IS NOT NULL
+     AND json_extract(data, '$.final') = 1 ORDER BY seq DESC LIMIT ?3"
+);
+
+/// [`next_final_text`].
+const NEXT_FINAL_TEXT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'agent.text' AND thread = ?1 AND turn = ?2 AND seq >= ?3
+     AND json_extract(data, '$.final') = 1 ORDER BY +seq LIMIT 1"
+);
+
+/// [`updates_about`]: through the kind index (`+seq`: not the primary key's order, which would
+/// read every event of the conversation), the thread's updates only, filtered before the limit.
+const UPDATES_ABOUT: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'conversation.update' AND thread = ?1
+     AND json_extract(data, '$.about_thread') = ?2 ORDER BY +seq DESC LIMIT ?3"
+);
+
 /// [`latest_of_kind`].
 const LATEST_OF_KIND: &str = concat!(
     "SELECT ",
@@ -1450,9 +2218,48 @@ const LATEST_OF_KIND: &str = concat!(
      WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC LIMIT ?3) ORDER BY seq DESC"
 );
 
+/// [`newest_runtime_start`]: through the kind index (`+seq`, as [`UPDATES_ABOUT`]), every
+/// predicate applied before the limit.
+const NEWEST_RUNTIME_START: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1
+     AND seq < ?2 AND source LIKE 'adapter:%'
+     AND (json_extract(data, '$.session_id') = ?3
+          OR (?4 AND json_extract(data, '$.session_id') IS NULL))
+     ORDER BY +seq DESC LIMIT 1"
+);
+
+/// [`has_stamped_start`].
+const HAS_STAMPED_START: &str = "SELECT EXISTS (SELECT 1 FROM events
+     WHERE kind IN ('thread.started', 'thread.resumed') AND thread = ?1 AND seq < ?2
+     AND source LIKE 'adapter:%' AND json_extract(data, '$.ext.twr.mode') IS NOT NULL)";
+
+/// [`latest_runtime_moves`]: the runtime moves only, filtered before the limit.
+const LATEST_RUNTIME_MOVES: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1
+     AND json_extract(data, '$.runtime') IS NOT NULL ORDER BY +seq DESC LIMIT ?2"
+);
+
+/// [`newest_account_move`].
+const NEWEST_ACCOUNT_MOVE: &str = concat!(
+    "SELECT ",
+    event_cols!(),
+    " FROM events WHERE kind = 'thread.model_changed' AND thread = ?1 AND seq < ?2
+     AND json_extract(data, '$.runtime') IS NOT NULL
+     AND json_extract(data, '$.account_changed') = 1 ORDER BY +seq DESC LIMIT 1"
+);
+
 /// [`seqs_of_kind`].
 const SEQS_OF_KIND: &str =
     "SELECT seq FROM events WHERE kind = ?1 AND thread = ?2 ORDER BY +seq DESC";
+
+/// [`work_turn_seqs_after`].
+const WORK_TURN_SEQS_AFTER: &str = "SELECT seq FROM events WHERE kind = 'turn.started'
+     AND thread = ?1 AND seq > ?2 AND json_extract(data, '$.ext.twr.compact') IS NOT 1
+     ORDER BY +seq DESC";
 
 /// [`event_at`].
 const EVENT_AT: &str = concat!(
@@ -1497,6 +2304,52 @@ pub fn last_final_text(
     let mut st = conn.prepare_cached(LAST_FINAL_TEXT)?;
     let row = st
         .query_row(params![thread, to_i64(turn)?], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// The latest final `agent.text` of `thread` in any turn (that of its newest turn that has
+/// one: turns follow the log), as stored (possibly capped).
+pub fn latest_final_text(conn: &Connection, thread: &str) -> anyhow::Result<Option<Event>> {
+    let mut st = conn.prepare_cached(LATEST_FINAL_TEXT)?;
+    let row = st.query_row(params![thread], row_to_raw).optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// The final `agent.text`s of `thread` in a turn, newest first, those with `seq < before_seq`
+/// (all with `None`), at most `limit`, as stored (possibly capped): what `speech.request` reads
+/// aloud (`hub::speech`), a page at a time.
+pub fn speakable_finals(
+    conn: &Connection,
+    thread: &str,
+    before_seq: Option<u64>,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let before = match before_seq {
+        Some(s) => to_i64(s)?,
+        None => i64::MAX,
+    };
+    let mut st = conn.prepare_cached(FINALS_BEFORE)?;
+    let rows = st.query_map(params![thread, before, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The `turn.started` of turn `turn` of `thread`, as stored (possibly capped).
+pub fn turn_start(conn: &Connection, thread: &str, turn: u64) -> anyhow::Result<Option<Event>> {
+    last_of_kind(conn, thread, Some(turn), "turn.started")
+}
+
+/// The first final `agent.text` of turn `turn` of `thread` at or after `seq`, as stored
+/// (possibly capped): the message a streamed text from `seq` (a delta of it) became.
+pub fn next_final_text(
+    conn: &Connection,
+    thread: &str,
+    turn: u64,
+    seq: u64,
+) -> anyhow::Result<Option<Event>> {
+    let mut st = conn.prepare_cached(NEXT_FINAL_TEXT)?;
+    let row = st
+        .query_row(params![thread, to_i64(turn)?, to_i64(seq)?], row_to_raw)
         .optional()?;
     row.map(|r| r.into_event()).transpose()
 }
@@ -1555,11 +2408,96 @@ pub fn latest_of_kind(
     rows.map(|r| r?.into_event()).collect()
 }
 
+/// The newest `thread.started` / `thread.resumed` of `thread` before `before` that a runtime
+/// reported (`source` `adapter:<runtime>`: not a park's or a user's resume the hub recorded)
+/// naming session `session`, or, with `or_none`, naming none; as stored (possibly capped: a
+/// session id is never moved to a blob). However many other starts came after it.
+pub fn newest_runtime_start(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+    session: &str,
+    or_none: bool,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_RUNTIME_START)?
+        .query_row(params![thread, before, session, or_none], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// Whether `thread` has a `thread.started` / `thread.resumed` before `before` a runtime
+/// reported that the hub (or a runner) stamped with the settings it ran in (`ext.twr.mode`,
+/// `hub::restart`).
+pub fn has_stamped_start(conn: &Connection, thread: &str, before: u64) -> anyhow::Result<bool> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    Ok(conn
+        .prepare_cached(HAS_STAMPED_START)?
+        .query_row(params![thread, before], |r| r.get(0))?)
+}
+
+/// The latest `limit` runtime moves of `thread` (`thread.model_changed` with a `runtime`),
+/// newest first, as stored (possibly capped): however many model or effort changes came
+/// after them.
+pub fn latest_runtime_moves(
+    conn: &Connection,
+    thread: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(LATEST_RUNTIME_MOVES)?;
+    let rows = st.query_map(params![thread, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
+/// The newest runtime move of `thread` before `before` that changed the account
+/// (`thread.model_changed` with a `runtime` and `account_changed`), as stored (possibly
+/// capped): however many other moves came after it.
+pub fn newest_account_move(
+    conn: &Connection,
+    thread: &str,
+    before: u64,
+) -> anyhow::Result<Option<Event>> {
+    let before = i64::try_from(before).unwrap_or(i64::MAX);
+    let row = conn
+        .prepare_cached(NEWEST_ACCOUNT_MOVE)?
+        .query_row(params![thread, before], row_to_raw)
+        .optional()?;
+    row.map(|r| r.into_event()).transpose()
+}
+
+/// The latest `limit` `conversation.update`s of `thread` about thread `about`
+/// (`about_thread`), newest first, as stored (possibly capped): however many updates about
+/// other threads came after them.
+pub fn updates_about(
+    conn: &Connection,
+    thread: &str,
+    about: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<Event>> {
+    let mut st = conn.prepare_cached(UPDATES_ABOUT)?;
+    let rows = st.query_map(params![thread, about, limit as i64], row_to_raw)?;
+    rows.map(|r| r?.into_event()).collect()
+}
+
 /// The `seq` of every event of kind `kind` of `thread`, newest first: for reading them one at
 /// a time ([`event_at`]) until enough are read.
 pub fn seqs_of_kind(conn: &Connection, thread: &str, kind: &str) -> anyhow::Result<Vec<u64>> {
     let mut st = conn.prepare_cached(SEQS_OF_KIND)?;
     let rows = st.query_map(params![kind, thread], |r| r.get::<_, i64>(0))?;
+    rows.map(|s| Ok(u64::try_from(s?)?)).collect()
+}
+
+/// The `seq` of every `turn.started` of `thread` after `after` that is no compaction
+/// (`ext.twr.compact`), newest first: the work turns since then, for reading them one at a
+/// time ([`event_at`]).
+pub fn work_turn_seqs_after(
+    conn: &Connection,
+    thread: &str,
+    after: u64,
+) -> anyhow::Result<Vec<u64>> {
+    let mut st = conn.prepare_cached(WORK_TURN_SEQS_AFTER)?;
+    let rows = st.query_map(params![thread, to_i64(after)?], |r| r.get::<_, i64>(0))?;
     rows.map(|s| Ok(u64::try_from(s?)?)).collect()
 }
 
@@ -1684,6 +2622,120 @@ mod tests {
         })
     }
 
+    /// The lines a replay writes, with their `data` as stored, read back as exactly the items
+    /// serializing their events gives: for events of several kinds, control or not, and for
+    /// rows written otherwise (`data` over several lines, which goes through its type and
+    /// comes out on one; another offset and more digits in `ts`; a kind this build does not
+    /// know).
+    #[test]
+    fn stream_lines_read_as_the_items_they_stand_for() {
+        use twr_core::event::{AttentionRaised, TaskUpdated};
+        use twr_core::proto::{ServerMessage, StreamItem, StreamKind};
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let bodies = vec![
+            EventBody::ThreadStarted(SessionPayload::default()),
+            text("hi \u{1F600} \"quoted\"\n\ttab"),
+            EventBody::TaskUpdated(TaskUpdated {
+                task_id: "b1".into(),
+                running: true,
+                description: "tests".into(),
+                ext: serde_json::json!({"claude": {"n": 1.5}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }),
+            EventBody::AttentionRaised(AttentionRaised {
+                attn_id: "a1".into(),
+                summary: "rm -rf target?".into(),
+                options: vec!["yes".into(), "no".into()],
+                ..Default::default()
+            }),
+            EventBody::ThreadStopped(SessionPayload::default()),
+        ];
+        let mut seq = 0;
+        for body in bodies {
+            seq += 1;
+            let control = body.is_control();
+            let mut e = ev("t1", seq, body);
+            e.turn = (seq % 2 == 0).then_some(seq);
+            e.raw = (seq == 2).then(|| "sha256:00".to_string());
+            s.append(&e, control, AppendExtras::default()).unwrap();
+        }
+        for (data, ts, kind) in [
+            (
+                "{\n  \"task_id\": \"b2\",\n  \"running\": false\n}",
+                "2026-10-20T03:04:05.123Z",
+                "task.updated",
+            ),
+            (
+                r#"{"session_id":"s9"}"#,
+                "2026-10-20T05:04:05.123456+02:00",
+                "thread.stopped",
+            ),
+            (
+                r#"{"later":[1,{"x":null}]}"#,
+                "2026-10-20T03:04:05Z",
+                "thread.from_later",
+            ),
+        ] {
+            seq += 1;
+            s.conn
+                .execute(
+                    "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data, raw)
+                     VALUES ('t1', ?1, ?2, 1, ?3, NULL, 'user:tui', ?4, ?5, NULL)",
+                    params![seq as i64, format!("id-{seq}"), ts, kind, data],
+                )
+                .unwrap();
+            s.conn
+                .execute(
+                    "INSERT INTO control (thread, seq) VALUES ('t1', ?1)",
+                    params![seq as i64],
+                )
+                .unwrap();
+        }
+        let read = |line: &[u8]| -> StreamItem {
+            assert_eq!(line.last(), Some(&b'\n'));
+            assert!(!line[..line.len() - 1].contains(&b'\n'), "one line");
+            match serde_json::from_slice(line).unwrap() {
+                ServerMessage::Stream(item) => *item,
+                ServerMessage::Response(r) => panic!("{r:?}"),
+            }
+        };
+        let through_type = |item: StreamItem| -> StreamItem {
+            serde_json::from_str(&serde_json::to_string(&item).unwrap()).unwrap()
+        };
+        let items = read_control(&s.conn, 0, 100).unwrap();
+        let lines = read_control_lines(&s.conn, 0, 100).unwrap();
+        assert_eq!(lines.len(), items.len());
+        assert!(items.len() >= 5, "{items:?}");
+        for ((g, event), (lg, line)) in items.into_iter().zip(&lines) {
+            assert_eq!(g, *lg);
+            let item = StreamItem {
+                stream: StreamKind::Control,
+                gseq: Some(g),
+                event,
+            };
+            assert_eq!(read(line), through_type(item));
+        }
+        let events = read_thread_events(&s.conn, "t1", 0, 100).unwrap();
+        let lines = read_thread_lines(&s.conn, "t1", 0, 100).unwrap();
+        assert_eq!(lines.len(), seq as usize);
+        assert_eq!(events.len(), lines.len());
+        for (event, (lseq, line)) in events.into_iter().zip(&lines) {
+            assert_eq!(event.seq, *lseq);
+            let item = StreamItem {
+                stream: StreamKind::Thread,
+                gseq: None,
+                event,
+            };
+            assert_eq!(read(line), through_type(item));
+        }
+        // From a seq on, at most a limit.
+        let some = read_thread_lines(&s.conn, "t1", 2, 3).unwrap();
+        assert_eq!(some.iter().map(|(q, _)| *q).collect::<Vec<_>>(), [3, 4, 5]);
+    }
+
     #[test]
     fn append_load_and_read_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -1780,6 +2832,9 @@ mod tests {
         assert_eq!(seq(last_final_text(c, "t1", 1).unwrap()), Some(2));
         assert_eq!(seq(last_final_text(c, "t1", 2).unwrap()), None);
         assert_eq!(seq(last_final_text(c, "t1", 3).unwrap()), Some(8));
+        assert_eq!(seq(latest_final_text(c, "t1").unwrap()), Some(8));
+        assert_eq!(seq(latest_final_text(c, "t2").unwrap()), Some(1));
+        assert_eq!(seq(latest_final_text(c, "t3").unwrap()), None);
         assert_eq!(seqs(latest_of_kind(c, "t1", kind, 2).unwrap()), [6, 4]);
         assert_eq!(
             seqs(latest_of_kind(c, "t1", "agent.text", 9).unwrap()),
@@ -1788,6 +2843,68 @@ mod tests {
         assert_eq!(seqs_of_kind(c, "t1", kind).unwrap(), [6, 4, 1]);
         assert_eq!(event_at(c, "t1", 7).unwrap(), Some(log[7].clone()));
         assert_eq!(event_at(c, "t1", 9).unwrap(), None);
+    }
+
+    /// `decision.made` items, newest first, before a control position, at most so many; read
+    /// off the kind's rows of `events_kind_turn`, never a walk of the control stream.
+    #[test]
+    fn decisions_are_read_newest_first_from_the_kind_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let decision = |chosen: &str| {
+            EventBody::DecisionMade(twr_core::event::DecisionMade {
+                chosen: chosen.into(),
+                ..Default::default()
+            })
+        };
+        let mut seqs: std::collections::HashMap<&str, u64> = Default::default();
+        let mut put = |s: &mut Store, thread: &'static str, body: EventBody| {
+            let seq = seqs.entry(thread).or_default();
+            *seq += 1;
+            let e = ev(thread, *seq, body);
+            let control = e.is_control();
+            s.append(&e, control, AppendExtras::default()).unwrap()
+        };
+        let mut decided = Vec::new();
+        for i in 0..10 {
+            let thread = if i % 2 == 0 { "t1" } else { "t2" };
+            put(&mut s, thread, text("noise"));
+            put(&mut s, thread, EventBody::TurnEnded(Default::default()));
+            let g = put(&mut s, thread, decision(&format!("d{i}"))).unwrap();
+            decided.push((g, format!("d{i}")));
+        }
+        let read = |before: u64, limit: usize| -> Vec<(u64, String)> {
+            read_decisions(s.conn(), before, limit)
+                .unwrap()
+                .into_iter()
+                .map(|(g, e)| match e.body {
+                    EventBody::DecisionMade(d) => (g, d.chosen),
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        let newest: Vec<(u64, String)> = decided.iter().rev().cloned().collect();
+        assert_eq!(read(u64::MAX, 100), newest);
+        assert_eq!(read(u64::MAX, 3), newest[..3]);
+        // Strictly before: the decision at `before` is not read.
+        let at = decided[6].0;
+        assert_eq!(read(at, 2), [decided[5].clone(), decided[4].clone()]);
+        assert_eq!(read(decided[0].0, 5), []);
+        let mut st = s
+            .conn()
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", decisions_sql("e.id")))
+            .unwrap();
+        let plan: Vec<String> = st
+            .query_map(params![1, 1], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(
+            plan.contains("USING INDEX events_kind_turn (kind=?)"),
+            "{plan}"
+        );
+        assert!(!plan.contains("SCAN "), "{plan}");
     }
 
     /// Every per-kind lookup of one thread goes through `events_kind_turn` (then reads the
@@ -1801,8 +2918,11 @@ mod tests {
             LAST_OF_KIND,
             FIRST_OF_KIND,
             LAST_FINAL_TEXT,
+            LATEST_FINAL_TEXT,
             LATEST_OF_KIND,
             SEQS_OF_KIND,
+            TURN_REACTIONS,
+            TURN_START,
         ] {
             let mut st = s
                 .conn()
@@ -1821,7 +2941,48 @@ mod tests {
             );
             assert!(!plan.contains("SCAN "), "{sql}:\n{plan}");
             assert!(!plan.contains("(thread=?)"), "{sql}:\n{plan}");
+            // The latest reply in any turn is read off the index's turn order: only the
+            // texts of the newest turns are read and sorted (by `seq`, within a turn), never
+            // all of the thread's.
+            if sql == LATEST_FINAL_TEXT {
+                assert!(plan.contains("USE TEMP B-TREE FOR "), "{sql}:\n{plan}");
+                assert!(
+                    !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                    "{sql}:\n{plan}"
+                );
+            }
         }
+    }
+
+    /// [`latest_final_text`] reads the texts of the newest turns only: on a thread of 5000
+    /// replies whose last turn has a partial text alone, it takes about as many steps as on
+    /// a thread of one.
+    #[test]
+    fn latest_final_text_reads_the_newest_turns_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let fill = |thread: &str, turns: u32| {
+            s.conn()
+                .execute(
+                    "INSERT INTO events (thread, seq, id, v, ts, turn, source, kind, data)
+                     WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+                     SELECT ?1, i, ?1 || '-' || i, 1, '2026-10-21T00:00:00Z', i, 'adapter:fake',
+                     'agent.text', json_object('text', 'reply ' || i, 'final', json(i < ?2))
+                     FROM n",
+                    params![thread, turns + 1],
+                )
+                .unwrap();
+        };
+        fill("big", 5000);
+        fill("small", 1);
+        let steps = |thread: &str| {
+            let mut st = s.conn().prepare(LATEST_FINAL_TEXT).unwrap();
+            let seq: i64 = st.query_row(params![thread], |r| r.get(1)).unwrap();
+            (seq, st.get_status(rusqlite::StatementStatus::VmStep))
+        };
+        let (big, small) = (steps("big"), steps("small"));
+        assert_eq!((big.0, small.0), (5000, 1));
+        assert!(big.1 < 2 * small.1 + 100, "{big:?} {small:?}");
     }
 
     #[test]
@@ -1842,6 +3003,91 @@ mod tests {
             assert!(err.contains("append-only"), "{sql}: {err}");
         }
         assert_eq!(s.load_all().unwrap().len(), 1);
+    }
+
+    /// Of the events, only agent ones may be deleted (`hub::prune` archives them): a control
+    /// event, or another kind that is not on the control stream, never; an agent event stored
+    /// as a control item (which the hub never does) neither.
+    #[test]
+    fn only_agent_events_may_be_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        let mut s = Store::open(&path).unwrap();
+        let started = EventBody::TurnStarted(Default::default());
+        s.append(&ev("t1", 1, started), true, AppendExtras::default())
+            .unwrap();
+        s.append(&ev("t1", 2, text("a")), false, AppendExtras::default())
+            .unwrap();
+        s.append(&ev("t1", 3, text("b")), true, AppendExtras::default())
+            .unwrap();
+        let limits = EventBody::RuntimeLimits(Default::default());
+        s.append(&ev("t1", 4, limits), false, AppendExtras::default())
+            .unwrap();
+        let conn = connect(&path).unwrap();
+        for seq in [1, 3, 4] {
+            let err = conn
+                .execute("DELETE FROM events WHERE seq = ?1", [seq])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("append-only"), "{seq}: {err}");
+        }
+        assert_eq!(
+            conn.execute("DELETE FROM events WHERE seq = 2", [])
+                .unwrap(),
+            1
+        );
+        let seqs: Vec<u64> = s.load_all().unwrap().iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [1, 3, 4]);
+    }
+
+    /// A database a development build of accounts marked with 9 when 9 meant account data
+    /// (schema 8's tables, no `checkpoints`) gets 9's tables when it is opened, and stays at
+    /// 9 until its replay finds the account data (`Store::fence_accounts`).
+    #[test]
+    fn an_early_accounts_database_at_9_gets_the_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        {
+            let conn = connect(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for schema in [REMOTE_OUTBOX, SCHEMA_4, SCHEMA_5, SCHEMA_6] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        assert!(checkpoints(s.conn()).unwrap().is_empty());
+        assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+        s.append(&ev("t1", 1, text("a")), false, AppendExtras::default())
+            .unwrap();
+        assert_eq!(s.conn().execute("DELETE FROM events", []).unwrap(), 1);
+        s.fence_accounts().unwrap();
+        drop(s);
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), ACCOUNTS_SCHEMA_VERSION);
+        assert!(checkpoints(s.conn()).unwrap().is_empty());
+        assert!(is_own_schema(SCHEMA_VERSION) && is_own_schema(ACCOUNTS_SCHEMA_VERSION));
+        assert!(!is_own_schema(SCHEMA_VERSION - 1) && !is_own_schema(ACCOUNTS_SCHEMA_VERSION + 1));
+    }
+
+    /// A schema 9 database made before agent events could be deleted gets the new trigger
+    /// when it is opened.
+    #[test]
+    fn an_early_schema_9_database_gets_the_prune_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        {
+            let conn = connect(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for schema in [REMOTE_OUTBOX, SCHEMA_4, SCHEMA_5, SCHEMA_6, SCHEMA_9] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+        let mut s = Store::open(&path).unwrap();
+        s.append(&ev("t1", 1, text("a")), false, AppendExtras::default())
+            .unwrap();
+        assert_eq!(s.conn().execute("DELETE FROM events", []).unwrap(), 1);
     }
 
     #[test]
@@ -2086,6 +3332,158 @@ mod tests {
         assert!(s.user_sent_since("t1", 3).unwrap());
         assert!(!s.user_sent_since("t1", 4).unwrap());
         assert!(!s.user_sent_since("t2", 0).unwrap());
+        // Sent now after another crash: the user's earlier mark moves up, never back.
+        assert!(s.mark_user_sent(sent.queued[0], 9).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
+        assert!(!s.mark_user_sent(sent.queued[0], 5).unwrap());
+        assert!(s.user_sent_since("t1", 9).unwrap());
+    }
+
+    fn user_version(s: &Store) -> i32 {
+        s.schema_version().unwrap()
+    }
+
+    fn created(account: Option<&str>) -> EventBody {
+        let twr = match account {
+            Some(a) => serde_json::json!({ "role": "worker", "account": a }),
+            None => serde_json::json!({ "role": "worker" }),
+        };
+        let mut ext = serde_json::Map::new();
+        ext.insert("twr".into(), twr);
+        EventBody::ThreadCreated(twr_core::event::ThreadCreated {
+            name: "w".into(),
+            box_name: "local".into(),
+            runtime: "claude-code".into(),
+            ext: Some(ext),
+            ..Default::default()
+        })
+    }
+
+    /// A database without account data keeps schema 9 (an older twr still opens it); the
+    /// first event with account data raises it to 10 in its own transaction, which a twr that
+    /// knows only 9 refuses. A failed append raises nothing.
+    #[test]
+    fn account_data_raises_the_schema_version() {
+        use twr_core::event::{AccountAdded, AccountRemoved, AccountStatus, ThreadModelChanged};
+        // What raises it, and what does not.
+        let at = |body: EventBody| ev("t1", 1, body);
+        for body in [
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            EventBody::AccountRemoved(AccountRemoved {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            EventBody::AccountStatus(AccountStatus {
+                runtime: "claude-code".into(),
+                account: "work".into(),
+                ..Default::default()
+            }),
+            created(Some("work")),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                account_changed: true,
+                account: None,
+                previous_account: Some("work".into()),
+                ..Default::default()
+            }),
+        ] {
+            assert!(account_dependent(&at(body.clone())), "{body:?}");
+        }
+        for body in [
+            created(None),
+            EventBody::ThreadModelChanged(ThreadModelChanged {
+                model: Some("opus".into()),
+                ..Default::default()
+            }),
+            EventBody::ThreadStarted(SessionPayload::default()),
+            text("account"),
+        ] {
+            assert!(!account_dependent(&at(body.clone())), "{body:?}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A native-only log: still 9.
+        s.append(&ev("t1", 1, created(None)), true, Default::default())
+            .unwrap();
+        s.append(&ev("t1", 2, text("hi")), false, Default::default())
+            .unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        drop(s);
+        let mut s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A batch whose account event fails to commit (a duplicate seq after it) leaves the
+        // version alone with the rest of the batch.
+        let dup = ev("t1", 2, text("again"));
+        let named = ev("t2", 1, created(Some("work")));
+        assert!(s
+            .append_batch(AppendBatch {
+                events: vec![(&named, true), (&dup, false)],
+                ..Default::default()
+            })
+            .is_err());
+        assert_eq!(user_version(&s), SCHEMA_VERSION);
+        // A thread on a named account raises it, with the event.
+        s.append(&named, true, Default::default()).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        drop(s);
+        // This twr opens it again; one that knows only 9 refuses it.
+        let s = Store::open(&path).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        assert_eq!(s.load_all().unwrap().len(), 3);
+        drop(s);
+        let e = check_version(ACCOUNTS_SCHEMA_VERSION, SCHEMA_VERSION).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "database schema version 10 is newer than this twr (9)"
+        );
+        assert!(check_version(SCHEMA_VERSION, SCHEMA_VERSION).is_ok());
+        // ...as a 9-only twr's `migrate` does on the real file.
+        let v: i32 = connect(&path)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert!(check_version(v, SCHEMA_VERSION).is_err());
+        // A version newer than this twr knows is refused at open.
+        connect(&path)
+            .unwrap()
+            .pragma_update(None, "user_version", ACCOUNTS_SCHEMA_VERSION + 1)
+            .unwrap();
+        let e = Store::open(&path).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("database schema version 11 is newer than this twr (10)"),
+            "{e:#}"
+        );
+
+        // An account event alone raises it too, and so does an explicit fence (the hub's
+        // replay of account data recorded before the fence); both only ever raise it.
+        let path = dir.path().join("b.db");
+        let mut s = Store::open(&path).unwrap();
+        let added = ev(
+            "hub",
+            1,
+            EventBody::AccountAdded(AccountAdded {
+                runtime: "codex".into(),
+                account: "side".into(),
+                dir: Some("/acc/side".into()),
+                ..Default::default()
+            }),
+        );
+        s.append(&added, true, Default::default()).unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        s.fence_accounts().unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
+        let path = dir.path().join("c.db");
+        let mut s = Store::open(&path).unwrap();
+        s.fence_accounts().unwrap();
+        assert_eq!(user_version(&s), ACCOUNTS_SCHEMA_VERSION);
     }
 
     #[test]
@@ -2153,6 +3551,119 @@ mod tests {
         assert!(!s.user_sent_since("t1", 0).unwrap());
         drop(s);
         Store::open(&path).unwrap();
+    }
+
+    /// A schema 8 database gets `checkpoints` (and keeps `pending_prompts.user_sent`, which it
+    /// had already); a new one has it from the start.
+    #[test]
+    fn schema_8_databases_migrate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("twr.db");
+        {
+            let conn = connect(&path).unwrap();
+            conn.execute_batch(SCHEMA).unwrap();
+            for schema in [REMOTE_OUTBOX, SCHEMA_4, SCHEMA_5, SCHEMA_6] {
+                conn.execute_batch(schema).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+        for path in [path, dir.path().join("new.db")] {
+            let s = Store::open(&path).unwrap();
+            let v: i32 = s
+                .conn()
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+            assert!(checkpoints(s.conn()).unwrap().is_empty());
+            drop(s);
+            Store::open(&path).unwrap();
+        }
+    }
+
+    /// Checkpoints: listed newest first without their state, the newest
+    /// [`CHECKPOINTS_KEPT`] of each of the [`CHECKPOINT_BUILDS_KEPT`] newest builds kept,
+    /// dropped all at once; an event's place found by its id.
+    #[test]
+    fn checkpoints_keep_the_newest_two_of_each_recent_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::open(&dir.path().join("twr.db")).unwrap();
+        let control = ev("t", 1, text("hi"));
+        let agent = ev("t", 2, text("there"));
+        s.append(&control, true, AppendExtras::default()).unwrap();
+        s.append(&agent, false, AppendExtras::default()).unwrap();
+        assert_eq!(
+            event_position(s.conn(), &control.id).unwrap(),
+            Some((1, Some(1)))
+        );
+        assert_eq!(
+            event_position(s.conn(), &agent.id).unwrap(),
+            Some((2, None))
+        );
+        assert_eq!(event_position(s.conn(), "nope").unwrap(), None);
+        assert_eq!(events_after(s.conn(), None).unwrap(), 2);
+        assert_eq!(events_after(s.conn(), Some(1)).unwrap(), 1);
+        assert_eq!(load_with_gseq(s.conn(), Some(1)).unwrap().len(), 1);
+        let ids: Vec<i64> = (0..3u8)
+            .map(|i| {
+                insert_checkpoint(
+                    s.conn(),
+                    &NewCheckpoint {
+                        format: 1,
+                        build: "b",
+                        config: "c",
+                        gseq: 1,
+                        last_event: &control.id,
+                        checksum: "x",
+                        state: &[i],
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        let kept = checkpoints(s.conn()).unwrap();
+        assert_eq!(kept.len(), CHECKPOINTS_KEPT);
+        assert_eq!(
+            kept.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![ids[2], ids[1]]
+        );
+        assert_eq!((kept[0].bytes, kept[0].gseq), (1, 1));
+        assert_eq!(checkpoint_state(s.conn(), ids[2]).unwrap(), Some(vec![2]));
+        assert_eq!(checkpoint_state(s.conn(), ids[0]).unwrap(), None);
+        // Per build: another build's checkpoint (one written for a build installed next to a
+        // running hub) outlives the running build's next ones; the build whose newest is
+        // oldest goes once more builds than kept have one.
+        let put = |build: &str| {
+            insert_checkpoint(
+                s.conn(),
+                &NewCheckpoint {
+                    format: 1,
+                    build,
+                    config: "c",
+                    gseq: 1,
+                    last_event: &control.id,
+                    checksum: "x",
+                    state: &[9],
+                },
+            )
+            .unwrap()
+        };
+        let new = put("new");
+        let b3 = put("b");
+        let b4 = put("b");
+        let ids_of = |s: &Store| {
+            checkpoints(s.conn())
+                .unwrap()
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids_of(&s), vec![b4, b3, new]);
+        let x = put("x");
+        let y = put("y");
+        // Builds by newest checkpoint: y, x, b, new: "new" goes.
+        assert_eq!(ids_of(&s), vec![y, x, b4, b3]);
+        assert_eq!(drop_checkpoints(s.conn()).unwrap(), 4);
+        assert!(checkpoints(s.conn()).unwrap().is_empty());
     }
 
     #[test]

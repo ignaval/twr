@@ -18,20 +18,26 @@ twr-core.workspace = true
 twr-hub.workspace = true
 twr-mcp.workspace = true
 twr-runner.workspace = true
+# `twr speak` and `twr remote`: the speaker (docs/read-aloud.md).
+twr-speech.workspace = true
 twr-tui.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
 hex.workspace = true
+# `term::read_hidden_line`: the terminal's settings (termios).
+libc.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
 twr-docs.workspace = true
 crossterm.workspace = true
+portable-pty.workspace = true
 tempfile.workspace = true

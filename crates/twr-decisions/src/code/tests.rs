@@ -553,6 +553,24 @@ fn block_kind_rule() {
         ..Default::default()
     };
     assert_eq!(block_kind(&auth), Some(BlockKind::UserBlocked));
+    // A limit is never retried at once, whatever the transient flag says; a sign-in failure
+    // still wins.
+    let limited = BlockContext {
+        result: Some(TurnResult::Error),
+        transient: true,
+        limited: true,
+        ..Default::default()
+    };
+    assert_eq!(block_kind(&limited), Some(BlockKind::Limited));
+    let d = CodeProvider
+        .decide_now(&DecisionContext::BlockKind(limited.clone()))
+        .unwrap();
+    assert_eq!((d.chosen.as_str(), d.confidence), ("limited", 1.0));
+    let both = BlockContext {
+        auth_failed: true,
+        ..limited
+    };
+    assert_eq!(block_kind(&both), Some(BlockKind::UserBlocked));
     assert!(CodeProvider
         .decide_now(&DecisionContext::BlockKind(crash))
         .is_none());

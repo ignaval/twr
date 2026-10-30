@@ -14,6 +14,7 @@ use twr_core::blob::strip_body_capping_metadata;
 use twr_core::event::*;
 
 use super::append::rejection;
+use super::coalesce::Due;
 use super::{
     git, AfterReap, Batch, BatchEvent, Core, EndedTurn, HubState, Inner, PendingExit, LOCAL_BOX,
 };
@@ -113,6 +114,23 @@ impl Core {
                 return Ok(None);
             }
         }
+        // A runtime's task updates come often: only those due are recorded (`hub::coalesce`).
+        let task_update = match &body {
+            EventBody::TaskUpdated(p) => {
+                let now = Utc::now();
+                let at = at.map_or(now, |a| {
+                    Self::event_time(a, self.last_ts.get(thread).copied(), now)
+                });
+                let due = self.task_update_due(hub, thread, p, at);
+                if due == Due::Skip {
+                    self.commit_ack(hub, ack)?;
+                    self.coalesced_events += 1;
+                    return Ok(None);
+                }
+                Some((p.task_id.clone(), p.running, at, due))
+            }
+            _ => None,
+        };
         namespace_attention(thread, self.runtime_gen(thread), &mut body);
         if let EventBody::AttentionResolved(p) = &body {
             if !self.is_adapter_withdrawal(thread, p) {
@@ -228,10 +246,14 @@ impl Core {
             }
             _ => None,
         };
-        // A turn whose message the user took back (`hub::withdraw`) ends `interrupted`,
-        // whatever its runtime reports (`ext.twr.runtime_result` keeps that): like any
-        // interrupted turn, it gets no grade, report, review or retry.
-        let withdrawn = ended.is_some() && turn.is_some_and(|t| self.turn_taken_back(thread, t));
+        // A turn whose message the user took back (`hub::withdraw`), or that the user
+        // interrupted to send the next queued message now (`message.send_now`), ends
+        // `interrupted`, whatever its runtime reports (`ext.twr.runtime_result` keeps that): like
+        // any interrupted turn, it gets no grade, report, review or retry.
+        let withdrawn = ended.is_some()
+            && turn.is_some_and(|t| {
+                self.turn_taken_back(thread, t) || self.turn_interrupted(thread, t)
+            });
         let ended = match (&mut body, withdrawn) {
             (EventBody::TurnEnded(p), true) => {
                 if p.result != TurnResult::Interrupted {
@@ -272,12 +294,24 @@ impl Core {
         // settings restart replaces.
         if let EventBody::ThreadStarted(p) | EventBody::ThreadResumed(p) = &mut body {
             use super::restart::{stamp, stamped, RunSettings};
-            let settings = self
+            let mut settings = self
                 .rt
                 .get(thread)
                 .and_then(|r| r.runtime_settings.clone())
                 .or_else(|| stamped(p, source))
                 .unwrap_or_else(RunSettings::unknown);
+            // On the hub's own box, a start of a session an earlier start named carries the
+            // login that session began under (`Core::carry_login`). A start that names no
+            // session resumed the thread's (a spawn is only for a thread with none).
+            let view = self.registry.get(thread);
+            let session = p
+                .session_id
+                .clone()
+                .or_else(|| view.and_then(|v| v.session_id.clone()));
+            if let (Some(session), true) = (session, view.is_some_and(|v| v.box_name == LOCAL_BOX))
+            {
+                self.carry_login(thread, &session, &mut settings);
+            }
             stamp(p, &settings);
         }
         let fallback = match &body {
@@ -322,6 +356,9 @@ impl Core {
             }
         }
         // Recorded: what follows is no reason to record the event again.
+        if let Some((task, running, at, due)) = &task_update {
+            self.task_update_recorded(thread, (task, *running), *at, *due);
+        }
         if let (Some(sign), Some(t)) = (running, turn) {
             self.withdrawn_turn_runs(hub, thread, t, sign);
         }
@@ -407,6 +444,8 @@ pub fn adapter_may_emit(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::TurnEnded(_)
             | EventBody::TaskUpdated(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     ) || matches!(body, EventBody::TurnStarted(p) if p.from == TurnFrom::Runtime)
         || matches!(
             body,
@@ -438,6 +477,8 @@ fn in_turn_kind(body: &EventBody) -> bool {
             | EventBody::AttentionRaised(_)
             | EventBody::AttentionResolved(_)
             | EventBody::TurnEnded(_)
+            | EventBody::ContextCompacting(_)
+            | EventBody::ContextCompacted(_)
     )
 }
 
@@ -467,10 +508,14 @@ pub(super) async fn supervise(
                     body,
                     EventBody::ThreadStarted(_) | EventBody::ThreadResumed(_)
                 ) {
-                    let host = (hub.core().registry.get(&thread))
-                        .and_then(|v| hub.hosts.get(&v.box_name).cloned());
+                    let host =
+                        (hub.core().registry.get(&thread)).and_then(|v| hub.host(&v.box_name));
                     crate::host::stamp_start_time(host, &thread, &mut body).await;
                 }
+                let session = matches!(
+                    body,
+                    EventBody::ThreadStarted(_) | EventBody::ThreadResumed(_)
+                );
                 let ev = (body, raw, turn);
                 let recorded = persist(&hub, &thread, "recording an adapter event", |core| {
                     core.record_adapter_event(
@@ -491,6 +536,11 @@ pub(super) async fn supervise(
                         continue;
                     }
                 };
+                // A runtime started with no turn (a settings restart) may be on another
+                // session than the one an open offer to compact was about (`hub::idle_compact`).
+                if session {
+                    hub.core().recheck_idle_offer(&hub, &thread);
+                }
                 if let Some(t) = ended {
                     let reacted = persist(&hub, &thread, "reacting to the end of a turn", |core| {
                         core.react_to_adapter_turn_end(&hub, &thread, &t)
@@ -528,9 +578,29 @@ pub(super) async fn supervise(
     }
 }
 
+/// What [`close_exited`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Closed {
+    /// The closing sequence (and the runner frame it came in, if any) was recorded.
+    Recorded,
+    /// The exit's connection proved a token the box no longer has (`box.token` changed it
+    /// before the commit, and put the runtime back as it was then): nothing was recorded.
+    Revoked,
+    /// The store failed for good (the hub fails).
+    Failed,
+}
+
 /// Records the closing sequence of an exited runtime (retrying the store), releases it, and
-/// dispatches the queue after a requested stop. Returns whether the closing sequence (and the
-/// runner frame it came in, if any) was recorded.
+/// dispatches the queue after a requested stop.
+///
+/// An exit a runner connection brought (its `exited` frame, or a runtime its reconciliation
+/// found lost) commits nothing once `box.token` changed or revoked the token the connection
+/// proved, checked under the core lock at each attempt ([`Closed::Revoked`]). The change
+/// itself put the runtime the exit took back, live and not exiting, in its own step under the
+/// core lock ([`Core::put_back_revoked_exits`]): a connection with the box's token that comes
+/// before this attempt finds the runtime as it was, and reports or finds the exit again. A
+/// connection fenced by a newer one of the box records the closing sequence without its
+/// frame's watermark (the frame comes again, and finds the runtime closed).
 ///
 /// The commit and the exit's bookkeeping ([`Core::finish_exit`]: the runtime no longer
 /// `exiting`) are one step under the core lock: a `thread.stop` never sees the runtime closed
@@ -539,9 +609,15 @@ pub(super) async fn supervise(
 /// with no runtime, and every later prompt stayed queued.) A stop that comes
 /// before the commit is the exit's own ([`Core::exit_plan`] closes it as stopped); one that
 /// comes after finds no runtime and closes the thread itself.
-pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut PendingExit) -> bool {
+pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut PendingExit) -> Closed {
     let mut dispatch = None;
+    let mut revoked = false;
     let closed = persist(hub, thread, "closing an exited runtime", |core| {
+        // Revoked: the runtime is back already, and may be another connection's exit by now.
+        if exit.fence.as_ref().is_some_and(|f| f.revoked()) {
+            revoked = true;
+            return Ok(());
+        }
         let plan = core.exit_plan(thread, exit);
         // A runner connection fenced meanwhile commits no watermark (its frame is replayed).
         let ack = match &exit.fence {
@@ -570,17 +646,29 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
     .await;
     #[cfg(test)]
     tests::after_close_commit();
+    if revoked {
+        tracing::info!(
+            thread,
+            "an exit a connection brought whose token the box no longer has: nothing recorded"
+        );
+        return Closed::Revoked;
+    }
     let dispatch = match dispatch {
         Some(d) => d,
-        // Never committed: released all the same (the hub fails below).
-        None => hub.core().finish_exit(hub, thread, exit, false),
+        // Never committed: released all the same (the hub fails below), unless a token change
+        // put the runtime back meanwhile (it keeps its slot).
+        None => {
+            let mut core = hub.core();
+            !exit.fence.as_ref().is_some_and(|f| f.revoked())
+                && core.finish_exit(hub, thread, exit, false)
+        }
     };
     if let Err(e) = closed {
         fail_hub(
             hub,
             format!("cannot record the closing sequence of thread {thread}: {e:#}"),
         );
-        return false;
+        return Closed::Failed;
     }
     if exit.crash {
         // A crash: classify it and retry once if it is due (`hub::retry`); nothing else is
@@ -591,6 +679,17 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
         .await;
         if let Err(e) = r {
             tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the crash");
+        }
+    }
+    if exit.stopped {
+        // Stopped: a transient failure whose retry the stop forestalls gets its item
+        // (`hub::retry`).
+        let r = persist(hub, thread, "reacting to a stop", |core| {
+            core.react_to_stop(hub, thread)
+        })
+        .await;
+        if let Err(e) = r {
+            tracing::error!(thread, error = %format!("{e:#}"), "cannot react to the stop");
         }
     }
     if dispatch {
@@ -610,7 +709,7 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
     if dispatch && exit.restart {
         hub.core().restart_after_settings_change(hub, thread);
     }
-    true
+    Closed::Recorded
 }
 
 /// Recording what runtime `generation` of `thread` did failed for good (`e`): stops the
@@ -727,7 +826,7 @@ pub(super) async fn reap_runtime(hub: &Arc<Inner>, thread: &str, generation: u64
             .registry
             .get(thread)
             .map_or_else(|| LOCAL_BOX.to_string(), |v| v.box_name.clone());
-        let Some(host) = hub.hosts.get(&box_name).filter(|h| !h.is_remote()) else {
+        let Some(host) = hub.host(&box_name).filter(|h| !h.is_remote()) else {
             return Some(true);
         };
         // Recorded for the live runtime, i.e. this generation's process (and signalled only
@@ -742,7 +841,7 @@ pub(super) async fn reap_runtime(hub: &Arc<Inner>, thread: &str, generation: u64
         });
         // Checked with the generation, under the same lock: nothing can start in between.
         rt.reaping += 1;
-        (Arc::clone(host), proc)
+        (host, proc)
     };
     let (t, min_start) = (thread.to_string(), hub.start_ticks);
     let gone = tokio::task::spawn_blocking(move || {
@@ -950,7 +1049,7 @@ mod tests {
                 *answer2.lock().unwrap() = Some(r);
             }))
         });
-        assert!(close_exited(&inner, &t, &mut exit).await);
+        assert_eq!(close_exited(&inner, &t, &mut exit).await, Closed::Recorded);
         let answer = answer.lock().unwrap().take().expect("the hook ran");
         assert_eq!(answer["stopping"], false, "{answer}");
         {
@@ -1058,8 +1157,11 @@ mod tests {
             let second = core.begin_exit(&t, gen, Some(1), "second".into()).unwrap();
             (first, second)
         };
-        assert!(close_exited(&inner, &t, &mut first).await);
-        assert!(close_exited(&inner, &t, &mut second).await);
+        assert_eq!(close_exited(&inner, &t, &mut first).await, Closed::Recorded);
+        assert_eq!(
+            close_exited(&inner, &t, &mut second).await,
+            Closed::Recorded
+        );
         let evs = hub.thread_events(&t, 0, 10_000).unwrap().1;
         let n = |k: &str| evs.iter().filter(|e| e.kind() == k).count();
         let kinds: Vec<&str> = evs.iter().map(|e| e.kind()).collect();

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::time::timeout;
 use twr_adapters::fake::FakeAdapter;
 use twr_core::adapter::{
-    Adapter, AdapterCmd, AdapterHandle, AdapterInfo, Answer, SpawnConfig, Tier,
+    Adapter, AdapterCmd, AdapterHandle, AdapterInfo, Answer, CodexAuto, SpawnConfig, Tier,
 };
 use twr_core::config::Config;
 use twr_core::event::*;
@@ -156,6 +156,103 @@ fn started_with(ev: &Event) -> Option<(Value, Value)> {
             Some((f["model"].clone(), f["effort"].clone()))
         }
         _ => None,
+    }
+}
+
+/// `[codex] auto` reaches every worker's runtime (`SpawnConfig::codex_auto`, reported by the
+/// fake as `ext.fake.codex_auto`), and a configured project's `codex_auto` wins for the
+/// threads made for that project; a thread of a folder that is no configured project gets
+/// the global one.
+#[tokio::test]
+async fn threads_start_with_their_codex_auto_setting() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("api");
+    std::fs::create_dir(&repo).unwrap();
+    let mut o = opts(dir.path());
+    o.config.codex.auto = CodexAuto::Never;
+    o.config.projects.insert(
+        "api".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            codex_auto: Some(CodexAuto::AutoReview),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let plain = new_thread(&hub, dir.path(), "plain", "fake").await;
+    let api = hub
+        .new_thread(
+            NewThread {
+                project: "api".into(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                no_worktree: true,
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (t, want) in [(plain, "never"), (api, "auto_review")] {
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        send(&hub, &t, "hi");
+        let evs = until(&mut sub, is_report).await;
+        let got = evs.iter().find_map(|e| match &e.body {
+            EventBody::ThreadStarted(p) => Some(p.ext.as_ref()?["fake"]["codex_auto"].clone()),
+            _ => None,
+        });
+        assert_eq!(got, Some(json!(want)), "{t}");
+    }
+}
+
+/// With nothing in `[codex]`, a worker's runtime gets `auto_review` (Codex's reviewer
+/// answers what its `auto` sandbox does not allow), and a configured project's `codex_auto =
+/// "ask"` brings the user's cards back for that project's threads.
+#[tokio::test]
+async fn threads_start_with_auto_review_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("api");
+    std::fs::create_dir(&repo).unwrap();
+    let mut o = opts(dir.path());
+    assert_eq!(o.config.codex, twr_core::config::CodexConfig::default());
+    o.config.projects.insert(
+        "api".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            codex_auto: Some(CodexAuto::Ask),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let plain = new_thread(&hub, dir.path(), "plain", "fake").await;
+    let api = hub
+        .new_thread(
+            NewThread {
+                project: "api".into(),
+                runtime: Some("fake".into()),
+                name: Some("api".into()),
+                no_worktree: true,
+                ..Default::default()
+            },
+            "test",
+        )
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for (t, want) in [(plain, "auto_review"), (api, "ask")] {
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        send(&hub, &t, "hi");
+        let evs = until(&mut sub, is_report).await;
+        let got = evs.iter().find_map(|e| match &e.body {
+            EventBody::ThreadStarted(p) => Some(p.ext.as_ref()?["fake"]["codex_auto"].clone()),
+            _ => None,
+        });
+        assert_eq!(got, Some(json!(want)), "{t}");
     }
 }
 
@@ -933,5 +1030,82 @@ async fn clears_are_fine_with_a_move_to_another_runtime() {
             .contains("grok-build keeps a session's model on resume"),
         "{e}"
     );
+    hub.shutdown().await;
+}
+
+/// The effort is checked against the `claude` the thread's spawn would run: a project whose
+/// `env` `PATH` names another `claude` (known not to list `--effort`) is refused at
+/// `thread.new` and `thread.set_model`; a thread without that `PATH` is not.
+#[tokio::test]
+async fn the_effort_is_checked_against_the_threads_own_claude() {
+    use twr_adapters::claude_code::cli::{lookup, Lookup};
+    if std::env::var_os("TWR_CLAUDE_BIN").is_some_and(|v| !v.is_empty()) {
+        eprintln!("skipped: TWR_CLAUDE_BIN names the binary, the PATH does not choose it");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // An older `claude` in the project's own `PATH`: options listed, `--effort` not.
+    let bin = root.join("old-claude");
+    std::fs::create_dir(&bin).unwrap();
+    let src = root.join("claude.src");
+    std::fs::write(
+        &src,
+        "#!/bin/sh\ncase \"$1\" in\n--help) printf 'Options:\\n  --model <model>  Model\\n  \
+         -p, --print  Print\\n';;\n--version) echo '2.1.100 (Claude Code)';;\nesac\n",
+    )
+    .unwrap();
+    // Copied, not written in place: a fork elsewhere holding it open would make exec'ing it
+    // fail (ETXTBSY).
+    let st = std::process::Command::new("install")
+        .args(["-m", "755"])
+        .arg(&src)
+        .arg(bin.join("claude"))
+        .status()
+        .unwrap();
+    assert!(st.success());
+    let repo = root.join("proj");
+    std::fs::create_dir(&repo).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    // What an earlier spawn of that thread read of it (the hub never probes for this).
+    let env = vec![("PATH".to_string(), path.clone())];
+    let resolved = twr_adapters::resolve::resolve(Path::new("claude"), &env, None, &repo);
+    if let Lookup::Probe(p) = lookup(&resolved, &repo, WAIT) {
+        p.wait().await;
+    }
+    let mut o = opts(&root);
+    o.config.projects.insert(
+        "old".into(),
+        twr_core::config::ProjectConfig {
+            repo: repo.clone(),
+            env: [("PATH".to_string(), path)].into_iter().collect(),
+            ..Default::default()
+        },
+    );
+    let hub = Hub::open(o).await.unwrap();
+    let req = |effort: Option<&str>| NewThread {
+        project: "old".into(),
+        runtime: Some("claude-code".into()),
+        name: Some(format!("old-{}", effort.unwrap_or("none"))),
+        effort: effort.map(str::to_string),
+        no_worktree: true,
+        ..Default::default()
+    };
+    let e = hub.new_thread(req(Some("high")), "test").await.unwrap_err();
+    assert_eq!(e.code, codes::BAD_REQUEST, "{e}");
+    assert!(e.message.contains("does not support --effort"), "{e}");
+    assert!(e.message.contains("2.1.100"), "{e}");
+    // Nothing was recorded: the name is free.
+    assert!(hub.thread_view("old-high").is_err());
+    hub.new_thread(req(None), "test").await.unwrap();
+    let e = hub
+        .set_model("old-none", None, Some("high"), &user())
+        .unwrap_err();
+    assert!(e.message.contains("does not support --effort"), "{e}");
+    // A thread of another directory, without that `PATH`: its `claude` is not known.
+    let mut other = new_req(&root, "elsewhere", "claude-code");
+    other.effort = Some("high".into());
+    let v = hub.new_thread(other, "test").await.unwrap();
+    assert_eq!(v["effort"], "high", "{v}");
     hub.shutdown().await;
 }

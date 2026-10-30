@@ -34,6 +34,32 @@ What doesn't pay off for twr's own threads:
 - sccache (`RUSTC_WRAPPER=sccache`) shares compiled dependencies between worktrees, but only saves build time: each `target/` still gets its own copies, the cache adds its own, and it doesn't cache incrementally built workspace crates or linked executables, which are most of the size.
 - Merging the integration test files of each crate into one test binary (`tests/it/main.rs` with a module per file) would save most of the executables' size and link time, about 1.5 GB per worktree for `twr-hub` alone with line tables. But it means moving every test file, which conflicts with every branch in flight, and tests that run in one process share its state. It's worth doing once few branches are open.
 
+## Timing startup
+
+`TWR_TRACE_STARTUP=<file>` has every twr process that sees the variable append one line per step to the file: `<microseconds since the Unix epoch> <pid> <step>`. Bare `twr` passes it on to the hub it starts, so one file has both sides:
+
+```sh
+TWR_TRACE_STARTUP=/tmp/twr-start.log twr
+```
+
+The CLI marks loading the config and each probe of the hub socket; the hub, locking its data, binding its socket, opening the store, loading and folding the log, recovering and serving, and how long it took to tell who each connection is; the TUI, connecting, subscribing to the control stream, the `Loading…` frame, the end of the control replay, the transcript's subscription, each key, and each frame that shows another thread or loading state, with how long it took to draw. Without the variable nothing is written. The hub's lines say whether it started from a checkpoint (`hub: checkpoint <id> loaded`, or why one was not used) and how many events it then loaded and folded.
+
+`crates/twr-hub/src/hub/bench.rs` times the hub's start: loading and folding the whole log, then writing a checkpoint and starting from it (one 5 000 events behind the log, and one covering all of it). It makes its log up by default; `TWR_BENCH_DB` names a copy of a real `twr.db` instead (it writes checkpoints into it):
+
+```sh
+TWR_BENCH_DB=/path/to/copy/twr.db cargo test --release -p twr-hub --lib -- --ignored --nocapture replay_bench
+```
+
+The checkpoint tests (`hub::checkpoint`) start a hub from a checkpoint at every control event of a made-up log and compare its state with a fold of the whole log, byte for byte. `TWR_CHECKPOINT_DB` names a copy of a real log for the same check at a few of its control events (`--ignored checkpoints_of_a_real_log`, in release mode), and `TWR_CHECKPOINT_CHECK=1` makes every hub of the crate's own tests check its log that way as it goes away.
+
+`crates/twr-tui/src/bench.rs` times what the TUI does with a replay: decoding a control stream of about 30 000 items, applying it, decoding and applying the orchestrator's last 2000 events, laying out the conversation and drawing it. It makes its log up by default; `TWR_BENCH_CONTROL` and `TWR_BENCH_TRANSCRIPT` name files of a real hub's stream lines instead (what `control.subscribe` and `thread.subscribe` push):
+
+```sh
+cargo test --release -p twr-tui --lib -- --ignored --nocapture replay_bench
+```
+
+It also times the same replay compacted as a hub compacts it (`control.subscribe` with `compact`). `compact_tests.rs` checks that a compacted replay leaves the TUI in the state a full one does, on made-up logs, and by hand on a real stream (`TWR_BENCH_CONTROL`, `compacted_real`); `crates/twr-hub/src/hub/bench.rs` `compact_bench` times the hub's selection on a copy of a real `twr.db` (`TWR_BENCH_DB`).
+
 ## The fake runtime
 
 The `fake` runtime plays a prompt line by line. Lines that start with a directive do something; other lines become the agent's reply. It's only available with `TWR_ENABLE_FAKE=1`, because `!write` writes files.
@@ -115,6 +141,30 @@ cargo test -p twr-hub --test runner_fuzz -- --ignored --nocapture
 
 A failure prints the seed, the invariant, the details and the end of the step log, and keeps the data directory. A seed fixes the actions but not the thread scheduling, so run a failing seed a few times.
 
+## The container box test
+
+The regular suite tests container boxes through a fake `docker exec`. The tests that use a real docker are ignored; run them where `docker` works for your user:
+
+```sh
+cargo test -p twr-cli --test ssh_box container_box -- --ignored
+```
+
+They build `docs/tools/container-box/Dockerfile` once as `twr-test-box:<the Dockerfile's hash>` (its base pulled the first time, which needs the network), and run each case in a container of its own, removed at the end: a box from `twr box add --command` to the container's removal (a thread's turns, doctor, `docker restart`, `docker stop` and `start`, the hub's client killed during a daemon restart, `twr hub stop`), the terminal paths (a clone whose client is killed, Ctrl-C during a clone, the detach keys during `twr box login`), and a container that runs as root. The image stays for the next run; `docker image rm twr-test-box:<hash>` removes it. `TWR_TEST_BOX_IMAGE` names another base image (default `ubuntu:24.04`): the debug build the tests upload needs this machine's glibc or newer there.
+
+## A runner protocol bump
+
+Each runner protocol version has fixtures captured from a real revision of it, in `crates/twr-core/tests/fixtures/runner-protocol-<version>`: what its runner sends, what the hub sends a drained runner as that revision decodes it, and its handshake proofs. `crates/twr-core/tests/runner_protocol_fixtures.rs` checks the tree against them, and `DRAINABLE_PROTOCOLS` lists the older versions the hub drains instead of refusing ([runners.md](runners.md#a-new-twr-build)). When you bump `PROTOCOL_VERSION`:
+
+1. In the working tree that bumps it, capture the new version's fixtures. The fixture test needs them before the bump can pass, so they come from the tree, not from a commit:
+
+   ```sh
+   docs/tools/capture-runner-fixtures.sh --worktree <new version>
+   ```
+
+   It takes the tree's tracked files, changes included (`git add` a new file first), builds the capture there in a temporary worktree under `target/`, and writes the three files. They name `HEAD` as their revision, with `"uncommitted": true` when the tree had changes.
+2. Run `cargo test -p twr-core --test runner_protocol_fixtures`. When an outbound value changed since the previous version's fixtures were captured, capture its `hub-accepts.json` again from the last commit that spoke it: `docs/tools/capture-runner-fixtures.sh <that commit> <previous version>`.
+3. Keep the previous version in `DRAINABLE_PROTOCOLS` only if its fixtures pass and the bump changed nothing a drain uses (the `PROTOCOL_VERSION` and `DRAINABLE_PROTOCOLS` docs in `twr_core::runner` say what that is). Otherwise leave it out: the hub then replaces such a daemon at once, its agents recorded as stopped for the upgrade.
+
 ## CI
 
 `.github/workflows/ci.yml` runs on every push to `dev` and `main` and on every pull request. It uses `pull_request`, never `pull_request_target`, so code from a fork runs without the repository's secrets and with a read-only token, and GitHub asks a maintainer to approve the workflows of a first-time contributor before they run. A new push to a pull request cancels the run still going for its previous one. On `dev` and `main` a new run waits for the one in progress instead, and GitHub keeps one waiting run per branch: a newer push replaces the run still waiting, so of quick pushes only the first and the last get a CI result. The jobs:
@@ -131,13 +181,13 @@ Every job uses the Rust version pinned in `rust-toolchain.toml`. The `release-bu
 
 ## Branches
 
-Work lands on `dev`. `main` moves only for a release, as a fast-forward to the `dev` commit being released, so `main` is always the latest release. twr.tools deploys from `main` (see [Website](#website)), so site and `install.sh` changes go live with the next release too.
+Work lands on `dev` through pull requests. `main` moves only for a release, through a pull request from `dev` merged with a merge commit, whose tree is that of the `dev` commit being released, so `main` is always the latest release. twr.tools deploys from `main` (see [Website](#website)), so site and `install.sh` changes go live with the next release too.
 
 ## Releases
 
-1. On `dev`, set the version in the workspace `Cargo.toml`, commit and push.
+1. On `dev`, set the version in the workspace `Cargo.toml` (`cargo update -w` updates `Cargo.lock`) and move the changelog's `[Unreleased]` notes under it, through a pull request.
 2. The push runs CI. Then run it by hand on that commit, `gh workflow run ci.yml --ref dev`, and wait for it to pass, release builds included (`gh run watch`). Also run the long command fuzz locally, `cargo test --release -p twr-decisions --test command_fuzz -- --ignored --nocapture` (see [The command fuzz](#the-command-fuzz)), and the long [translator](#the-translator-fuzz) and [frame](#the-frame-fuzz) fuzzes.
-3. Fast-forward `main` to it and push: `git push origin dev:main` (refused unless it is a fast-forward). Then push a tag `v<version>` on that commit. `.github/workflows/release.yml` checks that the tag matches the version.
+3. Open a pull request from `dev` to `main` and, once its checks pass, merge it with a merge commit: both branches refuse direct pushes, admins included. Check that the merge commit has the tree of the `dev` commit tested in step 2 (`git diff <that commit> origin/main` prints nothing). Then push a tag `v<version>` on the merge commit. `.github/workflows/release.yml` checks that the tag matches the version.
 4. The workflow builds static musl binaries for Linux x86_64 and aarch64 with cargo-zigbuild, and macOS builds for Apple silicon and Intel with a deployment target of 11.0.
 5. Each archive holds `twr`, `LICENSE`, `NOTICE`, `THIRD-PARTY-LICENSES.html` (generated with cargo-about from the dependency graph), `README.md` and `docs/` without `docs/tools/`.
 6. The release job writes `sha256sums.txt` (a line naming the release, `# twr release <tag>`, then the checksums of the archives and of the tagged commit's `install.sh`) and signs it and that `install.sh` with the release key (the `release` environment's secret `TWR_RELEASE_SIGNING_KEY`; without it the release fails), adds build provenance attestations for the four archives (`actions/attest-build-provenance`), and publishes a GitHub Release with `twr-<target>.tar.gz` for each target, `sha256sums.txt`, `install.sh`, their `.sig` files and install instructions, verification included.
@@ -162,7 +212,7 @@ These GitHub settings close gaps the workflows can't close by themselves:
 - **SHA-pinned actions.** Settings → Actions → General only allows actions pinned to a full commit SHA. The workflows comply.
 - **The `release` environment.** The `release` job in `release.yml` runs in it. It deploys only from `v*` tags and `main` (a manual rebuild runs from `main`), and publishing waits for a maintainer's approval.
 - **A tag ruleset for `v*`.** Only admins can create, move or delete a `v*` tag, so only they can start a release or change a released one.
-- **Branch protection on `main` and `dev`.** Changes from others go through a pull request with the CI jobs green. Force pushes and deletion are refused. Admins are not bound.
+- **Branch protection on `main` and `dev`.** Changes go through a pull request with the CI jobs green, admins' too (`enforce_admins`). Force pushes and deletion are refused.
 - **Security features.** Private vulnerability reporting (see [SECURITY.md](../SECURITY.md)), secret scanning with push protection, and Dependabot alerts. `.github/dependabot.yml` has Dependabot propose weekly updates of the Cargo dependencies and the pinned actions, against `dev`.
 
 `docs/tools/github-settings.sh` applies the tag ruleset, the branch protection and the environment's reviewer, and keeps its deployment policy. It lists the required checks by job name: when a job of `ci.yml` is added or renamed, update the list and run the script again. The SHA-pin rule, the environment's deployment policy and the security features are set in the repository's settings.
@@ -179,7 +229,7 @@ The still TUI images in the README and [tui.md](tui.md) are real captures:
 docs/tools/make-screenshots.sh
 ```
 
-The script builds twr and starts a throwaway hub with `TWR_HOME` under `/tmp` and the `fake` runtime for the worker threads. The orchestrator can't be `fake`, so the script writes a small scripted ACP agent (`[runtimes.scripted]`) that answers the two typed messages and sums up each hub update in a sentence. It makes five small git repositories and drives eight threads into different states: waiting on a permission, asking a question, failed, running, done and parked. Then it runs `twr` in a private tmux server, captures the stack view at 160x42, a card selected, and the grid view at 160x25, a tile selected, with their colors, and converts the captures with `docs/tools/ansi2svg.py`, which uses only the Python standard library. The hub gets a `PATH` without `claude`, `codex` or `grok`, so no real agent can start. Everything is removed on exit.
+The script builds twr and starts a throwaway hub with `TWR_HOME` under `/tmp` and the `fake` runtime for the worker threads. The orchestrator can't be `fake`, so the script writes a small scripted ACP agent (`[runtimes.scripted]`) that answers the two typed messages and sums up each hub update in a sentence. It makes five small git repositories and drives eight threads into different states: waiting on a permission, asking a question, failed, running, done and parked. Then it runs `twr` in a private tmux server, captures the stack view at 160x42, a card selected, the grid view at 160x25, a tile selected, and the compact layout's Threads screen at 40x20 (a phone), with their colors, and converts the captures with `docs/tools/ansi2svg.py`, which uses only the Python standard library. The TUI runs with `TWR_TUI_HIDE_LOAD=1`, which only these scripts set: it never reads the machine's load, so the images never show `busy: …` however loaded the machine is. The hub gets a `PATH` without `claude`, `codex` or `grok`, so no real agent can start. Everything is removed on exit.
 
 It needs git, tmux and python3, and takes about a minute because it waits for the hub's 30-second git snapshot. Set `TWR_SHOTS_KEEP=<dir>` to keep the raw captures.
 

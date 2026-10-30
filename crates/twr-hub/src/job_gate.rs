@@ -5,8 +5,9 @@
 //! The hub runs it as `<twr> __job-gate -- <argv...>` ([`GATE_ARG`]; `twr-job-gate -- ...` in
 //! this crate's tests), in the job's directory, with the job's environment as its own process
 //! environment (only its user may read it, unlike its arguments), its output to the job's log,
-//! as the leader of a process group of its own, and with its standard input one end of a Unix
-//! socket pair whose other end the hub keeps. Over that socket, one line each way at a time:
+//! as the leader of a session and process group of its own (no controlling terminal), and with
+//! its standard input one end of a Unix socket pair whose other end the hub keeps. Over that
+//! socket, one line each way at a time:
 //!
 //! 1. The gate finds the program as `execvp` would: a name with a `/` as it is; else each
 //!    directory of its own `PATH` (`/bin:/usr/bin` without one) in turn, an empty entry

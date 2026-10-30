@@ -75,7 +75,7 @@ use crate::host::ThreadHost;
 pub const GIT_TICK: Duration = Duration::from_secs(30);
 
 /// Where a thread works, from its `thread.created` `ext.twr`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub(super) enum Workspace {
     /// Nothing recorded (threads created before workspaces were recorded, the orchestrator):
     /// the recorded directory, not managed by the hub.
@@ -197,11 +197,20 @@ pub(super) struct NewWorkspace {
 impl NewWorkspace {
     /// The thread was not created after all: removes the worktree made for it (best effort,
     /// in the background, holding its repository like any change that removes something of
-    /// it, `delete::Reservations`; its branch stays).
-    pub(super) fn discard(self, hub: &Arc<Inner>, box_name: &str, host: &Arc<dyn ThreadHost>) {
+    /// it, `delete::Reservations`; its branch stays). `op`, the box's operation the creation
+    /// began with its gate check (`Core::reserve_box`), is held until that removal is over:
+    /// the box is not switched under it.
+    pub(super) fn discard(
+        self,
+        hub: &Arc<Inner>,
+        box_name: &str,
+        host: &Arc<dyn ThreadHost>,
+        op: Option<crate::remote::BoxOp>,
+    ) {
         if let Some((repo, path, branch)) = self.created {
             let (hub, box_name, git) = (Arc::clone(hub), box_name.to_string(), host.git());
             tokio::spawn(async move {
+                let _op = op;
                 let held = hub
                     .reservations
                     .reserve_repository(&box_name, git.as_ref(), &repo)
@@ -725,7 +734,7 @@ impl Hub {
             }
             let workspace = rt.workspace.clone();
             let view = core.view(&id)?.clone();
-            let host = hub.hosts.get(&view.box_name).cloned();
+            let host = hub.host(&view.box_name);
             // A remote box does not know about attaches (their command runs over ssh): the
             // hub keeps a worktree an attached thread works in. Checked under the lock that
             // grants attaches, which refuse one inside a worktree being parked
@@ -866,7 +875,7 @@ impl Hub {
             }
             rt.resuming = true;
             let workspace = rt.workspace.clone();
-            let host = hub.hosts.get(&view.box_name).cloned();
+            let host = hub.host(&view.box_name);
             (id, view, workspace, host)
         };
         let mut pending = Pending {
@@ -984,7 +993,7 @@ pub(super) async fn snapshot(hub: &Arc<Inner>, thread: &str) {
         let Some(host) = core
             .registry
             .get(thread)
-            .and_then(|v| hub.hosts.get(&v.box_name))
+            .and_then(|v| hub.host(&v.box_name))
         else {
             return;
         };

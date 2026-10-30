@@ -609,14 +609,37 @@ fn assert_refused_by_marker(resp: &Value, thread: &str, peer: u32) {
 }
 
 /// A `pty` worker's shell runs a client: it reads (hello, hub.info, thread.list, thread.get,
-/// attention.list, control.read, trash.list, thread.transcript, thread.activity) but every
-/// other request (the durable spawn's two methods included) is refused with the thread's name
-/// and its runtime's pid. The user's own connection (this test process, which descends from no runtime) does
+/// attention.list, control.read, trash.list, thread.transcript, thread.activity, box.agents,
+/// hub.glance; of the boxes' agents only whether each is found and signed in) but every other request (the
+/// durable spawn's two methods included) is refused with the thread's name and its runtime's
+/// pid; a fresh probe of a box's agents is the user's (`unauthorized`). The user's own connection (this test process, which descends from no runtime) does
 /// the same requests and gets through. Once the runtime has stopped, nothing is restricted by
 /// its old pid.
 #[tokio::test]
 async fn a_workers_shell_only_reads() {
-    let th = start(None, tempfile::tempdir().unwrap()).await;
+    // The hub's own agent CLIs, as a fake probe reports them (an agent sees their state only).
+    let th = start_with(None, tempfile::tempdir().unwrap(), |o| {
+        o.agent_probe = Some(Arc::new(|| {
+            futures::FutureExt::boxed(async {
+                vec![twr_core::runner::AgentInfo {
+                    runtime: "codex".into(),
+                    found: true,
+                    path: Some("/home/me/.local/bin/codex".into()),
+                    version: Some("codex-cli 0.160.0".into()),
+                    login: twr_core::runner::AgentLogin::LoggedOut,
+                    ..Default::default()
+                }]
+            })
+        }));
+    })
+    .await;
+    timeout(WAIT, async {
+        while th.hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hub's own probe");
     let mut c = th.client("itest").await;
     let agent = AgentClient::new(th.dir.path(), "w1", &th.socket);
     let runtime = format!("pty:sh {}", agent.script().display());
@@ -651,6 +674,8 @@ async fn a_workers_shell_only_reads() {
         json!({"id": 7, "method": "trash.list"}),
         json!({"id": 8, "method": "thread.transcript", "params": {"thread": "t2"}}),
         json!({"id": 9, "method": "thread.activity"}),
+        json!({"id": 30, "method": "box.agents", "params": {"box": "local"}}),
+        json!({"id": 32, "method": "hub.glance"}),
     ];
     let writes = [
         json!({"id": 10, "method": "attention.respond", "params": {"attn_id": "x", "answer": "allow"}}),
@@ -669,9 +694,21 @@ async fn a_workers_shell_only_reads() {
         json!({"id": 23, "method": "project.search", "params": {"project": "x", "query": "a"}}),
         json!({"id": 24, "method": "project.files", "params": {"project": "x"}}),
     ];
-    let requests: Vec<Value> = reads.iter().chain(&writes).cloned().collect();
-    let resps = agent.run(&requests).await;
+    // Asking a box to probe its agents again is the user's.
+    let refresh =
+        json!({"id": 31, "method": "box.agents", "params": {"box": "local", "refresh": true}});
+    let requests: Vec<Value> = (reads.iter().chain(&writes))
+        .chain([&refresh])
+        .cloned()
+        .collect();
+    let mut resps = agent.run(&requests).await;
     assert_eq!(resps.len(), requests.len());
+    let refused = resps.pop().unwrap();
+    assert_eq!(refused["error"]["code"], codes::UNAUTHORIZED, "{refused}");
+    // Of the boxes' agents, an agent reads their state only.
+    let codex = json!([{"runtime": "codex", "found": true, "login": "logged_out"}]);
+    assert_eq!(resps[1]["result"]["agents"], codex, "{}", resps[1]);
+    assert_eq!(resps[9]["result"]["agents"], codex, "{}", resps[9]);
     for (req, resp) in reads.iter().zip(&resps) {
         assert!(resp.get("error").is_none(), "{req} -> {resp}");
     }
@@ -681,6 +718,9 @@ async fn a_workers_shell_only_reads() {
         .map(|t| t["name"].as_str().unwrap())
         .collect();
     assert!(names.contains(&"w1") && names.contains(&"t2"), "{names:?}");
+    // Both threads are workers: the glance counts them.
+    assert_eq!(resps[10]["result"]["threads"], 2, "{}", resps[10]);
+    assert_eq!(resps[10]["result"]["workspace"], "default", "{}", resps[10]);
     for resp in &resps[reads.len()..] {
         assert_refused(resp, "w1", pid);
     }
@@ -694,6 +734,7 @@ async fn a_workers_shell_only_reads() {
     // to the hub (which then judges them as it always does).
     let info = c.call("hub.info", Value::Null).await.unwrap();
     assert_eq!(info["identity"], "user:itest");
+    assert_eq!(info["agents"][0]["path"], "/home/me/.local/bin/codex");
     c.call("thread.send", json!({"thread": "t2", "prompt": "hi"}))
         .await
         .unwrap();

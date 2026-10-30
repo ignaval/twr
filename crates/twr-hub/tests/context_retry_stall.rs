@@ -610,7 +610,10 @@ async fn a_silent_turn_is_stalled_until_activity_resumes() {
     let (turn, a) = raised(&evs).pop().unwrap();
     assert_eq!(turn, Some(1));
     assert_eq!(a.reason, AttentionReason::Stalled);
-    assert_eq!(a.summary, "No activity for 1 s");
+    assert_eq!(
+        a.summary,
+        "No activity for 1 s; nothing in flight that twr can see"
+    );
     assert_eq!(evs.last().unwrap().source, Source::Hub);
     // One item per thread, however long the silence lasts; it closes when output arrives.
     let evs = until(&mut sub, |e| e.kind() == "attention.resolved").await;
@@ -622,6 +625,7 @@ async fn a_silent_turn_is_stalled_until_activity_resumes() {
         (r.attn_id.as_str(), r.by),
         (a.attn_id.as_str(), ResolvedBy::Timeout)
     );
+    assert!(went_on(&r.ext), "its runtime's output: {r:?}");
     assert_eq!(
         evs.len(),
         2,
@@ -631,6 +635,55 @@ async fn a_silent_turn_is_stalled_until_activity_resumes() {
     until(&mut sub, ended_turn(1)).await;
     assert!(hub.attention_list(true).is_empty());
     hub.shutdown().await;
+}
+
+/// A stall closed by anything but its thread's own work going on (its thread stopped, its
+/// runtime crashed, the user interrupted the turn, the turn failed) is closed `by: timeout`
+/// in that batch without `ext.twr.went_on`: it did not resolve by itself.
+#[tokio::test]
+async fn a_stall_its_thread_did_not_go_on_from_says_nothing_of_going_on() {
+    for case in ["stop", "crash", "error", "interrupt"] {
+        let dir = tempfile::tempdir().unwrap();
+        let hub = Hub::open(stall_opts(dir.path())).await.unwrap();
+        let t = new_thread(&hub, dir.path(), "api", "fake").await;
+        let mut sub = hub.subscribe_thread(&t, 0).unwrap();
+        send(
+            &hub,
+            &t,
+            match case {
+                "crash" => "!sleep 1200\n!crash",
+                "error" => "!sleep 1200\n!error it broke",
+                _ => "!sleep 60000\ndone",
+            },
+        );
+        let evs = until(&mut sub, |e| e.kind() == "attention.raised").await;
+        let (_, a) = raised(&evs).pop().unwrap();
+        assert_eq!(a.reason, AttentionReason::Stalled, "{case}");
+        match case {
+            "stop" => {
+                hub.stop_thread(&t, "test").unwrap();
+            }
+            "interrupt" => {
+                let next = hub
+                    .send(&t, "next", TurnFrom::User, Source::User("test".into()))
+                    .unwrap();
+                hub.send_now(&t, next.msg_ref, &Caller::user("test"))
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let evs = until(
+            &mut sub,
+            |e| matches!(&e.body, EventBody::AttentionResolved(r) if r.attn_id == a.attn_id),
+        )
+        .await;
+        let EventBody::AttentionResolved(r) = &evs.last().unwrap().body else {
+            unreachable!()
+        };
+        assert_eq!(r.by, ResolvedBy::Timeout, "{case}");
+        assert!(!went_on(&r.ext), "{case}: {:?}", kinds(&evs));
+        hub.shutdown().await;
+    }
 }
 
 #[tokio::test]

@@ -5,7 +5,13 @@
 //! | method              | params                                              | result |
 //! |---------------------|-----------------------------------------------------|--------|
 //! | `hello`             | `{client, token?, protocol?}`                       | `{client, identity, workspace}` |
-//! | `hub.info`          | -                                                   | `{version, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, online, version}], client, identity, warnings}` |
+//! | `hub.info`          | -                                                   | `{version, build, checkpoint_build, runner_protocol, drainable_protocols, listening, pid, db, started_at, threads, control_head, open_attention, orchestrator, boxes: [{name, transport, state, online, version, refused, last_error, notes, os, arch, build, running_build, switch_pending, restart_pending, epoch, launch, drain, agents}], agents, accounts, client, identity, warnings}` (`accounts`: every runtime's, without directories, `hub::accounts`; the orchestrator and agents get each box's `name, state, online, version, agents` only, and of each agent `runtime, found, login`: `hub::box_agents`) |
+//! | `hub.glance`        | -                                                   | `{workspace, threads, running, permissions, questions, active, orchestrator: {id, name, status, preview, preview_seq} \| null}`: the hub's counts in one call, for the TUI's workspace sidebar (`hub::glance`) |
+//! | `box.add`           | `{name}` (users only)                               | `{box, transport, listening}`: box `name` of `config.toml` / `boxes.toml`, read again, added to the running hub (`hub::boxes`) |
+//! | `box.install`       | `{name}` (users only)                               | `{box}`: SSH box `name`'s supervisor tries again now (`crate::ssh_box`) |
+//! | `box.restart`       | `{box}` (users only)                                | `{box, epoch}`: SSH box `box`'s supervisor ends its session and connects again with the relay's `--restart` (`crate::ssh_box`); `epoch`: the connection replaced |
+//! | `box.token`         | `{box}` (users only)                                | `{box, changed, accepting}`: token box `box` takes its token from `config.toml` / `boxes.toml` again, or none when they no longer give it one; a change drops its runner connection (`hub::boxes`). Never the token |
+//! | `box.agents`        | `{box, refresh?}` (`refresh`: users only)           | `{box, online, agents}`: the box's agent CLIs (`local`: the hub's own), probed again first with `refresh` (`hub::box_agents`); the orchestrator and agents see `runtime, found, login` of each |
 //! | `hub.shutdown`      | -                                                   | `{ok: true}` (then the hub stops) |
 //! | `config.show`       | -                                                   | the configuration the hub loaded, from an allowlist (`hub::config_view`): no token, `env` value, preset command line, `ssh` destination or TLS file; `env` tables as `env_names` (not for agents) |
 //! | `thread.spawn` | `{operation_id, request: <thread.new params>, prompt?}` | durable operation (pending/complete/error) |
@@ -17,6 +23,13 @@
 //! | `thread.send`       | `{thread, prompt}`                                  | `{thread, queued, ref, turn, pending, dispatch_error?}` |
 //! | `say`               | `{message, focused?, seen_gseq?}`                   | `{action, thread?, thread_name?, ref?, turn?, attn_id?, options?, answer?, decision_ids}` |
 //! | `message.withdraw`  | `{thread, ref}` (users only)                        | `{withdrawn: true, state: "queued" \| "running", thread, thread_name, ref, prompt, turn?}` or `{withdrawn: false, reason: "acted" \| "ended" \| "uninterruptible" \| "withdrawn" \| "unknown", message, thread, thread_name, ref, turn?}` (`hub::withdraw`) |
+//! | `message.send_now`  | `{thread, ref}` (users only)                        | `{sent_now: true, state: "interrupting" \| "started" \| "waiting", thread, thread_name, ref, turn?, message?}` or `{sent_now: false, reason: "unknown" \| "not_next" \| "uninterruptible", message, ...}`: runs the next queued message now, interrupting the turn that runs (`hub::queue`) |
+//! | `thread.compact`    | `{thread, offers?}` (users only)                    | `{thread, thread_name, state: "started" \| "queued", turn?, already?}`: compacts the thread's context in a turn of its own, now or after its running turn and the messages queued before (`hub::compact`); refused for a runtime that cannot, a remote box, a thread with no session, parked or attached. With `offers: "on" \| "off"`, compacts nothing: turns the hub's offers to compact the thread's context once its prompt cache expired on or off (`hub::idle_compact`) and returns `{thread, thread_name, offers}` |
+//! | `thread.queue`      | `{thread}` (users only)                             | `{thread, thread_name, total, held, newest_mine, items: [{ref, prompt, truncated, from, mine, queued_at}]}`: the queued messages in the order they run (`hub::queue`) |
+//! | `shell.run`         | `{thread?, command, cwd?, share?}` (users only)      | the job, as `job.start` returns it, with `cwd`: runs the user's `!` command in a dive's worktree or the orchestrator view's folder (`hub::shell`) |
+//! | `shell.cd`          | `{cwd?, dir?}` (users only)                         | `{cwd}`: the orchestrator view's folder `dir` names from `cwd` (`hub::shell`) |
+//! | `suggest.next`      | `{thread, turn, model}` (users only)                | `{thread, turn, model, suggestion, reason?, cached, stats}`: a likely next message of the user's after turn `turn` ended, from `claude -p` with the user's login (`hub::suggest`) |
+//! | `summary.thread`    | `{thread, models?, every_secs}` (users only)        | `{thread, summary, basis, runtime, model, cached, reason?, next_after_secs?, stats}`: one line on where a worker thread stands, from its state, activity and routine updates, by the small model a suggestion uses (`hub::summary`, `twr_core::proto::SummaryThreadResult`) |
 //! | `thread.stop`       | `{thread}`                                          | `{thread, stopping, box_offline?, dropped_prompts}` |
 //! | `thread.set_mode`   | `{thread, mode}`                                    | `{thread, thread_name, mode, previous, changed, applies?, message?, dispatch_error?}` (the orchestrator: or `{status: "needs_confirmation", ...}`) |
 //! | `thread.set_model`  | `{thread, runtime?, model?, effort?}` (at least one; blank or `default` = the runtime's default; with another `runtime`, one left out is that runtime's default) | `{thread, thread_name, runtime, previous_runtime, runtime_changed, model, effort, previous_model, previous_effort, changed, applies?, message?, dispatch_error?}` |
@@ -25,7 +38,9 @@
 //! | `trash.list`        | -                                                   | `{items: [{item, short, thread, thread_name, project, box, deleted_at, deleted_at_ms, purge_at, purge_at_ms, bytes, size, losses, worktree, branch, dir, incomplete?, kept?, box_offline?}], keep_days, bytes, size, unavailable: [{box, error}], message}` (oldest first) |
 //! | `trash.empty`       | `{items?: [string], all?, dry_run?}` (users only)   | `{purged: [{item, short, thread_name, box, bytes}], failed: [{item, box, error}], bytes, size, message}`; with `dry_run` nothing is purged: `{dry_run: true, items: [item as in trash.list], bytes, size, message}` (clients purge exactly those ids after asking) |
 //! | `trash.restore`     | `{item, as?}` (users only)                          | `{thread, thread_name, previous_name, item, box, worktree, branch, checkout?, notes, skipped, session_id, message}` |
-//! | `orchestrator.show` | -                                                   | `{available, runtime, model, thread, name, status, live, configured: {runtime, model}, retired, runtimes}` |
+//! | `log.compact`       | `{vacuum?, drop_checkpoints?}` (users only)         | `{rows, bytes, kinds, purged_threads, turns, blobs, blob_bytes, archived, batches, longest_batch_ms, plan_ms, copy_ms, delete_ms, sweep_ms, total_ms, freed_pages, vacuum?: {ms, before, after, incremental_set}, checkpoints_dropped, skipped?}`: the agent events `[log]` lets go moved to `archive.db` now (`hub::prune`) |
+//! | `log.stats`         | - (users only)                                      | `{db, archive, checkpoints, backlog: {head, full, compacted}, retention_days, archive_on, next}`: sizes of the log and what the next compaction moves (`hub::prune`) |
+//! | `orchestrator.show` | -                                                   | `{available, runtime, model, account, account_shown, account_removed?, thread, name, status, live, configured: {runtime, model, account}, retired, runtimes}` (`account_removed`: true while the current orchestrator's account is removed) |
 //! | `orchestrator.reset` | - (users only)                                      | Fresh session on the current runtime/model, no handoff; same result as `orchestrator.use` with `handoff: null` |
 //! | `orchestrator.use`  | `{runtime, model?, summary?, wait_secs?}` (users only) | `{thread, name, runtime, model, previous: {thread, name, runtime, model, stopping, dropped_prompts} \| null, started, start_error?, handoff: {turn, bytes, summary, summary_note, exchanges, dropped_exchanges} \| null}` |
 //! | `thread.park`       | `{thread, keep?, force?}`                           | `{thread, parked: true, worktree?, worktree_removed, kept_dirty, dirty_files?, kept_reason?, kept, worktree_missing?, worktree_error?, pending}` |
@@ -38,17 +53,31 @@
 //! | `attach.begin`      | `{thread, force?}`                                  | `{thread, lease, argv, cwd, env, session_id, runtime, box?, trust_prompt?}` |
 //! | `attach.child`      | `{thread, pid, start_time}` (on the connection that attached) | `{thread}` |
 //! | `attach.end`        | `{thread}` (on the connection that attached)        | `{thread, detached: true}` |
-//! | `thread.events`     | `{thread, since_seq?, limit?}`                      | `{thread, events: [event], last_seq, next, more}` |
+//! | `thread.events`     | `{thread, since_seq?, limit?}`                      | `{thread, events: [event], last_seq, next, more}` (archived events too; `thread` may be a deleted thread's id) |
 //! | `thread.subscribe`  | `{thread, since_seq?}`                              | ack `{thread, since_seq, head}`, then `{"stream":"thread","event":...}` items |
 //! | `control.read`      | `{since?, limit?}`                                  | `{items: [{"stream":"control","gseq","event"}], head, next, more}` |
-//! | `control.subscribe` | `{since?}`                                          | ack `{since, head}`, then `{"stream":"control","gseq":n,"event":...}` items |
+//! | `control.subscribe` | `{since?, compact?, snapshot?}`                     | ack `{since, head}` (with `compact`: `backlog, compacted: true`; with `snapshot`, from `since` 0 only: `since` the head, `snapshot`, the state at it, and `snapshot_fold`, the fold that made it, else as without it), then `{"stream":"control","gseq":n,"event":...}` items |
+//! | `decisions.list`    | `{before?, limit?}`                                 | `{items: [{gseq, event}], more}`: the newest `decision.made` control items before `before`, newest first, hydrated |
 //! | `blob.get`          | `{ref, offset?, len?}`                              | `{ref, size, offset, encoding: "utf8" \| "base64", data, eof}` |
 //! | `context.read`      | `{project}`                                         | `{project, path, content, hash, bytes, remote, utf8, truncated}` |
 //! | `project.files`     | `{project, path?, thread?}`                         | `{project, commit, branch_of, path, entries: [{name, kind, size, utf8?, secret?}], total, more}`: a directory of a committed tree (`hub::project_read`; not for agents) |
 //! | `project.read`      | `{project, path, thread?, offset?}`                 | `{project, commit, branch_of, path, kind, content, offset, end, total, utf8?, note?}`: 16 KB of a committed file; secrets, binaries and files over 1 MiB refused |
 //! | `project.search`    | `{project, query, path?, thread?, ignore_case?}`    | `{project, commit, branch_of, query, path, hits: [{path, line, text}], more, hidden}` |
 //! | `context.set`       | `{project, content, expect_hash?}`                  | `{project, path, hash, bytes, changed}` (`conflict` if `expect_hash` is stale or the file is over 1 MiB) |
+//! | `memory.list`       | -                                                   | `{notes: [{name, type, description, updated, by, origin, runtime?, rev, bytes, unconfirmed?}], unreadable: [{name, why}], rev, count, bytes, limits, enabled, dir?}`: the orchestrator's memory (`hub::memory`; not for agents; `dir` for users) |
+//! | `memory.read`       | `{name}`                                            | a note of `memory.list` with its `body` |
+//! | `memory.save`       | `{name, type, description, body, rev?}`             | `{name, rev, op: saved \| updated, count, bytes}` (`conflict` when `rev` is stale, or missing for a note that exists) |
+//! | `memory.forget`     | `{name, rev?}`                                      | `{name, op: forgotten, count}` |
+//! | `speech.attach`     | `{device, name, engine, voice?, live?, read?, turn_from?, watermarks?, catchup_secs?}` (users only) | ack `{orchestrator, head}`, then `{"stream":"speech","item":{...}}` items (`msg`, `ctl`, `missed`, `orchestrator`): a speaker reads the orchestrator's messages aloud (`hub::speech`, `twr_core::speech`); `conflict` while a speaker of the device is attached |
+//! | `speech.state`      | `{playing?, queued, batch?, paused, live, voice?, rate, error?}` (on the connection that attached a speaker) | `{ok: true}`: what that speaker plays, for `speech.status` |
+//! | `speech.request`    | `{thread?, last? \| seq?, speaker?}` (users only)   | `{count, speakers, thread}`: reads the last `last` messages, or the one at `seq`, on the speakers now, as one batch (`hub::speech`) |
+//! | `speech.control`    | `{op, value?, speaker?}` (users only)               | `{speakers}`: stop, pause, resume, skip, live, voice or rate, sent to the speakers |
+//! | `speech.status`     | - (users only)                                      | `{speakers: [{device, name, engine, since, playing?, queued, batch?, paused, live, voice?, rate, error?}]}` |
 //! | `usage.get`         | -                                                   | `{now, runtimes: [{runtime, account, label, plan, windows: [{window, label, used_pct, resets_at, minutes}], observed_at, age_secs, stale, source}]}` |
+//! | `account.list`      | `{runtime?}` (not agents)                           | `{runtimes: {<runtime>: {shown, native, native_dir?, native_var?, accounts: [{runtime, name, native, dir, share, source, login, method, note, checked_at, removed, threads, conflict?, shared_credentials?, retained_paths?}]}}, now}`: every runtime that takes accounts (or `runtime`), the native account first (`hub::accounts`); `native_dir` (the runtime's own directory as the hub has it, `null` when none) and `native_var` (`{name, set, value?}`: its selector variable in the hub's environment) for each runtime that takes accounts; the orchestrator gets no `dir`, `native_dir`, `native_var`, `shared_credentials` nor `retained_paths` (`[{thread, path}]`: its threads given its directory by a path it is no longer configured with) |
+//! | `account.add`       | `{runtime, account, dir?, share?, native?, dry_run?, after_native_name?}` (users only) | `{runtime, account, native, dir, share, source, config, existing, recorded}`: records `account.added` unless config.toml declares it or a live record says the same; `dry_run` records nothing; `after_native_name` (a named account's dry run only) answers as if the native account were named that first, that rename checked too |
+//! | `account.remove`    | `{runtime, account, move_to?, force?}` (users only)  | `{runtime, account, native, dir, removed, config, threads, moved, running, message, dispatch_error?}`: records `account.removed`; refused for a config account without a record, and while threads run on it unless `move_to` or `force`; `running`: `[{thread, thread_name}]` whose runtime process still runs on the removed login (their thread objects say `runtime_account_removed` `{runtime, account, dir?}` until it stops; `dir`, the directory it was started in, for users only) |
+//! | `account.status`    | `{runtime?, account?, refresh?}` (users only)        | as `account.list`, after checking the logins again with `refresh` |
 //!
 //! Identity: a connection is `user:<client>` (source of what it does; its
 //! turns are `from: user`, whatever `thread.send` `from` says) unless its `hello` carried the
@@ -174,7 +203,9 @@
 //! listing. `trash.list` lists the trash of every box (the orchestrator may call it);
 //! `trash.empty` purges items now and `trash.restore` puts a thread back (`hub::trash`): users
 //! only, not in `ORCHESTRATOR_METHODS`, and the hub refuses the orchestrator identity as
-//! well. Items are purged `[trash] keep_days` after their deletion.
+//! well. Items are purged `[trash] keep_days` after their deletion. `box.add`,
+//! `box.install`, `box.restart`, `box.projects` and `box.token` change the hub's boxes
+//! (`hub::boxes`): users only too, refused to the orchestrator and to agents alike.
 //! `thread.send` succeeds once the prompt is queued (`queued` is its queue row id, and `ref`
 //! too: the message's ref); if dispatching it then failed, `dispatch_error` says why and the
 //! prompt stays queued. `say` returns the same `ref` when it queued the message (`send`,
@@ -192,6 +223,15 @@
 //! whether items follow; `next` is the `since_seq` / `since` that continues the read (the last
 //! item's seq / gseq; `last_seq` is the same for `thread.events`). Clients page until `more`
 //! is false.
+//! `control.subscribe` with `snapshot` (and `since` 0) acknowledges with the state a client
+//! folds from every control item up to the head (`snapshot`: a
+//! [`twr_core::client_state::ClientFold`], decisions and all, payloads whole) and `since` set
+//! to the head: the items after it follow. A state larger than [`crate::hub::SNAPSHOT_MAX`] is
+//! not sent: the ack is then the one without `snapshot` (the items from the start, compacted
+//! with `compact`). An older hub refuses `snapshot` (`bad_request`). `decisions.list` reads the
+//! older `decision.made` items a snapshot leaves out: `before` (exclusive; default: all)
+//! pages back by gseq, `limit` defaults to 200, at most [`crate::hub::DECISIONS_MAX`], and the
+//! page is cut at [`PAGE_BYTES`] too; `more` says whether older ones are left.
 //! `usage.get` returns the latest usage the hub knows of each runtime's account (`hub::usage`):
 //! the plan windows that have not reset, `used_pct` the share used, `stale` once the data is
 //! ten minutes old. Runtimes with no data are left out.
@@ -228,7 +268,7 @@ use twr_core::proto::{
 use twr_runner::reap::{self, AncestryEnd, ProcessId};
 
 use crate::hub::{
-    wait_state, AgentPeer, AgentWhy, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
+    wait_state, AgentPeer, AgentWhy, BoxView, Caller, Hub, HubState, NewThread, PeerWalk, ReadTool,
     StartedKind, SwitchOptions, SUMMARY_WAIT_MAX,
 };
 
@@ -473,6 +513,7 @@ pub async fn serve(
     let mut signalled = false;
     let sub_count = Arc::new(SubCount::default());
     tokio::pin!(signal);
+    twr_core::trace::mark("hub: serving");
     loop {
         tokio::select! {
             r = listener.accept() => match r {
@@ -498,7 +539,11 @@ pub async fn serve(
     }
     drop(listener);
     // Right away: a client that finds no socket may start a new hub while this one drains.
+    // This hub still takes runners until it exits, and holds its data directory's lock until
+    // then: a command that must reach every hub that may accept a box's runner (`twr box
+    // remove`, `twr box token`) waits for that lock when it finds no socket.
     socket.remove();
+    hub.socket_removed().await;
     hub.shutdown().await;
     let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
         while conns.join_next().await.is_some() {}
@@ -619,11 +664,22 @@ pub const METHODS: &[&str] = &[
     "hello",
     "say",
     "hub.info",
+    "hub.glance",
     "hub.shutdown",
     "config.show",
+    "box.add",
+    "box.install",
+    "box.restart",
+    "box.projects",
+    "box.token",
+    "box.agents",
     "notify.looking",
     "usage.get",
     "usage.threads",
+    "account.list",
+    "account.add",
+    "account.remove",
+    "account.status",
     "thread.new",
     "thread.spawn",
     "thread.spawn_status",
@@ -644,9 +700,23 @@ pub const METHODS: &[&str] = &[
     "thread.transcript",
     "thread.subscribe",
     "message.withdraw",
+    "message.send_now",
+    "thread.compact",
+    "thread.queue",
+    "shell.run",
+    "shell.cd",
+    "suggest.next",
+    "summary.thread",
+    "speech.attach",
+    "speech.state",
+    "speech.request",
+    "speech.control",
+    "speech.status",
     "trash.list",
     "trash.empty",
     "trash.restore",
+    "log.compact",
+    "log.stats",
     "orchestrator.show",
     "orchestrator.reset",
     "orchestrator.use",
@@ -663,12 +733,17 @@ pub const METHODS: &[&str] = &[
     "attach.end",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "context.read",
     "context.set",
     "project.files",
     "project.read",
     "project.search",
+    "memory.list",
+    "memory.read",
+    "memory.save",
+    "memory.forget",
     "job.start",
     "job.cancel",
     "job.list",
@@ -680,6 +755,8 @@ pub const METHODS: &[&str] = &[
 pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "hello",
     "hub.info",
+    "hub.glance",
+    "box.agents",
     "config.show",
     "thread.new",
     "thread.spawn",
@@ -688,6 +765,8 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "thread.activity",
     "usage.get",
     "usage.threads",
+    // Without the accounts' directories (`hub::accounts`).
+    "account.list",
     "thread.get",
     "thread.send",
     "thread.send_cancel",
@@ -707,6 +786,7 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "attention.annotate",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "report.write",
     "context.read",
@@ -714,6 +794,10 @@ pub const ORCHESTRATOR_METHODS: &[&str] = &[
     "project.files",
     "project.read",
     "project.search",
+    "memory.list",
+    "memory.read",
+    "memory.save",
+    "memory.forget",
     "orchestrator.watch",
     "orchestrator.unwatch",
     "orchestrator.watches",
@@ -742,6 +826,12 @@ const ORCHESTRATOR_CHANGES: &[&str] = &[
     "orchestrator.unwatch",
 ];
 
+/// The [`ORCHESTRATOR_METHODS`] that change the orchestrator's own memory (`hub::memory`):
+/// refused, like [`ORCHESTRATOR_CHANGES`], once the user took back the message of the turn they
+/// come in, but they leave that message free to be taken back (a note is no change to the
+/// hub's threads).
+const ORCHESTRATOR_NOTES: &[&str] = &["memory.save", "memory.forget"];
+
 /// Methods a thread's agent may call: reads, and starting and cancelling its own thread's jobs
 /// (from a process twr started for the thread; starting only while the thread's mode may run
 /// commands; [`agent_thread`], `hub::jobs`). It may not answer, change a mode or model, send or route a
@@ -756,6 +846,8 @@ pub const AGENT_METHODS: &[&str] = &[
     "job.list",
     "job.log",
     "hub.info",
+    "hub.glance",
+    "box.agents",
     "thread.list",
     "thread.activity",
     "usage.get",
@@ -767,6 +859,7 @@ pub const AGENT_METHODS: &[&str] = &[
     "attention.list",
     "control.read",
     "control.subscribe",
+    "decisions.list",
     "blob.get",
     "context.read",
     "trash.list",
@@ -847,7 +940,14 @@ async fn connection(
     default_client: String,
     sub_count: Arc<SubCount>,
 ) {
+    let walked = std::time::Instant::now();
     let (peer, PeerWalk { process, agent }) = agent_of(&hub, &stream).await;
+    twr_core::trace::mark_with(|| {
+        format!(
+            "hub: connection {default_client} classified in {}us",
+            walked.elapsed().as_micros()
+        )
+    });
     if let Some(a) = &agent {
         tracing::info!(thread = ?a.thread, peer = a.peer, why = ?a.why, "a connection from a thread's agent: it reads, and starts and cancels its own thread's jobs only");
     }
@@ -865,10 +965,20 @@ async fn connection(
     let mut subs = JoinSet::new();
     let mut state = hub.state();
     let mut leases: Leases = Vec::new();
+    // The speaker this connection attached (`speech.attach`), which its `speech.state` names.
+    let mut speaker: Option<u64> = None;
     loop {
         let frame = tokio::select! {
             f = read_frame::<_, Request>(&mut reader) => f,
             _ = wait_state(&mut state, |s| *s == HubState::Stopped) => {
+                // A connection for calls is told why it closes (as the reply to request 0): a
+                // client that keeps one open (the TUI, the MCP server) and writes to it later
+                // reads why its call failed, and knows nothing was done. A subscription's
+                // stream ends its connection itself.
+                if subs.is_empty() {
+                    let gone = RpcError::new(codes::STOPPING, "the hub is stopping");
+                    let _ = send(&writer, &Response::err(0, gone)).await;
+                }
                 // Subscriptions end on their own once they have flushed. Attach leases are
                 // left for the next hub to close (`thread.detached` reason `hub_restart`).
                 while subs.join_next().await.is_some() {}
@@ -947,6 +1057,14 @@ async fn connection(
                 continue;
             }
         }
+        if caller.is_orchestrator() && ORCHESTRATOR_NOTES.contains(&req.method.as_str()) {
+            if let Err(e) = hub.orchestrator_admitted(&req.method, received.as_ref()) {
+                if send(&writer, &Response::err(id, e)).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         let client = conn.client.clone();
         // Subscriptions that ended (their stream ended or failed, or their client went) no
         // longer count against this connection's.
@@ -957,8 +1075,8 @@ async fn connection(
                 match sub_slot(&sub_count, subs.len(), agent)
                     .and_then(|slot| Ok((slot, control_subscribe(&hub, req.params)?)))
                 {
-                    Ok((slot, (ack, sub))) => {
-                        subs.spawn(pump_control(writer.clone(), id, ack, sub, slot));
+                    Ok((slot, sub)) => {
+                        subs.spawn(pump_control(writer.clone(), id, sub, slot));
                     }
                     Err(e) => {
                         let _ = send(&writer, &Response::err(id, e)).await;
@@ -975,6 +1093,46 @@ async fn connection(
                     Err(e) => {
                         let _ = send(&writer, &Response::err(id, e)).await;
                     }
+                }
+            }
+            // A speaker (`hub::speech`): its items go out on this connection, and it reports
+            // its state on it.
+            "speech.attach" => {
+                let attached = if speaker.is_some() {
+                    Err(RpcError::new(
+                        codes::CONFLICT,
+                        "this connection has a speaker attached already",
+                    ))
+                } else {
+                    sub_slot(&sub_count, subs.len(), agent).and_then(|slot| {
+                        let p = required_params(req.params)?;
+                        Ok((slot, hub.speech_attach(p, &caller)?))
+                    })
+                };
+                match attached {
+                    Ok((slot, att)) => {
+                        speaker = Some(att.key());
+                        subs.spawn(pump_speech(writer.clone(), id, att, slot));
+                    }
+                    Err(e) => {
+                        let _ = send(&writer, &Response::err(id, e)).await;
+                    }
+                }
+            }
+            "speech.state" => {
+                let result = match speaker {
+                    Some(key) => params(req.params).and_then(|p| hub.speech_state(key, p)),
+                    None => Err(RpcError::new(
+                        codes::BAD_REQUEST,
+                        "no speaker is attached on this connection (speech.attach first)",
+                    )),
+                };
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
                 }
             }
             "attach.begin" => {
@@ -1007,11 +1165,46 @@ async fn connection(
                     break;
                 }
             }
+            // A suggestion or summary asked for is the client's only while it waits for it:
+            // its client gone (the user turned them off, or quit), the ask goes too, before
+            // any model is asked, or with the CLI it started (`hub::suggest`, `hub::summary`).
+            // (Dispatched by `call_async`: its own arm there is the method's.)
+            method @ ("suggest.next" | "summary.thread") => {
+                let result = tokio::select! {
+                    r = call_async(&hub, &caller, method, req.params, None) => r,
+                    () = hung_up(&mut reader) => break,
+                };
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
             "thread.new" | "thread.park" | "thread.resume" | "thread.delete" | "thread.trim"
             | "usage.threads" | "context.read" | "context.set" | "orchestrator.use"
             | "orchestrator.reset" | "trash.list" | "trash.empty" | "trash.restore"
-            | "project.files" | "project.read" | "project.search" => {
-                let result = call_async(&hub, &caller, &req.method, req.params).await;
+            | "log.compact" | "log.stats" | "project.files" | "project.read" | "project.search"
+            | "memory.list" | "memory.read" | "box.add" | "box.install" | "box.restart"
+            | "box.projects" | "box.token" | "account.status" | "account.remove"
+            | "thread.set_model" | "speech.request" | "speech.control" => {
+                let result =
+                    call_async(&hub, &caller, &req.method, req.params, received.as_ref()).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            // A change to the orchestrator's memory: the orchestrator's is bound to the turn it
+            // came in (`hub::memory`: the kind of turn it records, and the take-back check
+            // again).
+            "memory.save" | "memory.forget" => {
+                let result =
+                    memory_change(&hub, &caller, &req.method, req.params, received.as_ref()).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -1032,6 +1225,17 @@ async fn connection(
             }
             "hello" => {
                 let result = hello(&hub, &mut conn, req.params).await;
+                let resp = match result {
+                    Ok(v) => Response::ok(id, v),
+                    Err(e) => Response::err(id, e),
+                };
+                if send(&writer, &resp).await.is_err() {
+                    break;
+                }
+            }
+            // What the caller sees of the box depends on who it is (`hub::box_agents`).
+            "box.agents" => {
+                let result = box_agents(&hub, &conn, &caller, req.params).await;
                 let resp = match result {
                     Ok(v) => Response::ok(id, v),
                     Err(e) => Response::err(id, e),
@@ -1190,43 +1394,40 @@ struct Item<'a> {
     event: &'a Event,
 }
 
-/// Serves control subscription `sub` (request `id`, acknowledged with `ack`) until it ends,
-/// counted in the hub's subscriptions (`_slot`) meanwhile.
+/// Serves control subscription `sub` (request `id`) until it ends, counted in the hub's
+/// subscriptions (`_slot`) meanwhile. One with `snapshot` is acknowledged with the state at the
+/// head (serialized here, outside the core lock), or, too large to send, as one without it.
+/// A compacted one is acknowledged once its backlog is selected, with how many items it has
+/// (`backlog`); the selection failing fails the request.
 async fn pump_control(
     w: Writer,
     id: u64,
-    ack: Value,
     mut sub: crate::hub::ControlSubscription,
     _slot: SubSlot,
 ) {
-    if send(&w, &Response::ok(id, ack)).await.is_err() {
-        return;
+    // (First: one that does not send it falls back to the items from the start.)
+    let snapshot = sub.snapshot();
+    let mut ack = json!({ "since": sub.since(), "head": sub.head() });
+    if let Some(snapshot) = snapshot {
+        ack["snapshot"] = snapshot;
+        // The code that folded it: a client of another build refuses it and asks again without
+        // a snapshot (its own reducers may fold the same items otherwise).
+        ack["snapshot_fold"] = json!(twr_core::client_state::FOLD);
     }
-    loop {
-        match sub.next().await {
-            Ok(Some((gseq, ev))) => {
-                let item = Item {
-                    stream: StreamKind::Control,
-                    gseq: Some(gseq),
-                    event: &ev,
-                };
-                if send(&w, &item).await.is_err() {
-                    return;
-                }
+    if sub.compacted() {
+        match sub.compact().await {
+            Ok(backlog) => {
+                ack["backlog"] = json!(backlog);
+                ack["compacted"] = json!(true);
             }
-            Ok(None) => break,
             Err(e) => {
-                let _ = send(
-                    &w,
-                    &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
-                )
-                .await;
-                break;
+                let e = RpcError::new(codes::INTERNAL, format!("{e:#}"));
+                let _ = send(&w, &Response::err(id, e)).await;
+                return;
             }
         }
     }
-    // End of stream: close our side so the client sees EOF.
-    let _ = w.lock().await.shutdown().await;
+    pump(w, id, ack, sub).await;
 }
 
 /// Serves thread subscription `sub` like [`pump_control`].
@@ -1234,35 +1435,142 @@ async fn pump_thread(
     w: Writer,
     id: u64,
     ack: Value,
-    mut sub: crate::hub::ThreadSubscription,
+    sub: crate::hub::ThreadSubscription,
     _slot: SubSlot,
 ) {
+    pump(w, id, ack, sub).await;
+}
+
+/// Serves speaker `att` (request `id`) until its feed ends (the hub stopped) or the
+/// connection goes (which detaches it: dropping `att` does), counted in the hub's
+/// subscriptions meanwhile: its ack, then each item as `{"stream":"speech","item":{...}}`.
+async fn pump_speech(w: Writer, id: u64, mut att: crate::hub::SpeechAttachment, _slot: SubSlot) {
+    /// A line of the stream.
+    #[derive(Serialize)]
+    struct Line<'a> {
+        stream: &'static str,
+        item: &'a twr_core::speech::SpeechItem,
+    }
+    let ack = match serde_json::to_value(att.ack()) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = send(&w, &Response::err(id, internal(e))).await;
+            return;
+        }
+    };
     if send(&w, &Response::ok(id, ack)).await.is_err() {
         return;
     }
-    loop {
-        match sub.next().await {
-            Ok(Some(ev)) => {
-                let item = Item {
-                    stream: StreamKind::Thread,
-                    gseq: None,
-                    event: &ev,
-                };
-                if send(&w, &item).await.is_err() {
-                    return;
-                }
-            }
-            Ok(None) => break,
-            Err(e) => {
-                let _ = send(
-                    &w,
-                    &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
-                )
-                .await;
-                break;
-            }
+    while let Some(item) = att.next().await {
+        let line = Line {
+            stream: "speech",
+            item: &item,
+        };
+        if send(&w, &line).await.is_err() {
+            return;
         }
     }
+    // End of stream: close our side so the speaker sees EOF (and attaches again).
+    let _ = w.lock().await.shutdown().await;
+}
+
+/// Most bytes of items [`pump`] writes at once.
+const WRITE_BATCH: usize = 64 * 1024;
+
+/// A subscription [`pump`] serves.
+trait Feed: Send {
+    type Item: Send;
+    /// The next item; `Ok(None)` once the hub has shut down.
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send;
+    /// Appends the line of the next item already in the store to `buf`; `Ok(false)` when none
+    /// is, without waiting.
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool>;
+    /// Appends `item` to `buf` as its line.
+    fn line(item: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()>;
+}
+
+impl Feed for crate::hub::ControlSubscription {
+    type Item = crate::hub::ControlItem;
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+        crate::hub::ControlSubscription::next(self)
+    }
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        crate::hub::ControlSubscription::write_stored(self, buf)
+    }
+    fn line((gseq, ev): &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+        crate::hub::stream_line(buf, Some(*gseq), ev)
+    }
+}
+
+impl Feed for crate::hub::ThreadSubscription {
+    type Item = Arc<Event>;
+    fn next(
+        &mut self,
+    ) -> impl std::future::Future<Output = anyhow::Result<Option<Self::Item>>> + Send {
+        crate::hub::ThreadSubscription::next(self)
+    }
+    fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+        crate::hub::ThreadSubscription::write_stored(self, buf)
+    }
+    fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+        crate::hub::stream_line(buf, None, ev)
+    }
+}
+
+/// Serves subscription `sub` (request `id`, acknowledged with `ack`) until it ends: what the
+/// store holds first, in writes of up to [`WRITE_BATCH`] bytes (a replay of thousands goes out
+/// in few writes, not one each, its rows written out as stored), then each live item as it
+/// comes.
+async fn pump<F: Feed>(w: Writer, id: u64, ack: Value, mut sub: F) {
+    if send(&w, &Response::ok(id, ack)).await.is_err() {
+        return;
+    }
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let mut failed = None;
+        while buf.len() < WRITE_BATCH {
+            match sub.write_stored(&mut buf) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        // Nothing stored left: the next item comes live.
+        if buf.is_empty() && failed.is_none() {
+            match sub.next().await {
+                Ok(Some(item)) => {
+                    if F::line(&item, &mut buf).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => failed = Some(e),
+            }
+        }
+        if !buf.is_empty() {
+            let mut out = w.lock().await;
+            if out.write_all(&buf).await.is_err() || out.flush().await.is_err() {
+                return;
+            }
+        }
+        if let Some(e) = failed {
+            let _ = send(
+                &w,
+                &Response::err(id, RpcError::new(codes::INTERNAL, e.to_string())),
+            )
+            .await;
+            break;
+        }
+    }
+    // End of stream: close our side so the client sees EOF.
     let _ = w.lock().await.shutdown().await;
 }
 
@@ -1271,6 +1579,57 @@ fn params<T: DeserializeOwned + Default>(v: Value) -> Result<T, RpcError> {
         return Ok(T::default());
     }
     serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+}
+
+/// [`params`] of a method whose params have fields without a default: none given is a
+/// `bad_request` too.
+fn required_params<T: DeserializeOwned>(v: Value) -> Result<T, RpcError> {
+    serde_json::from_value(v).map_err(|e| RpcError::new(codes::BAD_REQUEST, e.to_string()))
+}
+
+/// Returns once the client closed its end of the connection (or it failed); never while it is
+/// open, whatever it sent meanwhile: what came stays in `reader` for the next read.
+async fn hung_up<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) {
+    use tokio::io::AsyncBufReadExt;
+    match reader.fill_buf().await {
+        Ok(b) if !b.is_empty() => std::future::pending().await,
+        _ => {}
+    }
+}
+
+/// `suggest.next`'s parameters: the thread, the turn, and what the client asks
+/// ([`crate::hub::SuggestAsk`]). `models` (each runtime's model) comes from a client that knows
+/// Codex answers too; `model` alone (Claude Code's), from one from before, whose user was told
+/// of Anthropic only, so only Claude Code answers it; neither, Claude Code with its default.
+fn suggest_params(p: Value) -> Result<(String, u64, crate::hub::SuggestAsk), RpcError> {
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SuggestParams {
+        thread: String,
+        turn: u64,
+        model: Option<String>,
+        models: Option<twr_core::config::SuggestModels>,
+        #[serde(default)]
+        retry: bool,
+    }
+    let p: SuggestParams = params(p)?;
+    let ask = match (p.models, p.model) {
+        (Some(models), _) => crate::hub::SuggestAsk {
+            models,
+            claude_only: false,
+            retry: p.retry,
+        },
+        (None, model) => crate::hub::SuggestAsk {
+            models: twr_core::config::SuggestModels {
+                claude_code: model
+                    .unwrap_or_else(|| twr_core::config::DEFAULT_SUGGEST_MODEL.to_string()),
+                ..Default::default()
+            },
+            claude_only: true,
+            retry: p.retry,
+        },
+    };
+    Ok((p.thread, p.turn, ask))
 }
 
 /// The thread of this hub whose agent `agent` is: jobs are for it alone. Only a process twr
@@ -1308,6 +1667,21 @@ fn agent_thread(hub: &Hub, agent: &crate::hub::AgentPeer) -> Result<String, RpcE
 /// from, a process twr started for that thread: what it found when the connection opened is
 /// not kept as that proof (the peer may have left its runtime since, or the runtime or attach
 /// may have ended).
+/// `memory.save` / `memory.forget` of the orchestrator, bound to the call as it was admitted.
+async fn memory_change(
+    hub: &Hub,
+    caller: &Caller,
+    method: &str,
+    p: Value,
+    received: Option<&crate::hub::OrchCall>,
+) -> Result<Value, RpcError> {
+    if method == "memory.save" {
+        hub.memory_save(params(p)?, caller, received).await
+    } else {
+        hub.memory_forget(params(p)?, caller, received).await
+    }
+}
+
 async fn job_request(
     hub: &Hub,
     conn: &Conn,
@@ -1487,6 +1861,13 @@ struct TrashEmptyParams {
     dry_run: bool,
 }
 
+/// `box.add`, `box.install`: the box.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoxParams {
+    name: String,
+}
+
 /// `trash.restore`: the item, and the name to restore it under.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1537,7 +1918,7 @@ struct SendParams {
     from: TurnFrom,
 }
 
-/// `message.withdraw` parameters.
+/// `message.withdraw` and `message.send_now` parameters.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WithdrawParams {
@@ -1556,6 +1937,10 @@ struct SayParams {
     seen_gseq: Option<u64>,
     /// `"orchestrator"`: hand the message to the orchestrator without routing it.
     to: Option<String>,
+    /// The message is a suggested one the user took unedited (`hub::suggest`): never applied
+    /// as a short command at once.
+    #[serde(default)]
+    suggested: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -1565,12 +1950,16 @@ struct SetModeParams {
     mode: String,
 }
 
-/// `thread.set_model` params: a missing `model` / `effort` keeps the thread's.
+/// `thread.set_model` params: a missing `model` / `effort` keeps the thread's (or, on a move
+/// to another runtime, is the new runtime's default).
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetModelParams {
     thread: String,
     runtime: Option<String>,
+    account: Option<String>,
+    #[serde(default)]
+    outside_pin: bool,
     model: Option<String>,
     effort: Option<String>,
 }
@@ -1681,6 +2070,37 @@ struct ControlParams {
     limit: Option<usize>,
 }
 
+/// `control.subscribe`'s parameters. An older hub refuses `compact` and `snapshot`
+/// (`bad_request`): a client asks again without them.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscribeParams {
+    #[serde(default)]
+    since: u64,
+    /// Accepted, as it always was (it was `control.read`'s), and unused.
+    #[allow(dead_code)]
+    limit: Option<usize>,
+    /// Compact the stored backlog ([`twr_core::compact`]).
+    #[serde(default)]
+    compact: bool,
+    /// Begin with the state at the head instead of the items up to it (`since` 0 only).
+    #[serde(default)]
+    snapshot: bool,
+}
+
+/// `decisions.list`'s parameters.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionsParams {
+    /// Only items before this control position (default: all).
+    before: Option<u64>,
+    /// At most this many (default [`DECISIONS_LIMIT`], at most [`crate::hub::DECISIONS_MAX`]).
+    limit: Option<usize>,
+}
+
+/// How many `decision.made` items `decisions.list` returns by default.
+const DECISIONS_LIMIT: usize = 200;
+
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BlobParams {
@@ -1709,8 +2129,16 @@ struct ParkParams {
     force: bool,
 }
 
-/// Methods that wait on git or on a runtime's exit.
-async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Result<Value, RpcError> {
+/// Methods that wait on git or on a runtime's exit. The orchestrator's `thread.new` and
+/// `thread.set_model` are bound to the call as admitted (`received`, [`Hub::orchestrator_acts`]):
+/// checked again after what they wait on.
+async fn call_async(
+    hub: &Hub,
+    caller: &Caller,
+    method: &str,
+    p: Value,
+    received: Option<&crate::hub::OrchCall>,
+) -> Result<Value, RpcError> {
     match method {
         // Committed files of a project on the hub's box (`hub::project_read`).
         "project.files" => hub.project_read(ReadTool::Files, params(p)?, caller).await,
@@ -1718,7 +2146,7 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "project.search" => hub.project_read(ReadTool::Search, params(p)?, caller).await,
         "thread.new" => {
             let p: NewThread = params(p)?;
-            hub.new_thread_by(p, caller).await
+            hub.new_thread_bound(p, caller, received).await
         }
         "thread.park" => {
             let p: ParkParams = params(p)?;
@@ -1733,6 +2161,25 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
         "thread.trim" => {
             let p: ThreadRef = params(p)?;
             hub.trim_thread(&p.thread, caller).await
+        }
+        "suggest.next" => {
+            let (thread, turn, ask) = suggest_params(p)?;
+            hub.suggest_ask(&thread, turn, &ask, caller).await
+        }
+        "summary.thread" => {
+            let p: twr_core::proto::SummaryThreadParams = params(p)?;
+            hub.summary_thread(&p, caller).await
+        }
+        // Sent to the speakers attached, each in its turn (`hub::speech`).
+        "speech.request" => {
+            let p: twr_core::speech::SpeechRequestParams = params(p)?;
+            let out = hub.speech_request(&p, caller).await?;
+            serde_json::to_value(out).map_err(internal)
+        }
+        "speech.control" => {
+            let p: twr_core::speech::SpeechControlParams = required_params(p)?;
+            let out = hub.speech_control(&p, caller).await?;
+            serde_json::to_value(out).map_err(internal)
         }
         "usage.threads" => {
             #[derive(Default, Deserialize)]
@@ -1781,9 +2228,90 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
             hub.trash_restore(&p.item, p.as_name.as_deref(), caller)
                 .await
         }
+        // A compaction of the log now (`hub::prune`).
+        "log.compact" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct LogCompactParams {
+                #[serde(default)]
+                vacuum: bool,
+                #[serde(default)]
+                drop_checkpoints: bool,
+            }
+            let p: LogCompactParams = params(p)?;
+            hub.log_compact(p.vacuum, p.drop_checkpoints, caller).await
+        }
+        "log.stats" => hub.log_stats(caller).await,
+        // Reads config.toml and boxes.toml again (`hub::boxes`).
+        "box.add" => {
+            let p: BoxParams = params(p)?;
+            hub.box_add(&p.name, caller).await
+        }
+        // Reads the box's `build` from them again.
+        "box.install" => {
+            let p: BoxParams = params(p)?;
+            hub.box_install(&p.name, caller).await
+        }
+        "box.restart" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BoxRestartParams {
+                #[serde(rename = "box")]
+                box_name: String,
+            }
+            let p: BoxRestartParams = params(p)?;
+            hub.box_restart(&p.box_name, caller)
+        }
+        // Reads the box's projects from them again.
+        "box.projects" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BoxProjectsParams {
+                #[serde(rename = "box")]
+                box_name: String,
+            }
+            let p: BoxProjectsParams = params(p)?;
+            hub.box_projects(&p.box_name, caller).await
+        }
+        // Reads the box's token from them again.
+        "box.token" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BoxTokenParams {
+                #[serde(rename = "box")]
+                box_name: String,
+            }
+            let p: BoxTokenParams = params(p)?;
+            hub.box_token(&p.box_name, caller).await
+        }
         "context.read" => {
             let p: ProjectParams = params(p)?;
             hub.context_read(&p.project).await
+        }
+        // The orchestrator's memory (`hub::memory`).
+        "memory.list" => {
+            let _: EmptyParams = params(p)?;
+            hub.memory_list(caller).await
+        }
+        "memory.read" => hub.memory_read(params(p)?, caller).await,
+        "memory.save" => hub.memory_save(params(p)?, caller, None).await,
+        "memory.forget" => hub.memory_forget(params(p)?, caller, None).await,
+        // Checks the logins again first with `refresh` (`hub::accounts`).
+        "account.status" => hub.account_status(params(p)?, caller).await,
+        // A move looks the thread's project up first when its log does not say it, as git
+        // has it (`hub::thread_account`).
+        "account.remove" => hub.account_remove(params(p)?, caller).await,
+        "thread.set_model" => {
+            let p: SetModelParams = params(p)?;
+            let req = crate::hub::ModelRequest {
+                runtime: p.runtime.as_deref(),
+                account: p.account.as_deref(),
+                outside_pin: p.outside_pin,
+                model: p.model.as_deref(),
+                effort: p.effort.as_deref(),
+            };
+            hub.set_thread_model_bound(&p.thread, req, caller, received)
+                .await
         }
         "context.set" => {
             let p: ContextSetParams = params(p)?;
@@ -1822,12 +2350,22 @@ async fn call_async(hub: &Hub, caller: &Caller, method: &str, p: Value) -> Resul
 
 async fn say(hub: &Hub, caller: &Caller, p: Value) -> Result<Value, RpcError> {
     let p: SayParams = params(p)?;
+    // A suggestion goes to the orchestrator only, where `say` keeps it from acting as a
+    // command; routed, an `@thread yes` in it would answer as the user.
+    if p.suggested && p.to.as_deref() != Some("orchestrator") {
+        return Err(RpcError::new(
+            codes::BAD_REQUEST,
+            "a suggested message goes to the orchestrator only (`to: \"orchestrator\"`)",
+        ));
+    }
     match p.to.as_deref() {
         None => {
             hub.say_seen(&p.message, p.focused.as_deref(), p.seen_gseq, caller)
                 .await
         }
-        Some("orchestrator") => hub.say_to_orchestrator(&p.message, p.seen_gseq, caller),
+        Some("orchestrator") => {
+            hub.say_to_orchestrator_as(&p.message, p.seen_gseq, caller, p.suggested)
+        }
         Some(other) => Err(RpcError::new(
             codes::BAD_REQUEST,
             format!("say `to` can only be \"orchestrator\" (not {other:?}); omit it to route"),
@@ -2119,6 +2657,42 @@ fn no_longer_orchestrator() -> RpcError {
     )
 }
 
+/// How much of the boxes `caller` on `conn` sees: everything for a user, a box's state and
+/// agents for the orchestrator and a thread's agent (`hub::box_agents`).
+fn box_view(conn: &Conn, caller: &Caller) -> BoxView {
+    if caller.is_orchestrator() || conn.restricted().is_some() {
+        BoxView::Limited
+    } else {
+        BoxView::Full
+    }
+}
+
+/// Takes the directory out of thread object `t`'s `runtime_account_removed` (a caller that
+/// sees no account directories: [`box_view`]).
+fn hide_removed_login_dir(t: &mut Value) {
+    if let Some(on) = t
+        .get_mut("runtime_account_removed")
+        .and_then(Value::as_object_mut)
+    {
+        on.remove("dir");
+    }
+}
+
+/// `box.agents {box, refresh?}` for `caller` on `conn` (`refresh`: users only).
+async fn box_agents(hub: &Hub, conn: &Conn, caller: &Caller, p: Value) -> Result<Value, RpcError> {
+    #[derive(Default, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BoxAgentsParams {
+        #[serde(rename = "box")]
+        box_name: String,
+        #[serde(default)]
+        refresh: bool,
+    }
+    let p: BoxAgentsParams = params(p)?;
+    hub.box_agents(&p.box_name, p.refresh, box_view(conn, caller))
+        .await
+}
+
 fn call(
     hub: &Hub,
     conn: &mut Conn,
@@ -2129,13 +2703,14 @@ fn call(
     let client = conn.client.clone();
     match method {
         "hub.info" => {
-            let mut info = hub.info();
+            // The orchestrator and agents see less of the boxes (`hub::box_agents`).
+            let mut info = hub.info_for(box_view(conn, caller));
             info["client"] = json!(client);
             info["identity"] = json!(conn.identity(caller));
             Ok(info)
         }
         "hub.shutdown" => Ok(json!({ "ok": true })),
-        "config.show" => Ok(crate::hub::config_view(hub.config())),
+        "config.show" => Ok(hub.config_show()),
         "thread.spawn" => {
             #[derive(Default, Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -2156,9 +2731,34 @@ fn call(
             let p: StatusParams = params(p)?;
             hub.spawn_status(&p.operation_id, caller)
         }
-        "thread.list" => Ok(Value::Array(hub.list_threads())),
+        // A removed login's directory (`runtime_account_removed.dir`) is the user's only, as
+        // the accounts' directories are.
+        "thread.list" => {
+            let mut threads = hub.list_threads();
+            if box_view(conn, caller) != BoxView::Full {
+                threads.iter_mut().for_each(hide_removed_login_dir);
+            }
+            Ok(Value::Array(threads))
+        }
+        "speech.status" => {
+            let _: EmptyParams = params(p)?;
+            serde_json::to_value(hub.speech_status(caller)?).map_err(internal)
+        }
         "thread.activity" => Ok(hub.thread_activity()),
+        "hub.glance" => hub.glance(),
         "usage.get" => Ok(hub.usage()),
+        // The accounts (`hub::accounts`): the orchestrator sees no directories.
+        "account.list" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct AccountListParams {
+                runtime: Option<String>,
+            }
+            let p: AccountListParams = params(p)?;
+            let full = box_view(conn, caller) == BoxView::Full;
+            hub.account_list(p.runtime.as_deref(), full)
+        }
+        "account.add" => hub.account_add(params(p)?, caller),
         // A user's TUI: whether the user looks at it, so the notification hook keeps quiet
         // meanwhile (`hub::hook`).
         "notify.looking" => {
@@ -2193,7 +2793,11 @@ fn call(
         }
         "thread.get" => {
             let p: ThreadRef = params(p)?;
-            hub.get_thread(&p.thread)
+            let mut t = hub.get_thread(&p.thread)?;
+            if box_view(conn, caller) != BoxView::Full {
+                hide_removed_login_dir(&mut t);
+            }
+            Ok(t)
         }
         "thread.send" => {
             let p: SendParams = params(p)?;
@@ -2220,19 +2824,47 @@ fn call(
             let p: WithdrawParams = params(p)?;
             hub.withdraw_message(&p.thread, p.msg_ref, caller)
         }
+        "message.send_now" => {
+            let p: WithdrawParams = params(p)?;
+            hub.send_now(&p.thread, p.msg_ref, caller)
+        }
+        "thread.compact" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct CompactParams {
+                thread: String,
+                #[serde(default)]
+                offers: Option<String>,
+            }
+            let p: CompactParams = params(p)?;
+            match p.offers.as_deref() {
+                Some(offers) => hub.compact_offers(&p.thread, offers, caller),
+                None => hub.compact_thread(&p.thread, caller),
+            }
+        }
+        "thread.queue" => {
+            let p: ThreadRef = params(p)?;
+            hub.thread_queue(&p.thread, caller)
+        }
+        "shell.run" => {
+            let p: crate::hub::ShellRun = params(p)?;
+            hub.shell_run(p, caller)
+        }
+        "shell.cd" => {
+            #[derive(Default, Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct ShellCdParams {
+                #[serde(default)]
+                cwd: Option<String>,
+                #[serde(default)]
+                dir: Option<String>,
+            }
+            let p: ShellCdParams = params(p)?;
+            hub.shell_cd(p.cwd.as_deref(), p.dir.as_deref(), caller)
+        }
         "thread.set_mode" => {
             let p: SetModeParams = params(p)?;
             hub.set_mode(&p.thread, &p.mode, caller)
-        }
-        "thread.set_model" => {
-            let p: SetModelParams = params(p)?;
-            hub.set_runtime_model(
-                &p.thread,
-                p.runtime.as_deref(),
-                p.model.as_deref(),
-                p.effort.as_deref(),
-                caller,
-            )
         }
         "thread.rename" => {
             let p: RenameParams = params(p)?;
@@ -2348,6 +2980,17 @@ fn call(
             let next = page.len().checked_sub(1).map_or(p.since, |i| items[i].0);
             Ok(json!({ "items": page, "head": head, "next": next, "more": more }))
         }
+        "decisions.list" => {
+            let p: DecisionsParams = params(p)?;
+            let limit = p
+                .limit
+                .unwrap_or(DECISIONS_LIMIT)
+                .clamp(1, crate::hub::DECISIONS_MAX);
+            let before = p.before.unwrap_or(u64::MAX);
+            let (items, older) = hub.decisions_list(before, limit).map_err(internal)?;
+            let (page, cut) = page(&items, limit, |(g, ev)| json!({ "gseq": g, "event": ev }))?;
+            Ok(json!({ "items": page, "more": older || cut }))
+        }
         "blob.get" => {
             let p: BlobParams = params(p)?;
             let len = p.len.unwrap_or(BLOB_CHUNK_MAX).clamp(1, BLOB_CHUNK_MAX);
@@ -2390,14 +3033,10 @@ fn call(
     }
 }
 
-fn control_subscribe(
-    hub: &Hub,
-    p: Value,
-) -> Result<(Value, crate::hub::ControlSubscription), RpcError> {
-    let p: ControlParams = params(p)?;
-    let sub = hub.subscribe_control(p.since);
-    let ack = json!({ "since": p.since, "head": sub.head() });
-    Ok((ack, sub))
+/// `control.subscribe`: the subscription (which knows the `since` it starts after).
+fn control_subscribe(hub: &Hub, p: Value) -> Result<crate::hub::ControlSubscription, RpcError> {
+    let p: SubscribeParams = params(p)?;
+    hub.subscribe_control_snapshot(p.since, p.compact, p.snapshot)
 }
 
 fn thread_subscribe(
@@ -2411,10 +3050,149 @@ fn thread_subscribe(
 }
 
 #[cfg(test)]
+mod suggest_params_tests {
+    use super::*;
+
+    /// A client from before `models` (`model` alone) gets Claude Code only; one that sends
+    /// `models`, either runtime; `retry` passes through; anything else is refused.
+    #[test]
+    fn old_clients_get_claude_code_only() {
+        let (thread, turn, ask) =
+            suggest_params(serde_json::json!({"thread": "api", "turn": 3, "model": "haiku"}))
+                .unwrap();
+        assert_eq!((thread.as_str(), turn), ("api", 3));
+        assert!(ask.claude_only && !ask.retry);
+        assert_eq!(ask.models.claude_code, "haiku");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3})).unwrap();
+        assert!(ask.claude_only);
+        assert_eq!(ask.models.claude_code, "claude-haiku-5-5");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3,
+            "models": {"claude-code": "claude-haiku-5-5", "codex": "gpt-6-luna"}, "retry": true}))
+        .unwrap();
+        assert!(!ask.claude_only && ask.retry);
+        assert_eq!(ask.models.codex, "gpt-6-luna");
+        let (_, _, ask) = suggest_params(serde_json::json!({"thread": "api", "turn": 3,
+            "models": {"codex": "gpt-5.6-luna"}}))
+        .unwrap();
+        assert_eq!(ask.models.claude_code, "claude-haiku-5-5");
+        assert_eq!(ask.models.codex, "gpt-5.6-luna");
+        for bad in [
+            serde_json::json!({"thread": "api", "turn": 3, "models": {"grok": "x"}}),
+            serde_json::json!({"thread": "api", "turn": 3, "runtime": "codex"}),
+        ] {
+            assert!(suggest_params(bad).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::HubOptions;
     use twr_core::config::Config;
+
+    /// A subscription of `stored` items in the store, then `live` ones (each a wait), then the
+    /// hub's end; or an error after `fail_after` items.
+    struct FakeFeed {
+        next: u64,
+        stored: u64,
+        live: u64,
+        fail_after: Option<u64>,
+    }
+
+    impl FakeFeed {
+        fn take(&mut self) -> anyhow::Result<Option<Arc<Event>>> {
+            if self.fail_after == Some(self.next) {
+                anyhow::bail!("the store failed");
+            }
+            self.next += 1;
+            let body = twr_core::event::EventBody::AgentText(twr_core::event::AgentText {
+                text: format!("event {} {}", self.next, "x".repeat(200)),
+                ..Default::default()
+            });
+            Ok(Some(Arc::new(Event::new(
+                "t1",
+                self.next,
+                None,
+                twr_core::event::Source::Hub,
+                body,
+            ))))
+        }
+    }
+
+    impl Feed for FakeFeed {
+        type Item = Arc<Event>;
+        async fn next(&mut self) -> anyhow::Result<Option<Self::Item>> {
+            if self.next >= self.stored + self.live {
+                return Ok(None);
+            }
+            if self.next >= self.stored {
+                tokio::task::yield_now().await;
+            }
+            self.take()
+        }
+        fn write_stored(&mut self, buf: &mut Vec<u8>) -> anyhow::Result<bool> {
+            if self.next >= self.stored {
+                return Ok(false);
+            }
+            let ev = self.take()?.unwrap();
+            crate::hub::stream_line(buf, None, &ev)?;
+            Ok(true)
+        }
+        fn line(ev: &Self::Item, buf: &mut Vec<u8>) -> serde_json::Result<()> {
+            crate::hub::stream_line(buf, None, ev)
+        }
+    }
+
+    /// What `feed` pumps: the lines read on the other end, up to its EOF.
+    async fn pumped(feed: FakeFeed) -> Vec<Value> {
+        use tokio::io::AsyncBufReadExt;
+        let (a, b) = UnixStream::pair().unwrap();
+        let (_r, w) = a.into_split();
+        let task = tokio::spawn(pump(Arc::new(Mutex::new(w)), 5, json!({"head": 0}), feed));
+        let mut lines = BufReader::new(b).lines();
+        let mut out = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            out.push(serde_json::from_str(&line).unwrap());
+        }
+        task.await.unwrap();
+        out
+    }
+
+    /// A replay goes out in writes of many items, and every item arrives, once and in order,
+    /// whatever the batches: the stored ones, then the live ones, then the end of the stream.
+    /// A store that fails mid-replay sends what came before it, then the error, then ends.
+    #[tokio::test]
+    async fn a_pumped_replay_arrives_whole_and_in_order() {
+        let out = pumped(FakeFeed {
+            next: 0,
+            stored: 3000,
+            live: 5,
+            fail_after: None,
+        })
+        .await;
+        assert_eq!(out[0], json!({"id": 5, "result": {"head": 0}}));
+        let seqs: Vec<u64> = out[1..]
+            .iter()
+            .map(|l| l["event"]["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, (1..=3005).collect::<Vec<_>>());
+
+        let out = pumped(FakeFeed {
+            next: 0,
+            stored: 3000,
+            live: 0,
+            fail_after: Some(1234),
+        })
+        .await;
+        assert_eq!(out.len(), 1 + 1234 + 1);
+        assert_eq!(out[1234]["event"]["seq"], 1234);
+        assert_eq!(out[1235]["id"], 5);
+        assert!(out[1235]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("the store failed"));
+    }
 
     /// A connection from this test process that presented `token`, opened by this process
     /// started at `start_time` as the hub read it (`None`: it could not be read).

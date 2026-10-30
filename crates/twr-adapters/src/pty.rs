@@ -307,10 +307,7 @@ impl Adapter for PtyAdapter {
                 .collect(),
         );
         cmd.cwd(&cwd);
-        for (k, v) in program_env(&cfg) {
-            cmd.env(k, v);
-        }
-        crate::process::scrub_pty(&mut cmd);
+        crate::process::apply_env_pty(&mut cmd, program_env(&cfg), &cfg.env_remove);
         // portable-pty's own error for a missing program lists every PATH entry it tried.
         let path = std::env::var_os("PATH");
         if let Some(why) =
@@ -325,10 +322,13 @@ impl Adapter for PtyAdapter {
         // Only the program may hold the terminal's slave side, or reads never see EOF.
         drop(pair.slave);
         let pid = child.process_id();
-        let reader = AsyncFd::new(std::fs::File::from(
-            nonblocking_dup(&*pair.master).context("pty reader")?,
-        ))
-        .context("pty reader")?;
+        let reader = std::fs::File::from(nonblocking_dup(&*pair.master).context("pty reader")?);
+        // SAFETY: the `File` owns the duplicate (open, and closed only when the `AsyncFd`
+        // drops it); [`read_task`] only reads through it, so the descriptor stays the same
+        // open file for the `AsyncFd`'s whole life.
+        let reader = unsafe { AsyncFd::register(reader) }
+            .map_err(std::io::Error::from)
+            .context("pty reader")?;
         let writer = pair.master.take_writer().context("pty writer")?;
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
@@ -498,10 +498,13 @@ struct Io {
 
 /// Sends `signal` to process group `pgid` with the `kill` command.
 fn signal_group(pgid: u32, signal: &str) {
-    let status = std::process::Command::new("kill")
-        .args([&format!("-{signal}"), "--", &format!("-{pgid}")])
-        .stderr(Stdio::null())
-        .status();
+    let mut cmd = std::process::Command::new("kill");
+    cmd.args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    // No terminal: whatever `kill` on `PATH` is.
+    crate::process::new_session_std(&mut cmd);
+    let status = cmd.status();
     tracing::debug!(pgid, signal, ?status, "pty: signalled process group");
 }
 
@@ -599,6 +602,22 @@ async fn drive(
                     }
                 }
                 Some(AdapterCmd::Interrupt) => tracing::warn!("pty: turn interruption is unsupported; session retained"),
+                // The hub refuses a compaction for a pty thread (`Adapter::compacts`).
+                Some(AdapterCmd::Compact { turn }) => {
+                    tracing::warn!(turn, "pty: context compaction is unsupported");
+                    let mut ext = None;
+                    twr_core::event::set_twr_ext(
+                        &mut ext,
+                        "error",
+                        json!("a pty session cannot compact its context from twr"),
+                    );
+                    let ended = twr_core::event::TurnEnded {
+                        result: twr_core::event::TurnResult::Error,
+                        ext,
+                        ..Default::default()
+                    };
+                    hub_gone = !end.emit(EventBody::TurnEnded(ended), Some(turn));
+                }
                 Some(AdapterCmd::Stop) | None => {
                     stop_deadline = Some(begin_stop(&mut io, &mut core, grace));
                 }

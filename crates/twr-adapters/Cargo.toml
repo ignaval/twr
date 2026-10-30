@@ -11,9 +11,13 @@ description = "Agent runtime adapters for twr"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+# Probes' process groups: setsid, waitid without reaping, killpg (`process`).
+libc.workspace = true
 portable-pty.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+# Codex's and Grok Build's config.toml, checked for credentials before it is shared (`account`).
+toml.workspace = true
 tracing.workspace = true
 twr-core.workspace = true
 ulid.workspace = true

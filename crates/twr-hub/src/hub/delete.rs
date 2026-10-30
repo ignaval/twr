@@ -945,7 +945,7 @@ fn added_since_card(card: &DeleteCard, targets: &[Target]) -> Vec<String> {
 }
 
 /// An open delete card, from its `attention.raised` (live and on replay).
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, Serialize, Deserialize)]
 pub(super) struct DeleteCard {
     /// The threads it deletes, in order.
     pub(super) threads: Vec<String>,
@@ -1176,7 +1176,7 @@ impl Core {
             .get(id)
             .map(|r| r.workspace.clone())
             .unwrap_or_default();
-        let host = hub.hosts.get(&view.box_name).cloned();
+        let host = hub.host(&view.box_name);
         let others = self.other_branches(id, &view.box_name);
         Ok(Target {
             id: id.to_string(),
@@ -1540,7 +1540,10 @@ impl Hub {
             ));
         }
         let hub = &self.inner;
-        let mut targets = {
+        // The boxes' operations, begun with their gate checks and held until the deletion is
+        // recorded (or refused): no box is switched while its threads are checked
+        // (`Core::reserve_box`).
+        let (mut targets, _ops) = {
             let core = hub.core();
             if core.shutting_down {
                 return Err(rpc(codes::CONFLICT, "hub is shutting down"));
@@ -1556,11 +1559,14 @@ impl Hub {
                 core.refuse_delete(id)?;
             }
             let mut targets = Vec::new();
+            let mut ops = Vec::new();
             for id in ids {
-                core.require_box(core.view(&id)?)?;
+                let view = core.view(&id)?;
+                core.require_box(view)?;
+                ops.extend(core.reserve_box(hub, &view.box_name)?);
                 targets.push(core.delete_target(hub, &id)?);
             }
-            targets
+            (targets, ops)
         };
         Self::check_losses(&mut targets).await;
         let mut core = hub.core();
@@ -1879,28 +1885,41 @@ impl Hub {
         changed: &[String],
     ) {
         let hub = &self.inner;
-        // Still the card's thread in the card's life, and deletable now.
-        let usable = |core: &Core, id: &str| -> Result<(), String> {
-            let view = core.view(id).map_err(|e| e.message)?;
+        // Still the card's thread in the card's life, and deletable now; `Err((box, why))`,
+        // `box` when only its box refuses (offline, or being switched).
+        let usable = |core: &Core, id: &str| -> Result<(), (bool, String)> {
+            let view = core.view(id).map_err(|e| (false, e.message))?;
             if card.other_life(id, view.lifecycle_seq) {
-                return Err(card.life_note(id, &view.name));
+                return Err((false, card.life_note(id, &view.name)));
             }
-            core.refuse_delete(id).map_err(|e| e.message)?;
-            core.require_box(view).map_err(|e| e.message)
+            core.refuse_delete(id).map_err(|e| (false, e.message))?;
+            core.require_box(view).map_err(|e| (true, e.message))
         };
         let mut left_out: Vec<String> = Vec::new();
+        // The threads only their box left out: (id, why).
+        let mut box_refused: Vec<(String, String)> = Vec::new();
         let mut targets = Vec::new();
+        // The boxes' operations, begun with their gate checks and held until the new card is
+        // raised: no box is switched while its threads are checked (`Core::reserve_box`).
+        let mut _ops = Vec::new();
         {
             let core = hub.core();
             if core.shutting_down {
                 return;
             }
             for id in &threads {
-                match usable(&core, id)
-                    .and_then(|()| core.delete_target(hub, id).map_err(|e| e.message))
-                {
+                let checked = usable(&core, id).and_then(|()| {
+                    let view = core.view(id).map_err(|e| (false, e.message))?;
+                    _ops.extend(
+                        core.reserve_box(hub, &view.box_name)
+                            .map_err(|e| (true, e.message))?,
+                    );
+                    core.delete_target(hub, id).map_err(|e| (false, e.message))
+                });
+                match checked {
                     Ok(t) => targets.push(t),
-                    Err(why) => left_out.push(why),
+                    Err((true, why)) => box_refused.push((id.clone(), why)),
+                    Err((false, why)) => left_out.push(why),
                 }
             }
         }
@@ -1916,7 +1935,8 @@ impl Hub {
         for t in targets {
             match usable(&core, &t.id) {
                 Ok(()) => kept.push(t),
-                Err(why) => left_out.push(why),
+                Err((true, why)) => box_refused.push((t.id.clone(), why)),
+                Err((false, why)) => left_out.push(why),
             }
         }
         if kept.is_empty() {
@@ -1924,8 +1944,17 @@ impl Hub {
                 card = card_id,
                 "no thread of a changed delete card is left to ask for again"
             );
+            // The user confirmed deleting those: an item on each says why nothing happened.
+            for (id, why) in &box_refused {
+                core.raise_delete_failure(
+                    hub,
+                    id,
+                    &format!("card {card_id} was confirmed, but {why}; nothing was deleted"),
+                );
+            }
             return;
         }
+        left_out.extend(box_refused.into_iter().map(|(_, why)| why));
         let (them, rest) = match changed {
             [_] => ("it", "the other thread"),
             _ => ("them", "the other threads"),
@@ -2277,9 +2306,9 @@ impl Core {
         }
     }
 
-    /// Step 4 of a deletion: `thread.deleted` with the resolution of the thread's open items
-    /// and of every open delete card whose threads are then all deleted, and the drop of its
-    /// queue, one batch.
+    /// Step 4 of a deletion: `thread.deleted` with the resolution of the thread's open items,
+    /// of every open delete card whose threads are then all deleted and of its offer card
+    /// (`hub::idle_compact`), and the drop of its queue, one batch.
     pub(super) fn record_deleted(
         &mut self,
         hub: &Inner,
@@ -2328,6 +2357,8 @@ impl Core {
                 batch.push(HUB_THREAD, None, Source::Hub, resolved(&attn_id));
             }
         }
+        // An offer to compact its context before its messages go (`hub::idle_compact`).
+        self.stage_idle_offer_close(&mut batch, id);
         batch.push(id, None, source, EventBody::ThreadDeleted(deleted));
         self.append_batch(hub, batch)?;
         Ok(())

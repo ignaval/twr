@@ -77,9 +77,25 @@
 //!   stay those of the recordings); an error answer stops the reads. The
 //!   `account/rateLimits/updated` notification (sparse: a window it leaves null is unknown,
 //!   not gone) is the passive report. Both become `runtime.limits`.
+//! - Limits: a failed turn with `codexErrorInfo` `usageLimitExceeded` carries
+//!   `ext.twr.limit` ([`crate::usage::Limit`], [`limit_of`]) and is not transient: usage, with
+//!   the window of the latest reports at 100% (else the one that resets first) and its reset;
+//!   spend when the last snapshot's `rateLimitReachedType` says credits are depleted. That
+//!   snapshot only tells spend from usage: any other failure names no limit.
+//!   `rateLimitExceeded` stays transient.
 //! - Tokens: `thread/tokenUsage/updated` after every model call; `total` is cumulative for the
 //!   thread (a resumed thread first replays its old total), so a turn's usage is the growth of
-//!   `total` over the turn. There is no USD cost.
+//!   `total` over the turn. There is no USD cost. `last.totalTokens` is how full the context
+//!   is, `modelContextWindow` the window: a turn's end carries the latest (`turn.ended`
+//!   `context`).
+//! - Context compaction (Codex 0.162.1): an item `{type: "contextCompaction"}` between its
+//!   `item/started` (`context.compacting`) and `item/completed` (`context.compacted`), at a
+//!   turn's start or after a tool's output; in between, a `thread/tokenUsage/updated` whose
+//!   `last` has only `totalTokens` (every other count 0) estimates the context after it
+//!   (`post_tokens`; `pre_tokens` is the `last.totalTokens` before). The user's compaction
+//!   ([`Translator::compact`]) is `thread/compact/start {threadId}`, answered `{}`, then a turn
+//!   of its own that no `turn/start` named: the next `turn/started` is the turn twr opened for
+//!   it. Sent during a turn it interrupts that turn, so it is queued like a prompt.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -90,6 +106,7 @@ use twr_core::adapter::Answer;
 use twr_core::usage::UsageWindow;
 
 use crate::claude_code::translate::{error_line, mark_visible, render_command, FULL_INPUT_KEY};
+use crate::usage::{Limit, LimitKind};
 use twr_core::event::{
     set_twr_ext, AgentText, AgentThinking, AgentToolCall, AgentToolResult, AttentionRaised,
     AttentionReason, AttentionResolved, EventBody, JsonMap, ResolvedBy, SessionPayload, TurnEnded,
@@ -174,6 +191,12 @@ pub struct Open {
     /// Why the Codex policy is not an exact match of the twr mode (`ext.codex.mode_note` on
     /// `thread.started`), see `codex::mode_note`.
     pub mode_note: Option<String>,
+    /// Developer instructions twr adds at the end of `params.developerInstructions` (the
+    /// `auto` sandbox note, `codex::AUTO_SANDBOX_NOTE`). A request's `developerInstructions`
+    /// replaces the Codex config's `developer_instructions`, so the translator reads the
+    /// config first (`config/read`) and puts those before twr's; when the read fails, twr's
+    /// addition is left out instead, so the user's own instructions still apply.
+    pub added_instructions: Option<String>,
 }
 
 impl Open {
@@ -217,6 +240,10 @@ enum Req {
         turn: u64,
     },
     Interrupt,
+    /// `thread/compact/start` for twr's turn `turn`.
+    Compact {
+        turn: u64,
+    },
     Steer,
     Terminals,
     ChildRead {
@@ -280,6 +307,21 @@ struct Current {
     /// The last `error` notification of the turn (`params.error`) and its `willRetry`: the
     /// cause of a failed turn whose `turn/completed` names none.
     last_error: Option<(Value, bool)>,
+    /// The turn is a compaction twr asked for (`thread/compact/start`): no answer names its id,
+    /// the next `turn/started` does.
+    compact: bool,
+}
+
+/// A compaction under way (a `contextCompaction` item started).
+#[derive(Debug, Clone)]
+struct Compacting {
+    item: String,
+    trigger: &'static str,
+    /// How full the context was before.
+    pre: Option<u64>,
+    /// Codex's estimate of the context after.
+    post: Option<u64>,
+    since: DateTime<Utc>,
 }
 
 /// A turn Codex started while twr's `turn/start` had no answer yet: whose it is is known once
@@ -386,6 +428,13 @@ pub struct Translator {
     routed: Vec<Emitted>,
     /// Latest thread token total seen.
     tokens: Tokens,
+    /// Queued turns that are compactions ([`Translator::compact`]).
+    compact_queued: HashSet<u64>,
+    /// The compaction under way.
+    compacting: Option<Compacting>,
+    /// How full the context is (the latest `last.totalTokens`) and the window.
+    context: Option<u64>,
+    context_window: Option<u64>,
     /// Item id → summary of its `item/started` (tool calls already reported).
     items: HashMap<String, String>,
     pending: Vec<Pending>,
@@ -396,8 +445,16 @@ pub struct Translator {
     cwd: Option<String>,
     /// When to read the plan's usage again (`account/rateLimits/read`).
     usage: crate::usage::Reads,
+    /// The rate-limit windows of the reports so far, merged (a report leaving a window out
+    /// does not forget it), for the limit a failed turn hit ([`limit_of`]).
+    limit_windows: Vec<UsageWindow>,
+    /// The last snapshot's `rateLimitReachedType` (each snapshot replaces it, so one that no
+    /// longer reports it clears it).
+    limit_reached: Option<String>,
     /// The clock usage reads are timed by.
     clock: fn() -> DateTime<Utc>,
+    /// Reviewer decisions too long to read so far, naming those without a readable id.
+    unread_reviews: u64,
 }
 
 impl Translator {
@@ -431,11 +488,18 @@ impl Translator {
             own_turns: HashMap::new(),
             routed: Vec::new(),
             tokens: Tokens::default(),
+            compact_queued: HashSet::new(),
+            compacting: None,
+            context: None,
+            context_window: None,
             items: HashMap::new(),
             pending: Vec::new(),
             used_attn_ids: Recent::new(ATTN_IDS_KEPT),
             usage: crate::usage::Reads::default(),
+            limit_windows: Vec::new(),
+            limit_reached: None,
             clock: Utc::now,
+            unread_reviews: 0,
         }
     }
 
@@ -460,6 +524,9 @@ impl Translator {
     /// covers every window the last read had.
     fn usage_report(&mut self, snapshot: &Value, source: &str, out: &mut Translated) {
         let windows = rate_limit_windows(snapshot);
+        self.limit_reached = opt_str(snapshot, "rateLimitReachedType");
+        self.limit_windows =
+            twr_core::usage::merge_windows(&self.limit_windows, &windows, (self.clock)());
         if source == "read" {
             self.usage.answered(&windows);
         } else {
@@ -541,12 +608,20 @@ impl Translator {
         self.dispatch().into_iter().collect()
     }
 
+    /// Queues turn `turn` as a compaction of the thread's context (`thread/compact/start`),
+    /// started like a prompt when no other turn runs ([`Translator::send`]).
+    pub fn compact(&mut self, turn: u64) -> Vec<String> {
+        self.compact_queued.insert(turn);
+        self.send("", turn)
+    }
+
     fn dispatch(&mut self) -> Option<String> {
         if !self.ready || self.current.is_some() {
             return None;
         }
         let thread_id = self.thread_id.clone()?;
         let (text, turn) = self.queued.pop_front()?;
+        let compact = self.compact_queued.remove(&turn);
         self.current = Some(Current {
             turn: Some(turn),
             codex_id: None,
@@ -555,7 +630,15 @@ impl Translator {
             interrupt_wanted: false,
             interrupt_sent: false,
             last_error: None,
+            compact,
         });
+        if compact {
+            return Some(self.request(
+                Req::Compact { turn },
+                "thread/compact/start",
+                json!({"threadId": thread_id}),
+            ));
+        }
         let mut params = json!({
             "threadId": thread_id,
             "input": [{"type": "text", "text": text, "text_elements": []}],
@@ -571,6 +654,7 @@ impl Translator {
     /// goes out as soon as it is.
     pub fn interrupt(&mut self) -> Option<String> {
         self.queued.clear();
+        self.compact_queued.clear();
         self.interrupt_current()
     }
 
@@ -584,6 +668,7 @@ impl Translator {
             cur.interrupt_sent = false;
             out.replies.extend(self.interrupt_current());
         } else if let Some((_, turn)) = self.queued.pop_front() {
+            self.compact_queued.remove(&turn);
             self.push(
                 &mut out,
                 EventBody::TurnEnded(TurnEnded {
@@ -762,9 +847,33 @@ impl Translator {
 
     /// A stdout line longer than the reader's cap was dropped; `head` is its start and `len`
     /// its length. A `turn/completed` still ends the running turn (`turn.ended{error}` with
-    /// `ext.twr.error = "oversized runtime message"`); anything else is only logged.
+    /// `ext.twr.error = "oversized runtime message"`); a `thread/settings/updated` ends the
+    /// session (twr cannot check it); an answer to `config/read` counts as a failed read; a
+    /// decision of Codex's reviewer agent is still in the transcript, as one twr could not
+    /// read; anything else is only logged.
     pub fn oversized(&mut self, head: &str, len: usize) -> Translated {
         let mut out = Translated::default();
+        // Settings twr cannot read are settings it cannot check.
+        if crate::process::head_has(head, "method", "thread/settings/updated") {
+            out.fatal = Some(format!(
+                "codex thread/settings/updated: a message of {len} bytes, too long to check"
+            ));
+            return out;
+        }
+        // Every decision of the reviewer is in the transcript: what it approved may have run
+        // outside the sandbox, whatever twr could read of it.
+        if crate::process::head_has(head, "method", "item/autoApprovalReview/completed") {
+            self.on_unread_auto_review(head, len, &mut out);
+            return out;
+        }
+        // A config/read answer too long to read is a failed read.
+        if let Some(id) = crate::process::head_response_id(head)
+            .filter(|id| matches!(self.requests.get(id), Some(Req::ConfigRead)))
+        {
+            let failed = json!({"id": id, "error": {"message": OVERSIZED_ERROR}});
+            self.on_response(&failed, "", &mut out);
+            return out;
+        }
         if !crate::process::head_has(head, "method", "turn/completed") || self.current.is_none() {
             return out;
         }
@@ -1229,7 +1338,7 @@ impl Translator {
                 None => {
                     out.replies
                         .push(json!({"jsonrpc": "2.0", "method": "initialized"}).to_string());
-                    if self.mcp_allow.is_some() {
+                    if self.mcp_allow.is_some() || self.open.added_instructions.is_some() {
                         let params = json!({"cwd": self.cwd});
                         let l = self.request(Req::ConfigRead, "config/read", params);
                         out.replies.push(l);
@@ -1240,14 +1349,27 @@ impl Translator {
                 }
             },
             Req::ConfigRead => match error_text {
-                Some(e) => {
+                Some(e) if self.mcp_allow.is_some() => {
                     out.fatal = Some(format!(
                         "codex config/read failed, so the MCP servers of the Codex config \
                          cannot be turned off: {e}"
                     ))
                 }
+                Some(e) => {
+                    tracing::warn!(error = %e, "codex: config/read failed; the thread starts without twr's sandbox note");
+                    self.merge_instructions(None);
+                    self.open_thread(out);
+                }
                 None => match self.disable_inherited_mcp(&v["result"]) {
-                    Ok(()) => self.open_thread(out),
+                    Ok(()) => {
+                        let configured = v
+                            .pointer("/result/config/developer_instructions")
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.trim().is_empty())
+                            .map(str::to_string);
+                        self.merge_instructions(Some(configured));
+                        self.open_thread(out);
+                    }
                     Err(why) => out.fatal = Some(why),
                 },
             },
@@ -1267,37 +1389,18 @@ impl Translator {
                 }
                 None => self.on_open(&v["result"], line, out),
             },
+            // Its turn comes as a `turn/started` of its own; a refusal ends twr's turn as a
+            // refused `turn/start` does.
+            Req::Compact { turn } => {
+                if let Some(e) = error_text {
+                    tracing::warn!(turn, error = %e, "codex: thread/compact/start failed");
+                    self.refused_turn(turn, &e, line, out);
+                }
+            }
             Req::TurnStart { turn } => match error_text {
                 Some(e) => {
                     tracing::warn!(turn, error = %e, "codex: turn/start failed");
-                    let mut codex = Map::new();
-                    codex.insert("error".into(), json!({"message": e}));
-                    codex.insert("transient".into(), json!(false));
-                    let auth = auth_failure(&json!({"message": e}));
-                    if auth {
-                        codex.insert("auth_failed".into(), json!(true));
-                    }
-                    let mut ext = ext_of(codex);
-                    let why = if auth {
-                        format!("{}{AUTH_HINT}", error_line(&e))
-                    } else {
-                        error_line(&e)
-                    };
-                    ext.get_or_insert_with(JsonMap::new)
-                        .insert("twr".into(), json!({ "error": why }));
-                    let body = EventBody::TurnEnded(TurnEnded {
-                        result: TurnResult::Error,
-                        session_id: self.thread_id.clone(),
-                        usage: None,
-                        ext,
-                        ..Default::default()
-                    });
-                    if self.current.as_ref().is_some_and(|c| c.turn == Some(turn)) {
-                        self.current = None;
-                    }
-                    self.push(out, body, Some(turn), Some(line));
-                    self.settle_unbound(None, line, out);
-                    out.replies.extend(self.dispatch());
+                    self.refused_turn(turn, &e, line, out);
                 }
                 None => {
                     if let Some(id) = v.pointer("/result/turn/id").and_then(Value::as_str) {
@@ -1331,6 +1434,39 @@ impl Translator {
                 }
             }
         }
+    }
+
+    /// Codex refused to start twr's turn `turn` (`turn/start`, `thread/compact/start`) with
+    /// error `e`: the turn ends `error` saying so, and the next one is dispatched.
+    fn refused_turn(&mut self, turn: u64, e: &str, line: &str, out: &mut Translated) {
+        let mut codex = Map::new();
+        codex.insert("error".into(), json!({"message": e}));
+        codex.insert("transient".into(), json!(false));
+        let auth = auth_failure(&json!({"message": e}));
+        if auth {
+            codex.insert("auth_failed".into(), json!(true));
+        }
+        let mut ext = ext_of(codex);
+        let why = if auth {
+            format!("{}{AUTH_HINT}", error_line(e))
+        } else {
+            error_line(e)
+        };
+        ext.get_or_insert_with(JsonMap::new)
+            .insert("twr".into(), json!({ "error": why }));
+        let body = EventBody::TurnEnded(TurnEnded {
+            result: TurnResult::Error,
+            session_id: self.thread_id.clone(),
+            usage: None,
+            ext,
+            ..Default::default()
+        });
+        if self.current.as_ref().is_some_and(|c| c.turn == Some(turn)) {
+            self.current = None;
+        }
+        self.push(out, body, Some(turn), Some(line));
+        self.settle_unbound(None, line, out);
+        out.replies.extend(self.dispatch());
     }
 
     fn on_open(&mut self, r: &Value, line: &str, out: &mut Translated) {
@@ -1973,6 +2109,38 @@ impl Translator {
     /// (a `config/read` answer) that is not in the thread's set (module docs, "MCP
     /// allowlist"). An error (why) when the config defines a server under one of the set's
     /// names: Codex would merge the two.
+    /// Puts the Codex config's own `developer_instructions` (`configured`: `Some(None)` when it
+    /// has none) before twr's [`Open::added_instructions`]; `None` (the config could not be
+    /// read) takes twr's addition out of the request instead, leaving out the whole field
+    /// when nothing else is in it.
+    fn merge_instructions(&mut self, configured: Option<Option<String>>) {
+        let Some(added) = self.open.added_instructions.clone() else {
+            return;
+        };
+        let Some(params) = self.open.params.as_object_mut() else {
+            return;
+        };
+        let current = params
+            .get("developerInstructions")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let merged = match configured {
+            Some(Some(own)) => format!("{own}\n\n{current}"),
+            Some(None) => current,
+            None => current
+                .strip_suffix(&added)
+                .unwrap_or(&current)
+                .trim_end()
+                .to_string(),
+        };
+        if merged.is_empty() {
+            params.remove("developerInstructions");
+        } else {
+            params.insert("developerInstructions".into(), json!(merged));
+        }
+    }
+
     fn disable_inherited_mcp(&mut self, result: &Value) -> Result<(), String> {
         let Some(allow) = &self.mcp_allow else {
             return Ok(());
@@ -2023,6 +2191,26 @@ impl Translator {
             self.check_mcp_server(p, out);
             return;
         }
+        // What a thread runs with can change during the session: never to more than twr asked
+        // for, the thread's own settings or a child's (a child agent runs with its parent's
+        // policy). Anything wider, or that twr cannot read, ends the session.
+        if method == "thread/settings/updated" {
+            let st = &p["threadSettings"];
+            let reported = json!({"approvalPolicy": st["approvalPolicy"],
+                "approvalsReviewer": st["approvalsReviewer"], "sandbox": st["sandboxPolicy"],
+                "cwd": st["cwd"]});
+            if let Err(why) = check_policy(&self.open.params, &reported) {
+                tracing::error!(%why, "codex: refusing a thread whose settings now allow more than twr asked for");
+                out.fatal = Some(format!("codex thread/settings/updated: {why}"));
+            }
+            return;
+        }
+        // Codex's reviewer agent decides for child agents too: their decisions are the
+        // thread's as much as its own.
+        if method == "item/autoApprovalReview/completed" {
+            self.on_auto_review(p, opt_str(p, "turnId"), line, out);
+            return;
+        }
         // A child thread's notifications are its background activity, except the withdrawal of
         // a request it raised: that request is pending here like the parent's.
         if let Some(thread) = opt_str(p, "threadId")
@@ -2067,10 +2255,18 @@ impl Translator {
                             interrupt_wanted: false,
                             interrupt_sent: false,
                             last_error: None,
+                            compact: false,
                         });
                         self.push_runtime_start(id, line, out);
                     }
                     if self
+                        .current
+                        .as_ref()
+                        .is_some_and(|c| c.compact && c.codex_id.is_none())
+                    {
+                        // twr's compaction: no answer names its turn, this start does.
+                        self.bind(id);
+                    } else if self
                         .current
                         .as_ref()
                         .is_some_and(|c| c.turn.is_some() && c.codex_id.is_none())
@@ -2128,6 +2324,25 @@ impl Translator {
                 }
             }
             "thread/tokenUsage/updated" => {
+                if let Some(last) = p.pointer("/tokenUsage/last").filter(|l| l.is_object()) {
+                    let n = |k: &str| last.get(k).and_then(Value::as_u64).unwrap_or(0);
+                    if let Some(tokens) = last.get("totalTokens").and_then(Value::as_u64) {
+                        // During a compaction, the estimate after it: every count but the
+                        // total is 0.
+                        let estimate = n("inputTokens") == 0 && n("outputTokens") == 0;
+                        match self.compacting.as_mut() {
+                            Some(c) if estimate => c.post = Some(tokens),
+                            _ => {}
+                        }
+                        self.context = Some(tokens);
+                    }
+                }
+                if let Some(w) = p
+                    .pointer("/tokenUsage/modelContextWindow")
+                    .and_then(Value::as_u64)
+                {
+                    self.context_window = Some(w);
+                }
                 let Some(total) = p.pointer("/tokenUsage/total") else {
                     return;
                 };
@@ -2201,6 +2416,27 @@ impl Translator {
         out: &mut Translated,
     ) {
         self.item_tasks(item, false, line, out);
+        if str_at(item, "type") == "contextCompaction" {
+            let manual = self
+                .current
+                .as_ref()
+                .is_some_and(|c| c.compact && (turn_id.is_none() || turn_id == c.codex_id));
+            let trigger = if manual { "manual" } else { "auto" };
+            self.compacting = Some(Compacting {
+                item: str_at(item, "id").to_string(),
+                trigger,
+                pre: self.context,
+                post: None,
+                since: (self.clock)(),
+            });
+            let turn = self.turn_of(turn_id.as_deref());
+            let body = EventBody::ContextCompacting(twr_core::event::ContextCompacting {
+                trigger: Some(trigger.into()),
+                ..Default::default()
+            });
+            self.push(out, body, turn, Some(line));
+            return;
+        }
         let Some(call) = tool_call(item, self.cwd.as_deref()) else {
             return;
         };
@@ -2213,6 +2449,130 @@ impl Translator {
         self.push(out, EventBody::AgentToolCall(call), turn, Some(line));
     }
 
+    /// A decision of Codex's reviewer agent (`[codex] auto = "auto_review"`), which answers
+    /// what the sandbox does not allow instead of the user: an `auto_review` tool call (the
+    /// action it judged) and its result (`ok` when approved; the status, risk, authorization
+    /// and rationale), so the transcript shows what ran outside the sandbox unasked and what
+    /// was refused. The whole review is kept as `ext.codex.review`.
+    fn on_auto_review(
+        &mut self,
+        p: &Value,
+        turn_id: Option<String>,
+        line: &str,
+        out: &mut Translated,
+    ) {
+        let review = &p["review"];
+        let action = &p["action"];
+        let id = format!("auto_review:{}", str_at(p, "reviewId"));
+        let status = str_at(review, "status");
+        let approved = status == "approved";
+        let what = match str_at(action, "command") {
+            "" => compact(action),
+            command => command.to_string(),
+        };
+        let child = opt_str(p, "threadId").filter(|id| Some(id) != self.thread_id.as_ref());
+        // A child's turn ids are not the thread's: its decisions go to the current turn.
+        let turn = match &child {
+            Some(_) => self.turn_of(None),
+            None => self.turn_of(turn_id.as_deref()),
+        };
+        let mut codex = Map::new();
+        codex.insert("item_type".into(), json!("autoApprovalReview"));
+        if let Some(child) = &child {
+            codex.insert("child_thread".into(), json!(child));
+        }
+        for (from, to) in [
+            ("targetItemId", "target_item_id"),
+            ("decisionSource", "decision_source"),
+        ] {
+            if let Some(x) = p.get(from).filter(|x| !x.is_null()) {
+                codex.insert(to.into(), x.clone());
+            }
+        }
+        codex.insert("action".into(), action.clone());
+        // The decision first: what a transcript line shows of a tool call is its input.
+        let decision = if status.is_empty() {
+            "no decision"
+        } else {
+            status
+        };
+        let call = AgentToolCall {
+            call_id: id.clone(),
+            tool: "auto_review".into(),
+            input_summary: one_line(&format!("{decision}: {what}"), INPUT_SUMMARY_MAX),
+            input_ref: None,
+            risky: approved,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolCall(call), turn, Some(line));
+        let mut said = decision.to_string();
+        let grades: Vec<String> = [
+            ("riskLevel", "risk"),
+            ("userAuthorization", "authorization"),
+        ]
+        .into_iter()
+        .filter_map(|(k, name)| opt_str(review, k).map(|v| format!("{name} {v}")))
+        .collect();
+        if !grades.is_empty() {
+            said = format!("{said} ({})", grades.join(", "));
+        }
+        if let Some(why) = opt_str(review, "rationale") {
+            said = format!("{said}: {why}");
+        }
+        let mut codex = Map::new();
+        codex.insert("status".into(), json!(status));
+        codex.insert("review".into(), review.clone());
+        let result = AgentToolResult {
+            call_id: id,
+            ok: approved,
+            output_summary: one_line(&said, OUTPUT_SUMMARY_MAX),
+            output_ref: None,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolResult(result), turn, None);
+    }
+
+    /// [`Translator::on_auto_review`] for a decision whose message was too long to read
+    /// (`len` bytes, `head` its start): an `auto_review` call and result that say so, in the
+    /// current turn, `risky` and not `ok` (it may have been approved).
+    fn on_unread_auto_review(&mut self, head: &str, len: usize, out: &mut Translated) {
+        let id = format!(
+            "auto_review:{}",
+            head_string(head, "reviewId")
+                .unwrap_or_else(|| format!("unread-{}", self.unread_reviews))
+        );
+        self.unread_reviews += 1;
+        let what = format!("a decision of {len} bytes, too long to read");
+        let mut codex = Map::new();
+        codex.insert("item_type".into(), json!("autoApprovalReview"));
+        codex.insert("oversized_len".into(), json!(len));
+        let turn = self.turn_of(None);
+        let call = AgentToolCall {
+            call_id: id.clone(),
+            tool: "auto_review".into(),
+            input_summary: format!("unread: {what}"),
+            input_ref: None,
+            risky: true,
+            ext: ext_of(codex.clone()),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolCall(call), turn, None);
+        let result = AgentToolResult {
+            call_id: id,
+            ok: false,
+            output_summary: format!(
+                "unread: Codex's reviewer decided, and twr could not read the decision ({what}); \
+                 what it approved ran outside the sandbox"
+            ),
+            output_ref: None,
+            ext: ext_of(codex),
+            ..Default::default()
+        };
+        self.push(out, EventBody::AgentToolResult(result), turn, None);
+    }
+
     fn on_item_completed(
         &mut self,
         item: &Value,
@@ -2223,6 +2583,31 @@ impl Translator {
         self.item_tasks(item, true, line, out);
         let turn = self.turn_of(turn_id.as_deref());
         match str_at(item, "type") {
+            "contextCompaction" => {
+                let id = str_at(item, "id");
+                let c = self
+                    .compacting
+                    .take_if(|c| c.item == id || id.is_empty())
+                    .unwrap_or(Compacting {
+                        item: id.to_string(),
+                        trigger: "auto",
+                        pre: None,
+                        post: None,
+                        since: (self.clock)(),
+                    });
+                let took = ((self.clock)() - c.since).num_milliseconds();
+                // It replaced the context: its estimate after, unknown without one (the count
+                // before is no longer the context; the next usage report gives it again).
+                self.context = c.post;
+                let body = EventBody::ContextCompacted(twr_core::event::ContextCompacted {
+                    trigger: c.trigger.into(),
+                    pre_tokens: c.pre,
+                    post_tokens: c.post,
+                    duration_ms: u64::try_from(took).ok().filter(|_| c.pre.is_some()),
+                    ..Default::default()
+                });
+                self.push(out, body, turn, Some(line));
+            }
             "agentMessage" => {
                 let text = str_at(item, "text");
                 if !text.is_empty() {
@@ -2386,17 +2771,24 @@ impl Translator {
             codex.insert("error".into(), err.clone());
         }
         // Every failed turn says why (`ext.twr.error`, what the hub quotes): the turn's error,
-        // else its last `error` notification. Not signed in (or the login expired): said with
-        // what to do, and never transient (Codex reports it as a failed connection, which
-        // otherwise is).
-        let auth = result == TurnResult::Error && auth_failure(&t["error"]);
+        // else its last `error` notification, which is then also what says whether it was not
+        // signed in or hit a limit (whether it is transient stays the turn's error's). Not
+        // signed in (or the login expired): said with what to do, and never transient (Codex
+        // reports it as a failed connection, which otherwise is).
+        let noted = cur
+            .as_ref()
+            .and_then(|c| c.last_error.as_ref())
+            .or_else(|| own_turn.as_ref().and_then(|o| o.last_error.as_ref()))
+            .map(|(e, _)| e);
+        let cause = t
+            .get("error")
+            .filter(|e| !e.is_null())
+            .or(noted)
+            .unwrap_or(&Value::Null);
+        let auth = result == TurnResult::Error && auth_failure(cause);
         let twr_error = (result == TurnResult::Error).then(|| {
-            let noted = cur
-                .as_ref()
-                .and_then(|c| c.last_error.as_ref())
-                .or_else(|| own_turn.as_ref().and_then(|o| o.last_error.as_ref()));
             let text = error_text(&t["error"])
-                .or_else(|| noted.and_then(|(e, _)| error_text(e)))
+                .or_else(|| noted.and_then(error_text))
                 .unwrap_or_else(|| match status {
                     "" => "Codex ended the turn without a status".to_string(),
                     s => format!("Codex ended the turn with status {s}"),
@@ -2407,9 +2799,21 @@ impl Translator {
                 error_line(&text)
             }
         });
+        let mut limit = None;
         if auth {
             codex.insert("auth_failed".into(), json!(true));
             codex.insert("transient".into(), json!(false));
+        } else if let Some(l) = twr_error.as_deref().and_then(|message| {
+            limit_of(
+                cause,
+                &self.limit_windows,
+                self.limit_reached.as_deref(),
+                message,
+            )
+        }) {
+            // Retrying before the reset cannot help.
+            codex.insert("transient".into(), json!(false));
+            limit = Some(l);
         } else if result == TurnResult::Error {
             let reason = transient_reason(&t["error"]);
             codex.insert("transient".into(), json!(reason.is_some()));
@@ -2446,17 +2850,28 @@ impl Translator {
             ext.get_or_insert_with(JsonMap::new)
                 .insert("twr".into(), json!({ "error": e }));
         }
+        if let Some(l) = limit {
+            set_twr_ext(&mut ext, crate::usage::LIMIT_KEY, l.to_value());
+        }
         // Codex's own turn: its end carries its id, so it closes only the turn its start opened.
         if turn.is_none() {
             if let Some(id) = codex_id.or_else(|| cur.as_ref().and_then(|c| c.codex_id.clone())) {
                 set_twr_ext(&mut ext, RUNTIME_TURN_KEY, json!(id));
             }
         }
+        let context = self.context.map(|tokens| twr_core::event::ContextSize {
+            tokens,
+            window: self.context_window,
+        });
+        if is_current {
+            self.compacting = None;
+        }
         let body = EventBody::TurnEnded(TurnEnded {
             result,
             session_id: self.thread_id.clone(),
             usage,
             duration_ms: t.get("durationMs").and_then(Value::as_u64),
+            context,
             ext,
             ..Default::default()
         });
@@ -2501,6 +2916,7 @@ impl Translator {
                         interrupt_wanted: false,
                         interrupt_sent: false,
                         last_error: u.last_error,
+                        compact: false,
                     });
                 } else {
                     self.own_turns.insert(
@@ -2642,6 +3058,17 @@ fn id_text(id: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+/// The string value of the first `"key"` in `head`, the start of a JSON message too long to
+/// parse: only a plain one (no escapes), as an id is.
+fn head_string(head: &str, key: &str) -> Option<String> {
+    let at = head.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = head[at..].trim_start().strip_prefix(':')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    let value = &rest[..end];
+    (!value.is_empty() && !value.contains('\\') && value.len() <= 128).then(|| value.to_string())
 }
 
 fn ext_of(codex: Map<String, Value>) -> Option<JsonMap> {
@@ -2798,7 +3225,7 @@ pub(crate) fn sandbox_rank(sandbox: &str) -> Option<u8> {
 
 /// Checks the policy a `thread/start` / `thread/resume` result reports (`approvalPolicy`,
 /// `sandbox.type`, `approvalsReviewer`) against the request's `params`: each must be reported,
-/// known, and no wider than requested (the reviewer exactly `user`). Short of
+/// known, and no wider than requested (the reviewer `user`, or the `auto_review` asked for). Short of
 /// `dangerFullAccess` (which allows everything anyway, and only when asked for), the sandbox's
 /// extras are checked too ([`check_sandbox_extras`]): network access only when twr asked for
 /// it, and only writable roots twr asked for. Err says what is not.
@@ -2837,12 +3264,51 @@ pub fn check_policy(params: &Value, result: &Value) -> Result<(), String> {
             ))
         }
     }
+    // `auto_review` (`[codex] auto`) only when asked for; `guardian_subagent` is Codex's
+    // older name for it.
+    let asked = str_at(params, "approvalsReviewer");
     match result.get("approvalsReviewer").and_then(Value::as_str) {
-        Some("user") => Ok(()),
+        Some("user") => {}
+        Some("auto_review" | "guardian_subagent") if asked == "auto_review" => {}
+        other => {
+            return Err(format!(
+                "the thread reports approvalsReviewer {:?} where twr asked for {asked:?}; \
+                 approvals would not reach the user",
+                other.unwrap_or("(none)")
+            ))
+        }
+    }
+    check_cwd(params, result)
+}
+
+/// Checks the `cwd` a result reports against the request's: a `workspace-write` sandbox lets
+/// commands write their cwd, so it must be the one asked for (the same path, or one that
+/// resolves to the same directory), and reported when the result's sandbox is
+/// `workspaceWrite` (every Codex twr knows, back to 0.155, reports it). Under another
+/// sandbox, one not reported passes. Nothing asked: no check.
+fn check_cwd(params: &Value, result: &Value) -> Result<(), String> {
+    let asked = str_at(params, "cwd");
+    if asked.is_empty() {
+        return Ok(());
+    }
+    let writes_cwd = result
+        .get("sandbox")
+        .and_then(|s| s.as_str().or_else(|| s.get("type").and_then(Value::as_str)))
+        .and_then(sandbox_rank)
+        != Some(0);
+    let same = |got: &str| {
+        Path::new(got) == Path::new(asked)
+            || matches!(
+                (Path::new(got).canonicalize(), Path::new(asked).canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    };
+    match result.get("cwd") {
+        None | Some(Value::Null) if !writes_cwd => Ok(()),
+        Some(Value::String(got)) if same(got) => Ok(()),
         other => Err(format!(
-            "the thread reports approvalsReviewer {:?} where twr asked for \"user\"; approvals \
-             would not reach the user",
-            other.unwrap_or("(none)")
+            "the thread reports cwd {} where twr asked for {asked:?}; commands could write there",
+            other.map_or("(none)".to_string(), compact)
         )),
     }
 }
@@ -3380,17 +3846,60 @@ fn with_auth_hint(text: String) -> String {
     }
 }
 
+/// The variant of a turn error's `codexErrorInfo` (`"usageLimitExceeded"`,
+/// `{"httpConnectionFailed": {...}}` → `httpConnectionFailed`).
+fn error_info_name(error: &Value) -> Option<&str> {
+    match error.get("codexErrorInfo")? {
+        Value::String(s) => Some(s),
+        Value::Object(m) => m.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
 /// Why a failed turn looks transient (`turn.error.codexErrorInfo`), if it does.
 pub fn transient_reason(error: &Value) -> Option<String> {
-    let info = error.get("codexErrorInfo")?;
-    let name = match info {
-        Value::String(s) => s.clone(),
-        Value::Object(m) => m.keys().next()?.clone(),
-        _ => return None,
-    };
+    let name = error_info_name(error)?;
     TRANSIENT_ERRORS
-        .contains(&name.as_str())
+        .contains(&name)
         .then(|| format!("codexErrorInfo {name}"))
+}
+
+/// The limit a failed turn (its `error`) hit, in the runtime's words `message`, given the
+/// rate-limit windows reported so far and the last snapshot's `rateLimitReachedType`
+/// `reached`. Only a `usageLimitExceeded` error names a limit: spend when `reached` says
+/// credits are depleted (`workspace_*_credits_depleted`), else usage, with the first window
+/// at 100% or more (else the one that resets first) and its reset time. None for any other
+/// error, whatever the snapshot says (`contextWindowExceeded` stays itself,
+/// `rateLimitExceeded` transient).
+pub fn limit_of(
+    error: &Value,
+    windows: &[UsageWindow],
+    reached: Option<&str>,
+    message: &str,
+) -> Option<Limit> {
+    if error_info_name(error) != Some("usageLimitExceeded") {
+        return None;
+    }
+    if reached.is_some_and(|r| r.contains("credits_depleted")) {
+        return Some(Limit {
+            kind: LimitKind::Spend,
+            window: None,
+            resets_at: None,
+            message: message.to_string(),
+        });
+    }
+    let window = windows.iter().find(|w| w.used_pct >= 100.0).or_else(|| {
+        windows
+            .iter()
+            .filter(|w| w.resets_at.is_some())
+            .min_by_key(|w| w.resets_at)
+    });
+    Some(Limit {
+        kind: LimitKind::Usage,
+        window: window.map(|w| w.window.clone()),
+        resets_at: window.and_then(|w| w.resets_at),
+        message: message.to_string(),
+    })
 }
 
 /// The text of one answer to a question with option `labels`, or None to decline.
@@ -3502,6 +4011,7 @@ mod tests {
                 method: "thread/start",
                 params: json!({}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         let cmd = format!("cargo test --workspace -- {}", "--flag ".repeat(60));
@@ -3532,6 +4042,7 @@ mod tests {
                 method: "thread/start",
                 params: json!({}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         let out = t.translate(r#"{"method":"item/tool/call","id":7,"params":{}}"#);
@@ -3565,6 +4076,7 @@ mod tests {
                 params: json!({"approvalPolicy": "untrusted", "approvalsReviewer": "user",
                     "sandbox": "workspace-write"}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         t.start();
@@ -3589,6 +4101,7 @@ mod tests {
                     params: json!({"threadId": "th", "approvalPolicy": "untrusted",
                         "approvalsReviewer": "user", "sandbox": "read-only"}),
                     mode_note: None,
+                    added_instructions: None,
                 },
             );
             t.start();
@@ -3646,6 +4159,7 @@ mod tests {
                 params: json!({"approvalPolicy": "never", "approvalsReviewer": "user",
                     "sandbox": "workspace-write"}),
                 mode_note: None,
+                added_instructions: None,
             },
         );
         t.start();
@@ -3654,6 +4168,407 @@ mod tests {
             r#"{"id":2,"result":{"thread":{"id":"th"},"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"readOnly"}}}"#,
         );
         assert!(out.fatal.is_none(), "{out:?}");
+    }
+
+    /// Codex's reviewer agent answers only where twr asked for it (`[codex] auto =
+    /// "auto_review"`): then `auto_review`, its older name `guardian_subagent`, or `user`
+    /// (narrower) pass; asked for `user`, only `user` does.
+    #[test]
+    fn the_auto_reviewer_is_accepted_only_when_asked_for() {
+        let params = |reviewer: &str| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": reviewer,
+                "sandbox": "read-only"})
+        };
+        let result = |reviewer: Value| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": reviewer,
+                "sandbox": {"type": "readOnly"}})
+        };
+        for got in ["auto_review", "guardian_subagent", "user"] {
+            assert_eq!(
+                check_policy(&params("auto_review"), &result(json!(got))),
+                Ok(()),
+                "{got}"
+            );
+        }
+        for got in [
+            json!("auto_review"),
+            json!("guardian_subagent"),
+            json!("someone"),
+            Value::Null,
+        ] {
+            let why = check_policy(&params("user"), &result(got.clone())).unwrap_err();
+            assert!(why.contains("approvalsReviewer"), "{why}");
+        }
+        for got in [json!("someone"), Value::Null] {
+            assert!(check_policy(&params("auto_review"), &result(got)).is_err());
+        }
+    }
+
+    /// Each decision of Codex's reviewer agent (as Codex 0.162.1 sent them) is in the
+    /// transcript: the action as an `auto_review` tool call, the decision as its result, `ok`
+    /// only when approved. The `started` notification and the `guardianWarning` repeating the
+    /// decision add nothing.
+    #[test]
+    fn auto_review_decisions_are_recorded_as_tool_calls() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let started = r#"{"method":"item/autoApprovalReview/started","params":{"threadId":"th","turnId":"tu1","startedAtMs":1,"reviewId":"r1","targetItemId":"exec-1","review":{"status":"inProgress","riskLevel":null,"userAuthorization":null,"rationale":null},"action":{"type":"command","source":"unifiedExec","command":"/bin/bash -lc 'git branch -d other'","cwd":"/w"}}}"#;
+        assert!(t.translate(started).events.is_empty());
+        let warning = r#"{"method":"guardianWarning","params":{"threadId":"th","message":"Automatic approval review approved (risk: medium, authorization: high): ..."}}"#;
+        assert!(t.translate(warning).events.is_empty());
+        let decided = |id: &str, status: &str, risk: &str| {
+            json!({"method": "item/autoApprovalReview/completed", "params": {
+                "threadId": "th", "turnId": "tu1", "startedAtMs": 1, "completedAtMs": 2,
+                "reviewId": id, "targetItemId": "exec-1", "decisionSource": "agent",
+                "review": {"status": status, "riskLevel": risk, "userAuthorization": "high",
+                    "rationale": "The user asked for it."},
+                "action": {"type": "command", "source": "unifiedExec",
+                    "command": "/bin/bash -lc 'git branch -d other'", "cwd": "/w"}}})
+            .to_string()
+        };
+        for (id, status, ok) in [("r1", "approved", true), ("r2", "denied", false)] {
+            let out = t.translate(&decided(id, status, "medium"));
+            let (call, result) = match &out.events[..] {
+                [Emitted {
+                    body: EventBody::AgentToolCall(c),
+                    turn: Some(1),
+                    ..
+                }, Emitted {
+                    body: EventBody::AgentToolResult(r),
+                    turn: Some(1),
+                    ..
+                }] => (c, r),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(call.tool, "auto_review");
+            assert_eq!(call.call_id, format!("auto_review:{id}"));
+            assert_eq!(
+                call.input_summary,
+                format!("{status}: /bin/bash -lc 'git branch -d other'")
+            );
+            assert_eq!(call.risky, ok);
+            assert_eq!(
+                call.ext.as_ref().unwrap()["codex"]["target_item_id"],
+                "exec-1"
+            );
+            assert_eq!(result.call_id, call.call_id);
+            assert_eq!(result.ok, ok);
+            assert_eq!(
+                result.output_summary,
+                format!("{status} (risk medium, authorization high): The user asked for it.")
+            );
+            assert_eq!(
+                result.ext.as_ref().unwrap()["codex"]["review"]["status"],
+                status
+            );
+        }
+        // An action that is not a command shows as JSON.
+        let other = json!({"method": "item/autoApprovalReview/completed", "params": {
+            "threadId": "th", "turnId": "tu1", "reviewId": "r3",
+            "review": {"status": "timedOut"}, "action": {"type": "network", "host": "x.dev"}}})
+        .to_string();
+        let out = t.translate(&other);
+        let [Emitted {
+            body: EventBody::AgentToolCall(c),
+            ..
+        }, Emitted {
+            body: EventBody::AgentToolResult(r),
+            ..
+        }] = &out.events[..]
+        else {
+            panic!("{:?}", out.events)
+        };
+        assert!(
+            c.input_summary.starts_with("timedOut: "),
+            "{}",
+            c.input_summary
+        );
+        assert!(c.input_summary.contains("x.dev"), "{}", c.input_summary);
+        assert!(!r.ok);
+        assert_eq!(r.output_summary, "timedOut");
+        // A child agent's decision is the thread's too, in its current turn, and says whose.
+        let child = json!({"method": "item/autoApprovalReview/completed", "params": {
+            "threadId": "child-1", "turnId": "child-turn", "reviewId": "r4",
+            "review": {"status": "approved"},
+            "action": {"type": "command", "command": "touch /x"}}})
+        .to_string();
+        let out = t.translate(&child);
+        let [Emitted {
+            body: EventBody::AgentToolCall(c),
+            turn: Some(1),
+            ..
+        }, Emitted {
+            body: EventBody::AgentToolResult(r),
+            ..
+        }] = &out.events[..]
+        else {
+            panic!("{:?}", out.events)
+        };
+        assert_eq!(c.input_summary, "approved: touch /x");
+        assert_eq!(c.ext.as_ref().unwrap()["codex"]["child_thread"], "child-1");
+        assert!(r.ok);
+    }
+
+    /// A reviewer decision too long to read is still in the transcript, in the running turn:
+    /// an `auto_review` call and result that say so, `risky` and not `ok`, under its review id
+    /// when the start of the message names one.
+    #[test]
+    fn an_auto_review_decision_too_long_to_read_is_recorded() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let heads = [
+            (
+                r#"{"method":"item/autoApprovalReview/completed","params":{"threadId":"th","turnId":"tu1","reviewId":"r9","action":{"type":"command","command":"echo aaaa"#,
+                "auto_review:r9",
+            ),
+            (
+                r#"{"method": "item/autoApprovalReview/completed", "params": {"action": {"command": "x"#,
+                "auto_review:unread-1",
+            ),
+        ];
+        for (head, id) in heads {
+            let out = t.oversized(head, 40 << 20);
+            assert!(out.fatal.is_none());
+            let [Emitted {
+                body: EventBody::AgentToolCall(c),
+                turn: Some(1),
+                ..
+            }, Emitted {
+                body: EventBody::AgentToolResult(r),
+                turn: Some(1),
+                ..
+            }] = &out.events[..]
+            else {
+                panic!("{:?}", out.events)
+            };
+            assert_eq!(c.tool, "auto_review");
+            assert_eq!(c.call_id, id);
+            assert_eq!(r.call_id, id);
+            assert!(c.risky && !r.ok);
+            assert!(
+                c.input_summary.starts_with("unread: "),
+                "{}",
+                c.input_summary
+            );
+            assert!(
+                r.output_summary.contains("could not read"),
+                "{}",
+                r.output_summary
+            );
+        }
+        assert_eq!(head_string(r#"{"reviewId":"a\"b"}"#, "reviewId"), None);
+        assert_eq!(
+            head_string(r#"{"reviewId" : "ok-1"}"#, "reviewId").as_deref(),
+            Some("ok-1")
+        );
+    }
+
+    /// The settings Codex reports during the session are held to what twr asked for, like
+    /// those it reported when the thread opened (the parent's and a child's alike): a wider
+    /// approval policy, sandbox, network or reviewer ends the session.
+    #[test]
+    fn a_thread_whose_settings_widen_mid_session_is_stopped() {
+        let mut t = open_translator();
+        t.send("go", 1);
+        t.translate(r#"{"id":3,"result":{"turn":{"id":"tu1"}}}"#);
+        let update = |thread: &str, approval: Value, reviewer: Value, sandbox: Value| {
+            json!({"method": "thread/settings/updated", "params": {"threadId": thread,
+                "threadSettings": {"approvalPolicy": approval, "approvalsReviewer": reviewer,
+                    "sandboxPolicy": sandbox, "cwd": "/w", "model": "m", "modelProvider": "p",
+                    "collaborationMode": {"mode": "default", "settings": {}}}}})
+            .to_string()
+        };
+        let ws = json!({"type": "workspaceWrite", "networkAccess": false});
+        let same = update("th", json!("untrusted"), json!("user"), ws.clone());
+        let out = t.translate(&same);
+        assert!(out.fatal.is_none(), "{out:?}");
+        for (thread, approval, reviewer, sandbox) in [
+            ("th", json!("never"), json!("user"), ws.clone()),
+            ("th", json!("untrusted"), json!("auto_review"), ws.clone()),
+            (
+                "th",
+                json!("untrusted"),
+                json!("user"),
+                json!({"type": "dangerFullAccess"}),
+            ),
+            (
+                "th",
+                json!("untrusted"),
+                json!("user"),
+                json!({"type": "workspaceWrite", "networkAccess": true}),
+            ),
+            ("child-1", json!("on-request"), json!("user"), ws.clone()),
+            ("th", json!({"granular": {}}), json!("user"), ws.clone()),
+        ] {
+            let out = t.translate(&update(thread, approval.clone(), reviewer.clone(), sandbox));
+            assert!(
+                out.fatal.is_some(),
+                "{thread} {approval} {reviewer} accepted: {out:?}"
+            );
+        }
+        // Too long to read: nothing to check it against, so the session ends.
+        let out = t.oversized(
+            r#"{"method":"thread/settings/updated","params":{"threadId":"th","#,
+            9_000_000,
+        );
+        assert!(out.fatal.unwrap().contains("too long"));
+    }
+
+    /// A workspace-write sandbox lets commands write their cwd: a thread that reports another
+    /// cwd than the one asked for, when it opens or in its settings later (or settings with
+    /// none), is refused.
+    #[test]
+    fn a_thread_must_run_in_the_cwd_twr_asked_for() {
+        let params = json!({"cwd": "/w/wt", "approvalPolicy": "on-request",
+            "approvalsReviewer": "user", "sandbox": "workspace-write"});
+        let result = |cwd: Value| {
+            json!({"approvalPolicy": "on-request", "approvalsReviewer": "user", "cwd": cwd,
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}})
+        };
+        assert_eq!(check_policy(&params, &result(json!("/w/wt"))), Ok(()));
+        assert_eq!(check_policy(&params, &result(json!("/w/wt/"))), Ok(()));
+        // A read-only sandbox writes no cwd: one not reported passes there.
+        let mut ro = params.clone();
+        ro["sandbox"] = json!("read-only");
+        let mut ro_result = result(Value::Null);
+        ro_result["sandbox"] = json!({"type": "readOnly"});
+        assert_eq!(check_policy(&ro, &ro_result), Ok(()));
+        for bad in [json!("/home/u"), json!("/w"), json!(["/w/wt"]), Value::Null] {
+            let why = check_policy(&params, &result(bad.clone())).unwrap_err();
+            assert!(why.contains("cwd"), "{bad}: {why}");
+        }
+        let mut t = Translator::new(
+            TranslatorOptions::default(),
+            Open {
+                method: "thread/start",
+                params: params.clone(),
+                mode_note: None,
+                added_instructions: None,
+            },
+        );
+        t.start();
+        t.translate(r#"{"id":1,"result":{}}"#);
+        let out = t.translate(
+            &json!({"id": 2, "result": {"thread": {"id": "th"}, "cwd": "/w/wt",
+                "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}}})
+            .to_string(),
+        );
+        assert!(out.fatal.is_none(), "{out:?}");
+        let settings = |cwd: Option<&str>| {
+            let mut st = json!({"approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandboxPolicy": {"type": "workspaceWrite", "networkAccess": false}});
+            if let Some(c) = cwd {
+                st["cwd"] = json!(c);
+            }
+            json!({"method": "thread/settings/updated",
+                "params": {"threadId": "th", "threadSettings": st}})
+            .to_string()
+        };
+        // Opening without a cwd (a workspace-write sandbox writes it) is refused too.
+        let mut t2 = Translator::new(
+            TranslatorOptions::default(),
+            Open {
+                method: "thread/start",
+                params: params.clone(),
+                mode_note: None,
+                added_instructions: None,
+            },
+        );
+        t2.start();
+        t2.translate(r#"{"id":1,"result":{}}"#);
+        let out = t2.translate(
+            &json!({"id": 2, "result": {"thread": {"id": "th"},
+                "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                "sandbox": {"type": "workspaceWrite", "networkAccess": false}}})
+            .to_string(),
+        );
+        assert!(out.fatal.unwrap().contains("cwd"));
+        assert!(t.translate(&settings(Some("/w/wt"))).fatal.is_none());
+        assert!(t.translate(&settings(Some("/home/u"))).fatal.is_some());
+        assert!(t.translate(&settings(None)).fatal.is_some());
+    }
+
+    /// The `auto` sandbox note comes after the developer instructions of the user's Codex
+    /// config, which a request's `developerInstructions` would otherwise replace: the config
+    /// is read first. When it cannot be read, twr's note is left out and the user's
+    /// instructions apply as configured.
+    #[test]
+    fn the_sandbox_note_keeps_the_configured_developer_instructions() {
+        let open = |params: Value| Open {
+            method: "thread/start",
+            params,
+            mode_note: None,
+            added_instructions: Some("NOTE".into()),
+        };
+        let start = |params: Value, config_reply: &str| {
+            let mut t = Translator::new(TranslatorOptions::default(), open(params));
+            t.start();
+            let out = t.translate(r#"{"id":1,"result":{}}"#);
+            let read = out
+                .replies
+                .iter()
+                .find(|l| l.contains("config/read"))
+                .expect("config/read")
+                .clone();
+            let id = serde_json::from_str::<Value>(&read).unwrap()["id"].clone();
+            let reply = config_reply.replace("ID", &id.to_string());
+            let out = t.translate(&reply);
+            let start = out
+                .replies
+                .iter()
+                .find(|l| l.contains("thread/start"))
+                .expect("thread/start")
+                .clone();
+            serde_json::from_str::<Value>(&start).unwrap()["params"].clone()
+        };
+        let p = start(
+            json!({"developerInstructions": "NOTE"}),
+            r#"{"id":ID,"result":{"config":{"developer_instructions":"Mine."}}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "Mine.\n\nNOTE");
+        let p = start(
+            json!({"developerInstructions": "twr text\n\nNOTE"}),
+            r#"{"id":ID,"result":{"config":{}}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "twr text\n\nNOTE");
+        let p = start(
+            json!({"developerInstructions": "NOTE"}),
+            r#"{"id":ID,"error":{"code":-32000,"message":"no"}}"#,
+        );
+        assert!(p.get("developerInstructions").is_none(), "{p}");
+        let p = start(
+            json!({"developerInstructions": "twr text\n\nNOTE"}),
+            r#"{"id":ID,"error":{"code":-32000,"message":"no"}}"#,
+        );
+        assert_eq!(p["developerInstructions"], "twr text");
+        // An answer too long to read is a failed read: the thread opens without the note.
+        let mut t = Translator::new(
+            TranslatorOptions::default(),
+            open(json!({"developerInstructions": "NOTE"})),
+        );
+        t.start();
+        let out = t.translate(r#"{"id":1,"result":{}}"#);
+        let read = out
+            .replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == "config/read")
+            .unwrap();
+        let out = t.oversized(
+            &format!(r#"{{"id":{},"result":{{"config":{{"#, read["id"]),
+            9_000_000,
+        );
+        assert!(out.fatal.is_none(), "{out:?}");
+        let start = out
+            .replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == "thread/start")
+            .expect("thread/start");
+        assert!(start["params"].get("developerInstructions").is_none());
     }
 
     /// Relay rule: a form or URL elicitation is never answered for the user. It

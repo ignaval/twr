@@ -23,6 +23,10 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("docs/usage.md", include_str!("../../../docs/usage.md")),
     ("docs/tui.md", include_str!("../../../docs/tui.md")),
     (
+        "docs/read-aloud.md",
+        include_str!("../../../docs/read-aloud.md"),
+    ),
+    (
         "docs/configuration.md",
         include_str!("../../../docs/configuration.md"),
     ),
@@ -33,6 +37,10 @@ pub const BUNDLED: &[(&str, &str)] = &[
     (
         "docs/runtimes.md",
         include_str!("../../../docs/runtimes.md"),
+    ),
+    (
+        "docs/accounts.md",
+        include_str!("../../../docs/accounts.md"),
     ),
     (
         "docs/orchestrator.md",
@@ -657,6 +665,7 @@ mod tests {
                 "connect a runner on another machine with a token",
                 "docs/runners.md",
             ),
+            ("ssh box daemon", "docs/runners.md"),
             ("socket api methods", "SKILL.md"),
         ] {
             let top = top_ids(&lib, q, 3);

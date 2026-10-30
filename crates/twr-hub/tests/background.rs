@@ -1143,6 +1143,17 @@ async fn silent_background_work_stalls_once_and_a_heartbeat_does_not_resolve_it(
         .open_attention
         .values()
         .any(|r| *r == AttentionReason::Stalled));
+    // Its background work went on (a task ended): the resolution says so.
+    let (_, evs) = hub.thread_events(&id, 0, 1000).unwrap();
+    let closed = evs
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::AttentionResolved(p) => Some(p.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(closed.by, ResolvedBy::Timeout);
+    assert!(went_on(&closed.ext), "{closed:?}");
     hub.stop_thread(&id, "test").unwrap();
     wait(&hub, &id, |e| e.kind() == "thread.stopped").await;
     hub.shutdown().await;
@@ -1405,5 +1416,286 @@ async fn a_task_id_reused_after_the_turns_task_ended_does_not_keep_it_interim() 
         update.contains(" finished (needs_verification): Not verified."),
         "{update}"
     );
+    hub.shutdown().await;
+}
+
+/// A running update of task `id`: progress saying `description` (`heartbeat: false`), or a
+/// heartbeat.
+fn update(id: &str, description: &str, heartbeat: bool) -> EventBody {
+    EventBody::TaskUpdated(TaskUpdated {
+        task_id: id.into(),
+        running: true,
+        description: description.into(),
+        heartbeat,
+        ..Default::default()
+    })
+}
+
+/// The recorded updates of task `id`: (running, description, heartbeat).
+fn recorded(hub: &Hub, thread: &str, id: &str) -> Vec<(bool, String, bool)> {
+    hub.thread_events(thread, 0, 10_000)
+        .unwrap()
+        .1
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::TaskUpdated(p) if p.task_id == id => {
+                Some((p.running, p.description, p.heartbeat))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn coalesced(hub: &Hub) -> u64 {
+    hub.info()["coalesced_events"].as_u64().unwrap()
+}
+
+/// The script's start, then `steps` after its turn ended, then a long sleep.
+fn started_then(steps: Vec<Step>) -> Vec<Step> {
+    let mut script = vec![
+        Step::EmitSession(EventBody::ThreadStarted(SessionPayload {
+            session_id: Some("background-session".into()),
+            ..Default::default()
+        })),
+        Step::EmitSession(update("build", "build", false)),
+        Step::Emit(EventBody::AgentText(AgentText {
+            text: "Building in the background.".into(),
+            is_final: true,
+            ..Default::default()
+        })),
+        Step::Emit(EventBody::TurnEnded(TurnEnded::default())),
+    ];
+    script.extend(steps);
+    script.push(Step::Sleep(60_000));
+    script
+}
+
+/// A runtime's task updates are recorded at most so often (`hub::coalesce`): progress once per
+/// interval (a tenth of the hung-turn threshold here: 1 s), heartbeats once per interval (a
+/// quarter of the background timeout here: 1 s) after the task's last recorded update; its
+/// start, an update with `ext` and its end always.
+#[tokio::test]
+async fn a_runtimes_task_updates_are_recorded_at_most_so_often() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_ext = EventBody::TaskUpdated(TaskUpdated {
+        task_id: "build".into(),
+        running: true,
+        description: "step 1b".into(),
+        ext: Some(serde_json::from_value(serde_json::json!({"x": 1})).unwrap()),
+        ..Default::default()
+    });
+    let script = started_then(vec![
+        Step::EmitSession(update("build", "step 1", false)),
+        Step::EmitSession(update("build", "", true)),
+        Step::EmitSession(with_ext),
+        Step::Sleep(1300),
+        Step::EmitSession(update("build", "step 2", false)),
+        Step::EmitSession(update("build", "step 3", false)),
+        Step::EmitSession(update("build", "", true)),
+        // A heartbeat with a new description is progress.
+        Step::EmitSession(update("build", "step 3", true)),
+        Step::Sleep(1300),
+        Step::EmitSession(update("build", "", true)),
+        Step::EmitSession(EventBody::TaskUpdated(TaskUpdated {
+            task_id: "build".into(),
+            description: "build".into(),
+            ..Default::default()
+        })),
+    ]);
+    let mut opts = options(dir.path(), script);
+    opts.stall_after = Some(Duration::from_secs(10));
+    opts.config.background_timeout_secs = 4;
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    wait(
+        &hub,
+        &id,
+        |e| matches!(&e.body, EventBody::TaskUpdated(p) if !p.running),
+    )
+    .await;
+    let s = |d: &str| d.to_string();
+    assert_eq!(
+        recorded(&hub, &id, "build"),
+        [
+            (true, s("build"), false),
+            (true, s("step 1b"), false),
+            (true, s("step 2"), false),
+            (true, s(""), true),
+            (false, s("build"), false),
+        ]
+    );
+    assert_eq!(coalesced(&hub), 5);
+    hub.shutdown().await;
+}
+
+/// A task whose progress is coalesced keeps its thread from stalling while it moves; once it
+/// goes silent, the thread stalls, `stall_after` after its last recorded progress.
+#[tokio::test]
+async fn coalesced_progress_keeps_a_thread_from_stalling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut steps = Vec::new();
+    for i in 0..40 {
+        steps.push(Step::Sleep(50));
+        steps.push(Step::EmitSession(update(
+            "build",
+            &format!("step {i}"),
+            false,
+        )));
+    }
+    let mut opts = options(dir.path(), started_then(steps));
+    let after = Duration::from_secs(2);
+    opts.stall_after = Some(after);
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    let stalled = wait(&hub, &id, |e| matches!(&e.body, EventBody::AttentionRaised(a) if a.reason == AttentionReason::Stalled)).await;
+    let (_, evs) = hub.thread_events(&id, 0, 10_000).unwrap();
+    let last_progress = evs
+        .iter()
+        .rfind(|e| matches!(&e.body, EventBody::TaskUpdated(p) if p.running && !p.heartbeat))
+        .unwrap();
+    // Once: no stall while it moved (nothing resolved one).
+    assert!(
+        !evs.iter().any(|e| e.kind() == "attention.resolved"),
+        "{evs:#?}"
+    );
+    assert!(stalled.seq > last_progress.seq);
+    assert!(stalled.ts - last_progress.ts >= chrono::Duration::from_std(after).unwrap());
+    let progress = recorded(&hub, &id, "build").len();
+    assert!(progress < 41, "{progress} of 41 updates recorded");
+    assert_eq!(coalesced(&hub), 41 - progress as u64);
+    hub.shutdown().await;
+}
+
+/// Coalesced heartbeats still renew a task's lease: the background timeout stops the runtime
+/// only once they stop, after the last recorded one.
+#[tokio::test]
+async fn coalesced_heartbeats_still_renew_the_background_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut steps = Vec::new();
+    for _ in 0..30 {
+        steps.push(Step::Sleep(100));
+        steps.push(Step::EmitSession(update("build", "", true)));
+    }
+    let mut opts = options(dir.path(), started_then(steps));
+    opts.config.background_timeout_secs = 2;
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    let stopped = wait(&hub, &id, |e| e.kind() == "thread.stopped").await;
+    let beats = recorded(&hub, &id, "build");
+    assert!(beats.len() < 31, "{beats:?}");
+    assert_eq!(coalesced(&hub), 31 - beats.len() as u64);
+    let (_, evs) = hub.thread_events(&id, 0, 10_000).unwrap();
+    let last = evs.iter().rfind(|e| e.kind() == "task.updated").unwrap();
+    assert!(stopped.ts - last.ts >= chrono::Duration::seconds(2));
+    // Renewed until its heartbeats stopped (3 s in): never stopped before.
+    let first = evs.iter().find(|e| e.kind() == "task.updated").unwrap();
+    assert!(
+        last.ts - first.ts >= chrono::Duration::milliseconds(2500),
+        "{beats:?}"
+    );
+    hub.shutdown().await;
+}
+
+/// Progress renews a task's lease whatever its own interval: with a background timeout
+/// shorter than the progress interval (30 s here), moving work is never stopped as silent.
+#[tokio::test]
+async fn coalesced_progress_still_renews_a_short_background_lease() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut steps = Vec::new();
+    for i in 0..30 {
+        steps.push(Step::Sleep(100));
+        steps.push(Step::EmitSession(update(
+            "build",
+            &format!("step {i}"),
+            false,
+        )));
+    }
+    let mut opts = options(dir.path(), started_then(steps));
+    opts.config.background_timeout_secs = 2;
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    let stopped = wait(&hub, &id, |e| e.kind() == "thread.stopped").await;
+    let progress = recorded(&hub, &id, "build");
+    assert!(progress.len() < 31, "{progress:?}");
+    assert_eq!(coalesced(&hub), 31 - progress.len() as u64);
+    let (_, evs) = hub.thread_events(&id, 0, 10_000).unwrap();
+    let updates: Vec<&Event> = evs.iter().filter(|e| e.kind() == "task.updated").collect();
+    let (first, last) = (updates[0], updates[updates.len() - 1]);
+    assert!(stopped.ts - last.ts >= chrono::Duration::seconds(2));
+    // Renewed until its progress stopped (3 s in): never stopped before.
+    assert!(
+        last.ts - first.ts >= chrono::Duration::milliseconds(2500),
+        "{progress:?}"
+    );
+    hub.shutdown().await;
+}
+
+/// A heartbeat that says what a stalled task does now is recorded, but is no progress: the
+/// real progress right after it is recorded too, and resolves the stall (its work went on).
+#[tokio::test]
+async fn progress_after_a_heartbeat_with_news_resolves_a_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = started_then(vec![
+        Step::Sleep(3500),
+        Step::EmitSession(update("build", "linking", true)),
+        Step::EmitSession(update("build", "linked", false)),
+    ]);
+    let mut opts = options(dir.path(), script);
+    opts.stall_after = Some(Duration::from_secs(2));
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    let closed = wait(&hub, &id, |e| e.kind() == "attention.resolved").await;
+    let s = |d: &str| d.to_string();
+    assert_eq!(
+        recorded(&hub, &id, "build"),
+        [
+            (true, s("build"), false),
+            (true, s("linking"), true),
+            (true, s("linked"), false),
+        ]
+    );
+    let EventBody::AttentionResolved(p) = &closed.body else {
+        unreachable!()
+    };
+    assert_eq!(p.by, ResolvedBy::Timeout);
+    assert!(went_on(&p.ext), "{p:?}");
+    hub.shutdown().await;
+}
+
+/// The same with a heartbeat that carries `ext` (always recorded): it is no progress either,
+/// so the progress right after it is recorded and resolves the stall.
+#[tokio::test]
+async fn progress_after_a_heartbeat_with_ext_resolves_a_stall() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut beat = update("build", "build", true);
+    if let EventBody::TaskUpdated(p) = &mut beat {
+        let mut ext = serde_json::Map::new();
+        ext.insert("fake".into(), serde_json::json!({"inventory": true}));
+        p.ext = Some(ext);
+    }
+    let script = started_then(vec![
+        Step::Sleep(3500),
+        Step::EmitSession(beat),
+        Step::EmitSession(update("build", "linked", false)),
+    ]);
+    let mut opts = options(dir.path(), script);
+    opts.stall_after = Some(Duration::from_secs(2));
+    let hub = Hub::open(opts).await.unwrap();
+    let id = start(&hub, dir.path()).await;
+    let closed = wait(&hub, &id, |e| e.kind() == "attention.resolved").await;
+    let s = |d: &str| d.to_string();
+    assert_eq!(
+        recorded(&hub, &id, "build"),
+        [
+            (true, s("build"), false),
+            (true, s("build"), true),
+            (true, s("linked"), false),
+        ]
+    );
+    let EventBody::AttentionResolved(p) = &closed.body else {
+        unreachable!()
+    };
+    assert_eq!(p.by, ResolvedBy::Timeout);
+    assert!(went_on(&p.ext), "{p:?}");
     hub.shutdown().await;
 }

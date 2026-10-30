@@ -164,7 +164,7 @@ impl Adapter for OrchAdapter {
                         let _ = stop_tx.send(());
                         return;
                     }
-                    AdapterCmd::Respond { .. } => {}
+                    AdapterCmd::Respond { .. } | AdapterCmd::Compact { .. } => {}
                 }
             }
         });
@@ -316,6 +316,27 @@ impl Env {
     }
 }
 
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path`, and the side file is removed. A child another test thread forks while this process
+/// writes the file would inherit the descriptor, and exec'ing the file would fail with
+/// ETXTBSY until that child execs or exits.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 fn tui() -> Caller {
     Caller::user("tui")
 }
@@ -379,9 +400,10 @@ fn assert_orchestrator_cfg(rt: &OrchRt, env: &Env) {
         );
         assert_eq!(
             rt.cfg.settings,
-            Some(twr_adapters::claude_code::guard::settings(Path::new(
-                "/opt/twr/bin/twr"
-            )))
+            Some(twr_adapters::claude_code::guard::settings(
+                Path::new("/opt/twr/bin/twr"),
+                None
+            ))
         );
     } else {
         assert_eq!(rt.cfg.builtin_tools, Some(Vec::new()), "{}", rt.runtime);
@@ -1589,7 +1611,6 @@ async fn a_switch_to_an_agent_that_is_not_installed_warns() {
 /// warning.
 #[tokio::test]
 async fn a_switch_to_a_built_in_runtime_whose_cli_is_missing_warns() {
-    use std::os::unix::fs::PermissionsExt;
     use twr_adapters::{codex::CodexAdapter, grok_build::GrokBuildAdapter};
 
     let env = Env::new();
@@ -1627,9 +1648,7 @@ async fn a_switch_to_a_built_in_runtime_whose_cli_is_missing_warns() {
         ("codex", None),
     ] {
         if missing.is_none() {
-            std::fs::create_dir_all(codex_bin.parent().unwrap()).unwrap();
-            std::fs::write(&codex_bin, "#!/bin/sh\nexit 0\n").unwrap();
-            std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            install(&codex_bin, "#!/bin/sh\nexit 0\n");
         }
         let r = switch(&hub, runtime, None, quick()).await;
         assert_eq!(
@@ -1648,7 +1667,6 @@ async fn a_switch_to_a_built_in_runtime_whose_cli_is_missing_warns() {
 /// switch's warning). `runtimes` keeps its shape: a list of names.
 #[tokio::test]
 async fn show_says_whether_the_runtime_was_configured_and_what_is_installed() {
-    use std::os::unix::fs::PermissionsExt;
     use twr_adapters::codex::CodexAdapter;
 
     let env = Env::new();
@@ -1689,9 +1707,7 @@ async fn show_says_whether_the_runtime_was_configured_and_what_is_installed() {
     hub.shutdown().await;
     drop(hub);
 
-    std::fs::create_dir_all(codex_bin.parent().unwrap()).unwrap();
-    std::fs::write(&codex_bin, "#!/bin/sh\nexit 0\n").unwrap();
-    std::fs::set_permissions(&codex_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    install(&codex_bin, "#!/bin/sh\nexit 0\n");
     let hub = {
         let mut last = None;
         timeout(WAIT, async {

@@ -19,6 +19,13 @@
 //!    connection, and a proof is bound to both nonces and to its direction, so neither side
 //!    can replay one. An unknown box gets a challenge with a random proof (the runner cannot
 //!    tell it from a wrong token), and a bad proof `error{unauthorized}`.
+//!
+//!    Sealed connections (an SSH box's daemon, [`crate::sealed`]) have no token: the sealed
+//!    channel the protocol runs inside already proved the hub (its key signed the channel's
+//!    opening) and binds the connection to the box. The same messages go through, but the
+//!    runner does not check the challenge's proof and answers [`SEALED_AUTH_PROOF`], and the
+//!    hub ignores the runner's proof (the hub's ssh dialed the box: there is nothing more to
+//!    check on its side).
 //! 3. The runner sends [`RunnerMsg::Inventory`] (version, running sessions, in-flight command
 //!    ids, highest spooled `rseq` per thread), which may be large: only an authenticated
 //!    connection may send large messages. The hub answers [`HubMsg::Welcome`] with a fresh
@@ -46,7 +53,8 @@
 //! Every message type is listed in [`RunnerMsg`] (runner to hub) and [`HubMsg`] (hub to
 //! runner). [`PROTOCOL_VERSION`] changes on any incompatible change; the hub rejects a hello
 //! with a different version (`error{code: "protocol"}`, before any authentication: the hello
-//! of another version need not have the same shape).
+//! of another version need not have the same shape), unless the version is one it can still
+//! drain ([`DRAINABLE_PROTOCOLS`]).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -56,7 +64,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::adapter::SpawnConfig;
+use crate::adapter::{CodexAuto, SpawnConfig};
 use crate::event::{Answer, EventBody};
 use crate::git::{
     DeleteRefs, RemoveOutcome, RestoreRequest, TrashPurge, TrashRequest, WorktreeCreated,
@@ -93,10 +101,70 @@ pub fn valid_run_id(run: &str) -> bool {
 /// 6: the mutual challenge-response handshake (a small [`Hello`], [`HubMsg::Challenge`],
 /// [`RunnerMsg::Auth`], [`HubMsg::Authenticated`], then [`RunnerMsg::Inventory`]): the token
 /// no longer crosses the connection, and the runner checks the hub before it trusts it.
-pub const PROTOCOL_VERSION: u32 = 6;
+///
+/// 7: the agents op ([`Op::Agents`]: the box's agent CLIs, found or not, their versions and
+/// whether they are signed in), which a runner before it would leave unanswered; the
+/// inventory's [`Inventory::agents`] came with it (additive: an older runner's inventory has
+/// none). No spooled frame changed: a protocol 6 spool's frames decode as they are.
+///
+/// A runner's spool keeps its frames across a restart, and so across an upgrade (it records
+/// the protocol they were written under): a bump that changes how spooled frames encode must
+/// migrate the spool, or the next runner refuses to open one that holds such frames.
+///
+/// Each version has fixtures captured from a real revision of it
+/// (`crates/twr-core/tests/fixtures/runner-protocol-<version>`, written by
+/// `docs/tools/capture-runner-fixtures.sh`; `tests/runner_protocol_fixtures.rs` checks them).
+/// When you bump this:
+/// 1. In the working tree that bumps it, capture the new version's fixtures
+///    (`docs/tools/capture-runner-fixtures.sh --worktree <new version>`): the fixture test
+///    needs them before the bump can pass and be committed.
+/// 2. Run the fixture test (`cargo test -p twr-core --test runner_protocol_fixtures`). The
+///    previous version's fixtures were captured while it was current; when an outbound value
+///    changed since, capture its `hub-accepts.json` again from the last commit that spoke it
+///    (`docs/tools/capture-runner-fixtures.sh <that commit> <previous version>`).
+/// 3. List the previous version in [`DRAINABLE_PROTOCOLS`] only if its fixtures pass and the
+///    bump changed nothing a drain uses (see there); else leave it out, and the hub replaces
+///    such a daemon at once.
+pub const PROTOCOL_VERSION: u32 = 7;
+
+/// Older runner protocols this hub still serves drain-only: it accepts such a runner's hello
+/// (and then authenticates it as any other), sends it nothing but acks, pings and the commands
+/// of sessions already running ([`Op::drain_safe`]), lets its running turns finish, then
+/// stops its runtimes and replaces it (an SSH box's daemon) or waits for it to be updated (a
+/// token box's runner). Never [`PROTOCOL_VERSION`].
+///
+/// A version is listed only when its fixtures (see [`PROTOCOL_VERSION`]) show that:
+/// - every message its runner sends (hello, auth, inventory, each event kind its runtimes
+///   emit, exited, synced, cmd_result, ping, pong) decodes as this build's [`RunnerMsg`],
+///   events to the same kind they had (never [`EventBody::Unknown`]);
+/// - every message this hub sends a drained runner (challenge, authenticated, welcome, ack,
+///   error, ping, pong, and `cmd` with a drain-safe op) decodes as that version's
+///   [`HubMsg`] and encodes back to the same value;
+/// - this build's [`auth_proof`] gives the proofs that version gives, and the sealed
+///   channel and its runner proof ([`SEALED_AUTH_PROOF`]) are the same.
+///
+/// The box daemon's socket lines (`twr-box 1 ...`) must be the same too. Usually only the
+/// previous version is listed; it may leave the list at any time (the hub then replaces such
+/// a daemon at once, its runtimes recorded as stopped for the upgrade).
+pub const DRAINABLE_PROTOCOLS: &[u32] = &[6];
+
+/// Whether the hub serves a runner of protocol `p` drain-only ([`DRAINABLE_PROTOCOLS`]).
+pub fn drainable(p: u32) -> bool {
+    DRAINABLE_PROTOCOLS.contains(&p)
+}
+
+/// The proof a runner sends in [`RunnerMsg::Auth`] on a sealed connection (see the module
+/// docs): none. The hub does not check it there.
+pub const SEALED_AUTH_PROOF: &str = "";
 
 /// Largest WebSocket message either side accepts (16 MiB).
 pub const MAX_FRAME_BYTES: usize = 16 << 20;
+
+/// The most bytes the hub's machine reads from each of stdout and stderr of an ssh that runs a
+/// script or a `twr runner` report command on an SSH box (`twr_hub::ssh_box::SSH_OUTPUT_MAX`):
+/// what a box-side report prints must stay well below it
+/// (`twr_runner::repos::REPORT_MAX_BYTES`), a login script's chatter aside.
+pub const SSH_OUTPUT_MAX: usize = 64 * 1024;
 
 /// How long a runner keeps the result of a durable command ([`is_durable_cmd_id`]) at least,
 /// counted from when it ran: a repeat of the id within this time returns the stored result
@@ -207,6 +275,55 @@ pub fn check_token_len(token: &str, what: &str) -> Result<Option<String>, String
         )))
     } else {
         Ok(None)
+    }
+}
+
+/// Longest token [`check_token_text`] accepts, in characters.
+pub const TOKEN_MAX_LEN: usize = 1024;
+
+/// Checks a token typed or piped in (`twr runner install-token`), already trimmed:
+/// [`check_token_len`], and at most [`TOKEN_MAX_LEN`] printable ASCII characters without
+/// spaces, so a paste that took in something else is refused rather than stored. `what` names
+/// it in the messages, which never hold it.
+pub fn check_token_text(token: &str, what: &str) -> Result<Option<String>, String> {
+    if token.chars().count() > TOKEN_MAX_LEN {
+        return Err(format!(
+            "{what} is too long (more than {TOKEN_MAX_LEN} characters)"
+        ));
+    }
+    if let Some(bad) = token.chars().find(|c| !c.is_ascii_graphic()) {
+        let kind = if bad.is_whitespace() {
+            "a space"
+        } else if bad.is_control() {
+            "a control character"
+        } else {
+            "a character that is not ASCII"
+        };
+        return Err(format!(
+            "{what} holds {kind}: a box token is printable ASCII without spaces (`twr box \
+             token <box>` on the hub prints it)"
+        ));
+    }
+    check_token_len(token, what)
+}
+
+/// Checks a box name (`[boxes.<name>]`, `twr runner --box`): box names become file names
+/// (`runner-<box>.db`) and parts of paths on the box, so `[A-Za-z0-9._-]`, not starting with
+/// `.`, at most 64 bytes.
+pub fn validate_box_name(name: &str) -> anyhow::Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with(['.', '-'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "invalid box name {name:?}: use letters, digits, '.', '_' or '-' (not starting with \
+             '.' or '-')"
+        ))
     }
 }
 
@@ -364,6 +481,114 @@ pub struct Inventory {
     /// Directory under which the box keeps thread worktrees
     /// (`<worktrees>/<project>/<thread-name>`).
     pub worktrees: PathBuf,
+    /// The runner's build id ([`crate::build_id`]: the first 16 hex digits of the SHA-256 of
+    /// its executable), when it could read its own executable. It tells two builds of one
+    /// version apart (two dirty development builds share their version string), so the hub
+    /// knows whether an SSH box runs the build it launched. Absent from an older runner's
+    /// inventory, and ignored by an older hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build: Option<String>,
+    /// The box's agent CLIs as its runner last probed them (protocol 7: [`Op::Agents`] asks
+    /// for them, fresh or not). Empty when the runner has not probed them yet (an inventory
+    /// sent right after it started), probes none (a box set up without), or is older.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentInfo>,
+    /// How an SSH box's daemon was started, as it tells from its own environment
+    /// ([`valid_launch`]): `launchd <label>` (a launchd job in the user's GUI session, macOS),
+    /// `systemd <unit>` (a transient user service, Linux) or `detached` (a session of its own,
+    /// started from ssh). Absent from a runner that is no box daemon, or an older one; ignored
+    /// by an older hub.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch: Option<String>,
+}
+
+/// Whether `launch` is what a box daemon reports of how it was started
+/// ([`Inventory::launch`]): `detached`, or `launchd ` or `systemd ` and a name of 1 to 128
+/// letters, digits, `.`, `-`, `_` and `@`. Nothing else is kept or shown.
+pub fn valid_launch(launch: &str) -> bool {
+    if launch == "detached" {
+        return true;
+    }
+    let name = launch
+        .strip_prefix("launchd ")
+        .or_else(|| launch.strip_prefix("systemd "));
+    name.is_some_and(|n| {
+        (1..=128).contains(&n.len())
+            && n.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@'))
+    })
+}
+
+/// Whether an agent CLI on a box is signed in ([`AgentInfo::login`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentLogin {
+    /// Its status command said it is signed in.
+    LoggedIn,
+    /// Its status command said it is not.
+    LoggedOut,
+    /// Not known: the CLI has no status command (Grok Build), it is not installed, or its
+    /// status could not be read ([`AgentInfo::note`] says why). Also any value a newer box
+    /// sends that this build does not know.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+/// One built-in agent runtime's CLI on a box, as the box's agent probe found it
+/// (`twr_adapters::agents`): resolved as the box would start the runtime (its `TWR_*_BIN`,
+/// else on the `PATH` its runtimes get), its version, and whether it is signed in. Never more
+/// than this: no account detail (email, organization, plan) is kept, and every string is
+/// short and printable.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentInfo {
+    /// The runtime (`claude-code`, `codex`, `grok-build`).
+    pub runtime: String,
+    /// Whether its program was found: an executable file on the box.
+    pub found: bool,
+    /// The executable file found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The first line its `--version` printed, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// Whether it is signed in.
+    pub login: AgentLogin,
+    /// How it is signed in, when it says and twr knows the word (Claude Code's `authMethod`:
+    /// `claude.ai`, `console`, `api-key`, `bedrock`, `vertex`; anything else is `other`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Why something is not known (a fixed phrase: "not found on PATH", "`claude auth
+    /// status` took longer than 10s").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What `twr runner --agents` prints (one JSON object): the box's agents as its runner would
+/// probe them, and how the login shell's `PATH` they are resolved with went.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentsReport {
+    /// The login shell's `PATH` ([`LoginPathReport`]).
+    pub login_path: LoginPathReport,
+    /// The agents, one per built-in agent runtime.
+    pub agents: Vec<AgentInfo>,
+}
+
+/// How asking the box's login shell for its `PATH` went ([`AgentsReport::login_path`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoginPathReport {
+    /// The shell asked (`$SHELL`), when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    /// How many entries its `PATH` gave (put before the runner's own), when it gave one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entries: Option<usize>,
+    /// Why it gave none (the runtimes then get the runner's own `PATH`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// Runner to hub.
@@ -494,7 +719,8 @@ pub enum HubMsg {
 pub mod hub_errors {
     /// A bad proof (wrong token), or an unknown box.
     pub const UNAUTHORIZED: &str = "unauthorized";
-    /// [`super::Hello::protocol`] is not the hub's version.
+    /// [`super::Hello::protocol`] is neither the hub's version nor one it drains
+    /// ([`super::DRAINABLE_PROTOCOLS`]).
     pub const PROTOCOL: &str = "protocol";
     /// A newer connection of the same box replaced this one.
     pub const FENCED: &str = "fenced";
@@ -527,6 +753,7 @@ pub mod hub_errors {
 /// | `trash_restore` | [`crate::git::RestoreOutcome`] |
 /// | `trash_restore_undo` | bool |
 /// | `disk_usage` | [`crate::git::DiskReading`] |
+/// | `agents` | `[`[`AgentInfo`]`]` |
 ///
 /// `git_common_dir`, `worktree_trash`, `branch_only_commits`, `worktree_inventory` and the
 /// `trash_*` ops came with protocol 3 ([`PROTOCOL_VERSION`]): a runner from before them is refused at its hello, so it is never
@@ -726,6 +953,14 @@ pub enum Op {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         disposable: Option<Vec<String>>,
     },
+    /// The box's agent CLIs ([`AgentInfo`], protocol 7): as the runner last probed them, or
+    /// probed again first when `refresh` (a probe started after the request, at most 10 s a
+    /// command). A box that probes none answers an empty list.
+    Agents {
+        /// Probe again before answering (a just installed or signed in CLI).
+        #[serde(default)]
+        refresh: bool,
+    },
 }
 
 impl Op {
@@ -753,6 +988,14 @@ impl Op {
                 | Op::Respond { .. }
                 | Op::Stop { .. }
         )
+    }
+
+    /// Whether the hub may send this op to a runner it drains ([`DRAINABLE_PROTOCOLS`]):
+    /// `send`, `respond` and `stop`, the commands a session already running issues (a
+    /// recorded prompt sent again, an answer, a stop). Nothing that starts a session or reads
+    /// or changes the box.
+    pub fn drain_safe(&self) -> bool {
+        matches!(self, Op::Send { .. } | Op::Respond { .. } | Op::Stop { .. })
     }
 
     /// Whether this op runs git commands that change a repository or a work tree on the box
@@ -797,6 +1040,7 @@ impl Op {
             Op::TrashRestore { .. } => "trash_restore",
             Op::TrashRestoreUndo { .. } => "trash_restore_undo",
             Op::DiskUsage { .. } => "disk_usage",
+            Op::Agents { .. } => "agents",
         }
     }
 
@@ -938,6 +1182,11 @@ pub struct WireSpawnConfig {
     pub thinking: bool,
     /// See [`SpawnConfig::env`].
     pub env: Vec<(String, String)>,
+    /// See [`SpawnConfig::env_remove`]. Not sent when empty, so a spawn without it is what
+    /// it was before; a runner from before it would ignore it (the hub runs no named account
+    /// on a remote box yet).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub env_remove: Vec<String>,
     /// See [`SpawnConfig::resume_session`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session: Option<String>,
@@ -948,6 +1197,11 @@ pub struct WireSpawnConfig {
     /// it (and anchors nothing); a hub from before it sends none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<PathBuf>,
+    /// See [`SpawnConfig::codex_auto`], spelled as the config spells it; absent for the default
+    /// (`ask`). A runner from before it ignores it, and a spelling this build does not know
+    /// is taken as the default: either way the thread asks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codex_auto: Option<String>,
 }
 
 impl From<SpawnConfig> for WireSpawnConfig {
@@ -966,9 +1220,11 @@ impl From<SpawnConfig> for WireSpawnConfig {
             settings: c.settings,
             thinking: c.thinking,
             env: c.env,
+            env_remove: c.env_remove,
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             repo: c.repo,
+            codex_auto: (c.codex_auto != CodexAuto::Ask).then(|| c.codex_auto.as_str().into()),
         }
     }
 }
@@ -990,10 +1246,17 @@ impl From<WireSpawnConfig> for SpawnConfig {
             settings: c.settings,
             thinking: c.thinking,
             env: c.env,
+            env_remove: c.env_remove,
             resume_session: c.resume_session,
             prompt_turn: c.prompt_turn,
             wrap: Vec::new(),
+            native_memory_off: false,
             repo: c.repo,
+            codex_auto: c
+                .codex_auto
+                .as_deref()
+                .and_then(CodexAuto::parse)
+                .unwrap_or_default(),
         }
     }
 }
@@ -1156,6 +1419,34 @@ pub fn decode_result<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, CmdE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box daemon's launch is one of three shapes, its name short and plain.
+    #[test]
+    fn launches() {
+        for ok in [
+            "detached",
+            "launchd tools.twr.box.0123456789abcdef.0a1b2c3d",
+            "systemd twr-box-0123456789abcdef-0a1b2c3d.service",
+            "systemd a@b",
+        ] {
+            assert!(valid_launch(ok), "{ok}");
+        }
+        let long = format!("launchd {}", "a".repeat(129));
+        for bad in [
+            "",
+            "setsid",
+            "launchd",
+            "launchd ",
+            "systemd  x",
+            "launchd a b",
+            "launchd a/b",
+            "launchd \u{1b}[0m",
+            "Detached",
+            long.as_str(),
+        ] {
+            assert!(!valid_launch(bad), "{bad:?}");
+        }
+    }
     use crate::event::{AgentText, GitSnapshot, SessionPayload};
     use serde_json::json;
 
@@ -1183,6 +1474,7 @@ mod tests {
             builtin_tools: Some(vec![]),
             thinking: true,
             env: vec![("TWR_THREAD".into(), "t1".into())],
+            env_remove: vec!["ANTHROPIC_API_KEY".into()],
             prompt_turn: Some(2),
             ..Default::default()
         }
@@ -1214,6 +1506,17 @@ mod tests {
             acks_needed: acks,
             runtimes: vec!["fake".into()],
             worktrees: "/data/worktrees".into(),
+            build: Some("0123456789abcdef".into()),
+            agents: vec![AgentInfo {
+                runtime: "claude-code".into(),
+                found: true,
+                path: Some("/home/u/.local/bin/claude".into()),
+                version: Some("2.1.302 (Claude Code)".into()),
+                login: AgentLogin::LoggedIn,
+                method: Some("claude.ai".into()),
+                note: None,
+            }],
+            launch: Some("launchd tools.twr.box.0123456789abcdef.0a1b2c3d".into()),
         }));
         round_trip_runner(RunnerMsg::Event {
             thread: "t1".into(),
@@ -1408,6 +1711,8 @@ mod tests {
                 worktree: Some("/w".into()),
                 disposable: Some(vec!["target/".into()]),
             },
+            Op::Agents { refresh: true },
+            Op::Agents { refresh: false },
         ];
         for op in ops {
             let name = op.name();
@@ -1461,6 +1766,30 @@ mod tests {
         assert!(h.nonce.is_empty());
         let auth = serde_json::to_value(RunnerMsg::Auth { proof: "p".into() }).unwrap();
         assert_eq!(auth, json!({"type": "auth", "proof": "p"}));
+
+        // An older runner's inventory has no build, and one without a build sends none (an
+        // older hub ignores it either way: the inventory takes unknown fields).
+        let inv: RunnerMsg =
+            serde_json::from_value(json!({"type": "inventory", "version": "1"})).unwrap();
+        let RunnerMsg::Inventory(inv) = inv else {
+            panic!("not an inventory")
+        };
+        assert_eq!(inv.build, None);
+        let v = serde_json::to_value(RunnerMsg::Inventory(inv)).unwrap();
+        assert!(v.get("build").is_none(), "{v}");
+        let inv: RunnerMsg = serde_json::from_value(
+            json!({"type": "inventory", "version": "1", "build": "0123456789abcdef", "new": 1}),
+        )
+        .unwrap();
+        let RunnerMsg::Inventory(inv) = inv else {
+            panic!("not an inventory")
+        };
+        assert_eq!(inv.build.as_deref(), Some("0123456789abcdef"));
+        // An inventory without agents (an older runner, or one that has not probed yet) has
+        // none, and sends none.
+        assert!(inv.agents.is_empty());
+        let v = serde_json::to_value(RunnerMsg::Inventory(inv)).unwrap();
+        assert!(v.get("agents").is_none(), "{v}");
         let ok = serde_json::to_value(HubMsg::Authenticated).unwrap();
         assert_eq!(ok, json!({"type": "authenticated"}));
 
@@ -1478,6 +1807,40 @@ mod tests {
             r,
             json!({"type": "cmd_result", "cmd_id": "c", "ok": true, "result": null})
         );
+    }
+
+    /// The agents op and what it answers, on the wire: `refresh` defaults to false, a login
+    /// state this build does not know reads as unknown, and what is not known is not sent.
+    #[test]
+    fn agents_on_the_wire() {
+        let op: Op = serde_json::from_value(json!({"type": "agents"})).unwrap();
+        assert_eq!(op, Op::Agents { refresh: false });
+        assert_eq!(op.name(), "agents");
+        assert!(!op.is_session_op() && !op.changes_repository() && op.thread().is_none());
+        let info = AgentInfo {
+            runtime: "codex".into(),
+            found: true,
+            path: Some("/usr/bin/codex".into()),
+            login: AgentLogin::LoggedOut,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            json!({"runtime": "codex", "found": true, "path": "/usr/bin/codex", "login": "logged_out"})
+        );
+        let newer: AgentInfo = serde_json::from_value(
+            json!({"runtime": "grok-build", "found": false, "login": "expired", "new": 1}),
+        )
+        .unwrap();
+        assert_eq!(newer.login, AgentLogin::Unknown);
+        assert!(!newer.found);
+        let report: AgentsReport = serde_json::from_value(json!({
+            "login_path": {"shell": "/bin/csh", "error": "csh is not asked"},
+            "agents": [{"runtime": "claude-code", "login": "logged_in"}]
+        }))
+        .unwrap();
+        assert_eq!(report.login_path.entries, None);
+        assert_eq!(report.agents[0].login, AgentLogin::LoggedIn);
     }
 
     #[test]
@@ -1529,7 +1892,13 @@ mod tests {
             "gpu",
             &rn,
             &hn,
-            &hub.to_uppercase().replace('A', "z")
+            // Another value for the first digit, whatever the random proof (a change of case
+            // alone is the same proof: hex decodes either case).
+            &format!(
+                "{}{}",
+                if hub.starts_with('0') { '1' } else { '0' },
+                &hub[1..]
+            )
         ));
         assert!(!ok(Prover::Hub, "gpu", &rn, &hn, ""));
         let other = Secret::new("0123456789abcdef0123456789abcdeX");
@@ -1563,6 +1932,27 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(!valid_nonce(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn box_names_are_checked() {
+        for ok in ["gpu", "gpu-2", "a.b_c", &"x".repeat(64)] {
+            validate_box_name(ok).unwrap();
+        }
+        for bad in [
+            "",
+            ".hidden",
+            "-gpu",
+            "--help",
+            "a/b",
+            "a b",
+            "ü",
+            &"x".repeat(65),
+            "a\0b",
+        ] {
+            let e = validate_box_name(bad).unwrap_err().to_string();
+            assert!(e.starts_with("invalid box name"), "{bad:?}: {e}");
         }
     }
 
@@ -1602,10 +1992,67 @@ mod tests {
     }
 
     #[test]
+    fn typed_tokens_are_printable_ascii() {
+        let good = new_token().unwrap();
+        assert_eq!(check_token_text(&good, "the token"), Ok(None));
+        assert!(check_token_text(&"x".repeat(20), "t").unwrap().is_some());
+        assert!(check_token_text(&"x".repeat(15), "t").is_err());
+        assert_eq!(check_token_text(&"x".repeat(TOKEN_MAX_LEN), "t"), Ok(None));
+        let e = check_token_text(&"x".repeat(TOKEN_MAX_LEN + 1), "t").unwrap_err();
+        assert!(e.contains("too long"), "{e}");
+        for (bad, kind) in [
+            ("s3cret-token-with space-1234", "a space"),
+            ("s3cret-token-with\ttab-12345", "a space"),
+            ("s3cret-token-\u{1b}[31m-123456", "a control character"),
+            ("s3cret-token-\u{7f}-1234567890", "a control character"),
+            ("s3cret-token-é-12345678901234", "not ASCII"),
+        ] {
+            let e = check_token_text(bad, "the token").unwrap_err();
+            assert!(e.contains(kind), "{bad:?}: {e}");
+            assert!(!e.contains("s3cret"), "{e}");
+        }
+    }
+
+    /// `codex_auto` crosses to a runner by its config spelling, and only when it is not the
+    /// default; a spelling the runner does not know (a newer hub's) is the default, `ask`,
+    /// so the thread asks. A hub that sends none (older) gets `ask` too.
+    #[test]
+    fn codex_auto_crosses_the_wire_by_name() {
+        for v in CodexAuto::ALL {
+            let sc = SpawnConfig {
+                codex_auto: v,
+                ..cfg().into()
+            };
+            let w = WireSpawnConfig::from(sc.clone());
+            let json = serde_json::to_value(&w).unwrap();
+            if v == CodexAuto::Ask {
+                assert!(json.get("codex_auto").is_none(), "{json}");
+            } else {
+                assert_eq!(json["codex_auto"], v.as_str());
+            }
+            let back: WireSpawnConfig = serde_json::from_value(json).unwrap();
+            assert_eq!(SpawnConfig::from(back), sc);
+        }
+        let mut json = serde_json::to_value(cfg()).unwrap();
+        json["codex_auto"] = serde_json::json!("ask_the_moon");
+        let w: WireSpawnConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(SpawnConfig::from(w).codex_auto, CodexAuto::Ask);
+    }
+
+    #[test]
     fn wire_conversions_are_lossless() {
         let sc: SpawnConfig = cfg().into();
         assert_eq!(WireSpawnConfig::from(sc.clone()), cfg());
         assert_eq!(SpawnConfig::from(WireSpawnConfig::from(sc.clone())), sc);
+        // A spawn that removes nothing goes over the wire as it did before `env_remove`.
+        let plain = serde_json::to_value(WireSpawnConfig {
+            env_remove: Vec::new(),
+            ..cfg()
+        })
+        .unwrap();
+        assert!(plain.get("env_remove").is_none(), "{plain}");
+        let j = serde_json::to_value(cfg()).unwrap();
+        assert_eq!(j["env_remove"], json!(["ANTHROPIC_API_KEY"]));
         for o in [
             RemoveOutcome::Removed,
             RemoveOutcome::KeptDirty { dirty_files: 3 },
@@ -1705,6 +2152,77 @@ mod tests {
         let r: GitSnapshot = decode_result(json!({"branch": "x", "dirty_files": 1})).unwrap();
         assert_eq!(r.dirty_files, 1);
         assert!(decode_result::<bool>(json!("nope")).is_err());
+    }
+
+    /// The drain contract: only older versions are listed, and a drained runner gets only
+    /// the commands of sessions already running.
+    #[test]
+    fn drainable_protocols_and_drain_safe_ops() {
+        assert!(!drainable(PROTOCOL_VERSION));
+        assert!(!drainable(PROTOCOL_VERSION + 1));
+        // 5 -> 6 changed the handshake: never drainable.
+        assert!(!drainable(5));
+        for p in DRAINABLE_PROTOCOLS {
+            assert!(*p < PROTOCOL_VERSION && *p >= 6 && drainable(*p), "{p}");
+        }
+        let safe = [
+            Op::Send {
+                thread: "t1".into(),
+                turn: 2,
+                text: "more".into(),
+                run: None,
+            },
+            Op::Respond {
+                thread: "t1".into(),
+                attn_id: "a".into(),
+                answer: Answer::allow(),
+                run: Some("r1".into()),
+            },
+            Op::Stop {
+                thread: "t1".into(),
+                run: None,
+            },
+        ];
+        for op in &safe {
+            assert!(op.drain_safe() && op.is_session_op(), "{}", op.name());
+        }
+        let unsafe_ops = [
+            Op::Spawn {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                prompt: None,
+                run: None,
+            },
+            Op::Resume {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                session_id: "s".into(),
+                run: None,
+            },
+            Op::AttachInfo {
+                thread: "t1".into(),
+                runtime: "fake".into(),
+                cfg: cfg(),
+                session_id: "s".into(),
+            },
+            Op::RepoRoot { dir: "/r".into() },
+            Op::GitSnapshot {
+                path: "/w".into(),
+                base: None,
+            },
+            Op::WorktreePrune { repo: "/r".into() },
+            Op::TrashList {},
+            Op::DiskUsage {
+                worktree: None,
+                disposable: None,
+            },
+            Op::Agents { refresh: false },
+        ];
+        for op in &unsafe_ops {
+            assert!(!op.drain_safe(), "{}", op.name());
+        }
     }
 
     #[test]

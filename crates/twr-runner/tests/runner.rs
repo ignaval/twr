@@ -35,6 +35,8 @@ struct HubState {
     /// Connections whose runner did not answer the hub's challenge (it did not accept the
     /// hub's proof).
     unanswered: u64,
+    /// When each of those connections ended (the runner left after the challenge).
+    unanswered_at: Vec<std::time::Instant>,
     /// Every event/exited frame received, duplicates included.
     received: Vec<(String, u64)>,
     committed: Vec<Committed>,
@@ -49,6 +51,8 @@ struct HubState {
     /// The frame lost with a dropped connection.
     lost: Option<(String, u64)>,
     connections: u64,
+    /// When each connection that authenticated was welcomed.
+    welcomed_at: Vec<std::time::Instant>,
     closed: u64,
 }
 
@@ -119,7 +123,9 @@ impl FakeHub {
             _ => None,
         };
         let Some(RunnerMsg::Auth { proof }) = next(stream.next().await) else {
-            self.state().unanswered += 1;
+            let mut st = self.state();
+            st.unanswered += 1;
+            st.unanswered_at.push(std::time::Instant::now());
             return;
         };
         assert!(
@@ -143,6 +149,7 @@ impl FakeHub {
             let mut s = self.state();
             s.epoch += 1;
             s.connections += 1;
+            s.welcomed_at.push(std::time::Instant::now());
             s.inventories.push(inv);
             (
                 HubMsg::Welcome {
@@ -270,6 +277,7 @@ fn opts(hub: &FakeHub, dir: &Path) -> RunnerOptions {
     let mut o = RunnerOptions::new(hub.url.clone(), Secret::new(TOKEN), BOX, dir);
     o.backoff_min = Duration::from_millis(20);
     o.backoff_max = Duration::from_millis(100);
+    o.refused_retry = Duration::from_millis(20);
     o.ping_interval = Duration::from_millis(200);
     o.idle_timeout = Duration::from_secs(5);
     o.welcome_timeout = Duration::from_secs(5);
@@ -277,8 +285,11 @@ fn opts(hub: &FakeHub, dir: &Path) -> RunnerOptions {
     o
 }
 
-/// The built-in adapters with the fake one (production registries leave it out).
+/// The built-in adapters with the fake one (production registries leave it out), and no
+/// login shell asked or agent CLI probed (`box_options` asks the user's): no real shell or
+/// agent CLI runs under a test.
 fn with_fake(mut o: LocalBoxOptions) -> LocalBoxOptions {
+    o.env = twr_runner::BoxEnv::none();
     o.adapters = Arc::new(|n: &str| {
         twr_adapters::registry_with(true)
             .into_iter()
@@ -380,7 +391,7 @@ async fn hello_welcome_then_live_events_in_rseq_order() {
         assert_eq!(s.hellos[0].box_name, BOX);
         assert_eq!(s.hellos[0].protocol, PROTOCOL_VERSION);
         let h = &s.inventories[0];
-        assert_eq!(h.version, twr_runner::client::VERSION);
+        assert_eq!(h.version, twr_runner::client::version());
         assert!(h.runtimes.contains(&"fake".to_string()));
         assert!(h.running.is_empty());
         assert_eq!(h.worktrees, dir.path().join("worktrees"));
@@ -479,6 +490,7 @@ async fn a_peer_that_cannot_prove_the_token_gets_nothing_but_the_hello() {
     let mut o = RunnerOptions::new(url, Secret::new(TOKEN), BOX, dir.path());
     o.backoff_min = Duration::from_millis(20);
     o.backoff_max = Duration::from_millis(50);
+    o.refused_retry = Duration::from_millis(50);
     o.welcome_timeout = Duration::from_secs(5);
     let run = start(o, lbox.clone());
     wait_for("four connections", || seen.lock().unwrap().len() >= 4).await;
@@ -774,6 +786,15 @@ async fn a_restarted_runner_replays_its_spool_and_continues_rseq() {
     );
 }
 
+/// A test's box asks no login shell and probes no agent CLI, though a runner's own box
+/// options ask the user's.
+#[test]
+fn a_tests_box_asks_nothing_of_the_users_environment() {
+    let o = RunnerOptions::new("ws://127.0.0.1:1/", Secret::new(TOKEN), BOX, "/nonexistent");
+    assert_eq!(o.box_options().env, twr_runner::BoxEnv::user());
+    assert_eq!(with_fake(o.box_options()).env, twr_runner::BoxEnv::none());
+}
+
 #[tokio::test]
 async fn the_spool_is_private_and_the_token_never_logged() {
     use std::os::unix::fs::PermissionsExt;
@@ -797,13 +818,24 @@ async fn the_spool_is_private_and_the_token_never_logged() {
     run.shutdown().await;
 
     // With a wrong token the runner does not accept the hub's proof: it sends nothing after
-    // its hello (and tries again later), and logs neither token.
+    // its hello, tries again no sooner than `refused_retry` (however short its backoff), and
+    // logs neither token.
     let mut bad = o.clone();
     bad.token = Secret::new("wrong-token-7c9d");
+    bad.refused_retry = Duration::from_millis(400);
     let connections = hub.state().connections;
+    let before = hub.state().unanswered_at.len();
     let run = start(bad, lbox.clone());
-    hub.wait("refused hellos", |s| s.unanswered >= 3).await;
+    hub.wait("refused hellos", |s| s.unanswered_at.len() >= before + 3)
+        .await;
     run.shutdown().await;
+    // Each retry starts after the previous connection ended and the wait passed, so the ends
+    // of successive refused connections are at least `refused_retry` apart.
+    let ends = hub.state().unanswered_at[before..].to_vec();
+    for w in ends.windows(2) {
+        let gap = w[1] - w[0];
+        assert!(gap >= Duration::from_millis(400), "{gap:?}");
+    }
     assert_eq!(hub.state().connections, connections);
 
     // Every test in this file logs into the same capture (at TRACE).
@@ -815,6 +847,57 @@ async fn the_spool_is_private_and_the_token_never_logged() {
     );
     assert!(!logs.contains(TOKEN), "{logs}");
     assert!(!logs.contains("wrong-token-7c9d"), "{logs}");
+}
+
+/// A runner whose token comes from a file and that the hub refuses reads the file again, and
+/// watches it while it waits: a new token installed there (`twr runner install-token`) brings
+/// it online within a poll or two, not after `refused_retry`. Timed between the fake hub's own
+/// records (the refused connection's end, the welcome), not by polling.
+#[tokio::test]
+async fn a_refused_runner_takes_a_new_token_from_its_file_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = FakeHub::start().await;
+    let file = dir.path().join("gpu.token");
+    let wrong = Secret::new("wrong-token-0123456789abcdef");
+    twr_runner::client::write_token_file(&file, &wrong, false, &mut || Ok(false)).unwrap();
+    let mut o = opts(&hub, dir.path());
+    o.token = twr_runner::client::read_token_file(&file).unwrap();
+    o.token_file = Some(file.clone());
+    o.refused_retry = Duration::from_secs(120);
+    let lbox = open_box(dir.path());
+    let run = start(o, lbox);
+    hub.wait("a refused hello", |s| s.unanswered_at.len() == 1)
+        .await;
+    // A token file that fails the checks is not taken: the runner keeps waiting.
+    std::fs::write(&file, format!("{TOKEN}\n")).unwrap();
+    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(hub.state().unanswered_at.len(), 1);
+    assert!(hub.state().welcomed_at.is_empty());
+    let stored =
+        twr_runner::client::write_token_file(&file, &Secret::new(TOKEN), false, &mut || Ok(true))
+            .unwrap();
+    assert_eq!(stored, twr_runner::client::Stored::Replaced);
+    wait_for_within(
+        "the runner online with the new token",
+        Duration::from_secs(30),
+        || !hub.state().welcomed_at.is_empty(),
+    )
+    .await;
+    let (refused_end, welcomed) = {
+        let s = hub.state();
+        (s.unanswered_at[0], s.welcomed_at[0])
+    };
+    let gap = welcomed - refused_end;
+    assert!(gap < Duration::from_secs(10), "{gap:?}");
+    assert_eq!(hub.state().unanswered_at.len(), 1);
+    run.shutdown().await;
+    let logs = String::from_utf8(LOGS.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("the token file changed: connecting with the new token"),
+        "{logs}"
+    );
+    assert!(!logs.contains(wrong.expose()), "{logs}");
 }
 
 #[tokio::test]
@@ -2741,15 +2824,35 @@ async fn oversized_events_become_marked_placeholders() {
     assert!(dropped(&e.ext) > twr_core::runner::MAX_FRAME_BYTES as u64);
 }
 
+/// Creates the executable `path` (mode 755, its directories made) holding `content`, without
+/// this process ever holding it open for writing: the bytes go to a side file, `cp` writes
+/// `path`, and the side file is removed. A child another test thread forks while this process
+/// writes the file would inherit the descriptor, and exec'ing the file would fail with
+/// ETXTBSY until that child execs or exits.
+fn install(path: &Path, content: impl AsRef<[u8]>) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut src = path.as_os_str().to_owned();
+    src.push(".src");
+    std::fs::write(&src, content).unwrap();
+    let st = std::process::Command::new("cp")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(st.success(), "cp failed");
+    std::fs::remove_file(&src).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// At most `MAX_CONCURRENT_OPS` non-session ops (here: git snapshots) run at once.
 #[tokio::test]
 async fn non_session_ops_are_bounded() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join("probe");
     std::fs::create_dir(&probe).unwrap();
     let git = dir.path().join("fake-git");
-    std::fs::write(
+    install(
         &git,
         format!(
             // (The listing of the config's drivers before each command, and where git finds its
@@ -2757,9 +2860,7 @@ async fn non_session_ops_are_bounded() {
             "#!/bin/sh\nfor a in \"$@\"; do case \"$a\" in --name-only|--absolute-git-dir) exit 0;; esac; done\nd='{}'\ntouch \"$d/run.$$\"\nls \"$d\" | grep -c '^run\\.' >> \"$d/../counts\"\nsleep 0.2\nrm -f \"$d/run.$$\"\n",
             probe.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     init_logs();
     let mut o = LocalBoxOptions::new(&dir.path().join("data"), BOX);
     o.git = twr_runner::local::LocalGit::with_bin(&git);

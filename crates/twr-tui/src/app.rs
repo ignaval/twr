@@ -26,8 +26,8 @@ use twr_core::config::CardOrder;
 use twr_core::event::{
     is_delete_card, message_ref, AttentionRaised, AttentionReason, AttentionResolved, ChangedBy,
     DecisionProvider, DecisionSite, EventBody, JsonMap, ResolvedBy, ThreadModelChanged, TurnFrom,
-    TurnResult, DELETE_KEY, HUB_THREAD, MODEL_RESTART_REASON, MODE_RESTART_REASON,
-    RUNTIME_RESTART_REASON,
+    TurnResult, ACCOUNT_RESTART_REASON, DELETE_KEY, HUB_THREAD, MODEL_RESTART_REASON,
+    MODE_RESTART_REASON, RUNTIME_RESTART_REASON,
 };
 use twr_core::proto::{StreamItem, StreamKind};
 use twr_core::reduce::{
@@ -35,6 +35,7 @@ use twr_core::reduce::{
 };
 use twr_core::Event;
 
+use crate::accounts::Accounts;
 use crate::edit::LineInput;
 use crate::select::{Anchor, PaneId, Panes, Selection, Target};
 use crate::slash::{self, Slash, TrashCmd};
@@ -60,6 +61,19 @@ pub const DECISIONS_CAP: usize = 2000;
 /// Grid tiles per row at `width` columns (at least one).
 pub fn grid_columns(width: u16) -> usize {
     usize::from((width / TILE_MIN_WIDTH).max(1))
+}
+
+/// Whether the thread of card `id` is at work in a way that changes its text every few
+/// seconds: a turn running, background tasks left, or its CLI attached. Its card only grows
+/// then ([`crate::order::Fit::settle`]), and gives back the rows it took over its turn once
+/// the turn ends.
+fn card_working(registry: &Registry, id: &str) -> bool {
+    registry.get(id).is_some_and(|t| {
+        matches!(
+            t.status(),
+            ThreadStatus::Running | ThreadStatus::Background | ThreadStatus::Attached
+        )
+    })
 }
 
 /// Index reached by moving one row down (or up) from `cur` in a grid of `n` tiles laid out
@@ -109,15 +123,28 @@ pub enum Screen {
 
 /// A screen of the compact layout (`[tui] compact_width`, `/compact`): on a phone the TUI
 /// shows one at a time, under a line naming them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum CompactPane {
     /// The conversation alone (the orchestrator's, or the thread dived into) and the input.
     #[default]
     Chat,
     /// What waits on the user, one line per item; Enter opens one in its action popup.
     Needs,
-    /// The threads, one per line.
+    /// The threads' cards; in a TUI opened on a workspace, nested under its card among the
+    /// other workspaces', which list their threads, and the buttons under them
+    /// ([`crate::sidebar::Place::Screen`]).
     Threads,
+}
+
+/// A row of the workspace list the keys select (on the compact layout's Threads screen): a workspace's card, by its name, or a button under them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WsRow {
+    /// A workspace's card: Enter switches to it.
+    Workspace(String),
+    /// `+ New workspace`: Enter asks for its name.
+    New,
+    /// `⚙ Settings`: Enter opens them.
+    Settings,
 }
 
 /// A command waiting for a one-key confirmation (`y`) in the status bar.
@@ -132,6 +159,11 @@ pub struct Confirm {
     /// A second choice: its key, what it runs and its pending status (the orchestrator
     /// switch's `s`: without the summary).
     pub alt: Option<(char, Action, String)>,
+    /// An offer the TUI makes by itself, not a command the user gave
+    /// ([`crate::firstrun`]): `y` (or the alternative's key) answers it only once it has been
+    /// on screen [`CARD_SETTLE`] with nothing typed, and any other key goes where it would
+    /// without it, which leaves the offer for this run ([`AppState::offer_key`]).
+    pub offer: bool,
 }
 
 /// Client-local view state. Nothing here is an event; pins in particular never leave the client.
@@ -229,6 +261,12 @@ pub struct ViewState {
     /// The orchestrator the hub would start (`orchestrator.show` `runtime`, `model`), for the
     /// main pane's header before an orchestrator thread exists.
     pub orch_default: Option<(String, Option<String>)>,
+    /// The account of that orchestrator (`orchestrator.show` `account`: a name, the native
+    /// account's under its current one), labelled in that header as a thread's is.
+    pub orch_default_account: Option<String>,
+    /// The hub's `default_runtime`, when `orchestrator.show` says it: its `configured.runtime`
+    /// while no `[orchestrator] runtime` is set (`/new --account` suggestions).
+    pub default_runtime: Option<String>,
     /// Whether each orchestrator runtime is installed, as `orchestrator.show` said (`/orch`
     /// suggestions).
     pub orch_installed: Vec<(String, bool)>,
@@ -245,6 +283,9 @@ pub struct ViewState {
     /// while the transcript as last drawn has it ([`AppState::note_panes`]); its expansion is
     /// kept in `long_expanded`.
     pub block: Option<String>,
+    /// The queued message selected above the input box, by its ref ([`crate::queue`]): Enter
+    /// on an empty line opens its action popup.
+    pub queued: Option<i64>,
     /// The selected row of the popup above the input line (`/` commands, `@` mentions).
     pub popup_sel: usize,
     /// The line the popup was closed on (Esc): it stays closed until the line changes.
@@ -264,12 +305,23 @@ pub struct ViewState {
     pub confirm_seen: Option<(String, Instant)>,
     /// The working icon moves (`[tui] animate`); else it is the still `_`.
     pub animate: bool,
+    /// How deep the colors go (`[tui] colors`, resolved at start, [`crate::color::resolve`]):
+    /// the frame is drawn in full color, then brought down to it ([`crate::color::degrade`]).
+    pub colors: crate::color::Depth,
+    /// `[tui] colors` as set (the settings change it), which [`ViewState::colors`] resolves.
+    pub color_mode: twr_core::config::ColorMode,
     /// How the cards are ordered within a group (`[tui] card_order`).
     pub card_order: CardOrder,
     /// With [`CardOrder::Stable`], the cards as last shown ([`crate::order`]), which
     /// [`AppState::settle_order`] brings up to date; `None` before it first did, and with
     /// [`CardOrder::Attention`].
     pub shown_cards: Option<crate::order::Shown>,
+    /// How tall each card and tile is on each list ([`crate::order::Fit`]): as tall as its
+    /// text at once, and shorter only once [`AppState::settle_order`] lets it shrink.
+    pub card_fit: crate::order::Fits,
+    /// When [`AppState::settle_order`] last ran, for the draw after it: a card whose text got
+    /// shorter in that draw waits to shrink from then ([`AppState::note_panes`]).
+    pub settled: Option<Instant>,
     /// Where the mouse pointer last was, and when it moved there: over the cards, it holds
     /// their order ([`AppState::cards_held`]). A terminal that lost focus forgets it.
     pub pointer: Option<(u16, u16, Instant)>,
@@ -279,14 +331,42 @@ pub struct ViewState {
     /// The confirm card's detail view: how far it is scrolled and which of its rows have been
     /// on screen ([`CardView`]).
     pub card_view: CardView,
+    /// On a phone, how far the action popup's text is scrolled ([`crate::select::Panes::sheet`]).
+    pub sheet_view: TextScroll,
+    /// On a phone, how far the prompt of the question waiting for `y` is scrolled
+    /// ([`crate::select::Panes::ask`]).
+    pub ask_view: TextScroll,
     /// Parked threads are listed among the cards and tiles (`/parked`); else only those
     /// pinned or with an open attention item are ([`AppState::order`]).
     pub show_parked: bool,
-    /// Ctrl-B, `/sidebar`: hide the worker cards so the conversation uses the full area.
+    /// Ctrl-B (Ctrl-T), `/sidebar` (`/spaces`), the sidebar's `‹`: the sidebar, the
+    /// workspaces with their threads ([`crate::sidebar`]), is hidden, and the views use the
+    /// whole width. Kept across runs (`tui-state.json`) and across the workspaces shown.
     pub sidebar_hidden: bool,
+    /// The row of the workspace list the keys select on the compact layout's Threads screen
+    /// (`None`: the current workspace's card).
+    pub ws_sel: Option<WsRow>,
+    /// Rows the workspace list is scrolled by the wheel.
+    pub ws_scroll: usize,
+    /// The tab of the strip a press under a modal overlay went down on, as drawn then: its
+    /// release switches only to that one.
+    pub pressed_tab: Option<String>,
+    /// The wheel scrolled the workspace list last: it stays where the wheel left it, rather
+    /// than showing the selected card, until a key moves the selection.
+    pub ws_wheeled: bool,
+    /// The new-workspace dialog, while open: the name typed so far.
+    pub new_ws: Option<String>,
+    /// The settings overlay, while open ([`crate::settings`]).
+    pub settings: Option<crate::settings::Settings>,
+    /// `[tui.notify] terminal`, as in effect (the settings change it).
+    pub notify_terminal: twr_core::config::TerminalAlert,
     /// `[tui] compact_width`: below it the compact layout is on ([`AppState::compact`]); 0:
     /// never by itself.
     pub compact_width: u16,
+    /// Next-message suggestions on (`[tui] suggest`, `/suggest`; [`crate::suggest`]).
+    pub suggest: bool,
+    /// The small model they come from, per runtime (`[tui] suggest_model`).
+    pub suggest_model: twr_core::config::SuggestModels,
     /// `/compact on|off`: the compact layout on or off whatever the width; `None`: by the
     /// width.
     pub compact: Option<bool>,
@@ -326,9 +406,6 @@ pub struct ViewState {
     pub repaint: bool,
 }
 
-/// The status when a key would select a card a narrow dive hides ([`AppState::dive_hides_cards`]).
-pub const DIVE_HIDES_CARDS: &str = "the cards are hidden in this dive (Esc goes back to them)";
-
 /// What the card keys say on the compact layout's conversation, which draws no cards.
 pub const COMPACT_LISTS: &str = "/n lists what needs you, /t the threads";
 
@@ -343,6 +420,8 @@ pub struct ThreadActivity {
     pub activity: String,
     pub said: Option<String>,
     pub task: Option<String>,
+    /// What it has in flight (`work`, [`twr_core::work::Work`]); `None` from an older hub.
+    pub work: Option<twr_core::work::Work>,
 }
 
 /// An overlay's scroll keys (the help's, the trash's): ↑↓ a row, PgUp/PgDn ten, Home/End its
@@ -424,6 +503,55 @@ impl CardView {
     }
 }
 
+/// On a phone, where a text scrolled in the rows it has is (the action popup's, the prompt of
+/// the question waiting for `y`, [`crate::select::CardWindow`]): which text, wrapped at which
+/// width, and how many rows down. Another text, or another width (which wraps it again),
+/// starts at its top; another height keeps the place (the keyboard opening or closing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TextScroll {
+    /// The text: an attention id, else what it is of (`CardWindow::attn_id`).
+    pub key: String,
+    /// Its revision (for a text with none, a hash of it).
+    pub revision: u64,
+    /// The width it was wrapped at.
+    pub width: u16,
+    /// Rows scrolled from its top.
+    pub scroll: usize,
+}
+
+impl TextScroll {
+    /// Where a window of text `key` (`revision`, wrapped at `width`) starts: as far down as
+    /// it was scrolled when it is this text at this width, else its top; within the furthest
+    /// it scrolls.
+    pub fn start_of(&self, key: &str, revision: u64, width: u16, max_scroll: usize) -> usize {
+        let same = self.key == key && self.revision == revision && self.width == width;
+        if same { self.scroll } else { 0 }.min(max_scroll)
+    }
+
+    /// Notes window `w` as drawn: of another text or width, scrolled where `w` starts.
+    pub fn note(&mut self, w: &crate::select::CardWindow) {
+        if self.key != w.attn_id || self.revision != w.revision || self.width != w.width {
+            *self = TextScroll {
+                key: w.attn_id.clone(),
+                revision: w.revision,
+                width: w.width,
+                scroll: w.start,
+            };
+        }
+    }
+
+    /// Scrolls the text as window `w` drew it down or up `n` rows, at most a page less a row
+    /// (a row of the last page stays in view).
+    pub fn scroll_by(&mut self, w: &crate::select::CardWindow, down: bool, n: usize) {
+        let step = n.min(usize::from(w.page.saturating_sub(1))).max(1);
+        self.scroll = if down {
+            self.scroll.saturating_add(step).min(w.max_scroll)
+        } else {
+            self.scroll.min(w.max_scroll).saturating_sub(step)
+        };
+    }
+}
+
 /// The choice of the agent that runs the orchestrator. The first-run one is offered when no
 /// orchestrator was ever chosen (no orchestrator thread, current or retired, and no
 /// `[orchestrator] runtime` in the config): choosing records it (`orchestrator.use`), so it is
@@ -432,13 +560,17 @@ impl CardView {
 /// <runtime>` does ([`AppState::confirm_switch`]); Esc leaves the orchestrator as it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
-    /// Runtimes that can host the orchestrator, and whether each is installed (`None`: the
-    /// hub did not say).
+    /// Its rows ([`orch_rows`]): the runtimes that can host the orchestrator, one row per
+    /// usable account (`claude-code:work`) of a runtime that shows account labels, and
+    /// whether each is installed (`None`: the hub did not say). A row is the runtime spec
+    /// choosing it sends; it is shown as [`orch_label`] says (the runtime alone while the
+    /// runtime hides account labels, though the spec names an account).
     pub runtimes: Vec<(String, Option<bool>)>,
     /// The highlighted row.
     pub selected: usize,
-    /// The configured default (`[orchestrator] runtime`, else `default_runtime`); for a
-    /// switch, the current orchestrator's runtime.
+    /// The configured default (`[orchestrator] runtime`, else `default_runtime`, with
+    /// `[orchestrator] account`: `claude-code:work`); for a switch, the current
+    /// orchestrator's runtime and account. A row ([`orch_rows`]).
     pub default: String,
     /// The configured model, sent when the default runtime is chosen (never for a switch,
     /// which starts the runtime's default model, as `/orch <runtime>` does).
@@ -449,8 +581,11 @@ pub struct Picker {
 
 impl Picker {
     /// The picker an `orchestrator.show` result asks for, or `None` when an orchestrator was
-    /// chosen already (or the hub is too old to say whether the config chose one).
-    pub fn from_show(show: &Value) -> Option<Picker> {
+    /// chosen already (or the hub is too old to say whether the config chose one). Its
+    /// default row is the configured runtime with the configured account
+    /// (`configured.account`, `[orchestrator] account`): choosing it sends both, so the
+    /// account the configuration names is the one the hub checks ([`orch_rows`]).
+    pub fn from_show(show: &Value, accounts: &Accounts) -> Option<Picker> {
         let configured = &show["configured"];
         let first = configured["explicit"].as_bool() == Some(false)
             && show["thread"].is_null()
@@ -467,21 +602,128 @@ impl Picker {
         if runtimes.is_empty() {
             return None;
         }
-        let default = configured["runtime"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        let selected = runtimes
-            .iter()
-            .position(|(r, _)| *r == default)
-            .unwrap_or(0);
+        let (rows, default) = orch_rows(
+            &runtimes,
+            accounts,
+            Some(OrchCurrent {
+                spec: configured["runtime"].as_str().unwrap_or_default(),
+                account: configured["account"].as_str(),
+                resolved: show["account"].as_str(),
+            }),
+        );
+        let selected = rows.iter().position(|(r, _)| *r == default).unwrap_or(0);
         Some(Picker {
-            runtimes,
+            runtimes: rows,
             selected,
             default,
             model: configured["model"].as_str().map(str::to_string),
             switch: false,
         })
+    }
+}
+
+/// The hub's `default_runtime` as `orchestrator.show` result `show` says it: the configured
+/// runtime while `[orchestrator] runtime` is not set (`configured.explicit` false), when the
+/// orchestrator runtime is `default_runtime`; else unknown.
+pub fn default_runtime(show: &Value) -> Option<String> {
+    let configured = &show["configured"];
+    (configured["explicit"].as_bool() == Some(false))
+        .then(|| configured["runtime"].as_str())
+        .flatten()
+        .map(|r| twr_core::account::split_runtime(r).0.to_string())
+}
+
+/// The orchestrator a picker marks ([`orch_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OrchCurrent<'a> {
+    /// Its runtime spec (`claude-code`, `claude-code:work`).
+    pub spec: &'a str,
+    /// The account it names, as configured or recorded (`None`: the account part of `spec`,
+    /// else none: the hub's default one).
+    pub account: Option<&'a str>,
+    /// The account it gets when it names none, as the hub resolved it (its native account
+    /// under its current name, or the policy's default).
+    pub resolved: Option<&'a str>,
+}
+
+/// The rows of an orchestrator picker and of `/orch` completion, each the runtime spec that
+/// chooses it, and the row of `current` (empty without one). Each of `runtimes` (with
+/// whether it is installed) is a row of its own, as `runtime`, unless it shows account
+/// labels ([`crate::accounts::RuntimeAccounts::shown`]): then each of its usable accounts is
+/// one (`claude-code:work`, `claude-code:personal`), `current`'s among them (added when it
+/// is not usable: choosing it is refused by the hub, never another account in its place).
+/// `current`'s runtime without labels is `runtime:account` when it names an account, so that
+/// choosing it keeps that account; else `runtime`, the hub's default account. A `current` the
+/// rows do not have is its spec as given.
+pub fn orch_rows(
+    runtimes: &[(String, Option<bool>)],
+    accounts: &Accounts,
+    current: Option<OrchCurrent<'_>>,
+) -> (Vec<(String, Option<bool>)>, String) {
+    let (base, account, resolved) = match current {
+        Some(c) => {
+            let (base, part) = twr_core::account::split_runtime(c.spec);
+            (Some(base), c.account.or(part), c.resolved)
+        }
+        None => (None, None, None),
+    };
+    let mut rows = Vec::new();
+    let mut default = current.map(|c| match account {
+        Some(a) if twr_core::account::split_runtime(c.spec).1.is_none() => {
+            format!("{}:{a}", c.spec)
+        }
+        _ => c.spec.to_string(),
+    });
+    for (runtime, installed) in runtimes {
+        let is_current = base == Some(runtime.as_str());
+        match accounts.runtime(runtime).filter(|r| r.shown) {
+            Some(entry) => {
+                // (Not the native account a named one's name shadows: its row is the named
+                // one's.)
+                let mut names: Vec<&str> = entry
+                    .accounts
+                    .iter()
+                    .filter(|a| a.usable() && !a.shadowed)
+                    .map(|a| a.name.as_str())
+                    .collect();
+                if is_current {
+                    let name = account.or(resolved).unwrap_or(&entry.native);
+                    if !names.contains(&name) {
+                        names.push(name);
+                    }
+                    default = Some(format!("{runtime}:{name}"));
+                }
+                rows.extend(
+                    names
+                        .into_iter()
+                        .map(|n| (format!("{runtime}:{n}"), *installed)),
+                );
+            }
+            None => {
+                let row = match account.filter(|_| is_current) {
+                    Some(a) => format!("{runtime}:{a}"),
+                    None => runtime.clone(),
+                };
+                if is_current {
+                    default = Some(row.clone());
+                }
+                rows.push((row, *installed));
+            }
+        }
+    }
+    (rows, default.unwrap_or_default())
+}
+
+/// How the UI shows orchestrator runtime spec `spec` (a picker row, [`orch_rows`]): as
+/// written while its runtime shows account labels ([`crate::accounts::RuntimeAccounts::
+/// shown`]), else the runtime alone, as a thread's label hides its account then. Only the
+/// display: the row still sends `spec`, account and all.
+pub fn orch_label(spec: &str, accounts: &Accounts) -> String {
+    match twr_core::account::split_runtime(spec) {
+        (runtime, Some(_)) if !accounts.runtime(runtime).is_some_and(|r| r.shown) => {
+            runtime.to_string()
+        }
+        _ => spec.to_string(),
     }
 }
 
@@ -512,6 +754,14 @@ pub const HYDRATION_PARALLEL: usize = 4;
 /// The longest wait before fetching a capped attention text again.
 pub const HYDRATION_RETRY_MAX: Duration = Duration::from_secs(60);
 
+/// How long a failed `account.list` waits before it is asked again, by failures in a row
+/// ([`AppState::accounts_answered`]): the last wait over and over.
+pub const ACCOUNTS_RETRY: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
 /// An attention card on screen: the item and revision an option key answers.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShownCard {
@@ -531,6 +781,8 @@ pub enum ActionTarget {
     Card(String),
     /// A worker request selected in the main conversation, by attention id.
     Request(String),
+    /// A queued message of the main pane's thread, by its ref ([`crate::queue`]).
+    Queued(i64),
 }
 
 /// What the next Esc does ([`AppState::esc_does`]).
@@ -566,6 +818,12 @@ pub enum ActionKind {
     Resume,
     /// Says how to attach to the thread from another terminal (`/attach`).
     Attach,
+    /// Takes a queued message back into the input box, to edit and send again.
+    Edit,
+    /// Takes a queued message back for good (its text goes to the history).
+    Delete,
+    /// Sends the next queued message now, interrupting the turn that runs.
+    SendNow,
 }
 
 /// One row of the action popup: what it does and what it says.
@@ -605,6 +863,16 @@ pub struct ActionPopup {
     /// enough ([`CARD_SETTLE`]): a tap on an answer, Dismiss or Stop runs it only when it is
     /// this one, the item unchanged ([`AppState::tap_row`]). Keys and the wheel arm nothing.
     pub armed: Option<(ActionKind, Option<(String, u64)>)>,
+    /// On a phone, what a tap on a row said (tap it again, read it first): in the popup's
+    /// bottom border, where the status bar would grow under the popup and cut it short.
+    pub hint: Option<String>,
+    /// The screen's size when a tap armed [`ActionPopup::armed`]: a resize (the keyboard
+    /// opening or closing, the phone turned) moves the rows, and disarms it.
+    pub armed_at: (u16, u16),
+    /// The highlight was moved (a key, the wheel, a tap, a filter) since the popup opened on
+    /// its row: on a phone the window of rows keeps it in view only then, and else shows the
+    /// first rows (the options) whatever the highlight it opened on.
+    pub moved: bool,
 }
 
 /// A press of the left button ([`ViewState::press`]): where, on which control, and what that
@@ -613,6 +881,11 @@ pub type Press = (u16, u16, Option<Target>, Option<String>);
 
 /// Two clicks on a card at most this far apart dive into its thread.
 pub const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// A screen shorter than this many rows gets the compact layout, whatever its width (unless
+/// `[tui] compact_width` is 0 or `/compact off`): a phone held on its side with its keyboard
+/// open has about 8 to 11.
+pub const COMPACT_HEIGHT: u16 = 12;
 
 /// How long a card must have been on screen before an option key answers it: a key pressed
 /// just after the card changed (the item was replaced, raised again, or another item came on
@@ -658,11 +931,29 @@ pub struct Sent {
     /// The first Esc on an empty line armed the second, at this time ([`UNSEND_WINDOW`]):
     /// the input box's title shows the hint meanwhile.
     pub armed: Option<Instant>,
+    /// The view the armed second Esc counts in: the message's thread's, or, when the first Esc
+    /// left the dive the message went to, the orchestrator conversation it went back to. In any
+    /// other view (another screen, another thread, even one left since) it takes nothing back.
+    pub armed_in: Option<ArmedView>,
     /// The hint ran out unused: for this message Esc goes on to its other steps (`/unsend`
     /// still takes it back).
     pub spent: bool,
     /// A `message.withdraw` for it is on its way.
     pub withdrawing: bool,
+    /// A suggestion taken and sent as it was ([`Action::SaySuggested`]).
+    pub suggested: bool,
+}
+
+/// Where an armed double Esc counts ([`Sent::armed_in`]): the main pane's thread, the screen
+/// and the compact layout's pane it was armed in.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmedView {
+    /// The main pane's thread.
+    pub main: Option<String>,
+    /// The screen.
+    pub screen: Screen,
+    /// The compact layout's pane.
+    pub pane: CompactPane,
 }
 
 /// A `message.withdraw` on its way ([`AppState::withdrawals`]).
@@ -672,8 +963,29 @@ pub struct Withdrawal {
     pub thread: String,
     /// Its ref.
     pub msg_ref: i64,
-    /// The line as typed, what goes back in the box.
+    /// The line as typed, what goes back in the box (a queued message's preview: its whole
+    /// text comes back with the answer).
     pub text: String,
+    /// Why it is taken back.
+    pub purpose: Retract,
+    /// The user sent it: only then may its text go back in the box or the history, as theirs
+    /// (a queued message of the orchestrator's, or a `!!` command's output, never does).
+    pub mine: bool,
+    /// A suggestion sent as it was: back in the box it is still one, and it never goes to
+    /// the history.
+    pub suggested: bool,
+}
+
+/// Why a message is taken back ([`Withdrawal::purpose`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Retract {
+    /// The last message sent, with Esc twice or `/unsend`: back in the box, as typed.
+    #[default]
+    Unsend,
+    /// A queued message, to edit it: its whole text back in the box (`↑`, `edit`).
+    Edit,
+    /// A queued message, to delete it: its text to the history (`delete`).
+    Delete,
 }
 
 /// Why the last message cannot be taken back ([`AppState::unsend_check`]).
@@ -726,6 +1038,14 @@ pub enum Action {
         /// then.
         seen_gseq: u64,
     },
+    /// [`Action::Say`] for a suggested message the user took and sent unedited (`say` with
+    /// `suggested`): never applied as a short command at once.
+    SaySuggested {
+        /// The text.
+        text: String,
+        /// As [`Action::Say`]'s.
+        seen_gseq: u64,
+    },
     /// Send the input line straight to the thread dived into (`thread.send`).
     Send {
         /// Target thread id.
@@ -733,7 +1053,45 @@ pub enum Action {
         /// The text.
         text: String,
     },
-    /// Take back a message sent (`message.withdraw`): Esc twice on an empty line, `/unsend`.
+    /// Run the user's `!` command (`shell.run`, [`crate::shell`]).
+    ShellRun {
+        /// The thread dived into; `None`: the orchestrator's.
+        thread: Option<String>,
+        /// The command line, without the `!`.
+        command: String,
+        /// The orchestrator view's folder (`!cd`), when it was moved.
+        cwd: Option<String>,
+        /// `!!`: its output goes to the thread when it ends.
+        share: bool,
+        /// Its number among this view's commands: what a stop asked before the answer names.
+        launch: u64,
+    },
+    /// Stop `!` command `launch` once `shell.run` answered it (Ctrl-C before the answer):
+    /// sent at once, after the run on the same ordered calls, so it stops the command even if
+    /// the view that asked is gone when the answer comes.
+    ShellStopLaunch { launch: u64 },
+    /// Move the orchestrator view's folder (`!cd`, `shell.cd`).
+    ShellCd {
+        /// The folder now (`None`: the orchestrator's).
+        cwd: Option<String>,
+        /// Where to (`None`: the orchestrator's folder).
+        dir: Option<String>,
+    },
+    /// Stop a running `!` command (`job.cancel`): Ctrl-C, or its `■ stop`.
+    JobCancel {
+        /// Its job.
+        job: String,
+    },
+    /// Run the next queued message now, interrupting the turn that runs
+    /// (`message.send_now`).
+    SendNow {
+        /// The thread it waits for.
+        thread: String,
+        /// Its ref.
+        msg_ref: i64,
+    },
+    /// Take back a message sent (`message.withdraw`): Esc twice on an empty line, `/unsend`,
+    /// or a queued message edited or deleted.
     Withdraw {
         /// The thread it went to.
         thread: String,
@@ -758,6 +1116,16 @@ pub enum Action {
         effort: Option<String>,
         /// The runtime, as typed; `None` keeps it (the hub checks it).
         runtime: Option<String>,
+    },
+    /// Move a thread to another account of its runtime (`thread.set_model {account}`,
+    /// `/account`): a new session with a handoff.
+    SetAccount {
+        /// Thread id.
+        thread: String,
+        /// The account, as typed (the hub checks it).
+        account: String,
+        /// Leave the thread's or its project's pin (`outside_pin`).
+        outside_pin: bool,
     },
     /// Rename a worker thread (`thread.rename`, `/rename`).
     Rename {
@@ -823,6 +1191,11 @@ pub enum Action {
         /// Thread id.
         thread: String,
     },
+    /// Compact a thread's context (`thread.compact`).
+    CompactContext {
+        /// Thread id.
+        thread: String,
+    },
     /// Switch the orchestrator to `runtime` (`orchestrator.use`): a new orchestrator session
     /// that starts with a handoff.
     UseOrchestrator {
@@ -841,6 +1214,10 @@ pub enum Action {
         runtime: Option<String>,
         /// Name; `None` = derived by the hub.
         name: Option<String>,
+        /// Account; `None` = the project's pin, else the runtime's default.
+        account: Option<String>,
+        /// Open it on `account` although the project's pin leaves it out.
+        outside_pin: bool,
     },
     /// Put selected text on the clipboard (OSC 52, and a local clipboard command when there
     /// is one).
@@ -850,6 +1227,30 @@ pub enum Action {
     },
     /// Take the mouse (`true`: the TUI selects text) or leave it to the terminal (`/mouse`).
     Mouse(bool),
+    /// The answer to the Shift-Enter offer ([`AppState::terminal_offer`]): `yes` sets the
+    /// terminal up (the IO loop edits its settings file), `no` leaves it; either is
+    /// remembered.
+    TerminalSetup { yes: bool },
+    /// The workspace sidebar shown (`true`) or hidden: the IO loop keeps that for the next
+    /// runs (`tui-state.json`) and the next workspaces shown.
+    WsSidebar(bool),
+    /// A setting changed in the settings overlay, applied to the view already: the IO loop
+    /// writes it where it is kept ([`crate::settings::Change::config_key`]) and holds it for
+    /// the next workspaces shown.
+    Setting(crate::settings::Change),
+    /// Ask the hub for its settings (`config.show`), for the settings overlay.
+    ConfigShow,
+    /// A `speech.request` or `speech.control` call (`/read`, Ctrl-R; [`crate::speech`]): its
+    /// answer says what was done.
+    Speech {
+        /// The method.
+        method: &'static str,
+        /// Its params, as [`twr_core::speech`] types them.
+        params: Value,
+    },
+    /// Read what the config file says of the TUI's settings, for the settings overlay: the
+    /// IO loop has the settings writer read it, off the loop.
+    SettingsFile,
     /// Switch to workspace `name` (a tab, `/ws`): the IO loop opens its hub (starting it when
     /// needed) and shows it in place of this one.
     Workspace {
@@ -859,6 +1260,10 @@ pub enum Action {
         create: bool,
     },
 }
+
+/// How much of a reply a transcript keeps as its latest ([`Transcript::last_reply`]): more
+/// than two rows of a card ever show.
+pub const LAST_REPLY_CHARS: usize = 600;
 
 /// One rendered unit of a thread's transcript.
 #[derive(Debug, Clone, PartialEq)]
@@ -879,6 +1284,9 @@ pub enum Entry {
         /// It says how a request ended whose raise is not in the transcript: an end of its
         /// own, never taken for a raise.
         resolution: bool,
+        /// A routine update ([`crate::summary::Routine::of`]): the orchestrator conversation
+        /// folds a thread's run of them into one row ([`crate::summary`]).
+        routine: Option<crate::summary::Routine>,
     },
     /// A turn boundary with the prompt that started it.
     TurnStart {
@@ -905,6 +1313,9 @@ pub enum Entry {
         text: String,
         /// Still receiving deltas.
         open: bool,
+        /// The seq of its final `agent.text`, once it came: what names the message to the
+        /// hub's `speech.*` (`/read this`, the `▶` of the message being read).
+        final_seq: Option<u64>,
     },
     /// A tool call, shown as one line; `ok` is filled by the matching tool result.
     Tool {
@@ -928,6 +1339,36 @@ pub enum Entry {
         result: TurnResult,
         /// Duration, if reported.
         duration_ms: Option<u64>,
+    },
+    /// A `!` command the user ran ([`crate::shell`]), from its job's `task.updated` events:
+    /// the command, where it ran, how it ended and what it printed.
+    Shell {
+        /// The seq of the event that started it, for persistent block identity.
+        seq: u64,
+        /// Its job.
+        job: String,
+        /// The command line.
+        command: String,
+        /// The folder it runs in.
+        cwd: String,
+        /// `!!`: its output goes to the thread when it ends.
+        share: bool,
+        /// Still running.
+        running: bool,
+        /// How it ended: `exited`, `cancelled`, `timed_out`, `failed_to_start`, `lost`.
+        outcome: Option<String>,
+        /// Its exit code.
+        exit: Option<i64>,
+        /// The signal that killed it.
+        signal: Option<i64>,
+        /// How long it ran.
+        duration_ms: Option<u64>,
+        /// What it printed: the end recorded with its end, or the end of its log as last read
+        /// (`job.log`), as plain text ([`twr_core::shell::plain_output`]).
+        output: String,
+        /// Its log was read after it ended (or there is nothing more to read): `output` is
+        /// all there is to show.
+        read: bool,
     },
     /// A one-line notice (attention raised/resolved, report, stop, crash).
     Notice {
@@ -985,6 +1426,18 @@ pub struct Transcript {
     /// `thread.model_changed` that moved it): what a handoff marker names. `None` until one
     /// did (the transcript replays only the latest events).
     pub runtime: Option<String>,
+    /// The seq and start of the latest final reply (a final `agent.text`) applied, up to
+    /// [`LAST_REPLY_CHARS`]: what the workspace sidebar shows of the orchestrator's last reply
+    /// (the seq says whether the hub's is newer). A text a stop or crash cut short is never
+    /// one.
+    pub last_reply: Option<(u64, String)>,
+    /// The account the thread's last account move (in the events applied so far) went to,
+    /// with its runtime ([`moved_label`]: `claude-code:work`): what the line of the stop
+    /// that move restarts the runtime with names. `None` before one.
+    pub moved_to: Option<String>,
+    /// That move resumes the session the thread left on that account
+    /// (`ext.twr.resume_session`): the stop's line says so instead of a new session.
+    pub moved_resumes: bool,
 }
 
 impl Transcript {
@@ -1000,6 +1453,13 @@ impl Transcript {
 
     /// Applies one event of this thread. Events of other threads and already-seen seqs are ignored.
     pub fn apply(&mut self, ev: &Event) {
+        self.apply_named(ev, &|_| None);
+    }
+
+    /// [`Transcript::apply`], with `native`: the current name of a runtime's native account
+    /// (`None`: not known, or the thread's box's own login), which the lines of account moves
+    /// name it by ([`model_changed_notice`]).
+    pub fn apply_named(&mut self, ev: &Event, native: &dyn Fn(&str) -> Option<String>) {
         if ev.thread != self.thread || (ev.seq != 0 && ev.seq <= self.last_seq) {
             return;
         }
@@ -1016,22 +1476,28 @@ impl Transcript {
                 // The first turn of a thread's new runtime carries a handoff of the previous
                 // session (`ext.twr.runtime_handoff`): marked, never shown (the prompt is the
                 // message as given).
-                let handoff = p
-                    .ext
-                    .as_ref()
-                    .and_then(|m| m.get("twr"))
+                let twr = p.ext.as_ref().and_then(|m| m.get("twr"));
+                let handoff = twr
                     .and_then(|t| t.get(RUNTIME_HANDOFF_KEY))
                     .is_some_and(|h| !h.is_null());
-                if handoff {
+                // A move back resumes the session the thread left that runtime with, told what
+                // the thread did since (`ext.twr.resumes`), with or without a handoff.
+                let resumes = twr
+                    .and_then(|t| t.get("resumes"))
+                    .and_then(|r| r.as_str())
+                    .is_some();
+                if handoff || resumes {
                     let rt = self
                         .runtime
                         .as_deref()
                         .map(|r| format!("{r} "))
                         .unwrap_or_default();
-                    self.notice(
-                        NoticeLevel::Info,
-                        format!("new {rt}session, with a handoff of the previous one"),
-                    );
+                    let what = if resumes {
+                        format!("earlier {rt}session resumed, told what the thread did since")
+                    } else {
+                        format!("new {rt}session, with a handoff of the previous one")
+                    };
+                    self.notice(NoticeLevel::Info, what);
                 }
                 let notice = p.from == TurnFrom::Runtime
                     || p.from == TurnFrom::Orchestrator
@@ -1070,26 +1536,36 @@ impl Transcript {
                     .is_some_and(|fields| fields.iter().any(|f| f.as_str() == Some("text")));
                 let open = self.entries.iter_mut().rev().find_map(|e| match e {
                     Entry::Text {
-                        text, open: true, ..
-                    } => Some(text),
+                        text,
+                        open: true,
+                        final_seq,
+                        ..
+                    } => Some((text, final_seq)),
                     _ => None,
                 });
                 match (open, p.is_final) {
                     // The final text carries the whole message: it replaces the deltas.
-                    (Some(text), true) => {
+                    (Some((text, final_seq)), true) => {
                         // A failed blob fetch must never replace complete streamed text
                         // with the final event's 512-byte preview.
                         if !capped || text.len() < p.text.len() {
                             *text = p.text.clone();
                         }
+                        *final_seq = Some(ev.seq);
                         self.close_text();
                     }
-                    (Some(text), false) => text.push_str(&p.text),
+                    (Some((text, _)), false) => text.push_str(&p.text),
                     (None, is_final) => self.push(Entry::Text {
                         seq: ev.seq,
                         text: p.text.clone(),
                         open: !is_final,
+                        final_seq: is_final.then_some(ev.seq),
                     }),
+                }
+                if p.is_final && !p.text.trim().is_empty() {
+                    // Its start only: a card shows two rows of it.
+                    let start = p.text.chars().take(LAST_REPLY_CHARS).collect();
+                    self.last_reply = Some((ev.seq, start));
                 }
                 if capped && p.is_final {
                     self.notice(
@@ -1144,6 +1620,21 @@ impl Transcript {
                     duration_ms: p.duration_ms,
                 });
             }
+            // A job's task is the hub's: no other source draws a `!` command.
+            EventBody::TaskUpdated(p) if ev.source == twr_core::event::Source::Hub => {
+                self.apply_shell(ev.seq, p)
+            }
+            // The runtime compacted its context (or failed to): a line of its own, in a dive
+            // and in the orchestrator's conversation alike. While it runs, the activity line
+            // says so.
+            EventBody::ContextCompacted(p) => {
+                self.close_text();
+                let level = match p.error {
+                    Some(_) => NoticeLevel::Error,
+                    None => NoticeLevel::Info,
+                };
+                self.notice(level, p.line());
+            }
             // What the orchestrator read of a project: shown like a hub update, so it stays on
             // screen when tool calls are folded.
             EventBody::ProjectRead(p) => self.push(Entry::HubUpdate {
@@ -1154,6 +1645,18 @@ impl Transcript {
                 outcome: None,
                 seq: ev.seq,
                 resolution: false,
+                routine: None,
+            }),
+            // A note of the orchestrator's memory saved or forgotten: shown the same way.
+            EventBody::MemoryChanged(p) => self.push(Entry::HubUpdate {
+                text: p.line(),
+                user_message: None,
+                attn_id: None,
+                about: None,
+                outcome: None,
+                seq: ev.seq,
+                resolution: false,
+                routine: None,
             }),
             EventBody::ConversationUpdate(p) => {
                 let twr = p.ext.as_ref().and_then(|e| e.get("twr"));
@@ -1191,6 +1694,11 @@ impl Transcript {
                         .retain(|_| entries.next().is_some_and(|e| !stale(e)));
                     self.entries.retain(|e| !stale(e));
                 }
+                // An item's update, or the acknowledgment of a message of the user's, is never
+                // routine.
+                let routine = (attn_id.is_none() && p.user_message.is_none())
+                    .then(|| crate::summary::Routine::of(&p.ext, &p.text))
+                    .flatten();
                 self.push(Entry::HubUpdate {
                     text: p.text.clone(),
                     user_message: p.user_message.clone(),
@@ -1199,6 +1707,7 @@ impl Transcript {
                     outcome: None,
                     seq: ev.seq,
                     resolution: resolved,
+                    routine,
                 });
             }
             EventBody::AttentionRaised(p) => self.notice(
@@ -1218,15 +1727,36 @@ impl Transcript {
                     .and_then(|m| m.get("twr"))
                     .and_then(|t| t.get("reason"))
                     .and_then(Value::as_str);
+                let on_account;
                 let text = match reason {
                     Some(MODE_RESTART_REASON) => "restarting the runtime in its new mode",
                     Some(MODEL_RESTART_REASON) => "restarting the runtime with its new settings",
                     Some(RUNTIME_RESTART_REASON) => {
                         "the previous runtime stopped; the next turn starts a session of the new one"
                     }
+                    // A move between accounts of one runtime: a new session, as for a runtime,
+                    // or the session the thread left on that account, resumed.
+                    Some(ACCOUNT_RESTART_REASON) => {
+                        let to = self.moved_to.as_deref().unwrap_or("its new account");
+                        on_account = match self.moved_resumes {
+                            true => format!(
+                                "the previous session stopped; the next turn resumes the \
+                                 thread's earlier session on {to}"
+                            ),
+                            false => format!(
+                                "the previous session stopped; the next turn starts a new \
+                                 session on {to}"
+                            ),
+                        };
+                        on_account.as_str()
+                    }
                     Some(twr_core::event::TRIM_RESTART_REASON) => {
                         "the runtime stopped for a trim of its build output; the next prompt \
                          resumes the session"
+                    }
+                    Some(twr_core::event::BOX_UPGRADE_REASON) => {
+                        "restarting on the box's new twr build; the next prompt resumes the \
+                         session"
                     }
                     _ => "thread stopped",
                 };
@@ -1244,7 +1774,17 @@ impl Transcript {
                 if let Some(r) = &p.runtime {
                     self.runtime = Some(r.clone());
                 }
-                self.notice(NoticeLevel::Info, model_changed_notice(p))
+                if p.account_changed {
+                    let rt = p.runtime.as_deref().or(p.previous_runtime.as_deref());
+                    self.moved_to = Some(moved_label(rt.unwrap_or("?"), &p.account, native));
+                    self.moved_resumes = p
+                        .ext
+                        .as_ref()
+                        .and_then(|e| e.get("twr"))
+                        .and_then(|t| t.get(twr_core::event::RESUME_SESSION_KEY))
+                        .is_some();
+                }
+                self.notice(NoticeLevel::Info, model_changed_notice(p, native))
             }
             EventBody::ThreadRenamed(p) => {
                 let by = match p.by {
@@ -1268,6 +1808,82 @@ impl Transcript {
             let excess = self.entries.len() - TRANSCRIPT_MAX_ENTRIES;
             self.entries.drain(..excess);
             self.ids.drain(..excess);
+        }
+    }
+
+    /// A job's `task.updated` (`p`, at `seq`): a `!` command's starts its entry, its end
+    /// says how it ended and what it printed; other jobs' and other tasks' show nothing here.
+    fn apply_shell(&mut self, seq: u64, p: &twr_core::event::TaskUpdated) {
+        let Some(job) = p
+            .ext
+            .as_ref()
+            .and_then(|e| e.get("twr"))
+            .and_then(|t| t.get("job"))
+        else {
+            return;
+        };
+        let Some(id) = job["id"].as_str() else {
+            return;
+        };
+        let text = |v: &Value| v.as_str().unwrap_or_default().to_string();
+        // Its end: what it printed, cut when the hub kept only a preview of it.
+        let printed = text(&job["printed"]);
+        let cut = job.get("printed_ref").is_some()
+            || job
+                .get(twr_core::blob::CAPPED_KEY)
+                .is_some_and(|c| c.to_string().contains("printed"));
+        let catching_up = self.catching_up();
+        let at = self
+            .entries
+            .iter()
+            .rposition(|e| matches!(e, Entry::Shell { job, .. } if job == id));
+        match at {
+            Some(i) if !p.running => {
+                if let Entry::Shell {
+                    running,
+                    outcome,
+                    exit,
+                    signal,
+                    duration_ms,
+                    output,
+                    read,
+                    ..
+                } = &mut self.entries[i]
+                {
+                    *running = false;
+                    *outcome = job["outcome"].as_str().map(str::to_string);
+                    *exit = job["exit"].as_i64();
+                    *signal = job["signal"].as_i64();
+                    *duration_ms = job["duration_ms"].as_u64();
+                    if !*read {
+                        *output = printed;
+                    }
+                    // Seen to its end here: one more read of its log for all of it. Replayed
+                    // history shows what its end recorded (`twr job log` has the rest).
+                    *read = catching_up || (!cut && *read);
+                }
+            }
+            Some(_) => {}
+            None => {
+                let Some(shell) = job.get("shell") else {
+                    return;
+                };
+                self.close_text();
+                self.push(Entry::Shell {
+                    seq,
+                    job: id.to_string(),
+                    command: text(&shell["command"]),
+                    cwd: text(&shell["cwd"]),
+                    share: shell["share"].as_bool().unwrap_or(false),
+                    running: p.running,
+                    outcome: job["outcome"].as_str().map(str::to_string),
+                    exit: job["exit"].as_i64(),
+                    signal: job["signal"].as_i64(),
+                    duration_ms: job["duration_ms"].as_u64(),
+                    output: printed,
+                    read: !p.running && (!cut || catching_up),
+                });
+            }
         }
     }
 
@@ -1487,32 +2103,65 @@ fn setting(v: &Option<String>) -> &str {
 /// the effort did. One that changes neither (the hub records none) reads `model kept at
 /// sonnet, effort at high`. A move to another runtime names the runtimes and the model and
 /// effort the thread has on the new one: `runtime claude-code → codex, model gpt-6.1-sol,
-/// effort xhigh (by you)`.
-pub fn model_changed_notice(p: &ThreadModelChanged) -> String {
+/// effort xhigh (by you)`. A move between accounts (`account_changed`) names both accounts
+/// (the native one by its current name, `native`, else `own login`): `account work →
+/// personal (by you)`, with the model or effort when they changed too (`account work →
+/// personal, model from opus to sonnet`), and with their runtimes when the runtime changed
+/// too: `runtime codex:team → claude-code:work, model default, effort default (by you)`.
+pub fn model_changed_notice(
+    p: &ThreadModelChanged,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
     let by = match p.by {
         ChangedBy::User => " (by you)",
         ChangedBy::Orchestrator => " (by the orchestrator)",
     };
+    let changed = |i: usize, what: &str, before: &Option<String>, now: &Option<String>| {
+        let verb = if i == 0 { " changed" } else { "" };
+        format!("{what}{verb} from {} to {}", setting(before), setting(now))
+    };
+    let settings = [
+        ("model", &p.previous_model, &p.model),
+        ("effort", &p.previous_effort, &p.effort),
+    ];
+    let previous_runtime = p.previous_runtime.as_deref();
+    if p.account_changed
+        && p.runtime
+            .as_deref()
+            .is_none_or(|r| Some(r) == previous_runtime)
+    {
+        let rt = p.runtime.as_deref().or(previous_runtime).unwrap_or("?");
+        let mut s = format!(
+            "account {} → {}",
+            moved_account(rt, &p.previous_account, native),
+            moved_account(rt, &p.account, native)
+        );
+        for (what, before, now) in settings.into_iter().filter(|(_, b, n)| b != n) {
+            // (No verb: `account work → personal, model from opus to sonnet`.)
+            s.push_str(&format!(", {}", changed(1, what, before, now)));
+        }
+        return format!("{s}{by}");
+    }
     if let Some(r) = &p.runtime {
+        let (from, to) = match p.account_changed {
+            true => (
+                moved_label(previous_runtime.unwrap_or("?"), &p.previous_account, native),
+                moved_label(r, &p.account, native),
+            ),
+            false => (previous_runtime.unwrap_or("?").to_string(), r.clone()),
+        };
         return format!(
-            "runtime {} → {r}, model {}, effort {}{by}",
-            p.previous_runtime.as_deref().unwrap_or("?"),
+            "runtime {from} → {to}, model {}, effort {}{by}",
             setting(&p.model),
             setting(&p.effort)
         );
     }
-    let changes: Vec<String> = [
-        ("model", &p.previous_model, &p.model),
-        ("effort", &p.previous_effort, &p.effort),
-    ]
-    .into_iter()
-    .filter(|(_, before, now)| before != now)
-    .enumerate()
-    .map(|(i, (what, before, now))| {
-        let verb = if i == 0 { " changed" } else { "" };
-        format!("{what}{verb} from {} to {}", setting(before), setting(now))
-    })
-    .collect();
+    let changes: Vec<String> = settings
+        .into_iter()
+        .filter(|(_, before, now)| before != now)
+        .enumerate()
+        .map(|(i, (what, before, now))| changed(i, what, before, now))
+        .collect();
     if changes.is_empty() {
         return format!(
             "model kept at {}, effort at {}{by}",
@@ -1523,14 +2172,45 @@ pub fn model_changed_notice(p: &ThreadModelChanged) -> String {
     format!("{}{by}", changes.join(", "))
 }
 
+/// Account `account` of `runtime` (`None`: the native one) as an account move's line names
+/// it: its name, the native account's current name when `native` knows it, else `own login`.
+fn moved_account(
+    runtime: &str,
+    account: &Option<String>,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    account
+        .clone()
+        .or_else(|| native(runtime))
+        .unwrap_or_else(|| "own login".into())
+}
+
+/// [`moved_account`] with its runtime: `codex:team`, `claude-code:personal`, or `claude-code
+/// (own login)` when the native account's name is not known.
+fn moved_label(
+    runtime: &str,
+    account: &Option<String>,
+    native: &dyn Fn(&str) -> Option<String>,
+) -> String {
+    match account.clone().or_else(|| native(runtime)) {
+        Some(a) => format!("{runtime}:{a}"),
+        None => format!("{runtime} (own login)"),
+    }
+}
+
 /// What `/model <thread>` says of a thread: its model and reasoning effort, and the model its
 /// runtime reports when that is another (an alias it resolved, or the one it still runs until
 /// it restarts): `api: model fable, effort high (runs claude-fable-5-1)`. A thread that moved
 /// to another runtime and has no session of it yet says so: `api: model default, effort
-/// default; its first codex session starts with its next turn`.
-pub fn model_show(t: &ThreadView) -> String {
+/// default; its first codex session starts with its next turn` (or, moving back, that its
+/// earlier session resumes). With `account`, the account it runs on as the UI labels it
+/// ([`AppState::account_label`]), first: `api: account work, model ...`.
+pub fn model_show(t: &ThreadView, account: Option<&str>) -> String {
+    let account = account
+        .map(|a| format!("account {a}, "))
+        .unwrap_or_default();
     let mut out = format!(
-        "{}: model {}, effort {}",
+        "{}: {account}model {}, effort {}",
         t.name,
         setting(&t.model),
         setting(&t.effort)
@@ -1543,10 +2223,16 @@ pub fn model_show(t: &ThreadView) -> String {
         out.push_str(&format!(" (runs {a})"));
     }
     if t.handoff_pending {
-        out.push_str(&format!(
-            "; its first {} session starts with its next turn",
-            t.runtime
-        ));
+        match &t.resume_session {
+            Some(_) => out.push_str(&format!(
+                "; its earlier {} session resumes with its next turn",
+                t.runtime
+            )),
+            None => out.push_str(&format!(
+                "; its first {} session starts with its next turn",
+                t.runtime
+            )),
+        }
     }
     out
 }
@@ -1765,6 +2451,30 @@ impl DecisionLog {
         }
     }
 
+    /// The rows of a snapshot of the control stream (oldest first; at most [`DECISIONS_CAP`]
+    /// are kept), of `seen` decisions in all: the log as folding them would leave it.
+    pub fn install(&mut self, rows: impl IntoIterator<Item = DecisionRow>, seen: u64) {
+        self.rows = rows.into_iter().collect();
+        while self.rows.len() > DECISIONS_CAP {
+            self.rows.pop_front();
+        }
+        self.seen = seen;
+    }
+
+    /// Puts `older` (rows older than every kept one, newest first, as `decisions.list` gives
+    /// them) before the kept rows, as many as fit under [`DECISIONS_CAP`]: a kept row is never
+    /// dropped for them. They were counted in [`DecisionLog::seen`] already. Returns how many
+    /// were put.
+    pub fn prepend_older(&mut self, older: impl IntoIterator<Item = DecisionRow>) -> usize {
+        let room = DECISIONS_CAP.saturating_sub(self.rows.len());
+        let mut put = 0;
+        for row in older.into_iter().take(room) {
+            self.rows.push_front(row);
+            put += 1;
+        }
+        put
+    }
+
     /// Rows kept.
     pub fn len(&self) -> usize {
         self.rows.len()
@@ -1810,6 +2520,132 @@ impl DecisionLog {
     }
 }
 
+/// A remote box as the hub last said it (`hub.info`'s `boxes`, polled every
+/// [`crate::INFO_EVERY`]), with what `runner.connected` / `runner.disconnected` changed since:
+/// what a thread's box token says ([`BoxStatus::word`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BoxStatus {
+    /// `online`, `switching`, `connecting`, `offline`, `needs_install` or `error`.
+    pub state: String,
+    /// A runner of the box is connected.
+    pub online: bool,
+    /// The connected runner's twr version.
+    pub version: Option<String>,
+    /// The build the box's daemon runs (an SSH box's).
+    pub running_build: Option<String>,
+    /// The box runs another build of the hub's protocol, switched once it is quiet.
+    pub switch_pending: bool,
+    /// Why the box's last runner was refused, while none is connected.
+    pub refused: Option<String>,
+    /// The box's runner, or the build the hub would launch there, speaks another runner
+    /// protocol than the hub: its refusal or last error says so ([`names_protocol`]). Another
+    /// build or version alone is not a mismatch.
+    pub protocol_mismatch: bool,
+}
+
+/// What a thread's box token adds after `@box` when the box is not simply online
+/// ([`BoxStatus::word`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoxWord {
+    /// The hub is switching the box to another build: its threads wait.
+    Switching,
+    /// The box runs another build of the same protocol, switched once quiet.
+    UpdatePending,
+    /// Its runner speaks another runner protocol than the hub.
+    Mismatch,
+    /// It needs `twr box install`.
+    NeedsInstall,
+    /// The hub cannot dial it (its box key).
+    Error,
+    /// The hub has no such box (removed since its threads were made): its threads cannot
+    /// run.
+    NotConfigured,
+    /// The hub is connecting to it.
+    Reconnecting,
+    /// No runner of it is connected.
+    Offline,
+}
+
+impl BoxWord {
+    /// The word as the token says it.
+    pub fn text(self) -> &'static str {
+        match self {
+            BoxWord::Switching => "switching",
+            BoxWord::UpdatePending => "update pending",
+            BoxWord::Mismatch => "twr mismatch",
+            BoxWord::NeedsInstall => "needs install",
+            BoxWord::Error => "error",
+            BoxWord::NotConfigured => "not configured",
+            BoxWord::Reconnecting => "reconnecting",
+            BoxWord::Offline => "offline",
+        }
+    }
+}
+
+impl BoxStatus {
+    /// The box as one entry of `hub.info`'s `boxes`.
+    fn from_info(b: &Value) -> BoxStatus {
+        let text = |v: &Value| v.as_str().map(str::to_string);
+        let refused = text(&b["refused"]["reason"]);
+        let last_error = text(&b["last_error"]);
+        let protocol_mismatch = refused
+            .iter()
+            .chain(last_error.iter())
+            .any(|s| names_protocol(s));
+        BoxStatus {
+            state: text(&b["state"]).unwrap_or_default(),
+            online: b["online"].as_bool() == Some(true),
+            version: text(&b["version"]),
+            running_build: text(&b["running_build"]),
+            switch_pending: b["switch_pending"].as_bool() == Some(true),
+            refused,
+            protocol_mismatch,
+        }
+    }
+
+    /// What its token says after `@box`: nothing when it is online with nothing pending;
+    /// else, first of these, `switching`, `update pending`, then why it is not online
+    /// (`twr mismatch`, `needs install`, `error`, `reconnecting`, `offline`).
+    pub fn word(&self) -> Option<BoxWord> {
+        if self.state == "switching" {
+            return Some(BoxWord::Switching);
+        }
+        if self.switch_pending {
+            return Some(BoxWord::UpdatePending);
+        }
+        // A state this TUI does not know goes by whether the box is online.
+        let known = ["needs_install", "error", "connecting", "offline"];
+        if self.state == "online" || (self.online && !known.contains(&self.state.as_str())) {
+            return None;
+        }
+        // `needs install` says what to do, so it wins over the mismatch that caused it (a
+        // build of another target that speaks an older protocol).
+        if self.state == "needs_install" {
+            return Some(BoxWord::NeedsInstall);
+        }
+        if self.protocol_mismatch {
+            return Some(BoxWord::Mismatch);
+        }
+        Some(match self.state.as_str() {
+            "error" => BoxWord::Error,
+            "connecting" => BoxWord::Reconnecting,
+            _ => BoxWord::Offline,
+        })
+    }
+}
+
+/// Whether `t` runs on a remote box (not the hub's own, `local`): its box token shows.
+pub fn on_remote_box(t: &ThreadView) -> bool {
+    !t.box_name.is_empty() && t.box_name != "local"
+}
+
+/// Whether `s` names a runner protocol (`speaks protocol 6`, `speaking protocol 6`): the hub's
+/// words for a runner refused for its protocol, or a build that would be.
+fn names_protocol(s: &str) -> bool {
+    s.match_indices("protocol ")
+        .any(|(i, m)| s[i + m.len()..].starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Everything the renderer needs.
 #[derive(Debug, Clone, Default)]
 pub struct AppState {
@@ -1834,8 +2670,20 @@ pub struct AppState {
     /// is still running. The view kept for this workspace waits for it, and keys do (the IO
     /// loop drops them), so nothing answers a state the screen has not shown yet.
     pub catch_up: Option<u64>,
+    /// The initial replay is a compacted backlog ([`AppState::begin_compacted_catch_up`]):
+    /// how many of its items came, of how many. It ends after the last of them, whatever its
+    /// gseq.
+    pub catch_up_items: Option<(u64, u64)>,
     /// Recent `decision.made` events for the audit view.
     pub decisions: DecisionLog,
+    /// The decisions older than a snapshot's to read (`decisions.list`): before which control
+    /// position, and how many at most ([`AppState::install_snapshot`]). Taken when the read
+    /// is sent.
+    pub older_decisions: Option<(u64, usize)>,
+    /// A view kept across a switch had this decision selected, at this place of the table,
+    /// and the snapshot's rows do not have it: it is selected again once the older rows have
+    /// it, unless the selection moved meanwhile ([`AppState::older_decisions_came`]).
+    pub pending_decision: Option<(String, usize)>,
     /// The latest usage of each runtime's account, from `account.usage` (the status bar's
     /// usage segment).
     pub usage: twr_core::usage::UsageView,
@@ -1845,8 +2693,35 @@ pub struct AppState {
     /// The boxes low on disk, with their free bytes (`hub.info`'s `disk`, polled): the status
     /// bar says so.
     pub disk_low: Vec<(String, u64)>,
+    /// The hub's remote boxes, by name ([`BoxStatus`]): what a thread's box token says.
+    pub boxes: BTreeMap<String, BoxStatus>,
+    /// A `hub.info` answer listed the hub's boxes ([`AppState::apply_boxes`]): a remote box
+    /// missing from [`AppState::boxes`] since is not configured, not merely undescribed.
+    pub boxes_known: bool,
     /// A `hub.info` poll is on its way: the next one waits for it.
-    pub disk_pending: bool,
+    pub info_pending: bool,
+    /// The hub's accounts (`account.list`, [`crate::accounts`]): which runtimes show account
+    /// labels ([`AppState::account_label`]). Empty for a hub older than accounts.
+    pub accounts: crate::accounts::Accounts,
+    /// An `account.list` call is on its way: another waits for its answer.
+    pub accounts_pending: bool,
+    /// An `account.*` control event came since the accounts were last asked for: they are to
+    /// be asked for again ([`AppState::send_accounts`]).
+    pub accounts_due: bool,
+    /// When the accounts are asked for again after a failed `account.list` (the one on
+    /// connecting too; [`AppState::accounts_answered`]), if one failed last.
+    pub accounts_retry: Option<Instant>,
+    /// How many `account.list` calls failed in a row: how long the next retry waits
+    /// ([`ACCOUNTS_RETRY`]).
+    pub accounts_failures: u32,
+    /// How many live `runner.connected` / `runner.disconnected` events were applied: the
+    /// order of those against the `hub.info` polls ([`AppState::send_info`]).
+    pub live_seq: u64,
+    /// Each box's last live runner event, by [`AppState::live_seq`].
+    pub box_live: BTreeMap<String, u64>,
+    /// [`AppState::live_seq`] when the `hub.info` poll on its way was sent: its answer says
+    /// nothing newer of a box than a live event after that.
+    pub info_sent: u64,
     /// Attention revisions known only by their capped preview, by attention id
     /// ([`Incomplete`]).
     pub incomplete: BTreeMap<String, Incomplete>,
@@ -1861,11 +2736,23 @@ pub struct AppState {
     pub activity: HashMap<String, ThreadActivity>,
     /// A `thread.activity` call is on its way: the next poll waits for it.
     pub activity_pending: bool,
+    /// What the hub's speakers read, polled ([`crate::speech`]).
+    pub speech: crate::speech::SpeechView,
     /// The workspace shown (`twr ws`), when the TUI can switch workspaces; `None` for a TUI
     /// opened on a socket.
     pub workspace: Option<String>,
     /// The workspaces' tabs, in the strip's order ([`crate::workspace`]).
     pub tabs: Vec<crate::workspace::Tab>,
+    /// The thread's agent this TUI runs for, if it does: it creates no workspace and
+    /// changes no setting (the CLI refuses an agent's workspace too).
+    pub agent: Option<String>,
+    /// The control stream ended ([`AppState::control_ended`]): what the view holds of its hub
+    /// is no longer news (its workspace's card goes by the polls then).
+    pub control_lost: bool,
+    /// The current orchestrator's newest reply the view saw (its thread, the seq, its start),
+    /// kept apart from its transcript, which the cache of conversations may drop: what the
+    /// workspace's card shows of it ([`AppState::tab_glance`]).
+    pub orch_reply: Option<(String, u64, String)>,
     /// The workspace being opened, until it is shown or fails.
     pub switching: Option<String>,
     /// What of a view kept for this workspace waits until the replay is applied
@@ -1884,6 +2771,81 @@ pub struct AppState {
     pub acted_turns: VecDeque<(String, u64)>,
     /// The `message.withdraw` calls on their way, matched to their answers by ref.
     pub withdrawals: Vec<Withdrawal>,
+    /// The main pane's thread's queued messages, as last read ([`crate::queue`]).
+    pub queue: Option<crate::queue::QueueView>,
+    /// The orchestrator view's folder for `!` commands, once known (`shell.cd`, `!cd`).
+    pub shell_cwd: Option<String>,
+    /// `shell.cd` was asked for the folder (once).
+    pub shell_cwd_asked: bool,
+    /// The user's `!cd` is on its way: its answer says where commands run now.
+    pub shell_cd_asked: bool,
+    /// The `shell.cd` calls on their way, in the order sent (answers come in that order, on
+    /// the one connection): `true` for the user's `!cd`, `false` for the TUI asking for the
+    /// folder's name.
+    pub shell_cds: VecDeque<bool>,
+    /// The `!` commands this TUI started that still run, oldest first: Ctrl-C stops the newest.
+    pub shell_jobs: Vec<crate::shell::Started>,
+    /// The latest `!` commands that ended (their jobs), at most 32: an answer to `shell.run`
+    /// that comes after its command's end starts nothing to stop.
+    pub shell_done: VecDeque<String>,
+    /// The `!` commands sent and not answered yet, in the order sent ([`crate::shell::Launch`]):
+    /// Ctrl-C meanwhile stops one as soon as its job is known.
+    pub shell_launching: VecDeque<crate::shell::Launch>,
+    /// The last `!` command's number ([`Action::ShellRun`]'s `launch`).
+    pub shell_launch_seq: u64,
+    /// How each `!` command's output is read, by job ([`crate::shell::Reads`]).
+    pub shell_reads: HashMap<String, crate::shell::Reads>,
+    /// The suggested next message, while it may show ([`crate::suggest`]).
+    pub suggestion: Option<crate::suggest::Suggestion>,
+    /// A suggestion to ask for: the thread and the turn that ended.
+    pub suggest_due: Option<(String, u64)>,
+    /// A suggestion call failed already (the status bar said so once).
+    pub suggest_failed: bool,
+    /// The hub's suggestion counts, as its last answer gave them.
+    pub suggest_stats: Value,
+    /// Counts the user's sends: a suggestion asked before the last one is not shown.
+    pub suggest_epoch: u64,
+    /// When the input thread read the terminal event being handled (`None`: now): a key read
+    /// before a suggestion appeared never takes it, however late it is handled.
+    pub input_at: Option<Instant>,
+    /// The suggestion asked for and its epoch ([`AppState::suggest_epoch`]).
+    pub suggest_asked: Option<(String, u64, u64)>,
+    /// The suggestion last taken into the box: sent unedited, it says so to the hub.
+    pub taken_suggestion: Option<String>,
+    /// The suggestions sent as they were, `(thread, ref)`, until one is taken back (a running
+    /// one can be, until it acts; a few dozen an hour at most): taken back, one is still a
+    /// suggestion.
+    pub suggested_refs: VecDeque<(String, i64)>,
+    /// Whether each send still to be answered was a suggestion sent as it was, oldest first
+    /// (one connection answers in order): every answer registers its own.
+    pub sends_suggested: VecDeque<bool>,
+    /// The second Ctrl-C while a `!` command's stop is on its way: the third quits.
+    pub shell_quit_armed: bool,
+    /// What the TUI has told the user across runs ([`crate::firstrun`]), and whether this
+    /// run told more that is not saved yet.
+    pub seen: crate::firstrun::Seen,
+    pub seen_dirty: bool,
+    /// A notice told once ([`AppState::show_once`]), until a frame has shown it.
+    pub once: Option<(crate::firstrun::Once, String)>,
+    /// A notice that must be drawn whole before what it tells of happens
+    /// ([`AppState::wait_for_notice`]): its text and its short form, what the status bar draws
+    /// when it has no room for the whole one; either drawn whole tells it. Kept once told: while
+    /// the status bar still shows it (until it is dismissed or replaced), it is drawn as it was
+    /// when told, its short form and the rows it needs before the notes
+    /// ([`crate::ui::render`]).
+    pub once_short: Option<(String, String)>,
+    /// Why suggestions stopped in this run: the hub can't run them
+    /// ([`AppState::suggest_unavailable`]); the notice saying so waits for a free status bar.
+    pub suggest_off_why: Option<String>,
+    /// The user turned suggestions on in this run (`/suggest on`): `hub.info` no longer
+    /// turns them off, only a call's answer does.
+    pub suggest_turned_on: bool,
+    /// The next ask says the user turned suggestions on ([`crate::suggest::Ask::retry`]).
+    pub suggest_retry: bool,
+    /// The Shift-Enter offer on screen, until it is answered ([`Action::TerminalSetup`]).
+    pub terminal_offer: Option<crate::firstrun::TerminalOffer>,
+    /// Summaries of the threads' routine updates ([`crate::summary`]).
+    pub summary: crate::summary::Summaries,
     /// Answers to this workspace's messages (`say`, `thread.send`, `message.withdraw`) that
     /// came while a view kept for it is being restored: applied once it is
     /// ([`AppState::finish_restore`]), into the view as it was left.
@@ -1901,6 +2863,7 @@ impl AppState {
     /// kept to what the replayed stack lists. Nothing is selected until the user selects a
     /// card (the TUI opens with none, unless a kept view had one).
     pub fn begin_catch_up(&mut self, head: u64) {
+        self.catch_up_items = None;
         if head > self.last_gseq {
             self.catch_up = Some(head);
         } else {
@@ -1911,11 +2874,27 @@ impl AppState {
         }
     }
 
+    /// [`AppState::begin_catch_up`] for a compacted replay (`control.subscribe` with
+    /// `compact`): `items` items of those up to `head`, not every one ([`twr_core::compact`]).
+    /// It ends after the last of them, and the TUI then stands at `head`, as after a full
+    /// replay (what it has seen, [`AppState::seen_gseq`], counts from there).
+    pub fn begin_compacted_catch_up(&mut self, head: u64, items: u64) {
+        if items == 0 {
+            self.last_gseq = self.last_gseq.max(head);
+        }
+        self.begin_catch_up(head);
+        if self.catch_up.is_some() {
+            self.catch_up_items = Some((0, items));
+        }
+    }
+
     /// The control stream ended (lost, or the hub closed it): no replay is coming any more,
     /// so a view kept for this workspace is restored with what was applied, and the answers to
     /// its messages that waited for that are applied ([`AppState::finish_restore`]).
     pub fn control_ended(&mut self) {
+        self.control_lost = true;
         self.catch_up = None;
+        self.catch_up_items = None;
         self.finish_restore();
     }
 
@@ -1924,26 +2903,63 @@ impl AppState {
     pub fn apply_event(&mut self, item: &StreamItem) {
         match item.stream {
             StreamKind::Control => {
-                if let Some(g) = item.gseq {
-                    if g <= self.last_gseq {
-                        return;
-                    }
-                    self.last_gseq = g;
+                if let Some((came, _)) = &mut self.catch_up_items {
+                    *came += 1;
                 }
-                self.apply_control_at(&item.event, item.gseq);
-                self.note_capped(item);
-                if self.catch_up.is_some_and(|head| self.last_gseq >= head) {
-                    self.catch_up = None;
+                let new = item.gseq.is_none_or(|g| g > self.last_gseq);
+                if new {
+                    if let Some(g) = item.gseq {
+                        self.last_gseq = g;
+                    }
+                    self.apply_control_at(&item.event, item.gseq);
+                    self.note_capped(item);
+                }
+                // A compacted replay ends with its last item, which may come before the head.
+                let compacted = self
+                    .catch_up_items
+                    .is_some_and(|(came, items)| came >= items);
+                let ended = self.catch_up.is_some_and(|head| self.last_gseq >= head) || compacted;
+                if ended {
+                    if let Some(head) = self.catch_up.take() {
+                        self.last_gseq = self.last_gseq.max(head);
+                    }
+                    self.catch_up_items = None;
                     self.finish_restore();
                     self.ensure_focus();
                 }
-                self.sync_action();
+                if new || ended {
+                    self.sync_action();
+                }
             }
             StreamKind::Thread => {
                 self.clear_transient_on(&item.event);
                 self.track_sent(&item.event);
+                // The native account's current name, for account moves' lines (a thread on
+                // another box: its own login, not named here).
+                let (accounts, registry) = (&self.accounts, &self.registry);
                 if let Some(t) = &mut self.transcript {
-                    t.apply(&item.event);
+                    let remote = registry.get(&t.thread).is_some_and(on_remote_box);
+                    let native = |rt: &str| {
+                        accounts
+                            .runtime(rt)
+                            .map(|r| r.native.clone())
+                            .filter(|n| !remote && !n.is_empty())
+                    };
+                    t.apply_named(&item.event, &native);
+                    // The orchestrator's newest reply outlives its transcript, which the
+                    // cache of conversations may drop.
+                    if let Some((seq, text)) = &t.last_reply {
+                        let orch = registry
+                            .get(&t.thread)
+                            .is_some_and(|v| v.is_current_orchestrator());
+                        let newer = self
+                            .orch_reply
+                            .as_ref()
+                            .is_none_or(|(id, s, _)| id != &t.thread || s < seq);
+                        if orch && newer {
+                            self.orch_reply = Some((t.thread.clone(), *seq, text.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -2111,12 +3127,27 @@ impl AppState {
             // A new row lands on top: keep a selection below the top on the same row.
             if self.view.decision_sel > 0 && self.view.decision_filter.matches(&row) {
                 self.view.decision_sel = self.view.decision_sel.saturating_add(1);
+                // A selection a kept view waits to find again moves with it: this is no move
+                // of the user's ([`AppState::pending_decision`]).
+                if let Some((_, at)) = self.pending_decision.as_mut() {
+                    *at = at.saturating_add(1);
+                }
             }
             self.decisions.push(row);
         }
         self.registry.apply(ev);
+        // (Before the item goes: whether it was a stall.)
+        self.note_stall_resolved(ev);
         self.attention.apply_at(ev, gseq);
         self.usage.apply(ev);
+        // An account added, removed or checked: the label rule may say otherwise now (the
+        // replay's are in the answer asked for on connecting). Usage changes no account.
+        if self.catch_up.is_none()
+            && ev.kind().starts_with("account.")
+            && !matches!(ev.body, EventBody::AccountUsage(_))
+        {
+            self.accounts_due = true;
+        }
         self.clear_transient_on(ev);
         self.track_sent(ev);
         match &ev.body {
@@ -2157,7 +3188,38 @@ impl AppState {
                 }
             }
             EventBody::AttentionRaised(p) => self.note_delete_card(&ev.thread, p),
+            // A `!` command ended (as the hub records it, nobody else): Ctrl-C quits again.
+            EventBody::TaskUpdated(p)
+                if !p.running && twr_core::event::is_job_task(&ev.source, &ev.body) =>
+            {
+                if let Some(job) = p.task_id.strip_prefix(twr_core::event::JOB_TASK_PREFIX) {
+                    let job = job.to_string();
+                    self.shell_ended(&ev.thread, &job);
+                }
+            }
+            // A turn ended while the TUI watched: a suggestion may be due; one started: the
+            // last one goes.
+            EventBody::TurnEnded(_) if self.catch_up.is_none() => {
+                self.queue_changed(&ev.thread);
+                if let Some(turn) = ev.turn {
+                    let thread = ev.thread.clone();
+                    self.suggest_after(&thread, turn);
+                }
+            }
+            EventBody::TurnStarted(_) => {
+                self.queue_changed(&ev.thread);
+                let thread = ev.thread.clone();
+                self.suggest_drop(&thread);
+            }
+            // The thread's queue moved: read it again when it is the main pane's.
+            EventBody::TurnEnded(_)
+            | EventBody::PromptWithdrawn(_)
+            | EventBody::TurnInterrupted(_)
+            | EventBody::ThreadStopped(_)
+            | EventBody::ThreadCrashed(_) => self.queue_changed(&ev.thread),
             EventBody::ThreadDeleted(p) => self.forget_thread(&ev.thread, p),
+            EventBody::RunnerConnected(p) => self.apply_runner(true, p),
+            EventBody::RunnerDisconnected(p) => self.apply_runner(false, p),
             EventBody::ThreadRenamed(p) if self.catch_up.is_none() => {
                 self.view.status = Some(format!("{} is now {}", p.previous, p.name));
             }
@@ -2184,6 +3246,162 @@ impl AppState {
             && self.registry.list().iter().any(|t| t.is_orchestrator())
         {
             self.view.picker = None;
+        }
+    }
+
+    /// What `t`'s box token says after `@box` ([`BoxStatus::word`]): nothing for a box online
+    /// with nothing pending or a local thread; `not configured` for a box the hub's boxes
+    /// ([`AppState::boxes_known`]) do not name, and nothing for one before the TUI knows them.
+    pub fn box_word(&self, t: &ThreadView) -> Option<BoxWord> {
+        if !on_remote_box(t) {
+            return None;
+        }
+        match self.boxes.get(&t.box_name) {
+            Some(b) => b.word(),
+            None => self.boxes_known.then_some(BoxWord::NotConfigured),
+        }
+    }
+
+    /// The account `t` runs on as the UI names it ([`crate::accounts::Accounts::label_on`]):
+    /// its name while its runtime shows account labels, `<name> (removed)` for a removed
+    /// account whatever the rule (not the native account of a thread on another box: that is
+    /// the box's own login), else `None` (a single-account user sees none anywhere).
+    pub fn account_label(&self, t: &ThreadView) -> Option<String> {
+        self.accounts
+            .label_on(&t.runtime, t.account.as_deref(), on_remote_box(t))
+    }
+
+    /// An `account.list` call is to be sent: an `account.*` control event came since the last
+    /// one ([`AppState::accounts_due`]) and none is on its way (`false` then: one at a time,
+    /// and an event meanwhile asks again once its answer is in).
+    pub fn send_accounts(&mut self) -> bool {
+        if !self.accounts_due || self.accounts_pending {
+            return false;
+        }
+        self.accounts_due = false;
+        self.accounts_pending = true;
+        // (This call is the retry, if one waited.)
+        self.accounts_retry = None;
+        true
+    }
+
+    /// What an `account.list` call answered (`result`, at `now`): the accounts; `null`, a hub
+    /// older than accounts (its unknown method), none, as they were (empty from the start);
+    /// `{failed: true}`, a call that failed otherwise (an error, no answer in time), the
+    /// accounts as they were, asked for again after [`ACCOUNTS_RETRY`]'s wait
+    /// ([`AppState::accounts_retry_due`]), so the labels do not stay stale for want of an
+    /// `account.*` event.
+    pub fn accounts_answered(&mut self, result: &Value, now: Instant) {
+        self.accounts_pending = false;
+        if result["failed"].as_bool() == Some(true) {
+            let wait =
+                ACCOUNTS_RETRY[(self.accounts_failures as usize).min(ACCOUNTS_RETRY.len() - 1)];
+            self.accounts_failures = self.accounts_failures.saturating_add(1);
+            self.accounts_retry = Some(now + wait);
+            return;
+        }
+        self.accounts_failures = 0;
+        self.accounts_retry = None;
+        if !result.is_null() {
+            self.accounts = crate::accounts::Accounts::from_list(result);
+        }
+    }
+
+    /// The retry of a failed `account.list` is due at `now`: the accounts are to be asked for
+    /// again ([`AppState::accounts_due`]).
+    pub fn accounts_retry_due(&mut self, now: Instant) {
+        if self.accounts_retry.is_some_and(|at| at <= now) {
+            self.accounts_retry = None;
+            self.accounts_due = true;
+        }
+    }
+
+    /// The calls an `account.*` control event asks for ([`AppState::send_accounts`]; none
+    /// while one is on its way): `account.list`, and, before an orchestrator thread exists,
+    /// `orchestrator.show` too, whose `account` the main pane's header shows
+    /// ([`ViewState::orch_default_account`]): the native account renamed, or a pool whose
+    /// choice changed, starts the orchestrator on another account.
+    pub fn account_calls(&mut self) -> Vec<&'static str> {
+        if !self.send_accounts() {
+            return Vec::new();
+        }
+        let mut calls = vec!["account.list"];
+        if self.orchestrator().is_none() {
+            calls.push("orchestrator.show");
+        }
+        calls
+    }
+
+    /// A `hub.info` poll is to be sent, unless one is on its way (`false` then): records when
+    /// ([`AppState::info_sent`]), so its answer does not undo a live runner event that comes
+    /// after it.
+    pub fn send_info(&mut self) -> bool {
+        if self.info_pending {
+            return false;
+        }
+        self.info_pending = true;
+        self.info_sent = self.live_seq;
+        true
+    }
+
+    /// Takes the boxes of `hub.info`'s answer `info` ([`AppState::boxes`]); an answer without
+    /// them (a failed poll, an older hub) changes nothing. A box whose runner connected or
+    /// left after the poll was sent ([`AppState::box_live`]) keeps what that event said when
+    /// the answer disagrees on whether it is online (the answer is older), and stays when the
+    /// answer does not name it; otherwise the answer's entry replaces it, and a box it does not
+    /// name goes.
+    pub fn apply_boxes(&mut self, info: &Value) {
+        let Some(boxes) = info["boxes"].as_array() else {
+            return;
+        };
+        self.boxes_known = true;
+        let sent = self.info_sent;
+        let newer = |name: &str| self.box_live.get(name).is_some_and(|s| *s > sent);
+        let mut next: BTreeMap<String, BoxStatus> = BTreeMap::new();
+        for b in boxes {
+            let Some(name) = b["name"].as_str() else {
+                continue;
+            };
+            let said = BoxStatus::from_info(b);
+            let entry = match self.boxes.get(name) {
+                Some(live) if newer(name) && live.online != said.online => live.clone(),
+                _ => said,
+            };
+            next.insert(name.to_string(), entry);
+        }
+        for (name, live) in &self.boxes {
+            if !next.contains_key(name) && newer(name) {
+                next.insert(name.clone(), live.clone());
+            }
+        }
+        self.boxes = next;
+    }
+
+    /// A box's runner connected or left (`runner.connected` / `runner.disconnected`), told
+    /// before the next `hub.info` poll: the box is online, or offline. A box being switched
+    /// stays `switching` while its runner is away; one that comes back is on its new build.
+    /// Not during the replay: those are past connections, and `hub.info` says the present.
+    fn apply_runner(&mut self, connected: bool, runner: &twr_core::event::RunnerPayload) {
+        if self.catch_up.is_some() {
+            return;
+        }
+        self.live_seq += 1;
+        self.box_live.insert(runner.box_name.clone(), self.live_seq);
+        let b = self.boxes.entry(runner.box_name.clone()).or_default();
+        if connected {
+            if b.state == "switching" {
+                b.switch_pending = false;
+            }
+            b.state = "online".into();
+            b.online = true;
+            b.version = runner.version.clone().or(b.version.take());
+            b.refused = None;
+            b.protocol_mismatch = false;
+        } else {
+            if b.state != "switching" {
+                b.state = "offline".into();
+            }
+            b.online = false;
         }
     }
 
@@ -2298,11 +3516,27 @@ impl AppState {
     /// listing the items it names, and `y` purges exactly those, by id.
     pub fn apply_result(&mut self, method: &'static str, result: &Value) {
         match method {
-            "say" | "thread.send" | "message.withdraw" if self.restoring.is_some() => {
+            "say" | "thread.send" | "message.withdraw" | "shell.run" | "shell.cd"
+            | "job.cancel"
+                if self.restoring.is_some() =>
+            {
                 self.deferred.push((method, result.clone()));
             }
             "say" | "thread.send" => self.sent_result(result),
             "message.withdraw" => self.withdraw_result(result),
+            "thread.queue" => self.queue_result(result, Instant::now()),
+            "message.send_now" => self.send_now_result(result),
+            "shell.run" => self.shell_started(result),
+            "shell.cd" => self.shell_moved(result),
+            "job.log" => self.shell_log(result, Instant::now()),
+            "job.cancel" => self.shell_cancel_result(result),
+            "suggest.next" => self.suggest_result(result),
+            "speech.status" | "speech.request" | "speech.control" => {
+                if let Some(msg) = self.speech.answered(method, result) {
+                    self.view.status = Some(msg);
+                }
+            }
+            "config.show" => self.settings_hub(result),
             // Only a successful reset requested by this TUI leaves its worker dive.
             // A reset from another client must not change where an unsent draft goes.
             "orchestrator.reset" => {
@@ -2321,9 +3555,23 @@ impl AppState {
                 self.view.trash_scroll = 0;
                 self.view.status = None;
             }
+            // An older hub's answer arrives as null, another failure as `{failed: true}`: the
+            // accounts stay as they were, asked for again after a failure.
+            "account.list" => self.accounts_answered(result, Instant::now()),
+            // The orchestrator the hub would start, asked for again after an account change
+            // ([`AppState::account_calls`]). A failed call arrives as null: what was known
+            // stays.
+            "orchestrator.show" => {
+                if let Some(rt) = result["runtime"].as_str() {
+                    let model = result["model"].as_str().map(str::to_string);
+                    self.view.orch_default = Some((rt.to_string(), model));
+                    self.view.orch_default_account = result["account"].as_str().map(str::to_string);
+                    self.view.default_runtime = default_runtime(result);
+                }
+            }
             // A failed poll arrives as null: nothing changes but the next poll.
             "hub.info" => {
-                self.disk_pending = false;
+                self.info_pending = false;
                 if let Some(disk) = result["disk"].as_object() {
                     self.disk_low = disk
                         .iter()
@@ -2331,6 +3579,8 @@ impl AppState {
                         .filter_map(|(b, d)| Some((b.clone(), d["free"].as_u64()?)))
                         .collect();
                 }
+                self.apply_boxes(result);
+                self.apply_suggest_info(result);
             }
             // A failed call arrives as null: only the next poll is let go.
             "thread.activity" => {
@@ -2344,6 +3594,7 @@ impl AppState {
                                 activity: text(&a["activity"]).unwrap_or_default(),
                                 said: text(&a["said"]),
                                 task: text(&a["task"]),
+                                work: serde_json::from_value(a["work"].clone()).ok(),
                             };
                             (id.clone(), activity)
                         })
@@ -2409,6 +3660,7 @@ impl AppState {
             ),
             pending,
             alt: None,
+            offer: false,
         });
     }
 
@@ -2479,9 +3731,18 @@ impl AppState {
 
     /// Brings the cards as shown ([`ViewState::shown_cards`]) up to date at `now`
     /// ([`crate::order::settle`]): what moves at once shows, the rest is applied once it has
-    /// waited and the cards are not held ([`AppState::cards_held`]). The IO loop calls it
+    /// waited and the cards are not held ([`AppState::cards_held`]). The cards that waited to
+    /// shrink and are due do, together ([`crate::order::Fit::settle`]). The IO loop calls it
     /// before each draw and at [`AppState::order_deadline`].
     pub fn settle_order(&mut self, now: Instant) {
+        self.view.settled = Some(now);
+        if self.catch_up.is_none() {
+            let held = self.cards_held(now);
+            let registry = &self.registry;
+            for ((_, id), fit) in &mut self.view.card_fit {
+                fit.settle(now, held, card_working(registry, id));
+            }
+        }
         if self.view.card_order != CardOrder::Stable {
             self.view.shown_cards = None;
             return;
@@ -2500,12 +3761,24 @@ impl AppState {
         ));
     }
 
-    /// When [`AppState::settle_order`] may next have a move to apply: when the waiting one is
-    /// due, or, while the mouse holds the cards, when its hold ends; `None` with nothing
-    /// waiting, or while a selection or popup holds them (a key or click ends that, and the
-    /// loop settles before it draws).
+    /// When [`AppState::settle_order`] may next have a move or a card's shrink to apply: when
+    /// the first waiting one is due, or, while the mouse holds the cards, when its hold ends;
+    /// `None` with nothing waiting, or while a selection or popup holds them (a key or click
+    /// ends that, and the loop settles before it draws).
     pub fn order_deadline(&self, now: Instant) -> Option<Instant> {
-        let pending = self.view.shown_cards.as_ref()?.pending.as_ref()?;
+        let moves = self
+            .view
+            .shown_cards
+            .as_ref()
+            .and_then(|s| s.pending.as_ref())
+            .map(crate::order::Pending::due);
+        let shrinks = self
+            .view
+            .card_fit
+            .iter()
+            .filter_map(|((_, id), f)| f.due(card_working(&self.registry, id)))
+            .min();
+        let due = moves.into_iter().chain(shrinks).min()?;
         if self.cards_held_by_selection() || self.catch_up.is_some() {
             return None;
         }
@@ -2515,7 +3788,7 @@ impl AppState {
                 .pointer
                 .map(|(_, _, at)| at + crate::order::HOVER_HOLD);
         }
-        Some(pending.due())
+        Some(due)
     }
 
     /// Whether the cards are held in their order at `now`: a card or tile is drawn selected,
@@ -2529,10 +3802,7 @@ impl AppState {
         let card = self.view.focus.as_deref().is_some_and(|f| {
             f == HUB_THREAD || self.registry.get(f).is_some_and(|t| !t.is_orchestrator())
         });
-        let selected = card
-            && self.view.screen != Screen::Decisions
-            && !self.main_focused()
-            && !self.forced_focus();
+        let selected = card && self.view.screen != Screen::Decisions && !self.main_focused();
         // The detail view as last drawn: an item too long for its card or popup.
         selected || self.view.action.is_some() || self.view.panes.card.is_some()
     }
@@ -2548,15 +3818,6 @@ impl AppState {
                     .list
                     .is_some_and(|l| l.area.contains((x, y).into()))
         })
-    }
-
-    /// Whether `id`'s card is as tall as one with an item: it has one, or shows as needing
-    /// you until the order is next applied ([`crate::order::Layout::attention`]).
-    pub fn card_tall(&self, id: &str) -> bool {
-        self.top_attention(id).is_some()
-            || self
-                .shown_layout()
-                .is_some_and(|l| l.attention.contains_key(id))
     }
 
     /// Whether the card listing leaves out worker `t`: hidden parked threads, or inactive
@@ -2629,25 +3890,30 @@ impl AppState {
         self.ensure_focus();
     }
 
-    /// Sidebar controls always return to the conversation; grid tiles are not a sidebar.
-    fn set_sidebar(&mut self, on: bool) {
-        if self.view.screen != Screen::Stack {
-            self.show(Screen::Stack);
-        }
+    /// Ctrl-B, Ctrl-T, `/sidebar`, `/spaces`, the setting, a tap on the sidebar's `‹` or the
+    /// tab strip's `≡`: shows (`on`) or hides the sidebar, the one there is (the workspaces with
+    /// their threads, [`crate::sidebar`]), in whatever view, kept across runs
+    /// ([`Action::WsSidebar`]). The card selected as it hides is selected again as it shows.
+    pub(crate) fn set_sidebar(&mut self, on: bool) -> Vec<Action> {
         if on && self.view.sidebar_hidden {
+            // Only where hiding it let the selection go (the stack view's cards): the grid's
+            // tiles kept theirs, and a tile selected since stays.
             let focus = self.view.sidebar_focus.take();
-            self.set_focus(focus);
+            if self.view.focus.is_none() {
+                self.set_focus(focus);
+            }
         } else if !on && !self.view.sidebar_hidden {
             self.view.sidebar_focus = self.view.focus.clone();
         }
         self.view.sidebar_hidden = !on;
         self.view.shown = None;
         self.view.status = Some(if on {
-            "thread sidebar shown (Ctrl-B hides it)".into()
+            "Threads sidebar shown (Ctrl-B hides it)".into()
         } else {
-            "thread sidebar hidden (Ctrl-B shows it)".into()
+            "Threads sidebar hidden (Ctrl-B shows it)".into()
         });
         self.ensure_focus();
+        vec![Action::WsSidebar(on)]
     }
 
     /// The current orchestrator's id while it has open attention items: its banner in the
@@ -2674,12 +3940,14 @@ impl AppState {
     }
 
     /// Whether the compact layout is on: `/compact` says so, else the screen is narrower than
-    /// `[tui] compact_width`.
+    /// `[tui] compact_width`, or (that not 0) shorter than [`COMPACT_HEIGHT`] rows: a phone on
+    /// its side with its keyboard open, too short for the cards beside the view.
     pub fn compact(&self) -> bool {
         self.view.compact.unwrap_or(
             self.view.compact_width > 0
                 && self.view.width > 0
-                && self.view.width < self.view.compact_width,
+                && (self.view.width < self.view.compact_width
+                    || (self.view.height > 0 && self.view.height < COMPACT_HEIGHT)),
         )
     }
 
@@ -2710,19 +3978,30 @@ impl AppState {
             .sum()
     }
 
-    /// Whether a compact layout's list shows (not its conversation): its rows are what is
-    /// selected, nothing else.
+    /// Whether a compact layout's list of threads shows (not its conversation, nor the
+    /// workspaces): its rows are what is selected, nothing else.
     pub fn compact_listed(&self) -> bool {
         self.compact()
             && self.view.screen != Screen::Decisions
-            && self.view.compact_pane != CompactPane::Chat
+            && matches!(
+                self.view.compact_pane,
+                CompactPane::Needs | CompactPane::Threads
+            )
     }
 
     /// Shows compact screen `pane`, its list's selection kept when it is in it.
-    fn show_pane(&mut self, pane: CompactPane) {
+    pub(crate) fn show_pane(&mut self, pane: CompactPane) {
+        if pane == CompactPane::Threads {
+            // No workspace's card selected: the arrows start from the current one.
+            self.view.ws_sel = None;
+        }
         self.view.compact_pane = pane;
         self.view.action = None;
         self.view.shown = None;
+        // The queue is listed in the conversation tab only: a row of it stays selected there.
+        if pane != CompactPane::Chat {
+            self.view.queued = None;
+        }
         // A list's selection is a card: nothing of the conversation stays selected, and its
         // first row is selected when none of its rows is.
         self.fit_compact();
@@ -2753,6 +4032,7 @@ impl AppState {
         self.view.main_focus = false;
         self.view.request = None;
         self.view.block = None;
+        self.view.queued = None;
         self.set_focus(Some(first));
         if let Some(target) = self.selection_target() {
             self.open_action(target);
@@ -2783,6 +4063,11 @@ impl AppState {
         let main = self.main_thread();
         if self.transcript.as_ref().map(|t| &t.thread) == main.as_ref() {
             return;
+        }
+        // Another thread on the main pane: a double Esc armed for the one before is for no
+        // view any more, even once that one shows again.
+        if let Some(s) = self.sent.as_mut() {
+            s.armed = None;
         }
         self.follow();
         self.view.expanded.clear();
@@ -2869,11 +4154,7 @@ impl AppState {
     }
 
     /// Back to the orchestrator conversation (also a dive the hub ended: a reset, a delete).
-    /// The selection a narrow dive forced on its own card ([`AppState::forced_focus`]) goes.
     pub fn back(&mut self) {
-        if self.forced_focus() {
-            self.set_focus(None);
-        }
         self.view.dive = None;
         self.view.focus_before_dive = None;
         self.view.screen = Screen::Stack;
@@ -2888,7 +4169,7 @@ impl AppState {
     /// the card selected when the dive began selected again, unless another card was selected
     /// during the dive (or that card is gone).
     fn leave_dive(&mut self) {
-        let untouched = self.view.focus.is_none() || self.forced_focus();
+        let untouched = self.view.focus.is_none();
         let before = self
             .view
             .focus_before_dive
@@ -2903,13 +4184,6 @@ impl AppState {
                 self.set_focus(Some(before));
             }
         }
-    }
-
-    /// Whether the selection is the one a narrow dive puts on its own card while the cards
-    /// are hidden ([`AppState::note_panes`]), not one the user made: Esc does not release it,
-    /// it leaves the dive.
-    pub fn forced_focus(&self) -> bool {
-        self.dive_hides_cards() && self.view.focus == self.view.dive
     }
 
     /// Tile ids in grid order: [`AppState::order`] with parked threads moved (in order) to the
@@ -2931,6 +4205,21 @@ impl AppState {
     /// Selection order of the current screen: what it draws that can be selected. The
     /// decisions screen draws no card: nothing.
     pub fn nav_order(&self) -> Vec<String> {
+        let mut nav = self.nav_listed();
+        // A column of cards too short for one (as last drawn): none of its cards.
+        if self.view.panes.no_cards {
+            let column = if self.compact() {
+                self.compact_threads()
+            } else {
+                self.order()
+            };
+            nav.retain(|id| !column.contains(id));
+        }
+        nav
+    }
+
+    /// [`AppState::nav_order`] by what the screen lists, drawn or not.
+    fn nav_listed(&self) -> Vec<String> {
         // The compact layout's lists are what its keys move through.
         if self.compact() && self.view.screen != Screen::Decisions {
             match self.view.compact_pane {
@@ -2986,7 +4275,7 @@ impl AppState {
     /// `/decisions`: opens the decisions overlay over the current screen, or closes it, back
     /// to the screen it was opened from. What that screen had selected, and a dive, stay as
     /// they were.
-    fn toggle_decisions(&mut self) {
+    pub(crate) fn toggle_decisions(&mut self) {
         self.view.action = None;
         self.view.card_scroll = None;
         if self.view.screen == Screen::Decisions {
@@ -3000,9 +4289,6 @@ impl AppState {
 
     /// Leaving the stack view ends a dive: typed lines go to the orchestrator again.
     fn end_dive(&mut self) {
-        if self.forced_focus() {
-            self.set_focus(None);
-        }
         self.view.focus_before_dive = None;
         if self.view.dive.take().is_some() {
             self.sync_main();
@@ -3113,6 +4399,13 @@ impl AppState {
             .collect()
     }
 
+    /// Whether the stack view's worker cards are out of sight: the sidebar hidden, or, as last
+    /// drawn, with no room for them ([`crate::select::Panes::no_cards`]). A request in the
+    /// conversation is then selected alone, its thread's card not.
+    fn cards_unseen(&self) -> bool {
+        self.view.sidebar_hidden || (self.view.panes.no_cards && !self.compact())
+    }
+
     /// The worker request selected in the main conversation (Shift-↑/↓ with the main pane
     /// selected, a click), while it is open. With the sidebar shown its thread's card is
     /// selected with it. With the sidebar hidden its thread has no card: the request, drawn in
@@ -3129,7 +4422,7 @@ impl AppState {
             matches!(
                 i.reason,
                 AttentionReason::Permission | AttentionReason::Question
-            ) && (self.view.sidebar_hidden
+            ) && (self.cards_unseen()
                 || self.view.main_focus
                 || self.focused() == Some(i.thread.as_str()))
                 && self
@@ -3158,6 +4451,10 @@ impl AppState {
     /// The item the selection's action popup answers: the request selected in the
     /// conversation, else the top item of the card it is about ([`AppState::selected_card`]).
     pub fn selected_attention(&self) -> Option<&AttentionItem> {
+        // A queued message selected has no item: its popup never answers the card's.
+        if self.view.queued.is_some() {
+            return None;
+        }
         // A resolved inline selection must not silently become another item's answer.
         if self.view.request.is_some() {
             self.selected_request()
@@ -3171,10 +4468,11 @@ impl AppState {
             return;
         };
         let thread = item.thread.clone();
+        self.view.queued = None;
         // With the sidebar hidden its thread has no card to select: the selection stays what
         // it was (none, or the orchestrator's card), see [`AppState::selected_request`]. So
         // with the conversation selected: the card it keeps is the one Shift-→ returns to.
-        if !self.view.sidebar_hidden && !self.main_focused() {
+        if !self.cards_unseen() && !self.main_focused() {
             self.set_focus(Some(thread));
         }
         self.view.request = Some(id.into());
@@ -3182,6 +4480,31 @@ impl AppState {
         self.view.shown = None;
         self.view.scroll = crate::ui::request_scroll(self, id);
         self.view.anchor = None;
+    }
+
+    /// The thread `name` names exactly, as a box or an update names one: its name, id, an alias
+    /// or a name it had before it was renamed (a box written before the rename); no prefix
+    /// match. A live thread first; else a deleted one ([`Registry::deleted_view`]) by its id,
+    /// or the only deleted thread `name` names, so what was said of it keeps its name and
+    /// color after it is gone ([`twr_core::reduce::Registry::is_deleted`] tells which).
+    pub fn thread_named(&self, name: &str) -> Option<&ThreadView> {
+        let names = |t: &ThreadView| {
+            t.name == name
+                || t.id == name
+                || t.aliases.iter().any(|a| a == name)
+                || t.former_names.iter().any(|n| n == name)
+        };
+        if let Some(t) = self.registry.resolve(name).ok().filter(|t| names(t)) {
+            return Some(t);
+        }
+        if let Some(t) = self.registry.deleted_view(name) {
+            return Some(t);
+        }
+        let mut gone = self.registry.deleted_views().filter(|t| names(t));
+        match (gone.next(), gone.next()) {
+            (Some(t), None) => Some(t),
+            _ => None,
+        }
     }
 
     /// The current orchestrator thread's view (none retired), if one exists.
@@ -3202,6 +4525,32 @@ impl AppState {
     /// orchestrator's banner in a dive or the grid, a card scrolled away, a card too short for
     /// its options, anything under an overlay) is never answered.
     pub fn note_drawn(&mut self, now: Instant) {
+        // A notice told once, drawn whole in the status bar (not cut, not under an overlay),
+        // or its short form where the bar had no room for the whole one: told.
+        if let Some((what, text)) = &self.once {
+            let short = self
+                .once_short
+                .as_ref()
+                .filter(|(t, _)| t == text)
+                .map(|(_, short)| short.as_str());
+            let drawn = self
+                .view
+                .panes
+                .status
+                .as_ref()
+                .is_some_and(|(t, _)| t == text || Some(t.as_str()) == short);
+            if drawn && self.view.status.as_deref() == Some(text) {
+                self.seen.told(what);
+                self.seen_dirty = true;
+                self.once = None;
+            }
+        }
+        // The suggested message on screen: since when (Tab or → takes it only once read).
+        if self.shown_suggestion().is_some() {
+            if let Some(s) = self.suggestion.as_mut().filter(|s| s.shown.is_none()) {
+                s.shown = Some(now);
+            }
+        }
         // The question waiting for `y`, as drawn with its `yes`: since when it has been.
         let yes = self
             .view
@@ -3238,6 +4587,13 @@ impl AppState {
                 *seen = true;
             }
         }
+        // On a phone, which text the action popup and the question waiting for `y` scroll.
+        if let Some(w) = self.view.panes.sheet.clone() {
+            self.view.sheet_view.note(&w);
+        }
+        if let Some(w) = self.view.panes.ask.clone() {
+            self.view.ask_view.note(&w);
+        }
         // Never an item known only by its capped preview ([`Incomplete`]).
         let top = self
             .selected_attention()
@@ -3264,8 +4620,9 @@ impl AppState {
             (None, _) => None,
         };
         // A row a tap armed stays armed only while the item it was armed on is the popup's and
-        // on screen in full: once another item took its place, or it was cut short or covered,
-        // even for a frame, it has to be picked again.
+        // on screen in full, on a screen of the same size: once another item took its place,
+        // or it was cut short or covered, even for a frame, or the screen was resized (its rows
+        // moved), it has to be picked again.
         let item = self
             .selected_attention()
             .map(|i| (i.attn_id.clone(), i.revision));
@@ -3277,12 +4634,14 @@ impl AppState {
                 .as_ref()
                 .is_some_and(|s| s.attn_id == *id && s.revision == *rev),
         };
+        let size = (self.view.width, self.view.height);
         if let Some(p) = self.view.action.as_mut() {
             if p.armed
                 .as_ref()
-                .is_some_and(|(_, armed)| *armed != item || !on_screen)
+                .is_some_and(|(_, armed)| *armed != item || !on_screen || p.armed_at != size)
             {
                 p.armed = None;
+                p.hint = None;
             }
         }
     }
@@ -3351,27 +4710,15 @@ impl AppState {
     pub fn set_focus(&mut self, thread: Option<String>) {
         self.view.request = None;
         self.view.block = None;
+        self.view.queued = None;
         self.view.detail = None;
-        // Another card selected: the cards follow the selection again.
+        // Another card selected: the cards (and the compact Threads screen's list, which the
+        // wheel may have moved) follow the selection again.
         if self.view.focus != thread {
             self.view.card_scroll = None;
+            self.view.ws_wheeled = false;
         }
         self.view.focus = thread;
-    }
-
-    /// Whether a dive hides the cards: in the stack view on a screen too narrow for their
-    /// column (as last drawn), where they would be a row above it. The dive's own card is the
-    /// selected one meanwhile ([`AppState::note_panes`]), and no key selects another.
-    pub fn dive_hides_cards(&self) -> bool {
-        // The compact layout's lists show the cards whatever the dive.
-        if self.compact() && self.view.compact_pane != CompactPane::Chat {
-            return false;
-        }
-        // Not before the first draw: no width yet.
-        self.view.dive.is_some()
-            && self.view.screen == Screen::Stack
-            && !self.view.sidebar_hidden
-            && (1..crate::ui::SIDE_MIN_WIDTH).contains(&self.view.width)
     }
 
     /// Whether the main pane is selected ([`ViewState::main_focus`]): only in the stack view,
@@ -3396,11 +4743,7 @@ impl AppState {
     /// not any more; the view stays where it is.
     fn focus_cards(&mut self) {
         if self.view.sidebar_hidden {
-            self.view.status = Some("the thread sidebar is hidden (Ctrl-B shows it)".into());
-            return;
-        }
-        if self.dive_hides_cards() {
-            self.view.status = Some(DIVE_HIDES_CARDS.into());
+            self.view.status = Some("the Threads sidebar is hidden (Ctrl-B shows it)".into());
             return;
         }
         self.view.main_focus = false;
@@ -3416,11 +4759,6 @@ impl AppState {
     /// Selects the card `delta` places after the selected one in the current view's order,
     /// wrapping around; with none selected, the first (forward) or the last (backward).
     fn move_focus(&mut self, delta: isize) {
-        let listed = self.compact() && self.view.compact_pane != CompactPane::Chat;
-        if self.dive_hides_cards() && !listed {
-            self.view.status = Some(DIVE_HIDES_CARDS.into());
-            return;
-        }
         let order = self.nav_order();
         if order.is_empty() {
             return;
@@ -3448,7 +4786,9 @@ impl AppState {
             .focused()
             .and_then(|f| order.iter().position(|id| id == f))
         {
-            Some(cur) => grid_step_vertical(cur, order.len(), grid_columns(self.view.width), down),
+            Some(cur) => {
+                grid_step_vertical(cur, order.len(), grid_columns(self.content_width()), down)
+            }
             None if down => 0,
             None => order.len() - 1,
         };
@@ -3519,12 +4859,14 @@ impl AppState {
             prompt: format!("{verb} {name}? y to confirm, any other key cancels"),
             pending: format!("{verb} {name}: waiting for the hub"),
             alt: None,
+            offer: false,
         });
     }
 
-    /// Asks for `y` before switching the orchestrator (`/orch`, or the picker `/orch` opens);
-    /// `s` switches without the current orchestrator's summary.
-    fn confirm_switch(&mut self, runtime: String, model: Option<String>) {
+    /// Asks for `y` before switching the orchestrator (`/orch`, or the picker `/orch` opens) to
+    /// runtime spec `runtime`, which the prompt calls `shown` (a picker row's display,
+    /// [`orch_label`]); `s` switches without the current orchestrator's summary.
+    fn confirm_switch(&mut self, runtime: String, shown: &str, model: Option<String>) {
         let with = model
             .as_deref()
             .map(|m| format!(" ({m})"))
@@ -3532,12 +4874,12 @@ impl AppState {
         self.view.status = None;
         self.view.confirm = Some(Confirm {
             prompt: format!(
-                "switch the orchestrator to {runtime}{with}? A new session that starts with a \
+                "switch the orchestrator to {shown}{with}? A new session that starts with a \
                  handoff. y: with the current one's summary (waits up to 60s if it is busy) · \
                  s: without it · any other key cancels"
             ),
             pending: format!(
-                "switching the orchestrator to {runtime}: asking the current one for a handoff \
+                "switching the orchestrator to {shown}: asking the current one for a handoff \
                  summary (up to 60s if it is busy)"
             ),
             alt: Some((
@@ -3547,10 +4889,9 @@ impl AppState {
                     model: model.clone(),
                     summary: false,
                 },
-                format!(
-                    "switching the orchestrator to {runtime} (no summary): waiting for the hub"
-                ),
+                format!("switching the orchestrator to {shown} (no summary): waiting for the hub"),
             )),
+            offer: false,
             action: Action::UseOrchestrator {
                 runtime,
                 model,
@@ -3651,7 +4992,7 @@ impl AppState {
                 let view = self.registry.get(&thread);
                 if model.is_none() && effort.is_none() && runtime.is_none() {
                     self.view.status = Some(match view {
-                        Some(t) => model_show(t),
+                        Some(t) => model_show(t, self.account_label(t).as_deref()),
                         None => format!("no thread {thread}"),
                     });
                     return (Vec::new(), true);
@@ -3706,9 +5047,13 @@ impl AppState {
                     prompt: "Clear the orchestrator conversation? History stays in the log; workers stay. [y/N]".into(),
                     pending: "clearing the orchestrator conversation...".into(),
                     alt: None,
+                    offer: false,
                 });
             }
-            Slash::Orch { runtime, model } => self.confirm_switch(runtime, model),
+            Slash::Orch { runtime, model } => {
+                let shown = runtime.clone();
+                self.confirm_switch(runtime, &shown, model)
+            }
             Slash::OrchPick => self.open_orch_picker(),
             Slash::Grid => self.toggle_grid(),
             Slash::Decisions => self.toggle_decisions(),
@@ -3723,6 +5068,8 @@ impl AppState {
                 project,
                 runtime,
                 name,
+                account,
+                outside_pin,
             } => {
                 self.view.status = Some(format!("creating a thread in {project}..."));
                 return (
@@ -3730,9 +5077,31 @@ impl AppState {
                         project,
                         runtime,
                         name,
+                        account,
+                        outside_pin,
                     }],
                     true,
                 );
+            }
+            Slash::Account {
+                thread,
+                account,
+                outside_pin,
+            } => return self.slash_account(thread, account, outside_pin),
+            Slash::AccountAdd { runtime, name } => {
+                // Its login needs a terminal, which the TUI cannot hand over.
+                self.view.status = Some(format!(
+                    "to add the account, run in another terminal: twr{} account add {runtime} \
+                     {name}",
+                    self.attach_via
+                ));
+            }
+            Slash::Accounts => {
+                self.view.status = Some(if self.accounts.runtimes.is_empty() {
+                    "no accounts known: the hub is older than accounts".into()
+                } else {
+                    format!("accounts: {}", self.accounts.summary())
+                });
             }
             Slash::Park(q) => {
                 self.confirm_lifecycle_of(true, q.as_deref());
@@ -3768,6 +5137,18 @@ impl AppState {
                 self.view.status = Some(format!("trim {name}: deleting its build output"));
                 return (vec![Action::Trim { thread }], true);
             }
+            Slash::CompactContext(q) => {
+                let t = match self.thread_arg(q.as_deref()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        self.view.status = Some(e);
+                        return (Vec::new(), false);
+                    }
+                };
+                let (thread, name) = (t.id.clone(), t.name.clone());
+                self.view.status = Some(format!("compact {name}'s context: waiting for the hub"));
+                return (vec![Action::CompactContext { thread }], true);
+            }
             Slash::Stop(q) => {
                 let Some((thread, name)) = thread(self, &q) else {
                     return (Vec::new(), false);
@@ -3778,6 +5159,7 @@ impl AppState {
                     prompt: format!("stop {name}? y to confirm, any other key cancels"),
                     pending: format!("stop {name}: waiting for the hub"),
                     alt: None,
+                    offer: false,
                 });
             }
             Slash::Delete(qs) => {
@@ -3811,7 +5193,7 @@ impl AppState {
                 return (vec![Action::TrashRestore { item, as_name }], true);
             }
             Slash::Parked(on) => self.show_parked(on.unwrap_or(!self.view.show_parked)),
-            Slash::Sidebar(on) => self.set_sidebar(on.unwrap_or(self.view.sidebar_hidden)),
+            Slash::Sidebar(on) | Slash::Spaces(on) => return (self.spaces(on), true),
             Slash::Compact(on) => {
                 let on = on.unwrap_or(!self.compact());
                 self.view.compact = Some(on);
@@ -3834,6 +5216,14 @@ impl AppState {
                 }
             }
             Slash::Focus(on) => self.set_focus_mode(on.unwrap_or(!self.view.focus_mode)),
+            Slash::Suggest(on) => {
+                self.toggle_suggest(on);
+                return (Vec::new(), true);
+            }
+            Slash::Summaries(on) => {
+                self.toggle_summaries(on);
+                return (Vec::new(), true);
+            }
             Slash::Mouse(on) => {
                 let on = on.unwrap_or(!self.view.mouse);
                 self.view.mouse = on;
@@ -3859,8 +5249,207 @@ impl AppState {
             }
             Slash::Ws(None) => self.view.status = Some(self.workspaces_line()),
             Slash::Ws(Some(name)) => return (self.switch_workspace(&name), true),
+            Slash::WsNew(name) => return (self.open_new_ws(name.as_deref()), true),
+            Slash::Settings => return (self.open_settings(), true),
+            Slash::Read { cmd, on } => return self.read_aloud(cmd, on),
         }
         (Vec::new(), true)
+    }
+
+    /// `/account [thread] [name] [--outside-pin]`: shows the account the thread runs on (in
+    /// the status bar: `api: claude-code account work (logged in)`, or `api: claude-code (one
+    /// account)`), or asks the hub to move it to account `name`. In a dive, one word is the
+    /// account to move the dived thread to, unless it names a thread and no account of the
+    /// dived thread's runtime.
+    fn slash_account(
+        &mut self,
+        thread: Option<String>,
+        account: Option<String>,
+        outside_pin: bool,
+    ) -> (Vec<Action>, bool) {
+        let usage = "usage: /account [thread] [name] [--outside-pin] (in a dive: /account [name])";
+        let (thread, account) = match (thread, account, self.dived()) {
+            (Some(one), None, Some(d)) => {
+                let an_account = self.accounts.account(&d.runtime, Some(&one)).is_some();
+                if an_account || self.thread_arg(Some(&one)).is_err() || outside_pin {
+                    (None, Some(one))
+                } else {
+                    (Some(one), None)
+                }
+            }
+            other => (other.0, other.1),
+        };
+        if outside_pin && account.is_none() {
+            self.view.status = Some(usage.into());
+            return (Vec::new(), false);
+        }
+        let t = match self.thread_arg(thread.as_deref()) {
+            Ok(t) => t,
+            Err(e) => {
+                let e = if thread.is_none() {
+                    format!("{e}; {usage}")
+                } else {
+                    e
+                };
+                self.view.status = Some(e);
+                return (Vec::new(), false);
+            }
+        };
+        let Some(account) = account else {
+            self.view.status = Some(self.account_show(t));
+            return (Vec::new(), true);
+        };
+        let (id, name) = (t.id.clone(), t.name.clone());
+        self.view.status = Some(format!("{name} → account {account}: waiting for the hub"));
+        (
+            vec![Action::SetAccount {
+                thread: id,
+                account,
+                outside_pin,
+            }],
+            true,
+        )
+    }
+
+    /// What `/account <thread>` says of a thread: the account it runs on with its login, when
+    /// its runtime has more than one account (`api: claude-code account work (logged in)`;
+    /// `(removed)` for a removed one), else `api: claude-code (one account)`. The accounts
+    /// are the hub's machine's: a thread on another box on the native account runs on that
+    /// box's own login (`api: claude-code (the box's own login)`), whatever they say.
+    pub fn account_show(&self, t: &ThreadView) -> String {
+        let rt = if t.runtime.is_empty() {
+            "?"
+        } else {
+            t.runtime.as_str()
+        };
+        if on_remote_box(t) && t.account.is_none() {
+            return format!("{}: {rt} (the box's own login)", t.name);
+        }
+        let entry = self.accounts.runtime(&t.runtime);
+        let listed = self.accounts.account(&t.runtime, t.account.as_deref());
+        let several = entry.is_some_and(|r| r.accounts.iter().filter(|a| !a.removed).count() > 1);
+        // (A named account the list no longer has is removed too, as the hub says.)
+        let gone = t.account.is_some()
+            && listed.is_none()
+            && entry.is_some_and(|r| !r.accounts.is_empty());
+        let removed = gone || listed.is_some_and(|a| a.removed);
+        if !several && !removed && t.account.is_none() {
+            return format!("{}: {rt} (one account)", t.name);
+        }
+        let name = t
+            .account
+            .clone()
+            .unwrap_or_else(|| entry.map_or_else(|| "default".into(), |r| r.native.clone()));
+        let state = match listed {
+            _ if gone => "removed".to_string(),
+            Some(a) => a.state_text(),
+            None => String::new(),
+        };
+        match state {
+            s if s.is_empty() => format!("{}: {rt} account {name}", t.name),
+            s => format!("{}: {rt} account {name} ({s})", t.name),
+        }
+    }
+
+    /// `/read ...` ([`slash::ReadCmd`]) on `on` (a speaker; `None`: every one), as a
+    /// `speech.*` call ([`crate::speech`]); `/read status` says what the last poll said. Never
+    /// a message. A command that can't go stays on the line, its error in the status bar.
+    fn read_aloud(&mut self, cmd: slash::ReadCmd, on: Option<String>) -> (Vec<Action>, bool) {
+        use crate::speech::{control, request};
+        use slash::ReadCmd;
+        use twr_core::speech::CtlOp;
+        let action = match cmd {
+            ReadCmd::Status => {
+                self.view.status = Some(self.speech.listing());
+                return (Vec::new(), true);
+            }
+            // In a dive, the thread's messages; else, or with --orch, the orchestrator's.
+            ReadCmd::Last { n, orch } => {
+                let thread = self.view.dive.clone().filter(|_| !orch);
+                Ok(request(thread, Some(n), None, on))
+            }
+            ReadCmd::This => self
+                .selected_message()
+                .map(|(thread, seq)| request(Some(thread), None, Some(seq), on)),
+            ReadCmd::On | ReadCmd::Off => {
+                control(CtlOp::Live, Some(Value::Bool(cmd == ReadCmd::On)), on)
+            }
+            ReadCmd::Stop => control(CtlOp::Stop, None, on),
+            ReadCmd::Pause => control(CtlOp::Pause, None, on),
+            ReadCmd::Resume => control(CtlOp::Resume, None, on),
+            ReadCmd::Skip => control(CtlOp::Skip, None, on),
+            ReadCmd::Voice(v) => control(CtlOp::Voice, Some(Value::String(v)), on),
+            ReadCmd::Rate(r) => control(CtlOp::Rate, Some(r.into()), on),
+        };
+        match action {
+            Ok(a) => {
+                self.view.status = None;
+                (vec![a], true)
+            }
+            Err(e) => {
+                self.view.status = Some(e);
+                (Vec::new(), false)
+            }
+        }
+    }
+
+    /// The message selected in the conversation (a long block, Shift-↑/↓): its thread and the
+    /// seq of its final text, for `/read this`. The error, for the status bar, says why there
+    /// is none.
+    fn selected_message(&self) -> Result<(String, u64), String> {
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        let (Some(key), Some(t)) = (self.view.block.as_deref(), self.transcript.as_ref()) else {
+            return Err(pick.into());
+        };
+        // `block:<thread>:text:<seq or #index>[:<section>]` ([`crate::ui`]'s block keys).
+        let Some(id) = key
+            .strip_prefix("block:")
+            .and_then(|k| k.strip_prefix(t.thread.as_str()))
+            .and_then(|k| k.strip_prefix(":text:"))
+            .and_then(|k| k.split(':').next())
+        else {
+            return Err(pick.into());
+        };
+        let (entries, _) = t.visible();
+        let found = entries.iter().enumerate().find_map(|(i, e)| match e {
+            Entry::Text {
+                seq,
+                open,
+                final_seq,
+                ..
+            } if (*seq == 0 && id == format!("#{i}")) || (*seq != 0 && id == seq.to_string()) => {
+                Some((*open, *final_seq))
+            }
+            _ => None,
+        });
+        match found {
+            None => Err(pick.into()),
+            Some((true, _)) => Err("that message is still being written".into()),
+            Some((false, None)) => {
+                Err("that message has no final text to read; /read N reads the last ones".into())
+            }
+            Some((false, Some(seq))) => Ok((t.thread.clone(), seq)),
+        }
+    }
+
+    /// Ctrl-R: stops what the speakers read (as `/read stop`); with nothing read, says how to
+    /// start.
+    fn stop_reading(&mut self) -> Vec<Action> {
+        if self.speech.unsupported {
+            self.view.status = Some(crate::speech::PREDATES.into());
+            return Vec::new();
+        }
+        if !self.speech.busy() {
+            self.view.status = Some(crate::speech::NOTHING_READ.into());
+            return Vec::new();
+        }
+        match crate::speech::control(twr_core::speech::CtlOp::Stop, None, None) {
+            Ok(a) => vec![a],
+            Err(e) => {
+                self.view.status = Some(e);
+                Vec::new()
+            }
+        }
     }
 
     /// Runtimes that can host the orchestrator (for `/orch` completion and its picker).
@@ -3872,16 +5461,9 @@ impl AppState {
         }
     }
 
-    /// `/orch` without arguments: the picker of the orchestrator's runtime
-    /// ([`Picker::switch`]), the current one highlighted (before an orchestrator thread
-    /// exists, the one the hub would start); choosing asks to confirm the switch.
-    fn open_orch_picker(&mut self) {
-        let current = self
-            .orchestrator()
-            .map(|o| o.runtime.clone())
-            .or_else(|| self.view.orch_default.as_ref().map(|(r, _)| r.clone()));
-        let runtimes: Vec<(String, Option<bool>)> = self
-            .runtimes()
+    /// The orchestrator runtimes ([`AppState::runtimes`]) with whether each is installed.
+    fn orch_runtimes_installed(&self) -> Vec<(String, Option<bool>)> {
+        self.runtimes()
             .into_iter()
             .map(|r| {
                 let installed = self
@@ -3892,8 +5474,41 @@ impl AppState {
                     .map(|(_, i)| *i);
                 (r, installed)
             })
-            .collect();
-        let default = current.unwrap_or_default();
+            .collect()
+    }
+
+    /// What `/orch` completes to: the rows of its picker without a current one
+    /// ([`orch_rows`]: `claude-code:work` while Claude Code shows account labels).
+    fn orch_specs(&self) -> Vec<(String, Option<bool>)> {
+        orch_rows(&self.orch_runtimes_installed(), &self.accounts, None).0
+    }
+
+    /// `/orch` without arguments: the picker of the orchestrator's runtime and account
+    /// ([`Picker::switch`], [`orch_rows`]), the current one highlighted (before an
+    /// orchestrator thread exists, the one the hub would start, its account named unless it
+    /// is the native one); choosing asks to confirm the switch.
+    fn open_orch_picker(&mut self) {
+        let current: Option<(String, Option<String>, Option<String>)> = match self.orchestrator() {
+            Some(o) => Some((o.runtime.clone(), o.account.clone(), None)),
+            None => self.view.orch_default.as_ref().map(|(r, _)| {
+                let base = twr_core::account::split_runtime(r).0;
+                let native = self.accounts.runtime(base).map(|e| e.native.as_str());
+                let resolved = self.view.orch_default_account.clone();
+                let named = resolved.clone().filter(|a| Some(a.as_str()) != native);
+                (r.clone(), named, resolved)
+            }),
+        };
+        let (runtimes, default) = orch_rows(
+            &self.orch_runtimes_installed(),
+            &self.accounts,
+            current
+                .as_ref()
+                .map(|(spec, account, resolved)| OrchCurrent {
+                    spec,
+                    account: account.as_deref(),
+                    resolved: resolved.as_deref(),
+                }),
+        );
         let selected = runtimes
             .iter()
             .position(|(r, _)| *r == default)
@@ -3958,8 +5573,9 @@ impl AppState {
             .map(|t| t.name.clone())
             .collect();
         let workspaces: Vec<String> = self.tabs.iter().map(|t| t.name.clone()).collect();
+        let runtimes: Vec<String> = self.orch_specs().into_iter().map(|(r, _)| r).collect();
         let (line, candidates) =
-            slash::complete(&self.view.input, &self.runtimes(), &threads, &workspaces);
+            slash::complete(&self.view.input, &runtimes, &threads, &workspaces);
         if let Some(l) = line {
             self.view.input.set(&l);
             self.view
@@ -3974,9 +5590,24 @@ impl AppState {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        let view = self.armed_view();
+        let armed = self.sent.as_ref().and_then(|s| s.armed);
         let actions = self.key(key);
         self.sync_action();
+        self.disarm_on_view_change(&view, armed);
         actions
+    }
+
+    /// A double Esc armed before an input that changed the view (`view` before it, the arm
+    /// `armed` then) is for no view any more, even once that one shows again (`Ctrl-G` twice);
+    /// unless the input armed it anew, as the Esc that leaves a dive does.
+    fn disarm_on_view_change(&mut self, view: &ArmedView, armed: Option<Instant>) {
+        if self.armed_view() == *view {
+            return;
+        }
+        if let Some(s) = self.sent.as_mut().filter(|s| s.armed == armed) {
+            s.armed = None;
+        }
     }
 
     /// [`AppState::handle_key`], before the action popup is checked against the selection.
@@ -3984,29 +5615,44 @@ impl AppState {
         // Any key ends a mouse selection (its text was copied when the button went up).
         self.view.selection = None;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl-C stops a `!` command this TUI runs on the main pane's thread, else quits.
         if ctrl && key.code == KeyCode::Char('c') {
-            return vec![Action::Quit];
+            return self.ctrl_c();
         }
         // Ctrl-L repaints the whole screen, whatever else is open.
         if ctrl && key.code == KeyCode::Char('l') {
             self.view.repaint = true;
             return Vec::new();
         }
+        // Ctrl-R stops what a speaker reads aloud, whatever else is open (a picker, the
+        // settings, the help, a confirmation): speech that starts at a bad moment stops at once.
+        if ctrl && key.code == KeyCode::Char('r') && !self.speech.unsupported && self.speech.busy()
+        {
+            return self.stop_reading();
+        }
         // Workspaces: Alt-1..9 the tab at that place, Ctrl-PgUp/PgDn the previous and next one
         // (only while the strip shows), whatever is open: the first-run picker of a new
         // workspace must not keep the user in it.
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char(c @ '1'..='9') if alt && !ctrl && self.tabs_shown() => {
+            KeyCode::Char(c @ '1'..='9') if alt && !ctrl && self.switchable() => {
                 return self.switch_tab(usize::from(c as u8 - b'1'));
             }
-            KeyCode::PageUp | KeyCode::PageDown if ctrl && self.tabs_shown() => {
+            KeyCode::PageUp | KeyCode::PageDown if ctrl && self.switchable() => {
                 return self.step_tab(key.code == KeyCode::PageDown);
             }
             _ => {}
         }
         if self.picker_open() {
             return self.picker_key(key);
+        }
+        // The new-workspace dialog and the settings take every key ([`crate::sidebar`],
+        // [`crate::settings`]).
+        if self.view.new_ws.is_some() {
+            return self.new_ws_key(key);
+        }
+        if self.view.settings.is_some() {
+            return self.settings_key(key);
         }
         // The help is drawn over the trash: it takes the key first. Both scroll with the
         // arrows, PgUp/PgDn and Home/End; any other key closes them.
@@ -4029,6 +5675,13 @@ impl AppState {
                 self.view.trash = None;
             }
             return Vec::new();
+        }
+        // An offer the TUI made by itself answers only its own keys, once read; any other key
+        // goes where it would.
+        if self.view.confirm.as_ref().is_some_and(|c| c.offer) {
+            if let Some(actions) = self.offer_key(key) {
+                return actions;
+            }
         }
         // A pending confirmation eats the next key: `y` runs it (or its alternative's key
         // its alternative), anything else cancels.
@@ -4068,6 +5721,17 @@ impl AppState {
         if self.newline(key) {
             return Vec::new();
         }
+        // Tab or → on the empty line takes the suggestion shown in it ([`crate::suggest`]).
+        if matches!(key.code, KeyCode::Tab | KeyCode::Right)
+            && key.modifiers.is_empty()
+            && self.accept_suggestion()
+        {
+            return Vec::new();
+        }
+        // The compact layout's Workspaces screen: ↑↓ and Enter on an empty line.
+        if let Some(actions) = self.ws_screen_key(key) {
+            return actions;
+        }
         // The slash command popup takes its keys first.
         if let Some(actions) = self.popup_key(key) {
             return actions;
@@ -4102,6 +5766,7 @@ impl AppState {
                     && self.compact()
                     && self.view.block.is_none()
                     && self.view.request.is_none()
+                    && self.view.queued.is_none()
                     && self.detail_card().is_none()
                     && (self.view.compact_pane == CompactPane::Chat
                         || self.selection_target().is_none()) =>
@@ -4217,7 +5882,8 @@ impl AppState {
         Some(Vec::new())
     }
 
-    /// Keys about the view, whatever is selected or typed: Ctrl-B (the sidebar), Ctrl-F
+    /// Keys about the view, whatever is selected or typed: Ctrl-B (the sidebar), Ctrl-T (the
+    /// workspace sidebar, [`crate::sidebar`]), Ctrl-F
     /// (Focus mode), Ctrl-O (tool calls), Ctrl-G (stack or grid), PgUp/PgDn (a page of the
     /// main pane, or of a detail view that takes it), and Ctrl-↑/↓ or Alt-↑/↓ (a line of it;
     /// Alt for macOS, whose Ctrl-↑/↓ belong to Mission Control). `None`: not one of them.
@@ -4225,7 +5891,8 @@ impl AppState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
-            KeyCode::Char('b') if ctrl => self.set_sidebar(self.view.sidebar_hidden),
+            // The one sidebar, whichever: Ctrl-T is Ctrl-B.
+            KeyCode::Char('b' | 't') if ctrl => return Some(self.toggle_workspaces()),
             KeyCode::Char('f') if ctrl => self.set_focus_mode(!self.view.focus_mode),
             KeyCode::Char('o') if ctrl => {
                 self.view.expand_all = !self.view.expand_all;
@@ -4244,6 +5911,7 @@ impl AppState {
             KeyCode::Char('g') if ctrl && self.view.screen != Screen::Decisions => {
                 self.toggle_grid();
             }
+            KeyCode::Char('r') if ctrl => return Some(self.stop_reading()),
             // A detail view in the main pane scrolls instead of the transcript under it.
             KeyCode::PageUp | KeyCode::PageDown if self.view.panes.card.is_some() => {
                 self.scroll_card(key.code == KeyCode::PageDown, usize::MAX);
@@ -4276,6 +5944,9 @@ impl AppState {
         if let Some(actions) = self.unsend_esc(Instant::now()) {
             return actions;
         }
+        if self.view.queued.take().is_some() {
+            return Vec::new();
+        }
         if self.view.screen == Screen::Stack && self.view.block.take().is_some() {
             return Vec::new();
         }
@@ -4291,7 +5962,7 @@ impl AppState {
             self.set_focus(None);
             return Vec::new();
         }
-        if self.view.focus.is_some() && !self.main_focused() && !self.forced_focus() {
+        if self.view.focus.is_some() && !self.main_focused() {
             self.set_focus(None);
             return Vec::new();
         }
@@ -4318,9 +5989,10 @@ impl AppState {
         }
         let main = self.main_focused();
         if (v.screen == Screen::Stack && v.block.is_some())
+            || v.queued.is_some()
             || v.request.is_some()
             || (main && v.dive.is_none())
-            || (v.focus.is_some() && !main && !self.forced_focus())
+            || (v.focus.is_some() && !main)
         {
             return EscDoes::Release;
         }
@@ -4337,22 +6009,32 @@ impl AppState {
     /// the second, within that time, takes it back ([`AppState::unsend`]). A hint that ran
     /// out is spent: for that message Esc goes on to its other steps. `None`: this Esc is not
     /// the double Esc's.
+    ///
+    /// The first Esc that leaves the dive the message went to leaves it at once: going back
+    /// never waits for the second. It arms the second there, in the orchestrator conversation,
+    /// and that one takes the message back and returns to its dive, where the text goes back
+    /// in the box.
     fn unsend_esc(&mut self, now: Instant) -> Option<Vec<Action>> {
         if !self.view.input.is_empty() {
             return None;
         }
         let here = self.main_thread();
+        let view = self.armed_view();
         if let Some(at) = self.sent.as_ref().and_then(|s| s.armed) {
-            // Armed for another thread than the one shown now (a dive left, Ctrl-G): no
+            // Armed for another view than the one shown now (Ctrl-G, another screen): no
             // second Esc for it; this one does what Esc does here.
-            if self.sent.as_ref().is_some_and(|s| s.thread != here) {
+            if self
+                .sent
+                .as_ref()
+                .is_some_and(|s| s.armed_in.as_ref() != Some(&view))
+            {
                 if let Some(s) = self.sent.as_mut() {
                     s.armed = None;
                 }
                 return None;
             }
             if now.saturating_duration_since(at) < UNSEND_WINDOW {
-                return Some(self.unsend());
+                return Some(self.unsend_armed());
             }
             self.expire_unsend(now);
             return None;
@@ -4361,8 +6043,42 @@ impl AppState {
         if s.spent || s.thread != here || self.unsend_check().is_err() {
             return None;
         }
-        self.sent.as_mut()?.armed = Some(now);
+        let armed_in = if self.esc_does() == EscDoes::Leave {
+            self.leave_dive();
+            self.view.status = None;
+            self.armed_view()
+        } else {
+            view
+        };
+        let s = self.sent.as_mut()?;
+        s.armed = Some(now);
+        s.armed_in = Some(armed_in);
         Some(Vec::new())
+    }
+
+    /// The view an armed double Esc counts in, as it is now ([`Sent::armed_in`]).
+    fn armed_view(&self) -> ArmedView {
+        ArmedView {
+            main: self.main_thread(),
+            screen: self.view.screen,
+            pane: self.view.compact_pane,
+        }
+    }
+
+    /// The armed second Esc (or tap): takes the last message back ([`AppState::unsend`]).
+    /// Armed by the Esc that left its dive, it returns there first, so the text goes back in
+    /// the box it was typed in.
+    fn unsend_armed(&mut self) -> Vec<Action> {
+        let back_to = self
+            .sent
+            .as_ref()
+            .filter(|s| s.armed_in.as_ref().is_some_and(|v| v.main != s.thread))
+            .and_then(|s| s.thread.clone());
+        let actions = self.unsend();
+        if let Some(thread) = back_to.filter(|_| !actions.is_empty()) {
+            self.dive(&thread);
+        }
+        actions
     }
 
     /// The input box's title while the double Esc is armed, nothing is typed, the main pane
@@ -4371,7 +6087,7 @@ impl AppState {
     pub fn unsend_hint(&self) -> Option<String> {
         let s = self.sent.as_ref().filter(|s| s.armed.is_some())?;
         if !self.view.input.is_empty()
-            || s.thread != self.main_thread()
+            || s.armed_in.as_ref() != Some(&self.armed_view())
             || self.unsend_check().is_err()
         {
             return None;
@@ -4379,6 +6095,12 @@ impl AppState {
         let thread = s.thread.as_deref().and_then(|t| self.registry.get(t))?;
         Some(if thread.is_orchestrator() {
             " Esc or tap again: take back your last message ".to_string()
+        } else if s.armed_in.as_ref().is_some_and(|v| v.main != s.thread) {
+            // Back from its dive.
+            format!(
+                " Esc or tap again: take back your message to {} ",
+                thread.name
+            )
         } else {
             format!(
                 " Esc or tap again: take back your message to {} · /back leaves ",
@@ -4456,6 +6178,9 @@ impl AppState {
                     thread: thread.clone(),
                     msg_ref,
                     text: s.text.clone(),
+                    purpose: Retract::Unsend,
+                    mine: true,
+                    suggested: s.suggested,
                 });
                 vec![Action::Withdraw { thread, msg_ref }]
             }
@@ -4495,12 +6220,17 @@ impl AppState {
     /// A message the input line sends now, to the thread dived into, else to the
     /// orchestrator (which `say`'s result names): it is the last message from now on. `typed`
     /// is the line as typed (a `//` escape included), what taking it back puts back.
-    fn note_sent(&mut self, thread: Option<String>, typed: &str) {
+    fn note_sent(&mut self, thread: Option<String>, typed: &str, suggested: bool) {
+        // A suggestion asked before this send is about a conversation that went on.
+        self.suggest_epoch += 1;
+        self.suggestion = None;
+        self.sends_suggested.push_back(suggested);
         let waiting = self.sent.as_ref().map_or(0, |s| s.waiting) + 1;
         self.sent = Some(Sent {
             thread,
             text: typed.to_string(),
             waiting,
+            suggested,
             ..Sent::default()
         });
     }
@@ -4510,6 +6240,17 @@ impl AppState {
     /// once, its turn (or the turn its ref started already), and whether that turn acted
     /// already; a short command has none (applied at once).
     fn sent_result(&mut self, result: &Value) {
+        // Queued or started, the thread's queue moved.
+        if let Some(t) = result["thread"].as_str() {
+            let t = t.to_string();
+            self.queue_changed(&t);
+        }
+        // A suggestion's ref, whichever send this answers (a later send replaced `sent`).
+        if self.sends_suggested.pop_front() == Some(true) {
+            if let (Some(t), Some(r)) = (result["thread"].as_str(), result["ref"].as_i64()) {
+                self.suggested_refs.push_back((t.to_string(), r));
+            }
+        }
         let Some(s) = self.sent.as_mut() else {
             return;
         };
@@ -4598,7 +6339,18 @@ impl AppState {
         else {
             return;
         };
-        let w = self.withdrawals.remove(i);
+        let mut w = self.withdrawals.remove(i);
+        self.queue_changed(&w.thread);
+        // A suggestion whose send was answered after the withdrawal began (the queue's list can
+        // come first): its answer, ahead of this one on the same calls, registered it.
+        let known = self
+            .suggested_refs
+            .iter()
+            .position(|(t, r)| *t == w.thread && *r == w.msg_ref);
+        w.suggested |= known.is_some();
+        if let (Some(k), true) = (known, result["withdrawn"] == true) {
+            self.suggested_refs.remove(k);
+        }
         let last = self
             .sent
             .as_mut()
@@ -4614,11 +6366,51 @@ impl AppState {
                 self.sent = None;
             }
             let here = Some(&w.thread) == self.main_thread().as_ref();
+            // A queued message comes back whole from the hub: the list had a preview.
+            // The hub's text is the message as sent: back in the box or the history as the line
+            // that sends it again, never a command.
+            let text = match (w.purpose, result["prompt"].as_str()) {
+                (Retract::Edit | Retract::Delete, Some(full)) => literal_line(full),
+                (Retract::Edit | Retract::Delete, None) => literal_line(&w.text),
+                _ => w.text.clone(),
+            };
+            // Someone else's message (the orchestrator's, a `!!` command's output): gone, and
+            // nowhere it could be sent again as the user's.
+            if !w.mine {
+                self.set_timed_status("deleted from the queue".to_string(), Instant::now());
+                return;
+            }
+            // A suggestion: in the box it is still one; never in the history.
+            if w.suggested && !(here && self.view.input.is_empty() && w.purpose != Retract::Delete)
+            {
+                self.set_timed_status(
+                    "taken back: it was a suggestion, so it is not kept in the history".into(),
+                    Instant::now(),
+                );
+                return;
+            }
+            if w.purpose == Retract::Delete {
+                self.keep_taken_back(&text);
+                self.set_timed_status(
+                    "deleted from the queue: its text is in the history (↑)".to_string(),
+                    Instant::now(),
+                );
+                return;
+            }
             let msg = if here && self.view.input.is_empty() {
-                self.view.input.set(&w.text);
-                "taken back: your message is in the box again"
+                let (cols, rows) = (self.input_cols(), self.input_rows());
+                self.view.input.set(&text);
+                self.view.input.keep_visible(cols, rows);
+                if w.suggested {
+                    self.taken_suggestion = Some(text.clone());
+                }
+                if w.purpose == Retract::Edit {
+                    "taken back from the queue: edit it, Enter sends it again (at the queue's end)"
+                } else {
+                    "taken back: your message is in the box again"
+                }
             } else {
-                self.keep_taken_back(&w.text);
+                self.keep_taken_back(&text);
                 if here {
                     "taken back: the box wasn't empty, so the message is in the history (↑)"
                 } else {
@@ -4664,6 +6456,9 @@ impl AppState {
     /// popup draws its item itself). None while the main pane is selected, or for a request
     /// no longer open: never another item in its place.
     pub fn selection_target(&self) -> Option<ActionTarget> {
+        if let Some(t) = self.queued_target() {
+            return Some(t);
+        }
         if let Some(i) = self.selected_request() {
             return Some(ActionTarget::Request(i.attn_id.clone()));
         }
@@ -4713,11 +6508,11 @@ impl AppState {
                     .as_ref()
                     .is_some_and(|s| s.attn_id == *id && s.revision == *rev)
             });
-        let sel = self
-            .action_rows(&target)
-            .iter()
-            .any(|r| r.kind == ActionKind::Talk)
-            .then_some(ActionKind::Talk);
+        // Talk to it, or a queued message's edit: rows Enter can run safely.
+        let rows = self.action_rows(&target);
+        let sel = [ActionKind::Talk, ActionKind::Edit]
+            .into_iter()
+            .find(|k| rows.iter().any(|r| r.kind == *k));
         self.view.shown = None;
         self.view.status = None;
         self.view.action = Some(ActionPopup {
@@ -4726,6 +6521,9 @@ impl AppState {
             filter: String::new(),
             read,
             armed: None,
+            hint: None,
+            armed_at: (0, 0),
+            moved: false,
         });
     }
 
@@ -4781,6 +6579,25 @@ impl AppState {
         };
         let dismissable = item.is_some_and(|i| i.thread == HUB_THREAD || !i.reason.is_blocking());
         match target {
+            ActionTarget::Queued(r) => {
+                let q = self.shown_queue();
+                let it = q.and_then(|q| q.items.iter().find(|i| i.msg_ref == *r));
+                if let Some(it) = it {
+                    let name = q
+                        .and_then(|q| self.registry.get(&q.thread))
+                        .map_or("the thread".to_string(), |t| t.name.clone());
+                    if it.mine {
+                        rows.push(row(ActionKind::Edit, "edit: back into the box"));
+                    }
+                    rows.push(row(ActionKind::Delete, "delete"));
+                    if q.and_then(|q| q.items.first()).map(|f| f.msg_ref) == Some(*r) {
+                        rows.push(row(
+                            ActionKind::SendNow,
+                            &format!("send now: interrupts {name}'s turn"),
+                        ));
+                    }
+                }
+            }
             ActionTarget::Request(_) => {
                 if let Some(t) = item.and_then(|i| self.registry.get(&i.thread)) {
                     rows.push(row(ActionKind::Talk, &format!("talk to {}", t.name)));
@@ -4844,7 +6661,21 @@ impl AppState {
         let at_row = popup
             .sel
             .and_then(|k| rows.iter().position(|r| r.kind == k));
-        let at = at_row.and_then(|r| matches.iter().position(|&i| i == r));
+        // On a phone, the row the popup opened on, out of the window of rows it drew (which
+        // shows the first ones until the highlight moves): ↑↓ go on from none.
+        let hidden = self.compact()
+            && !popup.moved
+            && at_row.is_some_and(|r| {
+                !self
+                    .view
+                    .panes
+                    .popup_rows
+                    .as_ref()
+                    .is_some_and(|(t, kinds)| *t == popup.target && kinds.contains(&rows[r].kind))
+            });
+        let at = at_row
+            .filter(|_| !hidden)
+            .and_then(|r| matches.iter().position(|&i| i == r));
         // The next (or previous) row the filter keeps, wrapping around; with none highlighted,
         // the first (or the last).
         let step = |down: bool| -> Option<usize> {
@@ -4866,6 +6697,7 @@ impl AppState {
         if let Some(sel) = moved {
             if let (Some(sel), Some(p)) = (sel, self.view.action.as_mut()) {
                 p.sel = Some(rows[sel].kind);
+                p.moved = true;
             }
             return Some(Vec::new());
         }
@@ -4937,6 +6769,16 @@ impl AppState {
             }
             KeyCode::Tab | KeyCode::BackTab => return None,
             KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right if shift => return None,
+            // On a phone its text scrolls in it ([`Panes::sheet`]); elsewhere they close it
+            // and scroll what is under it.
+            KeyCode::PageUp | KeyCode::PageDown if self.sheet_scrolls() => {
+                let down = key.code == KeyCode::PageDown;
+                self.scroll_text(crate::select::Scrolled::Sheet, down, usize::MAX);
+            }
+            KeyCode::Up | KeyCode::Down if (ctrl || alt) && self.sheet_scrolls() => {
+                let down = key.code == KeyCode::Down;
+                self.scroll_text(crate::select::Scrolled::Sheet, down, 1);
+            }
             KeyCode::PageUp | KeyCode::PageDown => self.view.action = None,
             KeyCode::Up | KeyCode::Down if ctrl || alt => self.view.action = None,
             _ if ctrl || alt => return None,
@@ -4954,6 +6796,7 @@ impl AppState {
             return;
         };
         popup.filter = filter;
+        popup.moved = true;
         let matches = self.action_matches(&popup, rows);
         popup.sel = match matches.as_slice() {
             [only] => Some(rows[*only].kind),
@@ -4971,9 +6814,19 @@ impl AppState {
         let Some(target) = self.view.action.as_ref().map(|p| p.target.clone()) else {
             return Vec::new();
         };
+        if let ActionTarget::Queued(r) = target {
+            self.view.action = None;
+            return match kind {
+                ActionKind::Edit => self.retract_queued(r, Retract::Edit),
+                ActionKind::Delete => self.retract_queued(r, Retract::Delete),
+                ActionKind::SendNow => self.send_queued_now(r),
+                _ => Vec::new(),
+            };
+        }
         let thread = match &target {
             ActionTarget::Card(id) => Some(id.clone()),
             ActionTarget::Request(_) => self.selected_attention().map(|i| i.thread.clone()),
+            ActionTarget::Queued(_) => None,
         };
         match kind {
             ActionKind::Answer(n) => {
@@ -5016,7 +6869,11 @@ impl AppState {
                     self.attach_via
                 ));
             }
-            ActionKind::Answer(_) | ActionKind::Dismiss => {}
+            ActionKind::Answer(_)
+            | ActionKind::Dismiss
+            | ActionKind::Edit
+            | ActionKind::Delete
+            | ActionKind::SendNow => {}
         }
         Vec::new()
     }
@@ -5041,7 +6898,8 @@ impl AppState {
         }
         let pools = self.pools();
         let mut s = slash::suggest(line, &pools);
-        if s.items.is_empty() {
+        // A `!` command is no message: its `@` is the shell's.
+        if s.items.is_empty() && !line.trim_start().starts_with('!') {
             s = slash::mention(line, self.view.input.cursor(), &pools);
         }
         (!s.items.is_empty()).then_some(s)
@@ -5061,7 +6919,12 @@ impl AppState {
             } else {
                 &t.runtime
             };
-            format!("{} · {rt} · mode {}", t.status().as_str(), t.mode)
+            // `claude-code:work` while its runtime shows account labels.
+            let account = self
+                .account_label(t)
+                .map(|a| format!(":{a}"))
+                .unwrap_or_default();
+            format!("{} · {rt}{account} · mode {}", t.status().as_str(), t.mode)
         };
         let workers: Vec<&ThreadView> = self
             .registry
@@ -5088,21 +6951,25 @@ impl AppState {
             })
             .collect();
         let runtimes = self
-            .runtimes()
+            .orch_specs()
             .into_iter()
-            .map(|r| {
-                let installed = self
-                    .view
-                    .orch_installed
-                    .iter()
-                    .find(|(n, _)| *n == r)
-                    .map(|(_, i)| *i);
-                let detail = match installed {
-                    Some(true) => "installed",
-                    Some(false) => "not installed",
-                    None => "",
+            .map(|(r, installed)| {
+                let installed = match installed {
+                    Some(true) => Some("installed"),
+                    Some(false) => Some("not installed"),
+                    None => None,
                 };
-                (r, detail.to_string())
+                // Of `claude-code:work`, the account's state too.
+                let state = match twr_core::account::split_runtime(&r) {
+                    (base, Some(a)) => self
+                        .accounts
+                        .account(base, Some(a))
+                        .map(|a| a.state_text())
+                        .filter(|s| !s.is_empty()),
+                    _ => None,
+                };
+                let detail: Vec<&str> = installed.into_iter().chain(state.as_deref()).collect();
+                (r, detail.join(" · "))
             })
             .collect();
         let workspaces = self
@@ -5116,12 +6983,45 @@ impl AppState {
                 )
             })
             .collect();
+        // Accounts a thread can move to: not removed, each with its state (`logged in`).
+        let accounts = self
+            .accounts
+            .runtimes
+            .iter()
+            .map(|(rt, entry)| {
+                // (Not the native account a named one's name shadows: the name moves to that
+                // one.)
+                let names = entry
+                    .accounts
+                    .iter()
+                    .filter(|a| !a.removed && !a.shadowed)
+                    .map(|a| (a.name.clone(), a.state_text()))
+                    .collect();
+                (rt.clone(), names)
+            })
+            .collect();
+        let thread_runtimes = workers
+            .iter()
+            .map(|t| (t.name.clone(), t.runtime.clone()))
+            .collect();
+        // The latest thread made for a configured project says its runtime (in creation
+        // order: a later one replaces an earlier one).
+        let project_runtimes = workers
+            .iter()
+            .filter(|t| t.configured_project && !t.runtime.is_empty())
+            .filter_map(|t| Some((t.project.clone()?, t.runtime.clone())))
+            .collect();
         slash::Pools {
             runtimes,
             threads,
             dive: self.view.dive.is_some(),
             mentions,
             workspaces,
+            accounts,
+            thread_runtimes,
+            account_runtime: self.thread_arg(None).ok().map(|t| t.runtime.clone()),
+            project_runtimes,
+            default_runtime: self.view.default_runtime.clone(),
         }
     }
 
@@ -5213,7 +7113,8 @@ impl AppState {
             KeyCode::Enter if p.switch => {
                 let runtime = p.runtimes[p.selected].0.clone();
                 self.view.picker = None;
-                self.confirm_switch(runtime, None);
+                let shown = orch_label(&runtime, &self.accounts);
+                self.confirm_switch(runtime, &shown, None);
             }
             KeyCode::Esc if p.switch => {
                 self.view.picker = None;
@@ -5224,7 +7125,8 @@ impl AppState {
                 let model = p.model.clone().filter(|_| runtime == p.default);
                 self.view.picker = None;
                 self.view.status = Some(format!(
-                    "choosing {runtime} for the orchestrator: waiting for the hub"
+                    "choosing {} for the orchestrator: waiting for the hub",
+                    orch_label(&runtime, &self.accounts)
                 ));
                 return vec![Action::UseOrchestrator {
                     runtime,
@@ -5233,7 +7135,7 @@ impl AppState {
                 }];
             }
             KeyCode::Esc => {
-                let default = p.default.clone();
+                let default = orch_label(&p.default, &self.accounts);
                 self.view.picker = None;
                 self.view.status = Some(format!(
                     "no choice made: the orchestrator will be {default} (asked again next \
@@ -5258,16 +7160,18 @@ impl AppState {
     }
 
     /// Columns of the input line's box (as last drawn; while it is not drawn, from the
-    /// terminal width, [`crate::ui::input_box_width`]).
-    fn input_cols(&self) -> usize {
-        usize::from(self.view.panes.get(&PaneId::Input).map_or_else(
-            || crate::ui::input_box_width(self, self.view.width).saturating_sub(2),
-            |p| p.area.width,
-        ))
+    /// columns the views get, [`AppState::content_width`]).
+    pub(crate) fn input_cols(&self) -> usize {
+        usize::from(
+            self.view
+                .panes
+                .get(&PaneId::Input)
+                .map_or_else(|| self.content_width().saturating_sub(2), |p| p.area.width),
+        )
     }
 
     /// Rows the input line's box may grow to at the terminal height of the last draw.
-    fn input_rows(&self) -> usize {
+    pub(crate) fn input_rows(&self) -> usize {
         crate::ui::input_cap(self.view.height)
     }
 
@@ -5301,6 +7205,13 @@ impl AppState {
         // Up on the first row and Down on the last browse the history; elsewhere they move
         // between the rows of the line.
         if key.modifiers.is_empty() {
+            // With messages of the user's queued, ↑ on an empty line takes the newest back to
+            // edit it ([`crate::queue`]); the history comes after.
+            if key.code == KeyCode::Up {
+                if let Some(actions) = self.edit_newest_queued() {
+                    return actions;
+                }
+            }
             match key.code {
                 KeyCode::Up if self.view.input.on_first_row(cols) && self.history_prev() => {
                     return Vec::new();
@@ -5323,7 +7234,21 @@ impl AppState {
                 if text.is_empty() {
                     return Vec::new();
                 }
-                self.remember(&text);
+                // A suggestion taken and sent as it was: it goes as one, and never to the
+                // history, from where it would come back as the user's own words.
+                let suggested = self.taken_suggestion.take().as_deref() == Some(text.as_str());
+                if !suggested {
+                    self.remember(&text);
+                }
+                // `!...` runs a shell command ([`crate::shell`]); `\!...` sends `!...`.
+                if text.starts_with('!') {
+                    let actions = self.shell_line(&text);
+                    if !actions.is_empty() {
+                        self.view.input.clear();
+                        self.follow();
+                    }
+                    return actions;
+                }
                 // `//...` sends `/...`; any other `/...` is a command, never a message.
                 if !text.starts_with("//") && text.starts_with('/') {
                     let (actions, done) = self.run_slash(&text);
@@ -5332,17 +7257,23 @@ impl AppState {
                     }
                     return actions;
                 }
+                // The line as typed is what taking it back puts in the box again: escapes
+                // and all, so it is the same message, never a command.
                 let typed = text.clone();
-                let text = match text.strip_prefix('/') {
-                    Some(literal) if literal.starts_with('/') => literal.to_string(),
-                    _ => text,
-                };
+                let text = message_text(&text);
                 // Only a dive sends to a thread; everything else goes to the orchestrator.
-                self.note_sent(self.view.dive.clone(), &typed);
+                // In a dive too: taken back, it is still a suggestion where it goes next.
+                self.note_sent(self.view.dive.clone(), &typed, suggested);
                 let action = match &self.view.dive {
                     Some(thread) => Action::Send {
                         thread: thread.clone(),
                         text,
+                    },
+                    // A suggestion taken and sent as it was: the hub never applies it as a short
+                    // command at once.
+                    None if suggested => Action::SaySuggested {
+                        text,
+                        seen_gseq: self.seen_gseq(),
                     },
                     None => Action::Say {
                         text,
@@ -5444,7 +7375,7 @@ impl AppState {
     fn decisions_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('b' | 'f' | 'o') if ctrl => return None,
+            KeyCode::Char('b' | 'f' | 'o' | 'r' | 't') if ctrl => return None,
             _ if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {}
             KeyCode::Esc => self.toggle_decisions(),
             KeyCode::Down | KeyCode::Char('j') => self.move_decision(1),
@@ -5501,21 +7432,66 @@ impl AppState {
         if self.view.screen != Screen::Stack {
             return;
         }
+        // The queued messages listed under the conversation are its last steps: Shift-↓ goes
+        // on into them, Shift-↑ back up out of them.
+        let queued: Vec<i64> = self
+            .shown_queue()
+            .map(|q| {
+                q.items
+                    .iter()
+                    .take(crate::queue::QUEUE_ROWS)
+                    .map(|i| i.msg_ref)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(i) = self
+            .view
+            .queued
+            .and_then(|cur| queued.iter().position(|r| *r == cur))
+        {
+            match (previous, i) {
+                (false, i) => {
+                    if let Some(next) = queued.get(i + 1) {
+                        self.select_queued(*next);
+                    }
+                    return;
+                }
+                (true, i) if i > 0 => {
+                    self.select_queued(queued[i - 1]);
+                    return;
+                }
+                // Up from the first: the conversation's last step.
+                (true, _) => self.view.queued = None,
+            }
+        }
         let (key, head) = {
             let view = crate::ui::BlockView::new(self);
             let steps = view.steps();
             if steps.is_empty() {
+                if let (false, Some(first)) = (previous, queued.first()) {
+                    self.select_queued(*first);
+                }
                 return;
             }
+            let last = steps.len() - 1;
             let current = match (&self.view.request, &self.view.block) {
                 (Some(id), _) => Some(format!("request:{id}")),
                 (None, Some(block)) => Some(block.clone()),
                 (None, None) => None,
             };
             let at = current.and_then(|c| steps.iter().position(|(k, _)| *k == c));
+            // Down from the last step: the first queued message.
+            if let (false, Some(i), Some(first)) = (previous, at, queued.first()) {
+                if i == last {
+                    let first = *first;
+                    drop(view);
+                    self.select_queued(first);
+                    return;
+                }
+            }
             let index = match at {
                 Some(i) if previous => i.saturating_sub(1),
-                Some(i) => (i + 1).min(steps.len() - 1),
+                Some(i) => (i + 1).min(last),
                 None => {
                     let top = view.top().unwrap_or(0);
                     let height = self
@@ -5579,6 +7555,7 @@ impl AppState {
         if !self.view.long_expanded.remove(&key) {
             self.view.long_expanded.insert(key.clone());
         }
+        self.view.queued = None;
         self.view.block = Some(key);
         self.view.request = None;
         if let Some(top) = top {
@@ -5639,6 +7616,35 @@ impl AppState {
         };
     }
 
+    /// On a phone, scrolls the action popup's text (or the prompt of the question waiting for
+    /// `y`) as last drawn down or up `n` rows, as [`AppState::scroll_card`] does the detail
+    /// view.
+    fn scroll_text(&mut self, which: crate::select::Scrolled, down: bool, n: usize) {
+        use crate::select::Scrolled;
+        let (w, view) = match which {
+            Scrolled::Sheet => (self.view.panes.sheet.as_ref(), &mut self.view.sheet_view),
+            Scrolled::Ask => (self.view.panes.ask.as_ref(), &mut self.view.ask_view),
+        };
+        if let Some(w) = w {
+            view.scroll_by(w, down, n);
+        }
+    }
+
+    /// A tap on the row under a text a phone scrolls ([`Target::More`]): a page down while
+    /// more of it is below, else back to its top.
+    fn page_text(&mut self, which: crate::select::Scrolled) {
+        use crate::select::Scrolled;
+        let (w, view) = match which {
+            Scrolled::Sheet => (self.view.panes.sheet.as_ref(), &mut self.view.sheet_view),
+            Scrolled::Ask => (self.view.panes.ask.as_ref(), &mut self.view.ask_view),
+        };
+        match w {
+            Some(w) if w.end < w.rows => view.scroll_by(w, true, usize::MAX),
+            Some(_) => view.scroll = 0,
+            None => {}
+        }
+    }
+
     /// The main pane follows its transcript's bottom again: new rows show as they come.
     pub fn follow(&mut self) {
         self.view.scroll = 0;
@@ -5668,12 +7674,17 @@ impl AppState {
     /// that frame drew it: how far up from the bottom, and the row at its top, which a view
     /// scrolled up stays on ([`ViewState::anchor`]). A view drawn at the bottom follows it.
     /// A long block stays selected only while the transcript drawn has it ([`Pane::block`]),
-    /// not while a card's detail view takes the main pane instead.
+    /// not while a card's detail view takes the main pane instead. The cards' heights as
+    /// drawn are kept ([`crate::order::note`], as of the settle before the draw).
     ///
     /// The action popup without room for its item ([`Panes::long_item`]) opens the item's
     /// detail view in the main pane ([`ViewState::detail`]), showing the stack view for it.
     pub fn note_panes(&mut self, panes: Panes) {
         self.view.panes = panes;
+        // The cards' heights as drawn, as of the settle before the draw.
+        let now = self.view.settled.take().unwrap_or_else(Instant::now);
+        let fits = std::mem::take(&mut self.view.panes.fits);
+        crate::order::note(&mut self.view.card_fit, fits, now);
         self.fit_compact();
         if let Some(card) = self.view.panes.long_item.take() {
             // First: the card stays selected in the stack view for its detail view, also with
@@ -5687,14 +7698,19 @@ impl AppState {
                 self.view.compact_pane = CompactPane::Chat;
             }
         }
-        // The cards hidden by a dive (one that began wider, then the screen narrowed): the keys
-        // about a card act on the thread the header names, not on one out of sight.
-        // Not while the detail view of another card's item shows: it is that card's.
-        if self.dive_hides_cards()
-            && self.view.focus != self.view.dive
-            && self.detail_card().is_none()
-        {
-            self.view.focus = self.view.dive.clone();
+        // No room for a card (a column too short for one): none stays selected out of sight,
+        // nor its popup open.
+        if self.view.panes.no_cards && self.detail_card().is_none() {
+            let nav = self.nav_order();
+            if let Some(card) = self.view.focus.clone().filter(|f| !nav.contains(f)) {
+                if matches!(
+                    self.view.action.as_ref().map(|p| &p.target),
+                    Some(ActionTarget::Card(c)) if *c == card
+                ) {
+                    self.view.action = None;
+                }
+                self.set_focus(None);
+            }
         }
         if let Some(p) = self.view.panes.get(&PaneId::Transcript) {
             self.view.scroll = p.scroll;
@@ -5807,9 +7823,12 @@ impl AppState {
     /// request or a long block; on the input line it puts the cursor there. The wheel scrolls
     /// the pane under the pointer, or moves the highlight of the popup under it.
     pub fn handle_mouse(&mut self, ev: MouseEvent, screen: &Buffer) -> Vec<Action> {
+        let view = self.armed_view();
+        let armed = self.sent.as_ref().and_then(|s| s.armed);
         let actions = self.mouse(ev, screen);
         // What the click moved the selection to: the popup is about it, or closes.
         self.sync_action();
+        self.disarm_on_view_change(&view, armed);
         actions
     }
 
@@ -5819,18 +7838,46 @@ impl AppState {
         self.view.pointer = Some((ev.column, ev.row, Instant::now()));
         let (x, y) = (ev.column, ev.row);
         // The picker is modal: its runtimes and its ✕ are tapped, the wheel picks. Only a tab
-        // of the strip, which it does not cover, switches workspaces.
-        if self.picker_open() {
+        // of the strip, which it does not cover, switches workspaces. So are the settings
+        // (their rows) and the new-workspace dialog.
+        if self.picker_open() || self.view.settings.is_some() || self.view.new_ws.is_some() {
             match ev.kind {
-                MouseEventKind::Down(MouseButton::Left) => self.press(x, y),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.press(x, y);
+                    // The tab under the press, as drawn then: a frame drawn before the
+                    // release may put another there.
+                    self.view.pressed_tab = match self.view.panes.at(x, y).map(|p| &p.id) {
+                        Some(PaneId::Tab(name)) => Some(name.clone()),
+                        _ => None,
+                    };
+                }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    if let (_, Some(t)) = self.tapped(x, y) {
-                        return self.tap(t);
+                    let pressed = self.view.pressed_tab.take();
+                    let (click, target) = self.tapped(x, y);
+                    match (click, target) {
+                        // A workspace's card in the docked sidebar, which it does not cover,
+                        // switches as a tab does; the sidebar's other controls wait.
+                        (_, Some(Target::Workspace(name))) => {
+                            return self.ws_activate(WsRow::Workspace(name));
+                        }
+                        (_, Some(Target::NewWorkspace | Target::Settings | Target::WsSidebar)) => {}
+                        (_, Some(t)) => return self.tap(t),
+                        (_, None) => {}
                     }
-                    if let Some(PaneId::Tab(name)) = self.view.panes.at(x, y).map(|p| p.id.clone())
-                    {
+                    // A tab, tapped: pressed and released on it, the same tab as drawn at each.
+                    let released = match self.view.panes.at(x, y).map(|p| &p.id) {
+                        Some(PaneId::Tab(name)) => Some(name.clone()),
+                        _ => None,
+                    };
+                    if let Some(name) = released.filter(|n| click && pressed.as_ref() == Some(n)) {
                         return self.switch_workspace(&name);
                     }
+                }
+                // Over the docked workspace list, the wheel scrolls it; elsewhere it picks.
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                    if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) =>
+                {
+                    self.ws_wheel(ev.kind == MouseEventKind::ScrollUp);
                 }
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                     let code = if ev.kind == MouseEventKind::ScrollUp {
@@ -5838,7 +7885,13 @@ impl AppState {
                     } else {
                         KeyCode::Down
                     };
-                    return self.picker_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    let arrow = KeyEvent::new(code, KeyModifiers::NONE);
+                    if self.picker_open() {
+                        return self.picker_key(arrow);
+                    }
+                    if self.view.settings.is_some() {
+                        return self.settings_key(arrow);
+                    }
                 }
                 _ => {}
             }
@@ -5850,14 +7903,17 @@ impl AppState {
                 let pane = self.view.panes.at(x, y).cloned();
                 let id = pane.as_ref().map(|p| p.id.clone());
                 // Like a key, a click outside the help (or the trash: its `✕` is outside its
-                // text too) closes it, and does nothing else; one on a tab of the strip, which
-                // they leave on screen, goes on to switch.
+                // text too) closes it, and does nothing else; one on a tab of the strip or a
+                // card of the docked workspace sidebar, which they leave on screen, goes on to
+                // switch.
+                let workspace_card =
+                    matches!(self.view.panes.target_at(x, y), Some(Target::Workspace(_)));
                 if (self.view.help || self.view.trash.is_some()) && id != Some(PaneId::Help) {
                     if !std::mem::take(&mut self.view.help) {
                         self.view.trash = None;
                     }
                     self.view.press = None;
-                    if !matches!(id, Some(PaneId::Tab(_))) {
+                    if !matches!(id, Some(PaneId::Tab(_))) && !workspace_card {
                         return Vec::new();
                     }
                 }
@@ -5901,6 +7957,24 @@ impl AppState {
                     // A click is about something else than the action popup's rows: it
                     // closes the popup, then does what it does.
                     self.view.action = None;
+                    // A running `!` command's `■ stop`: the same one under the press as under
+                    // the release (output streaming in may have moved another one there).
+                    let pressed = sel.pane.link(sel.anchor.y);
+                    let stop = (sel.pane.id == PaneId::Transcript)
+                        .then(|| {
+                            self.view
+                                .panes
+                                .get(&PaneId::Transcript)
+                                .filter(|p| p.area == sel.pane.area)
+                                .and_then(|p| p.link(y))
+                                .filter(|l| pressed == Some(*l))
+                                .and_then(|l| l.strip_prefix(crate::ui::SHELL_STOP))
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    if let Some(job) = stop {
+                        return self.stop_shell(&job);
+                    }
                     self.click(&sel.pane, x, y);
                     return Vec::new();
                 }
@@ -6014,6 +8088,11 @@ impl AppState {
     /// tap runs only once what it answers has been read. With a question waiting, any other
     /// tap cancels it, as any other key does.
     fn tap(&mut self, target: Target) -> Vec<Action> {
+        // A text scrolled on a phone pages, whatever is open over it or waits for `y`.
+        if let Target::More(which) = target {
+            self.page_text(which);
+            return Vec::new();
+        }
         if self.view.confirm.is_some() && !matches!(target, Target::Yes | Target::No) {
             self.view.confirm = None;
             self.view.status = Some("cancelled".into());
@@ -6046,6 +8125,30 @@ impl AppState {
                 self.follow();
             }
             Target::Close => return self.close_top(),
+            Target::Workspace(name) => return self.ws_activate(WsRow::Workspace(name)),
+            // Brought into view: chosen as the keys would, the cards' selection let go there.
+            Target::WsMore(name) => {
+                if self.ws_screen() {
+                    self.set_focus(None);
+                }
+                self.view.ws_sel = Some(WsRow::Workspace(name));
+            }
+            Target::NewWorkspace => return self.ws_activate(WsRow::New),
+            Target::Settings => return self.ws_activate(WsRow::Settings),
+            Target::WsSidebar => return self.toggle_workspaces(),
+            Target::Setting(key) => return self.tap_setting(key),
+            // Paged above.
+            Target::More(_) => {}
+            // A queued message: a tap selects it, a tap on the selected one opens its popup.
+            Target::Queued(r) => {
+                if self.view.queued == Some(r) {
+                    if let Some(t) = self.queued_target() {
+                        self.open_action(t);
+                    }
+                } else if self.shown_queue().is_some() {
+                    self.select_queued(r);
+                }
+            }
             Target::Release => {
                 if self.view.request.take().is_some() {
                     self.view.shown = None;
@@ -6095,6 +8198,9 @@ impl AppState {
                 }
             }
             Target::Yes => return self.tap_yes(),
+            Target::No if self.view.confirm.as_ref().is_some_and(|c| c.offer) => {
+                return self.tap_offer_no();
+            }
             Target::No => {
                 if self.view.confirm.take().is_some() {
                     self.view.status = Some("cancelled".into());
@@ -6104,7 +8210,7 @@ impl AppState {
                 self.view.status = None;
                 self.view.status_until = None;
             }
-            Target::Sidebar => self.set_sidebar(true),
+            Target::Sidebar => return self.sidebar_or_screen(true),
             Target::FocusOff => self.set_focus_mode(false),
             Target::Parked => self.show_parked(true),
         }
@@ -6116,6 +8222,9 @@ impl AppState {
     fn close_top(&mut self) -> Vec<Action> {
         if self.picker_open() {
             return self.picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if self.view.new_ws.take().is_some() || self.view.settings.take().is_some() {
+            return Vec::new();
         }
         let closed = std::mem::take(&mut self.view.help)
             || self.view.trash.take().is_some()
@@ -6135,15 +8244,7 @@ impl AppState {
     /// has been on screen for [`CARD_SETTLE`] ([`ViewState::confirm_seen`]); before that it
     /// says so, and the question stays.
     fn tap_yes(&mut self) -> Vec<Action> {
-        let Some(c) = &self.view.confirm else {
-            return Vec::new();
-        };
-        let read = self
-            .view
-            .confirm_seen
-            .as_ref()
-            .is_some_and(|(prompt, since)| *prompt == c.prompt && since.elapsed() >= CARD_SETTLE);
-        if !read {
+        if !self.confirm_read() {
             return Vec::new();
         }
         let Some(c) = self.view.confirm.take() else {
@@ -6153,15 +8254,157 @@ impl AppState {
         vec![c.action]
     }
 
+    /// Whether the question waiting for `y` had been on screen, with its `yes`, for
+    /// [`CARD_SETTLE`] ([`ViewState::confirm_seen`]) when the input being handled was read
+    /// ([`AppState::input_at`]; now, without one): a key read earlier and handled late was
+    /// meant for what was there then.
+    fn confirm_read(&self) -> bool {
+        let Some(c) = &self.view.confirm else {
+            return false;
+        };
+        let at = self.input_at.unwrap_or_else(Instant::now);
+        self.view
+            .confirm_seen
+            .as_ref()
+            .is_some_and(|(prompt, since)| {
+                *prompt == c.prompt
+                    && at
+                        .checked_duration_since(*since)
+                        .is_some_and(|d| d >= CARD_SETTLE)
+            })
+    }
+
+    /// On a phone, the action popup's text as last drawn had more rows than its room: it
+    /// scrolls ([`crate::select::Panes::sheet`]).
+    fn sheet_scrolls(&self) -> bool {
+        self.view
+            .panes
+            .sheet
+            .as_ref()
+            .is_some_and(|w| w.max_scroll > 0)
+    }
+
+    /// A key while an offer the TUI made by itself is on screen ([`Confirm::offer`]): `y`
+    /// (or the alternative's key), unmodified, on an empty input line and once the offer has
+    /// been read, answers it. Any other key leaves the offer for this run and goes where it
+    /// would without it (`None`): an offer never takes a key that was meant for typing.
+    fn offer_key(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+        let answerable = plain && self.view.input.is_empty() && self.confirm_read();
+        let c = self.view.confirm.take()?;
+        if answerable {
+            if let KeyCode::Char(got) = key.code {
+                if got.eq_ignore_ascii_case(&'y') {
+                    self.view.status = Some(c.pending);
+                    return Some(vec![c.action]);
+                }
+                if let Some((k, action, pending)) = c.alt {
+                    if got.eq_ignore_ascii_case(&k) {
+                        self.view.status = Some(pending);
+                        return Some(vec![action]);
+                    }
+                }
+            }
+        }
+        // Left for this run: it comes back at the next start until answered (a few times).
+        self.terminal_offer = None;
+        None
+    }
+
+    /// A tap on `no` of an offer the TUI made by itself: its alternative (don't ask again),
+    /// once the offer has been read; before that nothing.
+    fn tap_offer_no(&mut self) -> Vec<Action> {
+        if !self.confirm_read() {
+            return Vec::new();
+        }
+        let Some((_, action, pending)) = self.view.confirm.take().and_then(|c| c.alt) else {
+            return Vec::new();
+        };
+        self.view.status = Some(pending);
+        vec![action]
+    }
+
+    /// Shows `text` in the status bar, to be told once: [`AppState::note_drawn`] records it as
+    /// told ([`AppState::seen`]) once a frame showed it there.
+    pub fn show_once(&mut self, what: crate::firstrun::Once, text: String) {
+        self.view.status = Some(text.clone());
+        self.once = Some((what, text));
+        self.once_short = None;
+    }
+
+    /// Notice `what` (`text`, said `short` where the status bar has no room for it whole),
+    /// which must have been drawn whole before what it tells of happens (a suggestion asked
+    /// for, a summary): put in the status bar, unless a question has the bar (after it), it is
+    /// there already and waits for a frame, or another notice told once that a frame hasn't
+    /// shown is there (after it; one replaced meanwhile comes back at the next start). Shown,
+    /// then replaced before a frame showed it: shown again.
+    pub(crate) fn wait_for_notice(
+        &mut self,
+        what: crate::firstrun::Once,
+        text: String,
+        short: String,
+    ) {
+        let on_screen = self.view.status.as_deref() == Some(text.as_str());
+        match &self.once {
+            _ if self.view.confirm.is_some() => return,
+            Some((w, _)) if *w == what && on_screen => {}
+            Some((w, _)) if *w == what => self.view.status = Some(text.clone()),
+            Some((_, told)) if self.view.status.as_deref() == Some(told) => return,
+            _ => self.show_once(what, text.clone()),
+        }
+        self.once_short = Some((text, short));
+    }
+
+    /// Puts the Shift-Enter offer on screen at startup ([`crate::firstrun::terminal_offer`]):
+    /// a question for `y` or `n` ([`Confirm::offer`], counted as made by
+    /// [`crate::firstrun::reserve_offer`]), or a notice told once.
+    pub fn offer_terminal(&mut self, offer: crate::firstrun::TerminalOffer) {
+        use crate::firstrun::{Once, TerminalOffer};
+        match &offer {
+            TerminalOffer::Notice { key, text } => {
+                self.show_once(Once::Terminal(key.clone()), text.clone());
+            }
+            TerminalOffer::Edit { .. } => {
+                self.view.confirm = Some(Confirm {
+                    prompt: offer.question().unwrap_or_default(),
+                    pending: "setting Shift-Enter up…".into(),
+                    alt: Some((
+                        'n',
+                        Action::TerminalSetup { yes: false },
+                        "Shift-Enter left as it is: twr won't ask again (`twr terminal-setup` \
+                         sets it up any time; Ctrl-J starts a new line)"
+                            .into(),
+                    )),
+                    offer: true,
+                    action: Action::TerminalSetup { yes: true },
+                });
+                self.terminal_offer = Some(offer);
+            }
+        }
+    }
+
+    /// The Shift-Enter offer was answered (`yes`): remembered for its place; the offer, for
+    /// the IO loop to set the terminal up with when `yes`.
+    pub fn answer_terminal_offer(&mut self, yes: bool) -> Option<crate::firstrun::TerminalOffer> {
+        let offer = self.terminal_offer.take()?;
+        self.seen
+            .terminal
+            .entry(offer.key().to_string())
+            .or_insert_with(|| if yes { "yes" } else { "no" }.into());
+        self.seen_dirty = true;
+        yes.then_some(offer)
+    }
+
     /// Whether the input box offers to take back the last message ([`Target::TakeBack`]):
     /// nothing is typed, the main pane shows the message's thread, and it can still be taken
     /// back.
     pub fn take_back_offered(&self) -> bool {
+        let here = self.main_thread();
         self.view.input.is_empty()
-            && self
-                .sent
-                .as_ref()
-                .is_some_and(|s| s.thread == self.main_thread())
+            && self.sent.as_ref().is_some_and(|s| {
+                s.thread == here
+                    || (s.armed.is_some() && s.armed_in.as_ref() == Some(&self.armed_view()))
+            })
             && self.unsend_check().is_ok()
     }
 
@@ -6169,15 +8412,21 @@ impl AppState {
     /// takes the message back within [`UNSEND_WINDOW`], as Esc Esc does (the hint in the
     /// box's title says so meanwhile).
     fn tap_unsend(&mut self, now: Instant) -> Vec<Action> {
+        self.expire_unsend(now);
         if !self.take_back_offered() {
             return Vec::new();
         }
-        let armed = self.sent.as_ref().and_then(|s| s.armed);
-        if armed.is_some_and(|at| now.saturating_duration_since(at) < UNSEND_WINDOW) {
-            return self.unsend();
+        let view = self.armed_view();
+        if self
+            .sent
+            .as_ref()
+            .is_some_and(|s| s.armed.is_some() && s.armed_in.as_ref() == Some(&view))
+        {
+            return self.unsend_armed();
         }
         if let Some(s) = self.sent.as_mut() {
             s.armed = Some(now);
+            s.armed_in = Some(view);
         }
         Vec::new()
     }
@@ -6219,7 +8468,11 @@ impl AppState {
             .map(|i| (i.attn_id.clone(), i.revision));
         let guarded = matches!(
             kind,
-            ActionKind::Answer(_) | ActionKind::Dismiss | ActionKind::Stop
+            ActionKind::Answer(_)
+                | ActionKind::Dismiss
+                | ActionKind::Stop
+                | ActionKind::Delete
+                | ActionKind::SendNow
         );
         // On screen in full (the popup, or the main pane, drew it whole: [`ViewState::shown`])
         // and read: unchanged for CARD_SETTLE.
@@ -6238,9 +8491,12 @@ impl AppState {
         if popup.sel == Some(kind) && (!guarded || (armed && read)) {
             return self.run_action(kind);
         }
+        let size = (self.view.width, self.view.height);
         if let Some(p) = self.view.action.as_mut() {
             p.sel = Some(kind);
+            p.moved = true;
             p.armed = (guarded && read).then_some((kind, item));
+            p.armed_at = size;
         }
         if guarded {
             let label = rows[row]
@@ -6249,11 +8505,16 @@ impl AppState {
                 .next()
                 .unwrap_or_default()
                 .to_string();
-            self.view.status = Some(match shown {
+            let said = match shown {
                 Some(true) => format!("tap {label} again to run it"),
                 Some(false) => "just shown: read it, then tap again".to_string(),
                 None => NOT_ON_SCREEN.to_string(),
-            });
+            };
+            let phone = self.compact();
+            match self.view.action.as_mut().filter(|_| phone) {
+                Some(p) => p.hint = Some(said),
+                None => self.view.status = Some(said),
+            }
         }
         Vec::new()
     }
@@ -6283,7 +8544,7 @@ impl AppState {
                         Some(ActionTarget::Request(_)) => {
                             self.selected_request().is_some_and(|i| i.thread == *id)
                         }
-                        None => false,
+                        Some(ActionTarget::Queued(_)) | None => false,
                     } =>
             {
                 if let Some(t) = self.selection_target() {
@@ -6353,6 +8614,7 @@ impl AppState {
                     } else if key.starts_with("block:") {
                         self.view.block = Some(key);
                         self.view.request = None;
+                        self.view.queued = None;
                     } else {
                         self.view.expanded.insert(key);
                     }
@@ -6393,6 +8655,11 @@ impl AppState {
                 at.saturating_add(step).min(max)
             };
         };
+        // The docked workspace list stays beside the overlays: it scrolls under the pointer.
+        if self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Workspaces) {
+            self.ws_wheel(up);
+            return;
+        }
         if self.view.help {
             wheel(&mut self.view.help_scroll, self.view.panes.help_max);
             return;
@@ -6401,10 +8668,38 @@ impl AppState {
             wheel(&mut self.view.trash_scroll, self.view.panes.trash_max);
             return;
         }
+        // The compact Threads screen scrolls as one list, its cards with it (not under a
+        // popup, which takes the wheel).
+        let over_popup = self.view.panes.at(x, y).map(|p| &p.id) == Some(&PaneId::Popup);
+        if self.ws_screen()
+            && !over_popup
+            && self
+                .view
+                .panes
+                .phone
+                .is_some_and(|r| r.contains((x, y).into()))
+        {
+            self.ws_wheel(up);
+            return;
+        }
         let arrow = KeyEvent::new(
             if up { KeyCode::Up } else { KeyCode::Down },
             KeyModifiers::NONE,
         );
+        // On a phone, the text of the action popup or of the question waiting for `y` scrolls
+        // under the pointer; the popup's rows move their highlight under it.
+        let over = |w: &Option<crate::select::CardWindow>| {
+            w.as_ref()
+                .is_some_and(|w| w.max_scroll > 0 && w.area.contains((x, y).into()))
+        };
+        if over(&self.view.panes.ask) {
+            self.scroll_text(crate::select::Scrolled::Ask, !up, WHEEL_STEP);
+            return;
+        }
+        if over(&self.view.panes.sheet) {
+            self.scroll_text(crate::select::Scrolled::Sheet, !up, WHEEL_STEP);
+            return;
+        }
         match self.view.panes.at(x, y).map(|p| (p.id.clone(), p.area)) {
             Some((PaneId::Popup, _)) => {
                 if self.action_popup().is_some() {
@@ -6480,15 +8775,23 @@ impl AppState {
     /// answers nothing, a pasted line break sends nothing. The decisions overlay has no input
     /// box: a paste there does nothing.
     pub fn handle_paste(&mut self, text: &str) {
-        if self.picker_open() {
+        if self.picker_open() || self.view.settings.is_some() {
             return;
         }
         self.view.selection = None;
+        // The new-workspace dialog takes it as typed (its first line), never the input line.
+        if self.view.new_ws.is_some() {
+            self.paste_new_ws(text);
+            return;
+        }
         // Like a key, a paste closes the help or cancels a confirmation, and does nothing else.
         if std::mem::take(&mut self.view.help) {
             return;
         }
-        if self.view.confirm.take().is_some() {
+        // An offer the TUI made by itself goes for this run; the paste goes where it would.
+        if self.view.confirm.as_ref().is_some_and(|c| c.offer) {
+            self.view.confirm = None;
+        } else if self.view.confirm.take().is_some() {
             self.view.status = Some("cancelled".into());
             return;
         }
@@ -6548,6 +8851,36 @@ impl AppState {
 /// Returns whether it was one. The `/` or `@` popup takes Up and Down first while it is open;
 /// Up and Down with Ctrl or Alt scroll the main pane, with Shift they move the selection
 /// ([`AppState::view_key`], [`AppState::selection_key`]): they are no rows of the line.
+/// The message a line typed in the input box sends ([`AppState::input_key`]): `\!...` sends
+/// `!...` (one backslash of those before a `!` goes), `//...` sends `/...`; anything else as
+/// it is. A line that starts with `!` or a single `/` sends nothing: it is a command.
+pub fn message_text(line: &str) -> String {
+    if line.starts_with('\\') && line.trim_start_matches('\\').starts_with('!') {
+        return line[1..].to_string();
+    }
+    match line.strip_prefix('/') {
+        Some(rest) if rest.starts_with('/') => rest.to_string(),
+        _ => line.to_string(),
+    }
+}
+
+/// The line that sends `message` as it is ([`message_text`]'s inverse): what goes back in the
+/// input box or the history for a message taken back or a suggestion taken, so Enter sends it
+/// again as a message, never as a `!` or `/` command. Leading blanks go, as Enter trims them.
+pub fn literal_line(message: &str) -> String {
+    // As the box will hold it: control characters a message may start with go first, so they
+    // never hide a `!` or `/` from the escape.
+    let clean = crate::edit::clean_text(message);
+    let t = clean.trim_start();
+    if t.trim_start_matches('\\').starts_with('!') {
+        format!("\\{t}")
+    } else if t.starts_with('/') {
+        format!("/{t}")
+    } else {
+        t.to_string()
+    }
+}
+
 fn edit_key(line: &mut LineInput, key: KeyEvent, cols: usize, rows: usize) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -6825,6 +9158,30 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn memory_changes_show_as_hub_lines() {
+        let mut t = Transcript::new("t-orch");
+        let mut o = ThreadScript::new("t-orch");
+        t.apply(
+            &o.event(EventBody::MemoryChanged(twr_core::event::MemoryChanged {
+                op: "updated".into(),
+                name: "short-replies".into(),
+                by: "orchestrator".into(),
+                origin: Some("user".into()),
+                ..Default::default()
+            })),
+        );
+        let texts: Vec<&str> = t
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::HubUpdate { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["updated memory short-replies"]);
+    }
+
     /// A request's end goes onto the hub update that raised it: one entry, its outcome
     /// filled in. An end whose raise is not in the transcript stays an update of its own.
     #[test]
@@ -6930,30 +9287,34 @@ pub(crate) mod tests {
     }
 
     /// The compact layout (a phone, below `[tui] compact_width` columns): one screen at a time
-    /// under a line naming them. "Needs you" lists each item, most urgent first, and ↑↓ and
-    /// Enter open one's action popup; "Threads" lists each thread; the conversation has no
-    /// cards, and Enter on its empty line opens the oldest item waiting.
+    /// under a tab bar naming them. "Needs you" lists each item, most urgent first, and ↑↓ and
+    /// Enter open one's action popup; "Threads" shows each thread's card, the selected one kept
+    /// in view; the conversation has no cards, and Enter on its empty line opens the oldest
+    /// item waiting.
     #[test]
     fn the_compact_layout_shows_one_screen_at_a_time() {
         let mut st = three_threads();
         st.view.compact_width = 60;
         let lines = rows(&mut st, 50, 24);
         assert!(st.compact());
-        assert!(
-            lines[0].starts_with("Chat · Needs you 2 · Threads"),
+        let names: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(
+            names,
+            ["Chat", "Needs", "you", "2", "Threads"],
             "{lines:#?}"
         );
         // Needs you.
         type_line(&mut st, "/n");
         let lines = rows(&mut st, 50, 24);
         let text = lines.join("\n");
-        let perm = lines
-            .iter()
-            .position(|l| l.contains("beta · permission · Bash: rm -rf"));
-        let review = lines
-            .iter()
-            .position(|l| l.contains("alpha · review · turn gave up"));
+        // Two rows each: who and what, then what it asks.
+        let perm = lines.iter().position(|l| l.contains("beta · permission"));
+        let review = lines.iter().position(|l| l.contains("alpha · review"));
         assert!(perm.is_some() && review.is_some(), "{text}");
+        let (perm, review) = (perm.unwrap(), review.unwrap());
+        assert!(lines[perm + 1].contains("Bash: rm -rf"), "{text}");
+        assert!(lines[review + 1].contains("turn gave up"), "{text}");
+        assert_eq!(review, perm + 2, "{text}");
         assert_eq!(st.focused(), Some("t-beta"));
         st.handle_key(key(KeyCode::Down));
         assert_eq!(st.focused(), Some("t-alpha"));
@@ -6963,12 +9324,27 @@ pub(crate) mod tests {
         assert!(st.action_popup().is_some());
         st.handle_key(key(KeyCode::Esc));
         assert!(st.action_popup().is_none());
-        // Threads.
+        // Threads: the cards, as many as fit; ↓ moves on, and the cards follow it. (alpha
+        // and gamma say a lot: their cards are as tall as cards get.)
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({
+                "t-alpha": {"activity": "building ".repeat(40)},
+                "t-gamma": {"activity": "testing ".repeat(40)},
+            }),
+        );
         type_line(&mut st, "/t");
         let text = rows(&mut st, 50, 24).join("\n");
-        for name in ["alpha", "beta", "gamma"] {
-            assert!(text.contains(name), "{name}: {text}");
-        }
+        assert!(text.contains("┏ proj · beta "), "{text}");
+        assert!(text.contains("PERMISSION  Bash: rm -rf target"), "{text}");
+        assert!(!text.contains("gamma"), "{text}");
+        st.handle_key(key(KeyCode::Down));
+        st.handle_key(key(KeyCode::Down));
+        assert_eq!(st.focused(), Some("t-gamma"));
+        let text = rows(&mut st, 50, 24).join("\n");
+        assert!(text.contains("┏ proj · gamma "), "{text}");
+        // (The one-row tab bar leaves alpha room above it.)
+        assert!(text.contains("↑ 1 more"), "{text}");
         // The conversation: Enter on its empty line opens the oldest item waiting.
         type_line(&mut st, "/c");
         rows(&mut st, 50, 24);
@@ -7055,8 +9431,9 @@ pub(crate) mod tests {
         assert!(st.view.status.as_deref().unwrap_or("").contains("/n"));
     }
 
-    /// A long item opened from "Needs you" during a dive into another thread
-    /// keeps its card selected for its detail view.
+    /// A long item opened from "Needs you" during a dive into another thread opens in its
+    /// popup there, its text scrolling in it (no detail view in the conversation): its card
+    /// stays selected, and closed, Enter opens it again, not the older item of another card.
     #[test]
     fn a_long_item_from_needs_keeps_its_card_during_a_dive() {
         let mut st = three_threads();
@@ -7079,16 +9456,21 @@ pub(crate) mod tests {
         st.handle_key(key(KeyCode::Enter));
         rows(&mut st, 50, 24);
         rows(&mut st, 50, 24);
-        assert_eq!(st.view.compact_pane, CompactPane::Chat);
+        assert_eq!(st.view.compact_pane, CompactPane::Needs);
         assert_eq!(st.focused(), Some("t-delta"));
-        assert_eq!(st.detail_card(), Some("t-delta"));
-        assert!(st.action_popup().is_some(), "the popup keeps its target");
-        // Its popup closed to read the detail, Enter opens it again, not the
-        // older item of another card.
+        assert_eq!(st.detail_card(), None);
+        assert!(
+            st.view.panes.sheet.is_some(),
+            "its text scrolls in the popup"
+        );
+        assert_eq!(
+            st.action_popup().map(|p| p.target.clone()),
+            Some(ActionTarget::Card("t-delta".into()))
+        );
         st.handle_key(key(KeyCode::Esc));
         rows(&mut st, 50, 24);
         assert!(st.view.action.is_none());
-        assert_eq!(st.detail_card(), Some("t-delta"));
+        assert_eq!(st.focused(), Some("t-delta"));
         st.handle_key(key(KeyCode::Enter));
         assert_eq!(
             st.action_popup().map(|p| p.target.clone()),
@@ -7153,8 +9535,10 @@ pub(crate) mod tests {
         rows(&mut st, 50, 24);
         type_line(&mut st, "/n");
         let first = st.focused().map(str::to_string);
+        // The full layout at 60 columns: its sidebar keeps the card selected (narrower, it
+        // has no room for one, and nothing is selected).
         type_line(&mut st, "/compact off");
-        rows(&mut st, 50, 24);
+        rows(&mut st, 60, 24);
         st.handle_key(shift(KeyCode::Left));
         assert!(st.view.main_focus);
         type_line(&mut st, "/compact on");
@@ -7165,15 +9549,20 @@ pub(crate) mod tests {
             first.map(ActionTarget::Card)
         );
         st.handle_key(key(KeyCode::Esc));
+        // Threads: the cards, the selected one drawn as selected; cut with `…` only when cut.
         type_line(&mut st, "/t");
-        let lines = rows(&mut st, 50, 24);
-        let gamma = lines.iter().find(|l| l.contains("gamma")).unwrap();
-        assert!(!gamma.trim_end().ends_with('…'), "{gamma:?}");
-        let lines = rows(&mut st, 12, 24);
-        assert!(
-            lines.iter().any(|l| l.trim_end().ends_with('…')),
-            "{lines:#?}"
-        );
+        // (The cards are what is above the input box.)
+        let cards = |lines: Vec<String>| -> Vec<String> {
+            lines
+                .into_iter()
+                .take_while(|l| !l.contains("→ orchestrator"))
+                .collect()
+        };
+        let lines = cards(rows(&mut st, 50, 24));
+        assert!(lines.iter().any(|l| l.starts_with('┏')), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains('…')), "{lines:#?}");
+        let lines = cards(rows(&mut st, 12, 24));
+        assert!(lines.iter().any(|l| l.contains('…')), "{lines:#?}");
     }
 
     /// A dive with nothing waiting: "Needs you" is empty, and Enter opens
@@ -7206,7 +9595,11 @@ pub(crate) mod tests {
         type_line(&mut st, "/compact on");
         let lines = rows(&mut st, 120, 30);
         assert!(st.compact());
-        assert!(lines[0].starts_with("Chat · Needs you"), "{lines:#?}");
+        // The tab bar's names, on its row.
+        assert!(
+            lines[0].contains("Chat") && lines[0].contains("Needs you 2"),
+            "{lines:#?}"
+        );
         type_line(&mut st, "/compact off");
         rows(&mut st, 40, 30);
         assert!(!st.compact());
@@ -7236,6 +9629,36 @@ pub(crate) mod tests {
         evs.extend([c.created("gamma"), c.turn_started("tests")]);
         control(&mut st, &evs);
         st
+    }
+
+    /// A deleted thread is still named by its id, and by its name while no live thread has it
+    /// and no other deleted thread had it; a live thread of that name comes first.
+    #[test]
+    fn a_deleted_thread_is_named_by_its_id_and_its_unique_name() {
+        let mut st = AppState::new();
+        let (mut x, mut y, mut z) = (
+            ThreadScript::new("t-x"),
+            ThreadScript::new("t-y"),
+            ThreadScript::new("t-z"),
+        );
+        let gone = |s: &mut ThreadScript, name: &str| {
+            s.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                name: name.into(),
+                ..Default::default()
+            }))
+        };
+        control(&mut st, &[x.created("api"), gone(&mut x, "api")]);
+        let id = |st: &AppState, q: &str| st.thread_named(q).map(|t| t.id.clone());
+        assert_eq!(id(&st, "t-x").as_deref(), Some("t-x"));
+        assert_eq!(id(&st, "api").as_deref(), Some("t-x"));
+        assert_eq!(id(&st, "ap"), None, "no prefix match");
+        control(&mut st, &[y.created("api")]);
+        assert_eq!(id(&st, "api").as_deref(), Some("t-y"));
+        assert_eq!(id(&st, "t-x").as_deref(), Some("t-x"));
+        control(&mut st, &[gone(&mut y, "api"), z.created("web")]);
+        assert_eq!(id(&st, "api"), None, "two deleted threads had it");
+        assert_eq!(id(&st, "t-y").as_deref(), Some("t-y"));
+        assert_eq!(id(&st, "web").as_deref(), Some("t-z"));
     }
 
     /// A deleted thread leaves the listing; the status bar says so, and names the directory git
@@ -7470,11 +9893,15 @@ pub(crate) mod tests {
         type_line(&mut st, "/sidebar");
         assert!(!st.view.sidebar_hidden);
         type_line(&mut st, "/focus off");
+        // In the grid too, Ctrl-B and Ctrl-T hide and show the sidebar, in the grid.
         st.handle_key(ctrl('g'));
         assert_eq!(st.view.screen, Screen::Grid);
         st.handle_key(sidebar);
-        assert_eq!(st.view.screen, Screen::Stack);
+        assert_eq!(st.view.screen, Screen::Grid);
         assert!(st.view.sidebar_hidden);
+        st.handle_key(ctrl('t'));
+        assert_eq!(st.view.screen, Screen::Grid);
+        assert!(!st.view.sidebar_hidden);
     }
 
     /// Nothing is selected after the initial replay either (a card picked during it stays);
@@ -8106,7 +10533,8 @@ pub(crate) mod tests {
             [Entry::Text {
                 seq: later.seq,
                 text: "and more".into(),
-                open: false
+                open: false,
+                final_seq: Some(later.seq),
             }]
         );
 
@@ -8562,7 +10990,7 @@ pub(crate) mod tests {
     }
 
     /// Types `line` on a cleared input line and presses Enter.
-    fn type_line(st: &mut AppState, line: &str) -> Vec<Action> {
+    pub(crate) fn type_line(st: &mut AppState, line: &str) -> Vec<Action> {
         st.view.input.clear();
         for c in line.chars() {
             assert!(st.handle_key(key(KeyCode::Char(c))).is_empty());
@@ -8673,6 +11101,229 @@ pub(crate) mod tests {
         assert!(st.view.confirm.is_some());
     }
 
+    /// A `speech.*` call (`/read`, Ctrl-R).
+    fn speech_call(method: &'static str, params: Value) -> Vec<Action> {
+        vec![Action::Speech { method, params }]
+    }
+
+    /// The poll's answer: `laptop` reading message `seq` of `thread` (or idle).
+    fn speech_polled(st: &mut AppState, reading: Option<(&str, u64)>) {
+        use crate::speech::tests::{playing, polled, speaker};
+        let state = twr_core::speech::SpeechStateParams {
+            playing: reading.and_then(|(t, seq)| playing(t, seq)),
+            ..Default::default()
+        };
+        st.apply_result("speech.status", &polled(vec![speaker("laptop", state)]));
+    }
+
+    /// `/read` runs as the hub's `speech.*` calls, never as a message: the last messages of
+    /// the orchestrator, or in a dive of the thread (`--orch`: the orchestrator's still), on
+    /// every speaker or `--on` one; live mode and the controls. One that can't go stays on the
+    /// line with its error; `/read status` says what the last poll said.
+    #[test]
+    fn read_runs_as_speech_calls_never_as_messages() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let request = |p: Value| speech_call("speech.request", p);
+        let control = |p: Value| speech_call("speech.control", p);
+        assert_eq!(type_line(&mut st, "/read"), request(json!({"last": 1})));
+        assert!(st.view.input.is_empty());
+        assert_eq!(
+            type_line(&mut st, "/read 5 --on laptop"),
+            request(json!({"last": 5, "speaker": "laptop"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 2 --orch"),
+            request(json!({"last": 2})),
+            "outside a dive, the orchestrator's anyway"
+        );
+        assert_eq!(
+            type_line(&mut st, "/read on"),
+            control(json!({"op": "live", "value": true}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read off --on mini"),
+            control(json!({"op": "live", "value": false, "speaker": "mini"}))
+        );
+        for op in ["stop", "pause", "resume", "skip"] {
+            assert_eq!(
+                type_line(&mut st, &format!("/read {op}")),
+                control(json!({ "op": op })),
+                "{op}"
+            );
+        }
+        assert_eq!(
+            type_line(&mut st, "/read voice Samantha"),
+            control(json!({"op": "voice", "value": "Samantha"}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read rate 220"),
+            control(json!({"op": "rate", "value": 220}))
+        );
+        // In a dive: the thread's messages, unless --orch.
+        st.dive("t-gamma");
+        assert_eq!(
+            type_line(&mut st, "/read 3"),
+            request(json!({"thread": "t-gamma", "last": 3}))
+        );
+        assert_eq!(
+            type_line(&mut st, "/read 3 --orch"),
+            request(json!({"last": 3}))
+        );
+        // Refused: on the line still, the error said; nothing sent.
+        assert!(type_line(&mut st, "/read 99").is_empty());
+        assert_eq!(st.view.input, "/read 99");
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("/read N reads the last 1 to 50 messages")
+        );
+        // `/read status`: the last poll, here none yet, then a speaker.
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert!(st.view.input.is_empty());
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains("no word from the hub yet"));
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        assert!(type_line(&mut st, "/read status").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("1 speaker: laptop (spd) · live off · reading")
+        );
+    }
+
+    /// `/read this` reads the long message selected in the conversation, by the seq of its
+    /// final text; with none selected, or one still streaming, it says so.
+    #[test]
+    fn read_this_reads_the_selected_message() {
+        use serde_json::json;
+        let mut st = with_orch();
+        let pick = "select one of the conversation's messages first (Shift-←, then Shift-↑/↓)";
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(pick));
+        let t = st.transcript.as_mut().unwrap();
+        t.entries.push(Entry::Text {
+            seq: 5,
+            text: "long reply\n".repeat(30),
+            open: false,
+            final_seq: Some(9),
+        });
+        t.entries.push(Entry::Text {
+            seq: 12,
+            text: "still coming\n".repeat(30),
+            open: true,
+            final_seq: None,
+        });
+        st.view.block = Some("block:t-orch:text:5:0".into());
+        assert_eq!(
+            type_line(&mut st, "/read this --on mini"),
+            speech_call(
+                "speech.request",
+                json!({"thread": "t-orch", "seq": 9, "speaker": "mini"})
+            )
+        );
+        st.view.block = Some("block:t-orch:text:12:0".into());
+        assert!(type_line(&mut st, "/read this").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("that message is still being written")
+        );
+        // A block that is no message, or of another thread.
+        for key in [
+            "block:t-orch:prompt:3",
+            "block:t-gamma:text:5:0",
+            "block:t-orch:text:7:0",
+        ] {
+            st.view.block = Some(key.into());
+            assert!(type_line(&mut st, "/read this").is_empty());
+            assert_eq!(st.view.status.as_deref(), Some(pick), "{key}");
+        }
+    }
+
+    /// What the hub answers is said in the status bar: no speaker (and how to connect one), how
+    /// many messages are read; a hub from before reading aloud is said on `/read`, and its
+    /// poll stops, silently.
+    #[test]
+    fn read_answers_are_said() {
+        use crate::speech::answer;
+        use serde_json::json;
+        let mut st = with_orch();
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 1}),
+                &Ok(json!({"count": 0, "speakers": 0, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status, Some(crate::speech::no_speaker()));
+        assert!(st
+            .view
+            .status
+            .as_deref()
+            .unwrap()
+            .contains(&format!("twr speak --ssh {}", crate::speech::host())));
+        st.apply_result(
+            "speech.request",
+            &answer(
+                json!({"last": 4}),
+                &Ok(json!({"count": 4, "speakers": 1, "thread": "t"})),
+            ),
+        );
+        assert_eq!(st.view.status.as_deref(), Some("reading 4 messages"));
+        let old = || {
+            anyhow::Error::new(twr_core::proto::RpcError::new(
+                twr_core::proto::codes::METHOD_NOT_FOUND,
+                "unknown method",
+            ))
+        };
+        st.view.status = None;
+        st.speech.pending = true;
+        st.apply_result("speech.status", &answer(json!({}), &Err(old())));
+        assert_eq!(st.view.status, None, "the poll says nothing");
+        assert!(st.speech.unsupported && !st.speech.pending);
+        st.apply_result(
+            "speech.control",
+            &answer(json!({"op": "stop"}), &Err(old())),
+        );
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
+    }
+
+    /// Ctrl-R stops what a speaker reads, whatever is typed and in the decisions overlay too;
+    /// with nothing read it says how to start.
+    #[test]
+    fn ctrl_r_stops_reading_or_says_how_to_start() {
+        use serde_json::json;
+        let mut st = with_orch();
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::NOTHING_READ));
+        speech_polled(&mut st, None);
+        assert!(st.handle_key(ctrl('r')).is_empty(), "idle");
+        speech_polled(&mut st, Some(("t-orch", 4)));
+        let stop = speech_call("speech.control", json!({"op": "stop"}));
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        // With text typed, and the / popup open: it stays.
+        st.view.input.set("/re");
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.input, "/re");
+        st.view.input.clear();
+        st.toggle_decisions();
+        assert_eq!(st.view.screen, Screen::Decisions);
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert_eq!(st.view.screen, Screen::Decisions);
+        // With the help open: stopped too, and the help stays.
+        st.toggle_decisions();
+        st.view.help = true;
+        assert_eq!(st.handle_key(ctrl('r')), stop);
+        assert!(st.view.help);
+        st.view.help = false;
+        // An older hub: said.
+        st.speech.unsupported = true;
+        assert!(st.handle_key(ctrl('r')).is_empty());
+        assert_eq!(st.view.status.as_deref(), Some(crate::speech::PREDATES));
+    }
+
     #[test]
     fn slash_commands_run_locally_and_never_as_messages() {
         let mut st = five_threads();
@@ -8704,6 +11355,8 @@ pub(crate) mod tests {
                 project: "~/src/api".into(),
                 runtime: Some("codex".into()),
                 name: Some("api2".into()),
+                account: None,
+                outside_pin: false,
             }]
         );
         // /park and /stop ask first; the default is the focused thread.
@@ -9085,6 +11738,263 @@ pub(crate) mod tests {
         assert_eq!(st.view.status.as_deref(), Some("no thread orch"));
     }
 
+    /// One `hub.info` box: online unless `state` says otherwise.
+    pub(crate) fn info_box(name: &str, state: &str) -> Value {
+        serde_json::json!({
+            "name": name, "transport": "ssh", "state": state,
+            "online": state == "online" || state == "switching",
+            "version": "0.2.0", "refused": null, "last_error": null, "notes": [],
+            "os": "Linux", "arch": "x86_64", "build": "aaaa", "running_build": "aaaa",
+            "switch_pending": false, "agents": [],
+        })
+    }
+
+    /// What a box's token says, by its `hub.info` entry: `switching` first, then `update
+    /// pending`, then why it is not online; a protocol mismatch only from a refusal or error
+    /// that names a protocol, never from another build or version alone.
+    #[test]
+    fn a_box_word_follows_its_hub_info_entry() {
+        let word = |b: Value| BoxStatus::from_info(&b).word();
+        let with = |mut b: Value, k: &str, v: Value| {
+            b[k] = v;
+            b
+        };
+        assert_eq!(word(info_box("gpu", "online")), None);
+        // A box of another OS and CPU on another build and version, online: plain.
+        let cross = with(
+            with(info_box("mac", "online"), "running_build", "bbbb".into()),
+            "version",
+            "0.1.9".into(),
+        );
+        let cross = with(cross, "os", "Darwin".into());
+        assert_eq!(word(cross), None);
+        // A token box (no SSH fields) online, and offline.
+        let token = serde_json::json!({
+            "name": "pi", "transport": "token", "state": "online", "online": true,
+            "version": "0.2.0", "refused": null, "last_error": null, "notes": null,
+            "switch_pending": null, "agents": [],
+        });
+        assert_eq!(word(token.clone()), None);
+        let token = with(
+            with(token, "state", "offline".into()),
+            "online",
+            false.into(),
+        );
+        assert_eq!(word(token.clone()), Some(BoxWord::Offline));
+        // Refused for its protocol: a mismatch.
+        let refused = serde_json::json!({"at": "2026-10-17T10:00:00Z", "reason":
+            "a runner speaking protocol 6 was refused (the hub's is 7): update twr on box `pi`"});
+        assert_eq!(
+            word(with(token.clone(), "refused", refused)),
+            Some(BoxWord::Mismatch)
+        );
+        // Refused for its token: offline, not a mismatch.
+        let bad_token = serde_json::json!({"at": "2026-10-17T10:00:00Z", "reason":
+            "a runner was refused: its proof does not match this box's token"});
+        assert_eq!(
+            word(with(token, "refused", bad_token)),
+            Some(BoxWord::Offline)
+        );
+        // An online box being switched; one with a switch pending.
+        assert_eq!(word(info_box("gpu", "switching")), Some(BoxWord::Switching));
+        let pending = with(info_box("gpu", "online"), "switch_pending", true.into());
+        assert_eq!(word(pending.clone()), Some(BoxWord::UpdatePending));
+        // Switching wins over pending, pending over offline.
+        let both = with(info_box("gpu", "switching"), "switch_pending", true.into());
+        assert_eq!(word(both), Some(BoxWord::Switching));
+        let away = with(
+            with(pending, "state", "offline".into()),
+            "online",
+            false.into(),
+        );
+        assert_eq!(word(away), Some(BoxWord::UpdatePending));
+        for (state, want) in [
+            ("needs_install", BoxWord::NeedsInstall),
+            ("error", BoxWord::Error),
+            ("offline", BoxWord::Offline),
+            ("connecting", BoxWord::Reconnecting),
+        ] {
+            assert_eq!(word(info_box("gpu", state)), Some(want), "{state}");
+        }
+        // A cross-target box whose build speaks another protocol: `needs install` (what to do)
+        // wins over the mismatch that caused it.
+        let old = with(
+            info_box("mac", "needs_install"),
+            "last_error",
+            "box mac runs a twr build that speaks protocol 6, the hub 7: install this hub's \
+             build there: `twr box install mac`"
+                .into(),
+        );
+        assert_eq!(word(old), Some(BoxWord::NeedsInstall));
+        // An error that only mentions a protocol in passing is not one.
+        let ssh = with(
+            info_box("gpu", "offline"),
+            "last_error",
+            "ssh: the protocol banner was not read".into(),
+        );
+        assert_eq!(word(ssh), Some(BoxWord::Offline));
+    }
+
+    /// A thread on a box the hub's boxes do not name (removed since) is `not configured` once
+    /// a `hub.info` answer listed them, and says nothing before (no answer yet, or answers
+    /// without boxes); a box added back, or whose runner connects, is itself again. A local
+    /// thread never has a word.
+    #[test]
+    fn a_box_missing_from_the_hub_is_not_configured() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        let mut job = ThreadScript::new("t-job");
+        let mut created = job.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.box_name = "gpu".into();
+        }
+        let mut loc = ThreadScript::new("t-loc");
+        let mut local = loc.created("loc");
+        if let EventBody::ThreadCreated(p) = &mut local.body {
+            p.box_name = "local".into();
+        }
+        control(&mut st, &[created, local]);
+        let word = |st: &AppState, id: &str| st.box_word(st.registry.get(id).unwrap());
+        assert_eq!(word(&st, "t-job"), None);
+        st.apply_result("hub.info", &Value::Null);
+        st.apply_result("hub.info", &serde_json::json!({ "disk": {} }));
+        assert!(!st.boxes_known);
+        assert_eq!(word(&st, "t-job"), None);
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({ "boxes": [info_box("pi", "online")] }),
+        );
+        assert!(st.boxes_known);
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        assert_eq!(word(&st, "t-loc"), None);
+        // A failed poll after it changes nothing; an empty list leaves it unconfigured.
+        st.apply_result("hub.info", &Value::Null);
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [] }));
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        assert_eq!(word(&st, "t-loc"), None);
+        // Added back.
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({ "boxes": [info_box("gpu", "offline")] }),
+        );
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::Offline));
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [] }));
+        assert_eq!(word(&st, "t-job"), Some(BoxWord::NotConfigured));
+        // Its runner connecting before the next poll names it.
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let up = hub.event(EventBody::RunnerConnected(RunnerPayload {
+            box_name: "gpu".into(),
+            ..Default::default()
+        }));
+        control(&mut st, &[up]);
+        assert_eq!(word(&st, "t-job"), None);
+        assert_eq!(BoxWord::NotConfigured.text(), "not configured");
+    }
+
+    /// `hub.info` polls replace the boxes (a failed one keeps them); `runner.connected` and
+    /// `runner.disconnected` change a box at once between polls, but not during the replay.
+    #[test]
+    fn runner_events_change_a_box_between_polls() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")], "disk": {}}),
+        );
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        st.apply_result("hub.info", &Value::Null);
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let runner = |name: &str| RunnerPayload {
+            box_name: name.into(),
+            version: Some("0.2.1".into()),
+            ..Default::default()
+        };
+        let up = hub.event(EventBody::RunnerConnected(runner("gpu")));
+        let down = hub.event(EventBody::RunnerDisconnected(runner("gpu")));
+        control(&mut st, std::slice::from_ref(&up));
+        assert_eq!(st.boxes["gpu"].word(), None);
+        assert_eq!(st.boxes["gpu"].version.as_deref(), Some("0.2.1"));
+        control(&mut st, std::slice::from_ref(&down));
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // A box being switched stays so while its runner is away; back, it is on its build.
+        let mut switching = info_box("gpu", "switching");
+        switching["switch_pending"] = true.into();
+        assert!(st.send_info());
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [switching] }));
+        control(&mut st, std::slice::from_ref(&down));
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Switching));
+        control(&mut st, std::slice::from_ref(&up));
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // A box live-added since the last poll.
+        let new = hub.event(EventBody::RunnerConnected(runner("pi")));
+        control(&mut st, &[new]);
+        assert_eq!(st.boxes["pi"].word(), None);
+        // The replay's connections are past ones.
+        let mut st = AppState::new();
+        st.apply_boxes(&serde_json::json!({"boxes": [info_box("gpu", "online")]}));
+        st.begin_catch_up(10);
+        control(&mut st, &[down]);
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // A poll says which boxes there are: one removed goes.
+        assert!(st.send_info());
+        st.apply_result("hub.info", &serde_json::json!({"boxes": []}));
+        assert!(st.boxes.is_empty());
+    }
+
+    /// A `hub.info` answer does not undo a runner event newer than its request: a poll sent
+    /// before a disconnect, answered after it, leaves the box offline (and one it no longer
+    /// names but the event did, there); a poll sent after the event applies; an answer that
+    /// agrees on the box being online or not applies whenever it was sent.
+    #[test]
+    fn an_older_poll_does_not_undo_a_runner_event() {
+        use twr_core::event::RunnerPayload;
+        let mut st = AppState::new();
+        let mut hub = ThreadScript::new(twr_core::event::HUB_THREAD);
+        let runner = |name: &str| RunnerPayload {
+            box_name: name.into(),
+            ..Default::default()
+        };
+        let online = || serde_json::json!({"boxes": [info_box("gpu", "online")]});
+        assert!(st.send_info());
+        st.apply_result("hub.info", &online());
+        assert_eq!(st.boxes["gpu"].word(), None);
+        // Sent while online, answered after the box left.
+        assert!(st.send_info());
+        assert!(!st.send_info(), "one poll at a time");
+        let down = hub.event(EventBody::RunnerDisconnected(runner("gpu")));
+        control(&mut st, &[down]);
+        st.apply_result("hub.info", &online());
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // A box added after the poll was sent, which its answer does not name yet, stays.
+        assert!(st.send_info());
+        let pi_up = hub.event(EventBody::RunnerConnected(runner("pi")));
+        control(&mut st, &[pi_up]);
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")]}),
+        );
+        assert_eq!(st.boxes["pi"].word(), None);
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        // An older answer that agrees still applies (what it adds: its state, version...).
+        assert!(st.send_info());
+        let up = hub.event(EventBody::RunnerConnected(runner("gpu")));
+        control(&mut st, &[up]);
+        let mut newer = info_box("gpu", "online");
+        newer["version"] = "0.2.9".into();
+        st.apply_result("hub.info", &serde_json::json!({ "boxes": [newer] }));
+        assert_eq!(st.boxes["gpu"].version.as_deref(), Some("0.2.9"));
+        // A poll sent after the event applies, whatever it says.
+        assert!(st.send_info());
+        st.apply_result(
+            "hub.info",
+            &serde_json::json!({"boxes": [info_box("gpu", "offline")]}),
+        );
+        assert_eq!(st.boxes["gpu"].word(), Some(BoxWord::Offline));
+        assert!(!st.boxes.contains_key("pi"));
+    }
+
     #[test]
     fn control_replay_is_deduplicated_by_gseq() {
         let mut st = AppState::new();
@@ -9156,10 +12066,12 @@ pub(crate) mod tests {
                     notice: false,
                     withdrawn: false,
                 },
+                // The final after the deltas names the message: its seq.
                 Entry::Text {
                     seq: evs[2].seq,
                     text: "hello world".into(),
-                    open: false
+                    open: false,
+                    final_seq: Some(evs[6].seq),
                 },
                 Entry::Tool {
                     call_id: "c1".into(),
@@ -9795,11 +12707,17 @@ pub(crate) mod tests {
     /// Draws `st` at `w` x `h` the way the IO loop does: the width and the panes are kept.
     /// Returns the screen.
     pub(crate) fn draw(st: &mut AppState, w: u16, h: u16) -> Buffer {
+        draw_at(st, w, h, Instant::now())
+    }
+
+    /// [`draw`] at `now`: the cards' order and heights settled then, as the IO loop settles
+    /// them before it draws.
+    pub(crate) fn draw_at(st: &mut AppState, w: u16, h: u16, now: Instant) -> Buffer {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         (st.view.width, st.view.height) = (w, h);
         // As the IO loop does before it draws.
-        st.settle_order(Instant::now());
+        st.settle_order(now);
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         let mut panes = Panes::default();
         term.draw(|f| panes = crate::ui::render(f, st)).unwrap();
@@ -10312,8 +13230,8 @@ pub(crate) mod tests {
     fn a_drag_copies_the_transcript_text_without_borders() {
         let (mut st, screen) = with_transcript(40);
         let tr = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
-        // From the transcript's first cell, dragged past its right border and down past its
-        // bottom: the whole pane, nothing else.
+        // From the transcript's first cell, dragged past its right edge and down past its
+        // bottom: the whole pane, nothing else (not the input box under it).
         let actions = drag(&mut st, &screen, (tr.area.x, tr.area.y), (200, 200));
         let [Action::Copy { text }] = actions.as_slice() else {
             panic!("{actions:?}");
@@ -10335,7 +13253,8 @@ pub(crate) mod tests {
         assert!(shown[(tr.area.x, tr.area.y)]
             .modifier
             .contains(ratatui::style::Modifier::REVERSED));
-        assert!(!shown[(tr.area.x - 1, tr.area.y)]
+        // Not the header band above it.
+        assert!(!shown[(tr.area.x, tr.area.y - 1)]
             .modifier
             .contains(ratatui::style::Modifier::REVERSED));
         st.handle_key(key(KeyCode::Char('?')));
@@ -10360,9 +13279,8 @@ pub(crate) mod tests {
         let [Action::Copy { text }] = &actions[..] else {
             panic!("{actions:?}");
         };
-        assert!(text.starts_with("running · fake"), "{text:?}");
-        assert!(!text.contains("twr"), "{text:?}");
-        assert!(text.ends_with("\n› working"), "{text:?}");
+        // Its status row, without the icon, then the blank row under it.
+        assert_eq!(text.trim_end(), "running", "{text:?}");
     }
 
     /// Copying the conversation leaves the working cursor out, at the end of a reply
@@ -10389,6 +13307,7 @@ pub(crate) mod tests {
                     seq: 0,
                     text: "On it".into(),
                     open,
+                    final_seq: None,
                 },
             ];
             st.view.selection = None;
@@ -10462,9 +13381,10 @@ pub(crate) mod tests {
     fn a_double_click_on_a_card_dives_in() {
         let mut st = with_orch();
         let screen = draw(&mut st, 120, 40);
+        // (On its first row: a card with little to say has one.)
         let at = |st: &AppState, id: &str| {
             let a = st.view.panes.get(&PaneId::Thread(id.into())).unwrap().area;
-            (a.x + 1, a.y + 1)
+            (a.x + 1, a.y)
         };
         let beta = at(&st, "t-beta");
         let gamma = at(&st, "t-gamma");
@@ -10749,6 +13669,44 @@ pub(crate) mod tests {
         ));
     }
 
+    /// A compaction of the runtime's context reads as a line of the transcript (a dive's and
+    /// the orchestrator's conversation alike): its sizes, or why it failed.
+    #[test]
+    fn a_compaction_reads_as_a_line_of_the_transcript() {
+        let mut s = ThreadScript::new("t1");
+        let mut tr = Transcript::new("t1");
+        tr.apply(&s.event(EventBody::ContextCompacting(Default::default())));
+        assert!(tr.entries.is_empty(), "the activity line says it runs");
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                pre_tokens: Some(34_878),
+                post_tokens: Some(12_726),
+                ..Default::default()
+            },
+        )));
+        assert_eq!(
+            tr.entries.last(),
+            Some(&Entry::Notice {
+                seq: tr.last_seq,
+                level: NoticeLevel::Info,
+                text: "context compacted (auto) · 34.9k tokens → 12.7k".into()
+            })
+        );
+        tr.apply(&s.event(EventBody::ContextCompacted(
+            twr_core::event::ContextCompacted {
+                trigger: "auto".into(),
+                error: Some("too_few_groups".into()),
+                ..Default::default()
+            },
+        )));
+        assert!(matches!(
+            tr.entries.last(),
+            Some(Entry::Notice { level: NoticeLevel::Error, text, .. })
+                if text == "context compaction failed (auto): too_few_groups"
+        ));
+    }
+
     /// `thread.model_changed` reads as a line of the transcript naming what changed, from what,
     /// and by whom; the runtime the hub restarts for it did not stop, and any other reason (or
     /// none) is a stop.
@@ -10836,6 +13794,10 @@ pub(crate) mod tests {
                 Some(twr_core::event::TRIM_RESTART_REASON),
                 "the runtime stopped for a trim of its build output; the next prompt resumes the session",
             ),
+            (
+                Some(twr_core::event::BOX_UPGRADE_REASON),
+                "restarting on the box's new twr build; the next prompt resumes the session",
+            ),
             (Some("hub_shutdown"), "thread stopped"),
             (None, "thread stopped"),
         ] {
@@ -10846,6 +13808,150 @@ pub(crate) mod tests {
                 tr.entries.last()
             );
         }
+    }
+
+    /// An account move's `thread.model_changed` names both accounts (the native one by its
+    /// current name when the TUI knows it, else `own login`), the model or effort when they
+    /// changed too, and both runtimes on a move between runtimes; the stop that restarts the
+    /// runtime for it says the next turn starts a new session on the new account, not that the
+    /// thread stopped.
+    #[test]
+    fn an_account_move_is_a_transcript_line() {
+        use twr_core::event::{ChangedBy, SessionPayload};
+        let mut s = ThreadScript::new("t1");
+        let mut tr = Transcript::new("t1");
+        let opt = |v: Option<&str>| v.map(str::to_string);
+        let named = |rt: &str| (rt == "claude-code").then(|| "personal".to_string());
+        let unnamed = |_: &str| None;
+        let last = |tr: &Transcript| match tr.entries.last() {
+            Some(Entry::Notice { text, .. }) => text.clone(),
+            e => panic!("not a notice: {e:?}"),
+        };
+        let stop = |s: &mut ThreadScript| {
+            s.event(EventBody::ThreadStopped(SessionPayload {
+                ext: serde_json::json!({"twr": {"reason": ACCOUNT_RESTART_REASON}})
+                    .as_object()
+                    .cloned(),
+                ..Default::default()
+            }))
+        };
+        // Before any move the transcript saw (an older one, out of its replay).
+        tr.apply(&stop(&mut s));
+        assert_eq!(
+            last(&tr),
+            "the previous session stopped; the next turn starts a new session on its new account"
+        );
+        // (Runtime and account before, after; a new model; who; then the lines.)
+        let mut check = |(from_rt, from, to_rt, to): (&str, Option<&str>, &str, Option<&str>),
+                         model: Option<&str>,
+                         by: ChangedBy,
+                         native: &dyn Fn(&str) -> Option<String>,
+                         want: &str,
+                         on: &str| {
+            let mv = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+                runtime: opt(Some(to_rt)),
+                previous_runtime: opt(Some(from_rt)),
+                account_changed: true,
+                account: opt(to),
+                previous_account: opt(from),
+                model: opt(model.or(Some("opus"))),
+                previous_model: opt(Some("opus")),
+                by,
+                ..Default::default()
+            }));
+            tr.apply_named(&mv, native);
+            assert_eq!(last(&tr), want);
+            assert_eq!(tr.runtime.as_deref(), Some(to_rt));
+            tr.apply(&stop(&mut s));
+            assert_eq!(
+                last(&tr),
+                format!("the previous session stopped; the next turn starts a new session on {on}")
+            );
+        };
+        let cc = "claude-code";
+        check(
+            (cc, Some("work"), cc, None),
+            None,
+            ChangedBy::User,
+            &named,
+            "account work → personal (by you)",
+            "claude-code:personal",
+        );
+        check(
+            (cc, None, cc, Some("work")),
+            None,
+            ChangedBy::Orchestrator,
+            &unnamed,
+            "account own login → work (by the orchestrator)",
+            "claude-code:work",
+        );
+        check(
+            (cc, Some("work"), cc, Some("work2")),
+            Some("sonnet"),
+            ChangedBy::User,
+            &named,
+            "account work → work2, model from opus to sonnet (by you)",
+            "claude-code:work2",
+        );
+        check(
+            ("codex", Some("team"), cc, Some("work")),
+            None,
+            ChangedBy::User,
+            &named,
+            "runtime codex:team → claude-code:work, model opus, effort default (by you)",
+            "claude-code:work",
+        );
+        check(
+            (cc, None, "codex", Some("team")),
+            None,
+            ChangedBy::User,
+            &unnamed,
+            "runtime claude-code (own login) → codex:team, model opus, effort default (by you)",
+            "codex:team",
+        );
+        // A move back to an account the thread left resumes its session there: the stop says
+        // so.
+        let mut back = ThreadModelChanged {
+            runtime: opt(Some(cc)),
+            previous_runtime: opt(Some(cc)),
+            account_changed: true,
+            account: opt(Some("work")),
+            previous_account: opt(Some("work2")),
+            ..Default::default()
+        };
+        twr_core::event::set_twr_ext(
+            &mut back.ext,
+            twr_core::event::RESUME_SESSION_KEY,
+            serde_json::json!("s-work"),
+        );
+        tr.apply_named(&s.event(EventBody::ThreadModelChanged(back)), &named);
+        tr.apply(&stop(&mut s));
+        assert_eq!(
+            last(&tr),
+            "the previous session stopped; the next turn resumes the thread's earlier session on \
+             claude-code:work"
+        );
+
+        // The main pane's transcript names the native account as the hub lists it now.
+        let mut st = AppState::new();
+        st.accounts = crate::accounts::Accounts::from_list(&serde_json::json!({
+            "runtimes": {"claude-code": {"shown": true, "native": "personal", "accounts": []}}
+        }));
+        st.view.dive = Some("t1".into());
+        st.sync_main();
+        let mut s = ThreadScript::new("t1");
+        let mv = s.event(EventBody::ThreadModelChanged(ThreadModelChanged {
+            runtime: opt(Some(cc)),
+            previous_runtime: opt(Some(cc)),
+            account_changed: true,
+            account: opt(Some("work")),
+            ..Default::default()
+        }));
+        st.apply_event(&thread_item(&mv));
+        assert_eq!(
+            last(st.transcript.as_ref().unwrap()),
+            "account personal → work (by you)"
+        );
     }
 
     /// `/model <thread>` shows the thread's model and effort; with a model, `--effort` or both
@@ -10956,14 +14062,279 @@ pub(crate) mod tests {
             effort: Some("high".into()),
             ..Default::default()
         };
-        assert_eq!(model_show(&t), "api: model fable, effort high");
+        assert_eq!(model_show(&t, None), "api: model fable, effort high");
         t.actual_model = Some("claude-fable-5-1".into());
         assert_eq!(
-            model_show(&t),
+            model_show(&t, None),
             "api: model fable, effort high (runs claude-fable-5-1)"
         );
         t.model = Some("claude-fable-5-1".into());
-        assert_eq!(model_show(&t), "api: model claude-fable-5-1, effort high");
+        assert_eq!(
+            model_show(&t, None),
+            "api: model claude-fable-5-1, effort high"
+        );
+        t.runtime = "codex".into();
+        t.actual_model = None;
+        t.handoff_pending = true;
+        assert!(
+            model_show(&t, None).ends_with("; its first codex session starts with its next turn")
+        );
+        t.resume_session = Some("th-1".into());
+        assert!(model_show(&t, None)
+            .ends_with("; its earlier codex session resumes with its next turn"));
+    }
+
+    /// An `account.list` answer for the test runtime `fake`: `personal` (native) and `work`,
+    /// both logged in when `shown` (the runtime then shows account labels), else `work` logged
+    /// out.
+    pub(crate) fn fake_accounts(shown: bool) -> Value {
+        let mut l = crate::accounts::tests::list(shown);
+        let fake = l["runtimes"]["claude-code"].take();
+        l["runtimes"] = serde_json::json!({ "fake": fake });
+        l
+    }
+
+    /// [`three_threads`] (on the `fake` runtime's native account) plus `job`, on its account
+    /// `work`.
+    pub(crate) fn with_job_on_work() -> AppState {
+        let mut st = three_threads();
+        let mut j = ThreadScript::new("t-job");
+        j.at(30);
+        let mut created = j.created("job");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.ext = serde_json::json!({"twr": {"account": "work"}})
+                .as_object()
+                .cloned();
+        }
+        control(&mut st, &[created]);
+        st
+    }
+
+    /// `/account <thread>` says the account a thread runs on and its login (or that its
+    /// runtime has one account); `/account <thread> <name>` moves it (`thread.set_model
+    /// {account}`, `outside_pin` only with `--outside-pin`); in a dive one word is the
+    /// account, unless it names a thread and no account; `/model` names the account while
+    /// labels show; `/accounts` lists them; `/account add` says the command to run.
+    #[test]
+    fn slash_account_shows_moves_and_lists() {
+        let mut st = with_job_on_work();
+        let status = |st: &AppState| st.view.status.clone().unwrap_or_default();
+        // A hub older than accounts: nothing known, nothing labelled.
+        assert!(type_line(&mut st, "/accounts").is_empty());
+        assert_eq!(
+            status(&st),
+            "no accounts known: the hub is older than accounts"
+        );
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(status(&st), "alpha: fake (one account)");
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work");
+        st.apply_result("account.list", &fake_accounts(true));
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (logged in)");
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(
+            status(&st),
+            "alpha: fake account personal (native, logged in)"
+        );
+        assert!(type_line(&mut st, "/model job").is_empty());
+        assert_eq!(
+            status(&st),
+            "job: account work, model default, effort default"
+        );
+        assert!(type_line(&mut st, "/accounts").is_empty());
+        assert_eq!(
+            status(&st),
+            "accounts: fake: personal (native, logged in), work (logged in)"
+        );
+        // A move.
+        let set = |thread: &str, account: &str, outside_pin| Action::SetAccount {
+            thread: thread.into(),
+            account: account.into(),
+            outside_pin,
+        };
+        assert_eq!(
+            type_line(&mut st, "/account alpha work"),
+            [set("t-alpha", "work", false)]
+        );
+        assert_eq!(status(&st), "alpha → account work: waiting for the hub");
+        assert_eq!(
+            lib_request(&set("t-alpha", "work", false)),
+            (
+                "thread.set_model",
+                serde_json::json!({"thread": "t-alpha", "account": "work"})
+            )
+        );
+        assert_eq!(
+            type_line(&mut st, "/account alpha work --outside-pin"),
+            [set("t-alpha", "work", true)]
+        );
+        assert_eq!(
+            lib_request(&set("t-alpha", "work", true)),
+            (
+                "thread.set_model",
+                serde_json::json!({"thread": "t-alpha", "account": "work", "outside_pin": true})
+            )
+        );
+        assert!(type_line(&mut st, "/account nope work").is_empty());
+        assert_eq!(status(&st), "no thread nope");
+        // In a dive.
+        st.dive("t-alpha");
+        assert_eq!(
+            type_line(&mut st, "/account work"),
+            [set("t-alpha", "work", false)]
+        );
+        // Not an account, not a thread: the hub says what it has.
+        assert_eq!(
+            type_line(&mut st, "/account gpu"),
+            [set("t-alpha", "gpu", false)]
+        );
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (logged in)");
+        assert!(type_line(&mut st, "/account").is_empty());
+        assert_eq!(
+            status(&st),
+            "alpha: fake account personal (native, logged in)"
+        );
+        assert_eq!(
+            type_line(&mut st, "/account job --outside-pin"),
+            [set("t-alpha", "job", true)]
+        );
+        st.back();
+        st.set_focus(None);
+        assert!(type_line(&mut st, "/account").is_empty());
+        assert!(status(&st).starts_with("no thread selected; usage: /account"));
+        // Adding one needs a terminal.
+        assert!(type_line(&mut st, "/account add claude max-2").is_empty());
+        assert_eq!(
+            status(&st),
+            "to add the account, run in another terminal: twr account add claude max-2"
+        );
+        // The hub's answer to a move says what happens.
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "runtime": "fake",
+                    "account": "work", "previous_account": "personal", "account_changed": true,
+                    "runtime_changed": false, "changed": true, "applies": "after_turn",
+                    "message": "alpha moves to fake:work; its next turn starts a new session \
+                                there with a handoff"})
+            )
+            .as_deref(),
+            Some(
+                "alpha moves to fake:work; its next turn starts a new session there with a \
+                 handoff; the current turn finishes on the previous account first"
+            )
+        );
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "changed": false,
+                    "runtime": "fake", "account": "work",
+                    "message": "alpha already runs on fake:work with model default"})
+            )
+            .as_deref(),
+            Some("alpha already runs on fake:work with model default")
+        );
+        // The runtime alone asked for: what it has, as without accounts (no account named).
+        assert_eq!(
+            crate::result_status(
+                "thread.set_model",
+                &serde_json::json!({"thread_name": "alpha", "changed": false,
+                    "runtime": "fake", "account": "work",
+                    "message": "alpha already runs on fake with model default"})
+            )
+            .as_deref(),
+            Some("alpha already has model default, effort default")
+        );
+        // `/new --account`.
+        let new = type_line(&mut st, "/new api --account work --outside-pin");
+        assert_eq!(
+            lib_request(&new[0]),
+            (
+                "thread.new",
+                serde_json::json!({"project": "api", "account": "work", "outside_pin": true})
+            )
+        );
+        // An account the list no longer has (config.toml dropped it) is removed, as the hub's
+        // `account_removed` says: the label and `/account` name it so.
+        let mut l = fake_accounts(false);
+        l["runtimes"]["fake"]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|a| a["name"] != "work");
+        st.apply_result("account.list", &l);
+        let job = st.registry.get("t-job").unwrap().clone();
+        assert_eq!(st.account_label(&job).as_deref(), Some("work (removed)"));
+        assert!(type_line(&mut st, "/account job").is_empty());
+        assert_eq!(status(&st), "job: fake account work (removed)");
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(status(&st), "alpha: fake (one account)");
+    }
+
+    /// `/account` of a thread on another box on the native account says it runs on that
+    /// box's own login, never the state of this machine's native login.
+    #[test]
+    fn slash_account_of_a_remote_native_thread_shows_no_local_state() {
+        let mut st = with_job_on_work();
+        let mut gpu = ThreadScript::new("t-gpu");
+        gpu.at(40);
+        let mut created = gpu.created("far");
+        if let EventBody::ThreadCreated(p) = &mut created.body {
+            p.box_name = "gpu".into();
+        }
+        control(&mut st, &[created]);
+        st.apply_result("account.list", &fake_accounts(true));
+        assert!(type_line(&mut st, "/account far").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("far: fake (the box's own login)")
+        );
+        // A local one on it still shows the local login.
+        assert!(type_line(&mut st, "/account alpha").is_empty());
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("alpha: fake account personal (native, logged in)")
+        );
+    }
+
+    /// Completion names a thread's account while its runtime shows labels, and `/account`
+    /// completes the accounts of the thread named, or dived into, with their state.
+    #[test]
+    fn completion_names_accounts() {
+        let mut st = with_job_on_work();
+        let detail = |st: &AppState, name: &str| {
+            st.pools()
+                .threads
+                .into_iter()
+                .find(|t| t.0 == name)
+                .unwrap()
+                .1
+        };
+        st.apply_result("account.list", &fake_accounts(false));
+        assert_eq!(detail(&st, "job"), "idle · fake · mode manual");
+        st.apply_result("account.list", &fake_accounts(true));
+        assert_eq!(detail(&st, "job"), "idle · fake:work · mode manual");
+        assert_eq!(
+            detail(&st, "alpha").split(" · ").nth(1),
+            Some("fake:personal")
+        );
+        let values = |st: &AppState, line: &str| -> Vec<(String, String)> {
+            slash::suggest(line, &st.pools())
+                .items
+                .into_iter()
+                .map(|i| (i.value, i.detail))
+                .collect()
+        };
+        assert_eq!(
+            values(&st, "/account job "),
+            [
+                ("personal".to_string(), "native, logged in".to_string()),
+                ("work".to_string(), "logged in".to_string())
+            ]
+        );
+        st.dive("t-job");
+        assert_eq!(values(&st, "/account w")[0].0, "work");
     }
 
     /// The popup above the input line: arrows pick, Tab completes, Enter on a partial command
@@ -11040,7 +14411,7 @@ pub(crate) mod tests {
         type_chars(&mut st, "hello /x");
         assert!(st.popup().is_none());
         st.view.input.set("/");
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.popup().is_none());
     }
 
@@ -11308,8 +14679,8 @@ pub(crate) mod tests {
     }
 
     /// A card that comes to need you goes to the top at once, even while the cards are held
-    /// (a card selected, the mouse over them); once its item is answered it stays there, at
-    /// its height, until the order is applied: after the delay, once nothing holds the cards.
+    /// (a card selected, the mouse over them); once its item is answered it stays there until
+    /// the order is applied: after the delay, once nothing holds the cards.
     #[test]
     fn a_card_that_needs_you_jumps_to_the_top_and_waits_to_go_back() {
         use crate::order::ORDER_DELAY;
@@ -11324,12 +14695,10 @@ pub(crate) mod tests {
             let (mut st, mut s) = (st.clone(), s.clone());
             control(&mut st, &[s[2].raise(id, reason)]);
             assert_eq!(st.order(), ids(&["c", "a", "b"]), "{reason:?}, at once");
-            assert!(st.card_tall("t-c"));
         }
         control(&mut st, &[s[2].raise("p1", Permission)]);
         st.settle_order(t0);
         control(&mut st, &[s[2].resolve("p1")]);
-        assert!(st.card_tall("t-c"), "the height waits with the place");
         // Long past the delay, but held: c stays on top.
         let later = t0 + ORDER_DELAY * 5;
         st.settle_order(t0 + Duration::from_millis(10));
@@ -11349,13 +14718,12 @@ pub(crate) mod tests {
         st.settle_order(later);
         assert_eq!(st.order(), ids(&["c", "a", "b"]));
         // The pointer moves to the conversation: let go, the delay starts, then the move.
-        st.view.pointer = Some((1, 5, later));
+        st.view.pointer = Some((159, 5, later));
         st.settle_order(later);
         assert_eq!(st.order(), ids(&["c", "a", "b"]));
         assert_eq!(st.order_deadline(later), Some(later + ORDER_DELAY));
         st.settle_order(later + ORDER_DELAY);
         assert_eq!(st.order(), ids(&["a", "b", "c"]));
-        assert!(!st.card_tall("t-c"));
         assert_eq!(
             st.order_deadline(later + ORDER_DELAY),
             None,
@@ -11400,6 +14768,9 @@ pub(crate) mod tests {
             filter: String::new(),
             read: None,
             armed: None,
+            hint: None,
+            armed_at: (0, 0),
+            moved: false,
         });
         held.settle_order(t0 + ORDER_DELAY * 2);
         assert_eq!(held.order(), ids(&["a", "b", "c"]), "held by the popup");
@@ -11495,20 +14866,21 @@ pub(crate) mod tests {
     fn a_scrolled_list_of_cards_does_not_jump() {
         let screen = Buffer::empty(ratatui::layout::Rect::default());
         let (mut st, mut s) = working(&["a", "b", "c", "d", "e", "f"]);
-        draw(&mut st, 160, 24);
+        // (Three of their cards fit: each running thread's says little.)
+        draw(&mut st, 160, 12);
         let list = st.view.panes.list.unwrap();
         for _ in 0..2 {
             st.handle_mouse(
                 mouse(MouseEventKind::ScrollDown, list.area.x + 1, list.area.y + 1),
                 &screen,
             );
-            draw(&mut st, 160, 24);
+            draw(&mut st, 160, 12);
         }
         let shown = cards_drawn(&st);
         assert_eq!(shown[0], "t-c", "{shown:?}");
         control(&mut st, &[s[5].raise("p1", Permission)]);
         assert_eq!(st.order()[0], "t-f");
-        draw(&mut st, 160, 24);
+        draw(&mut st, 160, 12);
         assert_eq!(cards_drawn(&st)[0], "t-c", "the same first card");
         assert_eq!(st.view.panes.list.unwrap().start, 3);
         // Scrolled up to the top, the list shows its new first card.
@@ -11518,7 +14890,7 @@ pub(crate) mod tests {
                 mouse(MouseEventKind::ScrollUp, list.area.x + 1, list.area.y + 1),
                 &screen,
             );
-            draw(&mut st, 160, 24);
+            draw(&mut st, 160, 12);
         }
         assert_eq!(cards_drawn(&st)[0], "t-f");
     }
@@ -11529,20 +14901,20 @@ pub(crate) mod tests {
     fn a_list_scrolled_to_its_end_does_not_jump_either() {
         let screen = Buffer::empty(ratatui::layout::Rect::default());
         let (mut st, mut s) = working(&["a", "b", "c", "d", "e"]);
-        draw(&mut st, 160, 24);
+        draw(&mut st, 160, 12);
         for _ in 0..5 {
             let list = st.view.panes.list.unwrap();
             st.handle_mouse(
                 mouse(MouseEventKind::ScrollDown, list.area.x + 1, list.area.y + 1),
                 &screen,
             );
-            draw(&mut st, 160, 24);
+            draw(&mut st, 160, 12);
         }
         let list = st.view.panes.list.unwrap();
         assert_eq!(list.start, list.max, "at the end");
         let first = cards_drawn(&st)[0].clone();
         control(&mut st, &[s[4].raise("p1", Permission)]);
-        draw(&mut st, 160, 24);
+        draw(&mut st, 160, 12);
         assert_eq!(cards_drawn(&st)[0], first, "{:?}", cards_drawn(&st));
         assert!(st.view.panes.list.unwrap().start > st.view.panes.list.unwrap().max);
     }
@@ -11597,12 +14969,8 @@ pub(crate) mod tests {
             st.handle_mouse(mouse(kind, list.area.x + 1, list.area.y + 1), &screen);
             draw(st, w, h);
         };
-        // (size, grid, how many cards (rows of tiles) are left out at most)
-        for ((w, h), grid_view, more) in [
-            ((160, 24), false, 3),
-            ((80, 24), false, 3),
-            ((100, 14), true, 2),
-        ] {
+        // (size, grid)
+        for ((w, h), grid_view) in [((160, 24), false), ((80, 24), false), ((100, 14), true)] {
             for mode in ["none selected", "selected", "dive"] {
                 let mut st = five_threads();
                 if grid_view {
@@ -11629,7 +14997,10 @@ pub(crate) mod tests {
                 for _ in 0..10 {
                     wheel(&mut st, true, w, h);
                 }
-                assert_eq!(st.view.panes.list.unwrap().start, more, "{at}");
+                // As far as it goes: the last card (row of tiles) shows.
+                let list = st.view.panes.list.unwrap();
+                assert!(list.max > 0, "{at}");
+                assert_eq!(list.start, list.max, "{at}");
                 let order = if grid_view {
                     st.grid_order()
                 } else {
@@ -11766,7 +15137,7 @@ pub(crate) mod tests {
         }
         assert_eq!(st.view.dive.as_deref(), Some(id.as_str()));
         // A column of a few cards: the grid's row would be a card well above the dive's.
-        draw(&mut st, 160, 20);
+        draw(&mut st, 160, 14);
         assert!(cards_drawn(&st).len() < 6, "{:?}", cards_drawn(&st));
         assert!(cards_drawn(&st).contains(&id), "{:?}", cards_drawn(&st));
     }
@@ -11869,7 +15240,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_picker_is_offered_only_when_nothing_was_ever_chosen() {
-        let p = Picker::from_show(&first_show()).unwrap();
+        let p = Picker::from_show(&first_show(), &Accounts::default()).unwrap();
         assert_eq!(
             p.runtimes,
             [
@@ -11891,14 +15262,14 @@ pub(crate) mod tests {
         ] {
             let mut v = first_show();
             edit(&mut v);
-            assert!(Picker::from_show(&v).is_none(), "{v}");
+            assert!(Picker::from_show(&v, &Accounts::default()).is_none(), "{v}");
         }
-        assert!(Picker::from_show(&Value::Null).is_none());
+        assert!(Picker::from_show(&Value::Null, &Accounts::default()).is_none());
         // An unknown default: the first row; no `installed`: unknown.
         let mut v = first_show();
         v["configured"]["runtime"] = "fake".into();
         v.as_object_mut().unwrap().remove("installed");
-        let p = Picker::from_show(&v).unwrap();
+        let p = Picker::from_show(&v, &Accounts::default()).unwrap();
         assert_eq!(p.selected, 0);
         assert_eq!(p.runtimes[0].1, None);
     }
@@ -11906,11 +15277,11 @@ pub(crate) mod tests {
     #[test]
     fn the_picker_chooses_with_enter_and_waits_with_esc() {
         let mut st = AppState::new();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         st.begin_catch_up(5);
         assert!(!st.picker_open(), "not before the replay is applied");
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.picker_open());
         // Modal: other keys (and the mouse, and pastes) do nothing but say how it works.
         assert!(st.handle_key(key(KeyCode::Char('q'))).is_empty());
@@ -11953,7 +15324,7 @@ pub(crate) mod tests {
             )
         );
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert_eq!(
             st.handle_key(key(KeyCode::Enter)),
             [Action::UseOrchestrator {
@@ -11964,7 +15335,7 @@ pub(crate) mod tests {
         );
         // Esc closes it without choosing; keys work as usual afterwards.
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(st.view.picker.is_none());
         assert!(st
@@ -11977,14 +15348,14 @@ pub(crate) mod tests {
         assert_eq!(st.view.input, "q");
         // Ctrl-C quits from the picker.
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         assert_eq!(st.handle_key(ctrl('c')), [Action::Quit]);
     }
 
     #[test]
     fn the_picker_closes_once_an_orchestrator_exists() {
         let mut st = three_threads();
-        st.view.picker = Picker::from_show(&first_show());
+        st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
         let mut o = ThreadScript::new("t-orch");
         o.at(60);
         let mut created = o.created("orchestrator");
@@ -11995,6 +15366,327 @@ pub(crate) mod tests {
         }
         control(&mut st, &[created]);
         assert!(st.view.picker.is_none());
+    }
+
+    /// The first-run picker keeps the configured account: its default row is
+    /// `claude-code:work` with `[orchestrator] account = "work"`, and choosing it sends that
+    /// account, labels shown or not. While a runtime shows account labels it has a row per
+    /// usable account, the configured one among them even when it cannot be used (the hub
+    /// refuses it, never another login in its place); without labels and no account
+    /// configured, the rows are the runtimes alone.
+    #[test]
+    fn the_first_run_picker_keeps_the_configured_account() {
+        let show = |account: Option<&str>| {
+            let mut v = first_show();
+            v["runtime"] = "claude-code".into();
+            v["account"] = account.unwrap_or("personal").into();
+            v["configured"]["runtime"] = "claude-code".into();
+            v["configured"]["model"] = "opus".into();
+            v["configured"]["account"] = account.into();
+            v
+        };
+        let rows = |p: &Picker| p.runtimes.iter().map(|r| r.0.clone()).collect::<Vec<_>>();
+        // Labels hidden (one account logged in), an account configured: its row carries it.
+        let hidden = Accounts::from_list(&crate::accounts::tests::list(false));
+        let p = Picker::from_show(&show(Some("work")), &hidden).unwrap();
+        assert_eq!(rows(&p), ["claude-code:work", "codex", "grok-build"]);
+        assert_eq!((p.selected, p.default.as_str()), (0, "claude-code:work"));
+        assert_eq!(p.runtimes[0].1, Some(true), "installed, as its runtime");
+        let mut st = three_threads();
+        // It shows the runtime alone, as labels are hidden.
+        st.accounts = hidden.clone();
+        st.view.picker = Some(p.clone());
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!lines.iter().any(|l| l.contains("work")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code ") && l.contains("(default)")),
+            "{lines:?}"
+        );
+        st.handle_key(key(KeyCode::Esc));
+        let said = st.view.status.clone().unwrap();
+        assert!(
+            said.contains("the orchestrator will be claude-code (") && !said.contains("work"),
+            "{said}"
+        );
+        st.view.picker = Some(p);
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: Some("opus".into()),
+                summary: false,
+            }]
+        );
+        assert_eq!(
+            crate::action_request(&Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: None,
+                summary: false,
+            })
+            .unwrap()
+            .1["runtime"],
+            "claude-code:work"
+        );
+        // Labels hidden, nothing configured: as before accounts.
+        let p = Picker::from_show(&show(None), &hidden).unwrap();
+        assert_eq!(rows(&p), ["claude-code", "codex", "grok-build"]);
+        assert_eq!(p.default, "claude-code");
+        // An older hub (no `configured.account`): likewise.
+        let mut old = show(None);
+        old["configured"].as_object_mut().unwrap().remove("account");
+        assert_eq!(
+            Picker::from_show(&old, &hidden).unwrap().default,
+            "claude-code"
+        );
+        // Labels shown: one row per account, the configured one the default.
+        let shown = Accounts::from_list(&crate::accounts::tests::list(true));
+        let p = Picker::from_show(&show(Some("work")), &shown).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!((p.selected, p.default.as_str()), (1, "claude-code:work"));
+        let mut st = three_threads();
+        st.accounts = shown.clone();
+        st.view.picker = Some(p);
+        let lines = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("claude-code:work") && l.contains("(default)")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("claude-code:personal") && !l.contains("(default)")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            st.handle_key(key(KeyCode::Enter)),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: Some("opus".into()),
+                summary: false,
+            }]
+        );
+        // Nothing configured: the account the hub would pick is the default.
+        let p = Picker::from_show(&show(None), &shown).unwrap();
+        assert_eq!(p.default, "claude-code:personal");
+        // A configured account that cannot be used is still the default row; a logged-out
+        // one that is not configured is not offered.
+        let mut l = crate::accounts::tests::list(true);
+        l["runtimes"]["claude-code"]["accounts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"name": "old", "native": false, "login": "logged_out"}));
+        let three = Accounts::from_list(&l);
+        let p = Picker::from_show(&show(Some("work")), &three).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        let p = Picker::from_show(&show(Some("old")), &three).unwrap();
+        assert_eq!(
+            rows(&p),
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "claude-code:old",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!(p.default, "claude-code:old");
+        assert_eq!(default_runtime(&show(None)).as_deref(), Some("claude-code"));
+        let mut explicit = show(None);
+        explicit["configured"]["explicit"] = true.into();
+        assert_eq!(default_runtime(&explicit), None);
+    }
+
+    /// `/orch`'s picker and completion name accounts as the first-run picker does: the
+    /// current orchestrator's account is its highlighted row (`claude-code:work`), labels
+    /// shown or not, and `/orch` completes `claude-code:work` while labels show.
+    #[test]
+    fn orch_picks_and_completes_accounts() {
+        let on_work = |accounts: Value| {
+            let mut st = three_threads();
+            st.accounts = Accounts::from_list(&accounts);
+            st.view.orch_installed = vec![("claude-code".into(), true)];
+            let mut o = ThreadScript::new("t-orch");
+            o.at(40);
+            let mut evs = orch_events(&mut o, "t-orch");
+            if let EventBody::ThreadCreated(p) = &mut evs[0].body {
+                p.ext = serde_json::json!({"twr": {"role": "orchestrator", "account": "work"}})
+                    .as_object()
+                    .cloned();
+            }
+            control(&mut st, &evs);
+            st
+        };
+        let mut st = on_work(crate::accounts::tests::list(true));
+        type_line(&mut st, "/orch");
+        let p = st.view.picker.clone().unwrap();
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(
+            rows,
+            [
+                "claude-code:personal",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        assert_eq!((p.default.as_str(), p.selected), ("claude-code:work", 1));
+        st.handle_key(key(KeyCode::Up));
+        st.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('s'))),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:personal".into(),
+                model: None,
+                summary: false,
+            }]
+        );
+        let pools = st.pools();
+        assert!(
+            pools.runtimes.contains(&(
+                "claude-code:work".to_string(),
+                "installed · logged in".to_string()
+            )),
+            "{:?}",
+            pools.runtimes
+        );
+        assert!(!pools.runtimes.iter().any(|r| r.0 == "claude-code"));
+        st.view.input.set("/orch claude-code:w");
+        st.complete_slash();
+        assert_eq!(st.view.input.as_str(), "/orch claude-code:work ");
+        // Labels hidden: the runtimes alone, but the current one keeps its account.
+        let mut st = on_work(crate::accounts::tests::list(false));
+        type_line(&mut st, "/orch");
+        let p = st.view.picker.clone().unwrap();
+        let rows: Vec<&str> = p.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(rows, ["claude-code:work", "codex", "grok-build"]);
+        assert_eq!((p.default.as_str(), p.selected), ("claude-code:work", 0));
+        let pools = st.pools();
+        let names: Vec<&str> = pools.runtimes.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(names, ["claude-code", "codex", "grok-build"]);
+        // Shown as the runtime alone, the account still sent.
+        let lines: Vec<String> = crate::ui::picker_lines(&st)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(!lines.iter().any(|l| l.contains("work")), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 claude-code ") && l.contains("(current)")),
+            "{lines:?}"
+        );
+        st.handle_key(key(KeyCode::Enter));
+        let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+        assert!(
+            prompt.starts_with("switch the orchestrator to claude-code? "),
+            "{prompt}"
+        );
+        assert_eq!(
+            st.handle_key(key(KeyCode::Char('s'))),
+            [Action::UseOrchestrator {
+                runtime: "claude-code:work".into(),
+                model: None,
+                summary: false,
+            }]
+        );
+        assert!(
+            !st.view.status.clone().unwrap_or_default().contains("work"),
+            "{:?}",
+            st.view.status
+        );
+        // A native account a named one's name shadows has no row of its own: the name's row
+        // is the named account's.
+        let shadowed = serde_json::json!({"runtimes": {"claude-code": {
+            "shown": true, "native": "default", "accounts": [
+                {"name": "default", "native": true, "shadowed": true, "login": "logged_in"},
+                {"name": "default", "native": false, "login": "logged_in"},
+                {"name": "work", "native": false, "login": "logged_in"},
+        ]}}});
+        let st = on_work(shadowed);
+        let rows: Vec<String> = st.orch_specs().into_iter().map(|r| r.0).collect();
+        assert_eq!(
+            rows,
+            [
+                "claude-code:default",
+                "claude-code:work",
+                "codex",
+                "grok-build"
+            ]
+        );
+        let accounts = st.pools().accounts;
+        let names: Vec<&str> = accounts["claude-code"]
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(names, ["default", "work"]);
+    }
+
+    /// `/new <project> --account ` completes the accounts of the runtime the project's latest
+    /// thread made for it runs (a thread made for a path says nothing of the project's).
+    #[test]
+    fn new_account_completion_knows_a_projects_runtime() {
+        let mut st = three_threads();
+        st.accounts = Accounts::from_list(&crate::accounts::tests::list(true));
+        let make = |id: &str, at, runtime: &str, configured: bool| {
+            let mut s = ThreadScript::new(id);
+            s.at(at);
+            let mut created = s.created(id.trim_start_matches("t-"));
+            if let EventBody::ThreadCreated(p) = &mut created.body {
+                p.project = Some("api".into());
+                p.runtime = runtime.into();
+                p.ext = serde_json::json!({"twr": {"configured_project": configured}})
+                    .as_object()
+                    .cloned();
+            }
+            created
+        };
+        control(
+            &mut st,
+            &[
+                make("t-api1", 30, "codex", true),
+                make("t-api2", 31, "claude-code", true),
+                make("t-api3", 32, "codex", false),
+            ],
+        );
+        assert_eq!(
+            st.pools().project_runtimes.get("api").map(String::as_str),
+            Some("claude-code")
+        );
+        st.view.input.set("/new api --account ");
+        let rows: Vec<String> = st
+            .popup()
+            .unwrap()
+            .items
+            .into_iter()
+            .map(|i| i.value)
+            .collect();
+        assert_eq!(rows, ["personal", "work"]);
     }
 
     #[test]
@@ -12118,11 +15810,113 @@ pub(crate) mod tests {
         st
     }
 
+    /// The ways a phone's status bar is crowded for a notice that must be drawn whole: the
+    /// compact layout (`[tui] compact_width` 60, its default) with four workspaces' tabs
+    /// (`tabs`), and three threads at work on background tasks (`tasks`), whose note the
+    /// status bar adds.
+    fn crowd(st: &mut AppState, tabs: bool, tasks: bool) {
+        st.view.compact_width = 60;
+        if tabs {
+            st.workspace = Some("alpha".into());
+            st.set_tabs(
+                ["alpha", "beta", "gamma", "delta"]
+                    .iter()
+                    .map(|name| crate::workspace::Tab::new(*name))
+                    .collect(),
+            );
+        }
+        if tasks {
+            for i in 0..3 {
+                let mut s = ThreadScript::new(format!("t-bg{i}"));
+                s.at(50 + i);
+                let evs = [
+                    s.created(&format!("bg{i}")),
+                    s.turn_started("run the suite"),
+                    s.event(EventBody::TaskUpdated(twr_core::event::TaskUpdated {
+                        task_id: "suite".into(),
+                        running: true,
+                        description: "cargo test".into(),
+                        ..Default::default()
+                    })),
+                ];
+                control(st, &evs);
+            }
+        }
+    }
+
+    /// The notice that must be drawn whole, told at `w` x `h` (compact, [`crowd`] with tabs
+    /// and tasks) in its short form `short`, stays so in the frames after: drawn whole, before
+    /// the notes (they give way, and the bar grows, where it needs more than a third), until it is
+    /// dismissed (a tap on it, `dismiss`) or replaced. Then the bar is as before: a third at
+    /// most, its notes back. Returns the rows the bar had while it showed the notice.
+    fn notice_stays_until_gone(
+        st: &mut AppState,
+        short: &str,
+        w: u16,
+        h: u16,
+        dismiss: bool,
+    ) -> usize {
+        let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        // The status bar's rows: those under the input box's bottom border.
+        let bar_rows = |buf: &Buffer| {
+            let text = screen_text(buf);
+            let rows: Vec<&str> = text.lines().collect();
+            let input_end = rows.iter().rposition(|r| r.starts_with('└')).unwrap();
+            rows.len() - 1 - input_end
+        };
+        let now = Instant::now();
+        let mut grown = 0;
+        for frame in 0..3 {
+            let buf = draw(st, w, h);
+            let words = flat(&screen_text(&buf));
+            assert!(words.contains(&flat(short)), "frame {frame}: {words}");
+            let drawn = st.view.panes.status.as_ref().map(|(t, _)| t.as_str());
+            assert_eq!(drawn, Some(short), "frame {frame}");
+            let had = bar_rows(&buf);
+            assert!(
+                frame == 0 || had == grown,
+                "frame {frame}: {had} rows, then {grown}"
+            );
+            grown = had;
+            st.note_drawn(now);
+            assert!(st.once.is_none(), "told");
+        }
+        if dismiss {
+            st.tap(Target::Notice);
+        } else {
+            st.set_status("saved".into(), false, now);
+        }
+        let buf = draw(st, w, h);
+        let words = flat(&screen_text(&buf));
+        assert!(!words.contains(&flat(short)), "{words}");
+        assert!(words.contains("3 background task(s)"), "{words}");
+        // (A phone's bar has the notice on a band of its own, no `|` after it.)
+        assert_eq!(words.contains("saved"), !dismiss, "{words}");
+        let rows = bar_rows(&buf);
+        assert!(rows <= grown && rows <= usize::from(h / 3), "{rows} rows");
+        grown
+    }
+
     fn screen_text(buf: &Buffer) -> String {
         let area = buf.area;
         (0..area.height)
             .map(|y| {
                 (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// [`screen_text`] of the view alone: right of the sidebar where `st` docks it, so that
+    /// the view's rows read on without the sidebar's beside them.
+    fn view_text(st: &AppState, buf: &Buffer) -> String {
+        let area = buf.area;
+        let left = st.dock_width_at(area.width);
+        (0..area.height)
+            .map(|y| {
+                (left..area.width)
                     .map(|x| buf[(x, y)].symbol())
                     .collect::<String>()
             })
@@ -12150,12 +15944,13 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         let api = st.attention.get("pa").unwrap().revision;
         let web = st.attention.get("pw").unwrap().revision;
         assert!(api < web && web < st.last_gseq + 1);
-        let screen = draw(&mut st, 100, 12);
+        let screen = draw(&mut st, 100, 9);
         assert_eq!(drawn_ids(&st), ["pa"], "{}", screen_text(&screen));
         assert_eq!(st.seen_gseq(), web - 1);
         assert_eq!(
@@ -12219,6 +16014,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         let api = st.attention.get("pa").unwrap().first_revision;
         let web = st.attention.get("pw").unwrap().first_revision;
@@ -12230,21 +16026,21 @@ pub(crate) mod tests {
         }
         control(&mut st, &evs);
         // Web's card below the fold.
-        let screen = screen_text(&draw(&mut st, 160, 12));
+        let screen = screen_text(&draw(&mut st, 160, 9));
         assert!(screen.contains("↓ 5 more"), "{screen}");
         assert_eq!(drawn_ids(&st), ["pa"], "{screen}");
         assert_eq!(st.seen_gseq(), web - 1, "{screen}");
         // Both above it (the last card selected).
         let last = st.order().last().cloned();
         st.set_focus(last);
-        let screen = screen_text(&draw(&mut st, 160, 12));
+        let screen = screen_text(&draw(&mut st, 160, 9));
         assert!(screen.contains("↑"), "{screen}");
         assert!(drawn_ids(&st).is_empty(), "{screen}");
         assert_eq!(st.seen_gseq(), api - 1, "{screen}");
     }
 
     /// Nothing under the help overlay, the picker or the `/` popup is drawn: every blocking
-    /// item caps `seen_gseq` then.
+    /// item under one caps `seen_gseq` then. The `/` popup covers the conversation only.
     #[test]
     fn seen_gseq_counts_nothing_under_an_overlay() {
         let mut st = api_and_web_waiting();
@@ -12258,13 +16054,15 @@ pub(crate) mod tests {
         st.view.help = false;
         draw(&mut st, 160, 40);
         assert_eq!(st.seen_gseq(), st.last_gseq);
-        // The `/` popup over the cards it covers.
+        // The `/` popup covers the conversation alone: the sidebar's cards stay beside it, also
+        // beside a narrow conversation, drawn and seen.
         st.view.input.clear();
         st.view.input.insert("/");
-        let screen = screen_text(&draw(&mut st, 100, 14));
+        let screen = screen_text(&draw(&mut st, 90, 14));
+        assert!(screen.contains("commands"), "{screen}");
         let drawn = drawn_ids(&st);
-        assert!(drawn.len() < 2, "{screen}");
-        assert!(st.seen_gseq() < st.last_gseq, "{screen}");
+        assert_eq!(drawn.len(), 2, "{screen}");
+        assert_eq!(st.seen_gseq(), st.last_gseq, "{screen}");
     }
 
     /// The orchestrator's banner counts as drawn only where it is drawn: in a dive (or the
@@ -12385,7 +16183,8 @@ pub(crate) mod tests {
         assert!(st.hydration_due(now).is_empty(), "already fetching");
         st.hydrated("pb", item.revision, Err("blob.get: timeout".into()), now);
         let screen = screen_flat(&draw(&mut st, 90, 40));
-        assert!(screen.contains("(could not load"), "{screen}");
+        // (Its notice wraps in the banner beside the sidebar.)
+        assert!(screen.contains("(could not"), "{screen}");
         assert!(!drawn_ids(&st).contains(&"pb"));
         assert_eq!(st.seen_gseq(), item.first_revision - 1);
         assert!(st.hydration_due(now).is_empty(), "not due yet");
@@ -12504,6 +16303,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "later conversation\n".repeat(50),
             open: false,
+            final_seq: None,
         });
         // Long options: the tenth does not fit on the card, so the item is not drawn in full.
         expand_long_test_messages(&mut st);
@@ -12702,18 +16502,23 @@ pub(crate) mod tests {
         }
     }
 
-    /// A confirm card the frame cut short (a terminal too short for its options) is not seen:
-    /// `seen_gseq` stays below it, and no digit answers it (with no popup open they type).
-    /// Its action popup, with room for all of it, draws it in full: it is seen then, and
+    /// A confirm card the frame cut short (a terminal too short for its options, a long status
+    /// taking rows under the conversation) is not seen: `seen_gseq` stays below it, and no
+    /// digit answers it (with no popup open they type). Its action popup, over those rows too,
+    /// with room for all of it, draws it in full: it is seen then, and
     /// answered once read. A dive hides the banner: its popup does not open there.
     #[test]
     fn a_confirm_card_drawn_in_part_is_answered_from_its_popup() {
         let mut st = worker_orch_and_card();
         let first = st.attention.get("cc1").unwrap().first_revision;
         st.set_focus(Some("t-orch".into()));
-        // A height at which the banner is on screen but not its options.
+        // The tallest height at which the banner is on screen but not its options, in a view
+        // 60 columns wide beside the sidebar, a long status wrapped over the rows under it.
+        let w = 95;
+        st.view.status = Some("the hub said something long enough to wrap; ".repeat(6));
         let (h, screen) = (8..30)
-            .map(|h| (h, screen_text(&draw(&mut st, 60, h))))
+            .rev()
+            .map(|h| (h, screen_text(&draw(&mut st, w, h))))
             .find(|(_, s)| s.contains("confirm what you asked") && !s.contains("2 Cancel"))
             .expect("a height that cuts the card short");
         assert!(!drawn_ids(&st).contains(&"cc1"), "{screen}");
@@ -12725,7 +16530,7 @@ pub(crate) mod tests {
         assert_eq!(st.view.input.as_str(), "1", "typed");
         st.view.input.clear();
         st.handle_key(key(KeyCode::Enter));
-        let screen = screen_text(&draw(&mut st, 60, h));
+        let screen = screen_text(&draw(&mut st, w, h));
         assert!(drawn_ids(&st).contains(&"cc1"), "{screen}");
         assert_eq!(st.seen_gseq(), st.last_gseq, "{screen}");
         st.note_drawn(Instant::now());
@@ -12761,7 +16566,7 @@ pub(crate) mod tests {
 
     /// One worker `w`, the orchestrator `t-orch`, and confirm card `cc1` listing `n` actions,
     /// its banner selected.
-    fn worker_orch_and_long_card(n: usize) -> AppState {
+    pub(crate) fn worker_orch_and_long_card(n: usize) -> AppState {
         let mut st = AppState::new();
         let mut w = ThreadScript::new("t-w");
         let mut evs = vec![w.created("w"), w.turn_started("work")];
@@ -12770,6 +16575,11 @@ pub(crate) mod tests {
         evs.extend(orch_events(&mut o, "t-orch"));
         evs.push(long_confirm_card("cc1", n));
         control(&mut st, &evs);
+        // What w does, long: its card in the sidebar is as tall as a card gets there.
+        st.apply_result(
+            "thread.activity",
+            &serde_json::json!({"t-w": {"activity": "building ".repeat(100)}}),
+        );
         st.set_focus(Some("t-orch".into()));
         st
     }
@@ -12778,7 +16588,12 @@ pub(crate) mod tests {
     /// them), notes what it showed and pretends it has been there long enough to read. Returns
     /// the screen, flattened.
     fn settled_80x21(st: &mut AppState) -> String {
-        let screen = screen_flat(&draw(st, 80, 21));
+        settled_at(st, 80, 21)
+    }
+
+    /// [`settled_80x21`] at `w` x `h`.
+    fn settled_at(st: &mut AppState, w: u16, h: u16) -> String {
+        let screen = screen_flat(&draw(st, w, h));
         st.note_drawn(Instant::now());
         if let Some(s) = st.view.shown.as_mut() {
             s.since = Instant::now() - CARD_SETTLE - Duration::from_millis(50);
@@ -12791,45 +16606,57 @@ pub(crate) mod tests {
     /// drawn again without the popup (what it covered is on screen again). Returns what the
     /// key did and the screen with the popup.
     fn popup_key_80x21(st: &mut AppState, c: char) -> (Vec<Action>, String) {
+        popup_key_at(st, c, 80, 21)
+    }
+
+    /// [`popup_key_80x21`] at `w` x `h`.
+    fn popup_key_at(st: &mut AppState, c: char, w: u16, h: u16) -> (Vec<Action>, String) {
         st.handle_key(key(KeyCode::Enter));
-        let screen = settled_80x21(st);
+        let screen = settled_at(st, w, h);
         let actions = st.handle_key(key(KeyCode::Char(c)));
         if actions.is_empty() {
             st.handle_key(key(KeyCode::Esc));
         }
-        settled_80x21(st);
+        settled_at(st, w, h);
         (actions, screen)
     }
 
-    /// At 80 x 24, with 3 and 24 actions: a confirm card too long for the banner opens in the
-    /// main pane as a detail view listing every action on rows of its own, then both options;
-    /// it is unseen until scrolled through to its options (PgDn, then the wheel for
-    /// the 24 actions). Its action popup has room for the 3 actions: it draws the card in full
-    /// and answers it. The 24 it has no room for: it says so and answers nothing until the
-    /// detail view has been read to its options; then it lists them and, after the settle, 1
-    /// confirms and 2 cancels. Scrolled back up, the options off screen, it still answers:
-    /// every row of the detail view was on screen.
+    /// At 80 x 15, with 3 and 24 actions: a confirm card too long for the banner opens in the
+    /// main pane as a detail view listing every action on rows of its own, then both options.
+    /// The 3 actions fit it (and so the action popup, as tall as the main pane beside the
+    /// sidebar): the card is seen, and the popup draws it in full and answers it. The 24 are
+    /// unseen until scrolled through to their options (PgDn, then the wheel); the popup has no
+    /// room for them: it says so and answers nothing until the detail view has been read to
+    /// its options; then it lists them and, after the settle, 1 confirms and 2 cancels.
+    /// Scrolled back up, the options off screen, it still answers: every row of the detail
+    /// view was on screen.
     #[test]
     fn a_confirm_card_too_long_for_the_banner_scrolls_in_the_main_pane() {
         for n in [3, 24] {
             let mut st = worker_orch_and_long_card(n);
             let first = st.attention.get("cc1").unwrap().first_revision;
             let rev = revision(&st, "cc1");
-            let screen = settled_80x21(&mut st);
+            let screen = settled_at(&mut st, 80, 15);
             let w = st.view.panes.card.clone().expect("the detail view");
             assert_eq!((w.attn_id.as_str(), w.start), ("cc1", 0), "{n}");
-            assert!(w.end < w.rows, "{n}: needs scrolling");
             assert!(screen.contains("confirm what you asked"), "{n}: {screen}");
-            assert!(screen.contains("PgUp/PgDn"), "{n}: {screen}");
+            // (Wrapped beside the sidebar.)
             assert!(
-                screen
-                    .contains("• allow w (Bash: git fetch origin && git rebase origin/main step0)"),
+                screen.contains("• allow w (Bash: git fetch origin && git"),
                 "{n}: {screen}"
             );
-            assert!(!screen.contains("2 Cancel"), "{n}: {screen}");
-            assert!(st.view.panes.drawn_on("t-orch").is_none(), "{n}");
-            assert_eq!(st.seen_gseq(), first - 1, "{n}");
-            let (actions, popup) = popup_key_80x21(&mut st, '1');
+            if n == 3 {
+                assert_eq!(w.end, w.rows, "{n}: all of it");
+                assert!(screen.contains("2 Cancel"), "{n}: {screen}");
+                assert_eq!(st.seen_gseq(), st.last_gseq, "{n}");
+            } else {
+                assert!(w.end < w.rows, "{n}: needs scrolling");
+                assert!(screen.contains("PgUp/PgDn"), "{n}: {screen}");
+                assert!(!screen.contains("2 Cancel"), "{n}: {screen}");
+                assert!(st.view.panes.drawn_on("t-orch").is_none(), "{n}");
+                assert_eq!(st.seen_gseq(), first - 1, "{n}");
+            }
+            let (actions, popup) = popup_key_at(&mut st, '1', 80, 15);
             if n == 3 {
                 assert!(
                     popup.contains("1 Confirm") && popup.contains("2 Cancel"),
@@ -12850,7 +16677,7 @@ pub(crate) mod tests {
             assert_eq!(st.view.status.as_deref(), Some(NOT_ON_SCREEN));
             // (The status wraps over rows the detail view gets back.)
             st.view.status = None;
-            settled_80x21(&mut st);
+            settled_at(&mut st, 80, 15);
             // Scrolled through: PgDn, and the wheel over the view for the long one.
             let mut screens = vec![screen];
             while st.view.panes.card.as_ref().is_some_and(|w| w.end < w.rows) {
@@ -12864,7 +16691,7 @@ pub(crate) mod tests {
                 } else {
                     st.handle_key(key(KeyCode::PageDown));
                 }
-                screens.push(settled_80x21(&mut st));
+                screens.push(settled_at(&mut st, 80, 15));
                 assert!(screens.len() < 40, "{n}: scrolling ends");
             }
             let all = screens.join("\n");
@@ -12887,7 +16714,7 @@ pub(crate) mod tests {
                 "{n}"
             );
             assert_eq!(st.seen_gseq(), st.last_gseq, "{n}");
-            let (actions, popup) = popup_key_80x21(&mut st, '1');
+            let (actions, popup) = popup_key_at(&mut st, '1', 80, 15);
             assert!(popup.contains("read in full"), "{n}: {popup}");
             assert_eq!(
                 actions,
@@ -12898,9 +16725,9 @@ pub(crate) mod tests {
                 }],
                 "{n}"
             );
-            settled_80x21(&mut st);
+            settled_at(&mut st, 80, 15);
             assert_eq!(
-                popup_key_80x21(&mut st, '2').0,
+                popup_key_at(&mut st, '2', 80, 15).0,
                 [Action::Respond {
                     attn_id: "cc1".into(),
                     revision: rev,
@@ -12911,15 +16738,15 @@ pub(crate) mod tests {
             // Back up: the options are off screen, but every row of the detail view has been
             // on screen: the popup still answers it.
             st.handle_key(key(KeyCode::PageUp));
-            let up = settled_80x21(&mut st);
+            let up = settled_at(&mut st, 80, 15);
             assert!(!up.contains("2 Cancel"), "{n}: {up}");
-            assert_eq!(popup_key_80x21(&mut st, '1').0.len(), 1, "{n}");
+            assert_eq!(popup_key_at(&mut st, '1', 80, 15).0.len(), 1, "{n}");
             // Down again: every row was on screen already, the options are again.
             while st.view.panes.card.as_ref().is_some_and(|w| w.end < w.rows) {
                 st.handle_key(key(KeyCode::PageDown));
-                settled_80x21(&mut st);
+                settled_at(&mut st, 80, 15);
             }
-            assert_eq!(popup_key_80x21(&mut st, '2').0.len(), 1, "{n}");
+            assert_eq!(popup_key_at(&mut st, '2', 80, 15).0.len(), 1, "{n}");
         }
     }
 
@@ -12950,14 +16777,14 @@ pub(crate) mod tests {
         assert_eq!(popup_key_80x21(&mut st, '1').0.len(), 1);
     }
 
-    /// A card of more than 65,535 rows (a label of about 1.1 MB at 20 x 24) still scrolls to
+    /// A card of more than 65,535 rows (a label of about 1.3 MB at 20 x 24) still scrolls to
     /// its options: the detail view's scroll offsets are `usize`, never saturated at
     /// `u16::MAX`, and its popup answers it once every row has been on screen and its options
     /// are.
     #[test]
     fn a_card_of_more_rows_than_u16_still_reaches_its_options() {
         let mut st = worker_orch_and_long_card(1);
-        let label = "x".repeat(1_100_000);
+        let label = "x".repeat(1_300_000);
         let mut ev = long_confirm_card("cc1", 1);
         if let EventBody::AttentionRaised(p) = &mut ev.body {
             p.summary = format!("From your message: answer docs: \"{label}\"");
@@ -13627,7 +17454,7 @@ pub(crate) mod tests {
         );
         assert!(!screen.contains("confirm what you asked"), "{screen}");
         // Too long for the banner: the detail view has the same title.
-        let long: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let long: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
         control(
             &mut st,
             &[delete_card_event(
@@ -13640,7 +17467,8 @@ pub(crate) mod tests {
         h.at(95);
         control(&mut st, &[h.resolve("dc1")]);
         assert_eq!(st.delete_card("dc1"), None);
-        let screen = screen_flat(&draw(&mut st, 80, 21));
+        // (80 x 15: the banner beside the sidebar gets the conversation's rows but three.)
+        let screen = screen_flat(&draw(&mut st, 80, 15));
         assert!(st.view.panes.card.is_some(), "the detail view: {screen}");
         assert!(screen.contains(" confirm deleting beta "), "{screen}");
         // A proposal keeps its title.
@@ -13669,9 +17497,9 @@ pub(crate) mod tests {
             }
             s
         };
-        // The text of each row's leftmost box (the banner or the detail view).
-        let rows = |buf: &Buffer| -> Vec<String> {
-            screen_text(buf)
+        // The text of each row's leftmost box of the view (the banner or the detail view).
+        let rows = |st: &AppState, buf: &Buffer| -> Vec<String> {
+            view_text(st, buf)
                 .lines()
                 .filter_map(|r| {
                     r.split(['│', '┃'])
@@ -13690,7 +17518,8 @@ pub(crate) mod tests {
                 &summary(&["alpha", "gamma"]),
             )],
         );
-        let screen = rows(&draw(&mut st, 160, 40));
+        let buf = draw(&mut st, 160, 40);
+        let screen = rows(&st, &buf);
         assert!(st.view.panes.card.is_none(), "the banner: {screen:#?}");
         assert!(
             screen
@@ -13728,7 +17557,8 @@ pub(crate) mod tests {
                 &summary(&names),
             )],
         );
-        let screen = rows(&draw(&mut st, 80, 24));
+        let buf = draw(&mut st, 80, 24);
+        let screen = rows(&st, &buf);
         assert!(st.view.panes.card.is_some(), "the detail view: {screen:#?}");
         assert!(
             screen
@@ -13998,9 +17828,16 @@ pub(crate) mod tests {
         assert!(shown.contains("twr trash") && shown.contains("2 items in the trash"));
         // Taller than the screen, it scrolls: the arrows and PgUp/PgDn move it, any other key
         // closes it.
-        let buf = crate::ui::draw_offscreen(&mut st, 60, 8, Instant::now());
+        let buf = crate::ui::draw_offscreen(&mut st, 100, 8, Instant::now());
         let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(shown.contains("PgUp/PgDn scroll"), "{shown}");
+        // Beside the sidebar on a narrower screen, its footer keeps where it is, not the keys.
+        let buf = crate::ui::draw_offscreen(&mut st, 60, 8, Instant::now());
+        let shown: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            shown.contains(" rows 1-") && !shown.contains("Dn scroll"),
+            "{shown}"
+        );
         st.handle_key(key(KeyCode::Down));
         assert_eq!((st.view.trash_scroll, st.view.trash.is_some()), (1, true));
         // Never past its end: Up moves at once from the last rows.
@@ -14021,7 +17858,12 @@ pub(crate) mod tests {
             rows.iter().any(|r| r.contains("3 uncommitted")),
             "{rows:#?}"
         );
-        for r in rows.iter().filter(|r| r.starts_with('│')) {
+        // (Its rows: under its title, past the cards above it.)
+        let top = rows
+            .iter()
+            .position(|r| r.contains("twr trash"))
+            .expect("the overlay");
+        for r in rows[top + 1..].iter().filter(|r| r.starts_with('│')) {
             assert!(r.ends_with('│'), "{r}");
         }
         // Any key closes it, and does nothing else.
@@ -14113,6 +17955,7 @@ pub(crate) mod tests {
             prompt: "stop api? y to confirm, any other key cancels".into(),
             pending: "stop api: waiting for the hub".into(),
             alt: None,
+            offer: false,
         };
         st.view.confirm = Some(stop.clone());
         st.apply_result("trash.empty", &chosen);
@@ -14362,6 +18205,72 @@ pub(crate) mod tests {
         assert!(st.view.request.is_none());
     }
 
+    /// Without colors (`NO_COLOR`), what the conversation has selected still shows: a selected
+    /// request's box is thick (`┏━`, `┃`, `┗━`), as a selected card is, the others thin; so
+    /// is a selected long block's frame.
+    #[test]
+    fn a_selection_in_the_conversation_shows_without_colors() {
+        // The rows of each request box, by its link.
+        let boxes = |st: &mut AppState| -> Vec<(String, Vec<String>)> {
+            let buf = draw(st, 160, 40);
+            let rows = transcript_rows(st, &buf);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            assert!(
+                buf.content
+                    .iter()
+                    .all(|c| c.fg == ratatui::style::Color::Reset
+                        && c.bg == ratatui::style::Color::Reset),
+                "no colors"
+            );
+            let mut out: Vec<(String, Vec<String>)> = Vec::new();
+            for (row, link) in rows.iter().zip(&pane.links) {
+                let Some(id) = link.as_deref().and_then(|l| l.strip_prefix("request:")) else {
+                    continue;
+                };
+                match out.iter_mut().find(|(i, _)| i == id) {
+                    Some((_, r)) => r.push(row.clone()),
+                    None => out.push((id.to_string(), vec![row.clone()])),
+                }
+            }
+            out
+        };
+        let thick = |rows: &[String]| {
+            rows[0].starts_with('┏')
+                && rows[1..rows.len() - 1].iter().all(|r| r.starts_with('┃'))
+                && rows.last().unwrap().starts_with('┗')
+        };
+        let thin = |rows: &[String]| {
+            rows[0].starts_with('╭')
+                && rows[1..rows.len() - 1].iter().all(|r| r.starts_with('│'))
+                && rows.last().unwrap().starts_with('╰')
+        };
+        let mut st = api_and_web_waiting();
+        st.view.colors = crate::color::Depth::None;
+        let all = boxes(&mut st);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all.iter().all(|(_, r)| thin(r)), "{all:?}");
+        step(&mut st, KeyCode::Down);
+        let id = st.view.request.clone().unwrap();
+        for (i, rows) in boxes(&mut st) {
+            if i == id {
+                assert!(thick(&rows), "selected: {rows:#?}");
+            } else {
+                assert!(thin(&rows), "{rows:#?}");
+            }
+        }
+        // A long block selected in the conversation.
+        let mut st = conversation_and_cards(&boxed("a", 30, 3));
+        st.view.colors = crate::color::Depth::None;
+        let rows = drawn_rows(&mut st, 160, 30);
+        assert!(!rows.iter().any(|r| r.starts_with('┏')), "{rows:#?}");
+        st.handle_key(shift(KeyCode::Left));
+        step(&mut st, KeyCode::Down);
+        assert!(st.view.block.is_some());
+        let rows = drawn_rows(&mut st, 160, 30);
+        assert!(rows[0].starts_with('┏'), "{rows:#?}");
+        assert!(rows[1].starts_with('┃'), "{rows:#?}");
+    }
+
     #[test]
     fn inline_request_revision_resolution_and_overlays_cannot_redirect_an_answer() {
         let mut st = api_and_web_waiting();
@@ -14505,7 +18414,8 @@ pub(crate) mod tests {
             .iter()
             .any(|i| i.attn_id == "capped-inline"));
         st.view.request = None;
-        draw(&mut st, 80, 7);
+        // Four rows: the sidebar's card has no room for its options.
+        draw(&mut st, 80, 4);
         st.note_drawn(Instant::now());
         assert!(
             st.view.panes.items.is_empty(),
@@ -14524,6 +18434,7 @@ pub(crate) mod tests {
             outcome: Some("answered: allow".into()),
             seq: 3,
             resolution: false,
+            routine: None,
         }];
         let buf = draw(&mut st, 160, 40);
         let pane = st.view.panes.get(&PaneId::Transcript).unwrap();
@@ -14543,6 +18454,7 @@ pub(crate) mod tests {
                 seq: 0,
                 text: "Earlier reply".into(),
                 open: false,
+                final_seq: None,
             },
             Entry::HubUpdate {
                 text: "api needs permission".into(),
@@ -14552,11 +18464,13 @@ pub(crate) mod tests {
                 outcome: None,
                 seq: 0,
                 resolution: false,
+                routine: None,
             },
             Entry::Text {
                 seq: 0,
                 text: "Latest reply stays at the bottom".into(),
                 open: false,
+                final_seq: None,
             },
         ];
         let buf = draw(&mut st, 160, 40);
@@ -14599,6 +18513,7 @@ pub(crate) mod tests {
             seq: 0,
             text: "Long explanation after the selected request\n".repeat(60),
             open: false,
+            final_seq: None,
         });
         expand_long_test_messages(&mut st);
         settled(&mut st);
@@ -14694,6 +18609,28 @@ pub(crate) mod tests {
     /// same settle guard, and the selection (and the popup) hold while other events arrive.
     /// The popup has nothing about a thread to stop or park. Showing the sidebar again ends
     /// the selection.
+    /// A full layout too narrow for the sidebar draws no card: a request selected in the
+    /// conversation stays selected alone, as with the sidebar hidden, and Enter opens its
+    /// popup.
+    #[test]
+    fn with_no_room_for_the_sidebar_a_request_is_selected_alone() {
+        let mut st = api_and_web_waiting();
+        draw(&mut st, 50, 30);
+        assert!(st.view.panes.no_cards && st.dock_width() == 0);
+        st.select_request("pa");
+        draw(&mut st, 50, 30);
+        assert_eq!(st.view.request.as_deref(), Some("pa"));
+        assert_eq!(st.focused(), None, "no card is selected");
+        assert!(st.selected_request().is_some());
+        st.handle_key(key(KeyCode::Enter));
+        draw(&mut st, 50, 30);
+        assert!(
+            matches!(&st.view.action, Some(p) if p.target == ActionTarget::Request("pa".into())),
+            "{:?}",
+            st.view.action
+        );
+    }
+
     #[test]
     fn with_the_sidebar_hidden_only_a_selected_inline_request_is_answered() {
         let mut st = api_and_web_waiting();
@@ -14796,7 +18733,8 @@ pub(crate) mod tests {
     }
 
     /// Scrolled up, the view stays on what it shows while a reply streams in below it (more
-    /// rows, a reply finished, more replies), the bottom border counting the rows below.
+    /// rows, a reply finished, more replies), the pane's last row counting the rows below
+    /// (itself one of them: it says so in their place).
     /// Scrolled back down to the bottom it follows again: new text shows as it comes.
     #[test]
     fn a_view_scrolled_up_stays_put_while_text_streams_in() {
@@ -14808,9 +18746,9 @@ pub(crate) mod tests {
         assert!(read.iter().any(|r| r.contains("line-29")), "{read:?}");
         assert!(!read.iter().any(|r| r.contains("line-39")), "{read:?}");
         // The working cursor's rows at the bottom go while scrolled up: 8 of the 10 rows
-        // scrolled over are below.
+        // scrolled over are below, and the row that says so.
         assert_eq!(st.view.scroll, SCROLL_STEP - 2);
-        assert!(screen_text(&buf).contains("↓ 8 lines below · End to follow"));
+        assert!(screen_text(&buf).contains("↓ 9 lines below · End to follow"));
         let mut reply = String::new();
         let mut below = st.view.scroll;
         for k in 0..20 {
@@ -14821,7 +18759,7 @@ pub(crate) mod tests {
             assert_eq!(transcript_rows(&st, &buf), read, "after delta {k}");
             assert!(st.view.scroll > below, "{k}: {} rows below", st.view.scroll);
             below = st.view.scroll;
-            let shown = format!("↓ {below} lines below · End to follow");
+            let shown = format!("↓ {} lines below · End to follow", below + 1);
             assert!(screen_text(&buf).contains(&shown), "{k}: {shown}");
         }
         st.apply_event(&thread_item(&a.text(&reply)));
@@ -14941,7 +18879,7 @@ pub(crate) mod tests {
     fn a_view_scrolled_up_stays_on_its_reply_when_resized() {
         let words = "word ".repeat(24);
         let (mut st, _) = alpha_replies(30, |i| format!("para-{i:02} {words}"));
-        draw(&mut st, 100, 33);
+        draw(&mut st, 160, 33);
         st.handle_key(key(KeyCode::PageUp));
         st.handle_key(key(KeyCode::PageUp));
         let first = |st: &AppState, buf: &Buffer| {
@@ -14950,7 +18888,7 @@ pub(crate) mod tests {
                 .find_map(|r| r.find("para-").map(|at| r[at..at + 7].to_string()))
                 .unwrap()
         };
-        let buf = draw(&mut st, 100, 33);
+        let buf = draw(&mut st, 160, 33);
         let wide = transcript_rows(&st, &buf);
         let label = first(&st, &buf);
         let anchor = st.view.anchor.clone().unwrap();
@@ -14966,7 +18904,7 @@ pub(crate) mod tests {
             assert!(st.view.scroll > 0, "at {w}");
         }
         // Back at its width, it is exactly where it was.
-        let buf = draw(&mut st, 100, 33);
+        let buf = draw(&mut st, 160, 33);
         assert_eq!(transcript_rows(&st, &buf), wide);
     }
 
@@ -15027,7 +18965,7 @@ pub(crate) mod tests {
             .any(|r| r.contains("line-39")));
     }
 
-    /// On a phone-sized terminal the bottom border still says what is below, shortened.
+    /// On a phone-sized terminal the pane's last row still says what is below, shortened.
     #[test]
     fn the_indicator_fits_a_narrow_terminal() {
         assert_eq!(
@@ -15049,10 +18987,10 @@ pub(crate) mod tests {
             st.handle_key(key(KeyCode::PageUp));
             let buf = draw(&mut st, w, 40);
             let text = screen_text(&buf);
-            let shown = if w >= 40 {
-                "↓ 8 lines below · End to follow"
+            let shown = if w >= 34 {
+                "↓ 9 lines below · End to follow"
             } else {
-                "↓ 8 below · End"
+                "↓ 9 below · End"
             };
             assert!(text.contains(shown), "{w}:\n{text}");
         }
@@ -15227,14 +19165,16 @@ pub(crate) mod tests {
     /// into the replies after it, and stays scrolled up.
     #[test]
     fn a_final_reply_that_differs_keeps_the_view_in_it() {
+        // A conversation 80 columns wide, beside the sidebar.
+        const W: u16 = 115;
         let streamed = |ups: usize| {
             let (mut st, mut a) = alpha_replies(3, |i| format!("before-{i}"));
             st.apply_event(&delta(&mut a, &paragraphs(0, 30)));
-            draw(&mut st, 80, 30);
+            draw(&mut st, W, 30);
             for _ in 0..ups {
                 st.handle_key(key(KeyCode::PageUp));
             }
-            let read = drawn_rows(&mut st, 80, 30);
+            let read = drawn_rows(&mut st, W, 30);
             (st, a, read)
         };
         // The view is on the first fifteen paragraphs, which the final reply keeps.
@@ -15243,7 +19183,7 @@ pub(crate) mod tests {
         st.apply_event(&thread_item(
             &a.text(&format!("{}\n\nended otherwise", paragraphs(0, 15))),
         ));
-        assert_eq!(drawn_rows(&mut st, 80, 30), read);
+        assert_eq!(drawn_rows(&mut st, W, 30), read);
         // The view is further down than the final reply goes.
         let (mut st, mut a, read) = streamed(2);
         assert!(read.iter().any(|r| r.contains("w20q")), "{read:?}");
@@ -15251,7 +19191,7 @@ pub(crate) mod tests {
         for i in 0..30 {
             st.apply_event(&thread_item(&a.text(&format!("after-{i}"))));
         }
-        let rows = drawn_rows(&mut st, 80, 30);
+        let rows = drawn_rows(&mut st, W, 30);
         assert!(rows[0].contains("w2q19"), "{rows:?}");
         assert!(rows[2].contains("after-0"), "{rows:?}");
         assert!(st.view.scroll > 0);
@@ -15321,7 +19261,7 @@ pub(crate) mod tests {
         assert_eq!(drawn_rows(&mut st, 80, 30), up);
     }
 
-    /// More than 65,535 rows below a view scrolled up (`u16::MAX`): the bottom border counts
+    /// More than 65,535 rows below a view scrolled up (`u16::MAX`): the pane's last row counts
     /// them all, and PgUp and PgDn still move the view.
     #[test]
     fn a_view_more_than_u16_rows_up_still_scrolls_both_ways() {
@@ -15337,7 +19277,7 @@ pub(crate) mod tests {
         let buf = draw(&mut st, 80, 30);
         assert_eq!(transcript_rows(&st, &buf), read);
         assert!(st.view.scroll > 70_000, "{}", st.view.scroll);
-        let shown = format!("↓ {} lines below", st.view.scroll);
+        let shown = format!("↓ {} lines below", st.view.scroll + 1);
         assert!(screen_text(&buf).contains(&shown), "{shown}");
         st.handle_key(key(KeyCode::PageUp));
         let up = drawn_rows(&mut st, 80, 30);
@@ -15411,7 +19351,7 @@ pub(crate) mod tests {
             let wide = wheel_into(&mut st, word, 120, 30);
             assert!(st.view.request.is_none());
             let at = first_word(&wide[0], word).unwrap().to_string();
-            for w in [90, 70, 50] {
+            for w in [90, 70, 48] {
                 let rows = drawn_rows(&mut st, w, 30);
                 assert!(
                     rows[0].split_whitespace().any(|r| r == at),
@@ -15889,11 +19829,11 @@ pub(crate) mod tests {
     }
 
     /// Asserts that the main pane drawn `w` x 30 shows thread box `b` ([`boxed`]) from its
-    /// head: its top border, then its first line.
+    /// head: its top border (thick: the block is selected), then its first line.
     fn shows_head(st: &mut AppState, b: &str, w: u16) {
         let rows = drawn_rows(st, w, 30);
         assert!(
-            rows[0].starts_with('╭') && rows[1].contains(&format!("{b}0q0")),
+            rows[0].starts_with('┏') && rows[1].contains(&format!("{b}0q0")),
             "{b}: {rows:?}"
         );
     }
@@ -16090,7 +20030,7 @@ pub(crate) mod tests {
 
     /// Shift-← selects the conversation and Shift-→ gives the selection back to the card
     /// selected before. Ctrl-↑/↓ and Alt-↑/↓ scroll the conversation a line, whatever is
-    /// selected: up, it stops following and the bottom border counts what is below; down to
+    /// selected: up, it stops following and its last row counts what is below; down to
     /// the bottom, it follows again. PgUp, Home and End scroll it as always.
     #[test]
     fn shift_left_selects_the_conversation_and_shift_right_the_card_before() {
@@ -16107,7 +20047,8 @@ pub(crate) mod tests {
             st.handle_key(mods(KeyCode::Up, KeyModifiers::CONTROL));
             let buf = draw(&mut st, w, 30);
             assert_eq!(st.view.scroll, 1, "{w}");
-            assert!(screen_text(&buf).contains("↓ 1 line below"), "{w}");
+            // That line, and the row that says so.
+            assert!(screen_text(&buf).contains("↓ 2 lines below"), "{w}");
             assert_eq!(
                 st.focused(),
                 Some("t-alpha"),
@@ -16276,11 +20217,11 @@ pub(crate) mod tests {
         st.handle_key(mods(KeyCode::Up, KeyModifiers::CONTROL));
         let buf = draw(&mut st, 80, 30);
         assert_eq!(st.view.scroll, 1);
-        assert!(screen_text(&buf).contains("↓ 1 line below"));
+        assert!(screen_text(&buf).contains("↓ 2 lines below"));
         st.handle_key(mods(KeyCode::Up, KeyModifiers::CONTROL));
         let buf = draw(&mut st, 80, 30);
         assert_eq!(st.view.scroll, 2);
-        assert!(screen_text(&buf).contains("↓ 2 lines below"));
+        assert!(screen_text(&buf).contains("↓ 3 lines below"));
         st.handle_key(key(KeyCode::Esc));
         assert!(st.view.dive.is_none());
         assert!(st.main_focused());
@@ -16346,14 +20287,21 @@ pub(crate) mod tests {
         step(&mut st, KeyCode::Down);
         assert!(st.view.block.is_some());
         draw(&mut st, 160, 30);
-        // (Its footer's hint changes as it is released: the view is its top row.)
+        // (Its footer's hint changes as it is released, and its frame from thick to thin: the
+        // view is its top row.)
+        let thin = |r: &str| r.replace('┏', "╭").replace('━', "─").replace('┓', "╮");
         let top = drawn_rows(&mut st, 160, 30)[0].clone();
+        assert!(top.starts_with('┏'), "{top}");
         st.handle_key(shift(KeyCode::Right));
         assert!(
             st.view.block.is_none(),
             "no block is selected with the cards"
         );
-        assert_eq!(drawn_rows(&mut st, 160, 30)[0], top, "the view stays");
+        assert_eq!(
+            drawn_rows(&mut st, 160, 30)[0],
+            thin(&top),
+            "the view stays"
+        );
         st.handle_key(key(KeyCode::Enter));
         drawn(&mut st);
         st.handle_key(key(KeyCode::Enter));
@@ -16397,6 +20345,38 @@ pub(crate) mod tests {
         assert_eq!(st.focused(), Some("t-alpha"));
     }
 
+    /// A request selected with text after it is drawn whole above the row that says what is
+    /// below (the view scrolled up to it): its last row is not under that row, so it counts
+    /// as drawn in full, at any height that has room for it and that row; one drawn alone at
+    /// the bottom needs no such row. With the sidebar hidden, the conversation is the only
+    /// place it is drawn.
+    #[test]
+    fn a_selected_request_is_whole_above_the_row_saying_what_is_below() {
+        for after in [0, 1, 2, 30] {
+            for h in 16..40u16 {
+                let mut st = api_and_web_waiting();
+                st.view.sidebar_hidden = true;
+                let mut o = ThreadScript::new("t-orch");
+                o.at(50);
+                st.apply_event(&request_update(&mut o, "pa"));
+                for i in 0..after {
+                    st.apply_event(&thread_item(&o.text(&format!("reply {i}"))));
+                }
+                draw(&mut st, 100, h);
+                st.select_request("pa");
+                let screen = draw(&mut st, 100, h);
+                let text = screen_text(&screen);
+                // (Its card is 5 rows: room for it and the row under it.)
+                let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+                assert!(pane.area.height >= 7, "{h}");
+                assert!(
+                    drawn_ids(&st).contains(&"pa"),
+                    "{after} after, {h} rows:\n{text}"
+                );
+            }
+        }
+    }
+
     /// The first Ctrl-↑ from a request selected at the bottom of a working conversation
     /// releases it and puts a line of text below the view, past the working cursor's own rows
     /// (which go once it is scrolled), as with no request selected.
@@ -16427,7 +20407,8 @@ pub(crate) mod tests {
         assert!(st.view.request.is_none());
         let buf = draw(&mut st, 160, 40);
         assert_eq!(st.view.scroll, 1, "{}", screen_text(&buf));
-        assert!(screen_text(&buf).contains("↓ 1 line below"));
+        // That line, and the row that says so.
+        assert!(screen_text(&buf).contains("↓ 2 lines below"));
     }
 
     /// A request at the bottom of a working conversation, one row shorter than the pane,
@@ -16467,7 +20448,7 @@ pub(crate) mod tests {
             st.handle_key(mods(KeyCode::Up, KeyModifiers::CONTROL));
             let buf = draw(&mut st, 160, 40);
             assert_eq!(st.view.scroll, 1, "{lines}: {}", screen_text(&buf));
-            assert!(screen_text(&buf).contains("↓ 1 line below"));
+            assert!(screen_text(&buf).contains("↓ 2 lines below"));
             return;
         }
         panic!("no request held the view a row up");
@@ -17540,7 +21521,8 @@ pub(crate) mod tests {
 
     /// The second Esc counts for [`UNSEND_WINDOW`]: after it, the hint is spent and Esc goes
     /// on to its other steps (here: releasing the card) for that message. With text typed
-    /// Esc never arms. In a dive the hint names the thread, and Esc then leaves the dive.
+    /// Esc never arms. In a dive the first Esc leaves at once, and the hint, back in the
+    /// orchestrator conversation, names the thread.
     #[test]
     fn outside_its_window_the_double_esc_lets_esc_go_on() {
         let mut st = with_orch();
@@ -17579,15 +21561,19 @@ pub(crate) mod tests {
             serde_json::json!({"thread": "t-beta", "ref": 4, "turn": null, "pending": 1}),
         );
         st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None, "Esc left the dive at once");
         assert_eq!(
             st.unsend_hint().as_deref(),
-            Some(" Esc or tap again: take back your message to beta · /back leaves ")
+            Some(" Esc or tap again: take back your message to beta ")
         );
         st.sent.as_mut().unwrap().armed = Some(late);
         st.expire_unsend(Instant::now());
         assert_eq!(st.unsend_hint(), None);
-        st.handle_key(key(KeyCode::Esc));
-        assert_eq!(st.view.dive, None, "Esc left the dive");
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "too late: nothing taken back"
+        );
+        assert_eq!(st.view.dive, None);
         // `/unsend` still takes it back, from anywhere; its text then waits in the history.
         let back = type_line(&mut st, "/unsend");
         assert_eq!(
@@ -17846,6 +21832,9 @@ pub(crate) mod tests {
             "and the docs",
             serde_json::json!({"thread": "t-beta", "ref": 30, "turn": null, "pending": 1}),
         );
+        // A card selected in the dive: Esc would release it, so it arms in the dive.
+        st.set_focus(Some("t-alpha".into()));
+        assert_eq!(st.esc_does(), EscDoes::Release);
         assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
         assert!(st.unsend_hint().is_some());
         assert!(type_line(&mut st, "/back").is_empty());
@@ -17856,6 +21845,161 @@ pub(crate) mod tests {
             "nothing taken back"
         );
         assert_eq!(st.sent.as_ref().unwrap().armed, None);
+        // Armed back in the orchestrator conversation by the Esc that left the dive, it is
+        // that view's: diving in again, Esc takes nothing back (and leaves).
+        st.sent.as_mut().unwrap().spent = false;
+        st.set_focus(None);
+        st.dive("t-beta");
+        assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(st.view.dive, None);
+        assert!(st.unsend_hint().is_some());
+        assert!(type_line(&mut st, "/open beta").is_empty());
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+        assert_eq!(st.unsend_hint(), None);
+        assert_eq!(st.sent.as_ref().unwrap().armed, None, "disarmed");
+        // In its dive again, Esc is a first Esc: it leaves and arms afresh.
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        assert_eq!(st.view.dive, None, "the Esc left the dive");
+        assert!(st.unsend_hint().is_some());
+    }
+
+    /// The second Esc counts only in the view the first left the dive for: after Ctrl-G (the
+    /// grid, and back), or another dive and `/back` (the same conversation shown again), Esc
+    /// does what it does there and takes nothing back, nor does a tap.
+    #[test]
+    fn a_take_back_armed_by_leaving_a_dive_is_for_that_view_only() {
+        let mut st = with_orch();
+        let mut b = beta_script(60);
+        control(&mut st, &[b.turn_ended(TurnResult::Completed)]);
+        let leave_armed = |st: &mut AppState, msg_ref: i64| {
+            st.dive("t-beta");
+            st.view.input.clear();
+            send_line(
+                st,
+                "and the man page",
+                serde_json::json!({"thread": "t-beta", "ref": msg_ref, "turn": null,
+                                   "pending": 1}),
+            );
+            assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+            assert_eq!(st.view.dive, None);
+            assert!(st.unsend_hint().is_some());
+        };
+        leave_armed(&mut st, 33);
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Grid);
+        assert_eq!(st.unsend_hint(), None);
+        assert!(!st.take_back_offered());
+        assert!(st.tap_unsend(Instant::now()).is_empty());
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+        assert_eq!(st.view.dive, None);
+
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Stack);
+        st.sent = None;
+        // To the grid and back: the same view again, but not the one it was armed in.
+        leave_armed(&mut st, 35);
+        st.handle_key(ctrl('g'));
+        st.handle_key(ctrl('g'));
+        assert_eq!(st.view.screen, Screen::Stack);
+        assert_eq!(st.unsend_hint(), None);
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        st.sent = None;
+        leave_armed(&mut st, 34);
+        assert!(type_line(&mut st, "/open gamma").is_empty());
+        assert!(type_line(&mut st, "/back").is_empty());
+        assert_eq!(st.main_thread().as_deref(), Some("t-orch"));
+        assert_eq!(st.unsend_hint(), None);
+        assert!(
+            st.handle_key(key(KeyCode::Esc)).is_empty(),
+            "nothing taken back"
+        );
+        assert_eq!(st.sent.as_ref().unwrap().armed, None);
+    }
+
+    /// Esc leaves a dive at once, even with a message there that can still be taken back: it
+    /// never waits for the double Esc's second. That one, in the orchestrator conversation
+    /// within [`UNSEND_WINDOW`], takes the message back and returns to the dive, where the
+    /// text goes back in the box. A tap on the take-back control does the same.
+    #[test]
+    fn esc_leaves_a_dive_at_once_and_a_second_takes_the_message_back() {
+        let mut st = with_orch();
+        let mut b = beta_script(60);
+        control(&mut st, &[b.turn_ended(TurnResult::Completed)]);
+        st.dive("t-beta");
+        send_line(
+            &mut st,
+            "and the changelog",
+            serde_json::json!({"thread": "t-beta", "ref": 31, "turn": null, "pending": 1}),
+        );
+        assert!(st.take_back_offered());
+        assert_eq!(st.esc_does(), EscDoes::Leave);
+        // No time passes: the Esc acts on the spot, without a timer.
+        assert!(st.handle_key(key(KeyCode::Esc)).is_empty());
+        assert_eq!(st.view.dive, None, "back in the orchestrator conversation");
+        assert_eq!(st.main_thread().as_deref(), Some("t-orch"));
+        assert_eq!(
+            st.unsend_hint().as_deref(),
+            Some(" Esc or tap again: take back your message to beta ")
+        );
+        let screen = screen_text(&draw(&mut st, 120, 30));
+        assert!(
+            screen.contains("→ orchestrator  Esc or tap again: take back your message to beta"),
+            "{screen}"
+        );
+        assert!(
+            st.take_back_offered(),
+            "the take-back control is offered there too"
+        );
+        let back = st.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            back,
+            [Action::Withdraw {
+                thread: "t-beta".into(),
+                msg_ref: 31
+            }]
+        );
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"), "back in its dive");
+        taken_back(&mut st, 31);
+        assert_eq!(st.view.input.as_str(), "and the changelog");
+        assert_eq!(
+            st.view.status.as_deref(),
+            Some("taken back: your message is in the box again")
+        );
+
+        // A tap on the take-back control, back in the orchestrator conversation.
+        st.view.input.clear();
+        send_line(
+            &mut st,
+            "and the readme",
+            serde_json::json!({"thread": "t-beta", "ref": 32, "turn": null, "pending": 1}),
+        );
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None);
+        let back = st.tap_unsend(Instant::now());
+        assert_eq!(
+            back,
+            [Action::Withdraw {
+                thread: "t-beta".into(),
+                msg_ref: 32
+            }]
+        );
+        assert_eq!(st.view.dive.as_deref(), Some("t-beta"));
+
+        // Nothing to take back: Esc leaves too, and arms nothing.
+        st.sent = None;
+        st.handle_key(key(KeyCode::Esc));
+        assert_eq!(st.view.dive, None);
+        assert_eq!(st.unsend_deadline(), None);
     }
 
     /// A withdrawal's answer is matched by its ref: a message sent while it was on its way
@@ -18172,40 +22316,428 @@ pub(crate) mod tests {
             st
         }
 
+        /// Swipes (the wheel, as a phone's terminal sends a swipe) down the list of cards
+        /// until card `id` is on screen.
+        fn swipe_to(st: &mut AppState, w: u16, h: u16, id: &str) {
+            for _ in 0..20 {
+                frame(st, w, h);
+                if st.view.panes.get(&PaneId::Thread(id.into())).is_some() {
+                    return;
+                }
+                let list = st.view.panes.list.expect("a list of cards").area;
+                wheel_at(st, w, h, list.x + 1, list.y + 1, false);
+            }
+            panic!("no card {id} after swiping");
+        }
+
         fn responds(actions: &[Action]) -> bool {
             actions.iter().any(|a| matches!(a, Action::Respond { .. }))
         }
 
-        /// On a phone (40 x 20), the line naming the screens switches them: every cell of its
-        /// row is one of its names (or the separator after it).
+        /// On a phone the action popup's rows are menu choices two rows tall, both the row's,
+        /// none over another, and its `✕` is a row (its top border); a question waiting for `y`
+        /// has its answers two rows tall under it. A tap on a second row does what one on the
+        /// first does.
         #[test]
-        fn the_compact_screen_line_switches_screens_at_40x20() {
+        fn phone_popups_and_questions_have_two_row_choices() {
             let mut st = compact();
-            frame(&mut st, 40, 20);
-            assert!(st.compact());
-            let (_, y) = spot(&st, &Target::Screen(CompactPane::Chat));
-            for x in 0..40 {
-                assert!(
-                    matches!(st.view.panes.target_at(x, y), Some(Target::Screen(_))),
-                    "{x}"
-                );
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            st.handle_key(key(KeyCode::Enter));
+            frame(&mut st, 40, 30);
+            assert!(st.action_popup().is_some());
+            let targets = st.view.panes.targets.clone();
+            let rows: Vec<(ratatui::layout::Rect, ActionKind)> = targets
+                .iter()
+                .filter_map(|(r, t)| match t {
+                    Target::Row(k) => Some((*r, *k)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{targets:?}");
+            for (k, (a, _)) in rows.iter().enumerate() {
+                assert_eq!(a.height, 2, "{rows:?}");
+                for (b, _) in &rows[k + 1..] {
+                    assert!(!a.intersects(*b), "{rows:?}");
+                }
             }
-            tap(&mut st, 40, 20, Target::Screen(CompactPane::Needs));
-            assert_eq!(st.view.compact_pane, CompactPane::Needs);
-            tap(&mut st, 40, 20, Target::Screen(CompactPane::Threads));
-            assert_eq!(st.view.compact_pane, CompactPane::Threads);
-            tap(&mut st, 40, 20, Target::Screen(CompactPane::Chat));
-            assert_eq!(st.view.compact_pane, CompactPane::Chat);
-            // Its last cell too.
-            tap_at(&mut st, 40, 20, 39, y);
-            assert_eq!(st.view.compact_pane, CompactPane::Threads);
+            let close: u16 = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| r.height)
+                .sum();
+            assert_eq!(close, 1, "{targets:?}");
+            // The second row of a row picks it.
+            let (r, kind) = rows[1];
+            tap_at(&mut st, 40, 30, r.x + 2, r.y + 1);
+            assert_eq!(st.action_popup().and_then(|p| p.sel), Some(kind));
+            // The `✕` closes it.
+            let under = targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .max_by_key(|r| r.y)
+                .unwrap();
+            tap_at(&mut st, 40, 30, under.x + 1, under.y);
+            assert!(st.action_popup().is_none());
+            // A question waiting for `y`: its answers two rows tall; `no`'s second row cancels.
+            st.view.confirm = Some(Confirm {
+                action: Action::Quit,
+                prompt: "quit? y/n".into(),
+                pending: String::new(),
+                alt: None,
+                offer: false,
+            });
+            frame(&mut st, 40, 30);
+            let answers: Vec<(ratatui::layout::Rect, Target)> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| matches!(t, Target::Yes | Target::No))
+                .cloned()
+                .collect();
+            assert_eq!(answers.len(), 2, "{answers:?}");
+            assert!(answers.iter().all(|(r, _)| r.height == 2), "{answers:?}");
+            assert!(!answers[0].0.intersects(answers[1].0));
+            let no = answers.iter().find(|(_, t)| *t == Target::No).unwrap().0;
+            tap_at(&mut st, 40, 30, no.x + 1, no.y + 1);
+            assert!(st.view.confirm.is_none());
         }
 
-        /// On the Needs you and Threads lists a tap selects a row and a tap on the selected
-        /// row opens its popup, however long after (a double tap does both); Talk to it,
-        /// picked as the popup opens, dives in with one tap.
+        /// On short phones the action popup draws only whole two-row rows, the highlighted one
+        /// first: a row it draws is one Enter may run, and one it could not draw never runs.
         #[test]
-        fn a_compact_row_is_selected_then_opened_with_taps() {
+        fn a_short_phone_popup_runs_only_rows_it_drew_whole() {
+            for h in [16u16, 12, 10] {
+                let mut st = compact();
+                st.show_pane(CompactPane::Threads);
+                frame(&mut st, 40, h);
+                st.handle_key(key(KeyCode::Enter));
+                for _ in 0..8 {
+                    st.handle_key(key(KeyCode::Down));
+                    frame(&mut st, 40, h);
+                    let sel = st.action_popup().and_then(|p| p.sel);
+                    let drawn = st
+                        .view
+                        .panes
+                        .popup_rows
+                        .clone()
+                        .map(|(_, k)| k)
+                        .unwrap_or_default();
+                    for (r, t) in &st.view.panes.targets {
+                        if matches!(t, Target::Row(_)) {
+                            assert_eq!(r.height, 2, "40x{h} {t:?}");
+                        }
+                    }
+                    if let Some(sel) = sel.filter(|k| !drawn.contains(k)) {
+                        let out = st.handle_key(key(KeyCode::Enter));
+                        assert!(out.is_empty(), "40x{h} {sel:?}: {out:?}");
+                        assert!(st.action_popup().is_some(), "40x{h}");
+                    }
+                }
+            }
+        }
+
+        /// On a phone a dive's `‹ back` band is a row, as on a desktop; the help's `✕` is a row
+        /// too, its top border, and closes it.
+        #[test]
+        fn phone_back_band_and_help_close_on_one_row() {
+            let mut st = compact();
+            st.dive("t-beta");
+            frame(&mut st, 40, 20);
+            let back: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Back)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(back.len(), 1, "{:?}", st.view.panes.targets);
+            assert_eq!(back[0].height, 1);
+            tap_at(&mut st, 40, 20, back[0].x + 2, back[0].y);
+            assert!(st.view.dive.is_none(), "back");
+            st.view.help = true;
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                1,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(!st.view.help);
+        }
+
+        /// On the shortest phones the action popup still lists a row to act on: the item's
+        /// text gives way to it (then not drawn in full, so read in the main pane to answer).
+        #[test]
+        fn a_short_phone_popup_keeps_a_row_to_act_on() {
+            for (w, h) in [(40u16, 12u16), (40, 13), (80, 12)] {
+                let mut st = compact();
+                st.view.compact = Some(true);
+                st.show_pane(CompactPane::Needs);
+                frame(&mut st, w, h);
+                st.handle_key(key(KeyCode::Enter));
+                frame(&mut st, w, h);
+                assert!(st.action_popup().is_some(), "{w}x{h}");
+                let rows = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Row(_)))
+                    .count();
+                assert!(rows >= 1, "{w}x{h}: {:?}", st.view.panes.targets);
+            }
+        }
+
+        /// After a swipe moved the compact Threads list, a card Tab selects stays in view on
+        /// the frames after, not only the first.
+        #[test]
+        fn a_card_selected_after_a_swipe_stays_in_view() {
+            use crossterm::event::{MouseEvent, MouseEventKind};
+            let mut st = crate::sidebar::tests::in_workspaces("default");
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 14);
+            for _ in 0..20 {
+                let screen = frame(&mut st, 40, 14);
+                let area = st.view.panes.phone.unwrap();
+                st.handle_mouse(
+                    MouseEvent {
+                        kind: MouseEventKind::ScrollDown,
+                        column: area.x + 3,
+                        row: area.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &screen,
+                );
+            }
+            st.handle_key(key(KeyCode::Tab));
+            let card = st.focused().unwrap().to_string();
+            for _ in 0..3 {
+                frame(&mut st, 40, 14);
+                assert!(
+                    st.view.panes.get(&PaneId::Thread(card.clone())).is_some(),
+                    "{card} in view"
+                );
+            }
+        }
+
+        /// On a phone the settings' `✕` is a row (its top border), and a setting, a menu
+        /// choice, is tapped only where at least two of its rows, or all of them, show; the
+        /// new-workspace dialog's `✕` is a row too.
+        #[test]
+        fn phone_settings_and_dialog_close_on_one_row() {
+            let mut st = compact();
+            frame(&mut st, 40, 12);
+            st.open_settings();
+            for _ in 0..6 {
+                let buf = frame(&mut st, 40, 12);
+                let text = screen_text(&buf);
+                let targets = st.view.panes.targets.clone();
+                let close: u16 = targets
+                    .iter()
+                    .filter(|(_, t)| *t == Target::Close)
+                    .map(|(r, _)| r.height)
+                    .sum();
+                assert_eq!(close, 1, "{targets:?}\n{text}");
+                for (r, t) in &targets {
+                    if matches!(t, Target::Setting(_)) {
+                        assert!(r.height >= 2, "{t:?} {r:?}");
+                    }
+                }
+                st.handle_key(key(KeyCode::Down));
+            }
+            st.view.settings = None;
+            // (A TUI opened on a workspace: one on a socket makes none.)
+            st.workspace = Some("default".into());
+            st.set_tabs(vec![crate::workspace::Tab::new("default")]);
+            st.open_new_ws(None);
+            assert!(st.view.new_ws.is_some());
+            frame(&mut st, 40, 20);
+            let closes: Vec<ratatui::layout::Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, t)| *t == Target::Close)
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                closes.iter().map(|r| r.height).sum::<u16>(),
+                1,
+                "{closes:?}"
+            );
+            let under = closes.iter().max_by_key(|r| r.y).unwrap();
+            tap_at(&mut st, 40, 20, under.x + 1, under.y);
+            assert!(st.view.new_ws.is_none());
+        }
+
+        /// On a phone opened on a socket, a screen too short for a card selects none: Tab and
+        /// the arrows leave the cards alone, and Enter opens no card's popup.
+        #[test]
+        fn a_short_phone_on_a_socket_selects_no_card_it_cannot_draw() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Threads);
+            frame(&mut st, 40, 30);
+            frame(&mut st, 40, 8);
+            assert!(st.view.panes.no_cards);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Tab));
+            st.handle_key(key(KeyCode::Down));
+            frame(&mut st, 40, 8);
+            assert!(st.focused().is_none());
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.action_popup().is_none());
+        }
+
+        /// On a phone each Needs you row is two rows tall, both of them its own: a tap on its
+        /// second row selects it as one on its first does, and the next row starts under it.
+        #[test]
+        fn a_needs_row_is_two_rows_both_tapped() {
+            let mut st = compact();
+            st.show_pane(CompactPane::Needs);
+            frame(&mut st, 40, 20);
+            let rows: Vec<(String, ratatui::layout::Rect)> = st
+                .view
+                .panes
+                .panes
+                .iter()
+                .filter_map(|p| match &p.id {
+                    PaneId::Thread(id) => Some((id.clone(), p.area)),
+                    _ => None,
+                })
+                .collect();
+            assert!(rows.len() >= 2, "{rows:?}");
+            for pair in rows.windows(2) {
+                assert_eq!(pair[0].1.height, 2, "{pair:?}");
+                assert_eq!(pair[1].1.y, pair[0].1.bottom(), "{pair:?}");
+            }
+            let (id, area) = rows[1].clone();
+            tap_at(&mut st, 40, 20, 5, area.y + 1);
+            assert_eq!(st.focused(), Some(id.as_str()));
+        }
+
+        /// On a phone, the tab bar switches screens: every cell of its two rows is the tab of
+        /// the third of the width it is in, the gap after a tab included, and a tap anywhere in
+        /// it, its second row too, shows that screen.
+        #[test]
+        fn the_compact_tab_bar_switches_screens_by_thirds() {
+            let rows = crate::ui::TAB_BAR_ROWS;
+            for (w, h) in [(40u16, 20u16), (40, 30), (40, 12), (30, 20)] {
+                let mut st = compact();
+                frame(&mut st, w, h);
+                assert!(st.compact(), "{w}x{h}");
+                let shares = ratatui::layout::Layout::horizontal(
+                    [ratatui::layout::Constraint::Ratio(1, 3); 3],
+                )
+                .split(ratatui::layout::Rect::new(0, 0, w, 1));
+                let panes = [CompactPane::Chat, CompactPane::Needs, CompactPane::Threads];
+                for y in 0..rows {
+                    for x in 0..w {
+                        let k = shares
+                            .iter()
+                            .position(|r| r.x <= x && x < r.right())
+                            .unwrap();
+                        assert_eq!(
+                            st.view.panes.target_at(x, y),
+                            Some(&Target::Screen(panes[k])),
+                            "{w}x{h}: {x},{y}"
+                        );
+                    }
+                }
+                assert!(
+                    !matches!(st.view.panes.target_at(0, rows), Some(Target::Screen(_))),
+                    "{w}x{h}: the bar is {rows} rows"
+                );
+                // A tap on a tab's corners and its gap: its bottom row, its last cell.
+                for (k, pane) in panes.iter().enumerate() {
+                    let r = shares[k];
+                    tap_at(&mut st, w, h, r.x, rows - 1);
+                    assert_eq!(st.view.compact_pane, *pane, "{w}x{h} {k}");
+                    let other = panes[(k + 1) % 3];
+                    tap(&mut st, w, h, Target::Screen(other));
+                    assert_eq!(st.view.compact_pane, other);
+                    tap_at(&mut st, w, h, r.right() - 1, 0);
+                    assert_eq!(st.view.compact_pane, *pane, "{w}x{h} {k}: its last cell");
+                }
+            }
+        }
+
+        /// On the compact Threads screen the wheel (a swipe) scrolls the cards a card at a
+        /// time and leaves the selection where it is; a tap on a card's options only selects
+        /// the card (nothing is answered), and a tap on the selected card opens its popup.
+        #[test]
+        fn compact_cards_scroll_with_the_wheel_and_select_with_taps() {
+            let mut st = compact();
+            // Each thread says a lot: its card is as tall as cards get, and they do not all
+            // fit.
+            let long = serde_json::json!({"activity": "building ".repeat(40)});
+            st.apply_result(
+                "thread.activity",
+                &serde_json::json!({"t-alpha": long, "t-beta": long, "t-gamma": long}),
+            );
+            frame(&mut st, 40, 20);
+            type_line(&mut st, "/t");
+            let first = |st: &AppState| st.view.panes.list_first.clone();
+            frame(&mut st, 40, 20);
+            assert_eq!(first(&st).as_deref(), Some("t-beta"));
+            let focus = st.focused().map(str::to_string);
+            let list = st.view.panes.list.unwrap().area;
+            wheel_at(&mut st, 40, 20, list.x + 1, list.y + 1, false);
+            assert_eq!(first(&st).as_deref(), Some("t-alpha"), "a card down");
+            assert_eq!(
+                st.focused().map(str::to_string),
+                focus,
+                "the selection stays"
+            );
+            wheel_at(&mut st, 40, 20, list.x + 1, list.y + 1, false);
+            assert_eq!(first(&st).as_deref(), Some("t-gamma"));
+            wheel_at(&mut st, 40, 20, list.x + 1, list.y + 1, true);
+            assert_eq!(first(&st).as_deref(), Some("t-alpha"), "and back up");
+            // alpha's card: a tap on its options' row selects it, answers nothing.
+            frame(&mut st, 40, 20);
+            let a = st
+                .view
+                .panes
+                .get(&PaneId::Thread("t-alpha".into()))
+                .unwrap()
+                .area;
+            let screen = frame(&mut st, 40, 20);
+            let options = (a.y..a.bottom())
+                .find(|&y| {
+                    (a.x..a.right())
+                        .map(|x| screen[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains("1 retry")
+                })
+                .expect("its options");
+            let actions = tap_at(&mut st, 40, 20, a.x + 2, options);
+            assert!(!responds(&actions), "{actions:?}");
+            assert_eq!(st.focused(), Some("t-alpha"));
+            assert!(st.view.action.is_none(), "a first tap only selects");
+            tap_at(&mut st, 40, 20, a.x + 2, options);
+            assert_eq!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Card("t-alpha".into()))
+            );
+        }
+
+        /// On the Needs you list a tap selects a row, and on the Threads screen a card; a tap
+        /// on the selected one opens its popup, however long after (a double tap does both);
+        /// Talk to it, picked as the popup opens, dives in with one tap.
+        #[test]
+        fn a_compact_row_or_card_is_selected_then_opened_with_taps() {
             let mut st = compact();
             frame(&mut st, 40, 20);
             type_line(&mut st, "/n");
@@ -18220,8 +22752,9 @@ pub(crate) mod tests {
                 st.action_popup().map(|p| p.target.clone()),
                 Some(ActionTarget::Card("t-alpha".into()))
             );
-            // Threads: gamma, then its popup, then Talk to it.
+            // Threads: gamma's card, swiped to, then its popup, then Talk to it.
             tap(&mut st, 40, 20, Target::Screen(CompactPane::Threads));
+            swipe_to(&mut st, 40, 20, "t-gamma");
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-gamma".into()));
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-gamma".into()));
             assert_eq!(
@@ -18254,10 +22787,16 @@ pub(crate) mod tests {
                 let out = tap(&mut st, 40, 20, Target::Row(ActionKind::Answer(1)));
                 assert!(!responds(&out), "{out:?}");
             }
+            // On a phone it says so in the popup's bottom border: the status bar does not grow
+            // under the popup.
+            let hint = |st: &AppState| st.action_popup().and_then(|p| p.hint.clone());
             assert_eq!(
-                st.view.status.as_deref(),
+                hint(&st).as_deref(),
                 Some("just shown: read it, then tap again")
             );
+            assert_eq!(st.view.status, None);
+            let buf = frame(&mut st, 40, 20);
+            assert!(screen_text(&buf).contains("just shown: read it"));
             assert_eq!(
                 st.action_popup().and_then(|p| p.sel),
                 Some(ActionKind::Answer(1))
@@ -18270,7 +22809,7 @@ pub(crate) mod tests {
                 20,
                 Target::Row(ActionKind::Answer(1))
             )));
-            assert!(st.view.status.as_deref().unwrap().contains("again"));
+            assert!(hint(&st).unwrap().contains("again"));
             let out = tap(&mut st, 40, 20, Target::Row(ActionKind::Answer(1)));
             assert!(
                 matches!(&out[..], [Action::Respond { attn_id, decision, .. }]
@@ -18318,11 +22857,11 @@ pub(crate) mod tests {
             );
         }
 
-        /// An item the popup cannot draw in full is never answered by a tap: too long for
-        /// it, its options are not listed (no row to tap). An option drawn on a card is only
-        /// text: a tap on it selects the card.
+        /// On a phone a long item's popup draws it in full, its text scrolling: an option
+        /// tapped twice answers it. An option drawn on a card is only text: a tap on it
+        /// selects the card.
         #[test]
-        fn a_tap_never_answers_an_item_only_partly_drawn() {
+        fn a_long_item_is_answered_by_taps_from_its_popup() {
             // Too long: no option to tap.
             let mut st = compact();
             let mut d = ThreadScript::new("t-delta");
@@ -18342,22 +22881,14 @@ pub(crate) mod tests {
             st.handle_key(key(KeyCode::Enter));
             frame(&mut st, 40, 20);
             read(&mut st);
-            let screen = screen_text(&frame(&mut st, 40, 20));
+            // Its options are drawn under its text, which scrolls in the popup: drawn in
+            // full there, a tap picks one and a second answers it, unscrolled.
             assert!(st.view.action.is_some());
-            assert!(screen.contains("too long to show here"), "{screen}");
-            assert!(
-                !st.view
-                    .panes
-                    .targets
-                    .iter()
-                    .any(|(_, t)| matches!(t, Target::Row(ActionKind::Answer(_)))),
-                "{:?}",
-                st.view.panes.targets
-            );
-            // Its rows are there, but no option: a tap on any answers nothing.
-            for kind in [ActionKind::Talk, ActionKind::Pin] {
-                assert!(drawn_control(&st, &Target::Row(kind)));
-            }
+            let yes = Target::Row(ActionKind::Answer(1));
+            assert!(drawn_control(&st, &yes), "{:?}", st.view.panes.targets);
+            assert!(!responds(&tap(&mut st, 40, 20, yes.clone())));
+            read(&mut st);
+            assert!(responds(&tap(&mut st, 40, 20, yes.clone())));
             // An option drawn on a card is text: a tap there selects the card, twice opens its
             // popup, and answers nothing.
             let mut st = three_threads();
@@ -18489,6 +23020,7 @@ pub(crate) mod tests {
             // The action popup: the wheel moves its highlight, as ↓ does.
             st.view.input.clear();
             type_line(&mut st, "/t");
+            swipe_to(&mut st, 40, 20, "t-gamma");
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-gamma".into()));
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-gamma".into()));
             let pop = st.view.panes.get(&PaneId::Popup).unwrap().area;
@@ -18526,8 +23058,8 @@ pub(crate) mod tests {
         }
 
         /// The status bar's notes do what their keys do; a tap on a notice clears it; the
-        /// grid's header goes back to the stack; the main pane's bottom border, scrolled up,
-        /// follows the bottom again.
+        /// grid's header goes back to the stack; the main pane's last row, scrolled up,
+        /// follows the bottom again: all of it, and nothing above it.
         #[test]
         fn the_status_bar_and_headers_have_controls() {
             let mut st = three_threads();
@@ -18557,8 +23089,23 @@ pub(crate) mod tests {
             st.handle_key(key(KeyCode::PageUp));
             frame(&mut st, 120, 30);
             assert!(st.view.scroll > 0);
+            let (_, y) = spot(&st, &Target::Follow);
+            let tr = st.view.panes.get(&PaneId::Transcript).unwrap().area;
+            assert_eq!(y, tr.bottom(), "the row under the transcript's");
+            for x in tr.x..tr.right() {
+                assert_eq!(st.view.panes.target_at(x, y), Some(&Target::Follow), "{x}");
+                assert_ne!(
+                    st.view.panes.target_at(x, y - 1),
+                    Some(&Target::Follow),
+                    "{x}"
+                );
+            }
             tap(&mut st, 120, 30, Target::Follow);
             assert_eq!(st.view.scroll, 0);
+            assert!(
+                !drawn_control(&st, &Target::Follow),
+                "at the bottom: no row for it"
+            );
         }
 
         /// The input box's top border takes back the message just sent: a first tap arms it
@@ -18617,7 +23164,7 @@ pub(crate) mod tests {
         #[test]
         fn the_picker_works_with_taps() {
             let mut st = three_threads();
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             frame(&mut st, 100, 30);
             tap(&mut st, 100, 30, Target::Runtime(0));
             assert_eq!(st.view.picker.as_ref().unwrap().selected, 0);
@@ -18633,7 +23180,7 @@ pub(crate) mod tests {
                     summary: false,
                 }]
             );
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             tap(&mut st, 100, 30, Target::Close);
             assert!(st.view.picker.is_none());
         }
@@ -18673,8 +23220,8 @@ pub(crate) mod tests {
             let out = tap(&mut st, 160, 40, Target::Row(ActionKind::Answer(1)));
             assert!(!responds(&out), "{out:?}");
         }
-        /// An armed Stop does not run once its item is not on screen in full
-        /// any more (a smaller screen left the popup no room for it).
+        /// An armed Stop does not run once the screen was resized (a smaller screen, the
+        /// keyboard open, moved its rows): it is picked again first.
         #[test]
         fn an_armed_stop_needs_its_item_still_on_screen() {
             let mut st = compact();
@@ -18682,11 +23229,30 @@ pub(crate) mod tests {
             type_line(&mut st, "/n");
             tap_pane(&mut st, 40, 20, PaneId::Thread("t-beta".into()));
             read(&mut st);
+            // (On a phone its rows are two rows tall: ↓ brings Stop into view.)
+            for _ in 0..10 {
+                if st.action_popup().and_then(|p| p.sel) == Some(ActionKind::Stop) {
+                    break;
+                }
+                st.handle_key(key(KeyCode::Down));
+                frame(&mut st, 40, 20);
+            }
+            read(&mut st);
             tap(&mut st, 40, 20, Target::Row(ActionKind::Stop));
             assert!(st.view.action.as_ref().unwrap().armed.is_some());
-            frame(&mut st, 40, 13);
-            assert!(st.view.shown.is_none(), "no room for the item");
-            let out = tap(&mut st, 40, 13, Target::Row(ActionKind::Stop));
+            // The keyboard opens: the rows moved, Stop is disarmed.
+            frame(&mut st, 40, 11);
+            assert!(st.view.action.as_ref().unwrap().armed.is_none());
+            let stop = Target::Row(ActionKind::Stop);
+            for _ in 0..10 {
+                if drawn_control(&st, &stop) {
+                    break;
+                }
+                st.handle_key(key(KeyCode::Down));
+                frame(&mut st, 40, 11);
+            }
+            read(&mut st);
+            let out = tap(&mut st, 40, 11, stop);
             assert!(out.is_empty(), "{out:?}");
         }
 
@@ -18741,7 +23307,7 @@ pub(crate) mod tests {
                     .unwrap_or_else(|| panic!("no runtime {i}"))
             };
             let mut st = three_threads();
-            st.view.picker = Picker::from_show(&first_show());
+            st.view.picker = Picker::from_show(&first_show(), &Accounts::default());
             let buf = frame(&mut st, 40, 20);
             for i in 0..3 {
                 let y = first_row(&st, i);
@@ -18939,7 +23505,8 @@ pub(crate) mod tests {
         fn a_slash_popup_over_a_clicked_tile_is_no_double_click() {
             let mut st = three_threads();
             st.handle_key(ctrl('g'));
-            frame(&mut st, 80, 30);
+            // (Short: the popup reaches up over gamma's tile, on the second row.)
+            frame(&mut st, 80, 18);
             let tile = st
                 .view
                 .panes
@@ -18947,16 +23514,16 @@ pub(crate) mod tests {
                 .unwrap()
                 .area;
             let (x, y) = (tile.x + 2, tile.bottom() - 1);
-            tap_at(&mut st, 80, 30, x, y);
+            tap_at(&mut st, 80, 18, x, y);
             assert_eq!(st.focused(), Some("t-gamma"));
             typed(&mut st, "/");
-            frame(&mut st, 80, 30);
+            frame(&mut st, 80, 18);
             assert_eq!(
                 st.view.panes.at(x, y).map(|p| p.id.clone()),
                 Some(PaneId::Popup),
                 "the / popup covers the spot"
             );
-            tap_at(&mut st, 80, 30, x, y);
+            tap_at(&mut st, 80, 18, x, y);
             assert_eq!(st.view.dive, None);
         }
 
@@ -19008,11 +23575,8 @@ pub(crate) mod tests {
             }
             control(&mut st, &[again]);
             let screen = frame(&mut st, 40, 20);
-            assert_ne!(
-                st.view.panes.target_at(x, y),
-                Some(&Target::Row(ActionKind::Answer(1))),
-                "another row there now"
-            );
+            // (Its rows two rows tall on a phone, the same row may still be under the press:
+            // the revision it was pressed on is what refuses it.)
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty());
             assert!(st.action_popup().is_some(), "it stays");
@@ -19105,6 +23669,4249 @@ pub(crate) mod tests {
             assert_eq!(spot(&st, &Target::TakeBack), (x, y));
             let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
             assert!(out.is_empty(), "{out:?}");
+        }
+    }
+
+    /// On a phone the tabs and the menu choices are two rows tall, both rows their own
+    /// ([`crate::ui::TAP_ROWS`]): a popup's rows, the `/` completions, the orchestrator
+    /// picker's runtimes, the settings, `[ yes ]` and `[ no ]`, the Threads screen's entries.
+    /// Every other control is a row tall, as drawn, as on a desktop: the status bar's notice
+    /// and notes, `✕ close`, the decision table, the conversation's controls (folded lines,
+    /// `↓ lines below`), the queued messages and the take-back.
+    mod phone_targets {
+        use super::*;
+        use crate::select::Target;
+        use ratatui::layout::Rect;
+        use serde_json::json;
+
+        fn frame(st: &mut AppState, w: u16, h: u16) -> Buffer {
+            crate::ui::draw_offscreen(st, w, h, Instant::now())
+        }
+
+        /// A tap at `(x, y)`, a frame drawn before and after, as the IO loop draws.
+        fn tap_at(st: &mut AppState, w: u16, h: u16, x: u16, y: u16) -> Vec<Action> {
+            use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            let ev = |kind| MouseEvent {
+                kind,
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            };
+            let screen = frame(st, w, h);
+            st.handle_mouse(ev(MouseEventKind::Down(MouseButton::Left)), &screen);
+            let screen = frame(st, w, h);
+            let out = st.handle_mouse(ev(MouseEventKind::Up(MouseButton::Left)), &screen);
+            frame(st, w, h);
+            out
+        }
+
+        /// A tab or a menu choice: two rows tall on a phone.
+        fn menu(t: &Target) -> bool {
+            matches!(
+                t,
+                Target::Screen(_)
+                    | Target::Row(_)
+                    | Target::Suggestion(_)
+                    | Target::Runtime(_)
+                    | Target::Setting(_)
+                    | Target::Yes
+                    | Target::No
+                    | Target::Workspace(_)
+            )
+        }
+
+        /// The rows control `t` covers in the last frame (its rects together).
+        fn rows_of(st: &AppState, t: &Target) -> std::collections::BTreeSet<u16> {
+            st.view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, x)| x == t)
+                .flat_map(|(r, _)| r.top()..r.bottom())
+                .collect()
+        }
+
+        /// Every control the last frame drew: a tab or a menu choice two rows at least, any
+        /// other a row (each row of a note wrapped over two its own rect); none over
+        /// another's.
+        fn as_drawn(st: &AppState, what: &str) {
+            let targets = &st.view.panes.targets;
+            for (k, (a, ta)) in targets.iter().enumerate() {
+                let rows = rows_of(st, ta);
+                if menu(ta) {
+                    assert!(rows.len() >= 2, "{what}: {ta:?} {a:?} on {rows:?}");
+                } else {
+                    assert_eq!(a.height, 1, "{what}: {ta:?} {a:?} on {rows:?}");
+                }
+                for (b, tb) in &targets[k + 1..] {
+                    assert!(
+                        ta == tb || !a.intersects(*b),
+                        "{what}: {ta:?} {a:?} {tb:?} {b:?}"
+                    );
+                }
+            }
+        }
+
+        /// A cell of control `t` on its first row, `down` rows under it.
+        fn cell_of(st: &AppState, t: &Target, down: u16) -> (u16, u16) {
+            let rects: Vec<Rect> = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .filter(|(_, x)| x == t)
+                .map(|(r, _)| *r)
+                .collect();
+            let top = rects
+                .iter()
+                .map(|r| r.y)
+                .min()
+                .unwrap_or_else(|| panic!("no {t:?}"));
+            let y = top + down;
+            let r = rects
+                .iter()
+                .find(|r| r.top() <= y && y < r.bottom())
+                .unwrap_or_else(|| panic!("{t:?} has no row {y}"));
+            (r.x + r.width / 2, y)
+        }
+
+        /// The second row of menu choice `t` (the row under its first).
+        fn second_row(st: &AppState, t: &Target) -> (u16, u16) {
+            cell_of(st, t, 1)
+        }
+
+        /// The row of a one-row control `t`.
+        fn row_of(st: &AppState, t: &Target) -> (u16, u16) {
+            cell_of(st, t, 0)
+        }
+
+        fn phone() -> AppState {
+            let mut st = three_threads();
+            st.view.compact_width = 60;
+            st
+        }
+
+        /// The status bar's notice and a note are a row each, as they read; a tap on the
+        /// notice clears it, on Focus mode's note ends it.
+        #[test]
+        fn status_notes_are_one_row() {
+            for (w, h) in [(40u16, 20u16), (40, 30), (59, 16)] {
+                let mut st = phone();
+                st.view.focus_mode = true;
+                st.view.status = Some("hub: not_found".into());
+                frame(&mut st, w, h);
+                as_drawn(&st, &format!("{w}x{h}"));
+                let (x, y) = row_of(&st, &Target::Notice);
+                tap_at(&mut st, w, h, x, y);
+                assert!(st.view.status.is_none(), "{w}x{h}");
+                let (x, y) = row_of(&st, &Target::FocusOff);
+                tap_at(&mut st, w, h, x, y);
+                assert!(!st.view.focus_mode, "{w}x{h}");
+            }
+        }
+
+        /// The `/` popup's rows are menu choices two rows tall, a tap on a second row
+        /// completing it; its top border, a row, closes it.
+        #[test]
+        fn the_slash_popup_rows_are_two_rows() {
+            let mut st = phone();
+            st.view.input.set("/");
+            frame(&mut st, 40, 24);
+            as_drawn(&st, "slash popup");
+            let first = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .find_map(|(_, t)| match t {
+                    Target::Suggestion(v) => Some(Target::Suggestion(v.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            // No row of its own under the top border closes it: the first choice is there.
+            let (_, top) = row_of(&st, &Target::Close);
+            assert_eq!(row_of(&st, &first).1, top + 1);
+            let (x, y) = second_row(&st, &first);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_ne!(st.view.input.as_str(), "/", "completed");
+        }
+
+        /// The orchestrator picker's runtimes are two rows tall, its close one, its border's.
+        #[test]
+        fn the_picker_rows_are_two_rows() {
+            let mut st = phone();
+            st.view.picker = Some(crate::app::Picker {
+                runtimes: vec![
+                    ("claude-code".into(), Some(true)),
+                    ("codex".into(), Some(false)),
+                ],
+                selected: 0,
+                default: "claude-code".into(),
+                model: None,
+                switch: false,
+            });
+            frame(&mut st, 40, 24);
+            as_drawn(&st, "picker");
+            let (x, y) = second_row(&st, &Target::Runtime(1));
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.picker.as_ref().map(|p| p.selected), Some(1));
+        }
+
+        /// On a phone too short for the picker, it scrolls to keep the selected runtime's band
+        /// whole; a band the window cuts is not drawn, nor tapped.
+        #[test]
+        fn a_short_picker_draws_its_runtimes_whole() {
+            let mut st = phone();
+            st.view.picker = Some(crate::app::Picker {
+                runtimes: vec![
+                    ("claude-code".into(), Some(true)),
+                    ("codex".into(), Some(false)),
+                ],
+                selected: 0,
+                default: "claude-code".into(),
+                model: None,
+                switch: false,
+            });
+            for h in [8u16, 9, 10] {
+                for sel in [0, 1] {
+                    st.view.picker.as_mut().unwrap().selected = sel;
+                    let text = screen_text(&frame(&mut st, 40, h));
+                    as_drawn(&st, &format!("picker {sel} 40x{h}"));
+                    assert!(
+                        st.view
+                            .panes
+                            .targets
+                            .iter()
+                            .any(|(_, t)| *t == Target::Runtime(sel)),
+                        "{sel} 40x{h}:\n{text}"
+                    );
+                    // Every runtime named on screen is a whole band with its tap.
+                    for (i, name) in ["claude-code", "codex"].iter().enumerate() {
+                        let drawn = text.lines().any(|l| l.contains(name));
+                        let tapped = st
+                            .view
+                            .panes
+                            .targets
+                            .iter()
+                            .any(|(_, t)| *t == Target::Runtime(i));
+                        assert!(!drawn || tapped, "{sel}: {name} drawn, not tapped:\n{text}");
+                    }
+                }
+            }
+        }
+
+        /// A status message longer than the phone's bar still shows, and a tap on it clears it.
+        #[test]
+        fn a_long_notice_is_cut_not_dropped() {
+            let mut st = phone();
+            st.view.status = Some(format!("error: {}", "the hub said no. ".repeat(40)));
+            let text = screen_text(&frame(&mut st, 40, 20));
+            assert!(text.contains("error: the hub"), "{text}");
+            let (x, y) = row_of(&st, &Target::Notice);
+            tap_at(&mut st, 40, 20, x, y);
+            assert!(st.view.status.is_none());
+        }
+
+        /// The conversation's controls on a phone are its rows as drawn: no row is added to
+        /// one (a row with a link always has its text), as the view scrolls.
+        #[test]
+        fn conversation_controls_have_no_padding() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(500);
+            for i in 0..20 {
+                st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
+            }
+            let mut buf = frame(&mut st, 40, 20);
+            let mut links = 0;
+            for step in 0..40 {
+                let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+                for (k, link) in pane.links.iter().enumerate() {
+                    let Some(link) = link.as_deref().filter(|l| !l.starts_with("request:")) else {
+                        continue;
+                    };
+                    links += 1;
+                    let y = pane.area.y + k as u16;
+                    let row: String = (pane.area.left()..pane.area.right())
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect();
+                    assert!(
+                        !row.trim().is_empty(),
+                        "step {step}: {link} on a blank row {y}"
+                    );
+                }
+                st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+                buf = frame(&mut st, 40, 20);
+            }
+            assert!(links > 0, "a control seen");
+            assert!(st.view.scroll > 0);
+        }
+
+        /// `/sidebar` on a phone does as Ctrl-B: the Threads screen, then back to Chat.
+        #[test]
+        fn slash_sidebar_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            frame(&mut st, 40, 20);
+            for want in [CompactPane::Threads, CompactPane::Chat] {
+                st.view.input.set("/sidebar");
+                st.handle_key(key(KeyCode::Enter));
+                assert_eq!(st.view.compact_pane, want);
+            }
+        }
+
+        /// The decision table on a phone: its close, its filters and its rows a row each; a
+        /// tap on a filter moves it on.
+        #[test]
+        fn the_decision_table_controls_are_one_row() {
+            let mut st = with_decisions();
+            st.view.compact_width = 60;
+            open_decisions(&mut st);
+            frame(&mut st, 50, 24);
+            as_drawn(&st, "decisions");
+            let before = st.view.decision_filter.site;
+            let (x, y) = row_of(&st, &Target::SiteFilter);
+            tap_at(&mut st, 50, 24, x, y);
+            assert_ne!(st.view.decision_filter.site, before);
+        }
+
+        /// The trash's close is its top border's row, no row of its own under it.
+        #[test]
+        fn the_trash_close_is_one_row() {
+            let mut st = phone();
+            st.view.trash = Some(json!({"items": []}));
+            let text = screen_text(&frame(&mut st, 40, 20));
+            as_drawn(&st, "trash");
+            assert!(!text.contains("✕ close \n"), "{text}");
+            let (x, y) = row_of(&st, &Target::Close);
+            tap_at(&mut st, 40, 20, x, y);
+            assert!(st.view.trash.is_none());
+        }
+
+        /// The conversation's controls: a tap on a folded line expands it; scrolled up,
+        /// `↓ lines below` is a row, a tap on it following the bottom again.
+        #[test]
+        fn conversation_controls_are_one_row() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 24);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let (k, link) = pane
+                .links
+                .iter()
+                .enumerate()
+                .find_map(|(k, l)| {
+                    l.clone()
+                        .filter(|l| !l.starts_with("request:"))
+                        .map(|l| (k, l))
+                })
+                .expect("a folded line");
+            tap_at(&mut st, 40, 24, 5, pane.area.y + k as u16);
+            // Replies enough to scroll up from.
+            let mut o = ThreadScript::new("t-orch");
+            o.at(500);
+            for i in 0..30 {
+                st.apply_event(&thread_item(&o.text(&format!("reply-{i}"))));
+            }
+            frame(&mut st, 40, 24);
+            assert!(
+                st.view
+                    .expanded
+                    .iter()
+                    .any(|e| link.contains(e.as_str()) || e.contains(&link)),
+                "{link}: {:?}",
+                st.view.expanded
+            );
+            for _ in 0..3 {
+                st.handle_key(key(KeyCode::PageUp));
+            }
+            frame(&mut st, 40, 24);
+            assert!(st.view.scroll > 0, "scrolled");
+            as_drawn(&st, "scrolled up");
+            let (x, y) = row_of(&st, &Target::Follow);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.scroll, 0, "following again");
+        }
+
+        /// `↶ take back` on a phone is the input box's top border, a row, as on a desktop: a
+        /// tap arms it, a second takes the message back.
+        #[test]
+        fn take_back_is_one_row() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            send_line(
+                &mut st,
+                "deploy api",
+                serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
+                                   "turn": null, "pending": 1}),
+            );
+            let text = screen_text(&frame(&mut st, 40, 24));
+            as_drawn(&st, "take back");
+            let input = st.view.panes.get(&PaneId::Input).unwrap().area;
+            let (x, y) = row_of(&st, &Target::TakeBack);
+            assert_eq!(y + 1, input.y, "{text}");
+            assert_eq!(text.matches("take back").count(), 1, "{text}");
+            assert!(tap_at(&mut st, 40, 24, x, y).is_empty());
+            assert!(st.unsend_hint().is_some());
+            let (x, y) = row_of(&st, &Target::TakeBack);
+            assert_eq!(
+                tap_at(&mut st, 40, 24, x, y),
+                [Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 7
+                }]
+            );
+        }
+
+        /// A request selected in a phone's conversation is drawn whole, its footer row
+        /// counted, or read in the detail view: every frame, never cut.
+        #[test]
+        fn a_selected_request_is_whole_or_in_the_detail_view() {
+            for n in 1..14 {
+                for h in [18u16, 20, 24] {
+                    let mut st = api_and_web_waiting();
+                    st.view.compact_width = 60;
+                    let mut api = ThreadScript::new("t-api");
+                    api.at(80);
+                    let mut long = api.raise("long", Question);
+                    if let EventBody::AttentionRaised(p) = &mut long.body {
+                        p.summary = (0..n).map(|k| format!("line {k} of it\n")).collect();
+                        p.options = vec!["continue".into(), "cancel".into()];
+                    }
+                    control(&mut st, &[long]);
+                    for i in 0..30 {
+                        st.apply_event(&thread_item(
+                            &ThreadScript::new("t-orch").text(&format!("after {i}")),
+                        ));
+                    }
+                    frame(&mut st, 40, h);
+                    st.select_request("long");
+                    for f in 0..4 {
+                        let text = screen_text(&frame(&mut st, 40, h));
+                        let whole = st.view.panes.items.iter().any(|d| d.attn_id == "long");
+                        let detail = st.view.panes.card.is_some();
+                        assert!(whole || detail, "{n} lines, 40x{h}, frame {f}:\n{text}");
+                    }
+                }
+            }
+        }
+
+        /// The grid's selection stays as the sidebar shows again: only the stack view's
+        /// cards, which hiding it let go, get theirs back.
+        #[test]
+        fn showing_the_sidebar_keeps_the_grid_selection() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-alpha".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            st.set_focus(Some("t-beta".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-beta"));
+            // The stack view: hiding lets the card go, showing brings it back.
+            st.handle_key(ctrl('g'));
+            st.set_focus(Some("t-gamma".into()));
+            frame(&mut st, 160, 40);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), None);
+            st.handle_key(ctrl('b'));
+            assert_eq!(st.focused(), Some("t-gamma"));
+        }
+
+        /// Block navigation on a phone sees the rows as drawn: its rows are the pane's, link
+        /// for link.
+        #[test]
+        fn phone_block_navigation_sees_the_rows_drawn() {
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 200);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let links: Vec<Option<String>> = crate::ui::block_rows(&st)
+                .into_iter()
+                .map(|r| r.2)
+                .collect();
+            assert_eq!(pane.links, links);
+        }
+
+        /// With an action popup open over a phone's conversation, the take-back is still its
+        /// one row, the popup's two-row choices over none of it.
+        #[test]
+        fn take_back_stays_one_row_under_a_popup() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            send_line(
+                &mut st,
+                "deploy api",
+                serde_json::json!({"action": "delegate", "thread": "t-orch", "ref": 7,
+                                   "turn": null, "pending": 1}),
+            );
+            frame(&mut st, 40, 30);
+            assert_eq!(rows_of(&st, &Target::TakeBack).len(), 1);
+            st.handle_key(key(KeyCode::Enter));
+            assert!(st.view.action.is_some(), "a popup opens");
+            frame(&mut st, 40, 30);
+            as_drawn(&st, "popup open");
+            assert!(rows_of(&st, &Target::TakeBack).len() <= 1);
+        }
+
+        /// The status bar's `Ctrl-B shows` on a phone does what Ctrl-B does there: the
+        /// Threads screen, the flag as it was.
+        #[test]
+        fn the_sidebar_note_on_a_phone_shows_the_threads() {
+            let mut st = phone();
+            st.view.sidebar_hidden = true;
+            frame(&mut st, 40, 24);
+            let (x, y) = row_of(&st, &Target::Sidebar);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.compact_pane, CompactPane::Threads);
+            assert!(
+                st.view.sidebar_hidden,
+                "the full layout's sidebar stays as it was"
+            );
+        }
+
+        /// A workspace's selection comes back as the sidebar is now: hidden since, it waits
+        /// for the sidebar to show; shown since, it is selected again.
+        #[test]
+        fn a_restored_selection_follows_the_sidebar() {
+            let mut st = three_threads();
+            frame(&mut st, 160, 40);
+            st.set_focus(Some("t-beta".into()));
+            let saved = st.take_view();
+            let mut back = three_threads();
+            back.view.sidebar_hidden = true;
+            back.restore_view(saved);
+            back.finish_restore();
+            frame(&mut back, 160, 40);
+            assert_eq!(back.focused(), None);
+            back.handle_key(ctrl('b'));
+            assert_eq!(back.focused(), Some("t-beta"));
+            // Left hidden, the selection waiting; shown when it comes back.
+            back.handle_key(ctrl('b'));
+            let saved = back.take_view();
+            let mut again = three_threads();
+            again.restore_view(saved);
+            again.finish_restore();
+            frame(&mut again, 160, 40);
+            assert_eq!(again.focused(), Some("t-beta"));
+        }
+
+        /// On short phone screens every control is drawn as tall as it is and tapped where
+        /// drawn: the queue's messages each with its tap, the decision table, the
+        /// conversation's lines-below row.
+        #[test]
+        fn short_phones_draw_controls_as_tall_as_they_are() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 3,
+                        "held": false, "items": [
+                    {"ref": 7, "prompt": "one", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 8, "prompt": "two", "truncated": false, "from": "user", "mine": true},
+                    {"ref": 9, "prompt": "three", "truncated": false, "from": "user", "mine": true},
+                ]}),
+            );
+            for h in 10..=16 {
+                let text = screen_text(&frame(&mut st, 40, h));
+                as_drawn(&st, &format!("queue 40x{h}"));
+                let drawn = text.lines().filter(|l| l.contains("⧗ queued")).count();
+                let tapped = st
+                    .view
+                    .panes
+                    .targets
+                    .iter()
+                    .filter(|(_, t)| matches!(t, Target::Queued(_)))
+                    .count();
+                assert_eq!(drawn, tapped, "40x{h}:\n{text}");
+            }
+            let mut st = with_decisions();
+            st.view.compact_width = 60;
+            open_decisions(&mut st);
+            for h in 6..=12 {
+                frame(&mut st, 40, h);
+                as_drawn(&st, &format!("decisions 40x{h}"));
+            }
+            let mut st = crate::app::tests::without_worker_requests(with_orch());
+            st.view.compact_width = 60;
+            orch_conversation(&mut st);
+            frame(&mut st, 40, 10);
+            st.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+            for h in 8..=12 {
+                frame(&mut st, 40, h);
+                as_drawn(&st, &format!("follow 40x{h}"));
+            }
+        }
+
+        /// The queued messages above the input box are a row each; a tap on one selects it.
+        #[test]
+        fn queued_messages_are_one_row() {
+            let mut st = with_orch();
+            st.view.compact_width = 60;
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": 2,
+                        "held": false, "items": [
+                    {"ref": 7, "prompt": "fix the tests too", "truncated": false,
+                     "from": "user", "mine": true},
+                    {"ref": 8, "prompt": "then deploy", "truncated": false,
+                     "from": "user", "mine": true},
+                ]}),
+            );
+            frame(&mut st, 40, 24);
+            as_drawn(&st, "queue");
+            let (x, y) = row_of(&st, &Target::Queued(8));
+            assert_eq!(row_of(&st, &Target::Queued(7)).1 + 1, y);
+            tap_at(&mut st, 40, 24, x, y);
+            assert_eq!(st.view.queued, Some(8));
+        }
+    }
+
+    /// The queue of the main pane's thread ([`crate::queue`]).
+    mod queued {
+        use super::*;
+        use crate::select::Target;
+        use serde_json::json;
+
+        /// The orchestrator conversation with `items` queued (`total` waiting in all), as the
+        /// hub listed them.
+        fn with_queue(items: Value, total: u64) -> AppState {
+            let mut st = with_orch();
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "thread_name": "orchestrator", "total": total,
+                        "held": false, "items": items}),
+            );
+            st
+        }
+
+        fn three() -> Value {
+            json!([
+                {"ref": 7, "prompt": "fix the tests too", "truncated": false,
+                 "from": "user", "mine": true},
+                {"ref": 8, "prompt": "check the api\nand the web", "truncated": false,
+                 "from": "orchestrator", "mine": false},
+                {"ref": 9, "prompt": "then deploy", "truncated": true,
+                 "from": "user", "mine": true},
+            ])
+        }
+
+        /// They are listed right above the input box, the next first: who sent one when it
+        /// is not the user, `…` when there is more of it, `↑ edits` on the user's newest
+        /// while the line is empty, and how many more wait.
+        #[test]
+        fn queued_messages_are_listed_above_the_input_box() {
+            let mut st = with_queue(three(), 5);
+            let buf = draw(&mut st, 120, 30);
+            let rows: Vec<String> = screen_text(&buf).lines().map(str::to_string).collect();
+            let at = |needle: &str| {
+                rows.iter()
+                    .position(|r| r.contains(needle))
+                    .unwrap_or_else(|| panic!("no {needle:?} in\n{}", rows.join("\n")))
+            };
+            let first = at("⧗ queued · fix the tests too");
+            assert_eq!(
+                at("⧗ queued · (from the orchestrator) check the api …"),
+                first + 1
+            );
+            assert_eq!(at("⧗ queued · then deploy …"), first + 2);
+            assert!(rows[first + 2].contains("↑ edits"), "{}", rows[first + 2]);
+            assert!(!rows[first].contains("↑ edits"));
+            assert_eq!(at("+ 2 more queued"), first + 3);
+            // The input box's top border right under them.
+            assert!(
+                rows[first + 4].contains("→ orchestrator"),
+                "{}",
+                rows[first + 4]
+            );
+            // Typed text: no `↑ edits`.
+            typed(&mut st, "x");
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(!screen.contains("↑ edits"), "{screen}");
+            // Another thread on the main pane: not its queue.
+            st.view.input.clear();
+            st.dive("t-alpha");
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(!screen.contains("⧗ queued"), "{screen}");
+        }
+
+        /// ↑ on an empty line takes the user's newest queued message back (never the
+        /// orchestrator's); its whole text, as the hub returns it, goes in the box, and Enter
+        /// sends it again as a new message. With text typed, ↑ edits that.
+        #[test]
+        fn up_on_an_empty_line_takes_the_newest_queued_message_back_to_edit() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            typed(&mut st, "draft");
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            st.view.input.clear();
+            let out = st.handle_key(key(KeyCode::Up));
+            assert_eq!(
+                out,
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 9
+                }]
+            );
+            // A second ↑ before the answer asks nothing again.
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            let full = format!("then deploy {}", "x".repeat(3000));
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 9, "thread": "t-orch",
+                        "prompt": full}),
+            );
+            assert_eq!(st.view.input.as_str(), full);
+            assert!(
+                st.view
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("taken back from the queue")),
+                "{:?}",
+                st.view.status
+            );
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if *text == full),
+                "{sent:?}"
+            );
+        }
+
+        /// The queue is read when the main pane shows a thread, when something about it
+        /// changed, often while the thread works or messages wait, now and then otherwise; not
+        /// while a read is on its way.
+        #[test]
+        fn the_queue_is_read_when_it_changes_and_while_it_moves() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            assert_eq!(st.queue_due(now).as_deref(), Some("t-orch"));
+            assert_eq!(st.queue_due(now), None, "a read is on its way");
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 0, "items": []}),
+            );
+            let busy = st
+                .registry
+                .get("t-orch")
+                .is_some_and(|v| v.current_turn.is_some());
+            // Idle with nothing queued: still read now and then (another client may queue
+            // for a thread that can't take it, which starts no turn).
+            let idle = st.queue_deadline(now).unwrap();
+            let poll = if busy {
+                crate::queue::QUEUE_POLL
+            } else {
+                crate::queue::QUEUE_IDLE_POLL
+            };
+            assert!(idle > now && idle <= now + poll + Duration::from_secs(1));
+            // A message that queued: read again at once.
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 12, "turn": null,
+                        "pending": 1}),
+            );
+            assert_eq!(st.queue_deadline(now), Some(now));
+            assert_eq!(st.queue_due(now).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 12, "prompt": "x", "from": "user", "mine": true}]}),
+            );
+            // Messages wait: read again after a while.
+            let next = st.queue_deadline(now).unwrap();
+            assert!(next > now && next <= now + crate::queue::QUEUE_POLL + Duration::from_secs(1));
+            // A failed read (an older hub): the next one waits longer.
+            assert_eq!(st.queue_due(next).as_deref(), Some("t-orch"));
+            st.apply_result("thread.queue", &Value::Null);
+            assert!(st.queue_deadline(next).unwrap() >= now + Duration::from_secs(29));
+        }
+
+        /// Shift-↓ from the conversation goes on into the queued rows, Shift-↑ back; Enter
+        /// opens a selected one's popup: edit (the user's), delete, and send now (the next
+        /// one only); Esc releases it.
+        #[test]
+        fn a_selected_queued_message_opens_a_popup_to_edit_delete_or_send_it_now() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            st.handle_key(shift(KeyCode::Left));
+            let mut seen = Vec::new();
+            for _ in 0..12 {
+                st.handle_key(shift(KeyCode::Down));
+                seen.push(st.view.queued);
+            }
+            assert_eq!(seen.last(), Some(&Some(9)), "{seen:?}");
+            assert!(
+                seen.contains(&Some(7)) && seen.contains(&Some(8)),
+                "{seen:?}"
+            );
+            st.handle_key(shift(KeyCode::Up));
+            assert_eq!(st.view.queued, Some(8));
+            // The orchestrator's: delete only (not the next one: no send now).
+            assert_eq!(st.selection_target(), Some(ActionTarget::Queued(8)));
+            let rows = st.action_rows(&ActionTarget::Queued(8));
+            assert_eq!(
+                rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+                vec![ActionKind::Delete]
+            );
+            st.handle_key(shift(KeyCode::Up));
+            assert_eq!(st.view.queued, Some(7));
+            let rows = st.action_rows(&ActionTarget::Queued(7));
+            assert_eq!(
+                rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+                vec![ActionKind::Edit, ActionKind::Delete, ActionKind::SendNow]
+            );
+            // The popup opens on edit, never on what Enter would not undo.
+            draw(&mut st, 120, 30);
+            assert!(st.handle_key(key(KeyCode::Enter)).is_empty());
+            assert_eq!(st.view.action.as_ref().unwrap().sel, Some(ActionKind::Edit));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(screen.contains("QUEUED · yours"), "{screen}");
+            st.handle_key(key(KeyCode::Esc));
+            assert!(st.view.action.is_none());
+            let out = run_row(&mut st, ActionKind::SendNow);
+            assert_eq!(
+                out,
+                vec![Action::SendNow {
+                    thread: "t-orch".into(),
+                    msg_ref: 7
+                }]
+            );
+            st.apply_result(
+                "message.send_now",
+                &json!({"sent_now": true, "state": "interrupting", "thread": "t-orch",
+                        "thread_name": "orchestrator", "ref": 7, "turn": 3}),
+            );
+            assert!(
+                st.view
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.contains("runs next")),
+                "{:?}",
+                st.view.status
+            );
+            // Delete: its text goes to the history.
+            st.select_queued(9);
+            draw(&mut st, 120, 30);
+            let out = run_row(&mut st, ActionKind::Delete);
+            assert_eq!(
+                out,
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 9
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 9,
+                        "prompt": "then deploy, all of it"}),
+            );
+            assert_eq!(
+                st.view.history.last().map(String::as_str),
+                Some("then deploy, all of it")
+            );
+            assert!(st.view.input.is_empty());
+            // Esc releases a selected row.
+            st.select_queued(7);
+            st.handle_key(key(KeyCode::Esc));
+            assert_eq!(st.view.queued, None);
+        }
+
+        /// A message taken back comes back as the line that sends it again, never a command:
+        /// one that starts with `!` or `/`, edited from the queue, deleted to the history, or
+        /// taken back with Esc Esc after it was typed with its escape.
+        #[test]
+        fn a_message_taken_back_is_never_a_command_again() {
+            let mut st = with_queue(
+                json!([{"ref": 7, "prompt": "!rm -rf build", "from": "user", "mine": true}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Up));
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 7,
+                        "prompt": "!rm -rf build"}),
+            );
+            assert_eq!(st.view.input.as_str(), "\\!rm -rf build");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!rm -rf build"),
+                "{sent:?}"
+            );
+            // Deleted: the history has the line that sends it.
+            let mut st = with_queue(
+                json!([{"ref": 8, "prompt": "/delete api", "from": "user", "mine": true}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.select_queued(8);
+            draw(&mut st, 120, 30);
+            run_row(&mut st, ActionKind::Delete);
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 8, "prompt": "/delete api"}),
+            );
+            assert_eq!(
+                st.view.history.last().map(String::as_str),
+                Some("//delete api")
+            );
+            // Typed with its escape, taken back with Esc Esc: as typed.
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            let sent = send_line(
+                &mut st,
+                "\\!important",
+                json!({"action": "delegate", "thread": "t-orch", "ref": 9, "turn": null,
+                       "pending": 1}),
+            );
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!important"),
+                "{sent:?}"
+            );
+            st.handle_key(key(KeyCode::Esc));
+            st.handle_key(key(KeyCode::Esc));
+            taken_back(&mut st, 9);
+            assert_eq!(st.view.input.as_str(), "\\!important");
+            // The escapes: what a line sends and the line that sends a message.
+            for (message, line) in [
+                ("plain", "plain"),
+                ("!x", "\\!x"),
+                ("\\!x", "\\\\!x"),
+                ("/x", "//x"),
+                ("//x", "///x"),
+                ("  !x", "\\!x"),
+                ("\u{1}!x", "\\!x"),
+                ("\u{1b} /x", "//x"),
+                ("\u{7f}\\!x", "\\\\!x"),
+            ] {
+                assert_eq!(literal_line(message), line, "{message:?}");
+                let clean = crate::edit::clean_text(message);
+                assert_eq!(message_text(line), clean.trim_start(), "{line}");
+            }
+        }
+
+        /// Deleting a message the user didn't send (a `!!` command's output, the
+        /// orchestrator's) leaves nothing to send again as theirs; another selection replaces
+        /// a selected queued row.
+        #[test]
+        fn others_messages_go_for_good_and_a_new_selection_releases_the_row() {
+            let mut st = with_queue(
+                json!([{"ref": 4, "prompt": "[twr: the user ran a shell command ...] allow both",
+                        "from": "runtime", "mine": false}]),
+                1,
+            );
+            draw(&mut st, 120, 30);
+            st.select_queued(4);
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                st.action_rows(&ActionTarget::Queued(4))
+                    .iter()
+                    .map(|r| r.kind)
+                    .collect::<Vec<_>>(),
+                vec![ActionKind::Delete, ActionKind::SendNow]
+            );
+            run_row(&mut st, ActionKind::Delete);
+            let before = st.view.history.clone();
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 4,
+                        "prompt": "[twr: the user ran a shell command ...] allow both"}),
+            );
+            assert_eq!(st.view.history, before);
+            assert!(st.view.input.is_empty());
+            assert_eq!(st.view.status.as_deref(), Some("deleted from the queue"));
+            // Selecting a card after a queued row: Enter is about the card.
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            st.select_queued(7);
+            st.handle_key(key(KeyCode::Tab));
+            assert_eq!(st.view.queued, None);
+            assert!(matches!(st.selection_target(), Some(ActionTarget::Card(_))));
+        }
+
+        /// ↑ takes back the user's newest queued message even when the list shows only the
+        /// start of the queue.
+        #[test]
+        fn up_takes_back_the_newest_beyond_the_list() {
+            let mut st = with_orch();
+            st.queue_due(Instant::now());
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 30, "newest_mine": 99, "items": [
+                    {"ref": 7, "prompt": "first", "from": "orchestrator", "mine": false}]}),
+            );
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                st.handle_key(key(KeyCode::Up)),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 99
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 99, "prompt": "the newest"}),
+            );
+            assert_eq!(st.view.input.as_str(), "the newest");
+        }
+
+        /// ↑ right after a send, before the hub answered or the queue was read again, takes
+        /// nothing back: the newest of the user's may be the one just sent.
+        #[test]
+        fn up_waits_for_the_queue_after_a_send() {
+            let mut st = with_queue(three(), 3);
+            draw(&mut st, 120, 30);
+            assert!(matches!(
+                &type_line(&mut st, "and lint")[..],
+                [Action::Say { .. }]
+            ));
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("reading the queue"));
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 10, "turn": null,
+                        "pending": 4}),
+            );
+            assert!(st.handle_key(key(KeyCode::Up)).is_empty(), "not read since");
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            let mut items = three();
+            items.as_array_mut().unwrap().push(json!(
+                {"ref": 10, "prompt": "and lint", "from": "user", "mine": true}));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 4, "held": false, "items": items}),
+            );
+            assert_eq!(
+                st.handle_key(key(KeyCode::Up)),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 10
+                }]
+            );
+        }
+
+        /// In the compact conversation, Enter on a selected queued row opens its popup, not
+        /// the oldest item waiting.
+        #[test]
+        fn compact_enter_opens_a_selected_queued_row() {
+            let mut st = with_queue(three(), 3);
+            st.view.compact_width = 200;
+            draw(&mut st, 120, 30);
+            assert!(st.compact());
+            st.select_queued(7);
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(7))
+            );
+            // Another tab lists no queue: its selection goes, Enter is the list's.
+            st.view.action = None;
+            st.select_queued(7);
+            st.show_pane(CompactPane::Threads);
+            assert_eq!(st.view.queued, None);
+            assert!(st.shown_queue().is_none());
+            draw(&mut st, 120, 30);
+            st.handle_key(key(KeyCode::Enter));
+            assert_ne!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(7))
+            );
+        }
+
+        /// A tap selects a queued row, a tap on the selected one opens its popup.
+        #[test]
+        fn a_tap_selects_a_queued_message_and_another_opens_its_popup() {
+            let mut st = with_queue(three(), 3);
+            let screen = crate::ui::draw_offscreen(&mut st, 120, 30, Instant::now());
+            let (r, _) = st
+                .view
+                .panes
+                .targets
+                .iter()
+                .find(|(_, t)| *t == Target::Queued(8))
+                .cloned()
+                .expect("a queued row drawn");
+            let (x, y) = (r.x + 2, r.y);
+            let left = MouseButton::Left;
+            let tap = |st: &mut AppState, screen: &Buffer| {
+                st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), screen);
+                let screen = crate::ui::draw_offscreen(st, 120, 30, Instant::now());
+                st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
+                crate::ui::draw_offscreen(st, 120, 30, Instant::now())
+            };
+            let screen = tap(&mut st, &screen);
+            assert_eq!(st.view.queued, Some(8));
+            assert!(st.view.action.is_none());
+            tap(&mut st, &screen);
+            assert_eq!(
+                st.action_popup().map(|p| p.target.clone()),
+                Some(ActionTarget::Queued(8))
+            );
+        }
+    }
+
+    /// `!` commands ([`crate::shell`]).
+    mod shell_cmds {
+        use super::*;
+        use serde_json::json;
+        use twr_core::event::TaskUpdated;
+
+        /// A `!` command's job events on `o`'s thread: its start, and its end when `end`.
+        /// A job's update, as the hub records it.
+        fn job_event(o: &mut ThreadScript, job: Value, running: bool) -> Event {
+            let mut ev = o.event(EventBody::TaskUpdated(TaskUpdated {
+                task_id: format!("job:{}", job["id"].as_str().unwrap()),
+                running,
+                description: String::new(),
+                ext: json!({ "twr": { "job": job } }).as_object().cloned(),
+                ..Default::default()
+            }));
+            ev.source = twr_core::event::Source::Hub;
+            ev
+        }
+
+        fn start(id: &str, command: &str, share: bool) -> Value {
+            json!({"id": id, "name": command, "argv": ["/bin/sh", "-c", command],
+                   "wake": share, "by": "user:tui",
+                   "shell": {"command": command, "cwd": "/work/api", "share": share}})
+        }
+
+        fn end(id: &str, command: &str, exit: i64, printed: &str) -> Value {
+            json!({"id": id, "name": command, "outcome": "exited", "exit": exit,
+                   "duration_ms": 1234, "printed": printed,
+                   "shell": {"command": command, "cwd": "/work/api", "share": false}})
+        }
+
+        /// Enter on a `!` line runs it (`!!` shares it), in the dived thread or the
+        /// orchestrator's folder; `\!` sends a message that starts with `!`; a bare `!` or a
+        /// dive's `!cd` says what to do; the orchestrator view's `!cd` moves its folder.
+        #[test]
+        fn a_bang_line_runs_a_command() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(
+                type_line(&mut st, "!ls -la"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "ls -la".into(),
+                    cwd: None,
+                    share: false,
+                    launch: 1
+                }]
+            );
+            assert!(st.view.input.is_empty());
+            assert_eq!(st.view.history.last().map(String::as_str), Some("!ls -la"));
+            assert_eq!(
+                type_line(&mut st, "!! cargo test"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "cargo test".into(),
+                    cwd: None,
+                    share: true,
+                    launch: 2
+                }]
+            );
+            let sent = type_line(&mut st, "\\!important: read this");
+            assert!(
+                matches!(&sent[..], [Action::Say { text, .. }] if text == "!important: read this"),
+                "{sent:?}"
+            );
+            assert!(type_line(&mut st, "!").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("type a command"));
+            assert_eq!(st.view.input.as_str(), "!", "the line stays to fix");
+            st.view.input.clear();
+            assert_eq!(
+                type_line(&mut st, "!cd src"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: Some("src".into())
+                }]
+            );
+            st.apply_result("shell.cd", &json!({"cwd": "/work/src"}));
+            assert_eq!(st.shell_cwd.as_deref(), Some("/work/src"));
+            assert!(st.view.status.as_deref().unwrap().contains("/work/src"));
+            assert_eq!(
+                type_line(&mut st, "!pwd"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "pwd".into(),
+                    cwd: Some("/work/src".into()),
+                    share: false,
+                    launch: 3
+                }]
+            );
+            // A command typed while a `!cd` is on its way waits for it: it would run in the
+            // folder before.
+            assert_eq!(
+                type_line(&mut st, "!cd other"),
+                vec![Action::ShellCd {
+                    cwd: Some("/work/src".into()),
+                    dir: Some("other".into())
+                }]
+            );
+            assert!(type_line(&mut st, "!rm file").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("still changing"));
+            assert_eq!(
+                st.view.input.as_str(),
+                "!rm file",
+                "kept to run once it moved"
+            );
+            st.view.input.clear();
+            // It failed: commands run where they did.
+            st.apply_result("shell.cd", &json!({"failed": true}));
+            assert_eq!(
+                type_line(&mut st, "!rm file"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm file".into(),
+                    cwd: Some("/work/src".into()),
+                    share: false,
+                    launch: 4
+                }]
+            );
+            // `!cd` alone: back to the orchestrator's folder.
+            assert_eq!(
+                type_line(&mut st, "!cd"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: None
+                }]
+            );
+            // In a dive: its thread, its worktree.
+            st.dive("t-alpha");
+            assert_eq!(
+                type_line(&mut st, "!git status"),
+                vec![Action::ShellRun {
+                    thread: Some("t-alpha".into()),
+                    command: "git status".into(),
+                    cwd: None,
+                    share: false,
+                    launch: 5
+                }]
+            );
+            assert!(type_line(&mut st, "!cd src").is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("runs in its worktree"));
+        }
+
+        /// The TUI's ask for the folder's name and a user's `!cd` answer in the order sent:
+        /// the name, coming in while the `!cd` is still on its way, neither sets the folder nor
+        /// lets a command run before the `!cd` answered.
+        #[test]
+        fn a_late_folder_lookup_doesnt_undo_a_cd_on_its_way() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            typed(&mut st, "!");
+            assert!(st.shell_cwd_due(), "the folder's name is asked");
+            st.view.input.clear();
+            assert_eq!(
+                type_line(&mut st, "!cd /work/x"),
+                vec![Action::ShellCd {
+                    cwd: None,
+                    dir: Some("/work/x".into())
+                }]
+            );
+            st.apply_result("shell.cd", &json!({"cwd": "/home/me"}));
+            assert_eq!(st.shell_cwd, None);
+            assert!(type_line(&mut st, "!rm file").is_empty(), "still waiting");
+            st.view.input.clear();
+            st.apply_result("shell.cd", &json!({"cwd": "/work/x"}));
+            assert_eq!(st.shell_cwd.as_deref(), Some("/work/x"));
+            assert_eq!(
+                type_line(&mut st, "!rm file"),
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm file".into(),
+                    cwd: Some("/work/x".into()),
+                    share: false,
+                    launch: 1
+                }]
+            );
+        }
+
+        /// Ctrl-C right after Enter, before the hub answered: the command stops as soon as its
+        /// job is known, and the next Ctrl-C quits.
+        #[test]
+        fn ctrl_c_before_the_answer_stops_the_command_once_it_starts() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::ShellStopLaunch { launch: 1 }]
+            );
+            assert!(st.view.status.as_deref().unwrap().contains("as it starts"));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J9", "thread": "t-orch", "name": "sleep 99", "cwd": "/w"}),
+            );
+            assert!(st.shell_jobs.iter().any(|s| s.job == "J9" && s.stopping));
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+        }
+
+        /// A switch to another workspace and back keeps where `!` commands run, the commands
+        /// Ctrl-C stops, and an answer that came meanwhile.
+        #[test]
+        fn a_workspace_switch_keeps_the_commands_state() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            type_line(&mut st, "!cd /w/x");
+            st.apply_result("shell.cd", &json!({"cwd": "/w/x"}));
+            type_line(&mut st, "!sleep 99");
+            let kept = st.take_view();
+            let mut back = with_orch();
+            back.restore_view(kept);
+            back.apply_result(
+                "shell.run",
+                &json!({"job": "J5", "thread": "t-orch", "name": "sleep 99", "cwd": "/w/x"}),
+            );
+            back.finish_restore();
+            assert_eq!(back.shell_cwd.as_deref(), Some("/w/x"));
+            assert_eq!(
+                back.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J5".into() }]
+            );
+        }
+
+        /// A paste is never a key: a pasted `!` line runs only with a real Enter.
+        #[test]
+        fn a_pasted_bang_line_waits_for_enter() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            st.handle_paste("!rm -rf build\n");
+            assert_eq!(st.view.input.as_str(), "!rm -rf build\n");
+            let out = st.handle_key(key(KeyCode::Enter));
+            assert_eq!(
+                out,
+                vec![Action::ShellRun {
+                    thread: None,
+                    command: "rm -rf build".into(),
+                    cwd: None,
+                    share: false,
+                    launch: 1
+                }]
+            );
+        }
+
+        /// The input box says when its line is a shell command, where it runs, and whether
+        /// its output goes on.
+        #[test]
+        fn the_input_box_shows_shell_mode() {
+            let mut st = with_orch();
+            typed(&mut st, "!ls");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(
+                screen.contains(
+                    " ! shell  in the orchestrator's folder · Enter runs it · shown only"
+                ),
+                "{screen}"
+            );
+            st.view.input.clear();
+            typed(&mut st, "!!ls");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(
+                screen.contains(
+                    " !! shell  in the orchestrator's folder · Enter runs it, then sends its \
+                     output to the orchestrator"
+                ),
+                "{screen}"
+            );
+            // An `@` in a command is the shell's: no thread popup.
+            st.view.input.clear();
+            typed(&mut st, "!echo @al");
+            assert!(st.popup().is_none());
+        }
+
+        /// A command shows in the conversation: running, with `■ stop`; then how it ended and
+        /// the end of its output, all of it with Ctrl-O.
+        #[test]
+        fn a_command_shows_its_end_and_output() {
+            let mut st = with_orch();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J1", "cargo test", false),
+                true,
+            )));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(screen.contains("! cargo test"), "{screen}");
+            // Not started here (another TUI's, or from before this one): `■ stop` only.
+            assert!(
+                screen.contains("⏵ running · in /work/api · shown only · ■ stop"),
+                "{screen}"
+            );
+            // Started here: Ctrl-C stops it too.
+            st.shell_launching.push_back(crate::shell::Launch {
+                id: 1,
+                thread: Some("t-orch".into()),
+                command: "cargo test".into(),
+                cancel: false,
+            });
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J1", "thread": "t-orch", "name": "cargo test", "cwd": "/work/api"}),
+            );
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(
+                screen.contains("⏵ running · Ctrl-C stops it · in /work/api · shown only · ■ stop"),
+                "{screen}"
+            );
+            let printed: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                end("J1", "cargo test", 0, printed.trim_end()),
+                false,
+            )));
+            let screen = screen_text(&draw(&mut st, 120, 30));
+            assert!(
+                screen.contains("✓ exit 0 · 1.2s · in /work/api · shown only"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("… 4 earlier lines (ctrl+o to expand)"),
+                "{screen}"
+            );
+            assert!(
+                screen.contains("line 10") && !screen.contains("line 4\n"),
+                "{screen}"
+            );
+            st.handle_key(ctrl('o'));
+            let screen = screen_text(&draw(&mut st, 120, 40));
+            assert!(
+                screen.contains("line 1 ") || screen.contains("line 1\n"),
+                "{screen}"
+            );
+            assert!(!screen.contains("earlier line"), "{screen}");
+        }
+
+        /// Ctrl-C stops the newest command this TUI started on the main pane's thread, and
+        /// quits only once none runs; a click on `■ stop` stops one too.
+        #[test]
+        fn ctrl_c_stops_a_command_before_it_quits() {
+            let mut st = with_orch();
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            // A command that ended before `shell.run` answered: nothing to stop.
+            let quick = job_event(&mut o, end("J1", "true", 0, ""), false);
+            st.apply_control(&quick);
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J1", "thread": "t-orch", "name": "true", "cwd": "/work"}),
+            );
+            assert!(st.shell_jobs.is_empty());
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J2", "sleep 30", false),
+                true,
+            )));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J2", "thread": "t-orch", "name": "sleep 30", "cwd": "/work"}),
+            );
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J2".into() }]
+            );
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Ctrl-C again quits"));
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+            // Its end (on both streams): nothing left to stop.
+            let ended = job_event(&mut o, end("J2", "sleep 30", 0, ""), false);
+            st.apply_control(&ended);
+            st.apply_event(&thread_item(&ended));
+            assert!(st.shell_jobs.is_empty());
+            assert_eq!(st.view.status.as_deref(), Some("stopped `sleep 30`"));
+            // The `■ stop` of a running one.
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J3", "sleep 9", false),
+                true,
+            )));
+            let screen = draw(&mut st, 120, 30);
+            let text = screen_text(&screen);
+            let y = text
+                .lines()
+                .position(|l| l.contains("■ stop"))
+                .expect("a stop row") as u16;
+            // (In the conversation, right of the sidebar.)
+            let x = st.dock_width() + 10;
+            let left = MouseButton::Left;
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
+            let screen = draw(&mut st, 120, 30);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
+            assert_eq!(out, vec![Action::JobCancel { job: "J3".into() }]);
+            // Pressed on it, released once a redraw put another command's `■ stop` there
+            // (output streaming in moved the rows): nothing stops.
+            st.shell_jobs.clear();
+            let screen = draw(&mut st, 120, 30);
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
+            let screen = draw(&mut st, 120, 30);
+            let pane = st
+                .view
+                .panes
+                .panes
+                .iter_mut()
+                .find(|p| p.id == PaneId::Transcript)
+                .unwrap();
+            let row = usize::from(y - pane.area.y);
+            pane.links[row] = Some(format!("{}J9", crate::ui::SHELL_STOP));
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
+            assert!(
+                !out.iter().any(|a| matches!(a, Action::JobCancel { .. })),
+                "{out:?}"
+            );
+        }
+
+        /// A running command's output is read every so often, and once more after it ended;
+        /// what the read returns is shown as plain text.
+        #[test]
+        fn a_running_commands_output_is_read() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            // Live: the replay is over.
+            st.transcript.as_mut().unwrap().catch_up = None;
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J4", "make", false),
+                true,
+            )));
+            assert_eq!(st.shell_reads_due(now), vec!["J4".to_string()]);
+            assert!(st.shell_reads_due(now).is_empty(), "one read at a time");
+            st.apply_result(
+                "job.log",
+                &json!({"job": "J4", "text": "\u{1b}[32mbuilding\u{1b}[0m\n50%\r100%"}),
+            );
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "building\n100%");
+            assert!(st.shell_reads_due(now).is_empty(), "read just now");
+            assert!(st.shell_deadline(now).is_some());
+            // A read asked while it ran, answered after its end: what the end recorded stays,
+            // and another read follows.
+            let later = Instant::now() + crate::shell::SHELL_POLL + Duration::from_millis(50);
+            assert_eq!(st.shell_reads_due(later), vec!["J4".to_string()]);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                end("J4", "make", 2, "x"),
+                false,
+            )));
+            st.apply_result("job.log", &json!({"job": "J4", "text": "stale"}));
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "x");
+            // It ended: one more read, then none.
+            assert_eq!(st.shell_reads_due(later), vec!["J4".to_string()]);
+            st.apply_result("job.log", &json!({"job": "J4", "text": "all of it"}));
+            assert!(st
+                .shell_reads_due(later + Duration::from_secs(5))
+                .is_empty());
+            assert_eq!(st.shell_deadline(later), None);
+        }
+
+        /// A stop the hub refused is no longer pending: the status says why, and Ctrl-C stops
+        /// the command again.
+        #[test]
+        fn a_failed_stop_can_be_tried_again() {
+            let mut st = with_orch();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J7", "sleep 30", false),
+                true,
+            )));
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J7", "thread": "t-orch", "name": "sleep 30", "cwd": "/work"}),
+            );
+            let stop = vec![Action::JobCancel { job: "J7".into() }];
+            assert_eq!(st.handle_key(ctrl('c')), stop);
+            st.apply_result(
+                "job.cancel",
+                &json!({"failed": true, "job": "J7", "error": "connection lost"}),
+            );
+            let status = st.view.status.clone().unwrap();
+            assert!(
+                status.contains("could not stop `sleep 30` (connection lost)"),
+                "{status}"
+            );
+            assert_eq!(st.handle_key(ctrl('c')), stop);
+        }
+
+        /// Ctrl-C twice before the hub answered the command: the second says its stop is not
+        /// sent yet, the third quits.
+        #[test]
+        fn quitting_waits_one_more_ctrl_c_for_an_unsent_stop() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::ShellStopLaunch { launch: 1 }]
+            );
+            assert!(st.handle_key(ctrl('c')).is_empty());
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("still on its way"));
+            assert_eq!(st.handle_key(ctrl('c')), vec![Action::Quit]);
+        }
+
+        /// Only the hub's record of a `!` command's end ends it here: a runtime's
+        /// `task.updated` naming its job leaves Ctrl-C stopping it.
+        #[test]
+        fn only_the_hubs_record_ends_a_command() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            assert_eq!(type_line(&mut st, "!sleep 99").len(), 1);
+            st.apply_result(
+                "shell.run",
+                &json!({"job": "J8", "thread": "t-orch", "name": "sleep 99", "cwd": "/w"}),
+            );
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            let mut forged = job_event(&mut o, end("J8", "sleep 99", 0, ""), false);
+            forged.source = twr_core::event::Source::Adapter("claude-code".into());
+            st.apply_control(&forged);
+            assert_eq!(
+                st.handle_key(ctrl('c')),
+                vec![Action::JobCancel { job: "J8".into() }]
+            );
+        }
+
+        /// A long running command in the orchestrator conversation (its block cut to its
+        /// head) keeps its `■ stop`: a click on it stops the command.
+        #[test]
+        fn a_long_commands_stop_survives_the_block_cut() {
+            let mut st = with_orch();
+            st.transcript.as_mut().unwrap().catch_up = None;
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            st.apply_event(&thread_item(&job_event(
+                &mut o,
+                start("J5", "make", false),
+                true,
+            )));
+            let long: String = (0..6)
+                .map(|i| format!("{i}{}\n", "x".repeat(300)))
+                .collect();
+            st.shell_reads_due(Instant::now());
+            st.apply_result("job.log", &json!({"job": "J5", "text": long}));
+            let screen = draw(&mut st, 120, 40);
+            let text = screen_text(&screen);
+            assert!(text.contains("more lines"), "the block is cut:\n{text}");
+            let y = text
+                .lines()
+                .position(|l| l.contains("■ stop"))
+                .expect("a stop row") as u16;
+            // (In the conversation, right of the sidebar.)
+            let x = st.dock_width() + 10;
+            let left = MouseButton::Left;
+            st.handle_mouse(mouse(MouseEventKind::Down(left), x, y), &screen);
+            let screen = draw(&mut st, 120, 40);
+            let out = st.handle_mouse(mouse(MouseEventKind::Up(left), x, y), &screen);
+            assert_eq!(out, vec![Action::JobCancel { job: "J5".into() }]);
+        }
+
+        /// A command's end in the replay shows what the end recorded: its log is not read.
+        #[test]
+        fn a_replayed_commands_log_is_not_read() {
+            let now = Instant::now();
+            let mut st = with_orch();
+            assert!(st.transcript.as_ref().unwrap().catching_up());
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            let started = job_event(&mut o, start("J6", "make", false), true);
+            let ended = job_event(&mut o, end("J6", "make", 0, "done"), false);
+            st.apply_event(&thread_item(&started));
+            st.apply_event(&thread_item(&ended));
+            assert!(st.shell_reads_due(now).is_empty());
+            let Some(Entry::Shell { output, .. }) = st.transcript.as_ref().unwrap().entries.last()
+            else {
+                panic!()
+            };
+            assert_eq!(output, "done");
+        }
+    }
+
+    /// The Shift-Enter offer at startup ([`crate::firstrun`]).
+    mod terminal_offer {
+        use super::*;
+        use crate::firstrun::{Once, TerminalOffer};
+        use crate::terminal_setup::{Place, Terminal};
+
+        fn edit() -> TerminalOffer {
+            TerminalOffer::Edit {
+                key: "local:alacritty".into(),
+                place: Place::default(),
+                terminal: Terminal::Alacritty,
+                file: "/home/me/.config/alacritty/alacritty.toml".into(),
+            }
+        }
+
+        /// The offer on screen for [`CARD_SETTLE`] already.
+        fn offered() -> AppState {
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            let prompt = st.view.confirm.as_ref().unwrap().prompt.clone();
+            st.view.confirm_seen = Some((prompt, Instant::now() - CARD_SETTLE));
+            st
+        }
+
+        /// `y` sets the terminal up and `n` declines, once the offer has been read and nothing
+        /// is typed; the answer is remembered for the place, and the offer counted as made.
+        #[test]
+        fn y_and_n_answer_the_offer_once_read() {
+            for (k, yes) in [('y', true), ('Y', true), ('n', false)] {
+                let mut st = offered();
+                let shift = if k.is_ascii_uppercase() {
+                    KeyModifiers::SHIFT
+                } else {
+                    KeyModifiers::NONE
+                };
+                let out = st.handle_key(KeyEvent::new(KeyCode::Char(k), shift));
+                assert_eq!(out, vec![Action::TerminalSetup { yes }], "{k}");
+                assert!(st.view.confirm.is_none());
+                assert!(st.view.input.is_empty(), "the key typed nothing");
+                let offer = st.answer_terminal_offer(yes);
+                assert_eq!(offer.is_some(), yes);
+                assert_eq!(
+                    st.seen.terminal["local:alacritty"],
+                    if yes { "yes" } else { "no" }
+                );
+                assert!(st.seen_dirty);
+                assert_eq!(st.answer_terminal_offer(yes), None, "answered once");
+            }
+        }
+
+        /// An offer the user didn't ask for never takes a key meant for typing: a `y` before
+        /// it was read, a `y` with text typed, or any other key goes where it would, and the
+        /// offer goes for this run (unanswered: it comes back next start).
+        #[test]
+        fn other_keys_go_where_they_would() {
+            // Read in time, but the key was read before: typed, however late it is handled.
+            let mut st = offered();
+            let since = st.view.confirm_seen.as_ref().unwrap().1;
+            st.input_at = Some(since + CARD_SETTLE / 2);
+            assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "y");
+            assert!(st.view.confirm.is_none());
+            // Just shown: the `y` is typed.
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            assert!(st.handle_key(key(KeyCode::Char('y'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "y");
+            assert!(st.view.confirm.is_none() && st.terminal_offer.is_none());
+            assert!(st.seen.terminal.is_empty(), "not answered");
+            // Read, but another key: typed.
+            let mut st = offered();
+            assert!(st.handle_key(key(KeyCode::Char('h'))).is_empty());
+            assert_eq!(st.view.input.as_str(), "h");
+            assert!(st.view.confirm.is_none());
+            // Ctrl-Y is no answer.
+            let mut st = offered();
+            let out = st.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL));
+            assert!(
+                !out.contains(&Action::TerminalSetup { yes: true }),
+                "{out:?}"
+            );
+            assert!(st.view.confirm.is_none());
+            // A paste goes in, the offer goes.
+            let mut st = offered();
+            st.handle_paste("yes please");
+            assert_eq!(st.view.input.as_str(), "yes please");
+            assert!(st.view.confirm.is_none());
+            // Taps: `no` declines once read, not before.
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            assert!(st.tap_offer_no().is_empty());
+            assert!(st.view.confirm.is_some());
+            let mut st = offered();
+            assert_eq!(
+                st.tap_offer_no(),
+                vec![Action::TerminalSetup { yes: false }]
+            );
+        }
+
+        /// A notice instead of the question (twr can't edit here): told once a frame showed
+        /// it, then never again for that place.
+        #[test]
+        fn a_notice_is_told_once_shown() {
+            let mut st = with_orch();
+            st.offer_terminal(TerminalOffer::Notice {
+                key: "mosh".into(),
+                text: crate::keys::MOSH_NOTICE.into(),
+            });
+            assert!(st.view.confirm.is_none());
+            assert_eq!(st.view.status.as_deref(), Some(crate::keys::MOSH_NOTICE));
+            assert!(st.seen.terminal.is_empty());
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert_eq!(st.seen.terminal["mosh"], "shown");
+            assert!(st.once.is_none());
+            // Replaced before it was drawn: not told.
+            let mut st = with_orch();
+            st.show_once(Once::Terminal("ssh".into()), "over ssh".into());
+            st.view.status = Some("other".into());
+            st.note_drawn(Instant::now());
+            assert!(st.seen.terminal.is_empty());
+        }
+
+        /// The question is drawn with its `yes` and `no`, the file it would change named.
+        #[test]
+        fn the_offer_is_drawn_as_a_question() {
+            let mut st = with_orch();
+            st.offer_terminal(edit());
+            let screen = screen_text(&draw(&mut st, 200, 40));
+            assert!(
+                screen.contains("Shift-Enter sends Enter in Alacritty"),
+                "{screen}"
+            );
+            assert!(screen.contains("don't ask again"), "{screen}");
+            assert!(screen.contains("yes") && screen.contains("no"), "{screen}");
+            st.note_drawn(Instant::now());
+            assert!(st.view.confirm_seen.is_some(), "its yes was drawn");
+        }
+    }
+
+    /// Routine updates folded, and their summaries ([`crate::summary`]).
+    mod routine {
+        use super::*;
+        use crate::summary::{Answer, Routine};
+        use serde_json::json;
+        use twr_core::proto::{SummaryStats, SummaryThreadResult};
+
+        /// [`with_orch`], the orchestrator's script for its conversation, and the notice that
+        /// summaries are on told in an earlier run.
+        fn conversation(on: bool) -> (AppState, ThreadScript) {
+            let mut st = with_orch();
+            st.seen.summary_notice = true;
+            st.summary.on = on;
+            st.summary.every = Duration::from_secs(300);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            (st, o)
+        }
+
+        /// A hub update about `about` in the orchestrator's conversation, with `twr` as its
+        /// `ext.twr` (none for `null`); returns its seq.
+        fn say(
+            st: &mut AppState,
+            o: &mut ThreadScript,
+            about: &str,
+            text: &str,
+            twr: Value,
+        ) -> u64 {
+            let ev = o.event(EventBody::ConversationUpdate(
+                twr_core::event::ConversationUpdate {
+                    text: text.into(),
+                    about_thread: Some(about.into()),
+                    ext: (!twr.is_null())
+                        .then(|| json!({ "twr": twr }).as_object().cloned())
+                        .flatten(),
+                    ..Default::default()
+                },
+            ));
+            st.apply_event(&thread_item(&ev));
+            ev.seq
+        }
+
+        fn interim(st: &mut AppState, o: &mut ThreadScript, name: &str, said: &str) -> u64 {
+            say(
+                st,
+                o,
+                &format!("t-{name}"),
+                &format!(
+                    "{name} yielded with 2 background tasks still running (interim report: the \
+                     result comes later) (success): {said}"
+                ),
+                json!({"routine": "interim"}),
+            )
+        }
+
+        /// The conversation pane's rows as the last frame drew them, `w` x `h`.
+        fn rows(st: &mut AppState, w: u16, h: u16) -> Vec<String> {
+            let buf = draw(st, w, h);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            (pane.area.y..pane.area.bottom())
+                .map(|y| {
+                    (pane.area.x..pane.area.right())
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .filter(|r| !r.is_empty())
+                .collect()
+        }
+
+        fn result(thread: &str, summary: Option<&str>, reason: Option<&str>) -> Answer {
+            Answer::Got(Box::new(SummaryThreadResult {
+                thread: thread.into(),
+                summary: summary.map(str::to_string),
+                basis: "b".into(),
+                runtime: Some("claude-code".into()),
+                model: Some("claude-haiku-5-5".into()),
+                cached: false,
+                reason: reason.map(str::to_string),
+                next_after_secs: None,
+                stats: SummaryStats {
+                    calls: 1,
+                    failures: 0,
+                    cost_usd: 0.0002,
+                },
+                ..Default::default()
+            }))
+        }
+
+        /// Each routine kind folds: a thread's run is one row at the place of its newest
+        /// update, naming the thread, saying the newest update short and how many there are;
+        /// the other updates of the run draw nothing, and each thread has its own row.
+        #[test]
+        fn each_routine_kind_folds_into_one_row_per_thread() {
+            let (mut st, mut o) = conversation(false);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            st.apply_event(&thread_item(&o.text("Between the updates.")));
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            interim(&mut st, &mut o, "alpha", "migrations run");
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma's background work finished and no turn started after it: twr woke it \
+                 to continue (after its interim report of turn 1).",
+                json!({"routine": "auto_wake"}),
+            );
+            let entries = &st.transcript.as_ref().unwrap().entries;
+            let kinds: Vec<_> = entries
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::HubUpdate { routine, .. } => Some(*routine),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    Some(Routine::Interim),
+                    Some(Routine::BackgroundDone),
+                    Some(Routine::Interim),
+                    Some(Routine::AutoWake)
+                ]
+            );
+            let rows = rows(&mut st, 160, 40);
+            let text = rows.join("\n");
+            assert_eq!(
+                rows.iter().filter(|r| r.starts_with("◦ gamma")).count(),
+                1,
+                "{text}"
+            );
+            assert!(
+                rows.contains(
+                    &"◦ gamma · background work finished; woken to continue · 3 \
+                                updates (ctrl+o to expand)"
+                        .to_string()
+                ),
+                "{text}"
+            );
+            assert!(
+                rows.contains(
+                    &"◦ alpha · yielded with 2 background tasks still running: \
+                                migrations run (ctrl+o to expand)"
+                        .to_string()
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("started the build"), "{text}");
+            // At the place of the newest: below the reply between, below alpha's row.
+            let at = |s: &str| rows.iter().position(|r| r.contains(s)).unwrap();
+            assert!(at("Between the updates.") < at("◦ alpha"), "{text}");
+            assert!(at("◦ alpha") < at("◦ gamma"), "{text}");
+        }
+
+        /// Updates of an older hub, which has no mark, fold by their words.
+        #[test]
+        fn an_older_hubs_routine_updates_fold_by_their_words() {
+            let (mut st, mut o) = conversation(false);
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma yielded with 1 background task(s) (success): watching the tests",
+                Value::Null,
+            );
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                Value::Null,
+            );
+            let rows = rows(&mut st, 160, 40);
+            let text = rows.join("\n");
+            assert!(
+                rows.contains(
+                    &"◦ gamma · background work finished · 2 updates (ctrl+o to expand)"
+                        .to_string()
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("watching the tests"), "{text}");
+        }
+
+        /// Items, errors, hung turns, reports, confirm and delete outcomes and the
+        /// acknowledgment of a message never fold, and each ends the thread's run: the run
+        /// before it keeps its row and its text, and the next one is a row of its own.
+        #[test]
+        fn items_errors_hung_turns_and_reports_never_fold() {
+            let (mut st, mut o) = conversation(true);
+            let first = interim(&mut st, &mut o, "gamma", "started the build");
+            for (text, twr) in [
+                ("gamma failed: the build broke", json!({"attn_id": "e1"})),
+                ("gamma seems hung: turn 2", json!({"attn_id": "h1"})),
+                (
+                    "gamma needs review: check the diff",
+                    json!({"attn_id": "r1"}),
+                ),
+                ("gamma finished (success): all green", Value::Null),
+            ] {
+                say(&mut st, &mut o, "t-gamma", text, twr);
+            }
+            let ev = o.event(EventBody::ConversationUpdate(
+                twr_core::event::ConversationUpdate {
+                    text: "Sent to gamma.".into(),
+                    about_thread: Some("t-gamma".into()),
+                    user_message: Some("gamma: run it again".into()),
+                    ext: json!({"twr": {"routine": "interim"}}).as_object().cloned(),
+                    ..Default::default()
+                },
+            ));
+            st.apply_event(&thread_item(&ev));
+            for (text, id) in [
+                ("Confirmed. Applied: stop gamma. Skipped: nothing.", "c1"),
+                ("Confirmation cancelled; nothing applied.", "c2"),
+            ] {
+                let ev = o.event(EventBody::ConversationUpdate(
+                    twr_core::event::ConversationUpdate {
+                        text: text.into(),
+                        ext: json!({"twr": {"attn_id": id}}).as_object().cloned(),
+                        ..Default::default()
+                    },
+                ));
+                st.apply_event(&thread_item(&ev));
+            }
+            interim(&mut st, &mut o, "gamma", "second try");
+            // The first run's summary, asked while it was live.
+            st.summary
+                .texts_for_test("t-gamma", "t-orch", first, "Building, then tests.");
+            let entries = st.transcript.as_ref().unwrap().entries.clone();
+            let folded: Vec<bool> = entries
+                .iter()
+                .map(|e| crate::summary::kind(e, Some(&st)).is_some())
+                .collect();
+            assert_eq!(
+                folded,
+                [true, false, false, false, false, false, false, false, true]
+            );
+            let rows = rows(&mut st, 160, 40);
+            let text = rows.join("\n");
+            for says in [
+                "gamma failed: the build broke",
+                "gamma seems hung: turn 2",
+                "gamma needs review: check the diff",
+                "gamma finished · success",
+                "all green",
+                "gamma: run it again",
+                "Confirmed. Applied: stop gamma. Skipped: nothing.",
+                "Confirmation cancelled; nothing applied.",
+            ] {
+                assert!(text.contains(says), "{says}: {text}");
+            }
+            // The closed run keeps its summary; the new one is a row of its own.
+            assert_eq!(
+                rows.iter().filter(|r| r.starts_with("◦ gamma")).count(),
+                2,
+                "{text}"
+            );
+            assert!(
+                rows.contains(&"◦ gamma · Building, then tests. (ctrl+o to expand)".to_string()),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "◦ gamma · yielded with 2 background tasks still running: second try"
+                ),
+                "{text}"
+            );
+            // Only the live run's row may be asked about.
+            let live: Vec<_> = st.view.panes.routine.iter().map(|r| r.live).collect();
+            assert_eq!(live, [false, true]);
+        }
+
+        /// A stall folds once the hub closed its item because its thread went on working
+        /// (`ext.twr.went_on`), never while it is open (its update drawn before its raise came
+        /// on the control stream too), and never when it closed otherwise, as the hub closes
+        /// it then: answered by the user; `by: timeout` without the mark in the batch of the
+        /// thread's stop, crash, interrupt or failed turn, at the hub's startup, or by an older
+        /// hub (which never says). Live and on a replay of the control log alike.
+        #[test]
+        fn a_stall_folds_once_it_resolved_by_itself() {
+            use twr_core::event::{Source, TurnInterrupted};
+            let hub = |g: &mut ThreadScript, body: EventBody| {
+                let mut ev = g.event(body);
+                ev.source = Source::Hub;
+                ev
+            };
+            let raise = |g: &mut ThreadScript, id: &str| {
+                hub(
+                    g,
+                    EventBody::AttentionRaised(twr_core::event::AttentionRaised {
+                        attn_id: id.into(),
+                        reason: Stalled,
+                        summary: "No activity for 10 min".into(),
+                        options: vec!["dismiss".into()],
+                        ..Default::default()
+                    }),
+                )
+            };
+            let closed = |g: &mut ThreadScript, id: &str, went_on: bool| {
+                hub(
+                    g,
+                    EventBody::AttentionResolved(AttentionResolved {
+                        attn_id: id.into(),
+                        by: ResolvedBy::Timeout,
+                        ext: went_on
+                            .then(|| json!({"twr": {"went_on": true}}).as_object().cloned())
+                            .flatten(),
+                        ..Default::default()
+                    }),
+                )
+            };
+            let (mut st, mut o) = conversation(false);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(300);
+            // The conversation's update comes before the raise: not in the stack yet, open.
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma is stalled: No activity for 10 min",
+                json!({"attn_id": "s1"}),
+            );
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains("gamma is stalled: No activity for 10 min"),
+                "{text}"
+            );
+            assert!(!text.contains("◦ gamma"), "not raised yet: {text}");
+            let mut log = vec![g.turn_started("go"), raise(&mut g, "s1")];
+            control(&mut st, &log);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(!text.contains("◦ gamma"), "open: {text}");
+            // Its runtime said something: the item closes in that batch, the hub saying so.
+            let went = closed(&mut g, "s1", true);
+            control(&mut st, std::slice::from_ref(&went));
+            log.push(went);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains(
+                    "◦ gamma · was stalled (No activity for 10 min), went on (ctrl+o to expand)"
+                ),
+                "{text}"
+            );
+            // Every other way the hub closes one, as it records it.
+            let interrupted = hub(
+                &mut g,
+                EventBody::TurnInterrupted(TurnInterrupted {
+                    msg_ref: 4,
+                    turn: 1,
+                    ..Default::default()
+                }),
+            );
+            let mut failed = g.turn_ended(TurnResult::Error);
+            failed.source = Source::Adapter("claude-code".into());
+            let mut stop_end = g.turn_ended(TurnResult::Interrupted);
+            stop_end.source = Source::Hub;
+            let mut stopped = g.stopped();
+            stopped.source = Source::Hub;
+            let mut crash_end = g.turn_ended(TurnResult::Interrupted);
+            crash_end.source = Source::Hub;
+            let mut crashed = g.crashed(1);
+            crashed.source = Source::Hub;
+            let cases: Vec<(&str, Vec<Event>)> = vec![
+                ("answered", vec![]),
+                ("interrupted", vec![interrupted]),
+                ("failed", vec![failed]),
+                ("stopped", vec![stop_end, stopped]),
+                ("crashed", vec![crash_end, crashed]),
+                // The hub's startup, or an older hub: the resolution alone, unmarked.
+                ("startup", vec![]),
+            ];
+            for (k, (why, batch)) in cases.into_iter().enumerate() {
+                let id = format!("s{}", k + 2);
+                let said = format!("gamma is stalled: No activity for {} min", 20 + k);
+                let up = raise(&mut g, &id);
+                control(&mut st, std::slice::from_ref(&up));
+                log.push(up);
+                say(&mut st, &mut o, "t-gamma", &said, json!({ "attn_id": id }));
+                let mut evs = batch;
+                evs.push(if why == "answered" {
+                    g.resolve(&id)
+                } else {
+                    closed(&mut g, &id, false)
+                });
+                control(&mut st, &evs);
+                log.extend(evs);
+                let text = rows(&mut st, 160, 40).join("\n");
+                assert!(text.contains(&said), "{why}: {text}");
+            }
+            let entries = st.transcript.as_ref().unwrap().entries.clone();
+            let folded = |st: &AppState| -> Vec<bool> {
+                entries
+                    .iter()
+                    .filter(|e| matches!(e, Entry::HubUpdate { .. }))
+                    .map(|e| crate::summary::kind(e, Some(st)).is_some())
+                    .collect()
+            };
+            let want = [true, false, false, false, false, false, false];
+            assert_eq!(folded(&st), want);
+            // A fresh state replaying the control log reads the same.
+            let mut fresh = with_orch();
+            fresh.begin_catch_up(u64::MAX);
+            control(&mut fresh, &log);
+            assert_eq!(folded(&fresh), want);
+        }
+
+        /// A plain stall that a hung-turn card took the place of (the hub closes it `by:
+        /// timeout` in the card's batch, without `went_on`) did not go on: it never folds, live
+        /// or on replay, whether the hub says so (`ext.twr.superseded_by`) or, an older hub,
+        /// only raises the card on the same thread right after. One that went on before a later
+        /// card still folds.
+        #[test]
+        fn a_stall_a_hung_card_replaced_does_not_fold() {
+            let hub = |g: &mut ThreadScript, body: EventBody| {
+                let mut ev = g.event(body);
+                ev.source = twr_core::event::Source::Hub;
+                ev
+            };
+            let plain = |g: &mut ThreadScript, id: &str| {
+                hub(
+                    g,
+                    EventBody::AttentionRaised(twr_core::event::AttentionRaised {
+                        attn_id: id.into(),
+                        reason: Stalled,
+                        summary: "No activity for 10 min".into(),
+                        options: vec!["dismiss".into()],
+                        ..Default::default()
+                    }),
+                )
+            };
+            let closed = |g: &mut ThreadScript, id: &str, by: Option<&str>| {
+                hub(
+                    g,
+                    EventBody::AttentionResolved(AttentionResolved {
+                        attn_id: id.into(),
+                        by: ResolvedBy::Timeout,
+                        ext: by.and_then(|c| {
+                            json!({"twr": {"superseded_by": c}}).as_object().cloned()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+            };
+            let card = |g: &mut ThreadScript, id: &str| {
+                hub(
+                    g,
+                    EventBody::AttentionRaised(twr_core::event::AttentionRaised {
+                        attn_id: id.into(),
+                        reason: Stalled,
+                        summary: "gamma's turn 1 seems hung".into(),
+                        options: vec!["interrupt".into(), "wait".into()],
+                        ext: json!({"twr": {"hung": {"turn": 1, "waiting": "a message"}}})
+                            .as_object()
+                            .cloned(),
+                        ..Default::default()
+                    }),
+                )
+            };
+            // The current hub (says so), an older one (only the card's raise right after), and
+            // the current hub's word alone, whatever came between.
+            for (marked, gap) in [(true, false), (false, false), (true, true)] {
+                let (mut st, mut o) = conversation(false);
+                let mut g = ThreadScript::new("t-gamma");
+                g.at(300);
+                let mut log = vec![
+                    // s1 went on; much later the turn hangs: h0's card, the stall long closed.
+                    plain(&mut g, "s1"),
+                    {
+                        let mut ev = closed(&mut g, "s1", None);
+                        if let EventBody::AttentionResolved(p) = &mut ev.body {
+                            p.ext = json!({"twr": {"went_on": true}}).as_object().cloned();
+                        }
+                        ev
+                    },
+                    g.turn_started("go"),
+                    card(&mut g, "h0"),
+                    hub(
+                        &mut g,
+                        EventBody::AttentionResolved(AttentionResolved {
+                            attn_id: "h0".into(),
+                            by: ResolvedBy::Timeout,
+                            ..Default::default()
+                        }),
+                    ),
+                    // s2 is replaced by h1's card in one batch.
+                    plain(&mut g, "s2"),
+                    closed(&mut g, "s2", marked.then_some("h1")),
+                ];
+                if gap {
+                    log.push(g.annotate("s2", "closed"));
+                }
+                log.push(card(&mut g, "h1"));
+                for (text, id) in [
+                    ("gamma is stalled: No activity for 10 min", "s1"),
+                    ("gamma is stalled: No activity for 20 min", "s2"),
+                    ("gamma seems hung: turn 1", "h1"),
+                ] {
+                    say(&mut st, &mut o, "t-gamma", text, json!({ "attn_id": id }));
+                }
+                control(&mut st, &log);
+                let text = rows(&mut st, 160, 40).join("\n");
+                assert!(
+                    text.contains("gamma is stalled: No activity for 20 min"),
+                    "{marked} {gap}: {text}"
+                );
+                assert!(
+                    text.contains("◦ gamma · was stalled (No activity for 10 min), went on"),
+                    "{marked} {gap}: {text}"
+                );
+                let entries = st.transcript.as_ref().unwrap().entries.clone();
+                let folded = |st: &AppState| -> Vec<bool> {
+                    entries
+                        .iter()
+                        .filter(|e| matches!(e, Entry::HubUpdate { .. }))
+                        .map(|e| crate::summary::kind(e, Some(st)).is_some())
+                        .collect()
+                };
+                assert_eq!(folded(&st), [true, false, false], "{marked} {gap}");
+                // A fresh state replaying the control log reads the same.
+                let mut fresh = with_orch();
+                fresh.begin_catch_up(u64::MAX);
+                control(&mut fresh, &log);
+                assert_eq!(
+                    folded(&fresh),
+                    [true, false, false],
+                    "{marked} {gap}: replay"
+                );
+            }
+        }
+
+        /// Ctrl-O shows every update of a run as it is, in its place; so does a click on its
+        /// row, for that run only.
+        #[test]
+        fn ctrl_o_and_a_click_expand_a_run() {
+            let (mut st, mut o) = conversation(false);
+            let first = interim(&mut st, &mut o, "gamma", "started the build");
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            interim(&mut st, &mut o, "alpha", "migrations run");
+            let folded = rows(&mut st, 160, 40).join("\n");
+            assert!(!folded.contains("started the build"), "{folded}");
+            st.handle_key(ctrl('o'));
+            let all = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                all.contains("gamma yielded with 2 background tasks still running"),
+                "{all}"
+            );
+            assert!(all.contains("gamma background work finished."), "{all}");
+            assert!(all.contains("alpha yielded with"), "{all}");
+            assert!(!all.contains("◦ "), "{all}");
+            st.handle_key(ctrl('o'));
+            let buf = draw(&mut st, 160, 40);
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().clone();
+            let key = format!("routine:t-gamma:{first}");
+            let row = pane
+                .links
+                .iter()
+                .position(|l| l.as_deref() == Some(key.as_str()))
+                .unwrap();
+            let (x, y) = (pane.area.x + 4, pane.area.y + row as u16);
+            st.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y), &buf);
+            st.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y), &buf);
+            assert!(st.view.expanded.contains(&key));
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains("gamma yielded with 2 background tasks"),
+                "{text}"
+            );
+            assert!(text.contains("◦ alpha"), "alpha's stays folded: {text}");
+            // A folded row is no step of Shift-↑/↓: those are long blocks and requests.
+            let steps = crate::ui::BlockView::new(&st).steps();
+            assert!(
+                steps.iter().all(|(k, _)| !k.starts_with("routine:")),
+                "{steps:?}"
+            );
+        }
+
+        /// A summary is asked for a live run on screen, once; its text takes the row's place;
+        /// a new update asks again, not sooner than `summary_every` after the last ask, nor
+        /// than the hub's `next_after_secs`; one ask of a thread at a time.
+        #[test]
+        fn summaries_are_asked_on_change_and_paced() {
+            let (mut st, mut o) = conversation(true);
+            st.summary.every = Duration::from_secs(300);
+            // gamma's turn ends: it no longer works.
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            let now = Instant::now();
+            assert!(st.take_summaries_due(now).is_empty(), "nothing drawn yet");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now);
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].thread, "t-gamma");
+            assert_eq!(asks[0].params.thread, "t-gamma");
+            assert_eq!(asks[0].params.every_secs, 300);
+            assert_eq!(asks[0].params.models, Some(st.view.suggest_model.clone()));
+            // On its way: no other, even with a new update.
+            assert!(st.take_summaries_due(now).is_empty());
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            rows(&mut st, 160, 40);
+            let later = now + Duration::from_secs(400);
+            assert!(st.take_summaries_due(later).is_empty(), "one at a time");
+            st.summary_result_now(
+                "t-gamma",
+                result("t-gamma", Some("Built; tests next."), None),
+                now,
+            );
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains("◦ gamma · Built; tests next. (ctrl+o to expand)"),
+                "{text}"
+            );
+            // The new update: not before `summary_every` after the ask.
+            assert!(st
+                .take_summaries_due(now + Duration::from_secs(299))
+                .is_empty());
+            let asks = st.take_summaries_due(now + Duration::from_secs(300));
+            assert_eq!(asks.len(), 1);
+            // Nothing new since: not asked again.
+            let mut r = result("t-gamma", Some("Built and tested."), None);
+            if let Answer::Got(r) = &mut r {
+                r.next_after_secs = Some(900);
+            }
+            st.summary_result_now("t-gamma", r, now + Duration::from_secs(300));
+            assert!(st
+                .take_summaries_due(now + Duration::from_secs(5000))
+                .is_empty());
+            // A new update, but the hub said not before 900 s.
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            rows(&mut st, 160, 40);
+            let asked = now + Duration::from_secs(300);
+            assert!(st
+                .take_summaries_due(asked + Duration::from_secs(899))
+                .is_empty());
+            assert_eq!(
+                st.take_summaries_due(asked + Duration::from_secs(900))
+                    .len(),
+                1
+            );
+            // The hub's counts go to the usage line.
+            assert_eq!(st.summary.stats.calls, 1);
+        }
+
+        /// While the thread works, a summary is asked again when its activity line changed,
+        /// paced the same; not when it didn't, nor once the thread is idle.
+        #[test]
+        fn a_working_thread_is_summed_up_again_as_its_activity_changes() {
+            let (mut st, mut o) = conversation(true);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            let activity = |st: &mut AppState, text: &str| {
+                st.activity.insert(
+                    "t-gamma".into(),
+                    ThreadActivity {
+                        activity: text.into(),
+                        said: None,
+                        task: None,
+                        work: None,
+                    },
+                );
+            };
+            activity(&mut st, "compiling");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now("t-gamma", result("t-gamma", Some("Compiling."), None), now);
+            let every = st.summary.every();
+            assert!(
+                st.take_summaries_due(now + every).is_empty(),
+                "same activity"
+            );
+            activity(&mut st, "running the tests");
+            assert!(
+                st.take_summaries_due(now + every / 2).is_empty(),
+                "too soon"
+            );
+            assert_eq!(st.take_summaries_due(now + every).len(), 1);
+            st.summary_result_now(
+                "t-gamma",
+                result("t-gamma", Some("Testing."), None),
+                now + every,
+            );
+            // Idle: its activity changing asks nothing.
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            activity(&mut st, "done");
+            rows(&mut st, 160, 40);
+            assert!(st.take_summaries_due(now + every * 3).is_empty());
+        }
+
+        /// The first summary ever waits for the notice of what summaries send, drawn whole,
+        /// and the notice is told for good.
+        #[test]
+        fn the_first_summary_waits_for_its_notice() {
+            let (mut st, mut o) = conversation(true);
+            st.seen.summary_notice = false;
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            assert!(
+                st.take_summaries_due(now).is_empty(),
+                "not before the notice"
+            );
+            let notice =
+                crate::firstrun::summary_notice(&st.view.suggest_model, st.summary.every());
+            assert_eq!(st.view.status.as_deref(), Some(notice.as_str()));
+            for says in [
+                "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "3 KB",
+                "300 B",
+                "never an item",
+                "5 min",
+                "/summaries off",
+                "summaries = false",
+            ] {
+                assert!(notice.contains(says), "{says}");
+            }
+            // Cut short (no room for its short form either): not told.
+            draw(&mut st, 30, 9);
+            st.note_drawn(now);
+            assert!(!st.seen.summary_notice);
+            assert!(st.take_summaries_due(now).is_empty());
+            draw(&mut st, 400, 40);
+            st.note_drawn(now);
+            assert!(st.seen.summary_notice && st.seen_dirty);
+            assert_eq!(st.take_summaries_due(now).len(), 1, "asked once shown");
+        }
+
+        /// On a compact terminal (40x20) the status bar has no room for the notice whole: it
+        /// draws the short form, which still says what is sent, to whom, how often, what it
+        /// costs and how to turn them off, and that one drawn whole tells it. At a normal
+        /// width the whole one is drawn.
+        #[test]
+        fn the_summary_notice_is_said_short_where_it_has_no_room() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let models = twr_core::config::SuggestModels::default();
+            let every = Duration::from_secs(300);
+            let short = crate::firstrun::summary_notice_short(&models, every);
+            for says in [
+                "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "Claude Code",
+                "Codex",
+                "name, state, activity and routine updates",
+                "3 KB",
+                "no items",
+                "your login",
+                "5 min",
+                "$0.0002",
+                "/summaries off",
+            ] {
+                assert!(short.contains(says), "{says}");
+            }
+            let notice = crate::firstrun::summary_notice(&models, every);
+            for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
+                let (mut st, mut o) = conversation(true);
+                st.view.suggest_model = models.clone();
+                st.seen.summary_notice = false;
+                interim(&mut st, &mut o, "gamma", "started the build");
+                rows(&mut st, 160, 40);
+                let now = Instant::now();
+                assert!(st.take_summaries_due(now).is_empty());
+                let buf = draw(&mut st, w, h);
+                let words = flat(&view_text(&st, &buf));
+                let (drawn, not) = if whole {
+                    (&notice, &short)
+                } else {
+                    (&short, &notice)
+                };
+                assert!(words.contains(&flat(drawn)), "{w}x{h}: {words}");
+                assert!(!words.contains(&flat(not)), "{w}x{h}: {words}");
+                st.note_drawn(now);
+                assert!(st.seen.summary_notice, "{w}x{h}");
+                rows(&mut st, 160, 40);
+                assert_eq!(st.take_summaries_due(now).len(), 1, "{w}x{h}");
+            }
+        }
+
+        /// On a phone whose status bar is crowded (the compact layout at its default width,
+        /// several workspaces' tabs, background tasks' note), the notice still gets the rows it
+        /// needs while it waits: the notes give way and the bar grows, so its short form is
+        /// drawn whole, it is told, and the summary is asked for. At a normal width the whole
+        /// notice is drawn beside the notes.
+        #[test]
+        fn the_summary_notice_is_drawn_whole_on_a_crowded_phone() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let models = twr_core::config::SuggestModels::default();
+            let every = Duration::from_secs(300);
+            let short = crate::firstrun::summary_notice_short(&models, every);
+            let notice = crate::firstrun::summary_notice(&models, every);
+            for (w, h) in [(40, 20), (30, 20), (210, 40)] {
+                for (tabs, tasks) in [(true, false), (false, true), (true, true)] {
+                    let case = format!("{w}x{h} tabs {tabs} tasks {tasks}");
+                    let (mut st, mut o) = conversation(true);
+                    st.view.suggest_model = models.clone();
+                    st.seen.summary_notice = false;
+                    crowd(&mut st, tabs, tasks);
+                    interim(&mut st, &mut o, "gamma", "started the build");
+                    rows(&mut st, 160, 40);
+                    let now = Instant::now();
+                    assert!(st.take_summaries_due(now).is_empty(), "{case}");
+                    // (At 210 columns the sidebar is docked beside the view.)
+                    let buf = draw(&mut st, w, h);
+                    let words = flat(&view_text(&st, &buf));
+                    let drawn = if w == 210 { &notice } else { &short };
+                    assert!(words.contains(&flat(drawn)), "{case}: {words}");
+                    if w == 210 && tasks {
+                        assert!(words.contains("3 background task(s)"), "{case}: {words}");
+                    }
+                    st.note_drawn(now);
+                    assert!(st.seen.summary_notice, "{case}");
+                    rows(&mut st, 160, 40);
+                    assert_eq!(st.take_summaries_due(now).len(), 1, "{case}");
+                }
+            }
+        }
+
+        /// Told on a crowded phone, the summary notice stays readable: the frames after still
+        /// draw its short form whole before the notes, until a tap dismisses it or another
+        /// status replaces it, and then the status bar is as before.
+        #[test]
+        fn the_summary_notice_stays_until_dismissed_or_replaced() {
+            let models = twr_core::config::SuggestModels::default();
+            let short = crate::firstrun::summary_notice_short(&models, Duration::from_secs(300));
+            for (w, dismiss) in [(40, true), (40, false), (30, true), (30, false)] {
+                let (mut st, mut o) = conversation(true);
+                st.view.suggest_model = models.clone();
+                st.seen.summary_notice = false;
+                crowd(&mut st, true, true);
+                interim(&mut st, &mut o, "gamma", "started the build");
+                rows(&mut st, 160, 40);
+                assert!(st.take_summaries_due(Instant::now()).is_empty());
+                let had = notice_stays_until_gone(&mut st, &short, w, 20, dismiss);
+                // At 30 columns its short form needs more than a third of the screen.
+                assert!(w == 40 || had > 20 / 3, "{w}x20: {had} rows");
+                assert!(st.seen.summary_notice);
+            }
+        }
+
+        /// `/summaries off` stops them and drops the ask on its way (the IO loop aborts it);
+        /// what it would have answered is not taken, even once summaries are on again and the
+        /// thread asked about again: only the answer of that ask is (each ask has its id). On
+        /// again, the run is asked about again.
+        #[test]
+        fn summaries_off_stops_and_cancels() {
+            let (mut st, mut o) = conversation(true);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let first = st.take_summaries_due(now);
+            assert_eq!(first.len(), 1);
+            type_line(&mut st, "/summaries off");
+            assert!(!st.summary.on);
+            let status = st.view.status.clone().unwrap();
+            assert!(status.starts_with("summaries off"), "{status}");
+            assert!(status.contains("0 so far, $0.0000"), "{status}");
+            assert!(st.take_summaries_due(now).is_empty());
+            st.summary_result_now("t-gamma", result("t-gamma", Some("late"), None), now);
+            assert!(!rows(&mut st, 160, 40).join("\n").contains("late"));
+            st.toggle_summaries(Some(true));
+            let status = st.view.status.clone().unwrap();
+            assert!(
+                status.contains("Anthropic") && status.contains("OpenAI"),
+                "{status}"
+            );
+            let again = st.take_summaries_due(now);
+            assert_eq!(again.len(), 1, "asked again");
+            assert_ne!(again[0].id, first[0].id);
+            // The first ask's answers, come late (queued before the off), are not the new
+            // ask's: neither its summary nor that the hub can't run them.
+            st.summary_result(
+                "t-gamma",
+                first[0].id,
+                result("t-gamma", Some("late"), None),
+                now,
+            );
+            st.summary_result(
+                "t-gamma",
+                first[0].id,
+                result("t-gamma", None, Some("unavailable: no CLI")),
+                now,
+            );
+            assert!(st.summary.running());
+            assert_eq!(st.summary.asking("t-gamma"), Some(again[0].id));
+            assert!(!rows(&mut st, 160, 40).join("\n").contains("late"));
+            // Off, the rows read as their updates, summaries or not.
+            st.summary_result_now("t-gamma", result("t-gamma", Some("Building."), None), now);
+            assert!(rows(&mut st, 160, 40)
+                .join("\n")
+                .contains("◦ gamma · Building."));
+            st.toggle_summaries(Some(false));
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains("◦ gamma · yielded with 2 background tasks"),
+                "{text}"
+            );
+        }
+
+        /// The hub's `next_after_secs`, however large, puts the next ask off without taking
+        /// the clock past its end.
+        #[test]
+        fn a_huge_next_after_puts_the_ask_off_without_overflow() {
+            let (mut st, mut o) = conversation(true);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            let mut r = result("t-gamma", None, Some("limit"));
+            if let Answer::Got(r) = &mut r {
+                r.next_after_secs = Some(u64::MAX);
+            }
+            st.summary_result_now("t-gamma", r, now);
+            let year = Duration::from_secs(365 * 86400);
+            assert!(st.take_summaries_due(now + year).is_empty());
+        }
+
+        /// Where the hub can't run them (or has no `summary.thread`), summaries stop for the
+        /// run without another call, the rows read as their updates, and the status bar says
+        /// so once ever. Asked too soon (another TUI's), the hub's last one is not taken: the
+        /// run is asked about again once the pace allows.
+        #[test]
+        fn unavailable_summaries_stop_and_say_so_once() {
+            let (mut st, mut o) = conversation(true);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now(
+                "t-gamma",
+                result(
+                    "t-gamma",
+                    None,
+                    Some("unavailable: Claude Code is not signed in"),
+                ),
+                now,
+            );
+            let status = st.view.status.clone().unwrap();
+            assert!(status.contains("Claude Code is not signed in"), "{status}");
+            assert!(status.contains("summaries = false"), "{status}");
+            draw(&mut st, 400, 40);
+            st.note_drawn(now);
+            assert!(st.seen.summary_unavailable);
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(
+                text.contains("◦ gamma · background work finished · 2 updates"),
+                "{text}"
+            );
+            assert!(st
+                .take_summaries_due(now + Duration::from_secs(3600))
+                .is_empty());
+            // Told before: silent. An older hub: the same.
+            let (mut st, mut o) = conversation(true);
+            st.seen.summary_unavailable = true;
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now("t-gamma", Answer::Unsupported, now);
+            assert_eq!(st.view.status, None);
+            assert!(st
+                .take_summaries_due(now + Duration::from_secs(3600))
+                .is_empty());
+            // `interval`: the hub's last summary is not taken; asked again later.
+            let (mut st, mut o) = conversation(true);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            let mut r = result("t-gamma", Some("an older one"), Some("interval"));
+            if let Answer::Got(r) = &mut r {
+                r.next_after_secs = Some(120);
+            }
+            st.summary_result_now("t-gamma", r, now);
+            assert!(!rows(&mut st, 160, 40).join("\n").contains("an older one"));
+            let every = st.summary.every();
+            assert!(st
+                .take_summaries_due(now + every - Duration::from_secs(1))
+                .is_empty());
+            assert_eq!(st.take_summaries_due(now + every).len(), 1);
+            // A failed call is said once.
+            st.summary_result_now("t-gamma", Answer::Failed("connection refused".into()), now);
+            let status = st.view.status.clone().unwrap();
+            assert!(
+                status.contains("no summary: connection refused"),
+                "{status}"
+            );
+        }
+
+        /// An ask that brings no summary leaves its run due again, the same updates and all:
+        /// a failed call once the pace allows (the hub's `next_after_secs` kept), a hub that
+        /// couldn't run it at once after `/summaries on` (the runtime may be signed in by
+        /// then). Only an answer covers the run.
+        #[test]
+        fn an_ask_that_brings_no_summary_leaves_its_run_due() {
+            let (mut st, mut o) = conversation(true);
+            // gamma's turn ends: only a new update would ask about it again.
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let every = st.summary.every();
+            let now = Instant::now();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now("t-gamma", Answer::Failed("connection refused".into()), now);
+            assert!(st
+                .take_summaries_due(now + every - Duration::from_secs(1))
+                .is_empty());
+            let t1 = now + every;
+            assert_eq!(st.take_summaries_due(t1).len(), 1, "failed: due again");
+            // The hub's own failure, with its `next_after_secs`: due again, not before it.
+            let mut r = result("t-gamma", None, Some("failed: the CLI timed out"));
+            if let Answer::Got(r) = &mut r {
+                r.next_after_secs = Some(900);
+            }
+            st.summary_result_now("t-gamma", r, t1);
+            assert!(st
+                .take_summaries_due(t1 + Duration::from_secs(899))
+                .is_empty());
+            let t2 = t1 + Duration::from_secs(900);
+            assert_eq!(st.take_summaries_due(t2).len(), 1);
+            // Unable to run: nothing until `/summaries on`, which asks again at once.
+            st.summary_result_now(
+                "t-gamma",
+                result(
+                    "t-gamma",
+                    None,
+                    Some("unavailable: Claude Code is not signed in"),
+                ),
+                t2,
+            );
+            assert!(st
+                .take_summaries_due(t2 + Duration::from_secs(3600))
+                .is_empty());
+            st.toggle_summaries(Some(true));
+            assert_eq!(
+                st.take_summaries_due(t2).len(),
+                1,
+                "on: asked again at once"
+            );
+            // An older hub without summaries, then `/summaries on`: the same.
+            st.summary_result_now("t-gamma", Answer::Unsupported, t2);
+            assert!(st.take_summaries_due(t2).is_empty());
+            st.toggle_summaries(Some(true));
+            assert_eq!(st.take_summaries_due(t2).len(), 1);
+            // An answer covers it: nothing new, nothing asked.
+            st.summary_result_now("t-gamma", result("t-gamma", Some("Built."), None), t2);
+            st.toggle_summaries(Some(true));
+            assert!(st
+                .take_summaries_due(t2 + Duration::from_secs(3600))
+                .is_empty());
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Built."), "{text}");
+        }
+
+        /// A summary goes with the update the hub says it read last (`covers`), not the one
+        /// asked about: updates that came between the ask and the hub's read never put it on
+        /// the wrong run. An update it didn't read leaves the run due again; one it read
+        /// though the ask didn't name it is covered. Without `covers` (an older hub), the
+        /// update asked about; an `interval` answer is still declined.
+        #[test]
+        fn a_summary_goes_with_the_update_the_hub_read() {
+            let with_covers = |summary: &str, covers: Option<u64>, reason: Option<&str>| {
+                let mut r = result("t-gamma", Some(summary), reason);
+                if let Answer::Got(r) = &mut r {
+                    r.covers = covers;
+                }
+                r
+            };
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let every = st.summary.every();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            // Meanwhile the run closes (a report) and a new one starts: the hub read the new
+            // one's update.
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma finished (success): all green",
+                Value::Null,
+            );
+            let second = interim(&mut st, &mut o, "gamma", "second try");
+            st.summary_result_now(
+                "t-gamma",
+                with_covers("Trying again.", Some(second), None),
+                now,
+            );
+            let rows_ = rows(&mut st, 160, 40);
+            let text = rows_.join("\n");
+            assert!(
+                text.contains("◦ gamma · yielded with 2 background tasks still running: started"),
+                "the closed run keeps its words: {text}"
+            );
+            let with: Vec<&String> = rows_
+                .iter()
+                .filter(|r| r.contains("Trying again."))
+                .collect();
+            assert_eq!(with.len(), 1, "{text}");
+            // It read the newest: nothing new to ask about.
+            assert!(st.take_summaries_due(now + every * 2).is_empty());
+            // An update it didn't read (the hub read an older one): due again.
+            let t1 = now + every * 2;
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            let third = interim(&mut st, &mut o, "gamma", "third try");
+            rows(&mut st, 160, 40);
+            assert_eq!(st.take_summaries_due(t1).len(), 1);
+            st.summary_result_now(
+                "t-gamma",
+                with_covers("Background done.", Some(third - 1), None),
+                t1,
+            );
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Background done."), "{text}");
+            assert_eq!(st.take_summaries_due(t1 + every).len(), 1, "due again");
+            // `interval` (another basis's, made while this ask waited): declined, covers or
+            // not.
+            st.summary_result_now(
+                "t-gamma",
+                with_covers("Stale.", Some(third), Some("interval")),
+                t1 + every,
+            );
+            assert!(!rows(&mut st, 160, 40).join("\n").contains("Stale."));
+            assert_eq!(st.take_summaries_due(t1 + every * 2).len(), 1);
+            // An older hub: the update asked about.
+            st.summary_result_now("t-gamma", with_covers("Third.", None, None), t1 + every * 2);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Third."), "{text}");
+            assert!(st.take_summaries_due(t1 + every * 4).is_empty());
+        }
+
+        /// A `NONE` answer of a newer update of the run is the run's answer: its row reads as
+        /// its updates again, not as the earlier summary of it, and nothing more is asked
+        /// while nothing changes.
+        #[test]
+        fn a_none_answer_takes_the_place_of_an_earlier_summary_of_the_run() {
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            let first = interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let every = st.summary.every();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            let covering = |summary: Option<&str>, seq: u64| {
+                let reason = summary.is_none().then_some("none");
+                let mut r = result("t-gamma", summary, reason);
+                if let Answer::Got(r) = &mut r {
+                    (r.covers, r.covers_in) = (Some(seq), Some("t-orch".into()));
+                }
+                r
+            };
+            st.summary_result_now("t-gamma", covering(Some("Building."), first), now);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Building."), "{text}");
+            let second = say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            rows(&mut st, 160, 40);
+            let t1 = now + every;
+            assert_eq!(st.take_summaries_due(t1).len(), 1);
+            st.summary_result_now("t-gamma", covering(None, second), t1);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(!text.contains("Building."), "{text}");
+            assert!(
+                text.contains("◦ gamma · background work finished · 2 updates"),
+                "{text}"
+            );
+            assert!(st.take_summaries_due(t1 + every * 4).is_empty());
+        }
+
+        /// A closed run keeps the summary it ended with however many answers come after it,
+        /// while it is in the transcript: one answer per run is kept, the live run's newest
+        /// taking the place of its earlier ones. Once a run left the transcript (its oldest
+        /// entries dropped), its answer goes with the next one kept.
+        #[test]
+        fn closed_runs_keep_their_summaries_past_many_answers() {
+            let (mut st, mut o) = conversation(true);
+            // Its subscription made: the transcript is the conversation, caught up.
+            st.transcript.as_mut().unwrap().catch_up = None;
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            let covering = |summary: &str, seq: u64| {
+                let mut r = result("t-gamma", Some(summary), None);
+                if let Answer::Got(r) = &mut r {
+                    (r.covers, r.covers_in) = (Some(seq), Some("t-orch".into()));
+                }
+                r
+            };
+            let every = st.summary.every();
+            let mut now = Instant::now();
+            let mut ask = |st: &mut AppState, summary: &str, seq: u64| {
+                rows(st, 160, 120);
+                assert_eq!(st.take_summaries_due(now).len(), 1, "{summary}");
+                st.summary_result_now("t-gamma", covering(summary, seq), now);
+                now += every;
+            };
+            // 20 runs, each with its summary, each closed by a report.
+            const RUNS: usize = 20;
+            for i in 0..RUNS {
+                let seq = interim(&mut st, &mut o, "gamma", &format!("step {i}"));
+                ask(&mut st, &format!("Run {i}."), seq);
+                say(
+                    &mut st,
+                    &mut o,
+                    "t-gamma",
+                    &format!("gamma finished (success): report {i}"),
+                    Value::Null,
+                );
+            }
+            // The live run: 20 answers, each of a newer update of it.
+            for i in 0..20 {
+                let seq = interim(&mut st, &mut o, "gamma", &format!("live {i}"));
+                ask(&mut st, &format!("Live {i}."), seq);
+            }
+            let text = rows(&mut st, 160, 120).join("\n");
+            for i in 0..RUNS {
+                assert!(
+                    text.contains(&format!("◦ gamma · Run {i}.")),
+                    "run {i} keeps its summary:\n{text}"
+                );
+            }
+            assert!(text.contains("◦ gamma · Live 19."), "{text}");
+            assert!(!text.contains("Live 18."), "{text}");
+            let kept = st.summary.texts_for_thread("t-gamma");
+            assert_eq!(kept.len(), RUNS + 1, "one per run: {kept:?}");
+            // The first 5 runs leave the transcript (its oldest entries dropped, as past
+            // its cap): their answers go with the next one.
+            let t = st.transcript.as_mut().unwrap();
+            let gone = t
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| {
+                    matches!(e, Entry::HubUpdate { text, .. } if text.contains("report 4"))
+                })
+                .map(|(i, _)| i + 1)
+                .next()
+                .unwrap();
+            t.entries.drain(..gone);
+            t.ids.drain(..gone);
+            let seq = interim(&mut st, &mut o, "gamma", "live 20");
+            ask(&mut st, "Live 20.", seq);
+            let kept = st.summary.texts_for_thread("t-gamma");
+            assert_eq!(kept.len(), RUNS + 1 - 5, "{kept:?}");
+            assert!(kept.iter().all(|(_, _, t)| t.as_deref() != Some("Run 4.")));
+            assert!(kept.iter().any(|(_, _, t)| t.as_deref() == Some("Run 5.")));
+            let text = rows(&mut st, 160, 120).join("\n");
+            assert!(text.contains("◦ gamma · Run 5."), "{text}");
+            assert!(text.contains("◦ gamma · Live 20."), "{text}");
+        }
+
+        /// The run closes (a final report) before the hub reads the ask: a hub that names the
+        /// conversation it read (`covers_in`) and no update (`covers` none) read no routine
+        /// update, so its summary, of the later state, is no summary of the closed run, which
+        /// keeps its words. The run is not asked about again, however long and though its
+        /// thread works and its activity changes (each ask would pay for the same nothing),
+        /// until it has a newer update.
+        #[test]
+        fn a_run_that_closed_before_the_hub_read_gets_no_summary() {
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let every = st.summary.every();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            let mut r = result("t-gamma", Some("All green, done."), None);
+            if let Answer::Got(r) = &mut r {
+                (r.covers, r.covers_in) = (None, Some("t-orch".into()));
+            }
+            st.summary_result_now("t-gamma", r, now);
+            assert!(
+                st.summary.texts_for_thread("t-gamma").is_empty(),
+                "{:?}",
+                st.summary.texts_for_thread("t-gamma")
+            );
+            assert!(st.take_summaries_due(now + every).is_empty(), "not again");
+            control(&mut st, &[g.turn_started("go on")]);
+            for (k, doing) in ["compiling", "linking"].iter().enumerate() {
+                st.apply_result(
+                    "thread.activity",
+                    &serde_json::json!({"t-gamma": {"activity": doing}}),
+                );
+                rows(&mut st, 160, 40);
+                let at = now + every * (k as u32 + 2);
+                assert!(st.take_summaries_due(at).is_empty(), "{doing}");
+            }
+            // A newer update of the run: it is asked about.
+            interim(&mut st, &mut o, "gamma", "linked");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now + every * 4);
+            assert_eq!(asks.len(), 1, "due again");
+            st.summary_result_now("t-gamma", Answer::Failed("gone".into()), now + every * 4);
+            // The report that closed the run reaches the TUI after the answer.
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma finished (success): all green",
+                Value::Null,
+            );
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(!text.contains("All green, done."), "{text}");
+            assert!(
+                text.contains("◦ gamma · yielded with 2 background tasks still running: linked"),
+                "the closed run keeps its words: {text}"
+            );
+            // Closed: no longer asked about.
+            assert!(st.take_summaries_due(now + every * 6).is_empty());
+        }
+
+        /// A reset or a switch of the orchestrator is a new thread whose seqs start again: an
+        /// earlier conversation's summary is no summary of the new one's run though their
+        /// seqs are the same; the new run is asked about though its newest update has the seq
+        /// the last ask was about; an answer of the conversation the ask wasn't about is no
+        /// summary of the run, which is due again; and a run of a retired orchestrator's (a
+        /// frame drawn before the main pane followed the switch) is not asked about. A
+        /// workspace kept over the switch reads the same.
+        #[test]
+        fn a_summary_is_of_its_conversation_whose_seqs_start_again() {
+            let covering = |summary: &str, seq: u64, conv: &str| {
+                let mut r = result("t-gamma", Some(summary), None);
+                if let Answer::Got(r) = &mut r {
+                    (r.covers, r.covers_in) = (Some(seq), Some(conv.into()));
+                }
+                r
+            };
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            let seq = interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let every = st.summary.every();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now("t-gamma", covering("Building.", seq, "t-orch"), now);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Building."), "{text}");
+            // A new conversation; its first update about gamma has the same seq.
+            let mut o2 = ThreadScript::new("t-orch2");
+            o2.at(300);
+            control(&mut st, &orch_events(&mut o2, "t-orch2"));
+            rows(&mut st, 160, 40);
+            assert_eq!(st.transcript.as_ref().unwrap().thread, "t-orch2");
+            let mut c = ThreadScript::new("t-orch2");
+            c.at(400);
+            assert_eq!(interim(&mut st, &mut c, "gamma", "started the build"), seq);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(!text.contains("Building."), "{text}");
+            assert!(
+                text.contains("◦ gamma · yielded with 2 background tasks still running: started"),
+                "{text}"
+            );
+            assert_eq!(st.view.panes.routine[0].conv, "t-orch2");
+            // Its newest update is not the one the last ask was about, whatever its seq.
+            assert!(st.take_summaries_due(now + every / 2).is_empty(), "paced");
+            let t1 = now + every;
+            assert_eq!(st.take_summaries_due(t1).len(), 1);
+            // The hub read the old conversation (it had not switched yet): declined, and due
+            // again once the pace allows.
+            st.summary_result_now("t-gamma", covering("Old news.", seq, "t-orch"), t1);
+            assert!(!rows(&mut st, 160, 40).join("\n").contains("Old news."));
+            assert!(st.take_summaries_due(t1 + every / 2).is_empty(), "paced");
+            let t2 = t1 + every;
+            assert_eq!(st.take_summaries_due(t2).len(), 1);
+            st.summary_result_now("t-gamma", covering("Building anew.", seq, "t-orch2"), t2);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Building anew."), "{text}");
+            assert!(st.take_summaries_due(t2 + every * 2).is_empty());
+            assert_eq!(
+                st.summary.texts_for_thread("t-gamma"),
+                [
+                    ("t-orch".to_string(), seq, Some("Building.".to_string())),
+                    (
+                        "t-orch2".to_string(),
+                        seq,
+                        Some("Building anew.".to_string())
+                    ),
+                ]
+            );
+            // Kept over a workspace switch: still told apart.
+            let kept = st.take_view();
+            st.restore_view(kept);
+            st.finish_restore();
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("◦ gamma · Building anew."), "{text}");
+            assert!(!text.contains("◦ gamma · Building."), "{text}");
+            // A run drawn in a frame before another switch: not asked about (the hub reads
+            // the current conversation), until a frame draws the new one's.
+            interim(&mut st, &mut c, "gamma", "more of it");
+            rows(&mut st, 160, 40);
+            let mut o3 = ThreadScript::new("t-orch3");
+            o3.at(500);
+            control(&mut st, &orch_events(&mut o3, "t-orch3"));
+            assert_eq!(st.view.panes.routine[0].conv, "t-orch2", "the last frame's");
+            assert!(st.take_summaries_due(t2 + every * 4).is_empty());
+        }
+
+        /// The first asks after `/summaries on` say so (`retry`: the hub probes the agents'
+        /// CLIs afresh and tries again what its calls found unable to run); later ones, and
+        /// asks with summaries on from the start, don't.
+        #[test]
+        fn the_first_asks_after_summaries_on_carry_retry() {
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            let asks = st.take_summaries_due(now);
+            assert_eq!(asks.len(), 1);
+            assert!(!asks[0].params.retry, "on from the start");
+            st.summary_result_now(
+                "t-gamma",
+                result(
+                    "t-gamma",
+                    None,
+                    Some("unavailable: Claude Code is not signed in"),
+                ),
+                now,
+            );
+            st.toggle_summaries(Some(true));
+            // Nothing due yet for alpha: the retry waits for the next asks.
+            interim(&mut st, &mut o, "alpha", "migrations run");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now);
+            let mut asked: Vec<(&str, bool)> = asks
+                .iter()
+                .map(|a| (a.thread.as_str(), a.params.retry))
+                .collect();
+            asked.sort();
+            assert_eq!(asked, [("t-alpha", true), ("t-gamma", true)]);
+            let json = serde_json::to_value(&asks[0].params).unwrap();
+            assert_eq!(json["retry"], true, "{json}");
+            st.summary_result_now("t-gamma", result("t-gamma", Some("Building."), None), now);
+            st.summary_result_now("t-alpha", result("t-alpha", Some("Migrating."), None), now);
+            interim(&mut st, &mut o, "gamma", "second try");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now + st.summary.every());
+            assert_eq!(asks.len(), 1);
+            assert!(!asks[0].params.retry, "only the first after on");
+            // Off and on again: the next carries it again.
+            st.toggle_summaries(Some(false));
+            assert!(st.take_summaries_due(now).is_empty());
+            st.toggle_summaries(Some(true));
+            interim(&mut st, &mut o, "gamma", "third try");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now + st.summary.every() * 2);
+            assert_eq!(asks.len(), 1);
+            assert!(asks[0].params.retry);
+        }
+
+        /// A workspace switched away from and back keeps its summaries, their pace and the
+        /// hub's counts ([`crate::workspace::SavedView`]): a closed run's summary still reads
+        /// as it did, the live run is not asked about sooner than its pace allows, and an ask
+        /// that was on its way (answered to the view that is gone) leaves its run due again.
+        #[test]
+        fn summaries_and_their_pace_survive_a_workspace_switch() {
+            let (mut st, mut o) = conversation(true);
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(200);
+            control(&mut st, &[g.turn_ended(TurnResult::Completed)]);
+            let first = interim(&mut st, &mut o, "gamma", "started the build");
+            rows(&mut st, 160, 40);
+            let now = Instant::now();
+            assert_eq!(st.take_summaries_due(now).len(), 1);
+            st.summary_result_now(
+                "t-gamma",
+                result("t-gamma", Some("Building, then tests."), None),
+                now,
+            );
+            // The run closes (a report); a new one starts, and alpha's is asked about.
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma finished (success): all green",
+                Value::Null,
+            );
+            interim(&mut st, &mut o, "gamma", "second try");
+            interim(&mut st, &mut o, "alpha", "migrations run");
+            rows(&mut st, 160, 40);
+            let asks = st.take_summaries_due(now);
+            let asked: Vec<&str> = asks.iter().map(|a| a.thread.as_str()).collect();
+            assert_eq!(asked, ["t-alpha"], "gamma's pace holds it");
+            let kept = st.take_view();
+            assert!(st.summary.texts_for_thread("t-gamma").is_empty());
+            // Back: a fresh state, as `drive` makes one, with the view kept.
+            let mut back = with_orch();
+            back.seen.summary_notice = true;
+            back.summary.on = true;
+            back.summary.every = Duration::from_secs(300);
+            back.restore_view(kept);
+            back.finish_restore();
+            assert_eq!(back.summary.stats.calls, 1);
+            let text = rows(&mut back, 160, 40).join("\n");
+            assert!(
+                text.contains("◦ gamma · Building, then tests. (ctrl+o to expand)"),
+                "{text}"
+            );
+            assert_eq!(
+                back.summary.texts_for_thread("t-gamma"),
+                [(
+                    "t-orch".to_string(),
+                    first,
+                    Some("Building, then tests.".to_string())
+                )]
+            );
+            // gamma: still not before `summary_every` after its ask; alpha's ask on its way
+            // when the user left: due again at once.
+            let asks = back.take_summaries_due(now);
+            let asked: Vec<&str> = asks.iter().map(|a| a.thread.as_str()).collect();
+            assert_eq!(asked, ["t-alpha"]);
+            let every = back.summary.every();
+            let asks = back.take_summaries_due(now + every);
+            let asked: Vec<&str> = asks.iter().map(|a| a.thread.as_str()).collect();
+            assert_eq!(asked, ["t-gamma"]);
+        }
+
+        /// Where `needle` is drawn in `buf` (its first cell), searching row by row.
+        fn cell_of(buf: &ratatui::buffer::Buffer, needle: &str) -> Option<(u16, u16)> {
+            let area = buf.area;
+            (area.y..area.bottom()).find_map(|y| {
+                let cells: Vec<&str> = (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                let row: String = cells.concat();
+                let at = row.find(needle)?;
+                // Cells before it: one per symbol (these rows hold no wide character).
+                let (mut x, mut bytes) = (0, 0);
+                while bytes < at {
+                    bytes += cells[x].len();
+                    x += 1;
+                }
+                Some((area.x + x as u16, y))
+            })
+        }
+
+        /// Every hub update that names a thread draws its name in the thread's color, folded
+        /// and expanded: a folded run's row, each of its updates expanded, a report of a
+        /// follow-up turn (a report block, like any report), a hung turn (like the other
+        /// items' rows).
+        #[test]
+        fn every_update_names_its_thread_in_its_color() {
+            let (mut st, mut o) = conversation(false);
+            interim(&mut st, &mut o, "alpha", "migrations run");
+            say(
+                &mut st,
+                &mut o,
+                "t-alpha",
+                "alpha background work finished.",
+                json!({"routine": "background_done"}),
+            );
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma seems hung: no output for 20 min",
+                json!({"attn_id": "h1"}),
+            );
+            say(
+                &mut st,
+                &mut o,
+                "t-gamma",
+                "gamma finished, in a follow-up turn it started after background work \
+                 (success): all green",
+                Value::Null,
+            );
+            let (alpha, gamma) = (
+                crate::ui::thread_color(st.thread_named("t-alpha").unwrap()),
+                crate::ui::thread_color(st.thread_named("t-gamma").unwrap()),
+            );
+            let colored = |buf: &ratatui::buffer::Buffer, needle: &str, name: &str, color| {
+                let (x, y) = cell_of(buf, needle).unwrap_or_else(|| panic!("{needle}"));
+                let before = &needle[..needle.find(name).unwrap()];
+                let at = x + before.chars().count() as u16;
+                for dx in 0..name.len() as u16 {
+                    assert_eq!(buf[(at + dx, y)].fg, color, "{needle}");
+                }
+                buf[(at, y)].modifier
+            };
+            let buf = draw(&mut st, 160, 40);
+            let text = screen_text(&buf);
+            colored(&buf, "◦ alpha · background work", "alpha", alpha);
+            colored(&buf, "gamma seems hung: no output", "gamma", gamma);
+            let bold = colored(
+                &buf,
+                "gamma finished in a follow-up turn · success",
+                "gamma",
+                gamma,
+            );
+            assert!(bold.contains(ratatui::style::Modifier::BOLD), "{text}");
+            // The report's summary goes in its block, on a row of its own.
+            let (_, head) = cell_of(&buf, "gamma finished in a follow-up").unwrap();
+            let (_, body) = cell_of(&buf, "all green").unwrap();
+            assert!(body > head, "{text}");
+            assert!(!text.contains("(success): all green"), "{text}");
+            st.handle_key(ctrl('o'));
+            let buf = draw(&mut st, 160, 40);
+            colored(&buf, "alpha yielded with 2 background", "alpha", alpha);
+            colored(&buf, "alpha background work finished.", "alpha", alpha);
+            colored(&buf, "gamma seems hung", "gamma", gamma);
+        }
+
+        /// A summary is the text of a routine row only: the thread's items keep their own
+        /// rows and boxes, and an item's thread is still asked about only for its routine
+        /// row.
+        #[test]
+        fn a_summary_never_takes_an_items_place() {
+            let (mut st, mut o) = conversation(true);
+            let seq = interim(&mut st, &mut o, "beta", "deploy queued");
+            // beta's permission is open (`three_threads`): its update and its box.
+            say(
+                &mut st,
+                &mut o,
+                "t-beta",
+                "beta needs permission: Bash: rm -rf target",
+                json!({"attn_id": "pm1"}),
+            );
+            interim(&mut st, &mut o, "beta", "waiting on the deploy");
+            st.summary
+                .texts_for_test("t-beta", "t-orch", seq, "SUMMARY TEXT");
+            let rows = rows(&mut st, 160, 40);
+            let text = rows.join("\n");
+            assert!(text.contains("Bash: rm -rf target"), "{text}");
+            let with: Vec<&String> = rows.iter().filter(|r| r.contains("SUMMARY TEXT")).collect();
+            assert_eq!(with.len(), 1, "{text}");
+            assert!(with[0].starts_with("◦ beta · "), "{text}");
+        }
+
+        /// The color of the first cell of `word` on the conversation pane's first row that
+        /// starts with `lead` (after spaces), as the last frame drew it.
+        fn color_of(
+            st: &AppState,
+            buf: &Buffer,
+            lead: &str,
+            word: &str,
+        ) -> Option<ratatui::style::Color> {
+            let pane = st.view.panes.get(&PaneId::Transcript).unwrap().area;
+            (pane.y..pane.bottom()).find_map(|y| {
+                let cells: Vec<&str> = (pane.x..pane.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                if !cells.concat().trim_start().starts_with(lead) {
+                    return None;
+                }
+                let n = word.chars().count();
+                let at = (0..cells.len().saturating_sub(n))
+                    .find(|i| cells[*i..*i + n].concat() == word)?;
+                buf[(pane.x + at as u16, y)].fg.into()
+            })
+        }
+
+        /// A deleted thread's history keeps its name in its color (its id's): its folded run,
+        /// an update naming it and the orchestrator's box about it, both right after the
+        /// delete and in a TUI that replays a log with it deleted; the box has no status.
+        #[test]
+        fn a_deleted_threads_history_keeps_its_name_and_color() {
+            let deleted = || {
+                let mut g = ThreadScript::new("t-gamma");
+                g.at(90);
+                g.event(EventBody::ThreadDeleted(twr_core::event::ThreadDeleted {
+                    name: "gamma".into(),
+                    ..Default::default()
+                }))
+            };
+            let history = |st: &mut AppState, o: &mut ThreadScript| {
+                st.apply_event(&thread_item(
+                    &o.text("<thread name=\"gamma\">\nThe build runs.\n</thread>"),
+                ));
+                interim(st, o, "gamma", "started the build");
+                say(
+                    st,
+                    o,
+                    "t-gamma",
+                    "gamma background work finished.",
+                    Value::Null,
+                );
+                say(st, o, "t-gamma", "gamma has a note for you.", Value::Null);
+            };
+            let check = |st: &mut AppState, when: &str| {
+                assert!(st.registry.get("t-gamma").is_none(), "{when}");
+                let buf = draw(st, 160, 40);
+                let text = rows(st, 160, 40).join("\n");
+                assert!(!text.contains("t-gamma"), "{when}: {text}");
+                assert!(text.contains("╭─ gamma ──"), "{when}: {text}");
+                let gamma = Some(crate::color::thread_color(
+                    st.thread_named("t-gamma").unwrap(),
+                ));
+                for lead in ["╭─ gamma", "◦ gamma · ", "· gamma has a note"] {
+                    assert_eq!(color_of(st, &buf, lead, "gamma"), gamma, "{when}: {lead}");
+                }
+            };
+            // Deleted while the TUI watched.
+            let (mut st, mut o) = conversation(false);
+            history(&mut st, &mut o);
+            let text = rows(&mut st, 160, 40).join("\n");
+            assert!(text.contains("╭─ gamma · running"), "{text}");
+            control(&mut st, &[deleted()]);
+            check(&mut st, "after the delete");
+            // A TUI started after it: the control log replays the thread and its delete.
+            let mut st = AppState::new();
+            let mut g = ThreadScript::new("t-gamma");
+            g.at(20);
+            let mut evs = vec![g.created("gamma"), g.turn_started("tests")];
+            let mut orch = ThreadScript::new("t-orch");
+            orch.at(40);
+            evs.extend(orch_events(&mut orch, "t-orch"));
+            evs.push(deleted());
+            st.begin_catch_up(evs.len() as u64);
+            control(&mut st, &evs);
+            assert!(st.catch_up.is_none());
+            st.seen.summary_notice = true;
+            st.summary.every = Duration::from_secs(300);
+            let mut o = ThreadScript::new("t-orch");
+            o.at(100);
+            history(&mut st, &mut o);
+            check(&mut st, "after a replay");
+        }
+    }
+
+    /// Next-message suggestions ([`crate::suggest`]).
+    mod suggestions {
+        use super::*;
+        use serde_json::json;
+
+        /// The orchestrator conversation after its turn 1 ended live (the notice that
+        /// suggestions are on told in an earlier run).
+        fn ended(on: bool) -> (AppState, ThreadScript) {
+            let mut st = with_orch();
+            st.seen.suggest_notice = true;
+            st.view.suggest = on;
+            st.view.suggest_model = Default::default();
+            let mut o = ThreadScript::new("t-orch");
+            o.at(200);
+            let started = o.turn_started("fix it");
+            let ended = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended]);
+            (st, o)
+        }
+
+        /// The hub's answer to the ask that is due, on screen long enough to be taken.
+        fn answer(st: &mut AppState, text: &str) {
+            st.take_suggest_due();
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "model": "haiku", "suggestion": text,
+                        "cached": false, "stats": {"calls": 1, "failures": 0, "cost_usd": 0.0001}}),
+            );
+            if let Some(s) = st.suggestion.as_mut() {
+                s.shown = Some(Instant::now() - crate::suggest::SUGGEST_SETTLE);
+            }
+        }
+
+        /// Off by default: nothing is asked. On: one ask after a turn ended live, with the
+        /// model configured; none while something is typed.
+        #[test]
+        fn a_suggestion_is_asked_after_a_turn_only_when_on() {
+            let (mut st, _) = ended(false);
+            assert_eq!(st.take_suggest_due(), None);
+            let (mut st, mut o) = ended(true);
+            assert_eq!(
+                st.take_suggest_due(),
+                Some(crate::suggest::Ask {
+                    thread: "t-orch".into(),
+                    turn: 1,
+                    models: twr_core::config::SuggestModels::default(),
+                    retry: false,
+                })
+            );
+            assert_eq!(st.take_suggest_due(), None, "asked once");
+            typed(&mut st, "draft");
+            let started = o.turn_started("more");
+            let ended = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended]);
+            assert_eq!(st.take_suggest_due(), None, "typing: not asked");
+        }
+
+        /// The first suggestion ever waits for the notice of what suggestions send, and how
+        /// to turn them off, to be on screen: it is asked for only after a frame showed it,
+        /// and the notice is told for good.
+        #[test]
+        fn the_first_suggestion_waits_for_its_notice() {
+            let (mut st, _) = ended(true);
+            st.seen.suggest_notice = false;
+            assert_eq!(st.take_suggest_due(), None, "not before the notice");
+            let notice = crate::firstrun::suggest_notice(&st.view.suggest_model);
+            let notice = notice.as_str();
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+            for says in [
+                "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "$0.0002",
+                "Claude Code",
+                "/suggest off",
+                "suggest = false",
+                "2 KB",
+            ] {
+                assert!(notice.contains(says), "{says}");
+            }
+            assert_eq!(st.take_suggest_due(), None, "still not drawn");
+            // Replaced before a frame showed it: shown again.
+            st.view.status = Some("something else".into());
+            assert_eq!(st.take_suggest_due(), None);
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+            // Under the help (or cut), it is not on screen: not told.
+            st.view.help = true;
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "under the help");
+            assert_eq!(st.take_suggest_due(), None);
+            st.view.help = false;
+            draw(&mut st, 30, 9);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "cut short");
+            // A terminal of one row has no room for the status bar at all.
+            draw(&mut st, 1000, 1);
+            st.note_drawn(Instant::now());
+            assert!(!st.seen.suggest_notice, "no status bar");
+            assert_eq!(st.take_suggest_due(), None);
+            let screen = screen_text(&draw(&mut st, 400, 40));
+            assert!(screen.contains("suggestions are on"), "{screen}");
+            st.note_drawn(Instant::now());
+            assert!(st.seen.suggest_notice && st.seen_dirty);
+            assert!(st.take_suggest_due().is_some(), "asked once shown");
+            // `/suggest off` and back on tells nothing: the notice still comes first.
+            let (mut st, _) = ended(true);
+            st.seen.suggest_notice = false;
+            st.toggle_suggest(Some(false));
+            assert_eq!(st.take_suggest_due(), None);
+            assert!(!st.seen.suggest_notice);
+            st.toggle_suggest(Some(true));
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert_eq!(st.take_suggest_due(), None);
+            assert_eq!(st.view.status.as_deref(), Some(notice));
+        }
+
+        /// On a compact terminal (40x20) the status bar has no room for the notice whole: it
+        /// draws the short form, which still says what is sent, to whom, what it costs and
+        /// how to turn them off, and that one drawn whole tells it. At a normal width the
+        /// whole one is drawn.
+        #[test]
+        fn the_suggestion_notice_is_said_short_where_it_has_no_room() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let models = twr_core::config::SuggestModels::default();
+            let short = crate::firstrun::suggest_notice_short(&models);
+            for says in [
+                "Anthropic",
+                "OpenAI",
+                "claude-haiku-5-5",
+                "gpt-6-luna",
+                "Claude Code",
+                "Codex",
+                "prompt",
+                "8 KB",
+                "your login",
+                "$0.0002",
+                "/suggest off",
+            ] {
+                assert!(short.contains(says), "{says}");
+            }
+            let notice = crate::firstrun::suggest_notice(&models);
+            for (w, h, whole) in [(40, 20, false), (210, 40, true)] {
+                let (mut st, _) = ended(true);
+                st.seen.suggest_notice = false;
+                assert_eq!(st.take_suggest_due(), None);
+                let buf = draw(&mut st, w, h);
+                let words = flat(&view_text(&st, &buf));
+                let (drawn, not) = if whole {
+                    (&notice, &short)
+                } else {
+                    (&short, &notice)
+                };
+                assert!(words.contains(&flat(drawn)), "{w}x{h}: {words}");
+                assert!(!words.contains(&flat(not)), "{w}x{h}: {words}");
+                st.note_drawn(Instant::now());
+                assert!(st.seen.suggest_notice, "{w}x{h}");
+                assert!(st.take_suggest_due().is_some(), "{w}x{h}");
+            }
+        }
+
+        /// On a phone whose status bar is crowded (the compact layout at its default width,
+        /// several workspaces' tabs, background tasks' note), the notice still gets the rows it
+        /// needs while it waits: the notes give way and the bar grows, so its short form is
+        /// drawn whole, it is told, and the suggestion is asked for. At a normal width the
+        /// whole notice is drawn beside the notes.
+        #[test]
+        fn the_suggestion_notice_is_drawn_whole_on_a_crowded_phone() {
+            let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+            let models = twr_core::config::SuggestModels::default();
+            let short = crate::firstrun::suggest_notice_short(&models);
+            let notice = crate::firstrun::suggest_notice(&models);
+            for (w, h) in [(40, 20), (30, 20), (210, 40)] {
+                for (tabs, tasks) in [(true, false), (false, true), (true, true)] {
+                    let case = format!("{w}x{h} tabs {tabs} tasks {tasks}");
+                    let (mut st, _) = ended(true);
+                    st.seen.suggest_notice = false;
+                    crowd(&mut st, tabs, tasks);
+                    assert_eq!(st.take_suggest_due(), None, "{case}");
+                    // (At 210 columns the sidebar is docked beside the view.)
+                    let buf = draw(&mut st, w, h);
+                    let words = flat(&view_text(&st, &buf));
+                    let drawn = if w == 210 { &notice } else { &short };
+                    assert!(words.contains(&flat(drawn)), "{case}: {words}");
+                    if w == 210 && tasks {
+                        assert!(words.contains("3 background task(s)"), "{case}: {words}");
+                    }
+                    st.note_drawn(Instant::now());
+                    assert!(st.seen.suggest_notice, "{case}");
+                    assert!(st.take_suggest_due().is_some(), "{case}");
+                }
+            }
+        }
+
+        /// Told on a crowded phone, the suggestion notice stays readable: the frames after
+        /// still draw its short form whole before the notes, until a tap dismisses it or
+        /// another status replaces it, and then the status bar is as before.
+        #[test]
+        fn the_suggestion_notice_stays_until_dismissed_or_replaced() {
+            let models = twr_core::config::SuggestModels::default();
+            let short = crate::firstrun::suggest_notice_short(&models);
+            for (w, dismiss) in [(40, true), (40, false), (30, true), (30, false)] {
+                let (mut st, _) = ended(true);
+                st.seen.suggest_notice = false;
+                crowd(&mut st, true, true);
+                assert_eq!(st.take_suggest_due(), None);
+                let had = notice_stays_until_gone(&mut st, &short, w, 20, dismiss);
+                // At 30 columns its short form needs more than a third of the screen.
+                assert!(w == 40 || had > 20 / 3, "{w}x20: {had} rows");
+                assert!(st.seen.suggest_notice);
+            }
+        }
+
+        /// Where the hub can't run suggestions (no Claude Code CLI, or none signed in) they
+        /// stop for the run without another call, and the status bar says so once ever; a
+        /// call's answer and `hub.info` alike. After `/suggest on`, `hub.info` no longer
+        /// turns them off.
+        #[test]
+        fn unavailable_suggestions_stop_quietly() {
+            let unavailable = |st: &mut AppState| {
+                st.take_suggest_due();
+                st.apply_result(
+                    "suggest.next",
+                    &json!({"thread": "t-orch", "turn": 1, "model": "haiku", "suggestion": null,
+                            "reason": "unavailable: Claude Code is not signed in",
+                            "cached": false, "stats": {"calls": 1, "failures": 1}}),
+                );
+            };
+            let (mut st, mut o) = ended(true);
+            unavailable(&mut st);
+            assert!(!st.view.suggest);
+            let status = st.view.status.clone().unwrap();
+            assert!(status.contains("Claude Code is not signed in"), "{status}");
+            assert!(status.contains("suggest = false"), "{status}");
+            draw(&mut st, 200, 40);
+            st.note_drawn(Instant::now());
+            assert!(st.seen.suggest_unavailable);
+            let started = o.turn_started("more");
+            let ended_ = o.turn_ended(TurnResult::Completed);
+            control(&mut st, &[started, ended_]);
+            assert_eq!(st.take_suggest_due(), None, "no more calls");
+            // Told before: silent.
+            let (mut st, _) = ended(true);
+            st.seen.suggest_unavailable = true;
+            unavailable(&mut st);
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status, None);
+            // `hub.info` says so before any call: silent but for the one notice, which waits
+            // for a free status bar.
+            let info = json!({"suggest": {"unavailable": "unavailable: Claude Code's CLI (claude) is not installed"}});
+            let (mut st, _) = ended(true);
+            st.view.status = Some("busy".into());
+            st.apply_result("hub.info", &info);
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status.as_deref(), Some("busy"));
+            assert_eq!(st.take_suggest_due(), None);
+            st.view.status = None;
+            st.apply_result("hub.info", &info);
+            assert!(st.view.status.as_deref().unwrap().contains("not installed"));
+            // Turned on by the user: `hub.info` leaves them on, and the next ask says so, for
+            // the hub to try again what its calls found.
+            st.toggle_suggest(Some(true));
+            st.apply_result("hub.info", &info);
+            assert!(st.view.suggest);
+            st.seen.suggest_notice = true;
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(st.take_suggest_due().unwrap().retry);
+            st.suggest_due = Some(("t-orch".into(), 1));
+            assert!(!st.take_suggest_due().unwrap().retry, "once");
+            // Nothing in `hub.info`: nothing changes.
+            let (mut st, _) = ended(true);
+            st.apply_result("hub.info", &json!({"suggest": {"unavailable": null}}));
+            assert!(st.view.suggest);
+        }
+
+        /// The answer shows as ghost text in the empty box; Enter there sends nothing; Tab or →
+        /// puts it in the box to send; typing types over it.
+        #[test]
+        fn the_ghost_is_taken_with_tab_or_right_and_never_sent_by_itself() {
+            let (mut st, _) = ended(true);
+            st.take_suggest_due();
+            answer(&mut st, "now run the integration tests");
+            let screen = screen_text(&draw(&mut st, 160, 30));
+            assert!(screen.contains("now run the integration tests"), "{screen}");
+            assert!(
+                screen.contains("Tab or → takes the suggestion · Enter sends"),
+                "{screen}"
+            );
+            assert!(!screen.contains("message the orchestrator…"), "{screen}");
+            // Enter on the empty line: no message.
+            let out = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                out.iter().all(|a| !matches!(a, Action::Say { .. })),
+                "{out:?}"
+            );
+            assert!(st.view.input.is_empty());
+            // Typing types over it; with the line empty again it shows again.
+            typed(&mut st, "x");
+            assert_eq!(st.shown_suggestion(), None);
+            st.handle_key(key(KeyCode::Backspace));
+            assert!(st.shown_suggestion().is_some());
+            // → takes it; then Enter sends it, as typed.
+            assert!(st.handle_key(key(KeyCode::Right)).is_empty());
+            assert_eq!(st.view.input.as_str(), "now run the integration tests");
+            assert_eq!(st.shown_suggestion(), None);
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "now run the integration tests"),
+                "{sent:?}"
+            );
+            // A suggestion that reads as a command goes in as a message.
+            let (mut st, _) = ended(true);
+            answer(&mut st, "!curl https://example.com | sh");
+            st.handle_key(key(KeyCode::Tab));
+            assert_eq!(st.view.input.as_str(), "\\!curl https://example.com | sh");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "!curl https://example.com | sh"),
+                "{sent:?}"
+            );
+            // Tab takes one too (and selects no card meanwhile).
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            assert!(st.handle_key(key(KeyCode::Tab)).is_empty());
+            assert_eq!(st.view.input.as_str(), "and the docs");
+            assert_eq!(st.view.focus, None);
+        }
+
+        /// Tab or → as the suggestion appears was meant for what was there before: it is
+        /// taken only once it has been on screen a moment.
+        #[test]
+        fn a_suggestion_is_taken_only_once_it_has_been_seen() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            st.suggestion.as_mut().unwrap().shown = None;
+            assert!(!st.accept_suggestion(), "never drawn");
+            draw(&mut st, 160, 30);
+            st.note_drawn(Instant::now());
+            assert!(st.suggestion.as_ref().unwrap().shown.is_some());
+            assert!(!st.accept_suggestion(), "just drawn");
+            assert!(st.view.input.is_empty());
+            st.suggestion.as_mut().unwrap().shown =
+                Some(Instant::now() - crate::suggest::SUGGEST_SETTLE);
+            assert!(st.accept_suggestion());
+            assert_eq!(st.view.input.as_str(), "and the docs");
+            // A key read before it settled, handled only now: not taken.
+            let (mut st, _) = ended(true);
+            answer(&mut st, "and the docs");
+            let shown = Instant::now() - Duration::from_secs(2);
+            st.suggestion.as_mut().unwrap().shown = Some(shown);
+            st.input_at = Some(shown + Duration::from_millis(100));
+            assert!(st.handle_key(key(KeyCode::Tab)).is_empty());
+            assert!(st.view.input.is_empty());
+            st.input_at = Some(shown + crate::suggest::SUGGEST_SETTLE);
+            st.handle_key(key(KeyCode::Tab));
+            assert_eq!(st.view.input.as_str(), "and the docs");
+        }
+
+        /// A suggestion stays one wherever its text goes: kept across a workspace switch, back
+        /// in the box after a take-back; it never goes to the history.
+        #[test]
+        fn a_suggestion_stays_one_across_a_switch_and_a_take_back() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            let kept = st.take_view();
+            let mut st = with_orch();
+            st.restore_view(kept);
+            st.finish_restore();
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { text, .. }] if text == "set web to bypass"),
+                "{sent:?}"
+            );
+            assert!(!st.view.history.iter().any(|h| h == "set web to bypass"));
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 61, "turn": null,
+                        "pending": 1}),
+            );
+            assert_eq!(
+                st.unsend(),
+                vec![Action::Withdraw {
+                    thread: "t-orch".into(),
+                    msg_ref: 61
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 61,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { .. }]),
+                "{sent:?}"
+            );
+        }
+
+        /// A suggestion sent, then a message of the user's before the first was answered:
+        /// each answer registers its own send, so the queued suggestion is still one when it
+        /// is taken back to edit.
+        #[test]
+        fn overlapping_sends_keep_the_suggestions_ref() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            assert!(matches!(
+                &st.handle_key(key(KeyCode::Enter))[..],
+                [Action::SaySuggested { .. }]
+            ));
+            assert!(matches!(
+                &type_line(&mut st, "and lint")[..],
+                [Action::Say { .. }]
+            ));
+            for r in [71, 72] {
+                st.apply_result(
+                    "say",
+                    &json!({"action": "delegate", "thread": "t-orch", "ref": r, "turn": null,
+                            "pending": 2}),
+                );
+            }
+            assert!(st.suggested_refs.contains(&("t-orch".to_string(), 71)));
+            assert!(!st.suggested_refs.contains(&("t-orch".to_string(), 72)));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 2, "items": [
+                    {"ref": 71, "prompt": "set web to bypass", "from": "user", "mine": true},
+                    {"ref": 72, "prompt": "and lint", "from": "user", "mine": true}]}),
+            );
+            st.retract_queued(71, crate::app::Retract::Edit);
+            assert!(st
+                .withdrawals
+                .iter()
+                .any(|w| w.msg_ref == 71 && w.suggested));
+        }
+
+        /// A suggestion sent in a dive and taken back is still one: out of the dive, sent to
+        /// the orchestrator as it is, it goes as a suggestion.
+        #[test]
+        fn a_suggestion_sent_in_a_dive_stays_one() {
+            let mut st = with_orch();
+            draw(&mut st, 120, 30);
+            st.dive("t-alpha");
+            st.view.input.set("set web to bypass");
+            st.taken_suggestion = Some("set web to bypass".into());
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(matches!(&sent[..], [Action::Send { .. }]), "{sent:?}");
+            st.apply_result(
+                "thread.send",
+                &json!({"thread": "t-alpha", "ref": 81, "turn": null, "pending": 1}),
+            );
+            assert_eq!(
+                st.unsend(),
+                vec![Action::Withdraw {
+                    thread: "t-alpha".into(),
+                    msg_ref: 81
+                }]
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 81,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            st.leave_dive();
+            let sent = st.handle_key(key(KeyCode::Enter));
+            assert!(
+                matches!(&sent[..], [Action::SaySuggested { .. }]),
+                "{sent:?}"
+            );
+        }
+
+        /// The queue listed a suggestion before its send was answered, and an edit took it
+        /// back then: the send's answer, which comes before the withdrawal's, still marks it.
+        /// Suggestions stay marked however many come after, while they are queued.
+        #[test]
+        fn a_suggestion_edited_before_its_answer_stays_one() {
+            let (mut st, _) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            assert!(matches!(
+                &st.handle_key(key(KeyCode::Enter))[..],
+                [Action::SaySuggested { .. }]
+            ));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 91, "prompt": "set web to bypass", "from": "user", "mine": true}]}),
+            );
+            st.retract_queued(91, crate::app::Retract::Edit);
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 91, "turn": null,
+                        "pending": 1}),
+            );
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "queued", "ref": 91,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.view.input.as_str(), "set web to bypass");
+            assert_eq!(st.taken_suggestion.as_deref(), Some("set web to bypass"));
+            // Many suggestions later, the first still queued is still one.
+            st.view.input.clear();
+            st.taken_suggestion = None;
+            for i in 0..40 {
+                let text = format!("suggestion {i}");
+                st.view.input.set(&text);
+                st.taken_suggestion = Some(text);
+                st.handle_key(key(KeyCode::Enter));
+                st.apply_result(
+                    "say",
+                    &json!({"action": "delegate", "thread": "t-orch", "ref": 100 + i,
+                            "turn": null, "pending": 1}),
+                );
+            }
+            assert!(st.suggested_refs.contains(&("t-orch".to_string(), 100)));
+        }
+
+        /// A suggestion whose turn started is still one: until it acts it can be taken back
+        /// (an edit of its row before the queue is read again included).
+        #[test]
+        fn a_started_suggestion_taken_back_stays_one() {
+            let (mut st, mut o) = ended(true);
+            answer(&mut st, "set web to bypass");
+            st.handle_key(key(KeyCode::Tab));
+            st.handle_key(key(KeyCode::Enter));
+            assert_eq!(st.queue_due(Instant::now()).as_deref(), Some("t-orch"));
+            st.apply_result(
+                "thread.queue",
+                &json!({"thread": "t-orch", "total": 1, "items": [
+                    {"ref": 95, "prompt": "set web to bypass", "from": "user", "mine": true}]}),
+            );
+            st.apply_result(
+                "say",
+                &json!({"action": "delegate", "thread": "t-orch", "ref": 95, "turn": null,
+                        "pending": 1}),
+            );
+            let mut started = o.turn_started("set web to bypass");
+            if let EventBody::TurnStarted(p) = &mut started.body {
+                p.ext = json!({"twr": {(twr_core::event::MESSAGE_REF_KEY): 95}})
+                    .as_object()
+                    .cloned();
+            }
+            control(&mut st, &[started]);
+            st.retract_queued(95, crate::app::Retract::Edit);
+            st.apply_result(
+                "message.withdraw",
+                &json!({"withdrawn": true, "state": "running", "ref": 95,
+                        "prompt": "set web to bypass"}),
+            );
+            assert_eq!(st.taken_suggestion.as_deref(), Some("set web to bypass"));
+        }
+
+        /// An answer to an ask made before a send of the user's is about a conversation that
+        /// went on: it shows nothing.
+        #[test]
+        fn an_answer_from_before_a_send_shows_nothing() {
+            let (mut st, _) = ended(true);
+            st.take_suggest_due();
+            assert!(matches!(
+                &type_line(&mut st, "go on")[..],
+                [Action::Say { .. }]
+            ));
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": "and the docs"}),
+            );
+            assert!(st.suggestion.is_none());
+        }
+
+        /// A new turn takes the suggestion away, and an answer for a turn that is no longer the
+        /// last shows nothing; a failed call says so once; /suggest turns them off.
+        #[test]
+        fn suggestions_go_with_the_next_turn_and_can_be_turned_off() {
+            let (mut st, mut o) = ended(true);
+            answer(&mut st, "next step");
+            assert!(st.shown_suggestion().is_some());
+            control(&mut st, &[o.turn_started("go on")]);
+            assert_eq!(st.shown_suggestion(), None);
+            // Late answer for turn 1 while turn 2 runs: not shown.
+            answer(&mut st, "stale");
+            assert_eq!(st.shown_suggestion(), None);
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": null,
+                        "reason": "failed: Please run /login"}),
+            );
+            assert!(st
+                .view
+                .status
+                .as_deref()
+                .unwrap()
+                .contains("Please run /login"));
+            st.view.status = None;
+            st.apply_result(
+                "suggest.next",
+                &json!({"thread": "t-orch", "turn": 1, "suggestion": null,
+                        "reason": "failed: Please run /login"}),
+            );
+            assert_eq!(st.view.status, None, "said once");
+            type_line(&mut st, "/suggest off");
+            assert!(!st.view.suggest);
+            assert_eq!(st.view.status.as_deref(), Some("suggestions off"));
+            type_line(&mut st, "/suggest");
+            assert!(st.view.suggest);
+            let said = st.view.status.as_deref().unwrap();
+            for says in ["claude-haiku-5-5", "Anthropic", "gpt-6-luna", "OpenAI"] {
+                assert!(said.contains(says), "{said}");
+            }
         }
     }
 }

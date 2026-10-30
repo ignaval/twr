@@ -5,8 +5,9 @@
 //! `ext.twr.send_after = {id, prompt, after: [{thread, turn}], source, from}`: `turn` is the last
 //! turn each thread it waits for had ended then. It goes out when every one of them has
 //! finished a turn after that one and settled: no turn open, no background work or job, no
-//! prompt queued, its report written, and nothing from its runtime for [`GRACE`] (a runtime
-//! may start a turn of its own once its background work ends). A thread parked or stopped
+//! prompt queued, its report written, no wake of the hub's pending for it (`hub::wake`), and
+//! nothing from its runtime for [`GRACE`] (a runtime may start a turn of its own once its
+//! background work ends). A thread parked or stopped
 //! since has settled at once, whatever is queued for it: nothing runs it until it is resumed
 //! (a completed turn whose report is missing then counts as not finished well). Then the
 //! prompt is queued on the thread as its sender sent it (the user, or the orchestrator),
@@ -87,7 +88,8 @@ impl Gated {
     }
 }
 
-/// The gated prompts, from the log; and the channel to [`after_task`].
+/// The gated prompts, from the log; and the channel to [`after_task`]. In the hub's
+/// checkpoints (`hub::checkpoint`) as [`AfterFold`].
 #[derive(Default)]
 pub(super) struct AfterState {
     pub(super) pending: BTreeMap<String, Gated>,
@@ -100,6 +102,90 @@ pub(super) struct AfterState {
     tx: Option<mpsc::UnboundedSender<String>>,
 }
 
+/// [`AfterState`] as a checkpoint has it: all but the channel, each gated prompt with what its
+/// own serialization (`ext.twr.send_after`) leaves out.
+#[derive(Serialize, Deserialize)]
+struct AfterFold {
+    pending: BTreeMap<String, GatedFold>,
+    cards: HashMap<String, String>,
+    orphans: BTreeMap<String, (GatedFold, String)>,
+}
+
+/// A [`Gated`] whole.
+#[derive(Serialize, Deserialize)]
+struct GatedFold {
+    gated: Gated,
+    target: String,
+    card: Option<String>,
+}
+
+impl GatedFold {
+    fn of(g: &Gated) -> Self {
+        GatedFold {
+            gated: g.clone(),
+            target: g.target.clone(),
+            card: g.card.clone(),
+        }
+    }
+
+    fn into_gated(self) -> Gated {
+        Gated {
+            target: self.target,
+            card: self.card,
+            ..self.gated
+        }
+    }
+}
+
+/// Equal when they hold the same prompts and cards, and both have the channel or neither.
+impl PartialEq for AfterState {
+    fn eq(&self, other: &Self) -> bool {
+        self.pending == other.pending
+            && self.cards == other.cards
+            && self.orphans == other.orphans
+            && self.tx.is_some() == other.tx.is_some()
+    }
+}
+
+impl Serialize for AfterState {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        AfterFold {
+            pending: self
+                .pending
+                .iter()
+                .map(|(id, g)| (id.clone(), GatedFold::of(g)))
+                .collect(),
+            cards: self.cards.clone(),
+            orphans: self
+                .orphans
+                .iter()
+                .map(|(id, (g, why))| (id.clone(), (GatedFold::of(g), why.clone())))
+                .collect(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for AfterState {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let f = AfterFold::deserialize(d)?;
+        Ok(AfterState {
+            pending: f
+                .pending
+                .into_iter()
+                .map(|(id, g)| (id, g.into_gated()))
+                .collect(),
+            cards: f.cards,
+            orphans: f
+                .orphans
+                .into_iter()
+                .map(|(id, (g, why))| (id, (g.into_gated(), why)))
+                .collect(),
+            tx: None,
+        })
+    }
+}
+
 /// A wake of [`after_task`] for no thread in particular: the orphans.
 const ORPHANS: &str = "";
 
@@ -110,6 +196,12 @@ const SWEEP: Duration = Duration::from_secs(30);
 const RETRY: Duration = Duration::from_secs(5);
 
 impl AfterState {
+    /// Whether it has the channel to [`after_task`], which checkpoints skip (tests).
+    #[cfg(test)]
+    pub(super) fn has_channel(&self) -> bool {
+        self.tx.is_some()
+    }
+
     /// Whether thread `thread` is one a gated prompt is for or waits for.
     fn concerns(&self, thread: &str) -> bool {
         self.pending.values().any(|g| g.involves(thread))
@@ -225,6 +317,7 @@ impl Core {
         if prompt.trim().is_empty() {
             return Err(rpc(codes::BAD_REQUEST, "prompt is empty"));
         }
+        super::compact::refuse_compact_command(prompt, caller.from())?;
         if self.shutting_down {
             return Err(rpc(codes::CONFLICT, "hub is shutting down"));
         }
@@ -439,6 +532,11 @@ impl Core {
         // A completed turn's report is written after it ends.
         if completed && !v.reported {
             return GateState::Waiting(None);
+        }
+        // The hub is about to wake it after its background work (`hub::wake`): not finished.
+        if let Some(due) = self.wake.due(&gate.thread) {
+            let left = (due - chrono::Utc::now()).to_std().unwrap_or_default();
+            return GateState::Waiting(Some(now + left + Duration::from_secs(1)));
         }
         // Settled long enough: the runtime starts no turn of its own any more.
         let quiet = v

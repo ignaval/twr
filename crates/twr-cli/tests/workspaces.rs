@@ -18,7 +18,10 @@ fn command(home: &Path, args: &[&str]) -> Command {
         .env("TWR_HOME", home)
         .env_remove("TWR_WORKSPACE")
         .env_remove("RUST_LOG")
-        .env("TWR_TEST_USER_TOKEN_FILE", test_token());
+        .env("TWR_TEST_USER_TOKEN_FILE", test_token())
+        // No hub or runner of a test runs the user's login shell or real agent CLIs.
+        .env("TWR_AGENT_PROBE", "off")
+        .env("TWR_BOX_PROBE", "off");
     c
 }
 
@@ -435,6 +438,136 @@ fn bare_twr_starts_the_workspaces_hub() {
     let pid = info["pid"].as_u64().unwrap().to_string();
     let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
     assert!(killed.success());
+    poll("a's hub to stop", || {
+        (!twr(home, &["-w", "a", "info"]).status.success()).then_some(())
+    });
+}
+
+/// The controlling terminal of a `/proc/<pid>/stat` line (`tty_nr`, 0 for none).
+#[cfg(target_os = "linux")]
+fn tty_nr(stat: &str) -> i64 {
+    // After the command name, which may hold spaces: state, ppid, pgrp, session, tty_nr.
+    stat[stat.rfind(')').unwrap() + 1..]
+        .split_whitespace()
+        .nth(4)
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn posix_openpt(flags: i32) -> i32;
+    fn grantpt(fd: i32) -> i32;
+    fn unlockpt(fd: i32) -> i32;
+    fn ptsname_r(fd: i32, buf: *mut std::ffi::c_char, len: usize) -> i32;
+    fn setsid() -> i32;
+    fn ioctl(fd: i32, request: std::ffi::c_ulong, ...) -> i32;
+}
+
+/// A new pseudo-terminal: its master, and its slave opened (not as this process's
+/// controlling terminal).
+#[cfg(target_os = "linux")]
+fn open_pty() -> (std::os::fd::OwnedFd, std::fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    const O_RDWR: i32 = 2;
+    const O_NOCTTY: i32 = 0o400;
+    // SAFETY: plain calls on the descriptor posix_openpt returned; `name` outlives ptsname_r.
+    unsafe {
+        let master = posix_openpt(O_RDWR | O_NOCTTY);
+        assert!(
+            master >= 0,
+            "posix_openpt: {}",
+            std::io::Error::last_os_error()
+        );
+        let master = std::os::fd::OwnedFd::from_raw_fd(master);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+        assert_eq!(grantpt(fd), 0, "grantpt");
+        assert_eq!(unlockpt(fd), 0, "unlockpt");
+        let mut name = [0 as std::ffi::c_char; 128];
+        assert_eq!(ptsname_r(fd, name.as_mut_ptr(), name.len()), 0, "ptsname_r");
+        let name = std::ffi::CStr::from_ptr(name.as_ptr()).to_str().unwrap();
+        let slave = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(O_NOCTTY)
+            .open(name)
+            .unwrap();
+        (master, slave)
+    }
+}
+
+/// The hub that `twr` starts runs in a session of its own, without a controlling terminal,
+/// also when `twr` has one: neither the hub nor its runtimes and jobs can be stopped by that
+/// terminal (SIGTTIN, SIGTTOU when they read it or set its modes) or hung up with it. Here
+/// bare `twr` runs with a pseudo-terminal as its controlling terminal.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_hub_twr_starts_has_no_controlling_terminal() {
+    use std::os::unix::process::CommandExt;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    ok(home, &["ws", "new", "a"]);
+    let (master, slave) = open_pty();
+    let stat = home.join("twr.stat");
+    // `sh` records its stat (its controlling terminal), then becomes `twr -w a`.
+    let bare = command(home, &["-w", "a"]);
+    let mut c = Command::new("sh");
+    c.args([
+        "-c",
+        r#"cat /proc/$$/stat > "$0.part" && mv "$0.part" "$0"; exec "$@" < /dev/null"#,
+    ])
+    .arg(&stat)
+    .arg(bare.get_program())
+    .args(bare.get_args())
+    .envs(bare.get_envs().filter_map(|(k, v)| Some((k, v?))))
+    .env("TWR_ENABLE_FAKE", "1")
+    .stdin(slave)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    for (k, v) in bare.get_envs() {
+        if v.is_none() {
+            c.env_remove(k);
+        }
+    }
+    // SAFETY: setsid(2) and ioctl(2) are async-signal-safe and nothing is allocated: a new
+    // session whose controlling terminal is the pseudo-terminal on stdin (TIOCSCTTY).
+    unsafe {
+        c.pre_exec(|| {
+            if setsid() == -1 || ioctl(0, 0x540E, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut sh = c.spawn().unwrap();
+    // The TUI may come up on that terminal (it opens /dev/tty): only the hub matters here.
+    let info = poll("a's hub", || {
+        let out = twr(home, &["-w", "a", "info", "--json"]);
+        out.status.success().then_some(out.stdout)
+    });
+    let info: Value = serde_json::from_slice(&info).unwrap();
+    let pid = info["pid"].as_u64().unwrap().to_string();
+    // Read while `twr`, the session's leader, still runs: its exit would take the terminal
+    // from its whole session.
+    let hub_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let _ = sh.kill();
+    let _ = sh.wait();
+    drop(master);
+    let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    assert!(killed.success());
+    let twr_stat = std::fs::read_to_string(&stat).unwrap();
+    assert_ne!(
+        tty_nr(&twr_stat),
+        0,
+        "twr ran with a controlling terminal: {twr_stat}"
+    );
+    assert_eq!(
+        tty_nr(&hub_stat),
+        0,
+        "the hub has no controlling terminal: {hub_stat}"
+    );
     poll("a's hub to stop", || {
         (!twr(home, &["-w", "a", "info"]).status.success()).then_some(())
     });
@@ -1017,7 +1150,7 @@ fn hub_stop_all_reports_a_socket_that_keeps_closing_connections() {
     assert!(
         stdout.contains("a: failed:")
             && stdout.contains("keeps closing connections")
-            && stdout.contains("closed the connection during hello"),
+            && stdout.contains("closed the connection before answering hello"),
         "{stdout}"
     );
     assert!(
@@ -1418,7 +1551,31 @@ fn a_runner_keeps_its_data_in_the_root() {
         assert!(!made(&a.data_dir), "in workspace a's data");
         made(&root.data_dir).then_some(())
     });
-    let _ = runner.0.kill();
+    // Stopped as a user stops it (SIGTERM), not killed: it ends what it started, then exits
+    // (it starts no shell or agent CLI here: `TWR_BOX_PROBE=off`). A runner that has not
+    // listened for the signal yet (just started) ends by it.
+    let pid = runner.0.id().to_string();
+    assert!(Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap()
+        .success());
+    let deadline = Instant::now() + WAIT;
+    loop {
+        if let Some(st) = runner.0.try_wait().unwrap() {
+            use std::os::unix::process::ExitStatusExt;
+            assert!(
+                st.code().is_some() || st.signal() == Some(15),
+                "the runner ended by {st}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the runner did not stop on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A thread is never started in another workspace's worktree: that workspace's hub removes

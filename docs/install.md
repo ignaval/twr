@@ -1,6 +1,6 @@
 # Install
 
-twr is one binary, `twr`. It runs on Linux (x86_64, aarch64) and macOS (Apple silicon, Intel). macOS is built and tested in CI, but has had less hands-on use than Linux so far. Windows is unsupported. WSL2 runs Linux binaries, but twr is untested there. It needs git and at least one agent CLI: `claude` (Claude Code 2.1.110 or newer), `codex` or `grok`. Sign in with each agent's own CLI first. twr never runs a login and never sees the keys. [runtimes.md](runtimes.md#what-has-been-checked-against-the-real-clis) lists the versions twr was checked against.
+twr is one binary, `twr`. It runs on Linux (x86_64, aarch64) and macOS (Apple silicon, Intel). macOS is built and tested in CI, but has had less hands-on use than Linux so far. Windows is unsupported. WSL2 runs Linux binaries, but twr is untested there. It needs git and at least one agent CLI: `claude` (Claude Code 2.1.110 or newer), `codex` or `grok`. Sign in with each agent's own CLI first. twr never runs a login by itself and never sees your keys; on a remote box, `twr box login <box> <agent>` starts the agent's own login in your terminal ([runners.md](runners.md#log-an-agent-in-on-a-box)). [runtimes.md](runtimes.md#what-has-been-checked-against-the-real-clis) lists the versions twr was checked against.
 
 ## The install script
 

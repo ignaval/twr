@@ -59,7 +59,11 @@ twr mode api plan                      # change a thread's permission mode (thre
 twr model api opus --effort high       # change a thread's model and reasoning effort
 twr model api --runtime codex          # move a thread to another runtime, with a handoff
 twr orchestrator use codex --model gpt-5   # move the orchestrator to another runtime
-twr runner --hub ws://127.0.0.1:7878 --box gpu --token-file ~/.config/twr/gpu.token
+twr box add gpu me@gpu-box             # a box the hub reaches over SSH: it installs twr there
+twr box project gpu api                # find (or clone) the project's repository on the box
+twr thread new api --box gpu           # a thread on that box
+twr box list                           # the boxes, their state and twr version
+twr runner --hub ws://127.0.0.1:7878 --box=gpu --token-file ~/.config/twr/gpu.token
 twr info                               # what the running hub uses
 twr usage                              # how much of each subscription's 5h / weekly windows is used
 twr usage --threads --since 7d         # what each thread's turns spent: tokens, and cost where reported
@@ -86,7 +90,7 @@ There are no modes: the input box always takes what you type, so you can write t
 | Esc | close a popup, else release the selection, else back to the orchestrator from a dive; never clears what you typed |
 | Ctrl-↑↓, Alt-↑↓ | scroll the main pane a line |
 | Ctrl-O | show or fold tool calls (the orchestrator's, or in a dive the thread's) and the hub's updates |
-| Ctrl-B | show or hide the thread sidebar |
+| Ctrl-B | show or hide Threads, the sidebar: the workspaces, the current one's thread cards nested (Ctrl-T too) |
 | Ctrl-F | toggle Focus mode: working threads and anything needing you |
 | Ctrl-G | stack view or grid view (`Enter` on a tile opens its popup) |
 | PgUp, PgDn, mouse wheel | scroll the main pane; scrolled up, it stays put as text streams in |
@@ -109,7 +113,7 @@ There are no modes: the input box always takes what you type, so you can write t
 | `/parked [on\|off]` | list parked threads among the cards, or hide them |
 | `/pin [thread]` | pin or unpin a thread's card |
 | `/grid`, `/decisions` | the grid view; the decision audit table (`Esc` closes it) |
-| `/sidebar [on\|off]` | show or hide the thread sidebar; returns to the conversation |
+| `/sidebar [on\|off]` | show or hide Threads, the sidebar |
 | `/focus [on\|off]` | show only working threads and threads needing you, or list all |
 | `/mouse [on\|off]` | select and copy with the mouse in the TUI, or leave the mouse to the terminal |
 | `/help` | commands and keys |
@@ -119,7 +123,7 @@ On a phone (below 60 columns, or `/compact on`) it shows one screen at a time: t
 
 ## How it works
 
-Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. Threads on other machines run under `twr runner`, which connects out to the hub over WebSocket.
+Everything is an event in an append-only SQLite log. Thread state, the attention stack and reports are reducers over that log. Adapters drive each agent CLI through its headless JSON mode and turn its output into one small event schema. The orchestrator is another thread that works through the hub's tools over MCP. It can relay an answer you typed, but it can't decide one. Threads on other machines run under a box daemon the hub reaches over SSH (`twr box add`), or under `twr runner`, which connects out to the hub over WebSocket.
 
 ```mermaid
 flowchart LR

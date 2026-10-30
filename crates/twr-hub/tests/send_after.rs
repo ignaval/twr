@@ -578,3 +578,52 @@ async fn the_users_send_on_its_card_releases_a_crash_hold() {
     assert_eq!(p[1], "go on");
     hub.request_shutdown();
 }
+
+/// A prompt that waited, let go into a busy thread's queue, holds the reports agents wrote:
+/// `thread.queue` lists it as no send of the user's (`mine` false, never `newest_mine`, which
+/// `↑` would put in the input box as theirs to edit), while the user's own send behind it is.
+#[tokio::test]
+async fn a_prompt_that_waited_is_not_the_users_in_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let hub = Hub::open(opts(dir.path())).await.unwrap();
+    let (api, web) = (
+        thread(&hub, dir.path(), "api").await,
+        thread(&hub, dir.path(), "web").await,
+    );
+    send(&hub, &api, "!sleep 60000");
+    hub.send_after_by(&api, "web said: {report:web}", &["web".into()], &user())
+        .unwrap();
+    send(&hub, &web, "web is done");
+    let q = timeout(WAIT, async {
+        loop {
+            let q = hub.thread_queue(&api, &user()).unwrap();
+            if q["total"] == 1 {
+                return q;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the prompt never went out");
+    let item = &q["items"][0];
+    assert_eq!(item["prompt"], "web said: web is done", "{q}");
+    assert_eq!(
+        (item["from"].as_str(), item["mine"].as_bool()),
+        (Some("user"), Some(false)),
+        "{q}"
+    );
+    assert!(q["newest_mine"].is_null(), "{q}");
+    // The user's own send on the same thread is theirs.
+    let mine = hub.send_by(&api, "and then this", &user()).unwrap();
+    let q = hub.thread_queue(&api, &user()).unwrap();
+    let mine_flags: Vec<Option<bool>> = q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["mine"].as_bool())
+        .collect();
+    assert_eq!(mine_flags, [Some(false), Some(true)], "{q}");
+    assert_eq!(q["newest_mine"].as_i64(), Some(mine.msg_ref), "{q}");
+    hub.stop_thread(&api, "test").unwrap();
+    hub.request_shutdown();
+}

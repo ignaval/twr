@@ -481,7 +481,7 @@ impl Core {
                 v.name,
                 v.id,
                 v.project.as_deref().unwrap_or("-"),
-                v.runtime,
+                self.handoff_runtime(v),
                 model(&v.model),
                 v.status()
             );
@@ -603,6 +603,18 @@ impl Core {
     }
 
     /// `refuse` for a new prompt to the orchestrator while a switch is in progress.
+    /// How the handoff writes thread `v`'s runtime: with its account as the label rule says
+    /// (`claude-code:work` while the runtime shows account labels), and `(removed)` after a
+    /// removed account whatever the rule; the runtime alone otherwise.
+    fn handoff_runtime(&self, v: &ThreadView) -> String {
+        let (account, shown, removed) = self.thread_account_json(v);
+        match (shown, removed) {
+            (_, true) => format!("{}:{account} (removed)", v.runtime),
+            (true, false) => format!("{}:{account}", v.runtime),
+            (false, false) => v.runtime.clone(),
+        }
+    }
+
     pub(super) fn refuse_switching(&self, thread: &str) -> Result<(), RpcError> {
         if self.orch.switching && self.orch.is_thread(thread) {
             return Err(rpc(

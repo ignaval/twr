@@ -66,6 +66,7 @@ The values below are the defaults, except where a comment says "example".
 default_runtime = "claude-code"   # claude-code | codex | grok-build | acp:<command> | a [runtimes] name | pty:<command>
 stall_after_secs = 600            # foreground/background work silent this long raises stalled; 0 = off
 background_timeout_secs = 86400    # stop background-only work without task liveness for 24h; 0 = off
+wake_after_secs = 30              # wake a worker idle this long after its background work ended; 0 = off
 # Where a project given by its folder name is looked up (see below). Unset = these folders;
 # [] = no lookup.
 # project_roots = ["~/code", "~/src", "~/projects", "~/dev", "~/Developer", "~/repos", "~/git", "~/workspace"]
@@ -78,6 +79,8 @@ background_timeout_secs = 86400    # stop background-only work without task live
 autostart = false                 # start it with the hub instead of on your first message
 project_reads = true              # it may read your projects' committed files (false: never)
 # read_deny = ["*.sqlite", "config/prod/**"]  # more files it may never read, over the built-in secret names
+memory = true                     # it keeps notes across sessions and runtimes (false: no memory tools, nothing loaded)
+# account = "personal"           # the first orchestrator's account; unset = the policy default, else the native one
 
 [threads]
 default_mode = "auto"             # permission mode for new threads; checked when the hub starts
@@ -94,9 +97,14 @@ disk_warn_gb = 10                 # under this many GB free on a box, a disk car
 job_slots = 0                     # the machine's job slots for `twr job run`; 0 = its CPUs
 # cpu_weight = 20                 # the workers' CPU weight against the rest (systemd: 100); unset = no limit
 # memory_high = "8G"              # each worker's memory before it's slowed (systemd MemoryHigh); unset = none
+idle_compaction = "ask"           # a large context's prompt cache expired: ask before sending; "before_expiry" also compacts idle ones; "off"
 
 [trash]
 keep_days = 7                     # deleted threads stay in the trash this long; 0 = purge at the next check
+
+[log]
+retention_days = 30               # agent events of turns older than this leave twr.db (7 at least)
+archive = true                    # into archive.db beside it; false = they are deleted
 
 [projects.api]                    # example
 repo = "/home/me/code/api"        # the repository
@@ -107,10 +115,27 @@ repo = "/home/me/code/api"        # the repository
 # base = "dev"                    # the branch its threads merge into: ahead/behind and conflicts on their cards
 # trim_idle_after = "24h"         # trim the build output of its threads idle this long (90m, 24h, 2d)
 # idle_trim_disposable = ["target/"]  # replaces [threads] idle_trim_disposable for this project
+# codex_auto = "ask"              # overrides [codex] auto for this project's threads
+# account = "work"               # its threads' account on every runtime: a name, a glob, a list (accounts.md)
+# accounts = { codex = "team" }   # per runtime; replaces `account` there
+# exclude_accounts = ["personal"] # never these accounts
+
+[codex]
+auto = "auto_review"              # a Codex thread in `auto` whose sandbox says no: Codex's "auto_review" agent decides (the default), "ask" you, or "never" run it
+
+[accounts.claude-code.work]       # example: an account (accounts.md); `twr account add` can record one instead
+# dir = "~/.claude-work"          # unset = ~/.local/share/twr/accounts/claude-code/work
+# share = "config"                # what `twr account add` links into it from the native directory: config | none
+
+[accounts.claude-code.personal]   # example
+native = true                     # names the native account (the runtime's own directory)
+
+[account_policy.claude-code]      # example
+# default = "personal"            # the account of threads nothing pins; unset = the native one
 
 [notify]                          # the hub runs a command when something needs you; see notifications.md
 # command = ["notify-send", "--app-name=twr", "{title}", "{body}"]  # unset = off; no shell; {title} {body} {workspace}
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
 detail = false                    # true: what's asked or reported goes along (it may hold secrets)
 timeout_secs = 30                 # the command is ended after this long (1 to 600)
 
@@ -119,11 +144,29 @@ mouse = true                      # the TUI selects and copies text; false = the
 animate = true                    # the working icon moves; false = a still _ marker
 card_order = "stable"             # "attention": the most recently active thread first, every move at once
 compact_width = 60                # narrower, one screen at a time (a phone); 0 = never
+suggest = true                    # a small model suggests your next message after a turn; false: none
+suggest_model = { claude-code = "claude-haiku-5-5", codex = "gpt-6-luna" }  # small models only
+summaries = true                  # the same small model sums up a thread's routine updates in one line
+summary_every = "5m"              # at most one summary per thread this often (1m at least)
+colors = "auto"                   # "256", "16" or "none"; auto: from NO_COLOR, COLORTERM and TERM
 
 [tui.notify]
 terminal = "off"                  # bell | osc9 | osc777: alert the terminal when something needs you
 when = "unfocused"                # always: also while the terminal has focus
-events = ["permission", "question", "confirm", "error", "review", "report", "reply"]  # add "stalled" for stalls
+events = ["permission", "question", "confirm", "error", "review", "hung", "report", "reply"]  # add "stalled" for stalls
+
+[speech]                          # reading aloud, on the machine you listen on; see read-aloud.md
+engine = "auto"                   # say (macOS) | avspeech (macOS) | spd (Linux) | command; auto: say, else spd if installed
+voice = ""                        # the engine's voice; empty = the system's default
+rate = 0                          # words per minute, 80-500; 0 = the engine's default
+volume = 1.0                      # 0.0-1.0 (avspeech, spd)
+read = ["replies", "commentary"]  # replies: a turn's last text; commentary: texts before it
+turn_from = "all"                 # mine: only the turns you started
+code = "announce"                 # read | skip: what a code block reads as
+paths = "short"                   # full: paths as written
+catchup_secs = 120                # after a disconnect, messages older than this are counted, not read
+local = "auto"                    # on | off: the TUI speaks by itself (auto: not under SSH or mosh)
+command = []                      # engine = "command": a program and its arguments (no shell), text on stdin
 
 [runtimes.gemini]                 # example: an ACP agent under a short name (--runtime gemini)
 acp = "gemini --experimental-acp"
@@ -136,18 +179,33 @@ attach = "gemini --resume {session}"  # optional: what `twr attach` runs; also t
 # tls = { cert = "hub.pem", key = "hub.key" }   # serve wss:// (PEM files)
 allow_insecure_remote = false     # true: plain ws:// on the network (events in clear text)
 
-[boxes.gpu]                       # example: a remote box; see runners.md
-token = "..."                     # the runner presents this; never logged; `twr runner token` makes one
-ssh = "me@gpu-box"                # used by `twr attach` for threads on that box
+[boxes.gpu]                       # example: a box the hub reaches over SSH; see runners.md
+transport = "ssh"                 # the hub connects to it; unset = "token" (its runner connects to the hub)
+ssh = "me@gpu-box"                # where; also used by `twr attach` for threads on that box
+# build = "0123456789abcdef"      # the twr build `twr box install` put on a box of another OS or CPU
 
 [boxes.gpu.projects.api]
-repo = "/srv/code/api"            # where that project lives on the box
+repo = "/srv/code/api"            # where that project lives on the box (`twr box project gpu api` finds and writes it)
 # runtime = "codex"               # runtime for this project's threads on that box
+# account = "work"               # also accounts, exclude_accounts: replace the project's on that box
+
+[boxes.sandbox]                   # example: a container the hub reaches through docker exec
+transport = "command"
+command = ["docker", "exec", "-i", "twr-sandbox"]            # never through a shell; `sh -c ...` is appended
+terminal_command = ["docker", "exec", "-i", "-t", "twr-sandbox"]   # for `twr box login`, `twr box project --clone`
+
+[boxes.lab]                       # example: a box whose runner connects to the hub
+token = "..."                     # the runner presents this; never logged; `twr runner token` makes one
+ssh = "me@lab-box"                # used by `twr attach` for threads on that box
 ```
 
 ## Notes on some keys
 
+`[accounts.<runtime>.<name>]`, `[account_policy.<runtime>]`, `[orchestrator] account` and a project's `account`, `accounts` and `exclude_accounts` are about several logins per runtime; see [accounts.md](accounts.md). Accounts work for `claude-code`, `codex` and `grok-build`. A pin that names an account the runtime doesn't have refuses the thread. `default_runtime` and a project's `runtime` take a runtime alone: write an account as `accounts.<runtime>` or `[account_policy.<runtime>] default` (only `[orchestrator] runtime` takes `claude-code:work`).
+
 `[orchestrator] project_reads` (default `true`) lets the orchestrator read your projects' committed files, and `read_deny` lists more file names it may never read, as globs: `*` within a path part, `**` across parts, `?` one character. A pattern without `/` matches a file name, `*.sqlite`, and one with `/` a path from the repository's top, `config/prod/**`. They add to the built-in secret names and never remove one. See [Reading your projects](orchestrator.md#reading-your-projects).
+
+`[orchestrator] memory` (default `true`) lets the orchestrator keep notes across its sessions, on any runtime, in the workspace's data directory. `false` refuses its memory tools and loads nothing into its sessions; the notes stay, and `twr memory` still shows and changes them. See [orchestrator.md](orchestrator.md#memory).
 
 `default_runtime`, `[projects.<name>] runtime` and `[orchestrator] runtime` take the same values as `twr thread new --runtime`. A thread's runtime is the one given on the command line, else its project's, else `default_runtime`. See [runtimes.md](runtimes.md).
 
@@ -159,7 +217,7 @@ repo = "/srv/code/api"            # where that project lives on the box
 
 When `[orchestrator] runtime` isn't set and no orchestrator exists yet, the TUI asks which agent should run it the first time it opens. See [tui.md](tui.md#choosing-the-orchestrator).
 
-The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the TUI captures the mouse: a drag copies text from one pane, without borders, and the wheel scrolls. Shift-drag, or Option-drag in iTerm2, still uses the terminal's own selection. `/mouse` toggles it while the TUI runs. See [tui.md](tui.md#mouse).
+The TUI reads `[tui]` when it opens; the hub ignores it. Its [settings](tui.md#settings) (`/settings`) change `suggest`, `summaries`, `card_order`, `colors`, `compact_width` and `[tui.notify] terminal` while it runs and write them back here, changing that one line and nothing else of the file, or leave the file alone and say why when they can't be sure of that. With `mouse = true` the TUI captures the mouse: a drag copies text from one pane, without borders, and the wheel scrolls. Shift-drag, or Option-drag in iTerm2, still uses the terminal's own selection. `/mouse` toggles it while the TUI runs. See [tui.md](tui.md#mouse).
 
 `animate = true` animates the working cursor on whatever is running a turn: worker cards, grid tiles, and the main pane's header while the orchestrator or the thread you dived into works, plus the cursor where that thread's next text will appear. The TUI then redraws about eight times a second, but only while an icon is on screen. With `false` the same places show a still `_` and the TUI redraws only when something changes. See [tui.md](tui.md#what-is-working).
 
@@ -169,9 +227,17 @@ The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the
 
 `compact_width` is the width, in columns, below which the TUI shows one screen at a time: the conversation, what needs you, or the threads, switched with `/c`, `/n` and `/t`. It's meant for a phone over SSH or mosh. 0 turns it off; `/compact on|off` overrides it while the TUI runs. See [tui.md](tui.md#on-a-phone).
 
+`suggest` (on by default) has the TUI suggest your next message: after a turn of the thread you see ends, the hub asks a small model, through Claude Code's or Codex's CLI with your login, for a likely next message, which shows as ghost text in the empty input box until Tab or → takes it. The thread's own runtime answers when it is one of those two, else Claude Code, and the other only once the first turned out unable to run at all (from the next suggestion on). It sends that turn's prompt and the end of its reply to that runtime's provider (Anthropic or OpenAI), about $0.0002 a suggestion at list price, counted toward your plan's usage on a subscription: the TUI says so the first time a suggestion is due, before it asks for one. Without either CLI, or a login, on the hub's machine nothing is sent, and the TUI says so once. Set `suggest = false` to turn them off. `suggest_model` names the model for each runtime: `claude-code` (`claude-haiku-5-5` by default; any name `claude --model` takes) and `codex` (`gpt-6-luna` by default; any name in `codex debug models`); a plain string names Claude Code's. Only small models: a Claude Code model that isn't a Haiku, or a Codex one that isn't a Luna, mini or nano, is never used, nor replaced by the other runtime, and the hub warns about it when it starts (`hub.info` `warnings`). `/suggest on|off` turns it on or off while the TUI runs. See [tui.md](tui.md#suggestions).
+
+The TUI folds a thread's routine updates in the orchestrator conversation (interim reports, background work finishing, the hub waking it) into one row; `summaries` (on by default) has the same small model write that row's text: one line on where the thread is. The hub sends it the thread's name, state, what it is doing now and the text of those updates, never an item, a message of yours or a prompt, to the provider of the runtime that answers, with `suggest_model`'s models, at about what a suggestion costs. `summary_every` (`"5m"` by default, `"1m"` at least) is the shortest time between two summaries of one thread; a thread whose updates and activity didn't change gets none. The TUI says what summaries send the first time one is due, before it asks. With `summaries = false`, or without a CLI or login, the row reads as the newest update and how many there were. `/summaries on|off` turns them on or off while the TUI runs. See [tui.md](tui.md#routine-updates-and-summaries) and [security-model.md](security-model.md#thread-summaries).
+
+`colors` says how deep the TUI's colors go. `"auto"` (the default) decides when the TUI opens: none when `NO_COLOR` is set and not empty, else 256 when `COLORTERM` is set or `TERM` says so (`xterm-256color`), else 16 for a `TERM` with only those (`linux`, `xterm`, `screen`, ...), else 256. `"256"`, `"16"` and `"none"` set it. With 16, threads have no color of their own; with none, the TUI uses bold, dim, reverse video and border shapes only. See [tui.md](tui.md#colors).
+
 `[tui.notify]` has the TUI alert its terminal, with a bell or a desktop notification, when something needs you and the terminal isn't focused. The TUI reads it from the config of the machine it runs on. See [tui.md](tui.md#notifications).
 
-`default_mode` is passed to the runtime as its permission mode. The default, `auto`, is the agent's own auto mode: the agent decides which tool calls need asking, and whatever it asks comes to you as a permission card. twr itself still never answers a prompt. Set `manual` to have every edit and command that needs approval ask you. It isn't free text. The hub checks it when it starts and keeps it in its canonical spelling. An unknown mode is a config error and the hub doesn't start. Creating a thread on a runtime that can't take the mode fails. `twr mode <thread> <mode>` changes one thread's mode later. The orchestrator never runs in `auto`, whatever this says: it only asks. [runtimes.md](runtimes.md#permission-modes) lists the modes and how each runtime maps them.
+`default_mode` is passed to the runtime as its permission mode. The default, `auto`, is the agent's own auto mode: the agent decides which tool calls need asking, and whatever it asks comes to you as a permission card, except that a Codex thread's reviewer agent answers what its sandbox doesn't allow (`[codex] auto`, below). twr itself still never answers a prompt. Set `manual` to have every edit and command that needs approval ask you. It isn't free text. The hub checks it when it starts and keeps it in its canonical spelling. An unknown mode is a config error and the hub doesn't start. Creating a thread on a runtime that can't take the mode fails. `twr mode <thread> <mode>` changes one thread's mode later. The orchestrator never runs in `auto`, whatever this says: it only asks. [runtimes.md](runtimes.md#permission-modes) lists the modes and how each runtime maps them.
+
+`[codex] auto` decides who answers when a Codex thread in `auto` asks to run a command its sandbox doesn't allow: `auto_review` (the default) lets Codex's own reviewer agent approve or deny it without asking you, and the thread's transcript shows each decision; `ask` makes it a permission card for you; `never` asks nobody, so the command fails. `[projects.<name>] codex_auto` overrides it for that project's threads, and other runtimes and modes ignore both. `auto_review` lets commands run outside the sandbox that you never see first: set `auto = "ask"` to answer them yourself; [runtimes.md](runtimes.md#who-answers-when-the-sandbox-says-no) and [security-model.md](security-model.md#codex-auto) say what each value allows.
 
 `park_disposable` lists ignored paths that parking may delete along with a clean worktree. `name/` matches any directory with that name, and `name` matches any path component. Any other ignored file keeps the worktree. On Linux and macOS, deleting a thread deletes the same entries (its build output) instead of moving them to the trash, unless one holds a git repository or might ([usage.md](usage.md#delete-threads)). On other systems they go to the trash with the rest. `twr trim` deletes them too. See [worktrees.md](worktrees.md).
 
@@ -183,15 +249,27 @@ The TUI reads `[tui]` when it opens; the hub ignores it. With `mouse = true` the
 
 `cpu_weight` and `memory_high` limit the workers on the hub's machine. Both are off by default. See [usage.md](usage.md#resource-limits).
 
-`disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts. 0 turns both off. See [worktrees.md](worktrees.md#disk-use).
+`idle_compaction` is what the hub does when a worker's prompt cache has expired and its context is large (200 000 tokens or more; only Claude Code reports a cache). With `"ask"`, the default, the hub holds your message or the orchestrator's to such a worker and asks you on a card whether to compact its context first: `Compact first`, `Send as is` or `Don't ask for <thread>`. `"before_expiry"` does the same, and also has the hub compact an idle worker's context itself within the 5 minutes before a cache of an hour or more expires, so the compaction reads it from the cache: the one case where the hub compacts a context without being asked each time. `"off"` does neither. `twr compact <thread> --offers on|off` turns the offers on or off for one thread. Any other value is a config error. See [runtimes.md](runtimes.md#the-prompt-cache).
+
+`disk_warn_gb` is the free disk, in GB, under which the hub raises a disk card for a box: how much is left where the box keeps its worktrees, and the idle threads whose build output `Trim` would delete. The TUI's status bar says so too while it lasts, and `twr box doctor` warns under it. 0 turns them off. See [worktrees.md](worktrees.md#disk-use).
 
 `[trash] keep_days` is how long a deleted thread's worktree, record and branch stay in the trash of its box before the hub purges them. The hub checks when it starts and every hour, on every box that is online; a box that is offline is purged at the first check after it reconnects. `twr trash empty` purges sooner, and `twr trash restore` brings a thread back until then. See [usage.md](usage.md#trash).
 
+`[log]` is what the hub keeps of its log in `twr.db`. What threads, turns, items, reports and decisions are (the control events) always stays. What the agents said, thought and did (the agent events) moves out of `twr.db` into `archive.db` beside it once nothing reads it any more: a deleted thread's once its trash item is purged, and of any other thread, each turn's that ended more than `retention_days` ago and whose report (or, for the orchestrator, its outcome) is recorded. Each turn's final reply, every thread's last turn, and blobs a row that stays still points to stay. `retention_days` is 30 by default and at least 7: a remote box's recorded commands are resent for 6 days, and a resend reads its turn's events; twr refuses a config with less. With `archive = false` those events are deleted instead. The hub looks every hour and moves them once 2 000 or more can go; `twr log compact` does it now, and `twr log stats` says how big the log is and what would move. `twr events` reads archived events too; transcripts and the TUI's dive show an old turn's final reply but not its tool calls. An older twr (0.2.0 and before) refuses a config with a `[log]` table. See [architecture.md](architecture.md#archive-and-prune).
+
 A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can't be a built-in runtime name: `claude-code`, `codex`, `grok-build`, `acp`, `pty` or `fake`. `acp` is required. `attach` must contain `{session}`, which becomes the session id. `{mode}` becomes the thread's permission mode. twr refuses to attach a thread in a restricted mode, such as `plan`, through a template without `{mode}`, since the agent's CLI would then start in its own wider default mode. twr resolves the preset when the thread is created, so a later config change doesn't change an existing thread.
 
-`[boxes.<name>] token` must be at least 16 characters long. The hub refuses to start with a shorter one, and warns about one shorter than 32 in its log and in `twr info`. Other commands still load such a config, so after an upgrade `twr hub stop` still stops the old hub. To fix it, put a new token from `twr runner token` (64 characters) in the config and in the runner's token file, restart the hub (`twr hub stop`, then `twr`) and the runner. A config that holds a box token or a `[notify]` command holds a secret: keep it private with `chmod 600`. The hub warns at start, in its log and in `twr info`, when other users can access it (any group or other permission bit). See [runners.md](runners.md#set-it-up).
+`[boxes.<name>] token` must be at least 16 characters long. The hub refuses to start with a shorter one, and warns about one shorter than 32 in its log and in `twr info`. Other commands still load such a config, so after an upgrade `twr hub stop` still stops the old hub. To fix it, put a new token from `twr runner token` (64 characters) in the config and in the runner's token file, restart the hub (`twr hub stop`, then `twr`) and the runner. A config that holds a box token or a `[notify]` command holds a secret: keep it private with `chmod 600`. The hub warns at start, in its log and in `twr info`, when other users can access it (any group or other permission bit). `twr box add <name> --dial-in` writes a token box with a new token to `boxes.toml` instead (mode 0600), and `twr box token` shows or replaces it. Both files are checked for that warning, each for its own secrets: a token in `boxes.toml` is never blamed on `config.toml`. See [runners.md](runners.md#dial-in-boxes).
 
-`[boxes.<name>] ssh` is a destination `ssh` understands: `user@host` or a host from `~/.ssh/config`. Extra `ssh` arguments may come before it, separated by spaces, as in `-p 2222 me@host`.
+`[boxes.<name>] ssh` is a destination `ssh` understands: `user@host` or a host from `~/.ssh/config`. Extra `ssh` options may come before it (or after it), separated by spaces, as in `-p 2222 me@host`. They may set how ssh reaches the box: `-p`, `-i`, `-J`, `-F`, `-l`, `-4`, `-6`, `-C`, `-q`, `-v`, `-e`, `-b`, `-c`, `-m`, `-B`, `-I`, `-P`, and `-o` options such as `Port`, `IdentityFile`, `ProxyCommand` or `ProxyJump`. They may not forward anything, run a local command, share a connection or change what ssh runs or how, which twr decides (every ssh twr runs for a box, `twr attach`'s included, turns forwarding off; [security-model.md](security-model.md#ssh-boxes)): `-A`, `-X`, `-Y`, `-K`, `-L`, `-R`, `-D`, `-W`, `-w`, `-M`, `-S`, `-O`, `-N`, `-s`, `-f`, `-t`, `-T`, `-n`, `-G`, `-Q`, `-V`, `-E`, `-y`, and `-o` with `ForwardAgent`, `ForwardX11`, `ForwardX11Trusted`, `GSSAPIDelegateCredentials`, `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`, `Tunnel`, `TunnelDevice`, `PermitLocalCommand`, `LocalCommand`, `BatchMode`, `StdinNull`, `RequestTTY`, `RemoteCommand`, `SessionType`, `ForkAfterAuthentication`, `ControlMaster`, `ControlPath`, `ControlPersist`, `Include`, `Match` or `Host` (in any case). Neither may `--` or a second word that isn't an option, which ssh would run on the box. twr reads the options as ssh does (`-qA` is `-q -A`, `-oForwardAgent=yes` is `-o ForwardAgent=yes`, `-o =ControlMaster=yes` sets `ControlMaster`), and refuses an `-o` whose option name it can't read. An SSH box with such a value is refused wherever the config is read, `twr box add` included; a token box's (only `twr attach` uses it) is refused when the hub starts or adds the box.
+
+`[boxes.<name>] transport` says how the hub and the box find each other. `"ssh"`: the hub connects to the box over ssh, installs twr there and runs a box daemon ([SSH boxes](runners.md#ssh-boxes)); such a box needs `ssh` and has no `token`. `"command"`: the hub runs the box's `command` and speaks the same box protocol over its stdin and stdout, as over ssh ([Container boxes](runners.md#container-boxes)); such a box needs `command` and has neither `token` nor `ssh`. `"token"`, or no `transport`: the box's runner connects to the hub's listener with the box's `token` ([Dial-in boxes](runners.md#dial-in-boxes)). `[boxes.<name>] build`, on SSH and command boxes only, is the build id (16 lowercase hex digits) of the twr that `twr box install` put on a box of another OS or CPU, which the hub runs there; a box of the hub's own OS and CPU runs the hub's build whatever it says.
+
+`[boxes.<name>] command` (command boxes only, and required there) is the program and its arguments, an array of strings: `["docker", "exec", "-i", "<container>"]`. The hub runs it without a shell, with `sh`, `-c` and its script appended, from its own environment, without a terminal. At least one word, none empty and none with a NUL. Programs that hand their arguments to a shell on the far end are refused: a program named `ssh`, one whose first argument is `ssh` (`tailscale ssh`, `az ssh`), or the words `compute ssh` (`gcloud compute ssh`); make such hosts SSH boxes. It must pass its input to the box and give it no terminal (`-i`, no `-t`), which the hub checks on each attempt. Keep secrets out of it (`-e KEY=value`): `ps` shows it; give them to the container (`docker run --env-file`). `[boxes.<name>] terminal_command` (optional, command boxes only, the same checks) is what `twr box login` and `twr box project --clone` run in your terminal, usually `command` with `-t` (`twr box add --command` writes it for `docker`, `podman`, `nerdctl` and `kubectl exec`); without it those two are refused. A change to either needs a hub restart.
+
+### boxes.toml
+
+`twr box add`, `twr box install`, `twr box remove`, `twr box project` and `twr box token --rotate` write `boxes.toml`, next to `config.toml`, never `config.toml` itself. It holds `[boxes.<name>]` tables only, token boxes among them (`twr box add --dial-in`): it is written with mode 0600, and the hub warns when other users can access it while it holds a token, and every command and hub reads it together with `config.toml`, as if its boxes were there. A box named in both files is an error. twr rewrites the file whole, keeping every table and key but not comments, and takes a lock (`boxes.toml.lock`) while it reads and writes it, so two commands at once don't lose a change. `twr box project <box> <project>` writes a box's `[boxes.<box>.projects.<project>] repo` once it found the repository on the box, or cloned it there ([runners.md](runners.md#projects-on-a-box)), and `--remove` takes the entry out; you may also edit the file yourself, for example to add such entries. A box you configure by hand can just as well live in `config.toml` (`twr box project` then prints the lines to add there). A hub reads both files when it starts; `twr box add` adds a box to a running hub, `twr box project` has it read the box's projects again, `twr box token --rotate`, `--reload` and `twr box remove` have it take a token box's token from them again (or none), and any other change to a box needs a hub restart.
 
 ## Environment variables
 
@@ -200,7 +278,11 @@ A `[runtimes.<name>]` name is 1 to 64 letters, digits, `-`, `_` or `.`, and can'
 | `TWR_HOME` | put the config, the data directory and the socket under this directory |
 | `TWR_WORKSPACE` | the [workspace](workspaces.md) commands run in when `-w` doesn't say (default: `default`); a workspace's hub sets it for what it starts |
 | `TWR_RUNNER_TOKEN` | the runner's token when `twr runner` has no `--token-file` |
-| `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` |
+| `TWR_CLAUDE_BIN`, `TWR_CODEX_BIN`, `TWR_GROK_BIN` | the agent binary to run instead of `claude`, `codex` or `grok` on `PATH` (on a remote box, the login shell's `PATH` and then the runner's: [runners.md](runners.md#the-login-shells-path)) |
+| `TWR_AGENT_PROBE` | `off` keeps the hub from checking its own box's agent CLIs: no `claude`, `codex` or `grok` runs for it, and `hub.info` reports the local box's agents as not reported (an empty list). Any other value, or none, leaves the check on. For tests and troubleshooting |
+| `TWR_BOX_PROBE` | in a runner's environment (`twr runner`, an SSH box's daemon): `off` keeps it from asking your login shell for its `PATH` (the runtimes keep the runner's own) and from checking its agent CLIs (it reports none to the hub); a remote attach (`twr runner --exec`), `twr box login` and `twr box doctor`'s look at the box's agents then skip the login shell too, so they find the agent the runner does. Any other value, or none, leaves both on. For tests and troubleshooting |
+| `TWR_SSH` | the ssh program the hub and `twr box` run for SSH boxes, instead of `ssh` on `PATH` (it gets the same arguments); not used for command boxes |
+| `TWR_BOX_LAUNCHER` | on an SSH box, in the environment ssh commands get there: `setsid` makes the relay start the box daemon in a new session, never as a systemd user service or a launchd job; `launchd` makes it start the daemon as a launchd job in your GUI session and fail rather than start it any other way (an error off macOS; see [Mac boxes](runners.md#mac-boxes)). For tests and troubleshooting |
 | `VISUAL`, `EDITOR` | the editor for `twr context edit` |
 | `RUST_LOG` | the log filter of `twr hub` and `twr runner` (default `info`) and `twr mcp` (default `warn`), e.g. `debug` or `twr_hub=debug`. They log to stderr; a hub that `twr` starts in the background logs to `hub.log` in the data directory |
 

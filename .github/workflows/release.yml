@@ -173,7 +173,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q qemu-user-static
+          sudo apt-get install -y -q qemu-user
 
       - name: Build
         shell: bash
@@ -208,7 +208,7 @@ jobs:
             x86_64-unknown-linux-musl | aarch64-apple-darwin) ;;
             aarch64-unknown-linux-musl)
               qemu=$(command -v qemu-aarch64-static || command -v qemu-aarch64 || true)
-              [ -n "$qemu" ] || { echo "::error::qemu-user-static installed no qemu-aarch64"; exit 1; }
+              [ -n "$qemu" ] || { echo "::error::qemu-user installed no qemu-aarch64"; exit 1; }
               run=("$qemu")
               ;;
             x86_64-apple-darwin)

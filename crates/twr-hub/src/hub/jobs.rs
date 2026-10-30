@@ -27,7 +27,9 @@
 //! started it reports an interim report, and the thread's activity line names it. Unlike a
 //! runtime's own tasks it outlives the runtime (a settings restart, a crash), and neither a
 //! settings restart nor an automatic retry waits for it. While it runs the hub renews it every
-//! [`PROGRESS_EVERY`] (`queued (2 ahead)`, `running 6m`). It ends with a `task.updated`
+//! [`PROGRESS_EVERY`] (`queued (2 ahead)`, `running 6m 0s`); what the hub shows of it (the
+//! activity line, `thread.get`) is what it does now, read off the job itself
+//! ([`Core::job_description`]). It ends with a `task.updated`
 //! (`running: false`) whose `ext.twr.job` says how: `{id, name, argv, outcome: exited |
 //! cancelled | timed_out | failed_to_start | lost, exit?, signal?, duration_ms?, log, why?}`.
 //!
@@ -63,10 +65,15 @@ use twr_core::event::*;
 use twr_core::proto::{codes, RpcError};
 use twr_core::reduce::BackgroundTask;
 
+use super::shell::{
+    shell_output, shell_prompt, shell_record, SHELL_RECORD_BYTES, SHELL_SHARE_BYTES,
+};
 use super::{rpc, twr_ext_map, Core, Inner};
 
-/// How often a running or queued job renews its task (liveness, and what it says now).
-pub const PROGRESS_EVERY: Duration = Duration::from_secs(60);
+/// How often a running or queued job renews its task (liveness, and what it says now): for the
+/// log only. What the hub shows of a job it runs is read off the job ([`Core::job_description`]),
+/// and a stall asks whether the hub runs it ([`Core::runs_jobs_of`]).
+pub const PROGRESS_EVERY: Duration = Duration::from_secs(5 * 60);
 /// How often the members of a running job's process group are read, and recorded when they
 /// changed ([`record_members`]).
 const GROUP_EVERY: Duration = Duration::from_secs(5);
@@ -111,6 +118,24 @@ pub struct JobStart {
     /// Prompt the thread when it ends (default true).
     #[serde(default)]
     pub wake: Option<bool>,
+    /// A `!` command the user runs from the TUI (`shell.run`, `hub::shell`): never from
+    /// `job.start`'s parameters.
+    #[serde(skip)]
+    pub shell: Option<ShellJob>,
+}
+
+/// What makes a job a user's `!` command (`hub::shell`): it runs at once (no slots, no queue),
+/// on the orchestrator's thread too, in `cwd` there; its end records the end of its output;
+/// and only when the user shared it (`!!`) does its thread get a prompt, one that quotes the
+/// command and its output as such.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellJob {
+    /// The command line, as typed after `!` (run with `$SHELL -c`).
+    pub command: String,
+    /// Where it runs: the orchestrator view's folder (the thread's worktree when `None`).
+    pub cwd: Option<PathBuf>,
+    /// Its command and output go to the thread when it ends (`!!`).
+    pub share: bool,
 }
 
 /// The hub's jobs (memory only: a job the hub did not see end is `lost` at the next start).
@@ -150,6 +175,12 @@ pub(super) struct JobRt {
     slots: usize,
     cwd: PathBuf,
     env: Vec<(String, String)>,
+    /// The variables its process must not inherit (its thread's account's stray
+    /// credentials, [`twr_core::adapter::SpawnConfig::env_remove`]), removed after `env`.
+    env_remove: Vec<String>,
+    /// The account its environment is for: its thread's when it was asked for
+    /// ([`JobAccount`]). Checked again right before it starts ([`Core::job_at_launch`]).
+    account: JobAccount,
     timeout: Option<Duration>,
     wake: bool,
     log: PathBuf,
@@ -157,6 +188,8 @@ pub(super) struct JobRt {
     cancel: Arc<Cancel>,
     /// Since when it runs (`None`: queued).
     started: Option<Instant>,
+    /// A user's `!` command ([`ShellJob`]).
+    shell: Option<ShellJob>,
     /// Its directory held on the box ([`twr_runner::workdirs`]): no removal or trim of it
     /// runs while the job is queued or runs.
     _workdir: Option<twr_runner::workdirs::WorkdirUse>,
@@ -279,6 +312,18 @@ fn duration_text(d: Duration) -> String {
     }
 }
 
+/// What a job (`what`: `job`, or `!` for a user's command) named `name` that ran `ran` does,
+/// as the hub shows it: `running`, then the whole minutes it ran (`running 6m 0s`).
+fn running_text(what: &str, name: &str, ran: Duration) -> String {
+    match ran.as_secs() / 60 * 60 {
+        0 => format!("{what} {name}: running"),
+        s => format!(
+            "{what} {name}: running {}",
+            duration_text(Duration::from_secs(s))
+        ),
+    }
+}
+
 /// A job's name for people: given, else its command's first two words.
 fn job_name(argv: &[String], name: Option<&str>) -> String {
     match name.map(str::trim).filter(|n| !n.is_empty()) {
@@ -340,14 +385,22 @@ pub(super) fn tail(path: &Path, lines: usize) -> std::io::Result<String> {
     let mut buf = Vec::new();
     f.take(TAIL_BYTES).read_to_end(&mut buf)?;
     let text = String::from_utf8_lossy(&buf);
-    // A cut first line is no line.
-    let text = if from > 0 {
-        text.split_once('\n').map_or("", |(_, rest)| rest)
-    } else {
-        &text
+    // A cut first line is no line; but when the cut falls inside the last line, a long one,
+    // its end is the output, marked as cut.
+    let (text, cut) = match text.split_once('\n') {
+        Some((_, rest)) if from > 0 && !rest.trim().is_empty() => (rest.to_string(), false),
+        _ if from > 0 => (text.into_owned(), true),
+        _ => (text.into_owned(), false),
     };
     let all: Vec<&str> = text.lines().collect();
     let text = all[all.len().saturating_sub(lines)..].join("\n");
+    if cut {
+        let mark = "…";
+        return Ok(format!(
+            "{mark}{}",
+            keep_end(text, TAIL_BYTES as usize - mark.len())
+        ));
+    }
     Ok(keep_end(text, TAIL_BYTES as usize))
 }
 
@@ -387,7 +440,123 @@ fn open_log(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+/// What a job starts with ([`Core::job_at_launch`]).
+pub(super) struct Launch {
+    argv: Vec<String>,
+    cwd: PathBuf,
+    env: Vec<(String, String)>,
+    env_remove: Vec<String>,
+    log: PathBuf,
+    timeout: Option<Duration>,
+    name: String,
+    /// A `!` command's, not a job's ([`JobRt::shell`]).
+    shell: bool,
+    /// The account `env` is for ([`JobRt::account`]): checked again at its gate ([`release`]).
+    account: JobAccount,
+}
+
+/// The account a job's environment is for: its thread's runtime (an account of another
+/// runtime in the same directory is another environment: `CODEX_HOME`, not
+/// `CLAUDE_CONFIG_DIR`, and that runtime's removals), the named account (`None`: the native
+/// one), that account's directory as the thread recorded it ([`Core::account_dir`]) and the
+/// path the environment gives it by ([`Core::account_env_dir`]: the same account through
+/// another path to that directory, after a move, is another environment, a runtime keying its
+/// login on the path).
+pub(super) type JobAccount = (String, Option<String>, Option<PathBuf>, Option<PathBuf>);
+
 impl Core {
+    /// Thread `view`'s [`JobAccount`] now.
+    fn job_account(&self, view: &twr_core::reduce::ThreadView) -> JobAccount {
+        (
+            view.runtime.clone(),
+            view.account.clone(),
+            self.account_dir(view),
+            self.account_env_dir(view),
+        )
+    }
+
+    /// What job `id` starts with, read right before it starts (it may have waited for its
+    /// slots): its argv, directory, environment and removals, log, timeout, name, and the
+    /// account that environment is for. Its thread's account is checked again as a runtime's
+    /// start is ([`Core::refuse_account`]: one removed meanwhile, or now in another directory,
+    /// refuses it with that message); a thread that moved to another account meanwhile (or
+    /// to another runtime's account of the same name and directory, or to its account through
+    /// another path to its directory) gets that account's environment. `None` for a job that
+    /// is gone.
+    pub(super) fn job_at_launch(
+        &mut self,
+        hub: &Inner,
+        id: &str,
+    ) -> Option<Result<Launch, String>> {
+        let thread = self.jobs.jobs.get(id)?.thread.clone();
+        if let Some(view) = self.registry.get(&thread).cloned() {
+            if let Err(e) = self.refuse_account(&view) {
+                return Some(Err(e.message));
+            }
+            let now = self.job_account(&view);
+            if self.jobs.jobs.get(id)?.account != now {
+                let cfg = self.spawn_config(hub, &view);
+                let j = self.jobs.jobs.get_mut(id)?;
+                // Its own variables (the thread's and its marker) first, as when it was asked.
+                let mut env: Vec<(String, String)> = j
+                    .env
+                    .iter()
+                    .filter(|(k, _)| k == super::THREAD_ENV || k == super::AGENT_ENV)
+                    .cloned()
+                    .collect();
+                env.extend(cfg.env);
+                j.env = env;
+                j.env_remove = cfg.env_remove;
+                j.account = now;
+            }
+        }
+        let j = self.jobs.jobs.get(id)?;
+        Some(Ok(Launch {
+            argv: j.argv.clone(),
+            cwd: j.cwd.clone(),
+            env: j.env.clone(),
+            env_remove: j.env_remove.clone(),
+            log: j.log.clone(),
+            timeout: j.timeout,
+            name: j.name.clone(),
+            shell: j.shell.is_some(),
+            account: j.account.clone(),
+        }))
+    }
+
+    /// Why job `id`'s command, whose environment is for `account` ([`Launch::account`]), must
+    /// not run now that its gate opens ([`release`]): its thread's account refused
+    /// ([`Core::refuse_account`]: removed or unusable while the job was starting), or the
+    /// thread moved to another account (or runtime, or directory) meanwhile, so its
+    /// environment is another account's (said `<thread> moved to <runtime>:<account> while the
+    /// job started; run it again`), or to its account through another path to its directory
+    /// (said `<thread> moved to <runtime>:<account> through <path> while the job started; run
+    /// it again`). `None`: it may run.
+    fn refuse_job_account(&self, thread: &str, account: &JobAccount) -> Option<String> {
+        let view = self.registry.get(thread)?;
+        if let Err(e) = self.refuse_account(view) {
+            return Some(e.message);
+        }
+        let now = self.job_account(view);
+        if now == *account {
+            return None;
+        }
+        // Named as the labels name it (`AccountsView::label`).
+        let label = self.accounts.label(&view.runtime, view.account.as_deref());
+        let through = match (&now, account) {
+            ((r, a, d, Some(path)), (was_r, was_a, was_d, _))
+                if (r, a, d) == (was_r, was_a, was_d) =>
+            {
+                format!(" through {}", path.display())
+            }
+            _ => String::new(),
+        };
+        Some(format!(
+            "{} moved to {label}{through} while the job started; run it again",
+            view.name
+        ))
+    }
+
     /// The jobs directory (`<data>/jobs`).
     fn jobs_dir(hub: &Inner) -> PathBuf {
         hub.db_path
@@ -422,8 +591,28 @@ impl Core {
         self.refuse_retired(id)?;
         self.refuse_deleting(id)?;
         let name = view.name.clone();
-        if view.is_orchestrator() {
+        let shell = req.shell.clone();
+        // A `!` command is the user's, from `shell.run` only.
+        if shell.is_some() != (by == JobBy::Shell) {
+            return Err(rpc(
+                codes::BAD_REQUEST,
+                "a `!` command comes from shell.run only",
+            ));
+        }
+        // The orchestrator's view runs the user's `!` commands, recorded on its thread; its
+        // agent runs no job.
+        if view.is_orchestrator() && shell.is_none() {
             return Err(rpc(codes::BAD_REQUEST, "the orchestrator runs no jobs"));
+        }
+        if view.box_name != "local" && shell.is_some() {
+            return Err(rpc(
+                codes::CONFLICT,
+                format!(
+                    "{name} runs on box {}: `!` runs commands on the hub's own box only; \
+                     run it there with `twr attach {name}` or ssh",
+                    view.box_name
+                ),
+            ));
         }
         if view.box_name != "local" {
             return Err(rpc(
@@ -455,7 +644,7 @@ impl Core {
         if by == JobBy::Runtime && view.stopped {
             return Err(rpc(codes::CONFLICT, format!("{name} is stopped")));
         }
-        if by != JobBy::User {
+        if !by.is_user() {
             refuse_agent_job_mode(&view)?;
         }
         // Not while its worktree may go or change under it.
@@ -484,8 +673,13 @@ impl Core {
             }
         };
         let pool = self.slot_pool(hub);
-        let slots = req.slots.unwrap_or(1);
-        if slots == 0 || slots > pool.size() {
+        // A `!` command takes no slots: it runs at once, as typed in a terminal would.
+        let slots = if shell.is_some() {
+            0
+        } else {
+            req.slots.unwrap_or(1)
+        };
+        if shell.is_none() && (slots == 0 || slots > pool.size()) {
             return Err(rpc(
                 codes::BAD_REQUEST,
                 format!(
@@ -501,7 +695,14 @@ impl Core {
                 format!("{name} has {mine} jobs queued or running already"),
             ));
         }
-        let cfg = super::spawn_config(hub, &view);
+        // Not on an account that cannot run it (`hub::thread_account`).
+        self.refuse_account(&view)?;
+        let mut cfg = self.spawn_config(hub, &view);
+        // The orchestrator view's folder, which the user picked (`!cd`): it is no worktree.
+        let own_dir = shell.as_ref().and_then(|s| s.cwd.clone());
+        if let Some(dir) = &own_dir {
+            cfg.cwd = dir.clone();
+        }
         if !cfg.cwd.is_dir() {
             return Err(rpc(
                 codes::CONFLICT,
@@ -509,7 +710,7 @@ impl Core {
             ));
         }
         // Held from now until it ends: a removal or trim of its directory waits or is refused.
-        let workdir = match hub.hosts.get(&view.box_name) {
+        let workdir = match hub.host(&view.box_name).filter(|_| own_dir.is_none()) {
             Some(host) => host
                 .use_workdir(&cfg.cwd, id)
                 .map_err(|e| rpc(codes::CONFLICT, format!("{e:#}")))?,
@@ -532,15 +733,30 @@ impl Core {
             ],
         );
         let display = job_name(&req.argv, req.name.as_deref());
-        let ahead = self.jobs.queue.len();
+        let ahead = if shell.is_some() {
+            0
+        } else {
+            self.jobs.queue.len()
+        };
+        let wake = match &shell {
+            Some(s) => s.share,
+            None => req.wake.unwrap_or(true),
+        };
+        let mut record = json!({
+            "id": job, "name": display, "argv": req.argv, "slots": slots,
+            "log": log, "wake": wake, "by": by.recorded(&source, id),
+        });
+        if let Some(s) = &shell {
+            record["shell"] = shell_record(s, &cfg.cwd);
+        }
         let body = EventBody::TaskUpdated(TaskUpdated {
             task_id: format!("{JOB_TASK_PREFIX}{job}"),
             running: true,
-            description: format!("job {display}: queued ({ahead} ahead)"),
-            ext: twr_ext_map(json!({"job": {
-                "id": job, "name": display, "argv": req.argv, "slots": slots,
-                "log": log, "wake": req.wake.unwrap_or(true), "by": by.recorded(&source, id),
-            }})),
+            description: match &shell {
+                Some(_) => format!("! {display}: running"),
+                None => format!("job {display}: queued ({ahead} ahead)"),
+            },
+            ext: twr_ext_map(json!({ "job": record })),
             ..Default::default()
         });
         // Recorded by the hub, which runs it (a job's task is the hub's), saying who asked. Not
@@ -560,15 +776,21 @@ impl Core {
                 slots,
                 cwd: cfg.cwd.clone(),
                 env,
+                env_remove: cfg.env_remove.clone(),
+                account: self.job_account(&view),
                 timeout,
-                wake: req.wake.unwrap_or(true),
+                wake,
                 log: log.clone(),
                 cancel,
                 started: None,
+                shell: shell.clone(),
                 _workdir: workdir,
             },
         );
-        self.jobs.queue.push_back(job.clone());
+        // A `!` command waits for nothing: it is in no queue.
+        if shell.is_none() {
+            self.jobs.queue.push_back(job.clone());
+        }
         tokio::spawn(run_job(Arc::clone(hub), job.clone()));
         Ok(json!({
             "job": job,
@@ -577,6 +799,7 @@ impl Core {
             "name": display,
             "position": ahead,
             "log": log,
+            "cwd": cfg.cwd,
         }))
     }
 
@@ -680,6 +903,13 @@ impl Core {
                 "a thread's agent cancels only its own thread's jobs",
             ));
         }
+        // The user's `!` commands: only the user stops them.
+        if only.is_some() && self.jobs.jobs.get(&id).is_some_and(|j| j.shell.is_some()) {
+            return Err(rpc(
+                codes::RELAY_FORBIDDEN,
+                "a `!` command is the user's: only the user stops it",
+            ));
+        }
         if let Some(j) = self.jobs.jobs.get(&id) {
             j.cancel.cancel("cancelled", true);
         }
@@ -690,7 +920,18 @@ impl Core {
     /// nothing: whatever stopped it should not start it again.
     pub(super) fn cancel_jobs_of(&self, thread: &str, why: &str) -> usize {
         let mut n = 0;
-        for j in self.jobs.jobs.values().filter(|j| j.thread == thread) {
+        // The orchestrator's runtime stopping (a stop, a reset, a switch) leaves the user's `!`
+        // commands of its view running: they are no work of its.
+        let orch = self
+            .registry
+            .get(thread)
+            .is_some_and(|v| v.is_orchestrator());
+        for j in self
+            .jobs
+            .jobs
+            .values()
+            .filter(|j| j.thread == thread && !(orch && j.shell.is_some()))
+        {
             j.cancel.cancel(why, false);
             n += 1;
         }
@@ -707,6 +948,48 @@ impl Core {
     /// Whether thread `thread` has a job queued or running.
     pub(super) fn has_jobs(&self, thread: &str) -> bool {
         self.jobs.jobs.values().any(|j| j.thread == thread)
+    }
+
+    /// Whether this hub runs (or has queued) a job of thread `thread`'s own: not a `!` command
+    /// of the user's. Jobs never outlive their hub: one the log shows running that no job of
+    /// this hub is was lost ([`Core::close_lost_jobs`]).
+    pub(super) fn runs_jobs_of(&self, thread: &str) -> bool {
+        self.jobs
+            .jobs
+            .values()
+            .any(|j| j.thread == thread && j.shell.is_none())
+    }
+
+    /// What job task `task` (`job:<id>`) does now, when this hub runs it: `job <name>: queued
+    /// (N ahead)`, or `running` for how many whole minutes it ran (the line changes once a
+    /// minute, as the renewals once said it). `None` for any other task.
+    pub(super) fn job_description(&self, task: &str) -> Option<String> {
+        let id = task.strip_prefix(JOB_TASK_PREFIX)?;
+        let j = self.jobs.jobs.get(id)?;
+        let what = if j.shell.is_some() { "!" } else { "job" };
+        Some(match j.started {
+            Some(at) => running_text(what, &j.name, at.elapsed()),
+            None if j.shell.is_some() => running_text(what, &j.name, Duration::ZERO),
+            None => {
+                let ahead = self.jobs.queue.iter().position(|q| q == id).unwrap_or(0);
+                format!("job {}: queued ({ahead} ahead)", j.name)
+            }
+        })
+    }
+
+    /// `tasks` as this hub shows them now: the description of each job it runs is what the
+    /// job does now ([`Core::job_description`]).
+    pub(super) fn tasks_now<'a>(
+        &self,
+        tasks: impl Iterator<Item = (&'a String, &'a BackgroundTask)>,
+    ) -> Vec<String> {
+        tasks
+            .map(|(id, t)| {
+                self.job_description(id)
+                    .filter(|_| t.job)
+                    .unwrap_or_else(|| t.description.clone())
+            })
+            .collect()
     }
 
     /// Whether any job is queued or running.
@@ -762,8 +1045,8 @@ impl Core {
                 continue;
             }
             let hold = self.registry.get(&thread).cloned().and_then(|view| {
-                let cwd = super::spawn_config(hub, &view).cwd;
-                let host = hub.hosts.get(&view.box_name)?;
+                let cwd = self.spawn_config(hub, &view).cwd;
+                let host = hub.host(&view.box_name)?;
                 host.use_workdir(&cwd, &thread).ok().flatten()
             });
             tracing::error!(
@@ -824,7 +1107,8 @@ impl Core {
                 .registry
                 .get(&thread)
                 .is_none_or(|v| v.stopped || v.parked);
-            let told = !(job.quiet || resting)
+            // The user's `!` commands are theirs: an agent is never asked to run one again.
+            let told = !(job.quiet || job.shell || resting)
                 && {
                     let prompt = format!(
                         "[twr job {id}] {description}: lost, the hub stopped while it ran. Run it \
@@ -888,16 +1172,23 @@ pub(super) enum JobBy {
     Runtime,
     /// A process of the CLI attached to the thread.
     Attach,
+    /// A user client's `!` command (`shell.run`).
+    Shell,
 }
 
 impl JobBy {
+    /// Whether the user asked for it (a job or a `!` command): no agent's mode rules.
+    fn is_user(self) -> bool {
+        matches!(self, JobBy::User | JobBy::Shell)
+    }
+
     /// Who asked for a job of thread `thread`, as its task records it (`ext.twr.job.by`):
     /// `user:<client>` (`source`) for a user, `agent:<thread id>` for the thread's runtime,
     /// `attach:<thread id>` for the CLI attached to it. An agent's connection says
     /// `user:<client>` as its source too, so its own is not what it is.
     fn recorded(self, source: &Source, thread: &str) -> String {
         match self {
-            JobBy::User => source.to_string(),
+            JobBy::User | JobBy::Shell => source.to_string(),
             JobBy::Runtime => format!("agent:{thread}"),
             JobBy::Attach => format!("attach:{thread}"),
         }
@@ -983,15 +1274,30 @@ fn signal_group(pgid: u32, sig: &str) {
 /// Runs job `id`: waits for its turn and its slots, runs it, records how it ended, and wakes
 /// its thread.
 async fn run_job(hub: Arc<Inner>, id: String) {
-    let Some((cancel, slots_wanted, name)) = ({
+    let Some((cancel, slots_wanted, name, shell)) = ({
         let core = hub.core();
-        core.jobs
-            .jobs
-            .get(&id)
-            .map(|j| (Arc::clone(&j.cancel), j.slots, j.name.clone()))
+        core.jobs.jobs.get(&id).map(|j| {
+            (
+                Arc::clone(&j.cancel),
+                j.slots,
+                j.name.clone(),
+                j.shell.is_some(),
+            )
+        })
     }) else {
         return;
     };
+    // A `!` command runs at once: no turn to wait for, no slots.
+    if shell {
+        let started = Instant::now();
+        let outcome = if cancel.is_set() {
+            Outcome::Cancelled(cancel.why())
+        } else {
+            run_process(&hub, &id, &cancel, started).await
+        };
+        finish(&hub, &id, outcome, started.elapsed()).await;
+        return;
+    }
     let pool = hub.core().slot_pool(&hub);
     let moved = Arc::clone(&hub.core().jobs.moved);
     // 1. Its turn, and its slots.
@@ -1055,20 +1361,21 @@ async fn run_job(hub: Arc<Inner>, id: String) {
 
 /// Starts job `id`'s process and waits for its end, renewing its task meanwhile.
 async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Instant) -> Outcome {
-    let Some((argv, cwd, env, log, timeout, name)) = ({
-        let core = hub.core();
-        core.jobs.jobs.get(id).map(|j| {
-            (
-                j.argv.clone(),
-                j.cwd.clone(),
-                j.env.clone(),
-                j.log.clone(),
-                j.timeout,
-                j.name.clone(),
-            )
-        })
-    }) else {
-        return Outcome::Cancelled("gone".into());
+    let launch = hub.core().job_at_launch(hub, id);
+    let Launch {
+        argv,
+        cwd,
+        env,
+        env_remove,
+        log,
+        timeout,
+        name,
+        shell,
+        account,
+    } = match launch {
+        None => return Outcome::Cancelled("gone".into()),
+        Some(Err(why)) => return Outcome::FailedToStart(why),
+        Some(Ok(j)) => j,
     };
     let out = match open_log(&log) {
         Ok(f) => f,
@@ -1081,12 +1388,16 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
         Err(e) => return Outcome::FailedToStart(format!("cannot open its log: {e}")),
     };
     // Its whole environment, as its thread's runtime gets it: the hub's, with the job's
-    // variables over it, without what is scrubbed from a runtime's. A hub started in a thread
-    // has its runtime's generation: a job of its own must not match that runtime's cleanup.
+    // variables over it, without its account's stray credentials (`env_remove`) and what is
+    // scrubbed from a runtime's. A hub started in a thread has its runtime's generation: a
+    // job of its own must not match that runtime's cleanup.
     let mut vars: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
         std::env::vars_os().collect();
     for (k, v) in &env {
         vars.insert(k.into(), v.into());
+    }
+    for k in &env_remove {
+        vars.remove(std::ffi::OsStr::new(k));
     }
     for k in twr_adapters::process::SCRUBBED_ENV
         .iter()
@@ -1128,7 +1439,7 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
         if cancel.is_set() {
             return Outcome::Cancelled(cancel.why());
         }
-        if by != JobBy::User {
+        if !by.is_user() {
             if let Some(Err(e)) = core.registry.get(&thread).map(refuse_agent_job_mode) {
                 return Outcome::FailedToStart(e.message);
             }
@@ -1137,7 +1448,18 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
             j.started = Some(started);
         }
     }
-    let spawned = gated_spawn(hub, id, &name, &cwd, &vars, &command, (out, err), cancel).await;
+    let spawned = gated_spawn(
+        hub,
+        id,
+        &name,
+        &account,
+        &cwd,
+        &vars,
+        &command,
+        (out, err),
+        cancel,
+    )
+    .await;
     let mut child = match spawned {
         Ok(c) => c,
         Err(o) => return o,
@@ -1165,7 +1487,8 @@ async fn run_process(hub: &Arc<Inner>, id: &str, cancel: &Cancel, started: Insta
             _ = cancel.cancelled() => break Outcome::Cancelled(cancel.why()),
             _ = sleep_until_opt(deadline) => break Outcome::TimedOut,
             _ = renew.tick() => {
-                progress(hub, id, format!("job {name}: running {}", duration_text(started.elapsed())), true);
+                let what = if shell { "!" } else { "job" };
+                progress(hub, id, format!("{what} {name}: running {}", duration_text(started.elapsed())), true);
             }
             _ = snapshot.tick(), if reading.is_none() => {
                 let hook = hub.job_members_hook.clone();
@@ -1229,8 +1552,9 @@ async fn gate_line(sock: &std::os::unix::net::UnixStream) -> Option<String> {
 }
 
 /// Starts job `id`'s command `command` (its words, the program first) in `cwd` with
-/// environment `vars` (all of it) and output to `out` / `err`, as the leader of a process
-/// group of its own, held at its start gate ([`crate::job_gate`], run from
+/// environment `vars` (all of it) and output to `out` / `err`, as the leader of a session and
+/// process group of its own (no controlling terminal: a command that reads the terminal of
+/// whoever started the hub gets an error instead of being stopped), held at its start gate ([`crate::job_gate`], run from
 /// [`HubOptions::job_gate_exe`]) until its process group is recorded ([`release`]): so a later
 /// hub knows the group of every job whose command ran, and kills what is left of it when this
 /// hub stops without seeing the job end, also a process of it that cleared the `TWR_AGENT`
@@ -1260,6 +1584,7 @@ async fn gated_spawn(
     hub: &Arc<Inner>,
     id: &str,
     name: &str,
+    account: &JobAccount,
     cwd: &Path,
     vars: &std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     command: &[std::ffi::OsString],
@@ -1283,8 +1608,8 @@ async fn gated_spawn(
         .stdin(std::os::fd::OwnedFd::from(gate_end))
         .stdout(out)
         .stderr(err)
-        .process_group(0)
         .kill_on_drop(false);
+    twr_adapters::process::new_session(&mut cmd);
     let spawned = cmd.spawn();
     // The parent's copy of the gate's end goes with the command.
     drop(cmd);
@@ -1315,12 +1640,12 @@ async fn gated_spawn(
     if let Some(hook) = hub.job_gate_hook.clone() {
         let _ = tokio::task::spawn_blocking(move || hook(pid)).await;
     }
-    let start_time = match hub.hosts.get(super::LOCAL_BOX) {
-        Some(host) => crate::host::read_start_time(Arc::clone(host), pid).await,
+    let start_time = match hub.host(super::LOCAL_BOX) {
+        Some(host) => crate::host::read_start_time(host, pid).await,
         None => None,
     };
     let opened = match start_time {
-        Some(t) => release(hub, id, name, pid, t, cancel, &sock),
+        Some(t) => release(hub, id, name, account, (pid, t), cancel, &sock),
         None => Err(Outcome::FailedToStart(format!(
             "the start time of its process (pid {pid}) cannot be read: a later hub could not \
              tell what is left of it, so it does not run"
@@ -1345,18 +1670,21 @@ async fn gated_spawn(
 }
 
 /// Lets job `id`'s child, waiting at its gate ([`gated_spawn`]), run its command, under the
-/// hub's lock (the one a cancel and a mode change take), in this order: the job is still there
-/// and not cancelled; an agent's job's thread still is in a mode that may run commands; its
+/// hub's lock (the one a cancel, a mode change, an account's removal and a move take), in this
+/// order: the job is still there and not cancelled; an agent's job's thread still is in a mode
+/// that may run commands; its thread's account can still run it and is still `account`, the
+/// one its environment was built for ([`Core::refuse_job_account`]: removed, unusable or moved
+/// to while the gate was waited for, it fails to start, never having run its command); its
 /// process group, led by `pid` started at `start_time`, is recorded (its task's `running`
 /// update says `ext.twr.job.pgid` and `start_time`); the gate's line is written to `go`. A
-/// cancel or a mode change that comes after it finds the command running, and ends it as any
-/// running job's.
+/// cancel, a mode change or a move that comes after it finds the command running, and ends it
+/// (or not) as any running job's.
 fn release(
     hub: &Arc<Inner>,
     id: &str,
     name: &str,
-    pid: u32,
-    start_time: u64,
+    account: &JobAccount,
+    (pid, start_time): (u32, u64),
     cancel: &Cancel,
     mut go: &std::os::unix::net::UnixStream,
 ) -> Result<(), Outcome> {
@@ -1365,18 +1693,22 @@ fn release(
     let Some((thread, by)) = core.jobs.jobs.get(id).map(|j| (j.thread.clone(), j.by)) else {
         return Err(Outcome::Cancelled("gone".into()));
     };
+    let shell = by == JobBy::Shell;
     if cancel.is_set() {
         return Err(Outcome::Cancelled(cancel.why()));
     }
-    if by != JobBy::User {
+    if !by.is_user() {
         if let Some(Err(e)) = core.registry.get(&thread).map(refuse_agent_job_mode) {
             return Err(Outcome::FailedToStart(e.message));
         }
     }
+    if let Some(why) = core.refuse_job_account(&thread, account) {
+        return Err(Outcome::FailedToStart(why));
+    }
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),
         running: true,
-        description: format!("job {name}: running"),
+        description: format!("{} {name}: running", if shell { "!" } else { "job" }),
         ext: twr_ext_map(json!({"job": {"id": id, "pgid": pid, "start_time": start_time}})),
         ..Default::default()
     });
@@ -1424,7 +1756,7 @@ async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
 /// Records how job `id` ended and, unless it was told not to, prompts its thread: the two in
 /// one batch, retried a few times; the job stays listed until they are recorded.
 async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
-    let Some((thread, name, argv, log, wake)) = ({
+    let Some((thread, name, argv, log, wake, shell, cwd)) = ({
         let core = hub.core();
         core.jobs.jobs.get(id).map(|j| {
             (
@@ -1433,6 +1765,8 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
                 j.argv.clone(),
                 j.log.clone(),
                 j.wake && j.cancel.wakes(),
+                j.shell.clone(),
+                j.cwd.clone(),
             )
         })
     }) else {
@@ -1482,18 +1816,30 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
             format!("could not start: {why}"),
         ),
     };
+    let mut record = json!({
+        "id": id, "name": name, "argv": argv, "outcome": kind,
+        "exit": exit, "signal": signal, "duration_ms": took.as_millis() as u64,
+        "log": log,
+    });
+    // A `!` command's end keeps the end of what it printed: what the user saw, in the history.
+    if let Some(s) = &shell {
+        record["shell"] = shell_record(s, &cwd);
+        record["printed"] = json!(shell_output(&log, SHELL_RECORD_BYTES));
+    }
     let body = EventBody::TaskUpdated(TaskUpdated {
         task_id: format!("{JOB_TASK_PREFIX}{id}"),
         running: false,
-        description: format!("job {name}: {what}"),
-        ext: twr_ext_map(json!({"job": {
-            "id": id, "name": name, "argv": argv, "outcome": kind,
-            "exit": exit, "signal": signal, "duration_ms": took.as_millis() as u64,
-            "log": log,
-        }})),
+        description: match &shell {
+            Some(_) => format!("! {name}: {what}"),
+            None => format!("job {name}: {what}"),
+        },
+        ext: twr_ext_map(json!({ "job": record })),
         ..Default::default()
     });
     let prompt = wake.then(|| {
+        if let Some(s) = &shell {
+            return shell_prompt(s, &cwd, &what, &shell_output(&log, SHELL_SHARE_BYTES));
+        }
         let out = tail(&log, TAIL_LINES).unwrap_or_default();
         let output = if out.trim().is_empty() {
             "It printed nothing.".to_string()
@@ -1525,7 +1871,7 @@ async fn finish(hub: &Arc<Inner>, id: &str, outcome: Outcome, took: Duration) {
                 .jobs
                 .jobs
                 .get(id)
-                .is_some_and(|j| j.cancel.wakes() && (j.by == JobBy::User || !stopped));
+                .is_some_and(|j| j.cancel.wakes() && (j.by.is_user() || !stopped));
             let told = match prompt.as_ref().filter(|_| wakes) {
                 Some(p) => core
                     .push_prompt(&mut batch, &thread, p, TurnFrom::Runtime, Source::Hub, None)
@@ -1712,6 +2058,19 @@ mod tests {
         assert_eq!(duration_text(Duration::from_secs(45)), "45s");
         assert_eq!(duration_text(Duration::from_secs(372)), "6m 12s");
         assert_eq!(duration_text(Duration::from_secs(7380)), "2h 3m");
+        // Shown in whole minutes: the line changes once a minute.
+        assert_eq!(
+            running_text("job", "build", Duration::from_secs(59)),
+            "job build: running"
+        );
+        assert_eq!(
+            running_text("job", "build", Duration::from_secs(372)),
+            "job build: running 6m 0s"
+        );
+        assert_eq!(
+            running_text("!", "ls", Duration::from_secs(7399)),
+            "! ls: running 2h 3m"
+        );
         assert!(valid_job_id("01J0ABC"));
         assert!(!valid_job_id("../x") && !valid_job_id(""));
     }
@@ -1726,6 +2085,12 @@ mod tests {
         assert_eq!(t, "line 9997\nline 9998\nline 9999");
         std::fs::write(&p, "only\n").unwrap();
         assert_eq!(tail(&p, 40).unwrap(), "only");
+        // One line longer than the tail: its end, marked as cut, never nothing.
+        let long = format!("start{}end\n", "x".repeat(2 * TAIL_BYTES as usize));
+        std::fs::write(&p, long).unwrap();
+        let t = tail(&p, 40).unwrap();
+        assert!(t.starts_with('…') && t.ends_with("xend"), "{}", &t[..20]);
+        assert!(t.len() <= TAIL_BYTES as usize);
     }
 
     /// Output that is not UTF-8 reads as U+FFFD (three bytes for each byte): the text is cut

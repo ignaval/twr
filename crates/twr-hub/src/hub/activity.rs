@@ -22,6 +22,8 @@
 //! turn and the turn's prompt, both cut short) to the event before it is recorded, so the
 //! user can judge the request without asking the orchestrator ([`Core::request_context`]).
 
+use std::borrow::Cow;
+
 use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 use twr_core::activity;
@@ -46,7 +48,7 @@ const TEXT_KEEP: usize = 4096;
 const HEAD_KEEP: usize = 1024;
 
 /// What the log says about one thread's agent that no reducer keeps ([`Core::track_activity`]).
-#[derive(Debug, Clone, Default)]
+#[derive(PartialEq, Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(super) struct Activity {
     /// Its latest action in the open turn, in one line: `thinking`, `Bash: cargo test`, the
     /// last line of what it is writing. `None` before its first one.
@@ -71,9 +73,25 @@ pub(super) struct Activity {
     text: String,
     /// The start of the agent's latest message, at most [`HEAD_KEEP`] bytes.
     head: String,
+    /// What it has in flight, as the log says (`hub::work`).
+    #[serde(default)]
+    pub(super) work: super::work::WorkFold,
 }
 
 impl Activity {
+    /// What the agent is at in its open turn, from its own words and actions: the step of its
+    /// plan in progress or what it said it is about to do, then what its latest action does.
+    fn working(&self) -> Option<String> {
+        let lead = self.step.as_deref().or(self.intent.as_deref());
+        match (lead, self.action.as_deref()) {
+            // (`committing part 1`, not `committing part 1 · committing`.)
+            (Some(l), Some(x)) if !l.starts_with(x) => Some(format!("{l} · {x}")),
+            (Some(l), _) => Some(l.to_string()),
+            (None, Some(x)) => Some(x.to_string()),
+            (None, None) => None,
+        }
+    }
+
     /// What the message streamed so far says the agent is about to do, when it says so: the
     /// thread's intent from now on ([`activity::intent`]).
     fn note_intent(&mut self) {
@@ -84,21 +102,45 @@ impl Activity {
 }
 
 /// `s` on one line (whitespace runs, line breaks included, become one space), cut to `max`
-/// characters with `…`.
+/// characters with `…`. Reads `s` only as far as the line it gives: it runs for every bit of
+/// text an agent streams, and a hub start folds them all.
 pub(super) fn one_line(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= max {
-        return flat;
+    let mut flat = String::new();
+    let mut n = 0;
+    for word in s.split_whitespace() {
+        if n > 0 {
+            flat.push(' ');
+            n += 1;
+        }
+        flat.push_str(word);
+        n += word.chars().count();
+        if n > max {
+            let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+            out.push('…');
+            return out;
+        }
     }
-    let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
+    flat
 }
 
-/// The end of `s` on one line, at most `max` characters, with `…` before it when cut.
+/// The end of `s` on one line, at most `max` characters, with `…` before it when cut. Reads
+/// `s` from its end only as far as that, as [`one_line`] does from its start.
 fn tail(s: &str, max: usize) -> String {
-    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let n = flat.chars().count();
+    // The last words, the last first, until they are longer than `max`.
+    let mut words = Vec::new();
+    let mut n = 0;
+    for word in s.split_whitespace().rev() {
+        if !words.is_empty() {
+            n += 1;
+        }
+        n += word.chars().count();
+        words.push(word);
+        if n > max {
+            break;
+        }
+    }
+    words.reverse();
+    let flat = words.join(" ");
     if n <= max {
         return flat;
     }
@@ -147,6 +189,7 @@ impl Core {
         if ev.body.is_agent() && ev.turn.is_some() && ev.turn != open {
             return;
         }
+        self.track_work(ev);
         let at = ev.ts;
         let act = |a: &mut Activity, last: String| {
             a.last = Some(one_line(&last, DOING_MAX));
@@ -190,9 +233,10 @@ impl Core {
                 if !said.is_empty() {
                     a.said = Some(said);
                 }
-                let line = last_line(&a.text).to_string();
+                let line = last_line(&a.text);
                 if !line.trim().is_empty() {
-                    act(a, line);
+                    a.last = Some(one_line(line, DOING_MAX));
+                    a.at = Some(at);
                 }
                 // A final message is complete: what streams next is another one.
                 if t.is_final {
@@ -223,6 +267,19 @@ impl Core {
                 };
                 act(a, last);
             }
+            // Compacting its context: minutes, maybe, with nothing else said.
+            EventBody::ContextCompacting(_) => {
+                let a = self.activity.entry(ev.thread.clone()).or_default();
+                a.action = Some(activity::COMPACTING.into());
+                act(a, activity::COMPACTING.into());
+            }
+            EventBody::ContextCompacted(c) => {
+                let a = self.activity.entry(ev.thread.clone()).or_default();
+                if a.action.as_deref() == Some(activity::COMPACTING) {
+                    a.action = None;
+                }
+                act(a, c.line());
+            }
             // The turn is over: its actions are; what it said stays.
             EventBody::TurnEnded(_) => {
                 let a = self.activity.entry(ev.thread.clone()).or_default();
@@ -252,11 +309,7 @@ impl Core {
             ThreadStatus::Background => format!(
                 "working in background · {} task(s): {}",
                 v.background_tasks.len(),
-                v.background_tasks
-                    .values()
-                    .map(|t| t.description.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                self.tasks_now(v.background_tasks.iter()).join(", ")
             ),
             ThreadStatus::Running => match a.and_then(|a| a.last.as_deref()) {
                 Some(last) => last.to_string(),
@@ -297,10 +350,10 @@ impl Core {
                 None => activity::fallback(v).to_string(),
             },
             ThreadStatus::Background => {
-                let tasks: Vec<&str> = v
-                    .background_tasks
-                    .values()
-                    .map(|t| t.description.as_str())
+                let now = self.tasks_now(v.background_tasks.iter());
+                let tasks: Vec<&str> = now
+                    .iter()
+                    .map(String::as_str)
                     .filter(|d| !d.trim().is_empty())
                     .collect();
                 match (v.background_tasks.len(), tasks.as_slice()) {
@@ -309,20 +362,13 @@ impl Core {
                     (n, ds) => format!("waiting on {n} background tasks: {}", ds.join(", ")),
                 }
             }
-            ThreadStatus::Running => {
-                let lead = a.and_then(|a| a.step.as_deref().or(a.intent.as_deref()));
-                let action = a.and_then(|a| a.action.as_deref());
-                match (lead, action) {
-                    // (`committing part 1`, not `committing part 1 · committing`.)
-                    (Some(l), Some(x)) if !l.starts_with(x) => format!("{l} · {x}"),
-                    (Some(l), _) => l.to_string(),
-                    (None, Some(x)) => x.to_string(),
-                    (None, None) => match a.and_then(|a| a.task.as_deref()) {
-                        Some(task) => format!("starting: {task}"),
-                        None => activity::fallback(v).to_string(),
-                    },
-                }
-            }
+            ThreadStatus::Running => match a.and_then(Activity::working) {
+                Some(line) => line,
+                None => match a.and_then(|a| a.task.as_deref()) {
+                    Some(task) => format!("starting: {task}"),
+                    None => activity::fallback(v).to_string(),
+                },
+            },
             // The hub's error item (`api: turn 3 failed: …`), without the thread's name, and
             // with what happened when it does not say.
             ThreadStatus::Error => match self.open_reason(&v.id, AttentionReason::Error) {
@@ -375,6 +421,29 @@ impl Core {
         activity::cut(&line, activity::ACTIVITY_MAX)
     }
 
+    /// [`Core::activity_line`] as a thread summary may read it (`hub::summary`): only what the
+    /// agent's own words and actions, its own background tasks and its reports say; `None` while
+    /// that line would quote an item (waiting on the user, failed) or the turn's prompt (a
+    /// turn just started), and for a thread attached, parked or stopped.
+    ///
+    /// Read off [`own_work`]`(v)`: the `!` commands the user runs on the thread are theirs, as
+    /// they are to the orchestrator, so no line names one (a thread waiting on none but those
+    /// reads as it would without them).
+    pub(super) fn summary_activity(&self, v: &ThreadView) -> Option<String> {
+        let v = own_work(v);
+        let v = v.as_ref();
+        match v.status() {
+            ThreadStatus::Running => self
+                .activity
+                .get(&v.id)
+                .and_then(Activity::working)
+                .map(|l| activity::cut(&l, activity::ACTIVITY_MAX)),
+            ThreadStatus::Background => Some(self.activity_line(v)),
+            ThreadStatus::Done | ThreadStatus::Idle if !v.stopped => Some(self.activity_line(v)),
+            _ => None,
+        }
+    }
+
     /// The summary of `thread`'s first open permission or question (in attention order), if
     /// any: what it waits on.
     fn open_request(&self, thread: &str) -> Option<String> {
@@ -422,6 +491,7 @@ impl Core {
     /// `thread.activity`: every listed thread's activity, by thread id.
     pub(super) fn activity_json(&self) -> Value {
         let mut out = Map::new();
+        let now = Utc::now();
         for v in self.registry.list() {
             let a = self.activity.get(&v.id);
             out.insert(
@@ -432,11 +502,26 @@ impl Core {
                     "said": a.and_then(|a| a.said.as_deref()),
                     "task": a.and_then(|a| a.task.as_deref()),
                     "at": a.and_then(|a| a.at),
+                    // What it has in flight, and how sure the hub is (`hub::work`).
+                    "work": self.work(v, now),
                 }),
             );
         }
         Value::Object(out)
     }
+}
+
+/// `v` as its own work has it: without the `!` commands the user runs on it
+/// ([`twr_core::reduce::BackgroundTask::shell`], shared or not: a shared one's command goes to
+/// the thread only when it ends), so its status and activity line say nothing of them. `v`
+/// itself when it runs none.
+pub(super) fn own_work(v: &ThreadView) -> Cow<'_, ThreadView> {
+    if v.background_tasks.values().all(|t| !t.shell) {
+        return Cow::Borrowed(v);
+    }
+    let mut own = v.clone();
+    own.background_tasks.retain(|_, t| !t.shell);
+    Cow::Owned(own)
 }
 
 /// The first line of `s` with any text on it.
@@ -455,6 +540,52 @@ pub(super) fn add_context(ext: &mut Option<JsonMap>, context: Value) {
 
 #[cfg(test)]
 mod tests {
+
+    /// [`one_line`] and [`tail`] give what flattening all of `s` gives, though they read
+    /// only as much of it as they show: random text of words, runs of every kind of
+    /// whitespace and characters of several widths, at limits around its length.
+    #[test]
+    fn one_line_and_tail_read_only_what_they_show() {
+        fn flat(s: &str) -> String {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
+        fn one_line_whole(s: &str, max: usize) -> String {
+            let flat = flat(s);
+            if flat.chars().count() <= max {
+                return flat;
+            }
+            let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+            out.push('…');
+            out
+        }
+        fn tail_whole(s: &str, max: usize) -> String {
+            let flat = flat(s);
+            let n = flat.chars().count();
+            if n <= max {
+                return flat;
+            }
+            let mut out = String::from("…");
+            out.extend(flat.chars().skip(n - max.saturating_sub(1)));
+            out
+        }
+        let alphabet = ['a', 'b', ' ', ' ', '\n', '\t', '\u{3000}', 'é', '😀', '…'];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..3000 {
+            let len = next(40);
+            let s: String = (0..len).map(|_| alphabet[next(alphabet.len())]).collect();
+            for max in [0, 1, 2, 3, 5, 8, 13, 21, 40, 600] {
+                assert_eq!(one_line(&s, max), one_line_whole(&s, max), "{s:?} {max}");
+                assert_eq!(tail(&s, max), tail_whole(&s, max), "{s:?} {max}");
+            }
+        }
+    }
+
     use super::*;
     use crate::hub::{Hub, HubOptions};
     use twr_core::config::Config;

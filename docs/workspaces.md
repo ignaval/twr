@@ -14,28 +14,63 @@ twr ws                       # list them
 
 ## In the TUI
 
-With more than one workspace, a strip of tabs tops every view:
+Threads, the sidebar on the left, lists every workspace, a card each, with its threads under it. The current workspace's worker cards are nested under its card; each other workspace lists its threads, a row each:
 
 ```
- default ⚠1 ●2 │ client-x ●1 │ scratch ○
+ THREADS                            ‹
+▌_ default                      ⚠1 ●2
+▌  working · waiting on you
+▌ ┌ beta ─────── sonnet-4-5 ─ manual ┐
+▌ │waiting                           │
+▌ │ PERMISSION  Bash: rm -rf target  │
+▌ │1 allow  2 deny                   │
+▌ └──────────────────────────────────┘
+▌ ┌ alpha ────── sonnet-4-5 ─ manual ┐
+▌ │_ running                         │
+▌ └──────────────────────────────────┘
+
+ _ client-x                     ⚠1 ●1
+   working · waiting on you
+   I need you to approve the deploy of
+   billing.
+   ├ deploy · waiting on you
+   ├ billing · running
+   └ docs · done
+
+ ○ scratch
+   hub not running
+
+ + New workspace
+ ⚙ Settings
 ```
 
-`⚠` counts the permissions and questions waiting on you, `●` the threads running, and `○` marks a workspace whose hub isn't running. The current tab is highlighted. Switch with:
+Each card has the workspace's name, its activity and the start of the orchestrator's latest reply. It says `working` when a worker is running, even if the orchestrator is idle; permissions and questions still say `waiting on you`, and an orchestrator's failure still says `failed`, alongside `working` when other work continues. The working icon before the name means the orchestrator or a thread there is working: a turn, background tasks or a job of its own (not a `!` command you run). `⚠` counts the permissions and questions waiting on you, `●` the threads running, and `○` marks a workspace whose hub isn't running; its card says `hub not running` and keeps the last reply the TUI saw. Cards fit their content: status text wraps, the reply takes up to two rows, and a missing reply leaves no empty preview rows. The current workspace's card is highlighted. Another workspace's threads are as its hub last said them, those waiting on you first, up to six rows (`└ +3 more` for the rest); parked ones aren't listed, and none are while its hub isn't running. When the current workspace's cards need the room, the other cards get shorter, down to their names; where even those don't all fit, `↑ more` and `↓ more` stand for the rest, and a tap on one brings the next into view. In the grid and the decision table the cards aren't in the sidebar, and the workspaces' cards scroll there with the wheel.
 
-- a click on a tab;
-- `Alt-1` to `Alt-9` for the tab at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
+It is the TUI's only sidebar, narrower below 100 columns. `Ctrl-B` (or `Ctrl-T`, `/sidebar`, `/spaces`, or the `‹` in its header) hides it whole, the workspaces and the cards nested in it, and shows it again; the TUI remembers it for the next time. Hidden, a strip of tabs tops every view instead, once there is more than one workspace:
+
+```
+ ≡  default ⚠1 ●2 │ client-x ●1 │ scratch ○
+```
+
+The `≡` at its left shows the sidebar again, as `Ctrl-B` does. In the [compact layout](tui.md#on-a-phone) the workspaces are on its `Threads` screen, as in the sidebar, the current one's thread cards nested under its card, in a list that scrolls, each workspace and thread entry on it two rows tall. Switch with:
+
+- a click on a card, a thread under another workspace's card, or a tab;
+- `Alt-1` to `Alt-9` for the workspace at that place, `Ctrl-PgUp` / `Ctrl-PgDn` for the previous and next one (these work while typing too);
 - `/ws <name>`; `/ws` alone lists them. A name that doesn't exist yet asks `y` to create it.
 
-The TUI is connected to one hub at a time. Switching opens the other workspace's hub, starting it if it isn't running, and replays its log the way opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing, the selected card, pins, the view, the scroll position and the thread you were talking to. Every five seconds the TUI asks the other running hubs for their counts, and with [notifications](tui.md#notifications) on, a workspace that gets a new permission or question notifies you, naming the workspace.
+`+ New workspace` (or `/ws new`) asks for a name and checks it the way `twr ws new` does: lowercase letters, digits and `-`, not `default` or one that exists. `Enter` creates the workspace and switches to it. `/ws new <name>` does it in one go. A TUI that a thread's agent runs creates no workspace, whichever way it's asked, and neither does `twr ws new` from an agent. `⚙ Settings` opens the [settings](tui.md#settings).
 
-A TUI opened with `--socket` shows that hub alone, without tabs.
+The TUI is connected to one hub at a time. Switching opens the other workspace's hub, starting it if it isn't running, and replays its log the way opening the TUI does. What you left in a workspace is kept for when you come back: the line you were typing, the selected card, pins, the view, the scroll position and the thread you were talking to. The TUI asks every running hub how it is every five seconds, with one light call each (`hub.glance`: its counts, its orchestrator's latest reply and its threads), and a stopped hub or one that didn't answer every fifteen seconds; it never starts a hub to ask it, and looking at another workspace's threads resumes none of them. A hub older than this TUI is asked for its threads with a second read-only call (`thread.list`); one older still answers with its counts only, without its orchestrator's reply, until it's restarted. With [notifications](tui.md#notifications) on, a workspace that gets a new permission or question notifies you, naming the workspace.
+
+A TUI opened with `--socket` shows that hub alone, without workspaces in the sidebar or tabs.
 
 ## What's separate and what's shared
 
 | | Each workspace has its own |
 |---|---|
 | Hub, socket and log | yes |
-| Orchestrator and its conversation | yes, and its own working directory, so a Claude Code orchestrator keeps its own [memories](orchestrator.md#memory) |
+| Orchestrator and its conversation | yes |
+| Orchestrator's [memory](orchestrator.md#memory) | yes, on every runtime. A named workspace's orchestrator also has its own working directory, so a Claude Code orchestrator's own memory directory is that workspace's too |
 | Threads, watches, reports, attention | yes |
 | Worktrees and trash | yes |
 | Branches | new threads use `twr/@<workspace>/<name>`, so two workspaces can each have an `api` thread in one repository |
@@ -43,7 +78,7 @@ A TUI opened with `--socket` shows that hub alone, without tabs.
 
 Every workspace reads the same `config.toml`: projects, runtimes and notification settings apply to all of them. A named workspace ignores what belongs to the `default` hub: `hub.socket`, `hub.listen` and `hub.tls` (runners connect to `default`) and `[orchestrator] cwd`. The default hub's `hub.socket` can't be in the directory of the workspaces' sockets (`.../twr/ws/`). Agent installations and logins are shared, as are your repositories.
 
-One exception for orchestrator memories: Claude Code keys memories by the git repository a working directory is in. If your `TWR_HOME` is inside a git checkout, the orchestrators of all its workspaces share that repository's memories.
+One exception for Claude Code's own memory directory: Claude Code keys memories by the git repository a working directory is in. If your `TWR_HOME` is inside a git checkout, the orchestrators of all its workspaces share that repository's memories.
 
 An agent's own `twr` calls reach its workspace's hub: the hub sets `TWR_WORKSPACE` for everything it starts, and for a CLI you attach. The commands twr suggests, such as the TUI's `/attach` (`twr -w client-x attach api`), `twr resume api` or `twr trash list`, come with the `-w` of the workspace they're about, or `-w default` when your shell's `TWR_WORKSPACE` selects another. What an agent asks to run is shown as it asks, even when it quotes a `twr` command.
 
@@ -79,4 +114,4 @@ twr -w client-x hub stop
 twr ws rm client-x
 ```
 
-`twr ws rm` removes the workspace's data: its log, its orchestrator's conversation and its input history. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's memories stay in `~/.claude/projects/`. `default` can't be removed.
+`twr ws rm` removes the workspace's data: its log, its orchestrator's conversation and memory, and its input history. It refuses while the workspace's hub runs (on any socket: it holds a lock on the workspace's data), while it has threads (delete them first) and while its trash holds deleted threads (`twr -w client-x trash empty --all`), whose commits stay referenced in their repositories until purged. Branches stay in your repositories, and a Claude Code orchestrator's own memory directory stays in `~/.claude/projects/`. `default` can't be removed.

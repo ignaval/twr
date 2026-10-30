@@ -5,11 +5,11 @@
 //! adapter that hands every session to the test ([`OrchRt`]), so each test drives its turns.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use twr_adapters::fake::FakeAdapter;
 use twr_core::adapter::{
@@ -3682,6 +3682,220 @@ async fn the_orchestrators_runtime_move_goes_on_the_card() {
     hub.shutdown().await;
 }
 
+/// A hook on the moves' project lookups (`HubOptions::pins_lookup_hook`): once armed, it holds
+/// the next lookup until released.
+#[derive(Clone, Default)]
+struct LookupHold {
+    #[allow(clippy::type_complexity)]
+    armed: Arc<Mutex<Option<(oneshot::Sender<String>, oneshot::Receiver<()>)>>>,
+}
+
+impl LookupHold {
+    fn hook(&self) -> twr_hub::hub::BoxFilesReadHook {
+        let hold = self.clone();
+        Arc::new(move |id: &str| {
+            let armed = hold.armed.lock().unwrap().take();
+            let id = id.to_string();
+            Box::pin(async move {
+                if let Some((held, release)) = armed {
+                    let _ = held.send(id);
+                    let _ = release.await;
+                }
+            })
+        })
+    }
+
+    /// Holds the next lookup: the receiver gets its thread once it is held, the sender
+    /// releases it.
+    fn arm(&self) -> (oneshot::Receiver<String>, oneshot::Sender<()>) {
+        let (held, on_hold) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *self.armed.lock().unwrap() = Some((held, released));
+        (on_hold, release)
+    }
+}
+
+/// The orchestrator's `thread.set_model` moves of `thread`.
+fn model_changes(hub: &Hub, thread: &str) -> usize {
+    hub.thread_events(thread, 0, 10_000)
+        .unwrap()
+        .1
+        .iter()
+        .filter(|e| matches!(e.body, EventBody::ThreadModelChanged(_)))
+        .count()
+}
+
+/// A move looks the thread's project up before the core is locked, and the orchestrator that
+/// asked may be replaced meanwhile: once the lookup is done, its call is checked again as the
+/// server admitted it, and refused (`unauthorized`) when the user reset the orchestrator
+/// during the lookup. Nothing is recorded. A move between accounts of one runtime (applied
+/// directly, no card) shows it: held and let go with the same orchestrator, it is made.
+#[tokio::test]
+async fn an_orchestrators_move_is_refused_once_it_was_replaced_during_the_lookup() {
+    let mut env = Env::new();
+    let hold = LookupHold::default();
+    let side = env.path().join("acc").join("side");
+    std::fs::create_dir_all(&side).unwrap();
+    let mut opts = env.opts(|c| {
+        c.accounts.entry("claude-code".into()).or_default().insert(
+            "side".into(),
+            twr_core::config::AccountConfig {
+                dir: Some(side.clone()),
+                ..Default::default()
+            },
+        );
+    });
+    opts.pins_lookup_hook = Some(hold.hook());
+    let hub = Hub::open(opts).await.unwrap();
+    let worker = async |name: &str| {
+        let v = hub
+            .new_thread(
+                NewThread {
+                    project: env.path().to_string_lossy().into_owned(),
+                    runtime: Some("claude-code".into()),
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+                "test",
+            )
+            .await
+            .unwrap();
+        v["id"].as_str().unwrap().to_string()
+    };
+    let api = worker("api").await;
+    let web = worker("web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    // Its turn stays open: an account move needs none.
+    rt.next_turn().await;
+    let to_side = async |thread: &str| {
+        let req = twr_hub::hub::ModelRequest {
+            account: Some("side"),
+            ..Default::default()
+        };
+        hub.set_thread_model(thread, req, &Caller::Orchestrator)
+            .await
+    };
+
+    // The same orchestrator throughout: the move is made.
+    let (on_hold, release) = hold.arm();
+    let let_go = async {
+        assert_eq!(on_hold.await.unwrap(), web);
+        release.send(()).unwrap();
+    };
+    let (r, ()) = tokio::join!(to_side(&web), let_go);
+    let r = r.unwrap();
+    assert_eq!(r["account_changed"], json!(true), "{r}");
+    assert_eq!(
+        hub.thread_view(&web).unwrap().account.as_deref(),
+        Some("side")
+    );
+
+    // Reset while the move looks api's project up: refused, nothing recorded.
+    let before = hub.thread_view(&api).unwrap().account;
+    let (on_hold, release) = hold.arm();
+    let replace = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        let stopper = async {
+            let _ = timeout(WAIT, async {
+                while let Some(cmd) = rt.end.cmds.recv().await {
+                    if matches!(cmd, AdapterCmd::Stop) {
+                        rt.end.exited(Some(0), "");
+                        return;
+                    }
+                }
+            })
+            .await;
+        };
+        let user = tui();
+        let (reset, ()) = tokio::join!(hub.reset_orchestrator(&user), stopper);
+        reset.unwrap();
+        release.send(()).unwrap();
+    };
+    let (moved, ()) = tokio::join!(to_side(&api), replace);
+    let e = moved.unwrap_err();
+    assert_eq!(e.code, codes::UNAUTHORIZED, "{e:?}");
+    assert_eq!(
+        e.message,
+        "thread.set_model came from an orchestrator that was replaced or restarted since: it \
+         changes nothing"
+    );
+    assert_eq!(hub.thread_view(&api).unwrap().account, before);
+    assert_eq!(model_changes(&hub, &api), 0);
+    hub.shutdown().await;
+}
+
+/// The `set_mode` gate of the orchestrator's move to another runtime is the turn's the call
+/// came in: when that turn ends during the move's project lookup and the user's next message
+/// starts another, the move is refused (`relay_forbidden`), not proposed on the new turn's
+/// authority; a move the new turn asks for itself, held the same way, goes on the card.
+#[tokio::test]
+async fn an_orchestrators_move_keeps_the_gate_of_the_turn_it_came_in() {
+    let mut env = Env::new();
+    let hold = LookupHold::default();
+    let mut opts = env.opts(|_| {});
+    opts.pins_lookup_hook = Some(hold.hook());
+    let hub = Hub::open(opts).await.unwrap();
+    let api = env.worker(&hub, "api").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t1) = rt.next_turn().await;
+    rt.end_turn(t1, "Watching.");
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let r = hub
+        .say_to_orchestrator("move api to claude code", Some(seen), &tui())
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    let (_, t2) = rt.next_turn().await;
+    let to_claude = || {
+        let req = twr_hub::hub::ModelRequest {
+            runtime: Some("claude-code"),
+            ..Default::default()
+        };
+        hub.set_thread_model(&api, req, &Caller::Orchestrator)
+    };
+
+    // Turn 2 ends while the move looks api's project up, and the user's next message starts
+    // turn 3.
+    let (on_hold, release) = hold.arm();
+    let next = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        rt.end_turn(t2, "Done.");
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator("move api to claude code", Some(seen), &tui())
+            .unwrap();
+        assert_eq!(r["action"], "delegate", "{r}");
+        let (_, t3) = rt.next_turn().await;
+        release.send(()).unwrap();
+        t3
+    };
+    let (moved, t3) = tokio::join!(to_claude(), next);
+    assert!(t3 > t2);
+    let e = moved.unwrap_err();
+    assert_eq!(e.code, codes::RELAY_FORBIDDEN, "{e:?}");
+    assert_eq!(
+        e.message,
+        "the turn this call came in has ended: it cannot move api to another runtime; ask the \
+         user"
+    );
+    assert_eq!(hub.thread_view(&api).unwrap().runtime, "fake");
+    assert_eq!(model_changes(&hub, &api), 0);
+
+    // Turn 3's own move, held the same way: on the card.
+    let (on_hold, release) = hold.arm();
+    let let_go = async {
+        assert_eq!(on_hold.await.unwrap(), api);
+        release.send(()).unwrap();
+    };
+    let (r, ()) = tokio::join!(to_claude(), let_go);
+    let r = r.unwrap();
+    assert_eq!(r["status"], "needs_confirmation", "{r}");
+    assert_eq!(hub.thread_view(&api).unwrap().runtime, "fake");
+    drop(rt);
+    hub.shutdown().await;
+}
+
 /// A mode on a confirm card is for the runtime the thread ran when it was proposed: the
 /// orchestrator may move a thread in a restricted mode to another runtime without a card, and
 /// the same mode can let the other runtime do more without asking. Confirm then skips the mode,
@@ -3817,6 +4031,172 @@ async fn a_card_never_moves_a_thread_into_a_mode_its_new_runtime_does_not_take()
             );
         }
     }
+    drop(rt);
+    hub.shutdown().await;
+}
+
+/// The hub's own agent CLIs as a fake probe reports them: Claude Code's missing, Codex's
+/// there and signed in.
+fn fake_local_agents() -> twr_hub::hub::AgentProbe {
+    use futures::FutureExt;
+    use twr_core::runner::{AgentInfo, AgentLogin};
+    Arc::new(|| {
+        async {
+            vec![
+                AgentInfo {
+                    runtime: "claude-code".into(),
+                    note: Some("not found on PATH".into()),
+                    ..Default::default()
+                },
+                AgentInfo {
+                    runtime: "codex".into(),
+                    found: true,
+                    path: Some("/home/me/.local/bin/codex".into()),
+                    version: Some("codex-cli 0.160.0".into()),
+                    login: AgentLogin::LoggedIn,
+                    ..Default::default()
+                },
+            ]
+        }
+        .boxed()
+    })
+}
+
+/// The orchestrator starts a thread on a box it names (`thread.spawn` `box`, as `thread.new`
+/// takes it, with its errors); one on a runtime whose CLI the box reports missing is made,
+/// and the spawn's result warns. What it reads of the boxes' agents is their state only.
+#[tokio::test]
+async fn the_orchestrator_picks_a_box_and_is_warned_of_a_missing_agent() {
+    use twr_hub::hub::BoxView;
+    let env = Env::new();
+    let mut opts = env.opts(|_| {});
+    opts.agent_probe = Some(fake_local_agents());
+    let hub = Hub::open(opts).await.unwrap();
+    // Probed in the background as the hub started.
+    timeout(WAIT, async {
+        while hub.info()["agents"].as_array().is_none_or(Vec::is_empty) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the hub's own probe");
+    assert_eq!(hub.info()["agents"][1]["path"], "/home/me/.local/bin/codex");
+    assert_eq!(
+        hub.info_for(BoxView::Limited)["agents"],
+        json!([
+            {"runtime": "claude-code", "found": false, "login": "unknown"},
+            {"runtime": "codex", "found": true, "login": "logged_in"},
+        ])
+    );
+    let spawn = |op: &'static str, runtime: &'static str, box_name: &'static str| {
+        let hub = hub.clone();
+        let request = NewThread {
+            project: env.repo().to_string_lossy().into_owned(),
+            runtime: Some(runtime.into()),
+            name: Some(op.into()),
+            box_name: Some(box_name.into()),
+            ..Default::default()
+        };
+        async move {
+            hub.begin_spawn(op, request, None, &Caller::Orchestrator)
+                .unwrap();
+            timeout(WAIT, async {
+                loop {
+                    let status = hub.spawn_status(op, &Caller::Orchestrator).unwrap();
+                    if status["status"] != "pending" {
+                        break status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+    };
+    let made = spawn("on-local", "claude-code", "local").await;
+    assert_eq!(made["status"], "complete", "{made}");
+    assert_eq!(made["thread"]["box_name"], "local");
+    let warning = "box local (the hub's machine) reports no `claude` on its PATH; the thread may \
+                   fail to start";
+    assert_eq!(made["warning"], warning, "{made}");
+    assert_eq!(made["thread"]["warning"], warning, "{made}");
+    let made = spawn("on-gpu", "claude-code", "gpu").await;
+    assert_eq!(made["status"], "error", "{made}");
+    assert_eq!(made["error"]["code"], codes::BOX_OFFLINE, "{made}");
+    assert!(
+        made["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no box \"gpu\" is configured"),
+        "{made}"
+    );
+    // `box.agents` of the hub's own box, as the orchestrator sees it; no fresh probe for it.
+    let local = hub
+        .box_agents("local", false, BoxView::Limited)
+        .await
+        .unwrap();
+    assert_eq!(
+        local["agents"][1],
+        json!({"runtime": "codex", "found": true, "login": "logged_in"})
+    );
+    assert_eq!(
+        hub.box_agents("local", true, BoxView::Limited)
+            .await
+            .unwrap_err()
+            .code,
+        codes::UNAUTHORIZED
+    );
+    // A user's fresh probe of the hub's own box.
+    let fresh = hub.box_agents("local", true, BoxView::Full).await.unwrap();
+    assert_eq!(fresh["agents"][1]["version"], "codex-cli 0.160.0");
+    hub.shutdown().await;
+}
+
+/// A suggestion the user took unedited (`say` with `suggested`) goes to the orchestrator as a
+/// message, never applied as a short command; one that reads as a command now (an answer, a
+/// mode change: the orchestrator's turn could act on it) is not sent at all. The same words
+/// typed are applied directly.
+#[tokio::test]
+async fn a_suggested_message_is_never_applied_as_a_command() {
+    let mut env = Env::new();
+    let hub = env.hub().await;
+    let api = env.worker(&hub, "api").await;
+    let web = env.worker(&hub, "web").await;
+    hub.say_to_orchestrator("watch", None, &tui()).unwrap();
+    let mut rt = env.orch().await;
+    let (_, t) = rt.next_turn().await;
+    rt.end_turn(t, "Watching.");
+    permissions(&hub, &[&api]);
+    let mode = hub.thread_view(&web).unwrap().mode;
+    assert_ne!(mode, "plan");
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let e = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), true)
+            .unwrap_err();
+        assert_eq!(e.code, codes::BAD_REQUEST, "{m}: {e:?}");
+        assert!(e.message.contains("nothing was sent"), "{m}: {e:?}");
+    }
+    let seen = hub.control_read(0, 1000).unwrap().1;
+    let r = hub
+        .say_to_orchestrator_as("and update the docs", Some(seen), &tui(), true)
+        .unwrap();
+    assert_eq!(r["action"], "delegate", "{r}");
+    let (prompt, t) = rt.next_turn().await;
+    assert!(prompt.ends_with("and update the docs"), "{prompt}");
+    rt.end_turn(t, "ok");
+    assert!(open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, mode);
+    // Typed, the same words apply.
+    for m in ["allow api", "set web to plan mode"] {
+        let seen = hub.control_read(0, 1000).unwrap().1;
+        let r = hub
+            .say_to_orchestrator_as(m, Some(seen), &tui(), false)
+            .unwrap();
+        assert_eq!(r["action"], "command", "{m}: {r}");
+    }
+    assert!(!open(&hub, "p0"));
+    assert_eq!(hub.thread_view(&web).unwrap().mode, "plan");
     drop(rt);
     hub.shutdown().await;
 }

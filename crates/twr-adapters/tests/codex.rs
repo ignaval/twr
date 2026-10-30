@@ -734,6 +734,26 @@ fn auth_failures_say_how_to_sign_in() {
         );
     }
 
+    // No error on the turn: its last `error` notification says it, and is classified too.
+    let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
+    tr.send("say hi", 1);
+    tr.translate(r#"{"id":3,"result":{"turn":{"id":"T-1","status":"inProgress"}}}"#);
+    tr.translate(
+        r#"{"method":"error","params":{"error":{"message":"auth required","codexErrorInfo":"unauthorized"},"willRetry":false,"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turnId":"T-1"}}"#,
+    );
+    let out = tr.translate(
+        r#"{"method":"turn/completed","params":{"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turn":{"id":"T-1","status":"failed","error":null}}}"#,
+    );
+    let EventBody::TurnEnded(e) = &out.events[0].body else {
+        panic!("{:?}", out.events)
+    };
+    assert_eq!(ext(&e.ext, "auth_failed"), true);
+    assert_eq!(ext(&e.ext, "transient"), false);
+    assert_eq!(
+        e.ext.as_ref().unwrap()["twr"]["error"],
+        format!("auth required{hint}")
+    );
+
     // A failed connection that is not about signing in stays transient, without the hint.
     let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
     tr.send("go", 1);
@@ -903,7 +923,7 @@ fn failed_turns_say_why() {
 }
 
 /// A `thread/start` result reporting exactly what `manual` asks for.
-const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
+const OPENED_MANUAL: &str = r#"{"id":2,"result":{"thread":{"id":"th"},"cwd":"/tmp/sandbox-codex","approvalPolicy":"untrusted","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}}"#;
 
 #[test]
 fn reasoning_only_when_thinking() {
@@ -1396,6 +1416,7 @@ fn thread_params_for_new_and_resumed_threads() {
         method,
         params,
         mode_note,
+        added_instructions,
     } = thread_params(&SpawnConfig {
         model: Some("gpt-6-astra".into()),
         system_append: Some("Be brief.".into()),
@@ -1404,6 +1425,10 @@ fn thread_params_for_new_and_resumed_threads() {
     .unwrap();
     assert_eq!(method, "thread/start");
     assert_eq!(mode_note, None, "manual maps exactly");
+    assert_eq!(
+        added_instructions, None,
+        "the sandbox note is for auto only"
+    );
     assert_eq!(
         params,
         json!({"cwd": FIXTURE_CWD, "approvalPolicy": "untrusted", "approvalsReviewer": "user",
@@ -1570,9 +1595,14 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
     )
     .unwrap();
     let common = common.canonicalize().unwrap();
+    // And the shared memory folder, where there is one (`/dev/shm`): all a folder outside
+    // any repository gets with no home.
+    let shm = twr_adapters::codex::auto_writable_roots(dir.path(), None, |_| None);
     let roots: Vec<String> = ["worktrees/wt", "objects", "refs", "logs"]
         .iter()
-        .map(|d| common.join(d).display().to_string())
+        .map(|d| common.join(d))
+        .chain(shm)
+        .map(|d| d.display().to_string())
         .collect();
     let auto = SpawnConfig {
         cwd: wt.clone(),
@@ -1657,8 +1687,21 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 
     let mut tr = new_translator(&auto, TranslatorOptions::default());
     tr.start();
-    tr.translate(r#"{"id":1,"result":{}}"#);
-    let opened = json!({"id": 2, "result": {"thread": {"id": "th"},
+    // The sandbox note goes after the config's own developer instructions: the config is
+    // read before the thread opens.
+    let id_of = |replies: &[String], method: &str| {
+        replies
+            .iter()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["method"] == method)
+            .map(|v| v["id"].clone())
+            .unwrap_or_else(|| panic!("no {method} in {replies:?}"))
+    };
+    let out = tr.translate(r#"{"id":1,"result":{}}"#);
+    let read = id_of(&out.replies, "config/read");
+    let out = tr.translate(&json!({"id": read, "result": {"config": {}}}).to_string());
+    let open = id_of(&out.replies, "thread/start");
+    let opened = json!({"id": open, "result": {"thread": {"id": "th"}, "cwd": wt,
         "approvalPolicy": "on-request", "approvalsReviewer": "user",
         "sandbox": {"type": "workspaceWrite", "writableRoots": roots, "networkAccess": true,
                     "excludeTmpdirEnvVar": false, "excludeSlashTmp": false}}});
@@ -1680,7 +1723,7 @@ fn auto_widens_the_workspace_sandbox_on_start_resume_and_attach() {
 fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     use twr_adapters::codex::translate::check_policy;
     let result = |sandbox: Value| {
-        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted",
+        json!({"thread": {"id": "th"}, "approvalPolicy": "untrusted", "cwd": FIXTURE_CWD,
                "approvalsReviewer": "user", "sandbox": sandbox})
     };
     let ww = |extra: Value| {
@@ -1720,6 +1763,7 @@ fn a_sandbox_with_network_or_roots_twr_did_not_ask_for_is_refused() {
     asked["config"]["sandbox_workspace_write.writable_roots"] = json!(["/srv/cache"]);
     let mut on_request = ww(json!({"writableRoots": ["/srv/cache/"], "networkAccess": true}));
     on_request["approvalPolicy"] = json!("on-request");
+    on_request["cwd"] = json!(std::env::temp_dir());
     assert_eq!(check_policy(&asked, &on_request), Ok(()));
     on_request["sandbox"]["writableRoots"] = json!(["/srv/cache", "/home/u"]);
     assert!(check_policy(&asked, &on_request).is_err());
@@ -2040,6 +2084,9 @@ for line in open(fixture):
         if not got:
             sys.exit(3)
     else:
+        # Codex reports the cwd it runs in, which twr checks: the recording's is replaced,
+        # with the paths under it.
+        body = body.replace('/tmp/sandbox-codex', json.dumps(os.getcwd())[1:-1])
         sys.stdout.write(body + "\n"); sys.stdout.flush()
 while read_command():
     pass
@@ -2491,10 +2538,14 @@ async fn hub_orchestrator_on_codex() {
         parse(stdin.lines().nth(read).unwrap())["params"]["cwd"],
         dir.path().to_string_lossy().as_ref()
     );
+    // Codex's own memory off: the orchestrator keeps twr's.
+    for key in codex::MEMORY_OFF {
+        assert_eq!(p["config"][*key], false, "{key}");
+    }
     assert_eq!(
         p["config"].as_object().unwrap().len(),
-        builtin_len() + 2,
-        "the built-in switches, plugins off and the MCP servers, nothing else"
+        builtin_len() + 2 + codex::MEMORY_OFF.len(),
+        "the built-in switches, plugins off, the MCP servers and memory off, nothing else"
     );
     let run = std::fs::read_to_string(dir.path().join("run.json")).unwrap();
     let run = parse(&run);
@@ -2751,4 +2802,189 @@ fn attach_keeps_builtins_off_and_refuses_what_it_cannot_carry() {
     ] {
         assert!(a.attach_command(&cfg("manual"), bad).is_none(), "{bad:?}");
     }
+}
+
+/// A turn that hit a usage limit (`usageLimitExceeded`) carries `ext.twr.limit` and is not
+/// transient: the window of the latest rate-limit reports at 100% (else the one that resets
+/// first) with its reset; credits depleted in the last snapshot is spend, until a later
+/// snapshot no longer says so. The snapshot names no limit for any other error
+/// (`contextWindowExceeded` stays itself). `rateLimitExceeded` stays transient, with no limit.
+#[test]
+fn limits_are_named_on_the_failed_turn() {
+    const SOON: i64 = 1893456000; // 2030-01-01T00:00:00Z
+    const LATER: i64 = 1894000000;
+    let updated = |primary: Value, secondary: Value, reached: Value| {
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","primary":primary,"secondary":secondary,"credits":null,"planType":"plus","rateLimitReachedType":reached}}}).to_string()
+    };
+    let window = |used: u64, mins: u64, resets: i64| json!({"usedPercent": used, "windowDurationMins": mins, "resetsAt": resets});
+    let failed = |info: &str| {
+        format!(
+            r#"{{"method":"turn/completed","params":{{"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turn":{{"id":"T-1","status":"failed","error":{{"message":"You've hit your usage limit.","codexErrorInfo":"{info}"}}}}}}}}"#
+        )
+    };
+    let message = "You've hit your usage limit.";
+    let cases: Vec<(&str, Vec<String>, &str, Value)> = vec![
+        (
+            "the window at 100%",
+            vec![updated(
+                window(100, 300, LATER),
+                window(40, 10080, SOON),
+                Value::Null,
+            )],
+            "usageLimitExceeded",
+            json!({"kind": "usage", "window": "five_hour", "resets_at": "2030-01-07T07:06:40Z", "message": message}),
+        ),
+        (
+            "a sparse report keeps the other window",
+            vec![
+                updated(window(30, 300, LATER), window(90, 10080, SOON), Value::Null),
+                updated(Value::Null, window(100, 10080, SOON), Value::Null),
+            ],
+            "usageLimitExceeded",
+            json!({"kind": "usage", "window": "seven_day", "resets_at": "2030-01-01T00:00:00Z", "message": message}),
+        ),
+        (
+            "none at 100%: the soonest reset",
+            vec![updated(
+                window(97, 300, LATER),
+                window(99, 10080, SOON),
+                Value::Null,
+            )],
+            "usageLimitExceeded",
+            json!({"kind": "usage", "window": "seven_day", "resets_at": "2030-01-01T00:00:00Z", "message": message}),
+        ),
+        (
+            "no report at all",
+            vec![],
+            "usageLimitExceeded",
+            json!({"kind": "usage", "message": message}),
+        ),
+        (
+            "credits depleted",
+            vec![updated(
+                window(100, 300, LATER),
+                Value::Null,
+                json!("workspace_member_credits_depleted"),
+            )],
+            "usageLimitExceeded",
+            json!({"kind": "spend", "message": message}),
+        ),
+        (
+            "credits no longer depleted",
+            vec![
+                updated(
+                    window(100, 300, LATER),
+                    Value::Null,
+                    json!("workspace_member_credits_depleted"),
+                ),
+                updated(window(100, 300, LATER), Value::Null, Value::Null),
+            ],
+            "usageLimitExceeded",
+            json!({"kind": "usage", "window": "five_hour", "resets_at": "2030-01-07T07:06:40Z", "message": message}),
+        ),
+    ];
+    for (why, reports, info, want) in cases {
+        let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
+        tr.send("go", 1);
+        tr.translate(r#"{"id":3,"result":{"turn":{"id":"T-1","status":"inProgress"}}}"#);
+        for r in &reports {
+            tr.translate(r);
+        }
+        let out = tr.translate(&failed(info));
+        let e = out
+            .events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::TurnEnded(t) => Some(t.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{why}: {out:?}"));
+        assert_eq!(e.ext.as_ref().unwrap()["twr"]["limit"], want, "{why}");
+        assert_eq!(ext(&e.ext, "transient"), false, "{why}");
+        assert!(ext(&e.ext, "transient_reason").is_null(), "{why}");
+    }
+
+    // A turn that fails with no error of its own, after an `error` notification saying the
+    // limit was hit: the notification is the cause, its limit named as the turn's.
+    let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
+    tr.send("go", 1);
+    tr.translate(r#"{"id":3,"result":{"turn":{"id":"T-1","status":"inProgress"}}}"#);
+    tr.translate(&updated(window(100, 300, LATER), Value::Null, Value::Null));
+    tr.translate(
+        r#"{"method":"error","params":{"error":{"message":"You've hit your usage limit.","codexErrorInfo":"usageLimitExceeded"},"willRetry":false,"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turnId":"T-1"}}"#,
+    );
+    let out = tr.translate(
+        r#"{"method":"turn/completed","params":{"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turn":{"id":"T-1","status":"failed","error":null}}}"#,
+    );
+    let EventBody::TurnEnded(e) = &out.events[0].body else {
+        panic!("{:?}", out.events)
+    };
+    assert_eq!(e.ext.as_ref().unwrap()["twr"]["error"], message);
+    assert_eq!(
+        e.ext.as_ref().unwrap()["twr"]["limit"],
+        json!({"kind": "usage", "window": "five_hour", "resets_at": "2030-01-07T07:06:40Z", "message": message})
+    );
+    assert_eq!(ext(&e.ext, "transient"), false);
+
+    // Credits depleted in the last snapshot: a turn that then fails for another reason (the
+    // context window, an unsupported model) hit no limit and keeps its own error; the next
+    // `usageLimitExceeded` is spend.
+    let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
+    tr.send("go", 1);
+    tr.translate(r#"{"id":3,"result":{"turn":{"id":"T-1","status":"inProgress"}}}"#);
+    tr.translate(&updated(
+        window(100, 300, LATER),
+        Value::Null,
+        json!("workspace_owner_credits_depleted"),
+    ));
+    let mut turn = 1;
+    for (info, text) in [
+        (
+            r#""contextWindowExceeded""#,
+            "Codex ran out of room in the model's context window.",
+        ),
+        (
+            r#"{"badRequest":{}}"#,
+            "The model 'gpt-x' is not supported.",
+        ),
+        ("null", "Something went wrong."),
+    ] {
+        let out = tr.translate(&format!(
+            r#"{{"method":"turn/completed","params":{{"threadId":"01a0eb1f-bbfe-7030-9892-8a0d81f3d695","turn":{{"id":"T-{turn}","status":"failed","error":{{"message":"{text}","codexErrorInfo":{info}}}}}}}}}"#
+        ));
+        let EventBody::TurnEnded(e) = &out.events[0].body else {
+            panic!("{info}: {:?}", out.events)
+        };
+        let twr = &e.ext.as_ref().unwrap()["twr"];
+        assert_eq!(twr["error"], text, "{info}");
+        assert!(twr.get("limit").is_none(), "{info}: {twr}");
+        assert_eq!(ext(&e.ext, "transient"), false, "{info}");
+        turn += 1;
+        tr.send("again", turn);
+        tr.translate(&format!(
+            r#"{{"id":{},"result":{{"turn":{{"id":"T-{turn}","status":"inProgress"}}}}}}"#,
+            turn + 2
+        ));
+    }
+    let out = tr.translate(&failed("usageLimitExceeded").replace("T-1", &format!("T-{turn}")));
+    let EventBody::TurnEnded(e) = &out.events[0].body else {
+        panic!("{:?}", out.events)
+    };
+    assert_eq!(
+        e.ext.as_ref().unwrap()["twr"]["limit"],
+        json!({"kind": "spend", "message": message})
+    );
+    assert_eq!(ext(&e.ext, "transient"), false);
+
+    // Throttling stays transient, even at 100% of a window.
+    let (mut tr, _) = fed_until("approve", "\"id\":2,\"result\"");
+    tr.send("go", 1);
+    tr.translate(r#"{"id":3,"result":{"turn":{"id":"T-1","status":"inProgress"}}}"#);
+    tr.translate(&updated(window(100, 300, LATER), Value::Null, Value::Null));
+    let out = tr.translate(&failed("rateLimitExceeded"));
+    let EventBody::TurnEnded(e) = &out.events[0].body else {
+        panic!("{:?}", out.events)
+    };
+    assert_eq!(ext(&e.ext, "transient"), true);
+    assert!(e.ext.as_ref().unwrap()["twr"].get("limit").is_none());
 }

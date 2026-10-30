@@ -1,0 +1,54 @@
+{
+  "protocol": 7,
+  "revision": "daa8f4226cb7dca9b90337236f31d1722761ced5",
+  "sealed": {
+    "channel_version": 1,
+    "hello_prefix": "TWR-BOX-HELLO ",
+    "key_prefix": "TWR-BOX-KEY "
+  },
+  "vectors": [
+    {
+      "box": "gpu",
+      "by": "hub",
+      "connection": "token",
+      "hub_nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f000112233445566778899aabbccddeeff",
+      "proof": "6e7cac2f4216975d9905a10708764ce7376c1a2493715b20b90a0ecb5a4e63c7",
+      "runner_nonce": "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899",
+      "token": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "box": "gpu",
+      "by": "runner",
+      "connection": "token",
+      "hub_nonce": "0f1e2d3c4b5a69788796a5b4c3d2e1f000112233445566778899aabbccddeeff",
+      "proof": "3e63ccd0b5ddc221ea1572c7866fa7f1cd35f015b8c4cd467e62402d189e9b9e",
+      "runner_nonce": "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899",
+      "token": "0123456789abcdef0123456789abcdef"
+    },
+    {
+      "box": "mac-mini.local",
+      "by": "hub",
+      "connection": "token",
+      "hub_nonce": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+      "proof": "6b44c1bb65372529130ac9e4faa1b9d4a0c8b4f30f825376b6e37a7462c1b5b2",
+      "runner_nonce": "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899",
+      "token": "s3cr3t-T0ken_with.punctuation~0123456789"
+    },
+    {
+      "box": "mac-mini.local",
+      "by": "runner",
+      "connection": "token",
+      "hub_nonce": "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+      "proof": "ca84ba98d83296423a72197acbf065f7159a953caac7192730438263245a10d1",
+      "runner_nonce": "aa11bb22cc33dd44ee55ff6600778899aabbccddeeff00112233445566778899",
+      "token": "s3cr3t-T0ken_with.punctuation~0123456789"
+    },
+    {
+      "by": "runner",
+      "connection": "sealed",
+      "note": "on a sealed connection the runner sends this proof and does not check the hub's; the hub does not check the runner's but that it is this one",
+      "proof": ""
+    }
+  ],
+  "what": "handshake proofs this revision computes, and its sealed channel"
+}

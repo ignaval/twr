@@ -35,11 +35,11 @@ else
 fi
 echo "tag ruleset: v* tags are admin-only"
 
-# main and dev: changes from others go through a pull request whose CI jobs passed; no force
-# pushes or deletion. The checks are the `name:` of each job ci.yml runs on a pull request,
-# one per matrix entry, reported by GitHub Actions (app 15368) only; the release builds run by
-# hand and are not required. Admins are not bound (enforce_admins false): the maintainer
-# pushes to dev and fast-forwards main for a release (docs/development.md).
+# main and dev: every change goes through a pull request whose CI jobs passed, admins' too
+# (enforce_admins); no force pushes or deletion. The checks are the `name:` of each job ci.yml
+# runs on a pull request, one per matrix entry, reported by GitHub Actions (app 15368) only; the
+# release builds run by hand and are not required. A release merges dev into main through a
+# pull request (docs/development.md).
 for branch in main dev; do
     gh api -X PUT "repos/$repo/branches/$branch/protection" --input - > /dev/null << 'EOF'
 {
@@ -55,7 +55,7 @@ for branch in main dev; do
       { "context": "real systemd (linux)", "app_id": 15368 }
     ]
   },
-  "enforce_admins": false,
+  "enforce_admins": true,
   "required_pull_request_reviews": { "required_approving_review_count": 0 },
   "restrictions": null,
   "allow_force_pushes": false,

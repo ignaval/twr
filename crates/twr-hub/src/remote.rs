@@ -1,7 +1,20 @@
 //! Remote boxes: [`RemoteBox`] is the [`ThreadHost`] of a box whose runner
-//! connects to the hub (`[boxes.<name>]`). Every host call becomes a command
-//! ([`HubMsg::Cmd`] with an [`Op`]) on the box's current connection; the runner answers
+//! connects to the hub (`[boxes.<name>]`, transport `token`), or that the hub reaches itself,
+//! over ssh (transport `ssh`) or through a command (transport `command`, [`crate::ssh_box`]).
+//! Every host call becomes a command ([`HubMsg::Cmd`] with an [`Op`]) on the box's current
+//! connection; the runner answers
 //! [`RunnerMsg::CmdResult`](twr_core::runner::RunnerMsg::CmdResult) once per command id.
+//!
+//! **Transports.** A token box's runner proves its token on the hub's listener
+//! ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]). The token can change
+//! while the hub runs (`box.token`, [`RemoteBox::set_token`]): a handshake proves one
+//! snapshot of it ([`RemoteBox::token_snapshot`]) and connects only while that is still the
+//! box's token, and a change removes the connection that proved the old one. An SSH or a command box
+//! has no token: its only connections are the sealed ones the hub's own supervisor opens
+//! (`Hub::serve_sealed_runner`), so on the listener it is a box the hub does not know (a
+//! random proof, then `unauthorized`). Its threads' branches take the namespace of the hub's
+//! own box ([`RemoteBox::with_branch_namespace`]): the box's daemon belongs to this hub
+//! instance alone, as the hub's own worktrees do; a token box keeps `twr/<name>`.
 //!
 //! **Commands.** Each command gets a fresh id (a ULID) that it keeps for its whole life: a
 //! command in flight when its connection drops is sent again, with the same id, once the box is
@@ -87,21 +100,33 @@
 //! replacement). Should the counter ever run out, the connection is refused before anything
 //! changes. The box is *ready* once the
 //! hub has replayed the runner's spool and reconciled sessions; only then are commands sent.
+//! A connection whose runner speaks an older runner protocol that the hub only drains
+//! (`hub::drain`, [`twr_core::runner::DRAINABLE_PROTOCOLS`]) gets drain-safe commands only
+//! ([`Op::drain_safe`]: the `send`, `respond` and `stop` of sessions already running): any
+//! other op, request or session command, fails at once `box_offline` saying why, and one
+//! waiting from before is never written on it (it waits for the next connection).
 //!
 //! **Attach.** [`RemoteBox::attach_command`] runs, under the user's own ssh identity, the
 //! interactive command the hub's own adapter for the runtime builds for another box
 //! (`Adapter::remote_attach_command`: never fitted to what the hub knows of its own binaries,
 //! which may be other versions than the box's; never a program, argument or environment the
-//! runner names), wrapped as `ssh -t <boxes.NAME.ssh> -- <shell command>`
-//! ([`ssh_command`]). The runner is asked first (`attach_info`): it must offer an interactive
-//! CLI for the runtime, and only the working directory of its answer is used, when it is the
-//! thread's directory or lies under the box's worktrees or the thread's repository
-//! ([`attach_dir`]).
+//! runner names), wrapped as `ssh -t <boxes.NAME.ssh> -- <shell command>` with every kind
+//! of forwarding off ([`ssh_command`]). On an SSH box a built-in runtime's CLI runs through the
+//! box's own twr instead, the build its daemon reported ([`BoxInfo::build`]): `twr runner
+//! --exec <runtime> -- <the hub's arguments>` ([`ssh_exec_command`]), which picks the program
+//! on the box as a spawn there does (`TWR_*_BIN`, the thread's `PATH`, the login shell's asked
+//! with the box's own environment); the arguments and environment are still the hub's, the
+//! thread's environment passed as arguments and set on the agent's command only. The runner is asked first
+//! (`attach_info`): it must offer an interactive CLI for the runtime, and only the working
+//! directory of its answer is used, when it is the thread's directory or lies under the box's
+//! worktrees or the thread's repository ([`attach_dir`]). A command box refuses attach
+//! (`unsupported`): `docker exec -t` can be detached or lost while the agent's CLI keeps
+//! running in the container, so the end of an attach cannot be told.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -109,6 +134,7 @@ use futures::future::{BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use twr_core::adapter::{AdapterCmd, AdapterEvent, AdapterHandle, SpawnConfig};
+use twr_core::config::BoxTransport;
 use twr_core::event::GitSnapshot;
 use twr_core::git::{
     DeleteRefs, GitOps, OnlyCommits, PurgeOutcome, RemoveOutcome, RestoreOutcome, RestoreRequest,
@@ -117,12 +143,13 @@ use twr_core::git::{
 };
 use twr_core::proto::codes;
 use twr_core::runner::{
-    auth_proof, check_auth_proof, cmd_errors, decode_result, hub_errors, AttachInfo, CmdError,
-    CmdResult, HubMsg, Inventory, Op, Prover, Secret, WireRemoveOutcome, WireSpawnConfig,
+    auth_proof, check_auth_proof, cmd_errors, decode_result, hub_errors, AgentInfo, AttachInfo,
+    CmdError, CmdResult, HubMsg, Inventory, Op, Prover, Secret, WireRemoveOutcome, WireSpawnConfig,
     WireWorktreeCreated,
 };
 
 use crate::host::{path_component, StaleProcess, ThreadHost};
+use crate::ssh_box::BoxLink;
 
 /// How long a session's `spawn` / `resume` may take to be answered (across reconnections).
 pub const SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -226,6 +253,26 @@ pub struct BoxInfo {
     pub runtimes: Vec<String>,
     /// Where the box keeps thread worktrees.
     pub worktrees: PathBuf,
+    /// The box's agent CLIs as it last reported them: its inventory's (possibly none yet),
+    /// then each answer to [`Op::Agents`] on the same connection
+    /// ([`RemoteBox::refresh_agents`]). Empty: nothing known.
+    pub agents: Vec<AgentInfo>,
+    /// The build the runner says it runs (its inventory's, a build id): on an SSH box, the
+    /// build in the box's builds tree that a remote attach runs (`twr runner --exec`,
+    /// [`ssh_exec_command`]).
+    pub build: Option<String>,
+    /// How an SSH box's daemon says it was started (its inventory's, when it is a
+    /// [`twr_core::runner::valid_launch`]): `launchd <label>`, `systemd <unit>` or `detached`.
+    /// `hub.info` shows it to users only.
+    pub launch: Option<String>,
+}
+
+/// A box's report of its agent CLIs as the hub keeps it: the probe's own filters applied
+/// again (`twr_adapters::agents::kept_report`: the built-in runtimes once each, a known
+/// sign-in method for Claude Code only, the probe's own notes, short printable strings); the
+/// hub does not count on the box for that.
+fn kept_agents(agents: Vec<AgentInfo>) -> Vec<AgentInfo> {
+    twr_adapters::agents::kept_report(agents)
 }
 
 /// A remote box (see the module docs). Cheap to clone.
@@ -244,8 +291,13 @@ impl std::fmt::Debug for RemoteBox {
 
 struct Inner {
     name: String,
-    token: Secret,
-    ssh: Option<String>,
+    /// How the box connects: a token box's runner dials the listener, an SSH box's daemon is
+    /// dialed by the hub (see the module docs).
+    transport: BoxTransport,
+    /// How `twr attach` reaches it: its `ssh` (a token box's may have none), or its command.
+    link: Option<BoxLink>,
+    /// Namespace of its threads' branches (`twr/<namespace>/<name>`; `None`: `twr/<name>`).
+    branch_namespace: Option<String>,
     state: Mutex<State>,
     /// Session generations (this box's own counter).
     gens: AtomicU64,
@@ -263,16 +315,104 @@ struct Inner {
     /// Wakes [`RemoteBox::wait_settled`] when [`State::unsettled`] shrinks or the box's
     /// readiness changes.
     settled: Notify,
+    /// The latest refused connection that named this box, until one authenticates
+    /// ([`RemoteBox::note_refusal`]).
+    refusal: Mutex<Option<Refusal>>,
+    /// Hub operations on the box under way that passed its switching gate
+    /// ([`RemoteBox::begin_op`]).
+    ops: Arc<AtomicUsize>,
+    /// Held by an agents request from its sending to its answer kept
+    /// ([`RemoteBox::refresh_agents`]): one at a time, so an answer never replaces a newer
+    /// one (a poll's cached list taken while a refresh probes).
+    agents_asking: tokio::sync::Mutex<()>,
+    /// Whether a remote attach of a built-in agent runtime on this SSH box already logged
+    /// that it fell back to the hub's command (the box's inventory named no build): logged
+    /// once per box.
+    attach_fallback_logged: AtomicBool,
+}
+
+/// A hub operation on a box under way ([`RemoteBox::begin_op`]): counted until dropped.
+#[derive(Debug)]
+pub struct BoxOp(Arc<AtomicUsize>);
+
+impl Drop for BoxOp {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A connection naming a box that the hub refused before it authenticated: when, and why in
+/// words for `twr info`. Nothing in it is proven: any peer that reaches the
+/// listener can name the box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refusal {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub reason: String,
+}
+
+/// A token box's token as one handshake uses it ([`RemoteBox::token_snapshot`]): the token
+/// and its generation.
+#[derive(Clone)]
+pub struct BoxToken {
+    secret: Secret,
+    gen: u64,
+}
+
+impl BoxToken {
+    /// The token's generation (raised by each change, [`RemoteBox::set_token`]).
+    pub fn gen(&self) -> u64 {
+        self.gen
+    }
+}
+
+/// What [`RemoteBox::set_token`] did: whether the token changed, and the epoch of the
+/// connection it removed (the box was connected).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TokenSet {
+    pub changed: bool,
+    pub dropped: Option<u64>,
+}
+
+/// What [`RemoteBox::connect`] did with a new authenticated connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Connect {
+    /// It is the box's connection now, with this epoch.
+    Connected(u64),
+    /// The hub has numbered every epoch of the box: nothing changed, refuse it.
+    Exhausted,
+    /// The box's token changed since its handshake proved it: nothing changed, refuse it.
+    TokenChanged,
+}
+
+impl Connect {
+    /// The new connection's epoch, when it was taken.
+    pub fn epoch(self) -> Option<u64> {
+        match self {
+            Connect::Connected(e) => Some(e),
+            Connect::Exhausted | Connect::TokenChanged => None,
+        }
+    }
 }
 
 /// The box's current connection.
 struct Conn {
     epoch: u64,
     tx: ConnTx,
+    /// The older runner protocol it speaks, which the hub only drains (`hub::drain`): only
+    /// drain-safe commands go out on it ([`Op::drain_safe`]).
+    legacy: Option<u32>,
 }
 
 #[derive(Default)]
 struct State {
+    /// The token box's token (empty for an SSH or a command box, for a token box configured
+    /// without one, and once revoked: none of them is accepted on the listener), and its
+    /// generation, raised by each change ([`RemoteBox::set_token`]).
+    token: Secret,
+    token_gen: u64,
+    /// The last epoch numbered before the token last changed: the connections up to it proved
+    /// a token the box no longer has ([`RemoteBox::revoked`]).
+    revoked_through: u64,
     conn: Option<Conn>,
     last_epoch: u64,
     /// Synced and reconciled: commands may be sent.
@@ -341,6 +481,19 @@ fn offline(name: &str) -> CmdError {
     CmdError::new(
         codes::BOX_OFFLINE,
         format!("box {name:?} is offline (its runner is not connected)"),
+    )
+}
+
+/// Why `op` does not go to box `name`, whose runner speaks older runner protocol `protocol`
+/// (see the module docs, "Connections").
+fn not_drain_safe(name: &str, protocol: u32, op: &Op) -> CmdError {
+    CmdError::new(
+        codes::BOX_OFFLINE,
+        format!(
+            "box {name:?} runs an older twr (runner protocol {protocol}) that the hub only \
+             drains: no {} goes to it",
+            op.name()
+        ),
     )
 }
 
@@ -416,12 +569,18 @@ impl State {
         rx
     }
 
-    /// Sends pending command `order` on the current connection, if the box is ready.
+    /// Sends pending command `order` on the current connection, if the box is ready. Never on
+    /// a connection of an older protocol unless it is drain-safe ([`Op::drain_safe`]): it
+    /// stays pending for the next connection.
     fn send_pending(&mut self, order: u64) {
         let (Some(conn), true) = (self.conn.as_ref(), self.ready) else {
             return;
         };
-        if let Some(p) = self.pending.get_mut(&order) {
+        if let Some(p) = self
+            .pending
+            .get_mut(&order)
+            .filter(|p| conn.legacy.is_none() || p.op.drain_safe())
+        {
             p.sent = conn.tx.send(HubMsg::Cmd {
                 cmd_id: p.cmd_id.clone(),
                 op: p.op.clone(),
@@ -432,20 +591,57 @@ impl State {
 }
 
 impl RemoteBox {
-    /// Box `name`, whose runner authenticates with `token`; `ssh` is its `ssh` destination.
+    /// Token box `name`, whose runner authenticates with `token`; `ssh` is its `ssh`
+    /// destination (for attach).
     pub fn new(name: impl Into<String>, token: Secret, ssh: Option<String>) -> Self {
+        let link = ssh.map(BoxLink::Ssh);
+        Self::with_transport(name.into(), BoxTransport::Token, token, link)
+    }
+
+    /// SSH box `name`, which the hub reaches with `ssh` (its destination, also used for
+    /// attach). It has no token: the listener refuses every connection naming it.
+    pub fn new_ssh(name: impl Into<String>, ssh: String) -> Self {
+        let link = Some(BoxLink::Ssh(ssh));
+        Self::with_transport(name.into(), BoxTransport::Ssh, Secret::default(), link)
+    }
+
+    /// Command box `name`, which the hub reaches through `link` (its command). Like an SSH
+    /// box it has no token, and attach is refused on it (see the module docs).
+    pub fn new_command(name: impl Into<String>, link: BoxLink) -> Self {
+        Self::with_transport(
+            name.into(),
+            BoxTransport::Command,
+            Secret::default(),
+            Some(link),
+        )
+    }
+
+    fn with_transport(
+        name: String,
+        transport: BoxTransport,
+        token: Secret,
+        link: Option<BoxLink>,
+    ) -> Self {
         RemoteBox {
             inner: Arc::new(Inner {
-                name: name.into(),
-                token,
-                ssh,
-                state: Mutex::new(State::default()),
+                name,
+                transport,
+                link,
+                branch_namespace: None,
+                state: Mutex::new(State {
+                    token,
+                    ..State::default()
+                }),
                 gens: AtomicU64::new(1),
                 rejected: AtomicU64::new(0),
                 orphans: Notify::new(),
                 disposable: None,
                 change_timeout: twr_core::git::CHANGE_REQUEST_TIMEOUT,
                 settled: Notify::new(),
+                refusal: Mutex::new(None),
+                ops: Arc::default(),
+                agents_asking: tokio::sync::Mutex::new(()),
+                attach_fallback_logged: AtomicBool::new(false),
             }),
         }
     }
@@ -459,9 +655,66 @@ impl RemoteBox {
         self
     }
 
+    /// Namespace of the branches of new worktrees on this box (`twr/<namespace>/<name>`;
+    /// `None`, the default: `twr/<name>`), for creation and restore alike. An SSH box gets the
+    /// hub's own box's (see the module docs). Set before the box is shared.
+    pub fn with_branch_namespace(mut self, namespace: Option<String>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("the box is configured before it is shared")
+            .branch_namespace = namespace;
+        self
+    }
+
+    /// How the box connects (see the module docs).
+    pub fn transport(&self) -> BoxTransport {
+        self.inner.transport
+    }
+
     /// Repository changes on the box whose outcome is unknown (see the module docs).
     pub fn unsettled(&self) -> usize {
         self.state().unsettled.len()
+    }
+
+    /// A hub operation on the box begins that checked its switching gate and then awaits the
+    /// box (a new thread's workspace, a deletion, a trash restore, an attach's question):
+    /// counted until the returned guard is dropped, on every way out. The hub takes it under
+    /// its core lock in the same step as the gate check (`Core::reserve_box`), and a box with
+    /// any is not quiet (`Core::box_quiet`), so no switch begins while one runs, and none
+    /// starts once one began.
+    pub fn begin_op(&self) -> BoxOp {
+        self.inner.ops.fetch_add(1, Ordering::SeqCst);
+        BoxOp(Arc::clone(&self.inner.ops))
+    }
+
+    /// Hub operations on the box under way ([`RemoteBox::begin_op`]).
+    pub fn ops_in_progress(&self) -> usize {
+        self.inner.ops.load(Ordering::SeqCst)
+    }
+
+    /// Repository changes on the box waiting for their answer or unsettled: what may still
+    /// change the box's repositories ([`Op::changes_repository`], see the module docs).
+    pub fn repository_changes(&self) -> usize {
+        let st = self.state();
+        st.pending
+            .values()
+            .filter(|p| !p.session && p.op.changes_repository())
+            .count()
+            + st.unsettled.len()
+    }
+
+    /// Closes the box's current connection, if it has one, saying `why`: it ends as a lost
+    /// connection does (the box goes offline, and its runner keeps everything for the next).
+    pub fn close_connection(&self, why: &str) {
+        if let Some(c) = &self.state().conn {
+            c.tx.close(why);
+        }
+    }
+
+    /// [`RemoteBox::close_connection`], only while connection `epoch` is the current one.
+    pub fn close_connection_of(&self, epoch: u64, why: &str) {
+        if let Some(c) = self.state().conn.as_ref().filter(|c| c.epoch == epoch) {
+            c.tx.close(why);
+        }
     }
 
     /// Waits until no repository change of the hub may still run on the box (see the module
@@ -521,13 +774,31 @@ impl RemoteBox {
         &self.inner.name
     }
 
+    /// The box's token as it is now, with its generation: what one handshake proves both ways
+    /// ([`RemoteBox::hub_proof`], [`RemoteBox::checks_runner_proof`]) and then connects with
+    /// ([`RemoteBox::connect`]), so a token that changes meanwhile refuses that connection.
+    pub fn token_snapshot(&self) -> BoxToken {
+        let st = self.state();
+        BoxToken {
+            secret: st.token.clone(),
+            gen: st.token_gen,
+        }
+    }
+
     /// The hub's handshake proof for this box over the runner's and the hub's nonces
-    /// ([`twr_core::runner::auth_proof`] by [`Prover::Hub`]); `None` for a box without a token
-    /// (it accepts no runner).
-    pub fn hub_proof(&self, runner_nonce: &str, hub_nonce: &str) -> Option<String> {
-        (!self.inner.token.is_empty()).then(|| {
+    /// ([`twr_core::runner::auth_proof`] by [`Prover::Hub`]) with `token` (a
+    /// [`RemoteBox::token_snapshot`]); `None` for a box without a token (it accepts no runner
+    /// on the listener), an SSH box among them.
+    pub fn hub_proof(
+        &self,
+        token: &BoxToken,
+        runner_nonce: &str,
+        hub_nonce: &str,
+    ) -> Option<String> {
+        let token_box = self.inner.transport == BoxTransport::Token;
+        (token_box && !token.secret.is_empty()).then(|| {
             auth_proof(
-                &self.inner.token,
+                &token.secret,
                 Prover::Hub,
                 &self.inner.name,
                 runner_nonce,
@@ -536,17 +807,67 @@ impl RemoteBox {
         })
     }
 
-    /// Whether `proof` is the runner's handshake proof for this box over these nonces
-    /// (constant time; a box without a token accepts none).
-    pub fn checks_runner_proof(&self, runner_nonce: &str, hub_nonce: &str, proof: &str) -> bool {
-        check_auth_proof(
-            &self.inner.token,
-            Prover::Runner,
-            &self.inner.name,
-            runner_nonce,
-            hub_nonce,
-            proof,
-        )
+    /// Whether `proof` is the runner's handshake proof for this box over these nonces with
+    /// `token` (a [`RemoteBox::token_snapshot`]; constant time; a box without a token accepts
+    /// none, an SSH box none either).
+    pub fn checks_runner_proof(
+        &self,
+        token: &BoxToken,
+        runner_nonce: &str,
+        hub_nonce: &str,
+        proof: &str,
+    ) -> bool {
+        self.inner.transport == BoxTransport::Token
+            && check_auth_proof(
+                &token.secret,
+                Prover::Runner,
+                &self.inner.name,
+                runner_nonce,
+                hub_nonce,
+                proof,
+            )
+    }
+
+    /// A token box takes `token` (empty: none, so no runner is accepted on the listener),
+    /// under the state lock. When it differs from the box's token: it is stored, its
+    /// generation raised (a handshake that proved the old one is refused at
+    /// [`RemoteBox::connect`]), and the current connection, if any, is removed as
+    /// [`RemoteBox::disconnect`] removes one (requests in flight fail `box_offline`, the box
+    /// is not ready) and closed. A connection removed here is no longer current, so nothing it
+    /// sends commits any more, and its own end later changes nothing. An SSH or a command box
+    /// has no token: nothing changes. The caller (`box.token`) does this under the hub's core
+    /// lock and takes the box offline there in the same step.
+    pub fn set_token(&self, token: Secret) -> TokenSet {
+        if self.inner.transport != BoxTransport::Token {
+            return TokenSet::default();
+        }
+        let mut st = self.state();
+        if st.token.ct_eq(token.expose()) {
+            return TokenSet::default();
+        }
+        st.token = token;
+        st.token_gen += 1;
+        st.revoked_through = st.last_epoch;
+        let dropped = st.conn.take().map(|old| {
+            old.tx.send(HubMsg::Error {
+                code: hub_errors::UNAUTHORIZED.into(),
+                message: "the box's token changed: this connection is no longer accepted".into(),
+            });
+            old.tx.close("the box's token changed");
+            old.epoch
+        });
+        if dropped.is_some() {
+            st.ready = false;
+            st.drop_requests(&self.inner.name);
+        }
+        drop(st);
+        if dropped.is_some() {
+            self.inner.settled.notify_waiters();
+        }
+        TokenSet {
+            changed: true,
+            dropped,
+        }
     }
 
     /// What the latest inventory said (kept while the box is offline).
@@ -559,9 +880,88 @@ impl RemoteBox {
         self.state().ready
     }
 
+    /// Whether connection `epoch` proved a token the box no longer has: it was numbered
+    /// before the token last changed ([`RemoteBox::set_token`]), so what it sent is a revoked
+    /// runner's.
+    pub fn revoked(&self, epoch: u64) -> bool {
+        epoch <= self.state().revoked_through
+    }
+
+    /// The older runner protocol the box's current connection speaks, which the hub only
+    /// drains (`hub::drain`); `None` without a connection or for one of the hub's protocol.
+    pub fn legacy(&self) -> Option<u32> {
+        self.state().conn.as_ref().and_then(|c| c.legacy)
+    }
+
     /// Whether `epoch` is the current connection.
     pub fn is_current(&self, epoch: u64) -> bool {
         self.state().conn.as_ref().is_some_and(|c| c.epoch == epoch)
+    }
+
+    /// The current connection's epoch, while the box has one (each new connection's is
+    /// larger: see the module docs).
+    pub fn epoch(&self) -> Option<u64> {
+        self.state().conn.as_ref().map(|c| c.epoch)
+    }
+
+    /// The box's agent CLIs as it last reported them ([`BoxInfo::agents`]; none before its
+    /// first connection, or while it reported none).
+    pub fn agents(&self) -> Vec<AgentInfo> {
+        self.state()
+            .info
+            .as_ref()
+            .map(|i| i.agents.clone())
+            .unwrap_or_default()
+    }
+
+    /// Asks the box's runner for its agent CLIs ([`Op::Agents`], probed again first when
+    /// `refresh`), waiting at most `within`, and keeps the answer as the box's
+    /// ([`RemoteBox::agents`]) only while the connection it was asked on is still the current
+    /// one: an answer of a replaced connection changes nothing (the new connection's
+    /// inventory, or its own answers, are newer). Asked on the current connection, or only on
+    /// connection `on` when given (`failed` once it was replaced). `box_offline` while the box
+    /// is not ready. One request at a time per box, from its sending to its answer kept (the
+    /// wait for an earlier one counts in `within`): answers are kept in the order they were
+    /// asked for, each the box's state when it was asked, so a slow cached answer never
+    /// replaces a refresh asked after it.
+    pub async fn refresh_agents(
+        &self,
+        refresh: bool,
+        within: Duration,
+        on: Option<u64>,
+    ) -> Result<Vec<AgentInfo>, CmdError> {
+        let epoch = {
+            let st = self.state();
+            match (&st.conn, st.ready) {
+                (Some(c), true) => on.unwrap_or(c.epoch),
+                _ => return Err(offline(&self.inner.name)),
+            }
+        };
+        let asked = async {
+            let one = self.inner.agents_asking.lock().await;
+            let v = self
+                .call_on(Op::Agents { refresh }, Kind::Request, Some(epoch))
+                .await;
+            (one, v)
+        };
+        let (_one, v) = tokio::time::timeout(within, asked).await.map_err(|_| {
+            CmdError::new(
+                cmd_errors::FAILED,
+                format!(
+                    "box {:?} did not answer agents within {}s",
+                    self.inner.name,
+                    within.as_secs()
+                ),
+            )
+        })?;
+        let agents = kept_agents(decode_result(v?)?);
+        let mut st = self.state();
+        if st.conn.as_ref().is_some_and(|c| c.epoch == epoch) {
+            if let Some(info) = st.info.as_mut() {
+                info.agents = agents.clone();
+            }
+        }
+        Ok(agents)
     }
 
     /// Counts a runner frame refused because it names a thread of another box.
@@ -572,6 +972,26 @@ impl RemoteBox {
     /// Runner frames refused because they named a thread of another box.
     pub fn rejected_frames(&self) -> u64 {
         self.inner.rejected.load(Ordering::Relaxed)
+    }
+
+    /// Records that a connection naming this box was refused before it authenticated, and
+    /// why (shown while the box is offline, so a runner that keeps being refused is visible
+    /// on the hub's side too). The next authenticated connection clears it.
+    pub fn note_refusal(&self, reason: impl Into<String>) {
+        *self.refusal_slot() = Some(Refusal {
+            at: chrono::Utc::now(),
+            reason: reason.into(),
+        });
+    }
+
+    /// The latest refusal [`RemoteBox::note_refusal`] recorded since a connection of this box
+    /// last authenticated.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.refusal_slot().clone()
+    }
+
+    fn refusal_slot(&self) -> MutexGuard<'_, Option<Refusal>> {
+        self.inner.refusal.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The operation `cmd` of thread `thread`'s session is on the box (a `respond` already
@@ -594,6 +1014,11 @@ impl RemoteBox {
             AdapterCmd::Stop => Op::Stop { thread, run: None },
             AdapterCmd::Interrupt => {
                 tracing::warn!(%thread, "remote turn interruption is unsupported; session retained");
+                return None;
+            }
+            // The hub refuses a compaction on a remote box (`ThreadHost::compacts`).
+            AdapterCmd::Compact { turn } => {
+                tracing::warn!(%thread, turn, "remote context compaction is unsupported");
                 return None;
             }
         })
@@ -638,13 +1063,28 @@ impl RemoteBox {
     }
 
     /// Takes a new authenticated connection (see the module docs): fences the previous one,
-    /// fails requests in flight, and returns the new epoch. Not ready yet. `None` (nothing
-    /// changed; the connection is to be refused) once the hub has numbered `u64::MAX`
-    /// connections of this box.
-    pub fn connect(&self, inv: &Inventory, tx: ConnTx) -> Option<u64> {
+    /// fails requests in flight, and returns the new epoch ([`Connect::Connected`]). Not ready
+    /// yet. Nothing changes, and the connection is to be refused, once the hub has numbered
+    /// `u64::MAX` connections of this box ([`Connect::Exhausted`]), or when `token_gen` (the
+    /// generation of the token its handshake proved, [`RemoteBox::token_snapshot`]; `None` for
+    /// a sealed connection, which proves no token) is no longer the box's
+    /// ([`Connect::TokenChanged`]: [`RemoteBox::set_token`] ran meanwhile). `legacy`: the
+    /// connection's runner speaks that older protocol, which the hub only drains.
+    pub fn connect(
+        &self,
+        inv: &Inventory,
+        tx: ConnTx,
+        token_gen: Option<u64>,
+        legacy: Option<u32>,
+    ) -> Connect {
         let mut st = self.state();
+        if token_gen.is_some_and(|g| g != st.token_gen) {
+            return Connect::TokenChanged;
+        }
         // The hub's own counter, never the runner's `epoch_hint` (see the module docs).
-        let epoch = st.last_epoch.checked_add(1)?;
+        let Some(epoch) = st.last_epoch.checked_add(1) else {
+            return Connect::Exhausted;
+        };
         if let Some(old) = st.conn.take() {
             tracing::warn!(
                 box_name = %self.inner.name,
@@ -666,16 +1106,23 @@ impl RemoteBox {
             st.unsettled.clear();
         }
         st.last_epoch = epoch;
-        st.conn = Some(Conn { epoch, tx });
+        st.conn = Some(Conn { epoch, tx, legacy });
         st.ready = false;
         st.info = Some(BoxInfo {
             version: inv.version.clone(),
             runtimes: inv.runtimes.clone(),
             worktrees: inv.worktrees.clone(),
+            agents: kept_agents(inv.agents.clone()),
+            build: inv.build.clone().filter(|b| twr_core::valid_build_id(b)),
+            launch: inv
+                .launch
+                .clone()
+                .filter(|l| twr_core::runner::valid_launch(l)),
         });
         drop(st);
+        *self.refusal_slot() = None;
         self.inner.settled.notify_waiters();
-        Some(epoch)
+        Connect::Connected(epoch)
     }
 
     /// The box is synced and reconciled on connection `epoch`. In this order: stops the
@@ -822,7 +1269,7 @@ impl RemoteBox {
                     st.take_respond(thread, &attn_id).map(|(id, _)| id)
                 }
                 AdapterCmd::Stop => st.stops.remove(thread),
-                AdapterCmd::Interrupt => None,
+                AdapterCmd::Interrupt | AdapterCmd::Compact { .. } => None,
             };
             ids.extend(id);
         }
@@ -876,6 +1323,13 @@ impl RemoteBox {
         let mut st = self.state();
         if kind == Kind::Request && !st.ready {
             return Err(offline(&self.inner.name));
+        }
+        // A runner of an older protocol gets drain-safe commands only, requests and session
+        // commands alike (see the module docs, "Connections").
+        if let Some(p) = st.conn.as_ref().and_then(|c| c.legacy) {
+            if !op.drain_safe() {
+                return Err(not_drain_safe(&self.inner.name, p, &op));
+            }
         }
         if on.is_some_and(|e| !st.conn.as_ref().is_some_and(|c| c.epoch == e)) {
             return Err(CmdError::new(
@@ -1192,7 +1646,8 @@ impl RemoteBox {
     /// the directory [`attach_dir`] settles on, wrapped as `ssh -t <ssh> -- <command>`
     /// ([`ssh_command`]). `repo` is the thread's repository on the box (`thread.created`).
     /// Returns the command and that directory on the box. `None` when the runner has no
-    /// interactive CLI for the runtime. `unsupported` without `[boxes.NAME] ssh`.
+    /// interactive CLI for the runtime. `unsupported` without `[boxes.NAME] ssh`, and on a
+    /// command box (before the runner is asked: see the module docs).
     pub async fn attach_command(
         &self,
         runtime: &str,
@@ -1201,7 +1656,23 @@ impl RemoteBox {
         local: &Command,
         repo: Option<&Path>,
     ) -> Result<Option<(Command, Option<PathBuf>)>, CmdError> {
-        let Some(ssh) = self.inner.ssh.clone().filter(|s| !s.trim().is_empty()) else {
+        if self.inner.transport == BoxTransport::Command {
+            return Err(CmdError::new(
+                codes::UNSUPPORTED,
+                format!(
+                    "twr can't attach to threads on box {} yet: a command box's terminal \
+                     (`docker exec -t`) can be detached or lost while the agent's CLI keeps \
+                     running in the container, so twr can't tell when the attach ends. Continue \
+                     the thread from the TUI or with `twr send`.",
+                    self.inner.name
+                ),
+            ));
+        }
+        let ssh = match &self.inner.link {
+            Some(BoxLink::Ssh(ssh)) if !ssh.trim().is_empty() => Some(ssh.clone()),
+            _ => None,
+        };
+        let Some(ssh) = ssh else {
             return Err(CmdError::new(
                 codes::UNSUPPORTED,
                 format!(
@@ -1212,8 +1683,14 @@ impl RemoteBox {
         };
         let mut wire = WireSpawnConfig::from(cfg.clone());
         // Nothing of the hub's environment but the runtime spec's attach template (the
-        // runner's adapter builds the attach command from it; the runner keeps the same keys).
+        // runner's adapter builds the attach command from it; the runner keeps the same keys)
+        // and the `PATH` the thread configures, if any (the runner resolves the runtime's
+        // program on it, as for a spawn; else on the box's login shell's).
+        let path = twr_adapters::process::env_path(&wire.env).map(str::to_string);
         twr_adapters::retain_attach_env(&mut wire.env);
+        if let Some(p) = path {
+            wire.env.push(("PATH".into(), p));
+        }
         let v = self
             .call(
                 Op::AttachInfo {
@@ -1232,7 +1709,47 @@ impl RemoteBox {
         let dir = attach_dir(answer.cwd.as_deref(), &cfg.cwd, worktrees.as_deref(), repo);
         let mut info = AttachInfo::from_command(local);
         info.cwd = dir.clone();
-        Ok(Some((ssh_command(&ssh, &info, None), dir)))
+        // An SSH box runs the agent's CLI through its own twr (the build its daemon runs):
+        // resolved there as a spawn is. A token box's runner is no build of a tree the hub
+        // knows: the hub's command runs as it is. So does an SSH box whose inventory names no
+        // build (a runner of another twr): its PATH and `TWR_*_BIN` are not applied then, said
+        // once in the hub's log.
+        let dialed = self.inner.transport.dialed();
+        let build = if dialed {
+            self.info().and_then(|i| i.build)
+        } else {
+            None
+        };
+        let builtin = twr_adapters::resolve::BUILTIN_AGENTS
+            .iter()
+            .any(|(r, ..)| *r == runtime);
+        if builtin
+            && build.is_none()
+            && dialed
+            && !self
+                .inner
+                .attach_fallback_logged
+                .swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                box_name = %self.inner.name,
+                runtime,
+                "the box's runner named no build in its inventory: a remote attach runs the \
+                 hub's command over ssh, which resolves the agent's CLI on the PATH ssh gives \
+                 (not the box's login shell's, nor its TWR_*_BIN)"
+            );
+        }
+        let cmd = match build.filter(|_| builtin) {
+            Some(build) => ssh_exec_command(&ssh, &build, runtime, &info),
+            None => ssh_command(&ssh, &info, None),
+        }
+        .map_err(|why| {
+            CmdError::new(
+                codes::BAD_REQUEST,
+                format!("[boxes.{}] ssh = {ssh:?}: {why}", self.inner.name),
+            )
+        })?;
+        Ok(Some((cmd, dir)))
     }
 }
 
@@ -1288,6 +1805,13 @@ impl ThreadHost for RemoteBox {
             run: Some(twr_core::event::new_id()),
         };
         Ok(self.start_session(&thread, Some(op)))
+    }
+
+    fn worktree_branch(&self, name: &str) -> String {
+        match &self.inner.branch_namespace {
+            Some(ns) => format!("twr/{ns}/{name}"),
+            None => twr_core::git::thread_branch(name),
+        }
     }
 
     fn attach_command(
@@ -1611,13 +2135,53 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// The `ssh` arguments a box's `ssh` setting stands for: its whitespace-separated words (a
+/// destination, possibly preceded by `ssh` options), as attach and the hub's own ssh
+/// ([`crate::ssh_box`]) pass them, once [`twr_core::config::check_ssh_words`] accepts them
+/// (else why not: they forward something, or change what ssh runs or how). Every caller
+/// passes [`SSH_NO_FORWARDING`] after them.
+pub fn ssh_words(ssh: &str) -> Result<Vec<&str>, String> {
+    twr_core::config::check_ssh_words(ssh)?;
+    Ok(ssh.split_whitespace().collect())
+}
+
+/// What every ssh twr runs passes after a box's `ssh` words ([`ssh_words`]) and before `--`:
+/// no agent forwarding (`-a`), no X11 forwarding (`-x`), no GSSAPI credential forwarding
+/// (`-k`). ssh takes options after the destination too, and the last of `-a`/`-A` (and so
+/// on) wins over an earlier one and over any `ForwardAgent` (`ForwardX11`,
+/// `GSSAPIDelegateCredentials`) of the command line or a config file, so these hold whatever
+/// precedes them.
+pub const SSH_NO_FORWARDING: &[&str] = &["-a", "-x", "-k"];
+
+/// The options `twr attach`'s ssh passes before a box's `ssh` words: a terminal (`-t`), and
+/// what the hub's own ssh clears too (`crate::ssh_box::SSH_OPTIONS`; ssh takes the first
+/// value of a `-o` option, so these hold over your ssh config files): no forwarded port,
+/// agent, X11 display or tunnel, no local command.
+pub const ATTACH_SSH_OPTIONS: &[&str] = &[
+    "-t",
+    "-o",
+    "ClearAllForwardings=yes",
+    "-o",
+    "ForwardAgent=no",
+    "-o",
+    "ForwardX11=no",
+    "-o",
+    "PermitLocalCommand=no",
+    "-o",
+    "Tunnel=no",
+];
+
 /// The local command that runs `info` on a remote box over ssh:
-/// `ssh -t <ssh...> -- 'cd <cwd> && exec env -u K -- 'K2=V' <program> <args>'`, every part
-/// shell-quoted (the remote side runs it with the user's login shell; `--` ends `env`'s
-/// options, so a variable whose name starts with `-` is set, not taken for one). `cwd` is used when the
-/// command has no directory of its own. `ssh` is split on whitespace (a destination, possibly
-/// preceded by `ssh` options).
-pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Command {
+/// `ssh -t -o <no forwarding...> <ssh...> -a -x -k -- 'cd <cwd> && exec env -u K -- 'K2=V'
+/// <program> <args>'` ([`ATTACH_SSH_OPTIONS`], [`SSH_NO_FORWARDING`]),
+/// every part shell-quoted (the remote side runs it with the user's login shell; `--` ends
+/// `env`'s options, so a variable whose name starts with `-` is set, not taken for one).
+/// `cwd` is used when the command has no directory of its own. `ssh` is split on whitespace
+/// (a destination, possibly preceded by `ssh` options: [`ssh_words`], an error when it
+/// refuses them). An attached CLI on the box gets no forwarding either: it is an agent's
+/// CLI, and must not reach your ssh agent, X11 display, Kerberos credentials or forwarded
+/// ports any more than the box daemon's runtimes can.
+pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Result<Command, String> {
     let mut remote = String::new();
     let dir = info
         .cwd
@@ -1648,16 +2212,119 @@ pub fn ssh_command(ssh: &str, info: &AttachInfo, cwd: Option<&Path>) -> Command 
         remote.push_str(&sh_quote(a));
     }
     let mut c = Command::new("ssh");
-    c.arg("-t")
-        .args(ssh.split_whitespace())
+    c.args(ATTACH_SSH_OPTIONS)
+        .args(ssh_words(ssh)?)
+        .args(SSH_NO_FORWARDING)
         .arg("--")
         .arg(remote);
-    c
+    Ok(c)
+}
+
+/// The local command of a remote attach to a thread of built-in agent runtime `runtime` on an
+/// SSH box whose daemon runs build `build`: as [`ssh_command`] (the same ssh options, words
+/// and refusals, the same directory), but the box's own twr runs the agent: `sh -c '<data
+/// dir>; cd <dir> && exec env -u <twr's secrets> -- "$d"/twr/runner/builds/<build>/twr runner
+/// --exec=<runtime> [--path=<thread PATH>] [--env=NAME=VALUE]... [--unset=NAME]... -- <args>'`.
+/// The box resolves the agent's program as a spawn of the thread does (`TWR_*_BIN` there, else
+/// on the thread's `PATH`, else on the login shell's: `twr_adapters::agents::exec_command`),
+/// asking the login shell with the box's own environment (the ssh session's, as the daemon asks
+/// it with its own): the thread's environment is no part of that (a thread's `SHELL` or `HOME`
+/// would pick another shell or other startup files), it goes to `--env` / `--unset` and is set
+/// on the agent's command only, after its `PATH`. Everything else (the arguments, with the
+/// session id, mode, model and effort, and the environment) is the hub's, from `info` (the
+/// hub's own adapter's command; its program is not used). The builds tree is the one the relay
+/// runs from: `$XDG_DATA_HOME`, else `$HOME/.local/share`, as `sh` on the box reads them. An
+/// error for a `build` that is no build id, a runtime without a CLI of its own, an environment
+/// variable that is no name or is twr's own to set (`TWR_*`, as `[threads] env` refuses it),
+/// or `ssh` words [`ssh_words`] refuses.
+pub fn ssh_exec_command(
+    ssh: &str,
+    build: &str,
+    runtime: &str,
+    info: &AttachInfo,
+) -> Result<Command, String> {
+    if !twr_core::valid_build_id(build) {
+        return Err(format!("{build:?} is not a build id"));
+    }
+    if !twr_adapters::resolve::BUILTIN_AGENTS
+        .iter()
+        .any(|(r, ..)| *r == runtime)
+    {
+        return Err(format!("{runtime} has no CLI of its own to run on the box"));
+    }
+    let mut script = String::from(
+        "case ${XDG_DATA_HOME:-} in /*) d=$XDG_DATA_HOME ;; *) d=${HOME:-}/.local/share ;; esac\n",
+    );
+    if let Some(d) = info.cwd.as_deref().filter(|d| !d.as_os_str().is_empty()) {
+        script.push_str(&format!("cd {} && ", sh_quote(&d.to_string_lossy())));
+    }
+    script.push_str("exec ");
+    // The thread's PATH goes to `--path` (where the program is looked up, and the PATH it
+    // gets); twr's own variables the hub's command removes are removed before the box's twr
+    // runs (they reach neither it nor the login shell it asks; it removes its secrets from the
+    // agent's command itself); the rest is the agent's own (`--env`, `--unset`).
+    let path = info
+        .env
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "PATH")
+        .and_then(|(_, v)| v.clone());
+    let twr_own = |k: &str| k.to_ascii_uppercase().starts_with("TWR_");
+    let removed: Vec<&str> = info
+        .env
+        .iter()
+        .filter(|(k, v)| v.is_none() && twr_own(k))
+        .map(|(k, _)| k.as_str())
+        .collect();
+    let mut agent_env = Vec::new();
+    for (k, v) in info.env.iter().filter(|(k, _)| k != "PATH") {
+        match v {
+            None if twr_own(k) => {}
+            Some(v) => {
+                twr_core::config::check_env_name(k)?;
+                agent_env.push(format!("--env={k}={v}"));
+            }
+            None => {
+                twr_core::config::check_env_name(k)?;
+                agent_env.push(format!("--unset={k}"));
+            }
+        }
+    }
+    if !removed.is_empty() {
+        script.push_str("env ");
+        for k in removed {
+            script.push_str(&format!("-u {} ", sh_quote(k)));
+        }
+        script.push_str("-- ");
+    }
+    script.push_str(&format!(
+        "\"$d\"/twr/runner/builds/{build}/twr runner {}",
+        sh_quote(&format!("--exec={runtime}"))
+    ));
+    if let Some(p) = path {
+        script.push_str(&format!(" {}", sh_quote(&format!("--path={p}"))));
+    }
+    for e in agent_env {
+        script.push_str(&format!(" {}", sh_quote(&e)));
+    }
+    script.push_str(" --");
+    for a in &info.args {
+        script.push(' ');
+        script.push_str(&sh_quote(a));
+    }
+    let mut c = Command::new("ssh");
+    c.args(ATTACH_SSH_OPTIONS)
+        .args(ssh_words(ssh)?)
+        .args(SSH_NO_FORWARDING)
+        .arg("--")
+        .arg(crate::ssh_box::sh_c(&script));
+    Ok(c)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::install;
 
     fn conn() -> (ConnTx, watch::Receiver<Option<String>>) {
         let (tx, _rx) = mpsc::channel(4);
@@ -1730,9 +2397,9 @@ mod tests {
             ..Default::default()
         };
         let (first, first_closed) = conn();
-        assert_eq!(b.connect(&hello, first), Some(1));
+        assert_eq!(b.connect(&hello, first, None, None), Connect::Connected(1));
         let (second, _) = conn();
-        assert_eq!(b.connect(&hello, second), Some(2));
+        assert_eq!(b.connect(&hello, second, None, None), Connect::Connected(2));
         assert!(first_closed.borrow().is_some(), "the first is fenced");
         assert!(!b.is_current(1) && b.is_current(2));
         // The first connection's end leaves its replacement alone.
@@ -1741,12 +2408,108 @@ mod tests {
 
         b.state().last_epoch = u64::MAX - 1;
         let (last, last_closed) = conn();
-        assert_eq!(b.connect(&Inventory::default(), last), Some(u64::MAX));
+        assert_eq!(
+            b.connect(&Inventory::default(), last, None, None),
+            Connect::Connected(u64::MAX)
+        );
         let (extra, extra_closed) = conn();
-        assert_eq!(b.connect(&hello, extra), None);
+        assert_eq!(b.connect(&hello, extra, None, None), Connect::Exhausted);
         assert!(b.is_current(u64::MAX), "the current connection stays");
         assert!(last_closed.borrow().is_none(), "and is not fenced");
         assert!(extra_closed.borrow().is_none());
+    }
+
+    /// A new token raises the token's generation and removes the box's connection: closed,
+    /// no longer current, its requests failed `box_offline`, its own end a no-op. A
+    /// connection whose handshake proved the old token is refused and changes nothing (the
+    /// current connection, the refusal shown). The same token again changes nothing; an SSH
+    /// box has no token to set.
+    #[tokio::test]
+    async fn a_new_token_drops_the_connection_and_refuses_handshakes_of_the_old_one() {
+        let b = RemoteBox::new("gpu", Secret::new("old-token-0123456789"), None);
+        let before = b.token_snapshot();
+        let (tx, _rx) = mpsc::channel(4);
+        let (close, closed) = watch::channel(None);
+        let epoch = b
+            .connect(
+                &Inventory::default(),
+                ConnTx::new(tx, close),
+                Some(before.gen()),
+                None,
+            )
+            .epoch()
+            .unwrap();
+        assert!(b.set_ready(epoch, &[], Vec::new()));
+        let request = tokio::spawn(b.git().repo_root(PathBuf::from("/r")));
+        for _ in 0..500 {
+            if !b.state().pending.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(b.state().pending.len(), 1, "the request waits");
+
+        // The same token: nothing.
+        let same = b.set_token(Secret::new("old-token-0123456789"));
+        assert_eq!(same, TokenSet::default());
+        assert!(b.is_current(epoch) && closed.borrow().is_none());
+
+        let set = b.set_token(Secret::new("new-token-0123456789"));
+        assert_eq!(
+            set,
+            TokenSet {
+                changed: true,
+                dropped: Some(epoch)
+            }
+        );
+        let after = b.token_snapshot();
+        assert_eq!(after.gen(), before.gen() + 1);
+        assert!(!b.is_current(epoch) && !b.is_ready());
+        assert!(closed.borrow().is_some(), "its connection is closed");
+        let e = tokio::time::timeout(Duration::from_secs(10), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("offline"), "{e:#}");
+        assert!(!b.disconnect(epoch), "its own end changes nothing");
+        let (n1, n2) = ("a".repeat(64), "b".repeat(64));
+        assert!(b.hub_proof(&before, &n1, &n2) != b.hub_proof(&after, &n1, &n2));
+
+        // A handshake that proved the old token, connecting after the change: refused.
+        b.note_refusal("earlier");
+        let (late, late_closed) = conn();
+        assert_eq!(
+            b.connect(&Inventory::default(), late, Some(before.gen()), None),
+            Connect::TokenChanged
+        );
+        assert_eq!(b.epoch(), None);
+        assert!(late_closed.borrow().is_none());
+        assert!(b.refusal().is_some(), "the refusal shown stays");
+        // One that proved the new one connects.
+        let (good, _) = conn();
+        let next = b.connect(&Inventory::default(), good, Some(after.gen()), None);
+        assert_eq!(next, Connect::Connected(epoch + 1));
+        assert!(b.refusal().is_none());
+
+        // Revoked: no token, no proof, nothing accepted.
+        let set = b.set_token(Secret::default());
+        assert_eq!(set.dropped, Some(epoch + 1));
+        let none = b.token_snapshot();
+        assert_eq!(b.hub_proof(&none, &n1, &n2), None);
+        let proof = auth_proof(
+            &Secret::new("new-token-0123456789"),
+            Prover::Runner,
+            "gpu",
+            &n1,
+            &n2,
+        );
+        assert!(!b.checks_runner_proof(&none, &n1, &n2, &proof));
+        assert!(b.checks_runner_proof(&after, &n1, &n2, &proof));
+
+        let ssh = RemoteBox::new_ssh("far", "me@far".into());
+        assert_eq!(ssh.set_token(Secret::new("x")), TokenSet::default());
+        assert_eq!(ssh.token_snapshot().gen(), 0);
     }
 
     #[test]
@@ -1789,6 +2552,461 @@ mod tests {
         assert_eq!(attach_dir(None, Path::new(""), wt, repo), None);
     }
 
+    /// The commands that went out on a connection, as their ops (pings and the like left out).
+    fn sent_ops(rx: &mut mpsc::Receiver<HubMsg>) -> Vec<Op> {
+        let mut ops = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let HubMsg::Cmd { op, .. } = m {
+                ops.push(op);
+            }
+        }
+        ops
+    }
+
+    /// On a connection of an older protocol, which the hub only drains, only the drain-safe
+    /// commands of sessions already running go out (`send`, `respond`, `stop`, as issued or
+    /// sent again); a request (git) and a session's `spawn` fail at once saying why, and a
+    /// `spawn` that waited from before is not written on it (it waits for the next connection,
+    /// where it goes).
+    #[tokio::test]
+    async fn a_drained_connection_gets_only_drain_safe_commands() {
+        let b = RemoteBox::new_ssh("gpu", "me@gpu".into());
+        let connect = |legacy: Option<u32>| {
+            let (tx, rx) = mpsc::channel(64);
+            let (close, closed) = watch::channel(None);
+            let epoch = b
+                .connect(&Inventory::default(), ConnTx::new(tx, close), None, legacy)
+                .epoch()
+                .unwrap();
+            (epoch, rx, closed)
+        };
+        let spawn = |thread: &str| Op::Spawn {
+            thread: thread.into(),
+            runtime: "fake".into(),
+            cfg: WireSpawnConfig::default(),
+            prompt: Some("hi".into()),
+            run: None,
+        };
+        // A spawn issued while a connection of the hub's protocol is not ready yet waits.
+        let (_, mut rx, _c0) = connect(None);
+        let _waiting = b.start_session("early", Some(spawn("early")));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(sent_ops(&mut rx).is_empty());
+
+        let (epoch, mut rx, _c1) = connect(Some(6));
+        assert_eq!(b.legacy(), Some(6));
+        let resend = vec![
+            (
+                "send:t:1".to_string(),
+                Op::Send {
+                    thread: "t".into(),
+                    turn: 1,
+                    text: "again".into(),
+                    run: None,
+                },
+            ),
+            (
+                "respond:1:x".to_string(),
+                Op::Respond {
+                    attn_id: "a".into(),
+                    thread: "t".into(),
+                    answer: twr_core::event::Answer::allow(),
+                    run: None,
+                },
+            ),
+            (
+                "stop:t:1".to_string(),
+                Op::Stop {
+                    thread: "t".into(),
+                    run: None,
+                },
+            ),
+        ];
+        let safe: Vec<Op> = resend.iter().map(|(_, op)| op.clone()).collect();
+        assert!(b.set_ready(epoch, &[], resend));
+        // The resends go out; the waiting spawn does not.
+        assert_eq!(sent_ops(&mut rx), safe);
+
+        // A request fails at once, saying why.
+        let e = b.git().repo_root(PathBuf::from("/r")).await.unwrap_err();
+        let e = format!("{e:#}");
+        assert!(
+            e.contains("runs an older twr (runner protocol 6) that the hub only drains"),
+            "{e}"
+        );
+        // A new session's spawn too: the session ends at once.
+        let mut refused = b.start_session("late", Some(spawn("late")));
+        let mut events = refused.take_events().unwrap();
+        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await {
+            Ok(Some(AdapterEvent::Exited { stderr_tail, .. })) => assert!(
+                stderr_tail.contains("that the hub only drains: no spawn goes to it"),
+                "{stderr_tail}"
+            ),
+            other => panic!("no exit: {other:?}"),
+        }
+        // A session taken over sends, answers and stops (each once the one before it is
+        // answered).
+        let h = b.start_session("t", None);
+        let c = h.commander();
+        let cmds = [
+            AdapterCmd::Send {
+                text: "go".into(),
+                turn: 2,
+            },
+            AdapterCmd::Respond {
+                attn_id: "b".into(),
+                answer: twr_core::event::Answer::allow(),
+            },
+            AdapterCmd::Stop,
+        ];
+        let mut ops = Vec::new();
+        for cmd in cmds {
+            c.send(cmd).unwrap();
+            let m = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+            let Ok(Some(HubMsg::Cmd { cmd_id, op })) = m else {
+                panic!("no command: {m:?}")
+            };
+            b.on_result(epoch, CmdResult::new(&cmd_id, Ok(Value::Null)));
+            ops.push(op);
+        }
+        assert!(matches!(ops[0], Op::Send { turn: 2, .. }), "{ops:?}");
+        assert!(matches!(ops[1], Op::Respond { .. }), "{ops:?}");
+        assert!(matches!(ops[2], Op::Stop { .. }), "{ops:?}");
+
+        // The next connection, of the hub's protocol, gets the spawn that waited.
+        let (epoch, mut rx, _c2) = connect(None);
+        assert_eq!(b.legacy(), None);
+        assert!(b.set_ready(epoch, &[], Vec::new()));
+        let ops = sent_ops(&mut rx);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, Op::Spawn { thread, .. } if thread == "early")),
+            "{ops:?}"
+        );
+    }
+
+    /// Agent requests to one box go one at a time, each answer kept before the next is sent:
+    /// a poll's slow answer (the runner's cached list, older) cannot land after a refresh
+    /// asked later and replace its fresher one.
+    #[tokio::test]
+    async fn agent_answers_are_kept_in_the_order_they_were_asked() {
+        let b = RemoteBox::new_ssh("gpu", "me@gpu".into());
+        let (tx, mut rx) = mpsc::channel(4);
+        let (close, _closed) = watch::channel(None);
+        let epoch = b
+            .connect(&Inventory::default(), ConnTx::new(tx, close), None, None)
+            .epoch()
+            .unwrap();
+        assert!(b.set_ready(epoch, &[], Vec::new()));
+        let agent = |login: twr_core::runner::AgentLogin| twr_core::runner::AgentInfo {
+            runtime: "codex".into(),
+            found: true,
+            login,
+            ..Default::default()
+        };
+        let within = Duration::from_secs(10);
+        let poll = tokio::spawn({
+            let b = b.clone();
+            async move { b.refresh_agents(false, within, None).await }
+        });
+        let Some(HubMsg::Cmd { cmd_id: first, op }) = rx.recv().await else {
+            panic!("no poll")
+        };
+        assert_eq!(op, Op::Agents { refresh: false });
+        let refresh = tokio::spawn({
+            let b = b.clone();
+            async move { b.refresh_agents(true, within, None).await }
+        });
+        // The refresh waits for the poll's answer: nothing more goes out meanwhile.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(rx.try_recv().is_err(), "the refresh went out over the poll");
+        let old = vec![agent(twr_core::runner::AgentLogin::LoggedOut)];
+        b.on_result(epoch, CmdResult::new(&first, Ok(serde_json::json!(old))));
+        assert_eq!(poll.await.unwrap().unwrap(), old);
+        let Some(HubMsg::Cmd { cmd_id: second, op }) = rx.recv().await else {
+            panic!("no refresh")
+        };
+        assert_eq!(op, Op::Agents { refresh: true });
+        let new = vec![agent(twr_core::runner::AgentLogin::LoggedIn)];
+        b.on_result(epoch, CmdResult::new(&second, Ok(serde_json::json!(new))));
+        assert_eq!(refresh.await.unwrap().unwrap(), new);
+        assert_eq!(b.agents(), new);
+    }
+
+    const BUILD: &str = "0123456789abcdef";
+
+    /// A fake build of twr in `data`'s builds tree that writes where it ran, its environment
+    /// and its arguments to `out`.
+    fn fake_build(data: &Path, out: &Path) {
+        install(
+            &data.join(format!("twr/runner/builds/{BUILD}/twr")),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"${{FOO-unset}}\" \"${{TWR_RUNNER_TOKEN-unset}}\" \
+                 \"$HOME\" \"$SHELL\" \"$@\" > '{}'\n",
+                out.display()
+            ),
+        );
+    }
+
+    /// Runs the remote part of ssh command `c` as the box's login shell would (`sh -c`), with
+    /// the builds tree under `data`, a token, and the box's own `HOME` and `SHELL` in the
+    /// environment: what the fake build wrote.
+    fn run_remote(c: &Command, data: &Path, out: &Path) -> Vec<String> {
+        let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
+        let st = std::process::Command::new("sh")
+            .args(["-c", &remote])
+            .env("XDG_DATA_HOME", data)
+            .env("TWR_RUNNER_TOKEN", "secret")
+            .env("HOME", "/box/home")
+            .env("SHELL", "/box/bash")
+            .env_remove("FOO")
+            .status()
+            .unwrap();
+        assert!(st.success(), "{remote}");
+        std::fs::read_to_string(out)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A remote attach on an SSH box runs the agent through the box's own twr build (`twr
+    /// runner --exec`), end to end: the ssh command's remote part, run as the box's shell
+    /// runs it, runs `<data>/twr/runner/builds/<build>/twr runner --exec=<runtime>
+    /// --path=<thread PATH> --env=... --unset=... -- <the hub's arguments>` in the thread's
+    /// directory, twr's secrets removed, every argument as the hub built it. The box's twr
+    /// runs with the box's own environment (it asks the login shell with it, as the daemon
+    /// does for a spawn): the thread's variables, a `HOME` or `SHELL` of its own among them,
+    /// are its arguments, for the agent's command alone. The ssh part is attach's own
+    /// (options, words, refusals).
+    #[test]
+    fn attach_on_an_ssh_box_runs_the_boxs_twr() {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, out, thread) = (
+            dir.path().join("data"),
+            dir.path().join("out"),
+            dir.path().join("it's here"),
+        );
+        std::fs::create_dir(&thread).unwrap();
+        fake_build(&data, &out);
+        let info = AttachInfo {
+            program: "claude".into(),
+            args: vec![
+                "--resume".into(),
+                "s 1; rm -rf /".into(),
+                "--model".into(),
+                "it's".into(),
+            ],
+            cwd: Some(thread.clone()),
+            env: vec![
+                ("CLAUDE_CODE_SIMPLE".into(), None),
+                ("FOO".into(), Some("bar baz".into())),
+                ("HOME".into(), Some("/thread's home".into())),
+                ("PATH".into(), Some("bin:/usr/bin".into())),
+                ("SHELL".into(), Some("/bin/false".into())),
+                ("TWR_RUNNER_TOKEN".into(), None),
+            ],
+        };
+        let c = ssh_exec_command("-p 2222 me@gpu", BUILD, "claude-code", &info).unwrap();
+        let argv: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let head: Vec<&str> = ATTACH_SSH_OPTIONS
+            .iter()
+            .copied()
+            .chain(["-p", "2222", "me@gpu"])
+            .chain(SSH_NO_FORWARDING.iter().copied())
+            .chain(["--"])
+            .collect();
+        assert_eq!(c.get_program(), "ssh");
+        assert_eq!(argv[..argv.len() - 1], head[..]);
+        assert!(argv.last().unwrap().starts_with("sh -c "), "{argv:?}");
+        assert_eq!(
+            run_remote(&c, &data, &out),
+            [
+                thread.to_str().unwrap(),
+                "unset",
+                "unset",
+                "/box/home",
+                "/box/bash",
+                "runner",
+                "--exec=claude-code",
+                "--path=bin:/usr/bin",
+                "--unset=CLAUDE_CODE_SIMPLE",
+                "--env=FOO=bar baz",
+                "--env=HOME=/thread's home",
+                "--env=SHELL=/bin/false",
+                "--",
+                "--resume",
+                "s 1; rm -rf /",
+                "--model",
+                "it's",
+            ]
+        );
+        // A variable that is no name, or one of twr's own to set, is refused (`[threads] env`
+        // refuses them too).
+        for bad in ["TWR_CLAUDE_BIN", "A=B", ""] {
+            let info = AttachInfo {
+                env: vec![(bad.into(), Some("x".into()))],
+                ..info.clone()
+            };
+            assert!(
+                ssh_exec_command("me@gpu", BUILD, "claude-code", &info).is_err(),
+                "{bad}"
+            );
+        }
+        // No thread PATH: no `--path` (the box's login PATH then), no directory: where ssh
+        // lands.
+        let bare = AttachInfo {
+            env: Vec::new(),
+            cwd: None,
+            ..info.clone()
+        };
+        let c = ssh_exec_command("me@gpu", BUILD, "codex", &bare).unwrap();
+        let got = run_remote(&c, &data, &out);
+        assert_eq!(got[5..8], ["runner", "--exec=codex", "--"]);
+        // What it refuses: no build id, a runtime without a CLI of its own, ssh words that
+        // forward something.
+        assert!(ssh_exec_command("me@gpu", "../../x", "codex", &bare).is_err());
+        assert!(ssh_exec_command("me@gpu", BUILD, "acp", &bare).is_err());
+        let e = ssh_exec_command("-A me@gpu", BUILD, "codex", &bare).unwrap_err();
+        assert!(e.contains("ssh agent"), "{e}");
+    }
+
+    /// `RemoteBox::attach_command`: on an SSH box whose runner reported its build, a built-in
+    /// runtime's attach runs through that build ([`ssh_exec_command`]), with the hub's
+    /// arguments and never the runner's program or environment; a token box, or a runtime
+    /// without a CLI of its own, runs the hub's command as it is ([`ssh_command`]).
+    #[tokio::test]
+    async fn remote_attach_commands_by_transport() {
+        let dir = tempfile::tempdir().unwrap();
+        let thread = dir.path().join("wt");
+        std::fs::create_dir(&thread).unwrap();
+        let cfg = SpawnConfig {
+            thread: "t1".into(),
+            cwd: thread.clone(),
+            ..Default::default()
+        };
+        let mut local = Command::new("claude");
+        local.args(["--resume", "s1"]);
+        for (b, runtime, exec) in [
+            (
+                RemoteBox::new_ssh("gpu", "me@gpu".into()),
+                "claude-code",
+                true,
+            ),
+            (RemoteBox::new_ssh("gpu", "me@gpu".into()), "acp", false),
+            (
+                RemoteBox::new("gpu", Secret::new("t"), Some("me@gpu".into())),
+                "claude-code",
+                false,
+            ),
+        ] {
+            let (tx, mut rx) = mpsc::channel(4);
+            let (close, _closed) = watch::channel(None);
+            let inv = Inventory {
+                build: Some(BUILD.into()),
+                worktrees: dir.path().into(),
+                ..Default::default()
+            };
+            let epoch = b
+                .connect(&inv, ConnTx::new(tx, close), None, None)
+                .epoch()
+                .unwrap();
+            assert!(b.set_ready(epoch, &[], Vec::new()));
+            let answer = {
+                let b = b.clone();
+                tokio::spawn(async move {
+                    let Some(HubMsg::Cmd { cmd_id, op }) = rx.recv().await else {
+                        panic!("no command")
+                    };
+                    assert!(matches!(op, Op::AttachInfo { .. }), "{op:?}");
+                    // A runner naming a program and an environment of its own.
+                    let named = AttachInfo {
+                        program: "/tmp/evil".into(),
+                        args: vec!["--evil".into()],
+                        cwd: None,
+                        env: vec![("LD_PRELOAD".into(), Some("/tmp/x.so".into()))],
+                    };
+                    b.on_result(epoch, CmdResult::new(&cmd_id, Ok(serde_json::json!(named))));
+                })
+            };
+            let (c, _) = b
+                .attach_command(runtime, &cfg, "s1", &local, None)
+                .await
+                .unwrap()
+                .unwrap();
+            answer.await.unwrap();
+            let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !remote.contains("evil") && !remote.contains("LD_PRELOAD"),
+                "{remote}"
+            );
+            if exec {
+                assert!(
+                    remote.contains(&format!("/twr/runner/builds/{BUILD}/twr runner")),
+                    "{remote}"
+                );
+                assert!(remote.contains("--exec=claude-code"), "{remote}");
+            } else {
+                assert!(!remote.contains("runner --exec"), "{remote}");
+                assert!(remote.contains("'claude' '--resume' 's1'"), "{remote}");
+            }
+        }
+    }
+
+    /// A command box refuses `twr attach` (its terminal can be detached or lost while the
+    /// agent's CLI runs on in the container), with or without `terminal_command`, before its
+    /// runner is asked; it has no token proof either way.
+    #[tokio::test]
+    async fn a_command_box_refuses_attach() {
+        let cfg = SpawnConfig {
+            thread: "t1".into(),
+            cwd: "/w".into(),
+            ..Default::default()
+        };
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for terminal in [None, Some(words(&["docker", "exec", "-i", "-t", "c"]))] {
+            let b = RemoteBox::new_command(
+                "sb",
+                BoxLink::Command {
+                    command: words(&["docker", "exec", "-i", "c"]),
+                    terminal,
+                },
+            );
+            assert_eq!(b.transport(), BoxTransport::Command);
+            let token = b.token_snapshot();
+            assert_eq!(b.hub_proof(&token, "a", "b"), None);
+            assert!(!b.checks_runner_proof(&token, "a", "b", ""));
+            let (tx, mut rx) = mpsc::channel(4);
+            let (close, _closed) = watch::channel(None);
+            let inv = Inventory {
+                build: Some(BUILD.into()),
+                worktrees: "/w".into(),
+                ..Default::default()
+            };
+            let epoch = b
+                .connect(&inv, ConnTx::new(tx, close), None, None)
+                .epoch()
+                .unwrap();
+            assert!(b.set_ready(epoch, &[], Vec::new()));
+            let e = b
+                .attach_command("claude-code", &cfg, "s1", &Command::new("claude"), None)
+                .await
+                .unwrap_err();
+            assert_eq!(e.code, codes::UNSUPPORTED);
+            assert_eq!(
+                e.message,
+                "twr can't attach to threads on box sb yet: a command box's terminal (`docker \
+                 exec -t`) can be detached or lost while the agent's CLI keeps running in the \
+                 container, so twr can't tell when the attach ends. Continue the thread from \
+                 the TUI or with `twr send`."
+            );
+            assert!(rx.try_recv().is_err(), "the runner was asked");
+        }
+    }
+
     #[test]
     fn attach_commands_are_wrapped_in_ssh() {
         let info = AttachInfo {
@@ -1797,7 +3015,7 @@ mod tests {
             cwd: Some("/w/it's".into()),
             env: vec![("A".into(), Some("x y".into())), ("B".into(), None)],
         };
-        let c = ssh_command("-p 2222 me@gpu", &info, None);
+        let c = ssh_command("-p 2222 me@gpu", &info, None).unwrap();
         let argv: Vec<String> = std::iter::once(c.get_program())
             .chain(c.get_args())
             .map(|a| a.to_string_lossy().into_owned())
@@ -1807,13 +3025,32 @@ mod tests {
             vec![
                 "ssh",
                 "-t",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ForwardX11=no",
+                "-o",
+                "PermitLocalCommand=no",
+                "-o",
+                "Tunnel=no",
                 "-p",
                 "2222",
                 "me@gpu",
+                "-a",
+                "-x",
+                "-k",
                 "--",
                 r"cd '/w/it'\''s' && exec env -u 'B' -- 'A=x y' 'claude' '--resume' 's 1'"
             ]
         );
+        // Words that forward something, or decide the terminal, are refused: attach's own
+        // `-t` is the only one.
+        for (bad, says) in [("-A me@gpu", "ssh agent"), ("-T me@gpu", "terminal")] {
+            let e = ssh_command(bad, &info, None).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
         // The remote string runs as meant in a shell (echo instead of the program).
         let info = AttachInfo {
             program: "sh".into(),
@@ -1825,7 +3062,7 @@ mod tests {
             env: vec![("A".into(), Some("x y".into())), ("B".into(), None)],
         };
         let dir = tempfile::tempdir().unwrap();
-        let c = ssh_command("host", &info, Some(dir.path()));
+        let c = ssh_command("host", &info, Some(dir.path())).unwrap();
         let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
             .args(["-c", &remote])
@@ -1841,7 +3078,7 @@ mod tests {
             cwd: None,
             env: vec![("-ODD".into(), Some("y".into())), ("B".into(), None)],
         };
-        let c = ssh_command("host", &info, Some(dir.path()));
+        let c = ssh_command("host", &info, Some(dir.path())).unwrap();
         let remote = c.get_args().last().unwrap().to_string_lossy().into_owned();
         let out = std::process::Command::new("sh")
             .args(["-c", &remote])

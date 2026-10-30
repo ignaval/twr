@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 license = "Apache-2.0"
@@ -18,10 +18,15 @@ twr-hub = { path = "crates/twr-hub" }
 twr-mcp = { path = "crates/twr-mcp" }
 twr-tui = { path = "crates/twr-tui" }
 twr-docs = { path = "crates/twr-docs" }
+twr-avspeech = { path = "crates/twr-avspeech" }
+twr-speech = { path = "crates/twr-speech" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value`: event payloads parse straight into their types (`twr_core::event`).
+# `float_roundtrip`: a float reads back as the same float (the hub's checkpoints hold sums of
+# costs, `twr_hub` `hub::checkpoint`).
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 ulid = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
@@ -50,8 +55,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # macOS's mount list (`getfsstat`) for twr-runner's trims and deletions.
 libc = "0.2"
+# twr-runner's shutdown latch (`client::Shutdown`): an action in the SIGTERM / SIGINT handler
+# itself, next to Tokio's (which goes through the same registry).
+signal-hook-registry = "1.4"
 # `twr update` checks the release's Ed25519 signatures: the ring rustls already builds.
 ring = "0.17.14"
+# twr-avspeech (macOS only): AVFAudio's AVSpeechSynthesizer through objc2's bindings, with
+# only the features it uses.
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSArray", "NSObject"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "AVSpeechSynthesis"] }
 
 # Dev and test builds (`test` inherits `dev`) keep only line tables: panics and backtraces still
 # name file and line, and debuggers can step by line, but the variables and types of full
