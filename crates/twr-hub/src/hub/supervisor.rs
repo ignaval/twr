@@ -670,7 +670,7 @@ pub(super) async fn close_exited(hub: &Arc<Inner>, thread: &str, exit: &mut Pend
         );
         return Closed::Failed;
     }
-    if exit.crash {
+    if exit.crash && !exit.continue_after_compaction {
         // A crash: classify it and retry once if it is due (`hub::retry`); nothing else is
         // dispatched.
         let r = persist(hub, thread, "reacting to a crash", |core| {

@@ -436,8 +436,8 @@ runtime = "acp:remote --key s3cret-box"
             json!(["target/"])
         );
         assert_eq!(v["projects"]["api"]["idle_trim_disposable"], Value::Null);
-        // What the hub does about an expired prompt cache: `ask` unless set.
-        assert_eq!(defaults["threads"]["idle_compaction"], "ask");
+        // What the hub does about an expired prompt cache: `after_expiry` unless set.
+        assert_eq!(defaults["threads"]["idle_compaction"], "after_expiry");
         let mut idle = Config::default();
         idle.threads.idle_compaction = twr_core::config::IdleCompaction::BeforeExpiry;
         assert_eq!(

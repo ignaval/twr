@@ -478,7 +478,7 @@
           <h3><span class="tag">memory &amp; context</span> · long-running work</h3>
           <ul>
             <li>The orchestrator keeps notes on your preferences and setup, one memory per workspace, across sessions, restarts and runtime switches. Notes are information, never authority. <code>twr memory</code> manages them.</li>
-            <li>Context compactions show as a line in the conversation. <code>/compact-context</code> compacts a thread between turns, and before a message goes to a Claude Code thread with a large context whose prompt cache has expired, twr asks whether to compact first.</li>
+            <li>Context compactions show as a line in the conversation. <code>/compact-context</code> compacts a thread between turns, and before a message goes to a Claude Code thread with a large context whose prompt cache has expired, twr compacts automatically and continues without asking.</li>
             <li>A hub with weeks of history starts from a checkpoint instead of replaying its whole log, and old turns' detail moves to an archive.</li>
           </ul>
           <p class="more"><a href="https://github.com/ignaval/twr/blob/main/docs/orchestrator.md#memory">memory</a> · <a href="https://github.com/ignaval/twr/blob/main/docs/runtimes.md#context-compaction">compaction</a></p>

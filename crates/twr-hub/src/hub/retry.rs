@@ -51,7 +51,7 @@
 //! Crashes: queued prompts are not dispatched after a crash, to avoid crash
 //! loops. The automatic retry is the one exception: it restarts (resumes) the runtime once for
 //! the failed turn; if the retry fails too, nothing else is dispatched until the user acts.
-//! A worker's `thread.crashed` holds its queue (`ThreadRt::queue_held`, folded from the log, so
+//! A worker's `thread.crashed` during work holds its queue (`ThreadRt::queue_held`, folded from the log, so
 //! a hub restart keeps it): every ordinary dispatch (the background ticker, a runner's
 //! reconnection, a detach, ...) checks it, a due retry aside, and only the user's next prompt
 //! (`thread.send`, `say`), resume (`thread.resume`) or a runtime that starts again releases it:

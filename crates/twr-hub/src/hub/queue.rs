@@ -162,7 +162,7 @@ impl Core {
     }
 
     /// [`Core::release_for`], and an offer card holding the message (`hub::idle_compact`) is
-    /// answered `Send as is`, by `caller` (the user): sent now, it goes as it is.
+    /// answered `Send as is`, by `caller` (the user). Automatic compaction is bypassed too.
     fn release_now(
         &mut self,
         hub: &Arc<Inner>,
@@ -171,7 +171,7 @@ impl Core {
         caller: &Caller,
     ) -> Result<(), RpcError> {
         self.release_for(id, msg_ref)?;
-        self.send_past_idle_offer(hub, id, caller)
+        self.bypass_idle_compaction(hub, id, caller)
     }
 
     pub(super) fn send_now_locked(
@@ -276,7 +276,7 @@ impl Core {
             Some((turn, Some(row))) if row == msg_ref => with(json!({
                 "sent_now": true, "state": "started", "turn": turn,
             })),
-            // (A card raised by this dispatch: another session or cache than the one answered.)
+            // Compatibility with an old offer that could not yet be retired.
             _ => match self.idle_offer_waiting(id) {
                 Some(attn_id) => with(json!({
                     "sent_now": true,
