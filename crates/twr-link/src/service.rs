@@ -718,7 +718,8 @@ impl Service {
                     .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
             {
                 let b = crate::random::<64>()?;
-                crate::state::atomic_write(&file, &b)?;
+                // Never made here: the workspace may have been removed since it was looked at.
+                crate::state::atomic_write_existing(&file, &b)?;
                 b.to_vec()
             }
             Err(e) => return Err(e),

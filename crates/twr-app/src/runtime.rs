@@ -111,7 +111,38 @@ fn spawn_hub(paths: &Paths, socket: &Path, binary: &Path) -> Result<()> {
         None => twr_core::paths::ensure_private_dir(&paths.data_dir)?,
         Some(_) => twr_core::paths::check_private_dir(&paths.data_dir)?,
     }
+    // `default`'s directory stays when it is removed: its log is opened under its lock (as
+    // `twr` starts a hub), which `twr ws rm` holds as it marks it removed, and only while it
+    // isn't. Held by a hub that is starting (or the removal), none is started here: the next
+    // probe sees which.
+    let lock = match paths.workspace {
+        None => {
+            let path = paths.data_dir.join(twr_hub::LOCK_FILE);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("opening {}", path.display()))?;
+            match twr_hub::lock_opened(file, &path)? {
+                Some(lock) => {
+                    anyhow::ensure!(
+                        paths.exists(),
+                        "Workspace does not exist; create it before connecting"
+                    );
+                    Some(lock)
+                }
+                None => return Ok(()),
+            }
+        }
+        Some(_) => None,
+    };
     let log = twr_core::paths::open_private_append(&paths.hub_log())?;
+    // The hub takes the lock itself: let go of it, unlocked (a process started meanwhile
+    // shares the open file until it execs).
+    if let Some(lock) = lock {
+        let _ = lock.unlock();
+    }
     let mut command = std::process::Command::new(binary);
     command
         .args(["--workspace", paths.workspace_id(), "--socket"])

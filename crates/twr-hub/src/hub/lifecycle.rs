@@ -1478,6 +1478,15 @@ mod tests {
             None,
         )
         .unwrap();
+        // A message queued for it, which a next hub would send.
+        hub.inner
+            .core()
+            .store
+            .enqueue_prompt("o", "then do X", Default::default(), None, &Source::Hub, 0)
+            .unwrap();
+        let e = hub.shutdown_if_idle().unwrap_err();
+        assert!(e.message.contains("queued"), "{}", e.message);
+        hub.inner.core().store.clear_pending("o").unwrap();
         hub.shutdown_if_idle().unwrap();
         assert!(hub.inner.core().shutting_down);
         hub.shutdown().await;

@@ -939,11 +939,24 @@ pub const HISTORY_ENTRY_MAX: usize = 16 * 1024;
 /// (`twr ws rm`) does not make it again.
 pub fn save_history(path: &Path, entries: &[String]) -> std::io::Result<()> {
     use std::io::Write;
+    let removed = || {
+        path.parent()
+            .is_some_and(|d| d.join(twr_core::workspaces::REMOVED_FILE).exists())
+    };
+    let gone = || std::io::Error::other("its workspace was removed");
     if let Some(dir) = path.parent() {
         twr_core::paths::check_private_dir(dir).map_err(std::io::Error::other)?;
     }
+    // `default`'s directory stays when it is removed: its mark says so. Checked again under
+    // the lock, which the removal holds as it marks it and takes its files.
+    if removed() {
+        return Err(gone());
+    }
     let lock = twr_core::paths::open_private_append(&path.with_extension("lock"))?;
     lock.lock()?;
+    if removed() {
+        return Err(gone());
+    }
     let mut f = twr_core::paths::open_private_append(path)?;
     // A last line a crash left unfinished is ended first: the new lines start their own.
     if ends_unfinished(path)? {
@@ -2033,7 +2046,14 @@ fn spawn_removal(
 /// Creates workspace `name` when asked, opens its hub and connects to it.
 async fn open_workspace(ws: &dyn Workspaces, name: &str, create: bool) -> anyhow::Result<Session> {
     if create {
-        create_workspace(ws, name)?;
+        // It waits for the registry's lock, which a removal may hold a moment.
+        // (Only a multi-threaded runtime, the CLI's, can let a worker block.)
+        match tokio::runtime::Handle::current().runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| create_workspace(ws, name))?
+            }
+            _ => create_workspace(ws, name)?,
+        }
     }
     let socket = ws.open(name).await?;
     Session::connect(&socket, Some(name)).await
@@ -6205,6 +6225,11 @@ mod tests {
         assert!(save_history(&path, &["lost".into()]).is_err());
         assert!(!dir.path().join("sub").exists());
         std::fs::create_dir(dir.path().join("sub")).unwrap();
+        // `default` removed (its directory stays, marked): not written again either.
+        std::fs::write(dir.path().join("sub").join("workspace-removed"), "").unwrap();
+        assert!(save_history(&path, &["lost".into()]).is_err());
+        assert!(!path.exists());
+        std::fs::remove_file(dir.path().join("sub").join("workspace-removed")).unwrap();
         save_history(&path, &["a \"quoted\" line".into(), "/help".into()]).unwrap();
         assert_eq!(load_history(&path), ["a \"quoted\" line", "/help"]);
         let many: Vec<String> = (0..2 * app::HISTORY_MAX).map(|i| i.to_string()).collect();

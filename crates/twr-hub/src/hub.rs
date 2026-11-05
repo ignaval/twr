@@ -3082,11 +3082,49 @@ impl Hub {
                  done, or stop it",
             ));
         }
-        let items = std::fs::read_dir(&trash).map_or(0, |d| d.count());
-        if items > 0 {
+        // Every box's items (a remote one's live on the box), and the local directory's,
+        // which can't be read is not taken for empty.
+        let local = match std::fs::read_dir(&trash) {
+            Ok(d) => d.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => {
+                return Err(RpcError::new(
+                    codes::CONFLICT,
+                    format!("its trash can't be read ({e}): nothing was stopped"),
+                ))
+            }
+        };
+        if local > 0 || !core.trash.is_empty() {
             return Err(RpcError::new(
                 codes::CONFLICT,
                 "its trash holds deleted threads: empty it first",
+            ));
+        }
+        // Threads being made (a spawn the orchestrator asked for, still under way).
+        let spawning: i64 = core
+            .store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM spawn_operations WHERE result IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| RpcError::new(codes::CONFLICT, format!("reading the spawns: {e}")))?;
+        if spawning > 0 || !core.reserved_names.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "threads are being made in it now: wait until they are there",
+            ));
+        }
+        // Messages queued for it, which a next hub would send.
+        let queued = core
+            .store
+            .threads_with_pending()
+            .map_err(|e| RpcError::new(codes::CONFLICT, format!("reading the queue: {e:#}")))?;
+        if !queued.is_empty() {
+            return Err(RpcError::new(
+                codes::CONFLICT,
+                "messages are queued for its orchestrator: let them run, or take them back",
             ));
         }
         core.shutting_down = true;

@@ -73,7 +73,6 @@ pub const ROOT_OWNED: &[&str] = &[
     "loops",
     "worktrees",
     "tui-history",
-    "tui-history.lock",
     // Its identity to the runner service (`twr-link`): one made again is another workspace.
     "link-identity",
     NAME_FILE,
@@ -413,9 +412,17 @@ fn clear_root_leftovers(root: &Paths) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether `name`, an entry of the root's data directory, is the root slot's own.
+/// Whether `name`, an entry of the root's data directory, is the root slot's own: one of
+/// [`ROOT_OWNED`] or [`ROOT_OWNED_PREFIXES`], or what a writer of those left half written (a
+/// temporary file of the input history's, or of [`write_atomic`]'s). `tui-history.lock`
+/// stays: the removal holds it as it goes (so a TUI's save waits, then finds it gone).
 pub fn root_owned(name: &str) -> bool {
-    ROOT_OWNED.contains(&name) || ROOT_OWNED_PREFIXES.iter().any(|p| name.starts_with(p))
+    ROOT_OWNED.contains(&name)
+        || ROOT_OWNED_PREFIXES.iter().any(|p| name.starts_with(p))
+        || (name.starts_with("tui-history.") && name.ends_with(".tmp"))
+        || [NAME_FILE, GENERATION_FILE]
+            .iter()
+            .any(|f| name.starts_with(&format!(".{f}.tmp-")))
 }
 
 /// Moves the root slot's own entries of the root's data directory ([`root_owned`]) into a
@@ -459,9 +466,24 @@ pub struct Renamed {
 /// [`NAME_FILE`] (removes it when `to` is its id). Its hub may run meanwhile: nothing it
 /// uses moves. Callers refuse agents.
 pub fn rename(root: &Paths, selector: &str, to: &str) -> anyhow::Result<Renamed> {
+    rename_found(root, |root| root.find_workspace(selector), selector, to)
+}
+
+/// [`rename`] of the workspace whose id is `id`, never one only named so (the TUI's, which
+/// knows its workspaces by id: one removed meanwhile is not taken for another).
+pub fn rename_id(root: &Paths, id: &str, to: &str) -> anyhow::Result<Renamed> {
+    rename_found(root, |root| root.workspace(id), id, to)
+}
+
+fn rename_found(
+    root: &Paths,
+    find: impl Fn(&Paths) -> anyhow::Result<Paths>,
+    selector: &str,
+    to: &str,
+) -> anyhow::Result<Renamed> {
     let root = root.root();
     let _lock = RegistryLock::take(&root)?;
-    let ws = root.find_workspace(selector)?;
+    let ws = find(&root)?;
     if !ws.exists() {
         bail!("there is no workspace {selector} (`twr ws` lists them)");
     }
@@ -495,9 +517,22 @@ pub fn rename(root: &Paths, selector: &str, to: &str) -> anyhow::Result<Renamed>
 /// Makes the workspace `selector` names the default, under the registry lock. Its id and its
 /// name. Callers refuse agents.
 pub fn set_default(root: &Paths, selector: &str) -> anyhow::Result<(String, String)> {
+    set_default_found(root, |root| root.find_workspace(selector), selector)
+}
+
+/// [`set_default`] of the workspace whose id is `id` (the TUI's, as [`rename_id`]).
+pub fn set_default_id(root: &Paths, id: &str) -> anyhow::Result<(String, String)> {
+    set_default_found(root, |root| root.workspace(id), id)
+}
+
+fn set_default_found(
+    root: &Paths,
+    find: impl Fn(&Paths) -> anyhow::Result<Paths>,
+    selector: &str,
+) -> anyhow::Result<(String, String)> {
     let root = root.root();
     let _lock = RegistryLock::take(&root)?;
-    let ws = root.find_workspace(selector)?;
+    let ws = find(&root)?;
     if !ws.exists() {
         bail!("there is no workspace {selector} (`twr ws` lists them)");
     }
@@ -660,6 +695,35 @@ mod tests {
         assert!(root.data_dir.join("keep.bak").exists());
         assert!(root.data_dir.join("accounts").is_dir());
         assert!(root.workspace("a").unwrap().exists());
+    }
+
+    #[test]
+    fn the_root_slots_own_files_include_half_written_ones_but_not_the_history_lock() {
+        for own in [
+            "twr.db",
+            "orch-mcp-1.json",
+            "tui-history",
+            "tui-history.1234.tmp",
+            ".workspace-name.tmp-99",
+            ".workspace-generation.tmp-99",
+            GENERATION_FILE,
+        ] {
+            assert!(root_owned(own), "{own}");
+        }
+        for shared in [
+            "tui-history.lock",
+            "twr.lock",
+            "workspaces",
+            "accounts",
+            "job-slots",
+            "tui-state.json",
+            "twr.db.bak-mine",
+            REMOVED_FILE,
+            DEFAULT_FILE,
+            REGISTRY_LOCK,
+        ] {
+            assert!(!root_owned(shared), "{shared}");
+        }
     }
 
     #[test]

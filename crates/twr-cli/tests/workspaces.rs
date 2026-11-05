@@ -1971,7 +1971,14 @@ fn removing_default_refuses_while_anything_would_be_lost() {
     std::fs::create_dir_all(root.data_dir.join("trash/item")).unwrap();
     let e = fails(home, &["ws", "rm", "default"]);
     assert!(e.contains("trash empty --all"), "{e}");
-    std::fs::remove_dir_all(root.data_dir.join("trash")).unwrap();
+    // Taken out by hand, the deleted thread's item is still in the log: purged the way
+    // twr says, it goes.
+    std::fs::remove_dir_all(root.data_dir.join("trash/item")).unwrap();
+    assert!(fails(home, &["ws", "rm", "default"]).contains("holds 1 deleted thread"));
+    {
+        let _hub = start_hub(home, None);
+        ok(home, &["trash", "empty", "--all", "--yes"]);
+    }
     ok(home, &["ws", "rm", "default", "--yes"]);
     assert!(root.removed_marker().exists());
 }

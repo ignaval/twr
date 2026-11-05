@@ -2633,8 +2633,8 @@ async fn attach_while_idle_quiesces_and_detach_runs_the_queue() {
     assert_eq!(grant.argv.last(), Some(&session));
     let project = std::fs::canonicalize(dir.path()).unwrap();
     assert_eq!(grant.cwd.as_deref(), project.to_str());
-    // Nothing is set for the user's process but the attach and agent markers (no
-    // TWR_THREAD); twr's secrets are removed.
+    // Nothing is set for the user's process but the attach and agent markers and its
+    // workspace's id (no TWR_THREAD); twr's secrets are removed.
     assert_eq!(
         grant.env["TWR_ATTACH"],
         serde_json::json!(format!("{t}:{}", grant.lease))
@@ -2644,10 +2644,10 @@ async fn attach_while_idle_quiesces_and_detach_runs_the_queue() {
         serde_json::json!(format!("{t}:attach.{}", grant.lease))
     );
     assert!(
-        grant
-            .env
-            .iter()
-            .all(|(k, v)| v.is_null() || k == "TWR_ATTACH" || k == "TWR_AGENT")
+        grant.env.iter().all(|(k, v)| v.is_null()
+            || k == "TWR_ATTACH"
+            || k == "TWR_AGENT"
+            || (k == "TWR_WORKSPACE" && v == "default"))
             && !grant.env.contains_key("TWR_THREAD"),
         "{:?}",
         grant.env

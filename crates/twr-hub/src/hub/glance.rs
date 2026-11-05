@@ -201,6 +201,7 @@ mod tests {
             empty,
             json!({
                 "workspace": "default",
+                "workspace_name": "default",
                 "threads": 0, "running": 0, "permissions": 0, "questions": 0,
                 "active": false,
                 "orchestrator": null,
